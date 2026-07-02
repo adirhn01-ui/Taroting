@@ -42,5 +42,143 @@
   flex: 1;
   min-height: 0;
   display: flex;
+}
+
+.editor__stage {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ---------- media panel ---------- */
+
+.media-panel {
+  width: 260px;
+  flex: none;
+  border-right: 1px solid var(--border);
+  background: var(--bg-panel);
+  display: flex;
   flex-direction: column;
+  min-height: 0;
+}
+
+.media-panel__header {
+  padding: var(--sp-3) var(--sp-4);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.media-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--sp-2);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.media-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2);
+  border-radius: var(--radius-s);
+  user-select: none;
+}
+.media-row:hover {
+  background: var(--bg-hover);
+}
+
+.media-row__thumb {
+  width: 56px;
+  height: 32px;
+  flex: none;
+  border-radius: 5px;
+  background: var(--bg-active);
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+  overflow: hidden;
+}
+.media-row__thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.media-row__meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.media-row__name {
+  font-size: var(--fs-12);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.media-row__sub {
+  font-size: var(--fs-11);
+  color: var(--text-3);
+}
+
+.media-row__state {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  max-width: 90px;
+}
+
+.media-row__status {
+  font-size: var(--fs-11);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.media-row__status--ok {
+  color: var(--ok);
+}
+.media-row__status--bad {
+  color: var(--danger);
+}
+
+.media-row__bar {
+  width: 72px;
+  height: 3px;
+  border-radius: var(--radius-full);
+  background: var(--bg-active);
+  overflow: hidden;
+}
+.media-row__bar > div {
+  height: 100%;
+  background: var(--accent);
+  transition: width 150ms linear;
+}
+
+/* drop overlay shared look with home */
+.editor .drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: none;
+  padding: var(--sp-5);
+  background: color-mix(in srgb, var(--bg-app) 55%, transparent);
+}
+.editor .drop-overlay.active {
+  display: block;
+}
+.editor .drop-overlay__inner {
+  height: 100%;
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius-l);
+  background: var(--accent-dim);
+  display: grid;
+  place-items: center;
+  font-size: var(--fs-16);
+  font-weight: 600;
+  color: var(--accent-strong);
 }

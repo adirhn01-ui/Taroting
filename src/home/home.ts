@@ -11,15 +11,10 @@ import {
 import { describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles, pickProjectFile } from "../core/ipc";
 import { navigate } from "../core/nav";
 import { createProject, importMediaAsClip } from "../core/project";
+import { MEDIA_FILE_EXTENSIONS } from "../core/types";
 import type { RecentItem } from "../core/types";
 import { icon } from "../ui/icons";
 import { toast } from "../ui/toast";
-
-const MEDIA_EXTS = new Set([
-  "mp4", "mov", "mkv", "avi", "webm", "gif",
-  "mp3", "wav", "flac", "aac", "m4a", "ogg",
-  "png", "jpg", "jpeg",
-]);
 
 export function mountHome(root: HTMLElement): { dispose(): void } {
   root.innerHTML = `
@@ -158,7 +153,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       void openPath(project);
       return;
     }
-    const media = paths.filter((p) => MEDIA_EXTS.has(fileExt(p)));
+    const media = paths.filter((p) => MEDIA_FILE_EXTENSIONS.has(fileExt(p)));
     if (media.length === 0) {
       toast.error("Unsupported file type.");
       return;

@@ -175,7 +175,11 @@ pub struct SavedProject {
 }
 
 #[tauri::command]
-pub fn save_project(path: String, project: Value) -> Result<SavedProject> {
+pub fn save_project(
+    cache: tauri::State<'_, std::sync::Arc<crate::cache::Cache>>,
+    path: String,
+    project: Value,
+) -> Result<SavedProject> {
     // Validate before writing — never persist something we can't read back.
     let typed: ProjectFile = serde_json::from_value(project.clone())
         .map_err(|e| AppError::BadInput(format!("refusing to save invalid project: {e}")))?;
@@ -185,12 +189,30 @@ pub fn save_project(path: String, project: Value) -> Result<SavedProject> {
         serde_json::to_vec_pretty(&project)?.as_slice(),
     )?;
 
+    // Thumbnail for the recents grid: any cached thumb of the first clip's media.
+    let thumb = typed
+        .timeline
+        .tracks
+        .first()
+        .and_then(|t| t.clips.first())
+        .and_then(|c| typed.media.iter().find(|m| m.id == c.media_id))
+        .map(|m| {
+            crate::cache::MediaKey {
+                path: m.path.clone(),
+                size: m.size,
+                mtime_ms: m.mtime_ms,
+            }
+            .hash()
+        })
+        .and_then(|h| crate::media::thumbs::any_thumb_for(&cache, &h))
+        .map(|p| p.to_string_lossy().into_owned());
+
     upsert_recent(RecentItem {
         path: path.clone(),
         name: typed.name.clone(),
         modified_at: typed.modified_at.clone(),
         duration_sec: typed.timeline.duration(),
-        thumb: None, // thumbnails arrive with the media pipeline milestone
+        thumb,
     })?;
 
     Ok(SavedProject {

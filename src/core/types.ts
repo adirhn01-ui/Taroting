@@ -217,6 +217,12 @@ export const DEFAULT_SETTINGS: Settings = {
   shortcuts: DEFAULT_SHORTCUTS,
 };
 
+export const MEDIA_FILE_EXTENSIONS = new Set([
+  "mp4", "mov", "mkv", "avi", "webm", "gif",
+  "mp3", "wav", "flac", "aac", "m4a", "ogg",
+  "png", "jpg", "jpeg",
+]);
+
 export const DEFAULT_EXPORT_PRESET: ExportPreset = {
   format: "mp4",
   vcodec: "h264",
