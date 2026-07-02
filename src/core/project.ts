@@ -2,22 +2,34 @@
 // structural sharing — callers never mutate state in place.
 //
 // Invariants (verified by checkInvariants + fuzz tests):
-//  - exactly one video track, at tracks[0]
+//  - >=1 video track; video tracks form a contiguous prefix; tracks[0] is video
+//    (array order = z-order, tracks[0] topmost)
 //  - per track: clips sorted by timelineStart, non-overlapping
 //  - 0 <= srcIn < srcOut <= media.duration (still images excepted)
 //  - every clip.mediaId resolves; speed within [MIN_SPEED, MAX_SPEED]
+//  - markers sorted ascending; keyframe arrays strictly ascending, x/y paired
+//  - timeline width/height even integers in [16, 8192]
 
 import type {
+  AnimProp,
   Clip,
   ClipAudio,
+  ClipKeyframes,
   ClipTransform,
+  Generator,
+  Keyframe,
+  Marker,
   MediaInfo,
   MediaRef,
   ProjectFile,
   Track,
 } from "./types";
 import { DEFAULT_EXPORT_PRESET } from "./types";
+import { EPS_KF, removeKfNear, upsertKf } from "./anim";
 import { clipDuration, clipEnd } from "./time";
+
+export const MIN_CANVAS = 16;
+export const MAX_CANVAS = 8192;
 
 export const MIN_CLIP_DUR = 1 / 120; // one frame at 120fps — hard floor
 export const MIN_SPEED = 0.25;
@@ -140,6 +152,16 @@ function sortClips(clips: Clip[]): Clip[] {
   return [...clips].sort((a, b) => a.timelineStart - b.timelineStart);
 }
 
+/** The contiguous video prefix (per the z-order invariant). */
+export function videoTracks(p: ProjectFile): Track[] {
+  return p.timeline.tracks.filter((t) => t.kind === "video");
+}
+
+/** The topmost video track (tracks[0] per the invariant). */
+export function topVideoTrack(p: ProjectFile): Track {
+  return p.timeline.tracks[0]!;
+}
+
 /** Add an audio track. */
 export function addAudioTrack(p: ProjectFile): { project: ProjectFile; trackId: string } {
   const id = uid();
@@ -151,9 +173,25 @@ export function addAudioTrack(p: ProjectFile): { project: ProjectFile; trackId: 
   };
 }
 
+/** Add a video track as the new TOPMOST layer (unshifted to index 0). */
+export function addVideoTrack(p: ProjectFile): { project: ProjectFile; trackId: string } {
+  const id = uid();
+  const n = videoTracks(p).length + 1;
+  const track: Track = { id, kind: "video", name: `Video ${n}`, muted: false, clips: [] };
+  return {
+    project: { ...p, timeline: { ...p.timeline, tracks: [track, ...p.timeline.tracks] } },
+    trackId: id,
+  };
+}
+
+/** Remove a track. Audio tracks always removable. A video track may be removed
+ *  only when it is EMPTY and at least 2 video tracks exist (>=1 must remain). */
 export function removeTrack(p: ProjectFile, trackId: string): ProjectFile {
   const t = findTrack(p, trackId);
-  if (!t || t.kind === "video") return p; // the video track is permanent
+  if (!t) return p;
+  if (t.kind === "video") {
+    if (t.clips.length > 0 || videoTracks(p).length < 2) return p;
+  }
   const tracks = p.timeline.tracks.filter((x) => x.id !== trackId);
   return { ...p, timeline: { ...p.timeline, tracks } };
 }
@@ -360,13 +398,20 @@ export function rippleDelete(p: ProjectFile, clipId: string): ProjectFile {
 /* Property updates                                                    */
 /* ------------------------------------------------------------------ */
 
-/** Patch arbitrary clip fields (transform, audio, …). */
-export function updateClip(p: ProjectFile, clipId: string, patch: Partial<Clip>): ProjectFile {
+/** Patch arbitrary clip fields (transform, audio, …). Accepts a partial patch
+ *  object or an updater that returns the full replacement clip. */
+export function updateClip(
+  p: ProjectFile,
+  clipId: string,
+  patch: Partial<Clip> | ((clip: Clip) => Clip),
+): ProjectFile {
   const found = findClip(p, clipId);
   if (!found) return p;
   return withTrack(p, found.track.id, (t) => ({
     ...t,
-    clips: t.clips.map((c) => (c.id === clipId ? { ...c, ...patch } : c)),
+    clips: t.clips.map((c) =>
+      c.id === clipId ? (typeof patch === "function" ? patch(c) : { ...c, ...patch }) : c,
+    ),
   }));
 }
 
@@ -482,7 +527,7 @@ export function importMediaAsClip(
       trackId = r.trackId;
     }
   } else {
-    trackId = project.timeline.tracks[0]!.id;
+    trackId = topVideoTrack(project).id;
   }
 
   const track = project.timeline.tracks.find((t) => t.id === trackId)!;
@@ -493,14 +538,260 @@ export function importMediaAsClip(
 }
 
 /* ------------------------------------------------------------------ */
+/* Markers                                                             */
+/* ------------------------------------------------------------------ */
+
+function withMarkers(p: ProjectFile, markers: Marker[]): ProjectFile {
+  return { ...p, timeline: { ...p.timeline, markers } };
+}
+
+function sortMarkers(markers: Marker[]): Marker[] {
+  return [...markers].sort((a, b) => a.t - b.t);
+}
+
+/** Add a marker at timeline time t, keeping markers sorted. */
+export function addMarkerAt(
+  p: ProjectFile,
+  t: number,
+  color = 0,
+): { project: ProjectFile; markerId: string } {
+  const markerId = uid();
+  const markers = sortMarkers([...(p.timeline.markers ?? []), { id: markerId, t, color }]);
+  return { project: withMarkers(p, markers), markerId };
+}
+
+/** Move a marker to a new timeline time (re-sorts). */
+export function moveMarkerTo(p: ProjectFile, markerId: string, t: number): ProjectFile {
+  const cur = p.timeline.markers;
+  if (!cur) return p;
+  const markers = sortMarkers(cur.map((m) => (m.id === markerId ? { ...m, t } : m)));
+  return withMarkers(p, markers);
+}
+
+export function removeMarker(p: ProjectFile, markerId: string): ProjectFile {
+  const cur = p.timeline.markers;
+  if (!cur) return p;
+  return withMarkers(p, cur.filter((m) => m.id !== markerId));
+}
+
+/* ------------------------------------------------------------------ */
+/* Project canvas                                                      */
+/* ------------------------------------------------------------------ */
+
+function clampCanvas(n: number): number {
+  const even = Math.round(n / 2) * 2;
+  return Math.min(Math.max(even, MIN_CANVAS), MAX_CANVAS);
+}
+
+/** Set the project canvas size, clamped to even integers within [16, 8192].
+ *  No-op (same reference) if unchanged. */
+export function setProjectCanvas(p: ProjectFile, width: number, height: number): ProjectFile {
+  const w = clampCanvas(width);
+  const h = clampCanvas(height);
+  if (w === p.timeline.width && h === p.timeline.height) return p;
+  return { ...p, timeline: { ...p.timeline, width: w, height: h } };
+}
+
+/* ------------------------------------------------------------------ */
+/* Keyframes                                                           */
+/* ------------------------------------------------------------------ */
+
+const PROPS_OF_GROUP: Record<"position" | "scale" | "opacity", AnimProp[]> = {
+  position: ["x", "y"],
+  scale: ["scale"],
+  opacity: ["opacity"],
+};
+
+/** Write a rebuilt keyframes object onto a clip. Empty arrays are stripped; an
+ *  empty object collapses to no `keyframes` key at all (structural cleanliness
+ *  so undo-all equality holds). */
+function writeKeyframes(p: ProjectFile, clipId: string, kfs: ClipKeyframes): ProjectFile {
+  const cleaned: ClipKeyframes = {};
+  for (const [prop, arr] of Object.entries(kfs) as [AnimProp, Keyframe[] | undefined][]) {
+    if (arr && arr.length > 0) cleaned[prop] = arr;
+  }
+  const hasAny = Object.keys(cleaned).length > 0;
+  return updateClip(p, clipId, (clip) => {
+    if (!hasAny) {
+      if (clip.keyframes === undefined) return clip;
+      const { keyframes: _drop, ...rest } = clip;
+      return rest;
+    }
+    return { ...clip, keyframes: cleaned };
+  });
+}
+
+/** Upsert a keyframe on a single prop at source time s. */
+export function setKeyframe(
+  p: ProjectFile,
+  clipId: string,
+  prop: AnimProp,
+  s: number,
+  v: number,
+): ProjectFile {
+  const found = findClip(p, clipId);
+  if (!found) return p;
+  const kfs: ClipKeyframes = { ...found.clip.keyframes };
+  kfs[prop] = upsertKf(kfs[prop], s, v, EPS_KF);
+  return writeKeyframes(p, clipId, kfs);
+}
+
+/** Upsert BOTH x and y keyframes at source time s (kept paired). */
+export function setPositionKeyframes(
+  p: ProjectFile,
+  clipId: string,
+  s: number,
+  x: number,
+  y: number,
+): ProjectFile {
+  const found = findClip(p, clipId);
+  if (!found) return p;
+  const kfs: ClipKeyframes = { ...found.clip.keyframes };
+  kfs.x = upsertKf(kfs.x, s, x, EPS_KF);
+  kfs.y = upsertKf(kfs.y, s, y, EPS_KF);
+  return writeKeyframes(p, clipId, kfs);
+}
+
+/** Remove the keyframe(s) near source time s from a group. Position removes
+ *  from both x and y. Empty arrays drop their keys; an empty keyframes object
+ *  becomes undefined. */
+export function removeKeyframesNear(
+  p: ProjectFile,
+  clipId: string,
+  group: "position" | "scale" | "opacity",
+  s: number,
+): ProjectFile {
+  const found = findClip(p, clipId);
+  if (!found) return p;
+  const { clip } = found;
+  if (!clip.keyframes) return p;
+  const kfs: ClipKeyframes = { ...clip.keyframes };
+  for (const prop of PROPS_OF_GROUP[group]) {
+    const arr = kfs[prop];
+    if (!arr) continue;
+    kfs[prop] = removeKfNear(arr, s, EPS_KF);
+  }
+  return writeKeyframes(p, clipId, kfs);
+}
+
+/** Clear a group's animation. Deletes the group's arrays and, when `bake` is
+ *  provided, writes those static values into clip.transform. */
+export function clearAnimation(
+  p: ProjectFile,
+  clipId: string,
+  group: "position" | "scale" | "opacity",
+  bake?: Partial<{ x: number; y: number; scale: number; opacity: number }>,
+): ProjectFile {
+  const found = findClip(p, clipId);
+  if (!found) return p;
+  const { clip } = found;
+  const kfs: ClipKeyframes = { ...clip.keyframes };
+  for (const prop of PROPS_OF_GROUP[group]) delete kfs[prop];
+  let next = writeKeyframes(p, clipId, kfs);
+  if (bake && clip.transform) {
+    next = updateClip(next, clipId, { transform: { ...clip.transform, ...bake } });
+  }
+  return next;
+}
+
+/* ------------------------------------------------------------------ */
+/* Media                                                               */
+/* ------------------------------------------------------------------ */
+
+/** Patch fields on a media item. */
+export function updateMedia(
+  p: ProjectFile,
+  mediaId: string,
+  patch: Partial<MediaRef>,
+): ProjectFile {
+  return { ...p, media: p.media.map((m) => (m.id === mediaId ? { ...m, ...patch } : m)) };
+}
+
+/** Remove a media item AND every clip referencing it on every track. */
+export function removeMediaCascade(p: ProjectFile, mediaId: string): ProjectFile {
+  const tracks = p.timeline.tracks.map((t) => ({
+    ...t,
+    clips: t.clips.filter((c) => c.mediaId !== mediaId),
+  }));
+  return {
+    ...p,
+    media: p.media.filter((m) => m.id !== mediaId),
+    timeline: { ...p.timeline, tracks },
+  };
+}
+
+/** Register a synthetic (generated) media item — solid or text. Unlike addMedia
+ *  it never adopts the project resolution/fps. kind is "image"; path is the
+ *  display label only. */
+export function addGeneratedMedia(
+  p: ProjectFile,
+  generator: Generator,
+  width: number,
+  height: number,
+  label: string,
+): { project: ProjectFile; media: MediaRef } {
+  const media: MediaRef = {
+    id: uid(),
+    path: label,
+    size: 0,
+    mtimeMs: 0,
+    kind: "image",
+    duration: 0,
+    hasAudio: false,
+    width,
+    height,
+    generator,
+  };
+  return { project: { ...p, media: [...p.media, media] }, media };
+}
+
+/* ------------------------------------------------------------------ */
 /* Invariants (used by tests and the fuzz harness)                     */
 /* ------------------------------------------------------------------ */
 
+function checkKfArray(errors: string[], clipId: string, prop: string, arr: Keyframe[]): void {
+  let prevT = -Infinity;
+  for (const k of arr) {
+    if (!Number.isFinite(k.v)) errors.push(`clip ${clipId} kf ${prop}: non-finite v`);
+    if (!(k.t > prevT)) errors.push(`clip ${clipId} kf ${prop}: not strictly ascending`);
+    if (prop === "scale" && !(k.v > 0)) errors.push(`clip ${clipId} kf scale: v <= 0`);
+    if (prop === "opacity" && (k.v < 0 || k.v > 1))
+      errors.push(`clip ${clipId} kf opacity: v out of [0,1]`);
+    prevT = k.t;
+  }
+}
+
 export function checkInvariants(p: ProjectFile): string[] {
   const errors: string[] = [];
-  const videoTracks = p.timeline.tracks.filter((t) => t.kind === "video");
-  if (videoTracks.length !== 1) errors.push(`expected 1 video track, got ${videoTracks.length}`);
-  if (p.timeline.tracks[0]?.kind !== "video") errors.push("tracks[0] is not the video track");
+  const vtracks = p.timeline.tracks.filter((t) => t.kind === "video");
+  if (vtracks.length < 1) errors.push("expected >=1 video track, got 0");
+  if (p.timeline.tracks[0]?.kind !== "video") errors.push("tracks[0] is not a video track");
+  // contiguity: no video track appears after the first audio track
+  let seenAudio = false;
+  for (const t of p.timeline.tracks) {
+    if (t.kind === "audio") seenAudio = true;
+    else if (seenAudio) errors.push("video track after an audio track (non-contiguous)");
+  }
+
+  // canvas: even integers within bounds
+  for (const [dim, val] of [
+    ["width", p.timeline.width],
+    ["height", p.timeline.height],
+  ] as const) {
+    if (!Number.isInteger(val) || val % 2 !== 0 || val < MIN_CANVAS || val > MAX_CANVAS)
+      errors.push(`timeline ${dim} ${val} not an even integer in [16, 8192]`);
+  }
+
+  // markers: sorted ascending + finite t
+  const markers = p.timeline.markers;
+  if (markers) {
+    let prevT = -Infinity;
+    for (const m of markers) {
+      if (!Number.isFinite(m.t)) errors.push(`marker ${m.id}: non-finite t`);
+      if (m.t < prevT - EPS) errors.push(`marker ${m.id}: out of order`);
+      prevT = m.t;
+    }
+  }
 
   const mediaIds = new Set(p.media.map((m) => m.id));
   for (const track of p.timeline.tracks) {
@@ -523,6 +814,23 @@ export function checkInvariants(p: ProjectFile): string[] {
         errors.push(`clip ${c.id}: speed ${c.speed} out of range`);
       if (clipDuration(c) < MIN_CLIP_DUR - EPS)
         errors.push(`clip ${c.id}: below minimum duration`);
+      if (c.keyframes) {
+        for (const [prop, arr] of Object.entries(c.keyframes)) {
+          if (arr) checkKfArray(errors, c.id, prop, arr);
+        }
+        const xs = c.keyframes.x;
+        const ys = c.keyframes.y;
+        if ((xs === undefined) !== (ys === undefined)) {
+          errors.push(`clip ${c.id}: x/y keyframes not paired`);
+        } else if (xs && ys) {
+          if (xs.length !== ys.length) errors.push(`clip ${c.id}: x/y kf length mismatch`);
+          else
+            for (let k = 0; k < xs.length; k++) {
+              if (Math.abs(xs[k]!.t - ys[k]!.t) > 1e-9)
+                errors.push(`clip ${c.id}: x/y kf time mismatch at ${k}`);
+            }
+        }
+      }
       prevEnd = clipEnd(c);
       prevStart = c.timelineStart;
     }

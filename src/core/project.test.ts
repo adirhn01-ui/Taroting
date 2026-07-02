@@ -2,24 +2,39 @@ import { describe, expect, it } from "vitest";
 import { History } from "./history";
 import {
   addAudioTrack,
+  addGeneratedMedia,
+  addMarkerAt,
   addMedia,
+  addVideoTrack,
   checkInvariants,
+  clearAnimation,
   createProject,
   detachAudio,
   findClip,
   insertClip,
+  moveMarkerTo,
   removeClipAudio,
+  removeKeyframesNear,
+  removeMarker,
+  removeMediaCascade,
+  removeTrack,
   makeClip,
   moveClip,
   removeClip,
   resolvePosition,
   rippleDelete,
   setClipSpeed,
+  setKeyframe,
+  setPositionKeyframes,
+  setProjectCanvas,
   splitClip,
+  topVideoTrack,
   trimClip,
+  videoTracks,
 } from "./project";
+import { EPS_KF } from "./anim";
 import { clipDuration, clipEnd, rat } from "./time";
-import type { MediaInfo, ProjectFile } from "./types";
+import type { Generator, MediaInfo, ProjectFile } from "./types";
 
 const videoInfo = (duration = 60): MediaInfo => ({
   path: "C:\\media\\test video.mp4",
@@ -269,6 +284,187 @@ describe("speed", () => {
   });
 });
 
+describe("markers", () => {
+  it("inserts keeping sorted order", () => {
+    let { p } = baseProject();
+    p = addMarkerAt(p, 30).project;
+    p = addMarkerAt(p, 10, 2).project;
+    p = addMarkerAt(p, 20).project;
+    expect(p.timeline.markers!.map((m) => m.t)).toEqual([10, 20, 30]);
+    expect(p.timeline.markers!.find((m) => m.t === 10)!.color).toBe(2);
+    expectClean(p);
+  });
+
+  it("moveMarkerTo re-sorts", () => {
+    let { p } = baseProject();
+    const a = addMarkerAt(p, 5);
+    p = a.project;
+    p = addMarkerAt(p, 15).project;
+    p = moveMarkerTo(p, a.markerId, 25);
+    expect(p.timeline.markers!.map((m) => m.t)).toEqual([15, 25]);
+    expectClean(p);
+  });
+
+  it("removeMarker drops it", () => {
+    let { p } = baseProject();
+    const a = addMarkerAt(p, 5);
+    p = a.project;
+    p = removeMarker(p, a.markerId);
+    expect(p.timeline.markers).toHaveLength(0);
+    expectClean(p);
+  });
+});
+
+describe("video tracks", () => {
+  it("addVideoTrack unshifts a topmost layer", () => {
+    let { p } = baseProject();
+    const original = topVideoTrack(p).id;
+    const r = addVideoTrack(p);
+    p = r.project;
+    expect(topVideoTrack(p).id).toBe(r.trackId);
+    expect(p.timeline.tracks[1]!.id).toBe(original);
+    expect(videoTracks(p)).toHaveLength(2);
+    expect(topVideoTrack(p).name).toBe("Video 2");
+    expectClean(p);
+  });
+
+  it("removeTrack: last video not removable", () => {
+    const { p } = baseProject();
+    const only = topVideoTrack(p).id;
+    expect(removeTrack(p, only)).toBe(p);
+    expectClean(removeTrack(p, only));
+  });
+
+  it("removeTrack: non-empty video not removable, empty extra video removable", () => {
+    let { p, mediaId } = baseProject();
+    const media = p.media.find((m) => m.id === mediaId)!;
+    const r = addVideoTrack(p);
+    p = r.project;
+    // put a clip on the new top track → not removable
+    p = insertClip(p, r.trackId, makeClip(media, 0));
+    expect(removeTrack(p, r.trackId)).toBe(p);
+    // clear it → removable now (2 video tracks exist)
+    p = removeClip(p, findClip(p, topVideoTrack(p).clips[0]!.id)!.clip.id);
+    const removed = removeTrack(p, r.trackId);
+    expect(videoTracks(removed)).toHaveLength(1);
+    expectClean(removed);
+  });
+
+  it("moveClip crosses video tracks", () => {
+    let { p, clipId } = baseProject();
+    const r = addVideoTrack(p);
+    p = r.project;
+    p = moveClip(p, clipId, 0, r.trackId);
+    expect(findClip(p, clipId)!.track.id).toBe(r.trackId);
+    expectClean(p);
+  });
+});
+
+describe("project canvas", () => {
+  it("clamps to even integers within bounds", () => {
+    const { p } = baseProject();
+    let q = setProjectCanvas(p, 1921, 1081);
+    expect(q.timeline.width % 2).toBe(0);
+    expect(q.timeline.height % 2).toBe(0);
+    q = setProjectCanvas(p, 4, 99999);
+    expect(q.timeline.width).toBe(16);
+    expect(q.timeline.height).toBe(8192);
+    expectClean(q);
+  });
+
+  it("no-op when unchanged (same reference)", () => {
+    const { p } = baseProject();
+    const same = setProjectCanvas(p, p.timeline.width, p.timeline.height);
+    expect(same).toBe(p);
+  });
+});
+
+describe("keyframes", () => {
+  it("setKeyframe upserts and dedupes within eps", () => {
+    let { p, clipId } = baseProject();
+    p = setKeyframe(p, clipId, "opacity", 1, 0.5);
+    p = setKeyframe(p, clipId, "opacity", 1 + EPS_KF / 2, 0.8);
+    const kfs = findClip(p, clipId)!.clip.keyframes!.opacity!;
+    expect(kfs).toHaveLength(1);
+    expect(kfs[0]!.v).toBe(0.8);
+    expectClean(p);
+  });
+
+  it("setPositionKeyframes keeps x/y paired", () => {
+    let { p, clipId } = baseProject();
+    p = setPositionKeyframes(p, clipId, 0, 10, 20);
+    p = setPositionKeyframes(p, clipId, 5, 30, 40);
+    const kf = findClip(p, clipId)!.clip.keyframes!;
+    expect(kf.x!.map((k) => k.t)).toEqual(kf.y!.map((k) => k.t));
+    expect(kf.x).toHaveLength(2);
+    expectClean(p);
+  });
+
+  it("removeKeyframesNear empties keys and the object", () => {
+    let { p, clipId } = baseProject();
+    p = setPositionKeyframes(p, clipId, 3, 10, 20);
+    // removing the sole position keyframe drops x, y, and the whole object
+    p = removeKeyframesNear(p, clipId, "position", 3);
+    expect(findClip(p, clipId)!.clip.keyframes).toBeUndefined();
+    expectClean(p);
+  });
+
+  it("clearAnimation bakes values into transform", () => {
+    let { p, clipId } = baseProject();
+    p = setKeyframe(p, clipId, "scale", 0, 1);
+    p = setKeyframe(p, clipId, "scale", 5, 2);
+    p = clearAnimation(p, clipId, "scale", { scale: 1.5 });
+    const c = findClip(p, clipId)!.clip;
+    expect(c.keyframes).toBeUndefined();
+    expect(c.transform!.scale).toBe(1.5);
+    expectClean(p);
+  });
+});
+
+describe("media", () => {
+  it("removeMediaCascade clears clips across multiple tracks", () => {
+    let { p, mediaId } = baseProject();
+    const media = p.media.find((m) => m.id === mediaId)!;
+    // second video track with another clip of the same media
+    const r = addVideoTrack(p);
+    p = r.project;
+    p = insertClip(p, r.trackId, makeClip(media, 0));
+    // audio clip of a different media stays
+    const at = addAudioTrack(p);
+    p = at.project;
+    const am = addMedia(p, audioInfo());
+    p = am.project;
+    p = insertClip(p, at.trackId, makeClip(am.media, 0));
+
+    p = removeMediaCascade(p, mediaId);
+    expect(p.media.find((m) => m.id === mediaId)).toBeUndefined();
+    const remaining = p.timeline.tracks.flatMap((t) => t.clips);
+    expect(remaining.every((c) => c.mediaId !== mediaId)).toBe(true);
+    expect(remaining).toHaveLength(1); // only the audio clip survives
+    expectClean(p);
+  });
+
+  it("addGeneratedMedia does not adopt project resolution", () => {
+    const p = createProject("Gen");
+    const gen: Generator = {
+      type: "text",
+      text: "Hi",
+      fontFamily: "Arial",
+      sizePx: 96,
+      color: "#ffffff",
+      bold: false,
+      italic: false,
+    };
+    const r = addGeneratedMedia(p, gen, 400, 200, "Text: Hi");
+    expect(r.media.kind).toBe("image");
+    expect(r.media.width).toBe(400);
+    expect(r.media.generator).toEqual(gen);
+    // project canvas unchanged (unlike addMedia's first-visual adoption)
+    expect(r.project.timeline.width).toBe(1920);
+    expectClean(r.project);
+  });
+});
+
 /* ------------------------------------------------------------------ */
 /* Fuzz: 1000 random ops keep invariants; undo-all restores initial    */
 /* ------------------------------------------------------------------ */
@@ -292,6 +488,8 @@ describe("fuzz", () => {
     p = am.project;
     const at = addAudioTrack(p);
     p = at.project;
+    // start with a second video track so cross-video-track moves are exercised
+    p = addVideoTrack(p).project;
     const initial = p;
 
     const history = new History<ProjectFile>();
@@ -302,7 +500,7 @@ describe("fuzz", () => {
       const before = p;
       const clips = allClips(p);
       const pick = clips.length ? clips[Math.floor(rnd() * clips.length)] : undefined;
-      const op = Math.floor(rnd() * 7);
+      const op = Math.floor(rnd() * 12);
       let next = p;
       switch (op) {
         case 0: {
@@ -319,7 +517,12 @@ describe("fuzz", () => {
           break;
         }
         case 1:
-          if (pick) next = moveClip(p, pick.clip.id, rnd() * 300);
+          if (pick) {
+            // sometimes move to another track of the same kind (incl. video↔video)
+            const sameKind = p.timeline.tracks.filter((t) => t.kind === pick.track.kind);
+            const dest = sameKind[Math.floor(rnd() * sameKind.length)]!;
+            next = moveClip(p, pick.clip.id, rnd() * 300, dest.id);
+          }
           break;
         case 2:
           if (pick)
@@ -345,6 +548,36 @@ describe("fuzz", () => {
           break;
         case 6:
           if (pick) next = setClipSpeed(p, pick.clip.id, 0.25 + rnd() * 3.75);
+          break;
+        case 7:
+          // add a video track, but cap growth so the timeline stays bounded
+          if (videoTracks(p).length < 4) next = addVideoTrack(p).project;
+          break;
+        case 8:
+          next = addMarkerAt(p, rnd() * 300, Math.floor(rnd() * 6)).project;
+          break;
+        case 9: {
+          const ms = p.timeline.markers ?? [];
+          if (ms.length) next = removeMarker(p, ms[Math.floor(rnd() * ms.length)]!.id);
+          break;
+        }
+        case 10:
+          if (pick && pick.clip.transform) {
+            // key a source time within the clip's source range
+            const s = pick.clip.srcIn + rnd() * (pick.clip.srcOut - pick.clip.srcIn);
+            const which = Math.floor(rnd() * 3);
+            if (which === 0) next = setPositionKeyframes(p, pick.clip.id, s, rnd() * 100 - 50, rnd() * 100 - 50);
+            else if (which === 1) next = setKeyframe(p, pick.clip.id, "scale", s, 0.1 + rnd() * 3.9);
+            else next = setKeyframe(p, pick.clip.id, "opacity", s, rnd());
+          }
+          break;
+        case 11:
+          if (pick && pick.clip.keyframes) {
+            const groups = ["position", "scale", "opacity"] as const;
+            const g = groups[Math.floor(rnd() * groups.length)]!;
+            const s = pick.clip.srcIn + rnd() * (pick.clip.srcOut - pick.clip.srcIn);
+            next = removeKeyframesNear(p, pick.clip.id, g, s);
+          }
           break;
       }
       if (next !== p) {

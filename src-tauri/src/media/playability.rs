@@ -283,6 +283,7 @@ mod tests {
             has_audio: false,
             audio_rate: None,
             audio_channels: None,
+            generator: None,
         }
     }
 

@@ -47,6 +47,26 @@ pub struct MediaRef {
     pub audio_rate: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_channels: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generator: Option<Generator>,
+}
+
+/// A synthetic media source (solid color or styled text). Mirrors the TS
+/// `Generator` union: a `type`-tagged, camelCase enum.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all_fields = "camelCase")]
+pub enum Generator {
+    #[serde(rename = "solid")]
+    Solid { color: String },
+    #[serde(rename = "text")]
+    Text {
+        text: String,
+        font_family: String,
+        size_px: f64,
+        color: String,
+        bold: bool,
+        italic: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +104,27 @@ pub struct ClipAudio {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Keyframe {
+    pub t: f64,
+    pub v: f64,
+}
+
+/// Per-prop animation tracks. Each is optional; empty ones are skipped on the
+/// wire. `x`/`y` are kept paired by the frontend mutations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipKeyframes {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x: Option<Vec<Keyframe>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y: Option<Vec<Keyframe>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<Vec<Keyframe>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<Vec<Keyframe>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Clip {
     pub id: String,
@@ -95,6 +136,8 @@ pub struct Clip {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transform: Option<ClipTransform>,
     pub audio: ClipAudio,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyframes: Option<ClipKeyframes>,
 }
 
 impl Clip {
@@ -117,12 +160,21 @@ pub struct Track {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Marker {
+    pub id: String,
+    pub t: f64,
+    pub color: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Timeline {
     pub fps: Rational,
     pub width: u32,
     pub height: u32,
     pub tracks: Vec<Track>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<Marker>,
 }
 
 impl Timeline {
@@ -186,16 +238,40 @@ mod tests {
                 "fps": {"num": 30, "den": 1},
                 "hasAudio": true,
                 "someFutureField": {"nested": true}
+            }, {
+                "id": "m2",
+                "path": "Text: Hello",
+                "size": 0,
+                "mtimeMs": 0,
+                "kind": "image",
+                "duration": 0.0,
+                "hasAudio": false,
+                "width": 400, "height": 200,
+                "generator": {
+                    "type": "text",
+                    "text": "Hello",
+                    "fontFamily": "Georgia",
+                    "sizePx": 96.0,
+                    "color": "#ffffff",
+                    "bold": true,
+                    "italic": false
+                }
             }],
             "timeline": {
                 "fps": {"num": 30, "den": 1},
                 "width": 1920,
                 "height": 1080,
+                "markers": [{"id": "mk1", "t": 12.5, "color": 3}],
                 "tracks": [{
                     "id": "t1", "kind": "video", "name": "Video", "muted": false,
                     "clips": [{
                         "id": "c1", "mediaId": "m1",
                         "timelineStart": 0.0, "srcIn": 0.0, "srcOut": 60.0, "speed": 1.0,
+                        "keyframes": {
+                            "x": [{"t": 0.0, "v": 0.0}, {"t": 30.0, "v": 100.0}],
+                            "y": [{"t": 0.0, "v": 0.0}, {"t": 30.0, "v": -50.0}],
+                            "opacity": [{"t": 0.0, "v": 0.0}, {"t": 2.0, "v": 1.0}]
+                        },
                         "audio": {"volume": 1.0, "muted": false, "fadeInSec": 0.0,
                                    "fadeOutSec": 0.0, "gainOffsetDb": 0.0, "detached": false}
                     }]
@@ -212,6 +288,25 @@ mod tests {
         let out = serde_json::to_value(&parsed).unwrap();
         assert_eq!(out["media"][0]["mtimeMs"], 5);
         assert_eq!(out["timeline"]["tracks"][0]["clips"][0]["srcOut"], 60.0);
+
+        // markers survive
+        assert_eq!(out["timeline"]["markers"][0]["t"], 12.5);
+        assert_eq!(out["timeline"]["markers"][0]["color"], 3);
+
+        // clip keyframes survive with exact values
+        let kf = &out["timeline"]["tracks"][0]["clips"][0]["keyframes"];
+        assert_eq!(kf["x"][1]["t"], 30.0);
+        assert_eq!(kf["x"][1]["v"], 100.0);
+        assert_eq!(kf["y"][1]["v"], -50.0);
+        assert_eq!(kf["opacity"][1]["v"], 1.0);
+
+        // text generator survives with camelCase field names on the wire
+        let gen = &out["media"][1]["generator"];
+        assert_eq!(gen["type"], "text");
+        assert_eq!(gen["text"], "Hello");
+        assert_eq!(gen["fontFamily"], "Georgia");
+        assert_eq!(gen["sizePx"], 96.0);
+        assert_eq!(gen["bold"], true);
     }
 
     #[test]

@@ -211,6 +211,7 @@ mod e2e {
             has_audio: true,
             audio_rate: Some(48000),
             audio_channels: Some(2),
+            generator: None,
         };
         (src, media)
     }
@@ -245,10 +246,12 @@ mod e2e {
         let a = Clip {
             id: "a".into(), media_id: "m1".into(), timeline_start: 0.0,
             src_in: 0.5, src_out: 1.5, speed: 1.0, transform: None, audio: default_audio(),
+            keyframes: None,
         };
         let b = Clip {
             id: "b".into(), media_id: "m1".into(), timeline_start: 1.5,
             src_in: 2.0, src_out: 3.0, speed: 1.0, transform: None, audio: default_audio(),
+            keyframes: None,
         };
         let track = Track {
             id: "vt".into(), kind: "video".into(), name: "Video".into(),
@@ -256,6 +259,7 @@ mod e2e {
         };
         let tl = Timeline {
             fps: Rational { num: 30, den: 1 }, width: 640, height: 360, tracks: vec![track],
+            markers: vec![],
         };
         let preset = ExportPreset {
             format: "mp4".into(), vcodec: "h264".into(),
@@ -295,6 +299,7 @@ mod e2e {
         let c = Clip {
             id: "c".into(), media_id: "m1".into(), timeline_start: 0.0,
             src_in: 0.0, src_out: 1.0, speed: 1.0, transform: None, audio: default_audio(),
+            keyframes: None,
         };
         let track = Track {
             id: "vt".into(), kind: "video".into(), name: "Video".into(),
@@ -302,6 +307,7 @@ mod e2e {
         };
         let tl = Timeline {
             fps: Rational { num: 30, den: 1 }, width: 640, height: 360, tracks: vec![track],
+            markers: vec![],
         };
         let preset = ExportPreset {
             format: "gif".into(), vcodec: "h264".into(),
@@ -331,6 +337,7 @@ mod e2e {
         let c = Clip {
             id: "c".into(), media_id: "m1".into(), timeline_start: 0.0,
             src_in: 0.0, src_out: 10.0, speed: 1.0, transform: None, audio: default_audio(),
+            keyframes: None,
         };
         let track = Track {
             id: "vt".into(), kind: "video".into(), name: "Video".into(),
@@ -338,6 +345,7 @@ mod e2e {
         };
         let tl = Timeline {
             fps: Rational { num: 30, den: 1 }, width: 640, height: 360, tracks: vec![track],
+            markers: vec![],
         };
         let preset = ExportPreset {
             format: "mp4".into(), vcodec: "h264".into(),

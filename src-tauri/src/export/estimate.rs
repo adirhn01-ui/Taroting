@@ -94,6 +94,7 @@ mod tests {
             has_audio: true,
             audio_rate: Some(48000),
             audio_channels: Some(2),
+            generator: None,
         }
     }
 
@@ -114,6 +115,7 @@ mod tests {
                 gain_offset_db: 0.0,
                 detached: false,
             },
+            keyframes: None,
         };
         let track = Track {
             id: "vt".into(),
@@ -129,6 +131,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 tracks: vec![track],
+                markers: vec![],
             },
             preset,
             out_path: r"C:\o.mp4".into(),

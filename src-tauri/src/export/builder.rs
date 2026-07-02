@@ -668,6 +668,7 @@ mod tests {
             has_audio,
             audio_rate: Some(48000),
             audio_channels: Some(2),
+            generator: None,
         }
     }
 
@@ -692,11 +693,12 @@ mod tests {
             speed: 1.0,
             transform: None,
             audio: default_audio(),
+            keyframes: None,
         }
     }
 
     fn timeline(w: u32, h: u32, fps: Rational, tracks: Vec<Track>) -> Timeline {
-        Timeline { fps, width: w, height: h, tracks }
+        Timeline { fps, width: w, height: h, tracks, markers: vec![] }
     }
 
     fn vtrack(clips: Vec<Clip>) -> Track {

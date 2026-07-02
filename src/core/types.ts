@@ -8,6 +8,29 @@ export interface Rational {
 
 export type MediaKind = "video" | "audio" | "image" | "imageSeq" | "gif";
 
+/** The 6 fonts available to text generators (all ship with Windows). */
+export type FontFamily =
+  | "Segoe UI"
+  | "Arial"
+  | "Georgia"
+  | "Times New Roman"
+  | "Courier New"
+  | "Impact";
+
+/** A synthetic media source (no file on disk): a solid color fill or styled text.
+ *  Media carrying a generator has kind:"image"; its `path` is a display label. */
+export type Generator =
+  | { type: "solid"; color: string }
+  | {
+      type: "text";
+      text: string;
+      fontFamily: FontFamily;
+      sizePx: number;
+      color: string;
+      bold: boolean;
+      italic: boolean;
+    };
+
 /** A reference to an original media file on disk. Originals are never modified. */
 export interface MediaRef {
   id: string;
@@ -28,6 +51,8 @@ export interface MediaRef {
   hasAudio: boolean;
   audioRate?: number;
   audioChannels?: number;
+  /** present → synthetic media (solid/text); no file is probed */
+  generator?: Generator;
 }
 
 /** What `probe_media` returns — a MediaRef without an assigned id. */
@@ -66,6 +91,25 @@ export interface ClipAudio {
   detached: boolean;
 }
 
+/** A prop that can be animated over the life of a clip. */
+export type AnimProp = "x" | "y" | "scale" | "opacity";
+
+/** One animation control point.
+ *  `t` is in SOURCE seconds — the same domain as srcIn/srcOut. Keyframes glue
+ *  to media content (not timeline position), so move / trim / split / speed
+ *  changes need no remapping: the value at any source time is unchanged, and a
+ *  split simply lets both halves share the array (out-of-range "ghost"
+ *  keyframes remain legal interpolation anchors). */
+export interface Keyframe {
+  t: number;
+  v: number;
+}
+
+/** Per-prop keyframe tracks for a clip. Each array is sorted strictly ascending
+ *  by `t`. The `x` and `y` arrays are kept PAIRED (same length, same times) by
+ *  the mutations so position animates as a single 2D track. */
+export type ClipKeyframes = Partial<Record<AnimProp, Keyframe[]>>;
+
 export interface Clip {
   id: string;
   mediaId: string;
@@ -79,6 +123,8 @@ export interface Clip {
   /** video clips only */
   transform?: ClipTransform;
   audio: ClipAudio;
+  /** present → this clip animates one or more transform props */
+  keyframes?: ClipKeyframes;
 }
 
 export interface Track {
@@ -90,14 +136,24 @@ export interface Track {
   clips: Clip[];
 }
 
+/** A ruler flag at timeline time `t`. `color` is a palette index 0..5. */
+export interface Marker {
+  id: string;
+  t: number;
+  color: number;
+}
+
 export interface Timeline {
   /** project timebase (adopted from first video) */
   fps: Rational;
   /** project canvas (adopted from first video) */
   width: number;
   height: number;
-  /** invariant: tracks[0] is ALWAYS the single video track */
+  /** invariant: >=1 video track; all video tracks form a contiguous prefix;
+   *  array order = z-order with tracks[0] the TOPMOST layer. */
   tracks: Track[];
+  /** ruler markers, sorted ascending by t */
+  markers?: Marker[];
 }
 
 export type ResolutionPreset =
@@ -154,6 +210,7 @@ export type ActionId =
   | "paste"
   | "toggleSnap"
   | "toggleLoop"
+  | "addMarker"
   | "export"
   | "goHome";
 
@@ -201,6 +258,7 @@ export const DEFAULT_SHORTCUTS: Record<ActionId, string> = {
   paste: "Ctrl+V",
   toggleSnap: "N",
   toggleLoop: "L",
+  addMarker: "M",
   export: "Ctrl+E",
   goHome: "Ctrl+W",
 };

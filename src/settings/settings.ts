@@ -35,6 +35,7 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   paste: "Paste",
   toggleSnap: "Toggle snapping",
   toggleLoop: "Toggle loop",
+  addMarker: "Add marker",
   export: "Export…",
   goHome: "Close project",
 };
@@ -59,6 +60,7 @@ const ACTION_ORDER: ActionId[] = [
   "paste",
   "toggleSnap",
   "toggleLoop",
+  "addMarker",
   "export",
   "goHome",
 ];
