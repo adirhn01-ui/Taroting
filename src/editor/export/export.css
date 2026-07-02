@@ -1,0 +1,232 @@
+/* Export dialog — a single centered modal (reuses .modal / .field / .btn). */
+
+.export-modal {
+  width: 560px;
+  max-width: min(560px, calc(100vw - 48px));
+}
+
+/* stacked sections in the form body */
+.export-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+}
+
+/* a labelled row: label on the left, control(s) on the right */
+.export-row {
+  display: grid;
+  grid-template-columns: 116px 1fr;
+  align-items: center;
+  gap: var(--sp-4);
+}
+.export-row > label {
+  font-size: var(--fs-12);
+  font-weight: 500;
+  color: var(--text-2);
+  user-select: none;
+}
+.export-row__control {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+.export-row__control .select,
+.export-row__control .input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.export-row--hidden {
+  display: none;
+}
+
+/* segmented row of buttons (format picker) */
+.export-seg {
+  display: inline-flex;
+  gap: var(--sp-1);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  padding: 3px;
+}
+.export-seg .btn {
+  height: 26px;
+  padding: 0 var(--sp-3);
+  border-color: transparent;
+  background: transparent;
+  font-size: var(--fs-12);
+}
+.export-seg .btn:hover {
+  background: var(--bg-hover);
+  border-color: transparent;
+}
+.export-seg .btn--on {
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+}
+
+/* small number inputs for custom W×H / fps / bitrate */
+.export-num {
+  width: 82px;
+  flex: none !important;
+}
+.export-dim-x {
+  color: var(--text-3);
+  font-size: var(--fs-13);
+}
+
+/* extension suffix shown after the filename */
+.export-ext {
+  color: var(--text-3);
+  font-size: var(--fs-13);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+/* full output path — mono, muted, wrapping */
+.export-outpath {
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+  color: var(--text-3);
+  word-break: break-all;
+  line-height: 1.5;
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+}
+
+.export-estimate {
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}
+.export-estimate strong {
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+/* inline "file exists" warning strip */
+.export-warn {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius-s);
+  background: var(--danger-dim);
+  border: 1px solid var(--danger);
+  font-size: var(--fs-13);
+  color: var(--text-1);
+}
+.export-warn__msg {
+  flex: 1 1 auto;
+}
+.export-warn__actions {
+  display: flex;
+  gap: var(--sp-2);
+  flex: none;
+}
+
+/* ---------------- progress view ---------------- */
+
+.export-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  align-items: center;
+  text-align: center;
+  padding: var(--sp-4) 0;
+}
+.export-progress__pct {
+  font-size: var(--fs-32);
+  font-weight: 600;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+.export-bar {
+  width: 100%;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--bg-active);
+  overflow: hidden;
+}
+.export-bar__fill {
+  height: 100%;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  transition: width var(--dur) var(--ease);
+}
+.export-progress__meta {
+  display: flex;
+  gap: var(--sp-4);
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  min-height: 16px;
+}
+
+/* ---------------- result views ---------------- */
+
+.export-result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  align-items: center;
+  text-align: center;
+  padding: var(--sp-4) 0;
+}
+.export-result__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+}
+.export-result__icon--ok {
+  background: rgba(69, 201, 140, 0.14);
+  color: var(--ok);
+}
+.export-result__icon--bad {
+  background: var(--danger-dim);
+  color: var(--danger);
+}
+.export-result__title {
+  font-size: var(--fs-16);
+  font-weight: 600;
+  color: var(--text-1);
+}
+.export-result__path {
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+  color: var(--text-3);
+  word-break: break-all;
+  max-width: 100%;
+}
+.export-result__msg {
+  font-size: var(--fs-13);
+  color: var(--text-2);
+  max-width: 100%;
+}
+.export-log {
+  width: 100%;
+  text-align: left;
+}
+.export-log > summary {
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+}
+.export-log > pre {
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-3);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  color: var(--text-3);
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

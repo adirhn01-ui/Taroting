@@ -1,0 +1,230 @@
+.settings {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  user-select: none;
+}
+
+.settings__header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-6);
+}
+
+.settings__title {
+  font-size: var(--fs-16);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.settings__main {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 var(--sp-6) var(--sp-12);
+}
+
+.settings__inner {
+  max-width: 640px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+/* ---------- Card / section ---------- */
+.settings__card {
+  padding: var(--sp-4) var(--sp-5) var(--sp-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.settings__section-head {
+  font-size: var(--fs-12);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+  padding-bottom: var(--sp-1);
+}
+.settings__section-head--row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* ---------- Row ---------- */
+.settings__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  min-height: 32px;
+}
+.settings__row--stack {
+  align-items: flex-start;
+}
+
+.settings__row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.settings__row-label {
+  font-size: var(--fs-13);
+  font-weight: 500;
+  color: var(--text-1);
+}
+
+.settings__hint {
+  font-size: var(--fs-12);
+  color: var(--text-3);
+  line-height: 1.4;
+}
+
+.settings__row-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: none;
+}
+
+/* ---------- Segmented control ---------- */
+.settings__segmented {
+  display: inline-flex;
+  gap: var(--sp-1);
+  padding: 3px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  flex: none;
+}
+.settings__segmented .btn {
+  border-color: transparent;
+  background: transparent;
+}
+.settings__segmented .btn:hover {
+  background: var(--bg-hover);
+}
+.settings__segmented .btn--on:hover {
+  background: var(--accent-dim);
+}
+
+/* ---------- Export path ---------- */
+.settings__path {
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.settings__path--empty {
+  color: var(--text-3);
+  font-style: italic;
+}
+
+/* ---------- Cache ---------- */
+.settings__cache-total {
+  font-size: var(--fs-14);
+  font-weight: 600;
+  color: var(--text-1);
+}
+.settings__cache-breakdown {
+  font-family: var(--font-mono);
+}
+
+/* ---------- Shortcuts ---------- */
+.settings__conflict-warn {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-12);
+  color: var(--danger);
+  padding: var(--sp-1) 0 var(--sp-2);
+}
+.settings__conflict-warn svg {
+  flex: none;
+}
+
+.settings__shortcuts {
+  display: flex;
+  flex-direction: column;
+}
+
+.settings__shortcut {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  min-height: 36px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease);
+}
+.settings__shortcut:hover {
+  background: var(--bg-hover);
+}
+.settings__shortcut:focus-visible {
+  outline: none;
+  background: var(--bg-hover);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.settings__shortcut-label {
+  font-size: var(--fs-13);
+  color: var(--text-1);
+}
+
+.settings__shortcut-chord {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+}
+
+.settings__kbd {
+  display: inline-flex;
+  align-items: center;
+  min-width: 20px;
+  height: 22px;
+  padding: 0 6px;
+  justify-content: center;
+  background: var(--bg-active);
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  color: var(--text-1);
+}
+.settings__kbd-sep {
+  color: var(--text-3);
+  font-size: var(--fs-11);
+}
+
+.settings__capturing {
+  font-size: var(--fs-12);
+  color: var(--accent-strong);
+}
+
+.settings__shortcut--capturing {
+  background: var(--accent-dim);
+}
+.settings__shortcut--capturing:hover {
+  background: var(--accent-dim);
+}
+
+.settings__shortcut--conflict .settings__shortcut-label {
+  color: var(--danger);
+}
+.settings__shortcut--conflict .settings__kbd {
+  border-color: var(--danger);
+  color: var(--danger);
+}

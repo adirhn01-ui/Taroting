@@ -21,6 +21,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     <div class="home">
       <header class="home__header">
         <div class="home__brand"><span class="home__brand-mark">T</span>Taroting</div>
+        <button class="btn btn--ghost btn--icon" id="home-settings" title="Settings">${icon("gear")}</button>
       </header>
       <main class="home__main">
         <div class="home__inner">
@@ -165,6 +166,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
 
   root.querySelector("#btn-new")!.addEventListener("click", () => void createNew([]));
   root.querySelector("#btn-open")!.addEventListener("click", () => void openViaDialog());
+  root.querySelector("#home-settings")!.addEventListener("click", () => navigate({ view: "settings" }));
   search.addEventListener("input", renderGrid);
 
   grid.addEventListener("click", (e) => {

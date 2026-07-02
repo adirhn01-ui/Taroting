@@ -23,6 +23,7 @@ import { MEDIA_FILE_EXTENSIONS } from "../core/types";
 import type { Clip, MediaInfo, MediaRef } from "../core/types";
 import { icon } from "../ui/icons";
 import { toast } from "../ui/toast";
+import { openExportDialog } from "./export/export-dialog";
 import { mountInspector } from "./inspector/inspector";
 import { MediaManager } from "./media/media";
 import { AudioGraph } from "./playback/audio-graph";
@@ -65,7 +66,8 @@ export async function mountEditor(
         <div class="editor__savestate" id="ed-save">Saved</div>
         <div class="grow"></div>
         <button class="btn" id="ed-import">${icon("plus")}Import media</button>
-        <button class="btn btn--primary" id="ed-export" disabled title="Export arrives in a later milestone">${icon("export")}Export</button>
+        <button class="btn btn--ghost btn--icon" id="ed-settings" title="Settings">${icon("gear")}</button>
+        <button class="btn btn--primary" id="ed-export" title="Export (Ctrl+E)">${icon("export")}Export</button>
       </div>
       <div class="editor__body">
         <aside class="media-panel">
@@ -363,6 +365,8 @@ export async function mountEditor(
   }
 
   $("#ed-home").addEventListener("click", () => navigate({ view: "home" }));
+  $("#ed-settings").addEventListener("click", () => navigate({ view: "settings" }));
+  $("#ed-export").addEventListener("click", () => openExportDialog({ session }));
   $("#ed-import").addEventListener("click", () => {
     void pickMediaFiles().then((files) => {
       if (files.length) void importPaths(files);
@@ -402,7 +406,7 @@ export async function mountEditor(
   shortcuts.on("paste", () => actions.paste());
   shortcuts.on("toggleSnap", () => snapBtn.click());
   shortcuts.on("toggleLoop", () => loopBtn.click());
-  shortcuts.on("export", () => toast.info("Export arrives in a later milestone."));
+  shortcuts.on("export", () => openExportDialog({ session }));
   shortcuts.on("goHome", () => navigate({ view: "home" }));
   shortcuts.attach();
 

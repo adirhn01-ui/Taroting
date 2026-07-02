@@ -25,6 +25,11 @@ async function go(route: Route): Promise<void> {
   if (route.view === "home") {
     const view = mountHome(app);
     dispose = () => view.dispose();
+  } else if (route.view === "settings") {
+    const { mountSettings } = await import("./settings/settings");
+    if (token !== navToken) return;
+    const view = mountSettings(app);
+    dispose = () => view.dispose();
   } else {
     const { mountEditor } = await import("./editor/editor");
     if (token !== navToken) return;

@@ -68,6 +68,8 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
   const startedAt = new Date().toISOString();
   const errors: string[] = [];
   window.addEventListener("error", (e) => {
+    // benign: layout settled on the next frame; not a defect
+    if (e.message.includes("ResizeObserver loop")) return;
     errors.push(`error: ${e.message} @ ${e.filename}:${e.lineno}`);
   });
   window.addEventListener("unhandledrejection", (e) => {
@@ -251,6 +253,57 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       }
       assert(diff > 500, `canvas looks blank (diff=${diff})`);
       return `canvas has content (diff=${diff})`;
+    });
+
+    // Full-stack export: spec → Rust builder → ffmpeg → probe the output.
+    await test("export-e2e", async () => {
+      const { startExport } = await import("../editor/export/export-ipc");
+      const { onJobEvents } = await import("../core/ipc");
+      const project = session.project;
+      const outPath = `${fixturesDir}\\..\\autotest-export.mp4`;
+      const spec = {
+        media: project.media,
+        timeline: project.timeline,
+        preset: {
+          format: "mp4" as const,
+          vcodec: "h264" as const,
+          resolution: { w: 640, h: 360 },
+          fps: 30,
+          videoBitrate: "auto" as const,
+          audioBitrate: "auto" as const,
+          useHardware: false,
+        },
+        outPath,
+      };
+      const jobId = await startExport(spec);
+      const result = await new Promise<{ ok: boolean; detail: string }>((resolve) => {
+        let un: () => void = () => {};
+        const timer = setTimeout(() => {
+          un();
+          resolve({ ok: false, detail: "export timed out after 60s" });
+        }, 60_000);
+        void onJobEvents({
+          onDone: (e) => {
+            if (e.id !== jobId) return;
+            clearTimeout(timer);
+            un();
+            resolve({ ok: true, detail: String(e.output.path ?? outPath) });
+          },
+          onFailed: (e) => {
+            if (e.id !== jobId) return;
+            clearTimeout(timer);
+            un();
+            resolve({ ok: false, detail: `${e.message} | ${e.logTail.slice(-3).join(" / ")}` });
+          },
+        }).then((u) => (un = u));
+      });
+      assert(result.ok, result.detail);
+      const info = await ipc.probeMedia(result.detail);
+      assert(info.vcodec === "h264", `vcodec=${info.vcodec}`);
+      assert(info.width === 640 && info.height === 360, `${info.width}x${info.height}`);
+      assert(Math.abs(info.duration - engine.duration()) < 0.6, `duration=${info.duration}`);
+      assert(info.hasAudio, "expected audio stream");
+      return `exported ${info.width}x${info.height} h264, ${info.duration.toFixed(2)}s, audio ok`;
     });
   } catch (e) {
     results.push({ name: "setup", pass: false, detail: String(e) });

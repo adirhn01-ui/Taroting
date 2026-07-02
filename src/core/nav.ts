@@ -1,7 +1,10 @@
 // Tiny navigation indirection so screens can request route changes without
 // importing the boot module (avoids circular imports).
 
-export type Route = { view: "home" } | { view: "editor"; projectPath: string };
+export type Route =
+  | { view: "home" }
+  | { view: "editor"; projectPath: string }
+  | { view: "settings" };
 
 type Navigate = (route: Route) => void;
 

@@ -3,6 +3,8 @@
 mod cache;
 mod debug;
 mod error;
+mod export;
+mod hw;
 mod jobs;
 mod media;
 mod paths;
@@ -40,6 +42,9 @@ fn main() {
             project::store::new_project_path,
             settings::get_settings,
             settings::save_settings,
+            hw::detect_encoders,
+            export::estimate::estimate_export,
+            export::start_export,
             debug::debug_info,
             debug::debug_write_report,
         ])
