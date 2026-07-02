@@ -10,6 +10,9 @@ src-tauri/binaries/
 # generated test media
 tests/fixtures/
 
+# local release bundles (hundreds of MB with ffmpeg — never committed)
+release/
+
 # misc
 *.log
 .DS_Store
