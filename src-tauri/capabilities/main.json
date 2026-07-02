@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Capabilities of the main Taroting window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-progress-bar",
+    "core:window:allow-set-title",
+    "dialog:default",
+    "opener:default"
+  ]
+}

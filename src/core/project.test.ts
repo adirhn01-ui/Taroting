@@ -1,0 +1,363 @@
+import { describe, expect, it } from "vitest";
+import { History } from "./history";
+import {
+  addAudioTrack,
+  addMedia,
+  checkInvariants,
+  createProject,
+  findClip,
+  insertClip,
+  makeClip,
+  moveClip,
+  removeClip,
+  resolvePosition,
+  rippleDelete,
+  setClipSpeed,
+  splitClip,
+  trimClip,
+} from "./project";
+import { clipDuration, clipEnd, rat } from "./time";
+import type { MediaInfo, ProjectFile } from "./types";
+
+const videoInfo = (duration = 60): MediaInfo => ({
+  path: "C:\\media\\test video.mp4",
+  size: 1000,
+  mtimeMs: 1,
+  kind: "video",
+  duration,
+  fps: rat(30),
+  width: 1280,
+  height: 720,
+  hasAudio: true,
+});
+
+const audioInfo = (duration = 120): MediaInfo => ({
+  path: "C:\\media\\music.mp3",
+  size: 500,
+  mtimeMs: 2,
+  kind: "audio",
+  duration,
+  hasAudio: true,
+});
+
+/** Project with one 60s video media + one clip [0..60) on the video track. */
+function baseProject(): { p: ProjectFile; mediaId: string; clipId: string } {
+  let p = createProject("Test");
+  const added = addMedia(p, videoInfo());
+  p = added.project;
+  const clip = makeClip(added.media, 0);
+  p = insertClip(p, p.timeline.tracks[0]!.id, clip);
+  return { p, mediaId: added.media.id, clipId: clip.id };
+}
+
+const expectClean = (p: ProjectFile) => expect(checkInvariants(p)).toEqual([]);
+
+describe("createProject / addMedia", () => {
+  it("starts valid with a single video track", () => {
+    const p = createProject("New");
+    expectClean(p);
+    expect(p.timeline.tracks).toHaveLength(1);
+  });
+
+  it("adopts resolution + fps from the first visual media", () => {
+    let p = createProject("New");
+    p = addMedia(p, videoInfo()).project;
+    expect(p.timeline.width).toBe(1280);
+    expect(p.timeline.height).toBe(720);
+    expect(p.timeline.fps).toEqual(rat(30));
+    expectClean(p);
+  });
+});
+
+describe("placement", () => {
+  it("resolvePosition clamps into the nearest feasible gap", () => {
+    const { p, clipId } = baseProject();
+    const track = p.timeline.tracks[0]!;
+    const others = track.clips.filter((c) => c.id !== clipId);
+    // empty others: anywhere is fine
+    expect(resolvePosition(others, 10, 42)).toBe(42);
+    // with the 0..60 clip present, a 10s clip requested at 5 goes after it
+    expect(resolvePosition(track.clips, 10, 5)).toBe(60);
+  });
+
+  it("insertClip never overlaps", () => {
+    let { p, mediaId } = baseProject();
+    const media = p.media.find((m) => m.id === mediaId)!;
+    const c2 = makeClip(media, 30); // wants to land inside the existing clip
+    p = insertClip(p, p.timeline.tracks[0]!.id, c2);
+    expectClean(p);
+    expect(findClip(p, c2.id)!.clip.timelineStart).toBe(60);
+  });
+
+  it("moveClip moves within the track and clamps", () => {
+    let { p, mediaId } = baseProject();
+    const media = p.media.find((m) => m.id === mediaId)!;
+    const c2 = makeClip(media, 60);
+    p = insertClip(p, p.timeline.tracks[0]!.id, c2);
+    // move second clip to t=200 (free)
+    p = moveClip(p, c2.id, 200);
+    expect(findClip(p, c2.id)!.clip.timelineStart).toBe(200);
+    // move it onto the first clip → clamps against it
+    p = moveClip(p, c2.id, 10);
+    expectClean(p);
+    const start = findClip(p, c2.id)!.clip.timelineStart;
+    expect(start).toBeGreaterThanOrEqual(60);
+  });
+
+  it("moveClip across audio tracks, but never across kinds", () => {
+    let { p } = baseProject();
+    const a1 = addAudioTrack(p);
+    p = a1.project;
+    const am = addMedia(p, audioInfo());
+    p = am.project;
+    const ac = makeClip(am.media, 0);
+    p = insertClip(p, a1.trackId, ac);
+    const a2 = addAudioTrack(p);
+    p = a2.project;
+    // audio → audio track OK
+    p = moveClip(p, ac.id, 5, a2.trackId);
+    expect(findClip(p, ac.id)!.track.id).toBe(a2.trackId);
+    // audio → video track rejected (no-op)
+    const before = p;
+    p = moveClip(p, ac.id, 0, p.timeline.tracks[0]!.id);
+    expect(p).toBe(before);
+    expectClean(p);
+  });
+});
+
+describe("trim", () => {
+  it("trims the in-edge, adjusting srcIn", () => {
+    let { p, clipId } = baseProject();
+    p = trimClip(p, clipId, "in", 10);
+    const c = findClip(p, clipId)!.clip;
+    expect(c.timelineStart).toBe(10);
+    expect(c.srcIn).toBe(10);
+    expectClean(p);
+  });
+
+  it("trims the out-edge, adjusting srcOut", () => {
+    let { p, clipId } = baseProject();
+    p = trimClip(p, clipId, "out", 42);
+    const c = findClip(p, clipId)!.clip;
+    expect(c.srcOut).toBe(42);
+    expectClean(p);
+  });
+
+  it("cannot extend beyond the source media", () => {
+    let { p, clipId } = baseProject();
+    p = trimClip(p, clipId, "out", 999); // media is 60s
+    const c = findClip(p, clipId)!.clip;
+    expect(clipEnd(c)).toBeCloseTo(60, 9);
+    expectClean(p);
+  });
+
+  it("cannot trim into its neighbour", () => {
+    let { p, mediaId, clipId } = baseProject();
+    const media = p.media.find((m) => m.id === mediaId)!;
+    const c2 = makeClip(media, 60);
+    p = insertClip(p, p.timeline.tracks[0]!.id, c2);
+    // first clip trimmed shorter, then try to extend past the second's start
+    p = trimClip(p, clipId, "out", 30);
+    p = trimClip(p, clipId, "out", 80);
+    const c = findClip(p, clipId)!.clip;
+    expect(clipEnd(c)).toBeLessThanOrEqual(60 + 1e-9);
+    expectClean(p);
+  });
+
+  it("respects speed when mapping trims to source time", () => {
+    let { p, clipId } = baseProject();
+    p = setClipSpeed(p, clipId, 2); // 60s source → 30s footprint
+    p = trimClip(p, clipId, "in", 5);
+    const c = findClip(p, clipId)!.clip;
+    expect(c.srcIn).toBeCloseTo(10, 9); // 5s timeline at 2x = 10s source
+    expectClean(p);
+  });
+});
+
+describe("split", () => {
+  it("produces two contiguous clips sharing the source split point", () => {
+    const { p, clipId } = baseProject();
+    const { project, rightId } = splitClip(p, clipId, 20);
+    expect(rightId).not.toBeNull();
+    const left = findClip(project, clipId)!.clip;
+    const right = findClip(project, rightId!)!.clip;
+    expect(left.srcOut).toBeCloseTo(right.srcIn, 12);
+    expect(clipEnd(left)).toBeCloseTo(right.timelineStart, 12);
+    expectClean(project);
+  });
+
+  it("zeroes the fades at the cut", () => {
+    let { p, clipId } = baseProject();
+    p = {
+      ...p,
+      timeline: {
+        ...p.timeline,
+        tracks: p.timeline.tracks.map((t) => ({
+          ...t,
+          clips: t.clips.map((c) =>
+            c.id === clipId ? { ...c, audio: { ...c.audio, fadeInSec: 1, fadeOutSec: 1 } } : c,
+          ),
+        })),
+      },
+    };
+    const { project, rightId } = splitClip(p, clipId, 20);
+    const left = findClip(project, clipId)!.clip;
+    const right = findClip(project, rightId!)!.clip;
+    expect(left.audio.fadeInSec).toBe(1);
+    expect(left.audio.fadeOutSec).toBe(0);
+    expect(right.audio.fadeInSec).toBe(0);
+    expect(right.audio.fadeOutSec).toBe(1);
+  });
+
+  it("refuses to split at the very edges", () => {
+    const { p, clipId } = baseProject();
+    expect(splitClip(p, clipId, 0).rightId).toBeNull();
+    expect(splitClip(p, clipId, 60).rightId).toBeNull();
+  });
+});
+
+describe("ripple delete", () => {
+  it("closes the gap across all tracks", () => {
+    let { p, mediaId, clipId } = baseProject();
+    const media = p.media.find((m) => m.id === mediaId)!;
+    const videoTrack = p.timeline.tracks[0]!.id;
+
+    // second video clip after the first
+    const c2 = makeClip(media, 60);
+    p = insertClip(p, videoTrack, c2);
+
+    // audio clip starting at 70
+    const at = addAudioTrack(p);
+    p = at.project;
+    const am = addMedia(p, audioInfo());
+    p = am.project;
+    const ac = makeClip(am.media, 70);
+    p = insertClip(p, at.trackId, ac);
+
+    // ripple-delete the first 60s clip → everything shifts left by 60
+    p = rippleDelete(p, clipId);
+    expectClean(p);
+    expect(findClip(p, c2.id)!.clip.timelineStart).toBe(0);
+    expect(findClip(p, ac.id)!.clip.timelineStart).toBe(10);
+  });
+
+  it("plain remove leaves the gap", () => {
+    let { p, mediaId, clipId } = baseProject();
+    const media = p.media.find((m) => m.id === mediaId)!;
+    const c2 = makeClip(media, 60);
+    p = insertClip(p, p.timeline.tracks[0]!.id, c2);
+    p = removeClip(p, clipId);
+    expect(findClip(p, c2.id)!.clip.timelineStart).toBe(60);
+    expectClean(p);
+  });
+});
+
+describe("speed", () => {
+  it("clamps into range and trims to fit before a neighbour", () => {
+    let { p, mediaId, clipId } = baseProject();
+    const media = p.media.find((m) => m.id === mediaId)!;
+    const c2 = makeClip(media, 60);
+    p = insertClip(p, p.timeline.tracks[0]!.id, c2);
+    // slowing to 0.5 would need 120s but only 60 available → srcOut trimmed
+    p = setClipSpeed(p, clipId, 0.5);
+    const c = findClip(p, clipId)!.clip;
+    expect(c.speed).toBe(0.5);
+    expect(clipDuration(c)).toBeLessThanOrEqual(60 + 1e-9);
+    expectClean(p);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Fuzz: 1000 random ops keep invariants; undo-all restores initial    */
+/* ------------------------------------------------------------------ */
+
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+describe("fuzz", () => {
+  it("1000 random ops preserve invariants and undo-all restores the initial state", () => {
+    const rnd = mulberry32(0x7a2071);
+    let { p } = baseProject();
+    const am = addMedia(p, audioInfo());
+    p = am.project;
+    const at = addAudioTrack(p);
+    p = at.project;
+    const initial = p;
+
+    const history = new History<ProjectFile>();
+    const allClips = (proj: ProjectFile) =>
+      proj.timeline.tracks.flatMap((t) => t.clips.map((c) => ({ track: t, clip: c })));
+
+    for (let i = 0; i < 1000; i++) {
+      const before = p;
+      const clips = allClips(p);
+      const pick = clips.length ? clips[Math.floor(rnd() * clips.length)] : undefined;
+      const op = Math.floor(rnd() * 7);
+      let next = p;
+      switch (op) {
+        case 0: {
+          // insert a clip from a random media on a fitting track
+          const media = p.media[Math.floor(rnd() * p.media.length)]!;
+          const c = makeClip(media, rnd() * 300);
+          // shorten so the timeline doesn't grow unbounded
+          c.srcOut = Math.min(c.srcOut, c.srcIn + 1 + rnd() * 10);
+          const targetTracks = p.timeline.tracks.filter((t) =>
+            media.kind === "audio" ? t.kind === "audio" : t.kind === "video",
+          );
+          const track = targetTracks[Math.floor(rnd() * targetTracks.length)]!;
+          next = insertClip(p, track.id, c);
+          break;
+        }
+        case 1:
+          if (pick) next = moveClip(p, pick.clip.id, rnd() * 300);
+          break;
+        case 2:
+          if (pick)
+            next = trimClip(
+              p,
+              pick.clip.id,
+              rnd() < 0.5 ? "in" : "out",
+              pick.clip.timelineStart + (rnd() - 0.25) * 20,
+            );
+          break;
+        case 3:
+          if (pick) {
+            const at2 =
+              pick.clip.timelineStart + rnd() * clipDuration(pick.clip);
+            next = splitClip(p, pick.clip.id, at2).project;
+          }
+          break;
+        case 4:
+          if (pick) next = removeClip(p, pick.clip.id);
+          break;
+        case 5:
+          if (pick) next = rippleDelete(p, pick.clip.id);
+          break;
+        case 6:
+          if (pick) next = setClipSpeed(p, pick.clip.id, 0.25 + rnd() * 3.75);
+          break;
+      }
+      if (next !== p) {
+        history.push(before);
+        p = next;
+      }
+      const errors = checkInvariants(p);
+      if (errors.length) {
+        throw new Error(`invariants broken after op ${op} @ ${i}: ${errors.join("; ")}`);
+      }
+    }
+
+    while (history.canUndo) {
+      p = history.undo(p)!;
+    }
+    expect(p).toEqual(initial);
+  });
+});

@@ -1,0 +1,16 @@
+# deps / build output
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+
+# ffmpeg sidecars are fetched by scripts/fetch-ffmpeg.mjs, never committed
+src-tauri/binaries/
+
+# generated test media
+tests/fixtures/
+
+# misc
+*.log
+.DS_Store
+Thumbs.db

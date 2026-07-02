@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Taroting</title>
+    <style>
+      /* Critical inline styles: first paint is dark before any bundle loads */
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #111113;
+        color: #ececf1;
+        font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+        overflow: hidden;
+      }
+      #app {
+        height: 100%;
+      }
+    </style>
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <div id="app"></div>
+  </body>
+</html>
