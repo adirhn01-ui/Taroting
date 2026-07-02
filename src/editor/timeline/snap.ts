@@ -1,8 +1,8 @@
 // Snapping: collect interesting times (clip edges, playhead, origin) and
 // pull dragged values onto them when within a pixel threshold.
 
-import { clipEnd } from "../../core/time";
-import type { ProjectFile } from "../../core/types";
+import { clipEnd, timelineTime } from "../../core/time";
+import type { AnimProp, Clip, ProjectFile } from "../../core/types";
 
 export const SNAP_THRESHOLD_PX = 8;
 
@@ -12,11 +12,16 @@ export interface SnapResult {
   guide: number | null;
 }
 
-/** All snap-worthy times, excluding a clip being dragged. */
+const KF_PROPS: AnimProp[] = ["x", "y", "scale", "opacity"];
+
+/** All snap-worthy times, excluding a clip being dragged. When a selected clip
+ *  is passed and it has keyframes, its in-range keyframe timeline-times join the
+ *  candidates (so dragging snaps to its diamonds). */
 export function collectCandidates(
   project: ProjectFile,
   excludeClipId: string | null,
   playhead: number,
+  selectedClip?: Clip | null,
 ): number[] {
   const out: number[] = [0, playhead];
   for (const track of project.timeline.tracks) {
@@ -26,6 +31,16 @@ export function collectCandidates(
     }
   }
   for (const marker of project.timeline.markers ?? []) out.push(marker.t);
+  if (selectedClip?.keyframes) {
+    for (const prop of KF_PROPS) {
+      const arr = selectedClip.keyframes[prop];
+      if (!arr) continue;
+      for (const kf of arr) {
+        if (kf.t < selectedClip.srcIn - 1e-6 || kf.t > selectedClip.srcOut + 1e-6) continue;
+        out.push(timelineTime(selectedClip, kf.t));
+      }
+    }
+  }
   return out;
 }
 

@@ -3,23 +3,44 @@
 // audio settings. Sliders live-commit: continuous changes flow through
 // session.replace() during a drag (no history), then a single history entry is
 // pushed on release via session.commitFrom(before).
+//
+// Animatable groups (Position / Scale / Opacity) carry a diamond toggle: when a
+// group is animated its controls show the EVALUATED value at the playhead and
+// edits auto-key (setKeyframe / setPositionKeyframes at the playhead's source
+// time) instead of writing the static transform. When nothing is selected the
+// panel shows a Project-canvas editor instead of the empty state.
 
 import "./inspector.css";
 import { formatDuration, escapeHtml, fileStem } from "../../core/format";
 import { ipc } from "../../core/ipc";
+import { EPS_KF, evalKfs } from "../../core/anim";
 import {
+  MAX_CANVAS,
+  MIN_CANVAS,
+  clearAnimation,
   defaultTransform,
   detachAudio,
   findClip,
   findMedia,
   removeClipAudio,
+  removeKeyframesNear,
   setClipSpeed,
+  setKeyframe,
+  setPositionKeyframes,
+  setProjectCanvas,
   updateClip,
 } from "../../core/project";
 import type { ProjectSession } from "../../core/session";
 import type { Store } from "../../core/store";
-import { clipDuration } from "../../core/time";
-import type { Clip, ClipTransform, MediaRef, ProjectFile } from "../../core/types";
+import { clipDuration, fpsValue, sourceTime } from "../../core/time";
+import type {
+  AnimProp,
+  Clip,
+  ClipKeyframes,
+  ClipTransform,
+  MediaRef,
+  ProjectFile,
+} from "../../core/types";
 import type { PlaybackEngine } from "../playback/engine";
 import type { MediaManager } from "../media/media";
 import { toast } from "../../ui/toast";
@@ -34,6 +55,19 @@ export interface InspectorCtx {
 
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 const ROTATIONS: (0 | 90 | 180 | 270)[] = [0, 90, 180, 270];
+
+/** Canvas-size presets shown in the Project panel. */
+const CANVAS_PRESETS: { label: string; w: number; h: number }[] = [
+  { label: "1920 × 1080 (16:9)", w: 1920, h: 1080 },
+  { label: "2560 × 1440 (16:9)", w: 2560, h: 1440 },
+  { label: "3840 × 2160 (16:9)", w: 3840, h: 2160 },
+  { label: "1080 × 1920 (9:16)", w: 1080, h: 1920 },
+  { label: "1440 × 1080 (4:3)", w: 1440, h: 1080 },
+  { label: "1080 × 1080 (1:1)", w: 1080, h: 1080 },
+  { label: "2560 × 1080 (21:9)", w: 2560, h: 1080 },
+];
+
+type Group = "position" | "scale" | "opacity";
 
 /** Located clip plus its media and whether it lives on the video track. */
 interface Target {
@@ -65,6 +99,52 @@ function audioCopyOverlaps(p: ProjectFile, t: Target): boolean {
   return false;
 }
 
+/* ---------------- keyframe helpers (pure) ---------------- */
+
+const PROPS_OF_GROUP: Record<Group, AnimProp[]> = {
+  position: ["x", "y"],
+  scale: ["scale"],
+  opacity: ["opacity"],
+};
+
+/** Source time at the playhead for this clip (may lie outside [srcIn,srcOut]). */
+function playheadSource(clip: Clip, playhead: number): number {
+  return sourceTime(clip, playhead - clip.timelineStart);
+}
+
+/** Is the playhead within the clip's timeline footprint? */
+function playheadInClip(clip: Clip, playhead: number): boolean {
+  return playhead >= clip.timelineStart - 1e-6 && playhead <= clip.timelineStart + clipDuration(clip) + 1e-6;
+}
+
+/** Does a group have any keyframes on the clip? */
+function groupAnimated(kfs: ClipKeyframes | undefined, group: Group): boolean {
+  if (!kfs) return false;
+  for (const prop of PROPS_OF_GROUP[group]) {
+    const arr = kfs[prop];
+    if (arr && arr.length > 0) return true;
+  }
+  return false;
+}
+
+/** Toggle state for a group's diamond: none = not animated, here = a keyframe
+ *  sits at the playhead source time, elsewhere = animated but no kf here. */
+function diamondState(clip: Clip, group: Group, s: number): "none" | "here" | "elsewhere" {
+  if (!groupAnimated(clip.keyframes, group)) return "none";
+  for (const prop of PROPS_OF_GROUP[group]) {
+    const arr = clip.keyframes![prop];
+    if (arr && arr.some((k) => Math.abs(k.t - s) <= EPS_KF)) return "here";
+  }
+  return "elsewhere";
+}
+
+/** Evaluated value of a single prop at source time s (falls back to static). */
+function evalProp(clip: Clip, prop: AnimProp, staticVal: number, s: number): number {
+  const arr = clip.keyframes?.[prop];
+  if (arr && arr.length > 0) return evalKfs(arr, s);
+  return staticVal;
+}
+
 export function mountInspector(
   host: HTMLElement,
   ctx: InspectorCtx,
@@ -81,6 +161,8 @@ export function mountInspector(
     for (const c of cleanup) c();
     cleanup = [];
   }
+
+  const playhead = (): number => ctx.engine.time;
 
   /* -------- small builders (return elements, wire live-commit) -------- */
 
@@ -109,16 +191,37 @@ export function mountInspector(
     return f;
   }
 
-  /** Live-commit slider: replace() on input, commitFrom() on release. */
+  /** Options common to the live-commit input builders. `replaceMutation`, when
+   *  present, overrides the default updateClip(patch) live path — used for
+   *  keyframe auto-keying. `disabled` greys the control out (with a hint). */
+  interface LiveOpts {
+    patch: (v: number) => Partial<Clip>;
+    replaceMutation?: (v: number) => (p: ProjectFile) => ProjectFile;
+    disabled?: boolean;
+    disabledHint?: string;
+  }
+
+  function applyLive(clipId: string, v: number, opts: LiveOpts): void {
+    if (opts.replaceMutation) {
+      ctx.session.replace(opts.replaceMutation(v)(ctx.session.project));
+    } else {
+      ctx.session.replace(updateClip(ctx.session.project, clipId, opts.patch(v)));
+    }
+    ctx.refresh();
+  }
+
+  /** Live-commit slider with a numeric twin: replace() on input, commitFrom() on
+   *  release. Both the slider and the number reflect each other live. */
   function slider(
     clipId: string,
-    opts: {
+    opts: LiveOpts & {
       min: number;
       max: number;
       step: number;
       value: number;
+      /** decimals shown in the number twin (keeps it compact) */
+      decimals?: number;
       format: (v: number) => string;
-      patch: (v: number) => Partial<Clip>;
     },
   ): HTMLElement {
     const wrap = el("div", "insp-slider");
@@ -128,14 +231,41 @@ export function mountInspector(
     input.max = String(opts.max);
     input.step = String(opts.step);
     input.value = String(opts.value);
+
+    const num = el("input", "input insp-num insp-num--twin");
+    num.type = "number";
+    num.min = String(opts.min);
+    num.max = String(opts.max);
+    num.step = String(opts.step);
+    const dec = opts.decimals ?? 2;
+    const fmtNum = (v: number): string => {
+      const r = Number(v.toFixed(dec));
+      return String(r);
+    };
+    num.value = fmtNum(opts.value);
+
     const readout = el("div", "insp-slider__value mono", escapeHtml(opts.format(opts.value)));
+
     wrap.appendChild(input);
     wrap.appendChild(readout);
+    wrap.appendChild(num);
+
+    if (opts.disabled) {
+      input.disabled = true;
+      num.disabled = true;
+      if (opts.disabledHint) {
+        input.title = opts.disabledHint;
+        num.title = opts.disabledHint;
+      }
+      return wrap;
+    }
+
+    const clampRange = (v: number): number => Math.min(Math.max(v, opts.min), opts.max);
 
     let before: ProjectFile | null = null;
     const begin = (): void => {
       dragging = true;
-      before = ctx.session.project;
+      if (!before) before = ctx.session.project;
     };
     const commit = (): void => {
       if (before) {
@@ -144,35 +274,51 @@ export function mountInspector(
       }
       dragging = false;
     };
-    const onInput = (): void => {
-      const v = Number(input.value);
+    const onSlider = (): void => {
+      const v = clampRange(Number(input.value));
+      num.value = fmtNum(v);
       readout.textContent = opts.format(v);
-      ctx.session.replace(updateClip(ctx.session.project, clipId, opts.patch(v)));
-      ctx.refresh();
+      applyLive(clipId, v, opts);
+    };
+    const onNum = (): void => {
+      const raw = Number(num.value);
+      if (!Number.isFinite(raw)) return;
+      const v = clampRange(raw);
+      input.value = String(v);
+      readout.textContent = opts.format(v);
+      applyLive(clipId, v, opts);
     };
     input.addEventListener("pointerdown", begin);
     input.addEventListener("focusin", begin);
-    input.addEventListener("input", onInput);
+    input.addEventListener("input", onSlider);
     input.addEventListener("change", commit);
     input.addEventListener("pointerup", commit);
+    num.addEventListener("focusin", begin);
+    num.addEventListener("input", onNum);
+    num.addEventListener("change", commit);
+    num.addEventListener("blur", commit);
     cleanup.push(() => {
       input.removeEventListener("pointerdown", begin);
       input.removeEventListener("focusin", begin);
-      input.removeEventListener("input", onInput);
+      input.removeEventListener("input", onSlider);
       input.removeEventListener("change", commit);
       input.removeEventListener("pointerup", commit);
+      num.removeEventListener("focusin", begin);
+      num.removeEventListener("input", onNum);
+      num.removeEventListener("change", commit);
+      num.removeEventListener("blur", commit);
     });
     return wrap;
   }
 
-  /** Live-commit number input with clamping; commits one history step on blur/enter. */
+  /** Live-commit number input with clamping; commits one history step on
+   *  blur/enter. Supports the same keyframe auto-key override as slider(). */
   function numberInput(
     clipId: string,
-    opts: {
+    opts: LiveOpts & {
       value: number;
       step?: number;
       clamp: (v: number) => number;
-      patch: (v: number) => Partial<Clip>;
     },
   ): HTMLInputElement {
     const input = el("input", "input insp-num");
@@ -180,17 +326,22 @@ export function mountInspector(
     if (opts.step !== undefined) input.step = String(opts.step);
     input.value = String(opts.value);
 
+    if (opts.disabled) {
+      input.disabled = true;
+      if (opts.disabledHint) input.title = opts.disabledHint;
+      return input;
+    }
+
     let before: ProjectFile | null = null;
     const begin = (): void => {
       dragging = true;
-      before = ctx.session.project;
+      if (!before) before = ctx.session.project;
     };
     const onInput = (): void => {
       const raw = Number(input.value);
       if (!Number.isFinite(raw)) return;
       const v = opts.clamp(raw);
-      ctx.session.replace(updateClip(ctx.session.project, clipId, opts.patch(v)));
-      ctx.refresh();
+      applyLive(clipId, v, opts);
     };
     const commit = (): void => {
       const v = opts.clamp(Number(input.value) || 0);
@@ -242,12 +393,145 @@ export function mountInspector(
     ctx.refresh();
   };
 
+  /* -------- animated-group header (label + diamond toggle + clear) -------- */
+
+  /** A group header row: the group label, a diamond toggle button, and a
+   *  "Clear animation" ghost button (visible only when animated). */
+  function groupHeader(t: Target, group: Group, label: string): HTMLElement {
+    const s = playheadSource(t.clip, playhead());
+    const inClip = playheadInClip(t.clip, playhead());
+    const state = diamondState(t.clip, group, s);
+
+    const row = el("div", "insp-grouphead");
+    row.appendChild(el("div", "insp-sublabel", escapeHtml(label)));
+
+    const controls = el("div", "insp-grouphead__ctrls");
+
+    const diamond = el("button", `insp-kf insp-kf--${state}`);
+    diamond.type = "button";
+    diamond.innerHTML =
+      '<svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">' +
+      '<path d="M6 1 L11 6 L6 11 L1 6 Z" /></svg>';
+    diamond.title =
+      state === "none"
+        ? "Animate (add first keyframe)"
+        : state === "here"
+          ? "Remove keyframe at playhead"
+          : "Add keyframe at playhead";
+    if (!inClip) {
+      diamond.disabled = true;
+      diamond.title = "Move the playhead over the clip to keyframe";
+    }
+    const onDiamond = (): void => toggleKeyframe(t, group);
+    diamond.addEventListener("click", onDiamond);
+    cleanup.push(() => diamond.removeEventListener("click", onDiamond));
+    controls.appendChild(diamond);
+
+    if (state !== "none") {
+      const clear = button("Clear", "btn btn--ghost btn--xs insp-kf-clear", () =>
+        clearGroupAnimation(t, group),
+      );
+      clear.title = "Clear this animation (bakes the current value)";
+      controls.appendChild(clear);
+    }
+
+    row.appendChild(controls);
+    return row;
+  }
+
+  /** The evaluated pose (x, y, scale, opacity) at the playhead source time. */
+  function evalPose(clip: Clip, tf: ClipTransform, s: number): {
+    x: number;
+    y: number;
+    scale: number;
+    opacity: number;
+  } {
+    return {
+      x: evalProp(clip, "x", tf.x, s),
+      y: evalProp(clip, "y", tf.y, s),
+      scale: evalProp(clip, "scale", tf.scale, s),
+      opacity: evalProp(clip, "opacity", tf.opacity, s),
+    };
+  }
+
+  /** Diamond click: seed / upsert / remove per the plan's rules. */
+  function toggleKeyframe(t: Target, group: Group): void {
+    const clipId = t.clip.id;
+    const cur = resolve(ctx.session.project, clipId);
+    if (!cur) return;
+    const clip = cur.clip;
+    const tf = clip.transform ?? defaultTransform();
+    const ph = playhead();
+    if (!playheadInClip(clip, ph)) return;
+    const s = playheadSource(clip, ph);
+    const state = diamondState(clip, group, s);
+    const pose = evalPose(clip, tf, s);
+
+    if (state === "here") {
+      // Toggle OFF at an existing keyframe. If it's the LAST keyframe of the
+      // group, bake the evaluated value first so nothing jumps.
+      commit((p) => {
+        const found = findClip(p, clipId);
+        if (!found) return p;
+        const c = found.clip;
+        const count = PROPS_OF_GROUP[group].reduce(
+          (n, prop) => Math.max(n, c.keyframes?.[prop]?.length ?? 0),
+          0,
+        );
+        if (count <= 1) {
+          const bake =
+            group === "position"
+              ? { x: pose.x, y: pose.y }
+              : group === "scale"
+                ? { scale: pose.scale }
+                : { opacity: pose.opacity };
+          return clearAnimation(p, clipId, group, bake);
+        }
+        return removeKeyframesNear(p, clipId, group, s);
+      });
+      return;
+    }
+
+    // Toggle ON (seed first kf from static value, or upsert current evaluated).
+    commit((p) => {
+      if (group === "position") {
+        return setPositionKeyframes(p, clipId, s, pose.x, pose.y);
+      }
+      if (group === "scale") {
+        return setKeyframe(p, clipId, "scale", s, pose.scale);
+      }
+      return setKeyframe(p, clipId, "opacity", s, pose.opacity);
+    });
+  }
+
+  /** Clear a group's animation, baking the evaluated pose so nothing jumps. */
+  function clearGroupAnimation(t: Target, group: Group): void {
+    const clipId = t.clip.id;
+    const cur = resolve(ctx.session.project, clipId);
+    if (!cur) return;
+    const clip = cur.clip;
+    const tf = clip.transform ?? defaultTransform();
+    const s = playheadSource(clip, playhead());
+    const pose = evalPose(clip, tf, s);
+    const bake =
+      group === "position"
+        ? { x: pose.x, y: pose.y }
+        : group === "scale"
+          ? { scale: pose.scale }
+          : { opacity: pose.opacity };
+    commit((p) => clearAnimation(p, clipId, group, bake));
+  }
+
   /* -------- section builders -------- */
 
   function buildVideoSection(t: Target): HTMLElement {
     const s = section("Video");
     const clipId = t.clip.id;
     const tf = t.clip.transform ?? defaultTransform();
+    const ph = playhead();
+    const inClip = playheadInClip(t.clip, ph);
+    const src = playheadSource(t.clip, ph);
+    const hint = "Move the playhead over the clip to edit its animation.";
 
     // Speed
     const speedSel = el("select", "select select--sm");
@@ -265,30 +549,55 @@ export function mountInspector(
     cleanup.push(() => speedSel.removeEventListener("change", onSpeed));
     s.appendChild(field("Speed", speedSel));
 
-    // Scale
+    /* ---- Scale (animatable) ---- */
+    const scaleAnimated = groupAnimated(t.clip.keyframes, "scale");
+    const scaleVal = evalProp(t.clip, "scale", tf.scale, src);
+    s.appendChild(groupHeader(t, "scale", "Scale"));
     s.appendChild(
-      field(
-        "Scale",
-        slider(clipId, {
-          min: 0.1,
-          max: 4,
-          step: 0.01,
-          value: tf.scale,
-          format: (v) => `${v.toFixed(2)}×`,
-          patch: (v) => ({ transform: { ...(currentTransform(clipId) ?? tf), scale: v } }),
-        }),
-      ),
+      slider(clipId, {
+        min: 0.1,
+        max: 4,
+        step: 0.01,
+        value: scaleVal,
+        format: (v) => `${v.toFixed(2)}×`,
+        disabled: scaleAnimated && !inClip,
+        disabledHint: hint,
+        patch: (v) => ({ transform: { ...(currentTransform(clipId) ?? tf), scale: v } }),
+        replaceMutation: scaleAnimated
+          ? (v) => (p) => setKeyframe(p, clipId, "scale", src, v)
+          : undefined,
+      }),
     );
 
-    // Position X / Y
+    /* ---- Position X / Y (animatable, paired) ---- */
+    const posAnimated = groupAnimated(t.clip.keyframes, "position");
+    const posX = evalProp(t.clip, "x", tf.x, src);
+    const posY = evalProp(t.clip, "y", tf.y, src);
+    s.appendChild(groupHeader(t, "position", "Position"));
     const posRow = el("div", "insp-row");
+    // For paired auto-key, an edit to X keys BOTH x and the current y (and vice
+    // versa) so the arrays stay paired.
+    const posReplace =
+      (axis: "x" | "y") =>
+      (v: number) =>
+      (p: ProjectFile): ProjectFile => {
+        const c = resolve(p, clipId);
+        if (!c) return p;
+        const t2 = c.clip.transform ?? defaultTransform();
+        const curX = axis === "x" ? v : evalProp(c.clip, "x", t2.x, src);
+        const curY = axis === "y" ? v : evalProp(c.clip, "y", t2.y, src);
+        return setPositionKeyframes(p, clipId, src, curX, curY);
+      };
     posRow.appendChild(
       field(
         "X",
         numberInput(clipId, {
-          value: tf.x,
+          value: posX,
           clamp: (v) => Math.round(v),
+          disabled: posAnimated && !inClip,
+          disabledHint: hint,
           patch: (v) => ({ transform: { ...(currentTransform(clipId) ?? tf), x: v } }),
+          replaceMutation: posAnimated ? posReplace("x") : undefined,
         }),
       ),
     );
@@ -296,15 +605,18 @@ export function mountInspector(
       field(
         "Y",
         numberInput(clipId, {
-          value: tf.y,
+          value: posY,
           clamp: (v) => Math.round(v),
+          disabled: posAnimated && !inClip,
+          disabledHint: hint,
           patch: (v) => ({ transform: { ...(currentTransform(clipId) ?? tf), y: v } }),
+          replaceMutation: posAnimated ? posReplace("y") : undefined,
         }),
       ),
     );
     s.appendChild(posRow);
 
-    // Rotate (cycles)
+    // Rotate (cycles) — not animatable
     const rotBtn = button(`Rotate ${tf.rotate}°`, "btn btn--sm", () => {
       const cur = currentTransform(clipId) ?? tf;
       const next = ROTATIONS[(ROTATIONS.indexOf(cur.rotate) + 1) % ROTATIONS.length]!;
@@ -312,7 +624,7 @@ export function mountInspector(
     });
     s.appendChild(field("Rotate", rotBtn));
 
-    // Flip switches
+    // Flip switches — not animatable
     const flipRow = el("div", "insp-row");
     flipRow.appendChild(
       field(
@@ -334,19 +646,24 @@ export function mountInspector(
     );
     s.appendChild(flipRow);
 
-    // Opacity
+    /* ---- Opacity (animatable) ---- */
+    const opacityAnimated = groupAnimated(t.clip.keyframes, "opacity");
+    const opacityVal = evalProp(t.clip, "opacity", tf.opacity, src);
+    s.appendChild(groupHeader(t, "opacity", "Opacity"));
     s.appendChild(
-      field(
-        "Opacity",
-        slider(clipId, {
-          min: 0,
-          max: 1,
-          step: 0.01,
-          value: tf.opacity,
-          format: (v) => `${Math.round(v * 100)}%`,
-          patch: (v) => ({ transform: { ...(currentTransform(clipId) ?? tf), opacity: v } }),
-        }),
-      ),
+      slider(clipId, {
+        min: 0,
+        max: 1,
+        step: 0.01,
+        value: opacityVal,
+        format: (v) => `${Math.round(v * 100)}%`,
+        disabled: opacityAnimated && !inClip,
+        disabledHint: hint,
+        patch: (v) => ({ transform: { ...(currentTransform(clipId) ?? tf), opacity: v } }),
+        replaceMutation: opacityAnimated
+          ? (v) => (p) => setKeyframe(p, clipId, "opacity", src, v)
+          : undefined,
+      }),
     );
 
     // Crop
@@ -568,6 +885,107 @@ export function mountInspector(
     return cur?.clip.audio ?? fallback;
   }
 
+  /* -------- project canvas panel (empty-state replacement) -------- */
+
+  function buildProjectPanel(): HTMLElement {
+    const wrap = el("div", "insp-project");
+    const p = ctx.session.project;
+    const w = p.timeline.width;
+    const h = p.timeline.height;
+
+    const header = el("div", "insp-header");
+    header.appendChild(el("div", "insp-header__name", "Project"));
+    wrap.appendChild(header);
+
+    const s = section("Canvas");
+
+    // Preset select (matches a preset → that preset, else Custom).
+    const sel = el("select", "select select--sm");
+    for (let i = 0; i < CANVAS_PRESETS.length; i++) {
+      const preset = CANVAS_PRESETS[i]!;
+      const o = el("option");
+      o.value = String(i);
+      o.textContent = preset.label;
+      sel.appendChild(o);
+    }
+    const customOpt = el("option");
+    customOpt.value = "custom";
+    customOpt.textContent = "Custom";
+    sel.appendChild(customOpt);
+
+    const matchIdx = CANVAS_PRESETS.findIndex((pr) => pr.w === w && pr.h === h);
+    sel.value = matchIdx >= 0 ? String(matchIdx) : "custom";
+
+    // W / H inputs — enabled only for Custom; always show current values.
+    const wI = el("input", "input insp-num");
+    wI.type = "number";
+    wI.min = String(MIN_CANVAS);
+    wI.max = String(MAX_CANVAS);
+    wI.step = "2";
+    wI.value = String(w);
+    const hI = el("input", "input insp-num");
+    hI.type = "number";
+    hI.min = String(MIN_CANVAS);
+    hI.max = String(MAX_CANVAS);
+    hI.step = "2";
+    hI.value = String(h);
+
+    const custom = sel.value === "custom";
+    wI.disabled = !custom;
+    hI.disabled = !custom;
+
+    const applySize = (nw: number, nh: number): void => {
+      commit((pr) => setProjectCanvas(pr, nw, nh));
+    };
+
+    const onSel = (): void => {
+      if (sel.value === "custom") {
+        wI.disabled = false;
+        hI.disabled = false;
+        return;
+      }
+      const preset = CANVAS_PRESETS[Number(sel.value)]!;
+      applySize(preset.w, preset.h);
+    };
+    sel.addEventListener("change", onSel);
+    cleanup.push(() => sel.removeEventListener("change", onSel));
+    s.appendChild(field("Size", sel));
+
+    const onCustom = (): void => {
+      const nw = Number(wI.value);
+      const nh = Number(hI.value);
+      if (!Number.isFinite(nw) || !Number.isFinite(nh)) return;
+      applySize(nw, nh);
+    };
+    wI.addEventListener("change", onCustom);
+    hI.addEventListener("change", onCustom);
+    cleanup.push(() => {
+      wI.removeEventListener("change", onCustom);
+      hI.removeEventListener("change", onCustom);
+    });
+    const dimRow = el("div", "insp-row");
+    dimRow.appendChild(field("Width", wI));
+    dimRow.appendChild(field("Height", hI));
+    s.appendChild(dimRow);
+
+    // FPS (read-only)
+    const fps = fpsValue(p.timeline.fps);
+    const fpsRow = el("div", "insp-readout");
+    fpsRow.innerHTML = `<span>Frame rate</span><span class="mono">${Number(fps.toFixed(3))} fps</span>`;
+    s.appendChild(fpsRow);
+
+    s.appendChild(
+      el(
+        "div",
+        "insp-note",
+        "Clips re-fit automatically. Export uses the canvas size when resolution is Original.",
+      ),
+    );
+
+    wrap.appendChild(s);
+    return wrap;
+  }
+
   /* -------- top-level rebuild -------- */
 
   function rebuild(): void {
@@ -577,8 +995,7 @@ export function mountInspector(
     const sel = ctx.selection.get();
     const t = resolve(ctx.session.project, sel);
     if (!t) {
-      const empty = el("div", "empty-state", "Select a clip to edit its properties.");
-      host.appendChild(empty);
+      host.appendChild(buildProjectPanel());
       return;
     }
 
@@ -612,6 +1029,19 @@ export function mountInspector(
     if (dragging) return;
     rebuild();
   });
+  // While PAUSED (scrub/seek/step), rebuild as the playhead moves so a selected
+  // clip's diamond state and evaluated readouts track it. During playback we
+  // skip this entirely (no per-frame DOM churn) and never rebuild mid-drag.
+  // The rebuild is also a no-op when nothing/no-video-clip is selected.
+  let lastTickT = -1;
+  const unsubTick = ctx.engine.onTick((time, playing) => {
+    if (playing || dragging) return;
+    if (time === lastTickT) return;
+    lastTickT = time;
+    const cur = resolve(ctx.session.project, ctx.selection.get());
+    if (!cur || !cur.onVideoTrack || !cur.clip.keyframes) return;
+    rebuild();
+  });
 
   rebuild();
 
@@ -619,6 +1049,7 @@ export function mountInspector(
     dispose(): void {
       unsubSel();
       unsubSession();
+      unsubTick();
       clearBuild();
       host.innerHTML = "";
     },

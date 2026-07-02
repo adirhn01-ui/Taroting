@@ -88,7 +88,7 @@
 .insp-slider__value {
   font-size: var(--fs-12);
   color: var(--text-2);
-  min-width: 46px;
+  min-width: 40px;
   text-align: right;
 }
 
@@ -130,4 +130,90 @@
   font-size: var(--fs-12);
   color: var(--text-3);
   font-style: italic;
+}
+.insp-note--warn {
+  color: var(--warn, var(--danger));
+}
+
+/* number twin beside a slider readout */
+.insp-slider .insp-num--twin {
+  flex: 0 0 auto;
+  width: 52px;
+  text-align: right;
+}
+
+/* animatable-group header: label + diamond toggle + clear */
+.insp-grouphead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+.insp-grouphead__ctrls {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* keyframe diamond toggle */
+.insp-kf {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-s, 4px);
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-3);
+}
+.insp-kf:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--accent-strong);
+}
+.insp-kf:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.insp-kf svg path {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+}
+/* hollow = not animated */
+.insp-kf--none svg path {
+  fill: none;
+}
+/* half/dimmed = animated but no keyframe here */
+.insp-kf--elsewhere {
+  color: var(--accent);
+}
+.insp-kf--elsewhere svg path {
+  fill: color-mix(in srgb, var(--accent) 35%, transparent);
+  stroke: var(--accent);
+}
+/* filled = a keyframe exists at the playhead */
+.insp-kf--here {
+  color: var(--accent-strong, var(--accent));
+}
+.insp-kf--here svg path {
+  fill: var(--accent);
+  stroke: var(--accent);
+}
+
+.btn--xs {
+  height: 20px;
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-11);
+}
+.insp-kf-clear {
+  color: var(--text-3);
+}
+
+/* project canvas panel (empty-state replacement) */
+.insp-project {
+  display: flex;
+  flex-direction: column;
 }

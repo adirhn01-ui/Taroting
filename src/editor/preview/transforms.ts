@@ -37,15 +37,26 @@ export interface ComputedTransform {
   opacity: number;
 }
 
-/** Pure math: everything in project-canvas px, pre stage scaling. */
-export function computeTransform(
+/** Alloc-free core: writes the computed transform into a caller-owned scratch
+ *  object. `overrides` (when provided) replace the static x / y / scale /
+ *  opacity — this is how keyframe playback injects the interpolated pose
+ *  without touching the clip. Everything is project-canvas px, pre stage
+ *  scaling. */
+export function computeTransformInto(
+  out: ComputedTransform,
   transform: ClipTransform | undefined,
   media: { width?: number; height?: number },
   project: { width: number; height: number },
-): ComputedTransform {
+  overrides?: { x?: number; y?: number; scale?: number; opacity?: number },
+): void {
   const t = transform ?? defaultTransform();
   const srcW = Math.max(1, media.width ?? project.width);
   const srcH = Math.max(1, media.height ?? project.height);
+
+  const x = overrides?.x ?? t.x;
+  const y = overrides?.y ?? t.y;
+  const scale = overrides?.scale ?? t.scale;
+  const opacity = overrides?.opacity ?? t.opacity;
 
   const crop = t.crop ?? { x: 0, y: 0, w: srcW, h: srcH };
   const cropW = Math.max(1, Math.min(crop.w, srcW - crop.x));
@@ -56,22 +67,34 @@ export function computeTransform(
   const fitW = rotated ? cropH : cropW;
   const fitH = rotated ? cropW : cropH;
   const fit = Math.min(project.width / fitW, project.height / fitH);
-  const k = fit * t.scale;
+  const k = fit * scale;
 
-  return {
-    posX: t.x,
-    posY: t.y,
-    rotate: t.rotate,
-    flipH: t.flipH,
-    flipV: t.flipV,
-    cropW: cropW * k,
-    cropH: cropH * k,
-    mediaW: srcW * k,
-    mediaH: srcH * k,
-    offX: 0 - crop.x * k,
-    offY: 0 - crop.y * k,
-    opacity: t.opacity,
+  out.posX = x;
+  out.posY = y;
+  out.rotate = t.rotate;
+  out.flipH = t.flipH;
+  out.flipV = t.flipV;
+  out.cropW = cropW * k;
+  out.cropH = cropH * k;
+  out.mediaW = srcW * k;
+  out.mediaH = srcH * k;
+  out.offX = 0 - crop.x * k;
+  out.offY = 0 - crop.y * k;
+  out.opacity = opacity;
+}
+
+/** Pure math: everything in project-canvas px, pre stage scaling. */
+export function computeTransform(
+  transform: ClipTransform | undefined,
+  media: { width?: number; height?: number },
+  project: { width: number; height: number },
+): ComputedTransform {
+  const out: ComputedTransform = {
+    posX: 0, posY: 0, rotate: 0, flipH: false, flipV: false,
+    cropW: 0, cropH: 0, mediaW: 0, mediaH: 0, offX: 0, offY: 0, opacity: 1,
   };
+  computeTransformInto(out, transform, media, project);
+  return out;
 }
 
 /** Apply a computed transform to a layer at the given stage scale. */

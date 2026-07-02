@@ -1,10 +1,12 @@
-// Playback engine: the master clock. While a video clip is under the
-// playhead, its <video> element IS the clock (mapped to timeline time);
-// across gaps and stills a wall-clock advances at the preview speed.
+// Playback engine: the master clock. While a ready video clip is under the
+// playhead on some layer, the topmost such element IS the clock (mapped to
+// timeline time); across gaps and stills a wall-clock advances at the preview
+// speed. The scheduler composites the whole video-track stack; the engine only
+// tracks the nearest segment boundary across all layers.
 
 import { frameCenter, frameOf, timelineDuration } from "../../core/time";
 import type { ProjectFile, Rational } from "../../core/types";
-import { Scheduler, segmentEnd, type Segment } from "./scheduler";
+import { Scheduler } from "./scheduler";
 
 const BOUNDARY_EPS = 1 / 240;
 
@@ -15,11 +17,15 @@ export class PlaybackEngine {
   private t = 0;
   private playing_ = false;
   private previewSpeed_ = 1;
-  private segment: Segment = { type: "end" };
+  private boundary = Infinity;
   private raf = 0;
   private anchorWall = 0;
   private anchorT = 0;
   private listeners = new Set<TickListener>();
+  // frame-step chaining: the last COMMANDED frame, so rapid stepping (with no
+  // waits for the video element to settle) lands exactly. Reset whenever the
+  // playhead moves for any non-step reason.
+  private steppedFrame: number | null = null;
 
   constructor(
     private getProject: () => ProjectFile,
@@ -56,22 +62,31 @@ export class PlaybackEngine {
 
   /* ---------------- transport ---------------- */
 
-  seek(time: number): void {
+  /** Internal seek that does NOT clear the step chain (used by stepFrames). */
+  private seekInternal(time: number, fromStep: boolean): void {
+    if (!fromStep) this.steppedFrame = null;
     const dur = this.duration();
     this.t = Math.min(Math.max(0, time), dur);
     this.anchor(this.t);
-    this.segment = this.scheduler.activate(this.t, this.playing_);
+    this.boundary = this.scheduler.activate(this.t, this.playing_).boundary;
+    this.scheduler.animate(this.t);
     this.emit();
+  }
+
+  seek(time: number): void {
+    this.seekInternal(time, false);
   }
 
   play(): void {
     if (this.playing_) return;
     const dur = this.duration();
     if (dur <= 0) return;
+    this.steppedFrame = null;
     if (this.t >= dur - BOUNDARY_EPS) this.t = 0;
     this.playing_ = true;
     this.anchor(this.t);
-    this.segment = this.scheduler.activate(this.t, true);
+    this.boundary = this.scheduler.activate(this.t, true).boundary;
+    this.scheduler.animate(this.t);
     this.startTicker();
     this.emit();
   }
@@ -79,9 +94,12 @@ export class PlaybackEngine {
   pause(): void {
     if (!this.playing_) return;
     this.playing_ = false;
+    // pause is synchronous and always wins: stop the ticker + every element
+    // immediately, then re-activate paused so the exact current frame shows.
+    cancelAnimationFrame(this.raf);
     this.scheduler.pauseAll();
-    // freeze display on the exact current frame
-    this.segment = this.scheduler.activate(this.t, false);
+    this.boundary = this.scheduler.activate(this.t, false).boundary;
+    this.scheduler.animate(this.t);
     this.emit();
   }
 
@@ -92,6 +110,7 @@ export class PlaybackEngine {
 
   stop(): void {
     this.playing_ = false;
+    cancelAnimationFrame(this.raf);
     this.scheduler.pauseAll();
     this.seek(0);
   }
@@ -99,8 +118,10 @@ export class PlaybackEngine {
   stepFrames(n: number): void {
     if (this.playing_) this.pause();
     const fps = this.fps();
-    const target = frameCenter(frameOf(this.t, fps) + n, fps);
-    this.seek(target);
+    const base = this.steppedFrame ?? frameOf(this.t, fps);
+    const target = base + n;
+    this.steppedFrame = target;
+    this.seekInternal(frameCenter(target, fps), true);
   }
 
   jumpSeconds(s: number): void {
@@ -112,12 +133,14 @@ export class PlaybackEngine {
     this.scheduler.previewSpeed = speed;
     // re-anchor so the virtual clock doesn't jump
     this.anchor(this.t);
-    if (this.playing_) this.segment = this.scheduler.activate(this.t, true);
+    if (this.playing_) this.boundary = this.scheduler.activate(this.t, true).boundary;
   }
 
   /** Re-resolve after project edits (clips moved/trimmed under the playhead). */
   refresh(): void {
-    this.segment = this.scheduler.activate(this.t, this.playing_);
+    this.steppedFrame = null;
+    this.boundary = this.scheduler.activate(this.t, this.playing_).boundary;
+    this.scheduler.animate(this.t);
     this.emit();
   }
 
@@ -140,7 +163,7 @@ export class PlaybackEngine {
 
       // current time from the appropriate clock
       let now: number;
-      const videoTime = this.scheduler.videoClockTime(this.segment);
+      const videoTime = this.scheduler.masterClockTime();
       if (videoTime !== null) {
         now = videoTime;
         // keep the virtual clock anchored for a seamless handoff at clip end
@@ -149,29 +172,31 @@ export class PlaybackEngine {
         now = this.virtualNow();
       }
 
-      // advance across segment boundaries
+      // advance across the nearest boundary across all layers
       let guard = 0;
-      while (now >= segmentEnd(this.segment) - BOUNDARY_EPS && guard++ < 8) {
-        const boundary = segmentEnd(this.segment);
+      while (now >= this.boundary - BOUNDARY_EPS && guard++ < 16) {
+        const boundary = this.boundary;
         if (!Number.isFinite(boundary)) break;
-        if (this.segment.type === "video") this.scheduler.swapSlots();
+        this.scheduler.advanceBoundary(boundary);
         this.anchor(boundary);
         now = boundary;
-        this.segment = this.scheduler.activate(boundary, true);
-        if (this.segment.type === "end") break;
+        this.boundary = this.scheduler.activate(boundary, true).boundary;
+        if (!Number.isFinite(this.boundary) && boundary >= dur - BOUNDARY_EPS) break;
       }
 
       // end of timeline
-      if (now >= dur - BOUNDARY_EPS || this.segment.type === "end") {
+      if (now >= dur - BOUNDARY_EPS) {
         if (this.loop && dur > 0) {
           this.t = 0;
           this.anchor(0);
-          this.segment = this.scheduler.activate(0, true);
+          this.boundary = this.scheduler.activate(0, true).boundary;
+          this.scheduler.animate(0);
         } else {
           this.t = dur;
           this.playing_ = false;
           this.scheduler.pauseAll();
           this.scheduler.activate(this.t, false);
+          this.scheduler.animate(this.t);
           this.emit();
           return;
         }
@@ -179,6 +204,7 @@ export class PlaybackEngine {
         this.t = now;
       }
 
+      this.scheduler.animate(this.t);
       this.scheduler.preload(this.t);
       this.emit();
       this.raf = requestAnimationFrame(tick);

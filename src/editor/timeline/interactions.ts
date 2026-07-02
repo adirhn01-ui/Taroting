@@ -5,7 +5,14 @@ import { moveClip, moveMarkerTo, removeMarker, trimClip, findClip } from "../../
 import { clipDuration, clipEnd } from "../../core/time";
 import type { Clip, Marker, ProjectFile, Track } from "../../core/types";
 import { showMenu } from "../../ui/menu";
-import { EDGE_ZONE_PX, MARKER_HIT_PX, RULER_H, laneLayout } from "./render";
+import {
+  EDGE_ZONE_PX,
+  KF_STRIP_H,
+  MARKER_HIT_PX,
+  RULER_H,
+  clipDiamondTimes,
+  laneLayout,
+} from "./render";
 import { collectCandidates, snapMove, snapTime } from "./snap";
 import type { TimelineController } from "./timeline";
 
@@ -18,6 +25,7 @@ export type DragState =
 type Hit =
   | { type: "marker"; marker: Marker }
   | { type: "ruler" }
+  | { type: "kf"; clip: Clip; track: Track; t: number }
   | { type: "clip"; clip: Clip; track: Track; edge: "in" | "out" | null }
   | { type: "lane"; track: Track }
   | { type: "empty" };
@@ -67,6 +75,27 @@ export function attachInteractions(tl: TimelineController): () => void {
         const cx = tl.xOf(clip.timelineStart);
         const cw = clipDuration(clip) * tl.view.pxPerSec;
         if (x < cx - 2 || x > cx + cw + 2) continue;
+        // keyframe diamonds live on the clip's bottom strip; a point inside the
+        // strip within ±4px of a diamond wins over the clip/edge hit.
+        if (clip.keyframes) {
+          const clipTop = lane.y + 2;
+          const clipBot = clipTop + (lane.h - 4);
+          if (y >= clipBot - KF_STRIP_H && y <= clipBot) {
+            const times = clipDiamondTimes(clip);
+            if (times && times.length > 0) {
+              let bestT: number | null = null;
+              let bestDx = 4;
+              for (const tt of times) {
+                const dx = Math.abs(tl.xOf(tt) - x);
+                if (dx <= bestDx) {
+                  bestDx = dx;
+                  bestT = tt;
+                }
+              }
+              if (bestT !== null) return { type: "kf", clip, track: lane.track, t: bestT };
+            }
+          }
+        }
         let edge: "in" | "out" | null = null;
         if (cw > EDGE_ZONE_PX * 3) {
           if (x - cx <= EDGE_ZONE_PX) edge = "in";
@@ -103,6 +132,11 @@ export function attachInteractions(tl: TimelineController): () => void {
     if (hit.type === "marker") {
       tl.seek(hit.marker.t);
       mode = { name: "marker-move", markerId: hit.marker.id, before: tl.projectSnapshot() };
+    } else if (hit.type === "kf") {
+      // diamond: select the clip and seek to it; no drag.
+      tl.select(hit.clip.id);
+      tl.seek(Math.max(0, hit.t));
+      mode = { name: "idle" };
     } else if (hit.type === "clip") {
       tl.select(hit.clip.id);
       if (hit.edge) {
@@ -110,7 +144,7 @@ export function attachInteractions(tl: TimelineController): () => void {
           name: "trim",
           clip: hit.clip,
           edge: hit.edge,
-          candidates: collectCandidates(tl.project(), hit.clip.id, tl.playhead()),
+          candidates: collectCandidates(tl.project(), hit.clip.id, tl.playhead(), hit.clip),
         };
       } else {
         mode = {
@@ -138,11 +172,13 @@ export function attachInteractions(tl: TimelineController): () => void {
       canvas.style.cursor =
         hit.type === "marker"
           ? "ew-resize"
-          : hit.type === "clip"
-            ? hit.edge
-              ? "ew-resize"
-              : "grab"
-            : "default";
+          : hit.type === "kf"
+            ? "pointer"
+            : hit.type === "clip"
+              ? hit.edge
+                ? "ew-resize"
+                : "grab"
+              : "default";
       return;
     }
 
@@ -166,7 +202,7 @@ export function attachInteractions(tl: TimelineController): () => void {
         clip: mode.clip,
         track: mode.track,
         grabOffset: mode.grabOffset,
-        candidates: collectCandidates(tl.project(), mode.clip.id, tl.playhead()),
+        candidates: collectCandidates(tl.project(), mode.clip.id, tl.playhead(), mode.clip),
       };
       canvas.style.cursor = "grabbing";
     }
@@ -242,7 +278,7 @@ export function attachInteractions(tl: TimelineController): () => void {
       showMenu(e.clientX, e.clientY, [
         { label: "Delete marker", danger: true, onSelect: () => tl.commit((p) => removeMarker(p, id)) },
       ]);
-    } else if (hit.type === "clip") {
+    } else if (hit.type === "clip" || hit.type === "kf") {
       e.preventDefault();
       tl.select(hit.clip.id);
       tl.clipMenu(hit.clip, e.clientX, e.clientY);

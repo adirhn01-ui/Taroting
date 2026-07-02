@@ -32,7 +32,10 @@ export class AudioGraph {
   private ctx: AudioContext;
   private master: GainNode;
   private voices: Voice[] = [];
-  private videoGains = new Map<HTMLVideoElement, GainNode>();
+  // video-element gains are attached LAZILY (createMediaElementSource is
+  // one-shot per element; new layers appear over time). The WeakMap lets parked
+  // elements be GC'd if a set is ever dropped.
+  private videoGains = new WeakMap<HTMLVideoElement, GainNode>();
   private lastT = -1;
   private lastPlaying = false;
   private lastProject: ProjectFile | null = null;
@@ -46,16 +49,6 @@ export class AudioGraph {
     this.ctx = new AudioContext({ latencyHint: "interactive" });
     this.master = this.ctx.createGain();
     this.master.connect(this.ctx.destination);
-
-    for (const el of scheduler.videoElements()) {
-      const gain = this.ctx.createGain();
-      this.ctx.createMediaElementSource(el).connect(gain);
-      gain.connect(this.master);
-      // gains own loudness from here on; the element stays neutral
-      el.volume = 1;
-      el.muted = false;
-      this.videoGains.set(el, gain);
-    }
 
     for (let i = 0; i < POOL_SIZE; i++) {
       const el = new Audio();
@@ -89,22 +82,46 @@ export class AudioGraph {
 
   /* ---------------- video embedded audio ---------------- */
 
+  /** The gain node for a preview video element, created (and wired) on first
+   *  use. createMediaElementSource is one-shot per element, so this must be the
+   *  only place a source is created for `el`. */
+  private videoGain(el: HTMLVideoElement): GainNode {
+    let gain = this.videoGains.get(el);
+    if (!gain) {
+      gain = this.ctx.createGain();
+      gain.gain.value = 0;
+      this.ctx.createMediaElementSource(el).connect(gain);
+      gain.connect(this.master);
+      // gains own loudness from here on; the element stays neutral
+      el.volume = 1;
+      el.muted = false;
+      this.videoGains.set(el, gain);
+    }
+    return gain;
+  }
+
   private syncVideoGain(
     t: number,
-    project: ProjectFile,
+    _project: ProjectFile,
     discontinuity: boolean,
     previewSpeed: number,
   ): void {
-    const active = this.scheduler.activeVideoInfo();
-    for (const [el, gain] of this.videoGains) {
-      if (active && el === active.el) {
-        const track = project.timeline.tracks[0]!;
-        if (discontinuity) {
-          this.scheduleEnvelope(gain, active.clip, track, t, previewSpeed);
-        }
-      } else {
-        gain.gain.cancelScheduledValues(this.ctx.currentTime);
-        gain.gain.setValueAtTime(0, this.ctx.currentTime);
+    // Embedded audio from EVERY active video layer mixes (matching export).
+    // Zero every element we've touched, then schedule the active ones with
+    // their own track's envelope.
+    const infos = this.scheduler.activeVideoInfos();
+    const active = new Set(infos.map((i) => i.el));
+    for (const el of this.scheduler.videoElements()) {
+      if (active.has(el)) continue;
+      const gain = this.videoGains.get(el);
+      if (!gain) continue; // never attached → silent already, no source to make
+      gain.gain.cancelScheduledValues(this.ctx.currentTime);
+      gain.gain.setValueAtTime(0, this.ctx.currentTime);
+    }
+    for (const info of infos) {
+      const gain = this.videoGain(info.el);
+      if (discontinuity) {
+        this.scheduleEnvelope(gain, info.clip, info.track, t, previewSpeed);
       }
     }
   }

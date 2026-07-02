@@ -77,6 +77,11 @@
   outline: 1px solid var(--border);
 }
 
+.stage-layer-set {
+  position: absolute;
+  inset: 0;
+}
+
 .stage-layer__pos {
   position: absolute;
   left: 50%;
@@ -104,6 +109,12 @@
   display: block;
   max-width: none;
   max-height: none;
+}
+
+/* generated media (solid / text) rides the same transform tower */
+.stage-layer__gen {
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .preview__overlay {

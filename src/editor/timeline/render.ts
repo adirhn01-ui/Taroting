@@ -2,8 +2,8 @@
 // allocation in the hot path beyond Path2D construction for waveforms.
 
 import { fileStem } from "../../core/format";
-import { clipDuration } from "../../core/time";
-import type { Clip, MediaRef, ProjectFile, Track } from "../../core/types";
+import { clipDuration, timelineTime } from "../../core/time";
+import type { AnimProp, Clip, MediaRef, ProjectFile, Track } from "../../core/types";
 import type { WaveformData } from "../media/media";
 import type { DragState } from "./interactions";
 
@@ -14,6 +14,55 @@ export const LANE_GAP = 4;
 export const EDGE_ZONE_PX = 7;
 /** ±px hit slop around a marker stem in the ruler. */
 export const MARKER_HIT_PX = 5;
+
+/** Height of the clip bottom strip that carries keyframe diamonds. */
+export const KF_STRIP_H = 10;
+/** Props whose in-range keyframes contribute diamonds (their union, deduped). */
+const KF_PROPS: AnimProp[] = ["x", "y", "scale", "opacity"];
+
+/** NLE lane labels: video lanes are V{videoCount - index} (top lane highest,
+ *  bottom = V1); audio lanes are A{j+1} top-down. Cached by the track-count
+ *  signature so no per-frame string churn — rebuilt only when tracks change. */
+let laneLabelCache: { key: string; labels: string[] } | null = null;
+export function laneLabels(project: ProjectFile): string[] {
+  const tracks = project.timeline.tracks;
+  const videoCount = tracks.reduce((n, t) => n + (t.kind === "video" ? 1 : 0), 0);
+  const key = `${tracks.length}:${videoCount}`;
+  if (laneLabelCache && laneLabelCache.key === key) return laneLabelCache.labels;
+  const labels: string[] = [];
+  let vi = 0;
+  let ai = 0;
+  for (const t of tracks) {
+    if (t.kind === "video") labels.push(`V${videoCount - vi++}`);
+    else labels.push(`A${++ai}`);
+  }
+  laneLabelCache = { key, labels };
+  return labels;
+}
+
+/** In-range keyframe timeline-times for a clip's diamonds: the union across all
+ *  animated props with srcIn <= t <= srcOut, deduped at eps 1e-6, ascending.
+ *  Returns null when the clip has no keyframes (zero cost for static clips). */
+export function clipDiamondTimes(clip: Clip): number[] | null {
+  const kfs = clip.keyframes;
+  if (!kfs) return null;
+  const times: number[] = [];
+  for (const prop of KF_PROPS) {
+    const arr = kfs[prop];
+    if (!arr) continue;
+    for (const kf of arr) {
+      if (kf.t < clip.srcIn - 1e-6 || kf.t > clip.srcOut + 1e-6) continue;
+      times.push(timelineTime(clip, kf.t));
+    }
+  }
+  if (times.length === 0) return times;
+  times.sort((a, b) => a - b);
+  const out: number[] = [times[0]!];
+  for (let i = 1; i < times.length; i++) {
+    if (Math.abs(times[i]! - out[out.length - 1]!) > 1e-6) out.push(times[i]!);
+  }
+  return out;
+}
 
 /** Marker flag colors (index 0 = accent, resolved at draw time; 1..5 = fixed
  *  hexes chosen to read on both the dark and light themes). */
@@ -210,7 +259,9 @@ export function draw(ctx: CanvasRenderingContext2D, input: RenderInput): void {
 
   /* ---------------- lanes + clips ---------------- */
   const lanes = laneLayout(input.project);
-  for (const lane of lanes) {
+  const labels = laneLabels(input.project);
+  for (let li = 0; li < lanes.length; li++) {
+    const lane = lanes[li]!;
     if (lane.y > height) break;
     ctx.fillStyle = colors.laneBg;
     ctx.fillRect(0, lane.y, width, lane.h);
@@ -222,6 +273,12 @@ export function draw(ctx: CanvasRenderingContext2D, input: RenderInput): void {
       if (x + w < 0 || x > width) continue;
       drawClip(ctx, input, clip, lane, x, w);
     }
+
+    // lane label (drawn over clips so it stays legible at the corner)
+    ctx.fillStyle = colors.text3;
+    ctx.font = "10px 'Segoe UI Variable Text', 'Segoe UI', sans-serif";
+    ctx.textBaseline = "top";
+    ctx.fillText(labels[li]!, 4, lane.y + 4);
   }
 
   /* ---------------- snap guide ---------------- */
@@ -318,6 +375,27 @@ function drawClip(
     for (const hx of [x + 3.5, x + w - 3.5]) {
       ctx.beginPath();
       ctx.roundRect(hx - 1.5, hy - 8, 3, 16, 2);
+      ctx.fill();
+    }
+  }
+
+  // keyframe diamonds on the bottom strip (only for animated clips)
+  const times = clip.keyframes ? clipDiamondTimes(clip) : null;
+  if (times && times.length > 0) {
+    const t0 = input.t0;
+    const pps = input.pxPerSec;
+    const dy = y + h - KF_STRIP_H / 2; // strip vertical center
+    const rad = selected ? 3.5 : 3; // ~5px overall; selected slightly larger
+    ctx.fillStyle = selected ? colors.accent : colors.accentDim;
+    for (const tt of times) {
+      const dx = (tt - t0) * pps;
+      if (dx < x - 4 || dx > x + Math.max(w, 2) + 4) continue;
+      ctx.beginPath();
+      ctx.moveTo(dx, dy - rad);
+      ctx.lineTo(dx + rad, dy);
+      ctx.lineTo(dx, dy + rad);
+      ctx.lineTo(dx - rad, dy);
+      ctx.closePath();
       ctx.fill();
     }
   }

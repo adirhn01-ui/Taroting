@@ -1,23 +1,41 @@
-// Preview stage: a letterboxed project canvas with pooled media layers.
-// Two <video> layers (A/B double-buffering across cuts), one <img> layer for
-// stills, and a status overlay for media that is still being prepared.
+// Preview stage: a letterboxed project canvas with a dynamic stack of media
+// layer SETS — one per video track. Each set owns an A/B <video> pair (double-
+// buffering across cuts), one <img> for stills, and one "gen" <div> for
+// generated media (solid / text). Sets are z-ordered so index 0 paints on top
+// (z = count - i); z-index 1000+ is reserved for a future ".stage-overlay".
+// A status overlay sits above everything.
 
-import type { ProjectFile } from "../../core/types";
 import type { LayerBoxes } from "./transforms";
+
+/** One video track's worth of pooled preview elements, wrapped in the
+ *  pos/rot/crop transform tower. All four slots share the same layer set; only
+ *  one is displayed at a time (the scheduler owns show/hide). */
+export interface LayerSet {
+  /** the wrapper that carries z-index for the whole set */
+  el: HTMLElement;
+  videoA: LayerBoxes & { media: HTMLVideoElement };
+  videoB: LayerBoxes & { media: HTMLVideoElement };
+  image: LayerBoxes & { media: HTMLImageElement };
+  gen: LayerBoxes & { media: HTMLElement };
+}
 
 export interface Stage {
   root: HTMLElement;
   canvas: HTMLElement;
-  videoA: LayerBoxes & { media: HTMLVideoElement };
-  videoB: LayerBoxes & { media: HTMLVideoElement };
-  image: LayerBoxes & { media: HTMLImageElement };
+  /** one entry per video track, index-aligned with videoTracks(project);
+   *  index 0 is the TOPMOST layer (highest z-index). */
+  layers: LayerSet[];
   overlay: HTMLElement;
   /** px per project-canvas px */
   scale: number;
+  /** (re)build/park layer sets so exactly n are live and mounted */
+  syncLayerCount(n: number): void;
+  /** recompute fit from the current timeline dims (call when they change) */
+  refit(): void;
   dispose(): void;
 }
 
-function buildLayer(tag: "video" | "img"): LayerBoxes {
+function buildLayer(tag: "video" | "img" | "div"): LayerBoxes {
   const pos = document.createElement("div");
   pos.className = "stage-layer__pos";
   const rot = document.createElement("div");
@@ -40,7 +58,23 @@ function buildLayer(tag: "video" | "img"): LayerBoxes {
   return { pos, rot, crop, media };
 }
 
-export function mountStage(host: HTMLElement, project: ProjectFile, onResize: () => void): Stage {
+function buildLayerSet(): LayerSet {
+  const el = document.createElement("div");
+  el.className = "stage-layer-set";
+  const videoA = buildLayer("video") as LayerSet["videoA"];
+  const videoB = buildLayer("video") as LayerSet["videoB"];
+  const image = buildLayer("img") as LayerSet["image"];
+  const gen = buildLayer("div") as LayerSet["gen"];
+  gen.media.className = "stage-layer__media stage-layer__gen";
+  el.append(videoA.pos, videoB.pos, image.pos, gen.pos);
+  return { el, videoA, videoB, image, gen };
+}
+
+export function mountStage(
+  host: HTMLElement,
+  getTimelineDims: () => { width: number; height: number },
+  onResize: () => void,
+): Stage {
   host.innerHTML = `
     <div class="preview no-select">
       <div class="preview__canvas" tabindex="-1"></div>
@@ -49,39 +83,61 @@ export function mountStage(host: HTMLElement, project: ProjectFile, onResize: ()
   const root = host.querySelector<HTMLElement>(".preview")!;
   const canvas = host.querySelector<HTMLElement>(".preview__canvas")!;
 
-  const videoA = buildLayer("video") as Stage["videoA"];
-  const videoB = buildLayer("video") as Stage["videoB"];
-  const image = buildLayer("img") as Stage["image"];
   const overlay = document.createElement("div");
   overlay.className = "preview__overlay";
-  canvas.append(videoA.pos, videoB.pos, image.pos, overlay);
+
+  // a parked pool so growing/shrinking the layer count never destroys elements
+  // (createMediaElementSource is one-shot per <video>, so sets must persist).
+  const pool: LayerSet[] = [];
 
   const stage: Stage = {
     root,
     canvas,
-    videoA,
-    videoB,
-    image,
+    layers: [],
     overlay,
     scale: 1,
+    syncLayerCount(n: number): void {
+      while (pool.length < n) pool.push(buildLayerSet());
+      // detach every set, then (re)attach the first n in z-order.
+      for (const set of pool) if (set.el.parentElement) set.el.remove();
+      const live: LayerSet[] = [];
+      for (let i = 0; i < n; i++) {
+        const set = pool[i]!;
+        set.el.style.zIndex = String(n - i); // index 0 paints on top
+        canvas.appendChild(set.el);
+        live.push(set);
+      }
+      // keep the status overlay topmost
+      canvas.appendChild(overlay);
+      stage.layers = live;
+    },
+    refit(): void {
+      fit();
+    },
     dispose() {
       observer.disconnect();
-      videoA.media.src = "";
-      videoB.media.src = "";
+      for (const set of pool) {
+        set.videoA.media.src = "";
+        set.videoB.media.src = "";
+      }
     },
   };
 
-  const fit = (): void => {
+  // start with a single layer set (today's default cost) + overlay on top
+  stage.syncLayerCount(1);
+
+  function fit(): void {
+    const dims = getTimelineDims();
     const box = root.getBoundingClientRect();
     const pad = 24;
     const availW = Math.max(80, box.width - pad * 2);
     const availH = Math.max(60, box.height - pad * 2);
-    const scale = Math.min(availW / project.timeline.width, availH / project.timeline.height);
+    const scale = Math.min(availW / dims.width, availH / dims.height);
     stage.scale = scale;
-    canvas.style.width = `${Math.round(project.timeline.width * scale)}px`;
-    canvas.style.height = `${Math.round(project.timeline.height * scale)}px`;
+    canvas.style.width = `${Math.round(dims.width * scale)}px`;
+    canvas.style.height = `${Math.round(dims.height * scale)}px`;
     onResize();
-  };
+  }
 
   const observer = new ResizeObserver(fit);
   observer.observe(root);

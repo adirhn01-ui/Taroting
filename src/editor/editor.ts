@@ -116,15 +116,34 @@ export async function mountEditor(
   /* ---------------- playback stack ---------------- */
 
   // mountStage invokes the resize callback synchronously during construction,
-  // before the engine exists — route it through a mutable ref.
+  // before the engine exists — route it through a mutable ref. The stage reads
+  // the CURRENT timeline dims via the getter so a later resolution adoption
+  // refits (Addendum #9).
   let engineRef: PlaybackEngine | null = null;
-  const stage = mountStage($("#ed-stage"), session.project, () => engineRef?.refresh());
+  const stage = mountStage(
+    $("#ed-stage"),
+    () => ({ width: session.project.timeline.width, height: session.project.timeline.height }),
+    () => engineRef?.refresh(),
+  );
   const scheduler = new Scheduler(stage, () => session.project, media);
   const engine = new PlaybackEngine(() => session.project, scheduler);
   engineRef = engine;
 
   const graph = new AudioGraph(() => session.project, media, scheduler);
   const unGraphTick = engine.onTick((t, playing) => graph.tick(t, playing, engine.previewSpeed));
+
+  // Refit the stage when the project canvas w/h changes (resolution adoption,
+  // canvas settings). Cheap: compares two numbers per project change.
+  let stageW = session.project.timeline.width;
+  let stageH = session.project.timeline.height;
+  const unRefit = session.store.subscribe(() => {
+    const { width, height } = session.project.timeline;
+    if (width !== stageW || height !== stageH) {
+      stageW = width;
+      stageH = height;
+      stage.refit();
+    }
+  });
 
   /* ---------------- ui state ---------------- */
 
@@ -482,11 +501,8 @@ export async function mountEditor(
       media,
       timeline,
       audioGraph: graph,
-      activeVideo: (): HTMLVideoElement | null => {
-        if (stage.videoA.pos.style.display !== "none") return stage.videoA.media;
-        if (stage.videoB.pos.style.display !== "none") return stage.videoB.media;
-        return null;
-      },
+      scheduler,
+      activeVideo: (): HTMLVideoElement | null => scheduler.activeVideo(),
     };
   }
 
@@ -496,6 +512,7 @@ export async function mountEditor(
       unsubSettings();
       unTick();
       unGraphTick();
+      unRefit();
       for (const u of unsubs) u();
       unlistenDrop();
       inspector.dispose();

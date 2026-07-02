@@ -325,6 +325,141 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       return "suppressed on body, preserved on <input>";
     });
 
+    // ---- v0.6 Phase 3: multi-layer playback, stepping, canvas refit ----
+
+    await test("multi-layer-composite", async () => {
+      const { addVideoTrack, makeClip, insertClip } = await import("../core/project");
+      const scheduler = (dev as unknown as { scheduler: import("../editor/playback/scheduler").Scheduler }).scheduler;
+      const counter = session.project.media[0]!; // the counter fixture (imported first)
+
+      let topId = "";
+      session.commit((p) => { const r = addVideoTrack(p); topId = r.trackId; return r.project; });
+      session.commit((p) => {
+        const clip = makeClip(counter, 1);
+        clip.srcOut = clip.srcIn + 2; // 2s footprint → occupies [1,3]
+        return insertClip(p, topId, clip);
+      });
+      engine.refresh();
+
+      engine.seek(2);
+      await sleep(200);
+      const infos = scheduler.activeVideoInfos();
+      assert(infos.length === 2, `expected 2 active video layers at t=2, got ${infos.length}`);
+      const setOf = (el: HTMLVideoElement): HTMLElement =>
+        el.closest(".stage-layer-set") as HTMLElement;
+      const zTop = Number(setOf(infos[0]!.el).style.zIndex);
+      const zBot = Number(setOf(infos[1]!.el).style.zIndex);
+      assert(zTop > zBot, `topmost layer must have higher z-index (${zTop} vs ${zBot})`);
+      assert(infos[0]!.track.id === topId, "topmost active info must be the new top track");
+
+      engine.seek(4);
+      await sleep(150);
+      assert(scheduler.activeVideoInfos().length === 1, "expected 1 active video layer at t=4");
+
+      engine.seek(2.5);
+      await sleep(150);
+      const samples: number[] = [];
+      engine.play();
+      for (let i = 0; i < 12; i++) { await sleep(100); samples.push(engine.time); }
+      engine.pause();
+      let monotone = true;
+      for (let i = 1; i < samples.length; i++) if (samples[i]! < samples[i - 1]! - 0.02) monotone = false;
+      assert(monotone, `engine.time not monotone: ${samples.map((s) => s.toFixed(2)).join(",")}`);
+      assert(engine.time > 3, `expected to cross the top-layer 3s boundary, reached ${engine.time.toFixed(3)}`);
+
+      session.undo(); session.undo();
+      engine.refresh();
+      return `2-layer composite ok; z ${zTop}>${zBot}; crossed 3s, reached ${engine.time.toFixed(2)}s`;
+    });
+
+    await test("frame-step-rapid", async () => {
+      const fps = engine.fps();
+      const frameAt2 = (mt: number): number => Math.floor((mt * fps.num) / fps.den + 1e-9);
+      engine.seek(frameCenter(100, fps));
+      await sleep(150);
+      for (let i = 0; i < 10; i++) engine.stepFrames(1); // no sleeps → must chain to 110
+      await sleep(250);
+      let mt = await presentedMediaTime(dev.activeVideo()!);
+      assert(frameAt2(mt) === 110, `after 10x +1 expected frame 110, presented ${frameAt2(mt)}`);
+      for (let i = 0; i < 10; i++) engine.stepFrames(-1);
+      await sleep(250);
+      mt = await presentedMediaTime(dev.activeVideo()!);
+      assert(frameAt2(mt) === 100, `after 10x -1 expected frame 100, presented ${frameAt2(mt)}`);
+      return "rapid stepping lands exactly: 100 → 110 → 100";
+    });
+
+    await test("canvas-refit", async () => {
+      const { setProjectCanvas } = await import("../core/project");
+      const canvas = document.querySelector<HTMLElement>(".preview__canvas")!;
+      session.commit((p) => setProjectCanvas(p, 1280, 720));
+      await sleep(120); // let stage.refit() from the store subscription run
+      const w = parseFloat(canvas.style.width);
+      const h = parseFloat(canvas.style.height);
+      const ratio = w / h;
+      assert(Math.abs(ratio - 16 / 9) < 0.02, `canvas ratio ${ratio.toFixed(3)} not 16:9`);
+      session.undo();
+      engine.refresh();
+      return `refit to 16:9 ok (${w}x${h}, ratio ${ratio.toFixed(3)})`;
+    });
+
+    // ---- v0.6 Phase 3: keyframe UI evaluation + project canvas panel ----
+
+    await test("keyframe-ui-eval", async () => {
+      const { setPositionKeyframes, clearAnimation, findClip } = await import("../core/project");
+      const { evalKfs } = await import("../core/anim");
+      const { sourceTime } = await import("../core/time");
+      const { computeTransform } = await import("../editor/preview/transforms");
+
+      const clip0 = session.project.timeline.tracks[0]!.clips[0]!;
+      const id = clip0.id;
+
+      session.commit((p) => setPositionKeyframes(p, id, 0, -50, 0));
+      session.commit((p) => setPositionKeyframes(p, id, 2, 50, 0));
+
+      engine.seek(1);
+      await sleep(120);
+      const clip = findClip(session.project, id)!.clip;
+      const s = sourceTime(clip, engine.time - clip.timelineStart);
+      const evalX = evalKfs(clip.keyframes!.x!, s);
+      const expected = -50 + (50 - -50) * 0.5; // lerp(-50, 50, 0.5) = 0
+      assert(Math.abs(evalX - expected) < 1e-6, `evalX=${evalX}, expected ${expected}`);
+
+      const media2 = session.project.media.find((m) => m.id === clip.mediaId)!;
+      const proj = session.project.timeline;
+      const ct = computeTransform(clip.transform, media2, proj);
+      assert(Math.abs(ct.posX - clip.transform!.x) < 1e-6, "computeTransform reads static x");
+
+      session.commit((p) => clearAnimation(p, id, "position", { x: evalX, y: 0 }));
+      const baked = findClip(session.project, id)!.clip;
+      assert(baked.keyframes?.x === undefined, "position kfs should be cleared");
+      assert(Math.abs(baked.transform!.x - evalX) < 1e-6, `baked x=${baked.transform!.x}`);
+
+      session.undo();
+      session.undo();
+      session.undo();
+      engine.refresh();
+      const restored = findClip(session.project, id)!.clip;
+      assert(restored.keyframes === undefined, "keyframes should be gone after undo x3");
+      return `evalX=${evalX.toFixed(3)} (expected ${expected}); bake+undo round-trip exact`;
+    });
+
+    await test("project-canvas-panel", async () => {
+      const { setProjectCanvas, checkInvariants } = await import("../core/project");
+      const tl = (): import("../core/types").Timeline => session.project.timeline;
+      const w0 = tl().width;
+      const h0 = tl().height;
+
+      session.commit((p) => setProjectCanvas(p, 1280, 720));
+      assert(tl().width === 1280 && tl().height === 720, `${tl().width}x${tl().height}`);
+      const errs = checkInvariants(session.project);
+      assert(errs.length === 0, `invariants: ${errs.join("; ")}`);
+
+      session.undo();
+      engine.refresh();
+      assert(tl().width === w0 && tl().height === h0, `undo restored ${tl().width}x${tl().height}`);
+      return `canvas 1280x720 set + invariants clean + undo restored ${w0}x${h0}`;
+    });
+
     await test("timeline-canvas-painted", () => {
       const canvas = document.querySelector<HTMLCanvasElement>(".timeline-canvas");
       assert(canvas !== null, "timeline canvas missing");
