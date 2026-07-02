@@ -25,6 +25,7 @@ fn main() {
             media::probe::probe_media,
             media::playability::plan_playback,
             media::waveform::ensure_waveform,
+            media::normalize::normalize_scan,
             media::thumbs::get_thumbnail,
             media::thumbs::ensure_filmstrip,
             jobs::cancel_job,

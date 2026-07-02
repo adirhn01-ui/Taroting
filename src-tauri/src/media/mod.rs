@@ -1,3 +1,4 @@
+pub mod normalize;
 pub mod playability;
 pub mod prepare;
 pub mod probe;

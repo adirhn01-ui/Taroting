@@ -1,0 +1,133 @@
+/* Right-docked properties panel. */
+
+.inspector {
+  width: 280px;
+  flex: 0 0 280px;
+  border-left: 1px solid var(--border);
+  background: var(--bg-panel);
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.inspector .empty-state {
+  flex: 1;
+  padding: var(--sp-6);
+  text-align: center;
+  font-size: var(--fs-13);
+}
+
+.insp-header {
+  padding: var(--sp-4);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.insp-header__name {
+  font-size: var(--fs-14);
+  font-weight: 600;
+  color: var(--text-1);
+  word-break: break-word;
+}
+.insp-header__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.insp-header__dur {
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+
+.insp-body {
+  display: flex;
+  flex-direction: column;
+}
+
+.insp-section {
+  padding: var(--sp-4);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+.insp-section__title {
+  font-size: var(--fs-11);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.insp-field {
+  gap: var(--sp-1);
+}
+
+.insp-row {
+  display: flex;
+  gap: var(--sp-3);
+}
+.insp-row > .field {
+  flex: 1;
+  min-width: 0;
+}
+.insp-row > .btn {
+  flex: 1;
+}
+
+.insp-slider {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+.insp-slider .slider {
+  flex: 1;
+}
+.insp-slider__value {
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  min-width: 46px;
+  text-align: right;
+}
+
+.insp-num {
+  width: 100%;
+}
+
+.insp-block {
+  width: 100%;
+  justify-content: center;
+}
+
+.insp-sublabel {
+  font-size: var(--fs-12);
+  font-weight: 500;
+  color: var(--text-2);
+}
+
+.insp-crop {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.insp-crop__grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-2);
+}
+
+.insp-readout {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}
+
+.insp-note {
+  font-size: var(--fs-12);
+  color: var(--text-3);
+  font-style: italic;
+}

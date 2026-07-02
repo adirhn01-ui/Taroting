@@ -391,6 +391,72 @@ export function setClipSpeed(p: ProjectFile, clipId: string, speed: number): Pro
   }));
 }
 
+/** Detach a video clip's embedded audio into its own audio-track clip.
+ *  The new clip shares the source range/speed and gets its own copy of the
+ *  audio settings; the source clip is marked audio.detached so it contributes
+ *  no sound. The new clip lands on the first audio track that can hold it at
+ *  the same start; otherwise a fresh audio track is created. No-op unless the
+ *  clip lives on the video track, its media has audio, and it isn't already
+ *  detached. */
+export function detachAudio(
+  p: ProjectFile,
+  clipId: string,
+): { project: ProjectFile; audioClipId: string | null } {
+  const found = findClip(p, clipId);
+  if (!found || found.track.kind !== "video") return { project: p, audioClipId: null };
+  const { clip } = found;
+  const media = findMedia(p, clip.mediaId);
+  if (!media || !media.hasAudio || clip.audio.detached) {
+    return { project: p, audioClipId: null };
+  }
+
+  const audioClipId = uid();
+  const audioClip: Clip = {
+    id: audioClipId,
+    mediaId: clip.mediaId,
+    timelineStart: clip.timelineStart,
+    srcIn: clip.srcIn,
+    srcOut: clip.srcOut,
+    speed: clip.speed,
+    audio: { ...clip.audio, detached: false },
+  };
+
+  // mark the source clip detached
+  let project = updateClip(p, clipId, { audio: { ...clip.audio, detached: true } });
+
+  // find an audio track that keeps the clip at the same start
+  const dur = clipDuration(audioClip);
+  let trackId: string | null = null;
+  for (const t of project.timeline.tracks) {
+    if (t.kind !== "audio") continue;
+    const pos = resolvePosition(t.clips, dur, audioClip.timelineStart);
+    if (Math.abs(pos - audioClip.timelineStart) <= EPS) {
+      trackId = t.id;
+      break;
+    }
+  }
+  if (trackId === null) {
+    const r = addAudioTrack(project);
+    project = r.project;
+    trackId = r.trackId;
+  }
+  project = insertClip(project, trackId, audioClip);
+  return { project, audioClipId };
+}
+
+/** Silence a clip's audio contribution by marking it detached (in place).
+ *  Works for video-track clips; no-op if already detached or media has no
+ *  audio. */
+export function removeClipAudio(p: ProjectFile, clipId: string): ProjectFile {
+  const found = findClip(p, clipId);
+  if (!found) return p;
+  const { clip } = found;
+  if (clip.audio.detached) return p;
+  const media = findMedia(p, clip.mediaId);
+  if (!media || !media.hasAudio) return p;
+  return updateClip(p, clipId, { audio: { ...clip.audio, detached: true } });
+}
+
 export function touchModified(p: ProjectFile): ProjectFile {
   return { ...p, modifiedAt: new Date().toISOString() };
 }

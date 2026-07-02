@@ -9,6 +9,7 @@ import { navigate } from "../core/nav";
 import { createProject, importMediaAsClip, splitClip } from "../core/project";
 import type { ProjectSession } from "../core/session";
 import { frameCenter } from "../core/time";
+import type { AudioGraph } from "../editor/playback/audio-graph";
 import type { MediaManager } from "../editor/media/media";
 import type { PlaybackEngine } from "../editor/playback/engine";
 
@@ -16,6 +17,7 @@ export interface DevHook {
   engine: PlaybackEngine;
   session: ProjectSession;
   media: MediaManager;
+  audioGraph: AudioGraph;
   activeVideo(): HTMLVideoElement | null;
 }
 
@@ -216,6 +218,19 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       engine.refresh();
       assert(t > 8.4, `expected to cross the 8s cut, reached ${t.toFixed(3)}`);
       return `crossed cut, reached ${t.toFixed(3)}s`;
+    });
+
+    await test("audio-drift", async () => {
+      const graph = dev.audioGraph;
+      graph.resetDriftStats();
+      engine.seek(1);
+      await sleep(200);
+      engine.play();
+      await sleep(3000);
+      engine.pause();
+      const drift = graph.maxObservedDriftSec();
+      assert(drift < 0.12, `A/V drift ${drift.toFixed(4)}s exceeded 0.12s`);
+      return `max A/V drift ${(drift * 1000).toFixed(1)}ms over 3s`;
     });
 
     await test("timeline-canvas-painted", () => {

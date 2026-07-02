@@ -91,6 +91,16 @@ export class ProjectSession {
     this.markDirty();
   }
 
+  /** Commit a history step for changes already applied via replace().
+   *  Used by slider drags: live edits go through replace() (no history),
+   *  then one history entry is pushed on release. `before` is the snapshot
+   *  captured when the drag began. No-op if nothing actually changed. */
+  commitFrom(before: ProjectFile): void {
+    if (this.store.get() === before) return;
+    this.history.push(before);
+    this.markDirty();
+  }
+
   /** Replace state without a history entry (e.g. media relink fixups). */
   replace(next: ProjectFile): void {
     if (next === this.store.get()) return;

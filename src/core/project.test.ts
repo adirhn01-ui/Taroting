@@ -5,8 +5,10 @@ import {
   addMedia,
   checkInvariants,
   createProject,
+  detachAudio,
   findClip,
   insertClip,
+  removeClipAudio,
   makeClip,
   moveClip,
   removeClip,
@@ -359,5 +361,65 @@ describe("fuzz", () => {
       p = history.undo(p)!;
     }
     expect(p).toEqual(initial);
+  });
+});
+
+describe("audio detach / remove", () => {
+  it("detaches into an aligned audio clip, invariants hold", () => {
+    const { p, clipId } = baseProject();
+    const src = findClip(p, clipId)!.clip;
+    const { project, audioClipId } = detachAudio(p, clipId);
+    expect(audioClipId).not.toBeNull();
+    expectClean(project);
+
+    // source clip is now detached
+    expect(findClip(project, clipId)!.clip.audio.detached).toBe(true);
+
+    // new clip is on an audio track, aligned, sharing source params
+    const found = findClip(project, audioClipId!)!;
+    expect(found.track.kind).toBe("audio");
+    expect(found.clip.timelineStart).toBeCloseTo(src.timelineStart, 6);
+    expect(found.clip.srcIn).toBe(src.srcIn);
+    expect(found.clip.srcOut).toBe(src.srcOut);
+    expect(found.clip.speed).toBe(src.speed);
+    expect(found.clip.mediaId).toBe(src.mediaId);
+    expect(found.clip.audio.detached).toBe(false);
+    expect(found.clip.transform).toBeUndefined();
+  });
+
+  it("detaching twice is a no-op", () => {
+    const { p, clipId } = baseProject();
+    const once = detachAudio(p, clipId);
+    const twice = detachAudio(once.project, clipId);
+    expect(twice.audioClipId).toBeNull();
+    expect(twice.project).toBe(once.project);
+  });
+
+  it("detach uses a new track when the first is occupied at that position", () => {
+    let { p, clipId } = baseProject();
+    // occupy an audio track at [0..60) so the detached clip can't align there
+    const media = p.media.find((m) => m.kind === "video")!;
+    const at = addAudioTrack(p);
+    p = at.project;
+    const blocker = makeClip(media, 0);
+    p = insertClip(p, at.trackId, blocker);
+
+    const before = p.timeline.tracks.filter((t) => t.kind === "audio").length;
+    const { project, audioClipId } = detachAudio(p, clipId);
+    const after = project.timeline.tracks.filter((t) => t.kind === "audio").length;
+    expect(after).toBe(before + 1);
+    const found = findClip(project, audioClipId!)!;
+    expect(found.clip.timelineStart).toBeCloseTo(0, 6);
+    expect(found.track.id).not.toBe(at.trackId);
+    expectClean(project);
+  });
+
+  it("removeClipAudio marks detached and round-trips", () => {
+    const { p, clipId } = baseProject();
+    const removed = removeClipAudio(p, clipId);
+    expect(findClip(removed, clipId)!.clip.audio.detached).toBe(true);
+    expectClean(removed);
+    // already detached → no-op (same reference)
+    expect(removeClipAudio(removed, clipId)).toBe(removed);
   });
 });

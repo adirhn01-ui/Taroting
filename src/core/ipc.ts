@@ -104,6 +104,12 @@ export const ipc = {
     call<WaveformResult>("ensure_waveform", { key, duration, hasAudio }),
   getThumbnail: (key: MediaKey, atSec: number) =>
     call<string>("get_thumbnail", { key, atSec }),
+  normalizeScan: (path: string, srcIn: number, srcOut: number) =>
+    call<{ maxVolumeDb: number; suggestedGainDb: number }>("normalize_scan", {
+      path,
+      srcIn,
+      srcOut,
+    }),
   ensureFilmstrip: (key: MediaKey, duration: number, intervalSec: number, heightPx: number) =>
     call<FilmstripResult>("ensure_filmstrip", { key, duration, intervalSec, heightPx }),
   cancelJob: (id: number) => call<boolean>("cancel_job", { id }),

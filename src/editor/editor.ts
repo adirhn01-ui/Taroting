@@ -17,12 +17,15 @@ import {
 } from "../core/project";
 import { ProjectSession, currentSession, settingsStore } from "../core/session";
 import { ShortcutManager } from "../core/shortcuts";
+import { Store } from "../core/store";
 import { clipEnd, locate } from "../core/time";
 import { MEDIA_FILE_EXTENSIONS } from "../core/types";
 import type { Clip, MediaInfo, MediaRef } from "../core/types";
 import { icon } from "../ui/icons";
 import { toast } from "../ui/toast";
+import { mountInspector } from "./inspector/inspector";
 import { MediaManager } from "./media/media";
+import { AudioGraph } from "./playback/audio-graph";
 import { PlaybackEngine } from "./playback/engine";
 import { Scheduler } from "./playback/scheduler";
 import { mountStage } from "./preview/preview";
@@ -95,6 +98,7 @@ export async function mountEditor(
             <div class="timeline-host" id="ed-timeline"></div>
           </div>
         </div>
+        <aside class="inspector-panel" id="ed-inspector"></aside>
       </div>
       <div class="drop-overlay" id="ed-drop">
         <div class="drop-overlay__inner">Drop to import into this project</div>
@@ -114,23 +118,38 @@ export async function mountEditor(
   const engine = new PlaybackEngine(() => session.project, scheduler);
   engineRef = engine;
 
+  const graph = new AudioGraph(() => session.project, media, scheduler);
+  const unGraphTick = engine.onTick((t, playing) => graph.tick(t, playing, engine.previewSpeed));
+
   /* ---------------- ui state ---------------- */
 
-  let selectedClipId: string | null = null;
+  const selection = new Store<string | null>(null);
   let snapOn = true;
   let clipboard: { clip: Clip; kind: "video" | "audio" } | null = null;
 
   const select = (id: string | null): void => {
-    selectedClipId = id;
+    selection.set(id);
   };
+  const selectedClipId = (): string | null => selection.get();
 
   const timeline = new TimelineController($("#ed-timeline"), {
     session,
     media,
     engine,
     select,
-    getSelected: () => selectedClipId,
+    getSelected: () => selection.get(),
     snapEnabled: () => snapOn,
+  });
+
+  const inspector = mountInspector($("#ed-inspector"), {
+    session,
+    media,
+    engine,
+    selection,
+    refresh: () => {
+      engine.refresh();
+      timeline.requestRender();
+    },
   });
 
   /* ---------------- actions ---------------- */
@@ -144,8 +163,9 @@ export async function mountEditor(
   function clipUnderPlayhead(): Clip | null {
     const t = engine.time;
     const p = session.project;
-    if (selectedClipId) {
-      const f = findClip(p, selectedClipId);
+    const sel = selectedClipId();
+    if (sel) {
+      const f = findClip(p, sel);
       if (f && t > f.clip.timelineStart + 1e-6 && t < clipEnd(f.clip) - 1e-6) return f.clip;
     }
     for (const track of p.timeline.tracks) {
@@ -163,20 +183,21 @@ export async function mountEditor(
       commit((p) => splitClip(p, target.id, t).project);
     },
     remove(): void {
-      if (!selectedClipId) return;
-      const id = selectedClipId;
+      const id = selectedClipId();
+      if (!id) return;
       select(null);
       commit((p) => removeClip(p, id));
     },
     ripple(): void {
-      if (!selectedClipId) return;
-      const id = selectedClipId;
+      const id = selectedClipId();
+      if (!id) return;
       select(null);
       commit((p) => rippleDelete(p, id));
     },
     copy(): void {
-      if (!selectedClipId) return;
-      const found = findClip(session.project, selectedClipId);
+      const id = selectedClipId();
+      if (!id) return;
+      const found = findClip(session.project, id);
       if (found) {
         clipboard = {
           clip: JSON.parse(JSON.stringify(found.clip)) as Clip,
@@ -389,6 +410,7 @@ export async function mountEditor(
 
   // show the first frame
   engine.seek(0);
+  graph.tick(engine.time, engine.playing, engine.previewSpeed);
 
   // dev hook for the in-app autotest harness
   if (import.meta.env.DEV) {
@@ -397,6 +419,7 @@ export async function mountEditor(
       session,
       media,
       timeline,
+      audioGraph: graph,
       activeVideo: (): HTMLVideoElement | null => {
         if (stage.videoA.pos.style.display !== "none") return stage.videoA.media;
         if (stage.videoB.pos.style.display !== "none") return stage.videoB.media;
@@ -410,10 +433,13 @@ export async function mountEditor(
       shortcuts.detach();
       unsubSettings();
       unTick();
+      unGraphTick();
       for (const u of unsubs) u();
       unlistenDrop();
+      inspector.dispose();
       timeline.dispose();
       engine.dispose();
+      graph.dispose();
       stage.dispose();
       media.dispose();
       currentSession.set(null);

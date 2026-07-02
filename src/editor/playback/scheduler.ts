@@ -36,6 +36,8 @@ export class Scheduler {
   private slotSrc: Record<Slot, string | null> = { A: null, B: null };
   private activeSlot: Slot = "A";
   private shown: "A" | "B" | "image" | "none" = "none";
+  /** The clip currently shown in the active video slot (null otherwise). */
+  private activeClip: Clip | null = null;
 
   constructor(
     private stage: Stage,
@@ -87,6 +89,20 @@ export class Scheduler {
 
   /* ---------------- element management ---------------- */
 
+  /** The two pooled preview video elements (for the audio graph to route). */
+  videoElements(): HTMLVideoElement[] {
+    return [this.stage.videoA.media, this.stage.videoB.media];
+  }
+
+  /** The currently shown video slot's element and clip, or null when no video
+   *  segment is on screen (image / gap / end). The AudioGraph reads this to
+   *  drive the video element's embedded-audio gain. */
+  activeVideoInfo(): { el: HTMLVideoElement; clip: Clip } | null {
+    if (this.shown !== "A" && this.shown !== "B") return null;
+    if (!this.activeClip) return null;
+    return { el: this.video(this.activeSlot), clip: this.activeClip };
+  }
+
   private video(slot: Slot): HTMLVideoElement {
     return (slot === "A" ? this.stage.videoA : this.stage.videoB).media;
   }
@@ -121,12 +137,8 @@ export class Scheduler {
     const project = this.getProject();
     const layer = slot === "image" ? this.stage.image : this.layer(slot);
     styleLayer(layer, clip.transform, media, project.timeline, this.stage.scale);
-    if (slot !== "image") {
-      const el = this.video(slot);
-      const track = this.videoTrack();
-      el.muted = clip.audio.muted || track.muted;
-      el.volume = Math.min(1, Math.max(0, clip.audio.volume));
-    }
+    // Loudness is owned by the AudioGraph now — the video elements stay neutral
+    // (volume 1, unmuted); the graph applies gain/mute/fades per clip.
   }
 
   /** Re-apply styling after project edits or stage resize. */
@@ -145,6 +157,7 @@ export class Scheduler {
         const { clip, media } = segment;
         const url = this.urlFor(media);
         if (!url) {
+          this.activeClip = null;
           this.show("none");
           const st = this.media.status.get()[media.id];
           setOverlay(
@@ -162,6 +175,7 @@ export class Scheduler {
           el.currentTime = srcT;
         }
         el.playbackRate = clip.speed * this.previewSpeed;
+        this.activeClip = clip;
         this.show(this.activeSlot);
         if (playing) {
           void el.play().catch(() => {});
@@ -172,6 +186,7 @@ export class Scheduler {
         return segment;
       }
       case "image": {
+        this.activeClip = null;
         setOverlay(this.stage, null);
         const img = this.stage.image.media;
         const url = mediaUrl(segment.media.path);
@@ -182,6 +197,7 @@ export class Scheduler {
         return segment;
       }
       default: {
+        this.activeClip = null;
         setOverlay(this.stage, null);
         this.show("none");
         this.pauseAll();
