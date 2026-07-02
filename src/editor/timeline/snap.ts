@@ -25,6 +25,7 @@ export function collectCandidates(
       out.push(clip.timelineStart, clipEnd(clip));
     }
   }
+  for (const marker of project.timeline.markers ?? []) out.push(marker.t);
   return out;
 }
 

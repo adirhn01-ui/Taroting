@@ -4,7 +4,7 @@
 
 import type { ProjectSession } from "../../core/session";
 import { timelineDuration } from "../../core/time";
-import type { MediaRef, ProjectFile } from "../../core/types";
+import type { Clip, MediaRef, ProjectFile } from "../../core/types";
 import type { MediaManager } from "../media/media";
 import type { PlaybackEngine } from "../playback/engine";
 import { attachInteractions, type DragState } from "./interactions";
@@ -17,6 +17,8 @@ export interface TimelineDeps {
   select(id: string | null): void;
   getSelected(): string | null;
   snapEnabled(): boolean;
+  /** Open the clip context menu at a viewport (client) position. */
+  onClipMenu(clip: Clip, clientX: number, clientY: number): void;
 }
 
 const MIN_PX_PER_SEC = 0.5;
@@ -159,6 +161,25 @@ export class TimelineController {
     this.deps.session.commit(mutate);
     this.deps.engine.refresh();
     this.requestRender();
+  }
+  /** Current project snapshot (for capturing a gesture's `before`). */
+  projectSnapshot(): ProjectFile {
+    return this.deps.session.project;
+  }
+  /** Live, history-free replace during a gesture (drag). */
+  liveReplace(mutate: (p: ProjectFile) => ProjectFile): void {
+    this.deps.session.replace(mutate(this.deps.session.project));
+    this.deps.engine.refresh();
+    this.requestRender();
+  }
+  /** Close a gesture: push one history entry from the captured `before`. */
+  commitFrom(before: ProjectFile): void {
+    this.deps.session.commitFrom(before);
+    this.requestRender();
+  }
+  /** Delegate to the editor to build a clip context menu. */
+  clipMenu(clip: Clip, clientX: number, clientY: number): void {
+    this.deps.onClipMenu(clip, clientX, clientY);
   }
   setDrag(drag: DragState, guide: number | null): void {
     this.drag = drag;

@@ -23,6 +23,7 @@ const paths: Record<string, string> = {
   volume: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12"/>',
   mute: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="m22 9-6 6M16 9l6 6"/>',
   warning: '<path d="M12 3 2 20h20z"/><path d="M12 9v5m0 3v.01"/>',
+  flag: '<path d="M4 22V4M4 4h11l-2 4 2 4H4"/>',
 };
 
 export function icon(name: keyof typeof paths | string, size = 16): string {

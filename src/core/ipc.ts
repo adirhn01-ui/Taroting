@@ -95,6 +95,11 @@ export const ipc = {
   pathExists: (path: string) => call<boolean>("path_exists", { path }),
   newProjectPath: (name?: string) =>
     call<string>("new_project_path", { name: name ?? null }),
+  renameProject: (path: string, newName: string) =>
+    call<string>("rename_project", { path, newName }),
+  duplicateProject: (path: string, newName: string, newId: string) =>
+    call<string>("duplicate_project", { path, newName, newId }),
+  deleteProject: (path: string) => call<void>("delete_project", { path }),
   getSettings: () => call<Settings | null>("get_settings", undefined, () => null),
   saveSettings: (settings: Settings) => call<void>("save_settings", { settings }),
 

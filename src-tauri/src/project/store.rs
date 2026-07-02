@@ -43,6 +43,33 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
 const MAX_RECENTS: usize = 24;
 
+/// Current UTC time as an ISO 8601 string (e.g. `2026-07-02T15:04:05Z`),
+/// computed from the Unix epoch with no external date crate.
+fn now_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    // civil-from-days (Howard Hinnant), epoch shifted to 0000-03-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, m, d, hh, mm, ss
+    )
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RecentItem {
@@ -51,6 +78,12 @@ pub struct RecentItem {
     pub modified_at: String,
     pub duration_sec: f64,
     pub thumb: Option<String>,
+    /// on-disk size of the `.trt` file; refreshed by `list_recents`
+    #[serde(default)]
+    pub size_bytes: u64,
+    /// last time this project was opened (ISO 8601 UTC); stamped by `load_project`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -84,8 +117,18 @@ fn write_recents(index: &RecentsIndex) -> Result<()> {
     atomic_write(&recents_path()?, serde_json::to_vec(index)?.as_slice())
 }
 
-fn upsert_recent(item: RecentItem) -> Result<()> {
+fn upsert_recent(mut item: RecentItem) -> Result<()> {
     let mut index = read_recents();
+    // Preserve a prior openedAt when the caller doesn't supply one, and refresh
+    // the on-disk size so callers don't all have to stat.
+    if let Some(prev) = index.items.iter().find(|r| r.path == item.path) {
+        if item.opened_at.is_none() {
+            item.opened_at = prev.opened_at.clone();
+        }
+    }
+    if let Ok(meta) = std::fs::metadata(&item.path) {
+        item.size_bytes = meta.len();
+    }
     index.items.retain(|r| r.path != item.path);
     index.items.insert(0, item);
     index.items.truncate(MAX_RECENTS);
@@ -95,8 +138,14 @@ fn upsert_recent(item: RecentItem) -> Result<()> {
 #[tauri::command]
 pub fn list_recents() -> Result<RecentsIndex> {
     let mut index = read_recents();
-    // Drop entries whose project file vanished (moved/deleted by the user).
+    // Drop entries whose project file vanished (moved/deleted by the user),
+    // and refresh the on-disk size of the survivors.
     index.items.retain(|r| Path::new(&r.path).is_file());
+    for r in &mut index.items {
+        if let Ok(meta) = std::fs::metadata(&r.path) {
+            r.size_bytes = meta.len();
+        }
+    }
     Ok(index)
 }
 
@@ -161,11 +210,41 @@ pub fn load_project(path: String) -> Result<LoadedProject> {
         }
     }
 
+    // Stamp openedAt on this path's recents entry (create it if absent — a
+    // freshly opened file may not be in the list yet).
+    stamp_opened(&path, &typed);
+
     Ok(LoadedProject {
         project: migrated,
         missing,
         recovered,
     })
+}
+
+/// Record that `path` was just opened. Updates the existing recents entry's
+/// `opened_at`, or inserts a fresh entry built from the loaded project.
+fn stamp_opened(path: &str, typed: &ProjectFile) {
+    let now = now_iso8601();
+    let mut index = read_recents();
+    if let Some(entry) = index.items.iter_mut().find(|r| r.path == path) {
+        entry.opened_at = Some(now);
+    } else {
+        let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        index.items.insert(
+            0,
+            RecentItem {
+                path: path.to_string(),
+                name: typed.name.clone(),
+                modified_at: typed.modified_at.clone(),
+                duration_sec: typed.timeline.duration(),
+                thumb: None,
+                size_bytes,
+                opened_at: Some(now),
+            },
+        );
+        index.items.truncate(MAX_RECENTS);
+    }
+    let _ = write_recents(&index);
 }
 
 #[derive(Debug, Serialize)]
@@ -213,6 +292,8 @@ pub fn save_project(
         modified_at: typed.modified_at.clone(),
         duration_sec: typed.timeline.duration(),
         thumb,
+        size_bytes: 0, // filled by upsert_recent via fs metadata
+        opened_at: None, // preserved from any prior entry by upsert_recent
     })?;
 
     Ok(SavedProject {
@@ -245,6 +326,116 @@ pub fn new_project_path(name: Option<String>) -> Result<String> {
     Err(AppError::BadInput("could not find a free project name".into()))
 }
 
+/// Pick a free `<base>.trt` path in `dir`, deduping to `<base> (2).trt` etc.
+/// when the plain name is taken. `base` must already be sanitized.
+fn free_path_in(dir: &Path, base: &str) -> Result<PathBuf> {
+    for n in 0..1000 {
+        let candidate = if n == 0 {
+            dir.join(format!("{base}.trt"))
+        } else {
+            dir.join(format!("{base} ({}).trt", n + 1))
+        };
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::BadInput("could not find a free project name".into()))
+}
+
+/// Read a project file as a raw JSON `Value`, preserving unknown fields.
+fn read_raw_value(path: &Path) -> Result<Value> {
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::BadInput(format!("{} is not valid JSON", path.display())))
+}
+
+/// Rename a project on disk: rewrite its inner `name`, move the file to a
+/// sanitized/deduped path in the same dir, drop the stale `.bak`, and update
+/// the recents entry. Returns the new path.
+#[tauri::command]
+pub fn rename_project(path: String, new_name: String) -> Result<String> {
+    let old = Path::new(&path);
+    let dir = old
+        .parent()
+        .ok_or_else(|| AppError::BadInput(format!("no parent dir for {}", old.display())))?;
+
+    let mut value = read_raw_value(old)?;
+    let base = sanitize_filename(&new_name);
+    let new_path = free_path_in(dir, &base)?;
+
+    value["name"] = Value::String(new_name);
+    atomic_write(&new_path, serde_json::to_vec_pretty(&value)?.as_slice())?;
+
+    if new_path != old {
+        let _ = std::fs::remove_file(old);
+        let mut bak = old.as_os_str().to_owned();
+        bak.push(".bak");
+        let _ = std::fs::remove_file(PathBuf::from(bak));
+    }
+
+    // Replace the recents entry's path + name, preserving the rest.
+    let new_path_str = new_path.to_string_lossy().into_owned();
+    let mut index = read_recents();
+    let name_field = value["name"].as_str().unwrap_or_default().to_string();
+    if let Some(entry) = index.items.iter_mut().find(|r| r.path == path) {
+        entry.path = new_path_str.clone();
+        entry.name = name_field;
+    }
+    let _ = write_recents(&index);
+
+    Ok(new_path_str)
+}
+
+/// Duplicate a project: copy its raw JSON with a new `name` + `id`, to a
+/// deduped path derived from `new_name`, and add it to recents. The caller
+/// supplies `new_id` (frontend `crypto.randomUUID()`). Returns the new path.
+#[tauri::command]
+pub fn duplicate_project(path: String, new_name: String, new_id: String) -> Result<String> {
+    let src = Path::new(&path);
+    let dir = src
+        .parent()
+        .ok_or_else(|| AppError::BadInput(format!("no parent dir for {}", src.display())))?;
+
+    let mut value = read_raw_value(src)?;
+    value["name"] = Value::String(new_name.clone());
+    value["id"] = Value::String(new_id);
+
+    let base = sanitize_filename(&new_name);
+    let new_path = free_path_in(dir, &base)?;
+    atomic_write(&new_path, serde_json::to_vec_pretty(&value)?.as_slice())?;
+
+    let new_path_str = new_path.to_string_lossy().into_owned();
+    let size_bytes = std::fs::metadata(&new_path).map(|m| m.len()).unwrap_or(0);
+    // Carry the source's duration/thumb across so the new card looks right
+    // before it is ever opened+saved.
+    let src_recent = read_recents().items.into_iter().find(|r| r.path == path);
+    upsert_recent(RecentItem {
+        path: new_path_str.clone(),
+        name: new_name,
+        modified_at: value["modifiedAt"].as_str().unwrap_or_default().to_string(),
+        duration_sec: src_recent.as_ref().map(|r| r.duration_sec).unwrap_or(0.0),
+        thumb: src_recent.and_then(|r| r.thumb),
+        size_bytes,
+        opened_at: None,
+    })?;
+
+    Ok(new_path_str)
+}
+
+/// Permanently delete a project file, its `.bak` sibling, and its recents entry.
+#[tauri::command]
+pub fn delete_project(path: String) -> Result<()> {
+    let p = Path::new(&path);
+    std::fs::remove_file(p)?;
+    let mut bak = p.as_os_str().to_owned();
+    bak.push(".bak");
+    let _ = std::fs::remove_file(PathBuf::from(bak));
+
+    let mut index = read_recents();
+    index.items.retain(|r| r.path != path);
+    write_recents(&index)
+}
+
 pub fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -273,6 +464,178 @@ mod tests {
         assert_eq!(sanitize_filename("dots..."), "dots");
         assert_eq!(sanitize_filename(""), "Untitled");
         assert_eq!(sanitize_filename("***"), "___");
+    }
+
+    // The recents index lives under %APPDATA%, a process-global env var. Every
+    // test touching rename/duplicate/delete (which read+write recents) points
+    // APPDATA at its own temp dir; ENV_LOCK serializes them so parallel threads
+    // never share state. `with_isolated` acquires the lock, sets up a private
+    // temp dir + APPDATA, runs the body, then restores and cleans up.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_isolated(tag: &str, body: impl FnOnce(&Path)) {
+        // Hold the lock for the whole test; recover it even if a prior test panicked.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "taroting-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", dir.join("appdata"));
+
+        body(&dir);
+
+        match prev {
+            Some(v) => std::env::set_var("APPDATA", v),
+            None => std::env::remove_var("APPDATA"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_json(path: &Path, v: &Value) {
+        std::fs::write(path, serde_json::to_vec_pretty(v).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn now_iso8601_is_well_formed() {
+        let s = now_iso8601();
+        // e.g. 2026-07-02T15:04:05Z
+        assert_eq!(s.len(), 20, "unexpected length: {s}");
+        assert!(s.ends_with('Z'));
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[10..11], "T");
+        let year: i64 = s[0..4].parse().unwrap();
+        assert!(year >= 2024 && year < 3000, "implausible year: {year}");
+    }
+
+    #[test]
+    fn rename_preserves_unknown_fields_and_updates_name() {
+        with_isolated("rename", |dir| {
+            let old = dir.join("Old.trt");
+            let value = serde_json::json!({
+                "schema": 1, "app": "taroting", "id": "abc", "name": "Old",
+                "createdAt": "x", "modifiedAt": "y",
+                "media": [], "timeline": {}, "export": {},
+                "futureField": { "nested": [1, 2, 3] }
+            });
+            write_json(&old, &value);
+
+            let new_path =
+                rename_project(old.to_string_lossy().into_owned(), "Fresh".into()).unwrap();
+            assert!(new_path.ends_with("Fresh.trt"), "got {new_path}");
+            assert!(!old.exists(), "old file should be gone");
+
+            let written: Value = read_raw_value(Path::new(&new_path)).unwrap();
+            assert_eq!(written["name"], "Fresh");
+            assert_eq!(written["id"], "abc"); // untouched
+            assert_eq!(written["futureField"]["nested"], serde_json::json!([1, 2, 3]));
+        });
+    }
+
+    #[test]
+    fn rename_dedupes_when_target_exists() {
+        with_isolated("rename-dedupe", |dir| {
+            let old = dir.join("A.trt");
+            write_json(&old, &serde_json::json!({ "name": "A", "id": "1" }));
+            write_json(&dir.join("Taken.trt"), &serde_json::json!({ "name": "Taken" }));
+
+            let new_path =
+                rename_project(old.to_string_lossy().into_owned(), "Taken".into()).unwrap();
+            assert!(new_path.ends_with("Taken (2).trt"), "got {new_path}");
+        });
+    }
+
+    #[test]
+    fn duplicate_gives_fresh_id_and_leaves_original() {
+        with_isolated("dup", |dir| {
+            let src = dir.join("Src.trt");
+            write_json(
+                &src,
+                &serde_json::json!({ "name": "Src", "id": "orig-id", "modifiedAt": "z", "keep": true }),
+            );
+
+            let new_path = duplicate_project(
+                src.to_string_lossy().into_owned(),
+                "Src copy".into(),
+                "new-id".into(),
+            )
+            .unwrap();
+            assert!(new_path.ends_with("Src copy.trt"), "got {new_path}");
+            assert!(src.exists(), "original must remain");
+
+            let orig: Value = read_raw_value(&src).unwrap();
+            assert_eq!(orig["id"], "orig-id"); // original untouched
+
+            let copy: Value = read_raw_value(Path::new(&new_path)).unwrap();
+            assert_eq!(copy["id"], "new-id");
+            assert_eq!(copy["name"], "Src copy");
+            assert_eq!(copy["keep"], true); // unknown field preserved
+        });
+    }
+
+    #[test]
+    fn delete_removes_file_and_bak() {
+        with_isolated("delete", |dir| {
+            let target = dir.join("Gone.trt");
+            atomic_write(&target, b"one").unwrap();
+            atomic_write(&target, b"two").unwrap(); // creates Gone.trt.bak
+            let bak = dir.join("Gone.trt.bak");
+            assert!(target.exists() && bak.exists());
+
+            delete_project(target.to_string_lossy().into_owned()).unwrap();
+            assert!(!target.exists(), "file should be deleted");
+            assert!(!bak.exists(), ".bak should be deleted");
+        });
+    }
+
+    #[test]
+    fn recents_lifecycle_across_commands() {
+        with_isolated("recents", |dir| {
+            // Seed a recents entry for a source project.
+            let src = dir.join("Proj.trt");
+            write_json(
+                &src,
+                &serde_json::json!({ "name": "Proj", "id": "1", "modifiedAt": "m" }),
+            );
+            upsert_recent(RecentItem {
+                path: src.to_string_lossy().into_owned(),
+                name: "Proj".into(),
+                modified_at: "m".into(),
+                duration_sec: 12.5,
+                thumb: None,
+                size_bytes: 0,
+                opened_at: Some("2020-01-01T00:00:00Z".into()),
+            })
+            .unwrap();
+            assert_eq!(read_recents().items.len(), 1, "seed should persist");
+
+            // Rename → recents entry path+name updated in place.
+            let renamed =
+                rename_project(src.to_string_lossy().into_owned(), "Renamed".into()).unwrap();
+            let items = read_recents().items;
+            assert!(items.iter().any(|r| r.path == renamed && r.name == "Renamed"));
+            assert!(!items.iter().any(|r| r.name == "Proj"));
+
+            // Duplicate → new recents entry carrying the source duration, no openedAt.
+            let dup = duplicate_project(renamed.clone(), "Renamed copy".into(), "dup-id".into())
+                .unwrap();
+            let items = read_recents().items;
+            let dup_entry = items.iter().find(|r| r.path == dup).unwrap();
+            assert_eq!(dup_entry.duration_sec, 12.5);
+            assert!(dup_entry.opened_at.is_none());
+
+            // Delete → recents entry removed.
+            delete_project(dup.clone()).unwrap();
+            assert!(!read_recents().items.iter().any(|r| r.path == dup));
+
+            // list_recents refreshes size_bytes for survivors.
+            let listed = list_recents().unwrap();
+            let entry = listed.items.iter().find(|r| r.path == renamed).unwrap();
+            assert!(entry.size_bytes > 0, "size should be stat'ed");
+        });
     }
 
     #[test]

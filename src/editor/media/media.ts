@@ -112,6 +112,15 @@ export class MediaManager {
     for (const media of project.media) void this.ensure(media);
   }
 
+  /** Forget a media item's tracking and re-ensure it against the current
+   *  project (e.g. after a relink changed its path/size/mtime → new cache
+   *  keys). Safe no-op if the media no longer exists. */
+  retrack(mediaId: string): void {
+    this.tracked.delete(mediaId);
+    const m = this.getProject().media.find((x) => x.id === mediaId);
+    if (m) void this.ensure(m);
+  }
+
   async ensure(media: MediaRef): Promise<void> {
     if (this.disposed || this.tracked.has(media.id)) return;
     this.tracked.add(media.id);

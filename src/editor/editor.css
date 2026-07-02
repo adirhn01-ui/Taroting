@@ -296,3 +296,71 @@
   font-weight: 600;
   color: var(--accent-strong);
 }
+
+/* Inspector: muted warning variant of the italic note (restore-audio hint). */
+.insp-note--warn {
+  color: var(--warn);
+  font-style: normal;
+}
+
+/* ---------------- relink dialog ---------------- */
+.relink-modal {
+  width: min(640px, 92vw);
+}
+.relink-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.relink-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  background: var(--bg-panel);
+}
+.relink-row--resolved {
+  opacity: 0.65;
+}
+.relink-row__info {
+  min-width: 0;
+}
+.relink-row__name {
+  font-weight: 600;
+  font-size: var(--fs-14);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.relink-row__path {
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.relink-row__status {
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}
+.relink-row__status--ok {
+  color: var(--ok, var(--accent));
+}
+.relink-row__status--bad {
+  color: var(--danger);
+}
+.relink-row__warn {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-12);
+  color: var(--warn);
+}
+.relink-row__warn .btn {
+  margin-left: auto;
+}

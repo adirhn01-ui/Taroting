@@ -7,6 +7,8 @@ import { describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles } from "../cor
 import { navigate } from "../core/nav";
 import {
   addAudioTrack,
+  addMarkerAt,
+  addMedia,
   findClip,
   importMediaAsClip,
   insertClip,
@@ -14,6 +16,7 @@ import {
   rippleDelete,
   splitClip,
   uid,
+  updateClip,
 } from "../core/project";
 import { ProjectSession, currentSession, settingsStore } from "../core/session";
 import { ShortcutManager } from "../core/shortcuts";
@@ -22,10 +25,12 @@ import { clipEnd, locate } from "../core/time";
 import { MEDIA_FILE_EXTENSIONS } from "../core/types";
 import type { Clip, MediaInfo, MediaRef } from "../core/types";
 import { icon } from "../ui/icons";
+import { showMenu } from "../ui/menu";
 import { toast } from "../ui/toast";
 import { openExportDialog } from "./export/export-dialog";
 import { mountInspector } from "./inspector/inspector";
 import { MediaManager } from "./media/media";
+import { openRelinkDialog } from "./media/relink";
 import { AudioGraph } from "./playback/audio-graph";
 import { PlaybackEngine } from "./playback/engine";
 import { Scheduler } from "./playback/scheduler";
@@ -52,9 +57,6 @@ export async function mountEditor(
   media.ensureAll(session.project);
 
   if (loaded.recovered) toast.info("Project restored from its automatic backup.");
-  if (loaded.missing.length > 0) {
-    toast.error(`${loaded.missing.length} media file(s) are missing on disk.`);
-  }
 
   /* ---------------- layout ---------------- */
 
@@ -94,6 +96,7 @@ export async function mountEditor(
               <button class="btn btn--ghost btn--icon btn--sm" id="tr-loop" title="Loop playback (L)">${icon("loop", 14)}</button>
               <button class="btn btn--ghost btn--icon btn--sm btn--on" id="tr-snap" title="Snapping (N)">${icon("magnet", 14)}</button>
               <button class="btn btn--ghost btn--icon btn--sm" id="tr-split" title="Split at playhead (S)">${icon("scissors", 14)}</button>
+              <button class="btn btn--ghost btn--icon btn--sm" id="tr-marker" title="Add marker (M)">${icon("flag", 14)}</button>
               <button class="btn btn--ghost btn--icon btn--sm" id="tr-zoom-out" title="Zoom out">${icon("zoomOut", 14)}</button>
               <button class="btn btn--ghost btn--icon btn--sm" id="tr-zoom-in" title="Zoom in (Ctrl+wheel)">${icon("zoomIn", 14)}</button>
             </div>
@@ -141,6 +144,7 @@ export async function mountEditor(
     select,
     getSelected: () => selection.get(),
     snapEnabled: () => snapOn,
+    onClipMenu: (clip, clientX, clientY) => openClipMenu(clip, clientX, clientY),
   });
 
   const inspector = mountInspector($("#ed-inspector"), {
@@ -241,6 +245,50 @@ export async function mountEditor(
     },
   };
 
+  /* ---------------- clip context menu ---------------- */
+
+  // Pick one media file and retarget `clip` at it: probe → add to the bin →
+  // point the clip's mediaId at it, resetting srcIn and clamping srcOut to the
+  // new source length (images keep their footprint). No confirmation.
+  async function replaceClipMedia(clip: Clip): Promise<void> {
+    const files = await pickMediaFiles();
+    const path = files[0];
+    if (!path) return;
+    let info: MediaInfo;
+    try {
+      info = await ipc.probeMedia(path);
+    } catch (e) {
+      toast.error(`Couldn't read ${fileStem(path)}: ${describeError(e)}`);
+      return;
+    }
+    commit((p) => {
+      const added = addMedia(p, info);
+      return updateClip(added.project, clip.id, (c) => ({
+        ...c,
+        mediaId: added.media.id,
+        srcIn: 0,
+        srcOut:
+          info.kind === "image" ? c.srcOut - c.srcIn : Math.min(info.duration, c.srcOut - c.srcIn),
+      }));
+    });
+    media.ensureAll(session.project);
+    select(clip.id);
+  }
+
+  // Built on demand by the timeline (right-click on a clip). The clip is already
+  // selected by the timeline before this runs. Instant actions, no confirms.
+  function openClipMenu(clip: Clip, clientX: number, clientY: number): void {
+    const t = engine.time;
+    const insideClip = t > clip.timelineStart + 1e-6 && t < clipEnd(clip) - 1e-6;
+    showMenu(clientX, clientY, [
+      { label: "Copy", onSelect: () => actions.copy() },
+      { label: "Split at playhead", disabled: !insideClip, onSelect: () => actions.split() },
+      { label: "Replace media…", onSelect: () => void replaceClipMedia(clip) },
+      { label: "Delete", onSelect: () => actions.remove() },
+      { label: "Ripple delete", danger: true, onSelect: () => actions.ripple() },
+    ]);
+  }
+
   /* ---------------- transport ---------------- */
 
   const playBtn = $("#tr-play");
@@ -261,6 +309,10 @@ export async function mountEditor(
   $("#tr-step-back").addEventListener("click", () => engine.stepFrames(-1));
   $("#tr-step-fwd").addEventListener("click", () => engine.stepFrames(1));
   $("#tr-split").addEventListener("click", () => actions.split());
+  const addMarker = (): void => {
+    commit((p) => addMarkerAt(p, engine.time).project);
+  };
+  $("#tr-marker").addEventListener("click", addMarker);
   $("#tr-zoom-in").addEventListener("click", () => timeline.zoomCentered(1.5));
   $("#tr-zoom-out").addEventListener("click", () => timeline.zoomCentered(1 / 1.5));
   $("#tr-speed").addEventListener("change", (e) => {
@@ -406,6 +458,7 @@ export async function mountEditor(
   shortcuts.on("paste", () => actions.paste());
   shortcuts.on("toggleSnap", () => snapBtn.click());
   shortcuts.on("toggleLoop", () => loopBtn.click());
+  shortcuts.on("addMarker", addMarker);
   shortcuts.on("export", () => openExportDialog({ session }));
   shortcuts.on("goHome", () => navigate({ view: "home" }));
   shortcuts.attach();
@@ -415,6 +468,11 @@ export async function mountEditor(
   // show the first frame
   engine.seek(0);
   graph.tick(engine.time, engine.playing, engine.previewSpeed);
+
+  // Offer to relink any media whose file is missing/changed on disk.
+  if (loaded.missing.length > 0) {
+    openRelinkDialog({ session, media, missing: loaded.missing });
+  }
 
   // dev hook for the in-app autotest harness
   if (import.meta.env.DEV) {

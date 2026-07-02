@@ -51,6 +51,20 @@ function resolve(p: ProjectFile, id: string | null): Target | null {
   return { clip: found.clip, media, onVideoTrack: found.track.kind === "video" };
 }
 
+/** True if some clip on an audio track shares this clip's media and overlaps its
+ *  source [srcIn, srcOut) range — i.e. a detached copy that would double-play. */
+function audioCopyOverlaps(p: ProjectFile, t: Target): boolean {
+  const { clip } = t;
+  for (const track of p.timeline.tracks) {
+    if (track.kind !== "audio") continue;
+    for (const c of track.clips) {
+      if (c.mediaId !== clip.mediaId) continue;
+      if (c.srcIn < clip.srcOut && clip.srcIn < c.srcOut) return true;
+    }
+  }
+  return false;
+}
+
 export function mountInspector(
   host: HTMLElement,
   ctx: InspectorCtx,
@@ -414,8 +428,25 @@ export function mountInspector(
     const clipDur = clipDuration(t.clip);
 
     if (t.onVideoTrack && a.detached) {
-      const note = el("div", "insp-note", "Audio detached");
-      s.appendChild(note);
+      s.appendChild(el("div", "insp-note", "Audio detached"));
+      s.appendChild(
+        button("Restore audio", "btn btn--sm insp-block", () => {
+          commit((p) =>
+            updateClip(p, clipId, (c) => ({ ...c, audio: { ...c.audio, detached: false } })),
+          );
+        }),
+      );
+      // Warn if a detached copy of this media overlaps our source range on an
+      // audio track — restoring would then play the sound twice.
+      if (audioCopyOverlaps(ctx.session.project, t)) {
+        s.appendChild(
+          el(
+            "div",
+            "insp-note insp-note--warn",
+            "A detached copy exists on an audio track — restoring may double the sound.",
+          ),
+        );
+      }
       return s;
     }
 

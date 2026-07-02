@@ -232,6 +232,10 @@ export interface RecentItem {
   modifiedAt: string;
   durationSec: number;
   thumb: string | null;
+  /** on-disk size of the .trt file, refreshed by list_recents */
+  sizeBytes: number;
+  /** ISO 8601; stamped when the project is opened (absent until first open) */
+  openedAt?: string;
 }
 
 export interface RecentsIndex {

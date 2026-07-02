@@ -5,6 +5,37 @@ import { setNavigator, type Route } from "./core/nav";
 import { initSettings } from "./core/session";
 import { mountHome } from "./home/home";
 
+// Suppress WebView2's native context menu everywhere except editable text
+// fields (which keep native copy/paste). Our own contextmenu handlers still
+// fire — preventDefault only kills the browser's default menu. Zero-cost.
+window.addEventListener("contextmenu", (e) => {
+  const t = e.target as HTMLElement;
+  const editable =
+    t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t.isContentEditable;
+  if (!editable) e.preventDefault();
+});
+
+// In production only, block browser-chrome shortcuts that make no sense in a
+// packaged desktop app (print, reload, find, downloads, view-source, …).
+if (!import.meta.env.DEV) {
+  window.addEventListener(
+    "keydown",
+    (e) => {
+      const k = e.key;
+      const ctrl = e.ctrlKey && !e.altKey;
+      if (
+        (ctrl && (k === "p" || k === "r" || k === "f" || k === "j" || k === "u")) ||
+        k === "F5" ||
+        k === "F3" ||
+        k === "F7"
+      ) {
+        e.preventDefault();
+      }
+    },
+    true,
+  );
+}
+
 // Boot: paint the home screen immediately. The editor is a separate chunk,
 // prefetched on idle so opening a project is instant without slowing startup.
 

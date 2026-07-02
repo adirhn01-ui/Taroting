@@ -1,10 +1,11 @@
 // Pointer interactions: select, move, trim, scrub, zoom, pan. Drags are
 // transient (rendered as overrides); the project mutates once on pointer-up.
 
-import { moveClip, trimClip, findClip } from "../../core/project";
+import { moveClip, moveMarkerTo, removeMarker, trimClip, findClip } from "../../core/project";
 import { clipDuration, clipEnd } from "../../core/time";
-import type { Clip, ProjectFile, Track } from "../../core/types";
-import { EDGE_ZONE_PX, RULER_H, laneLayout } from "./render";
+import type { Clip, Marker, ProjectFile, Track } from "../../core/types";
+import { showMenu } from "../../ui/menu";
+import { EDGE_ZONE_PX, MARKER_HIT_PX, RULER_H, laneLayout } from "./render";
 import { collectCandidates, snapMove, snapTime } from "./snap";
 import type { TimelineController } from "./timeline";
 
@@ -15,6 +16,7 @@ export type DragState =
   | null;
 
 type Hit =
+  | { type: "marker"; marker: Marker }
   | { type: "ruler" }
   | { type: "clip"; clip: Clip; track: Track; edge: "in" | "out" | null }
   | { type: "lane"; track: Track }
@@ -32,15 +34,32 @@ type Mode =
       startY: number;
     }
   | { name: "move"; clip: Clip; track: Track; grabOffset: number; candidates: number[] }
-  | { name: "trim"; clip: Clip; edge: "in" | "out"; candidates: number[] };
+  | { name: "trim"; clip: Clip; edge: "in" | "out"; candidates: number[] }
+  | { name: "marker-move"; markerId: string; before: ProjectFile };
 
 export function attachInteractions(tl: TimelineController): () => void {
   const canvas = tl.canvas;
   let mode: Mode = { name: "idle" };
 
   const hitTest = (x: number, y: number): Hit => {
-    if (y < RULER_H) return { type: "ruler" };
     const project = tl.project();
+    if (y < RULER_H) {
+      // markers first: a point within ±MARKER_HIT_PX of a marker stem wins
+      const markers = project.timeline.markers;
+      if (markers) {
+        let best: Marker | null = null;
+        let bestDx = MARKER_HIT_PX;
+        for (const m of markers) {
+          const dx = Math.abs(tl.xOf(m.t) - x);
+          if (dx <= bestDx) {
+            bestDx = dx;
+            best = m;
+          }
+        }
+        if (best) return { type: "marker", marker: best };
+      }
+      return { type: "ruler" };
+    }
     const t = tl.tOf(x);
     for (const lane of laneLayout(project)) {
       if (y < lane.y || y > lane.y + lane.h) continue;
@@ -81,7 +100,10 @@ export function attachInteractions(tl: TimelineController): () => void {
     const { x, y } = localPos(e);
     const hit = hitTest(x, y);
 
-    if (hit.type === "clip") {
+    if (hit.type === "marker") {
+      tl.seek(hit.marker.t);
+      mode = { name: "marker-move", markerId: hit.marker.id, before: tl.projectSnapshot() };
+    } else if (hit.type === "clip") {
       tl.select(hit.clip.id);
       if (hit.edge) {
         mode = {
@@ -114,12 +136,26 @@ export function attachInteractions(tl: TimelineController): () => void {
     if (mode.name === "idle") {
       const hit = hitTest(x, y);
       canvas.style.cursor =
-        hit.type === "clip" ? (hit.edge ? "ew-resize" : "grab") : "default";
+        hit.type === "marker"
+          ? "ew-resize"
+          : hit.type === "clip"
+            ? hit.edge
+              ? "ew-resize"
+              : "grab"
+            : "default";
       return;
     }
 
     if (mode.name === "scrub") {
       tl.seek(Math.max(0, tl.tOf(x)));
+      return;
+    }
+
+    if (mode.name === "marker-move") {
+      const id = mode.markerId;
+      const t = Math.max(0, tl.tOf(x));
+      tl.liveReplace((p) => moveMarkerTo(p, id, t));
+      tl.seek(t);
       return;
     }
 
@@ -180,7 +216,9 @@ export function attachInteractions(tl: TimelineController): () => void {
     if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
     const drag = tl.drag;
 
-    if (mode.name === "move" && drag?.kind === "move") {
+    if (mode.name === "marker-move") {
+      tl.commitFrom(mode.before);
+    } else if (mode.name === "move" && drag?.kind === "move") {
       tl.commit((p: ProjectFile) => moveClip(p, drag.clipId, drag.start, drag.toTrackId));
     } else if (mode.name === "trim" && (drag?.kind === "trimIn" || drag?.kind === "trimOut")) {
       tl.commit((p: ProjectFile) =>
@@ -191,6 +229,25 @@ export function attachInteractions(tl: TimelineController): () => void {
     mode = { name: "idle" };
     canvas.style.cursor = "default";
     tl.setDrag(null, null);
+  };
+
+  /* ---------------- context menu ---------------- */
+
+  const onContextMenu = (e: MouseEvent): void => {
+    const { x, y } = localPos(e as unknown as PointerEvent);
+    const hit = hitTest(x, y);
+    if (hit.type === "marker") {
+      e.preventDefault();
+      const id = hit.marker.id;
+      showMenu(e.clientX, e.clientY, [
+        { label: "Delete marker", danger: true, onSelect: () => tl.commit((p) => removeMarker(p, id)) },
+      ]);
+    } else if (hit.type === "clip") {
+      e.preventDefault();
+      tl.select(hit.clip.id);
+      tl.clipMenu(hit.clip, e.clientX, e.clientY);
+    }
+    // ruler / lane / empty: leave the global suppression to swallow the default
   };
 
   /* ---------------- wheel: zoom / pan ---------------- */
@@ -211,6 +268,7 @@ export function attachInteractions(tl: TimelineController): () => void {
   canvas.addEventListener("pointermove", onPointerMove);
   canvas.addEventListener("pointerup", onPointerUp);
   canvas.addEventListener("pointercancel", onPointerUp);
+  canvas.addEventListener("contextmenu", onContextMenu);
   canvas.addEventListener("wheel", onWheel, { passive: false });
 
   return () => {
@@ -218,6 +276,7 @@ export function attachInteractions(tl: TimelineController): () => void {
     canvas.removeEventListener("pointermove", onPointerMove);
     canvas.removeEventListener("pointerup", onPointerUp);
     canvas.removeEventListener("pointercancel", onPointerUp);
+    canvas.removeEventListener("contextmenu", onContextMenu);
     canvas.removeEventListener("wheel", onWheel);
   };
 }

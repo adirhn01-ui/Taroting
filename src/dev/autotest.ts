@@ -235,6 +235,96 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       return `max A/V drift ${(drift * 1000).toFixed(1)}ms over 3s`;
     });
 
+    // ---- v0.6 interaction QoL: markers, restore-audio, ctx-menu suppression ----
+
+    await test("marker-add-seek-drag-delete", async () => {
+      const { addMarkerAt, moveMarkerTo, removeMarker } = await import("../core/project");
+      const markers = (): import("../core/types").Marker[] =>
+        session.project.timeline.markers ?? [];
+      const before = markers().length;
+
+      // add at the playhead (transport "M" equivalent)
+      engine.seek(4);
+      await sleep(50);
+      let id = "";
+      session.commit((p) => {
+        const r = addMarkerAt(p, engine.time);
+        id = r.markerId;
+        return r.project;
+      });
+      assert(markers().length === before + 1, `add: ${markers().length} markers`);
+      const added = markers().find((m) => m.id === id)!;
+      assert(Math.abs(added.t - 4) < 1e-6, `marker t=${added.t}, expected 4`);
+
+      // seek-to-marker (what a pointerdown on the flag does)
+      engine.seek(added.t);
+      assert(Math.abs(engine.time - added.t) < 0.05, `seek-to-marker time=${engine.time}`);
+
+      // drag (marker-move gesture, clamped >= 0)
+      session.commit((p) => moveMarkerTo(p, id, 9));
+      assert(Math.abs(markers().find((m) => m.id === id)!.t - 9) < 1e-6, "drag to 9s");
+
+      // right-click → delete
+      session.commit((p) => removeMarker(p, id));
+      assert(!markers().some((m) => m.id === id), "marker not deleted");
+      assert(markers().length === before, `after delete: ${markers().length}`);
+      return "add → seek → drag(4→9) → delete round-trip exact";
+    });
+
+    await test("restore-audio-round-trip", async () => {
+      const { detachAudio, updateClip, findClip, importMediaAsClip } = await import(
+        "../core/project"
+      );
+      // the counter fixture is video-only; use direct_h264.mp4 (testsrc2+sine)
+      // which actually has an audio stream to detach.
+      const info = await ipc.probeMedia(`${fixturesDir}\\direct_h264.mp4`);
+      assert(info.hasAudio, "fixture direct_h264.mp4 must have audio");
+      let id = "";
+      session.commit((p) => {
+        const r = importMediaAsClip(p, info);
+        id = r.clipId;
+        return r.project;
+      });
+
+      // detach via the existing mutation
+      session.commit((p) => detachAudio(p, id).project);
+      const detached = findClip(session.project, id)!.clip;
+      assert(detached.audio.detached === true, "clip should be detached");
+
+      // restore via the button-equivalent mutation the inspector runs
+      session.commit((p) =>
+        updateClip(p, id, (c) => ({ ...c, audio: { ...c.audio, detached: false } })),
+      );
+      const restored = findClip(session.project, id)!.clip;
+      assert(restored.audio.detached === false, "clip should be restored");
+
+      // clean up: restore → detach → import
+      session.undo();
+      session.undo();
+      session.undo();
+      engine.refresh();
+      return "detach → restore flips audio.detached true→false";
+    });
+
+    await test("contextmenu-suppressed", () => {
+      // main.ts installs a window-level contextmenu handler that preventDefaults
+      // on any non-editable target. Dispatch on document.body and assert it took.
+      const ev = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+      const delivered = document.body.dispatchEvent(ev);
+      assert(ev.defaultPrevented === true, "native context menu was not suppressed");
+      assert(delivered === false, "contextmenu default should be prevented");
+
+      // an editable field keeps the native menu (copy/paste)
+      const inp = document.createElement("input");
+      document.body.appendChild(inp);
+      const ev2 = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+      inp.dispatchEvent(ev2);
+      const ok = ev2.defaultPrevented === false;
+      inp.remove();
+      assert(ok, "editable input should keep the native context menu");
+      return "suppressed on body, preserved on <input>";
+    });
+
     await test("timeline-canvas-painted", () => {
       const canvas = document.querySelector<HTMLCanvasElement>(".timeline-canvas");
       assert(canvas !== null, "timeline canvas missing");
@@ -304,6 +394,61 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       assert(Math.abs(info.duration - engine.duration()) < 0.6, `duration=${info.duration}`);
       assert(info.hasAudio, "expected audio stream");
       return `exported ${info.width}x${info.height} h264, ${info.duration.toFixed(2)}s, audio ok`;
+    });
+
+    // Full-stack v0.6 export: 2 stacked video layers + a windowed top clip with
+    // x/opacity keyframes + a text generator → Rust builder → ffmpeg → probe.
+    // Exercises overlay stacking, kf_expr (position + alphamerge), drawtext
+    // textfile lifecycle, tail-pad.
+    await test("export-v06-layers-keyframes-text", async () => {
+      const { startExport } = await import("../editor/export/export-ipc");
+      const { onJobEvents } = await import("../core/ipc");
+      const p = session.project;
+      const baseTrack = p.timeline.tracks.find((t) => t.kind === "video")!;
+      const baseClip = baseTrack.clips[0];
+      assert(!!baseClip, "need at least one base clip");
+      const textMedia = {
+        id: "atx_text", path: "Text", size: 0, mtimeMs: 0, kind: "image" as const,
+        duration: 0, hasAudio: false, width: 640, height: 360,
+        generator: { type: "text" as const, text: "TAROTING 100%", fontFamily: "Arial" as const,
+          sizePx: 96, color: "#ffffff", bold: true, italic: false },
+      };
+      const topClip = {
+        id: "atx_top", mediaId: "atx_text", timelineStart: 0,
+        srcIn: 0, srcOut: Math.min(2, baseClip!.srcOut - baseClip!.srcIn), speed: 1,
+        transform: { rotate: 0 as const, flipH: false, flipV: false, scale: 1, x: 0, y: 0, opacity: 1 },
+        audio: { volume: 1, muted: false, fadeInSec: 0, fadeOutSec: 0, gainOffsetDb: 0, detached: false },
+        keyframes: {
+          x: [{ t: 0, v: -100 }, { t: 2, v: 100 }],
+          opacity: [{ t: 0, v: 0.2 }, { t: 2, v: 1 }],
+        },
+      };
+      const topTrack = { id: "atx_vtop", kind: "video" as const, name: "V2", muted: false, clips: [topClip] };
+      // tracks[0] is TOPMOST → unshift the overlay track above the existing prefix.
+      const timeline = { ...p.timeline, tracks: [topTrack, ...p.timeline.tracks] };
+      const outPath = `${fixturesDir}\\..\\autotest-export-v06.mp4`;
+      const spec = {
+        media: [...p.media, textMedia], timeline,
+        preset: { format: "mp4" as const, vcodec: "h264" as const, resolution: { w: 640, h: 360 },
+          fps: 30, videoBitrate: "auto" as const, audioBitrate: "auto" as const, useHardware: false },
+        outPath,
+      };
+      const jobId = await startExport(spec);
+      const result = await new Promise<{ ok: boolean; detail: string }>((resolve) => {
+        let un: () => void = () => {};
+        const timer = setTimeout(() => { un(); resolve({ ok: false, detail: "timeout 60s" }); }, 60_000);
+        void onJobEvents({
+          onDone: (e) => { if (e.id !== jobId) return; clearTimeout(timer); un();
+            resolve({ ok: true, detail: String(e.output.path ?? outPath) }); },
+          onFailed: (e) => { if (e.id !== jobId) return; clearTimeout(timer); un();
+            resolve({ ok: false, detail: `${e.message} | ${e.logTail.slice(-3).join(" / ")}` }); },
+        }).then((u) => (un = u));
+      });
+      assert(result.ok, result.detail);
+      const info = await ipc.probeMedia(result.detail);
+      assert(info.vcodec === "h264", `vcodec=${info.vcodec}`);
+      assert(info.width === 640 && info.height === 360, `${info.width}x${info.height}`);
+      return `v0.6 layered+keyframed+text export ok: ${info.width}x${info.height} ${info.duration.toFixed(2)}s`;
     });
   } catch (e) {
     results.push({ name: "setup", pass: false, detail: String(e) });

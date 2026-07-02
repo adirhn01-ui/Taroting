@@ -62,9 +62,20 @@
   letter-spacing: -0.02em;
 }
 
+.home__toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
 .home__search {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   max-width: 360px;
+}
+
+.home__sort {
+  flex: none;
 }
 
 .recents-grid {
@@ -124,7 +135,7 @@
   align-items: center;
 }
 
-.project-card__remove {
+.project-card__more {
   position: absolute;
   top: 6px;
   right: 6px;
@@ -138,13 +149,37 @@
   color: #fff;
   cursor: pointer;
   opacity: 0;
-  transition: opacity var(--dur) var(--ease);
+  transition: opacity var(--dur) var(--ease), background var(--dur) var(--ease);
 }
-.project-card:hover .project-card__remove {
+.project-card:hover .project-card__more,
+.project-card:focus-within .project-card__more {
   opacity: 1;
 }
-.project-card__remove:hover {
-  background: var(--danger);
+.project-card__more:hover {
+  background: rgba(0, 0, 0, 0.75);
+}
+
+/* Inline rename input, sized to sit where the name text was. */
+.project-card__rename {
+  width: 100%;
+  height: 24px;
+  font-size: var(--fs-13);
+  font-weight: 600;
+}
+
+/* Home confirm/prompt modals reuse the shared .modal shell. */
+.home-modal__body-text {
+  font-size: var(--fs-13);
+  color: var(--text-2);
+  line-height: 1.5;
+}
+.home-modal__label {
+  font-size: var(--fs-13);
+  color: var(--text-2);
+  margin-bottom: var(--sp-2);
+}
+.home-modal__input {
+  width: 100%;
 }
 
 .home__drop-hint {

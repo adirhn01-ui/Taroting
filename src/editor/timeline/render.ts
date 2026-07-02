@@ -12,6 +12,25 @@ export const VIDEO_LANE_H = 60;
 export const AUDIO_LANE_H = 42;
 export const LANE_GAP = 4;
 export const EDGE_ZONE_PX = 7;
+/** ±px hit slop around a marker stem in the ruler. */
+export const MARKER_HIT_PX = 5;
+
+/** Marker flag colors (index 0 = accent, resolved at draw time; 1..5 = fixed
+ *  hexes chosen to read on both the dark and light themes). */
+export const MARKER_PALETTE = [
+  "", // 0 → accent (filled in from theme colors)
+  "#e5484d",
+  "#f5a623",
+  "#30a46c",
+  "#0091ff",
+  "#8e4ec6",
+];
+
+/** Resolve a marker's palette index to a concrete color. */
+function markerColor(index: number, accent: string): string {
+  const c = MARKER_PALETTE[index] ?? "";
+  return c === "" ? accent : c;
+}
 
 export interface LaneRect {
   track: Track;
@@ -161,6 +180,33 @@ export function draw(ctx: CanvasRenderingContext2D, input: RenderInput): void {
   ctx.moveTo(0, RULER_H - 0.5);
   ctx.lineTo(width, RULER_H - 0.5);
   ctx.stroke();
+
+  /* ---------------- markers (ruler flags) ---------------- */
+  const markers = input.project.timeline.markers;
+  if (markers && markers.length > 0) {
+    for (const marker of markers) {
+      const mx = xOf(marker.t);
+      if (mx < -8 || mx > width + 8) continue;
+      const x = Math.round(mx) + 0.5;
+      const color = markerColor(marker.color, colors.accent);
+      // stem
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, 2);
+      ctx.lineTo(x, RULER_H - 1);
+      ctx.stroke();
+      // pennant (points right, ~7x9)
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(x, 2);
+      ctx.lineTo(x + 7, 2);
+      ctx.lineTo(x + 7, 7);
+      ctx.lineTo(x, 11);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
 
   /* ---------------- lanes + clips ---------------- */
   const lanes = laneLayout(input.project);
