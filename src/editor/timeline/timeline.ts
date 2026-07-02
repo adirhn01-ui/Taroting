@@ -39,11 +39,15 @@ export class TimelineController {
   private mediaByIdOf: ProjectFile | null = null;
   private disposers: (() => void)[] = [];
   private themeObserver: MutationObserver;
+  private readonly host: HTMLElement;
+  /** Reused overlay guide for external drag-and-drop (created lazily). */
+  private dropGuide: HTMLElement | null = null;
 
   constructor(
     host: HTMLElement,
     private deps: TimelineDeps,
   ) {
+    this.host = host;
     this.canvas = document.createElement("canvas");
     this.canvas.className = "timeline-canvas";
     host.appendChild(this.canvas);
@@ -187,6 +191,35 @@ export class TimelineController {
     this.requestRender();
   }
 
+  /** The timeline host rect in viewport coordinates (for DnD hit-testing). */
+  hostRect(): DOMRect {
+    return this.host.getBoundingClientRect();
+  }
+
+  /** Show a transient drop guide overlaying the host: an accent vertical line
+   *  at host-local x plus a lane tint. Pure DOM (no render.ts changes); the one
+   *  reusable guide div is created on first use and reused thereafter. */
+  setDropPreview(laneY: number, laneH: number, x: number): void {
+    if (!this.dropGuide) {
+      const g = document.createElement("div");
+      g.className = "tl-drop-guide";
+      g.innerHTML = `<div class="tl-drop-guide__lane"></div><div class="tl-drop-guide__line"></div>`;
+      this.host.appendChild(g);
+      this.dropGuide = g;
+    }
+    const g = this.dropGuide;
+    g.style.display = "block";
+    const lane = g.firstElementChild as HTMLElement;
+    const line = g.lastElementChild as HTMLElement;
+    lane.style.top = `${laneY}px`;
+    lane.style.height = `${laneH}px`;
+    line.style.transform = `translateX(${Math.round(x)}px)`;
+  }
+
+  clearDropPreview(): void {
+    if (this.dropGuide) this.dropGuide.style.display = "none";
+  }
+
   /* ---------------- rendering ---------------- */
 
   requestRender(): void {
@@ -231,6 +264,7 @@ export class TimelineController {
   dispose(): void {
     cancelAnimationFrame(this.raf);
     for (const d of this.disposers) d();
+    this.dropGuide?.remove();
     this.canvas.remove();
   }
 }

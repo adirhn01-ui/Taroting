@@ -1,0 +1,96 @@
+/* Text / solid generator creation dialogs. Reuses the shared .modal shell. */
+
+.gen-modal {
+  min-width: 420px;
+  max-width: 460px;
+}
+
+.gen-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.gen-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.gen-row {
+  display: flex;
+  gap: var(--sp-3);
+}
+.gen-row > .field,
+.gen-row > .gen-field {
+  flex: 1;
+  min-width: 0;
+}
+.gen-row--color {
+  align-items: center;
+}
+
+.gen-textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 60px;
+  font-family: inherit;
+}
+
+.gen-num {
+  width: 100%;
+}
+
+.gen-color {
+  width: 44px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s, 4px);
+  background: transparent;
+  cursor: pointer;
+}
+
+.gen-swatches {
+  display: flex;
+  gap: var(--sp-2);
+  flex: 1;
+}
+.gen-swatch {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.gen-swatch__dot {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+}
+
+/* Live preview row */
+.gen-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 72px;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m, 6px);
+  background:
+    repeating-conic-gradient(var(--bg-inset, #1a1a1a) 0% 25%, transparent 0% 50%) 50% / 16px 16px;
+  overflow: hidden;
+}
+.gen-preview__text {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gen-preview--solid {
+  min-height: 72px;
+}
+
+.gen-footer {
+  gap: var(--sp-2);
+}

@@ -11,7 +11,7 @@ import {
 } from "../core/format";
 import { describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles, pickProjectFile } from "../core/ipc";
 import { navigate } from "../core/nav";
-import { createProject, importMediaAsClip } from "../core/project";
+import { addMedia, createProject } from "../core/project";
 import { MEDIA_FILE_EXTENSIONS } from "../core/types";
 import type { RecentItem } from "../core/types";
 import { icon } from "../ui/icons";
@@ -246,10 +246,12 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       const projectPath = await ipc.newProjectPath(suggested);
       let project = createProject(fileStem(projectPath));
       let failures = 0;
+      // Bin-first: media is registered only (no clips). addMedia still adopts
+      // the first visual media's resolution/fps for the new project.
       for (const p of mediaPaths) {
         try {
           const info = await ipc.probeMedia(p);
-          project = importMediaAsClip(project, info).project;
+          project = addMedia(project, info).project;
         } catch (e) {
           failures++;
           toast.error(`Couldn't import ${fileStem(p)}: ${describeError(e)}`);

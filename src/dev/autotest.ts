@@ -402,6 +402,131 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       return `refit to 16:9 ok (${w}x${h}, ratio ${ratio.toFixed(3)})`;
     });
 
+    // ---- v0.6 Phase 4: bin-first import, add-layer, generated media ----
+
+    await test("bin-first-import", async () => {
+      const { addMedia, insertClip, makeClip, topVideoTrack, findClip } = await import("../core/project");
+      const info = await ipc.probeMedia(`${fixturesDir}\\counter_h264.mp4`);
+      const clipCount = (): number =>
+        session.project.timeline.tracks.reduce((n, t) => n + t.clips.length, 0);
+      const mediaCount = (): number => session.project.media.length;
+      const clipsBefore = clipCount();
+      const mediaBefore = mediaCount();
+      session.commit((p) => addMedia(p, info).project);
+      engine.refresh();
+      assert(clipCount() === clipsBefore, `import must NOT create a clip (was ${clipsBefore}, now ${clipCount()})`);
+      assert(mediaCount() === mediaBefore + 1, `media list should grow by 1 (was ${mediaBefore})`);
+      const media2 = session.project.media[session.project.media.length - 1]!;
+
+      engine.seek(3);
+      await sleep(50);
+      const at = engine.time;
+      // the playhead position is occupied by the base clip, so insertClip
+      // resolves to the nearest free spot — compute the expectation the same way
+      const { resolvePosition } = await import("../core/project");
+      const { clipDuration } = await import("../core/time");
+      const probeClip = makeClip(media2, at);
+      const expectedAt = resolvePosition(
+        topVideoTrack(session.project).clips,
+        clipDuration(probeClip),
+        at,
+      );
+      let newId = "";
+      session.commit((p) => {
+        const clip = makeClip(media2, at);
+        newId = clip.id;
+        return insertClip(p, topVideoTrack(p).id, clip);
+      });
+      engine.refresh();
+      assert(clipCount() === clipsBefore + 1, `double-click should insert exactly one clip`);
+      const placed = findClip(session.project, newId)!.clip;
+      assert(
+        Math.abs(placed.timelineStart - expectedAt) < 1e-6,
+        `clip should land at the resolved position (${placed.timelineStart} vs ${expectedAt})`,
+      );
+
+      session.undo();
+      session.undo();
+      engine.refresh();
+      assert(clipCount() === clipsBefore && mediaCount() === mediaBefore, `undo x2 should restore (${clipCount()} clips, ${mediaCount()} media)`);
+      return `import→bin only (0 clips, +1 media); dblclick→clip @ ${at.toFixed(2)}s; undo x2 restored`;
+    });
+
+    await test("add-layer-button", async () => {
+      const { addVideoTrack, videoTracks } = await import("../core/project");
+      const before = videoTracks(session.project).length;
+      let topId = "";
+      session.commit((p) => { const r = addVideoTrack(p); topId = r.trackId; return r.project; });
+      engine.refresh();
+      assert(videoTracks(session.project).length === before + 1, `video tracks should be ${before + 1}`);
+      assert(session.project.timeline.tracks[0]!.id === topId, `new layer must be tracks[0] (topmost/z-order)`);
+      session.undo();
+      engine.refresh();
+      assert(videoTracks(session.project).length === before, `undo should restore ${before} video tracks`);
+      return `addVideoTrack → +1 layer as tracks[0]; undo restored ${before}`;
+    });
+
+    await test("generated-media-roundtrip", async () => {
+      const { addGeneratedMedia, makeClip, insertClip, updateMedia, findMedia } =
+        await import("../core/project");
+
+      let solidId = "";
+      session.commit((p) => {
+        const r = addGeneratedMedia(p, { type: "solid", color: "#10b981" }, 640, 360, "Solid #10b981");
+        solidId = r.media.id;
+        return r.project;
+      });
+      const gm = findMedia(session.project, solidId);
+      assert(!!gm && gm.generator?.type === "solid", "solid media not in project with generator");
+
+      media.ensureAll(session.project);
+      const st = await waitFor(
+        () => {
+          const s = media.status.get()[solidId];
+          return s && s.state === "ready" ? s : null;
+        },
+        4000,
+        "solid media ready",
+      );
+      assert(st.state === "ready" && st.url === "", `expected ready+empty url, got ${JSON.stringify(st)}`);
+
+      engine.seek(0.2);
+      let genClipId = "";
+      session.commit((p) => {
+        const m = findMedia(p, solidId)!;
+        const clip = makeClip(m, engine.time);
+        genClipId = clip.id;
+        return insertClip(p, p.timeline.tracks[0]!.id, clip);
+      });
+      engine.refresh();
+      const genClip = session.project.timeline.tracks[0]!.clips.find((c) => c.id === genClipId)!;
+      engine.seek(genClip.timelineStart + 0.3);
+      engine.refresh();
+      await sleep(200);
+
+      let shownGreen = false;
+      for (const g of Array.from(document.querySelectorAll<HTMLElement>(".stage-layer__gen"))) {
+        if (getComputedStyle(g).backgroundColor === "rgb(16, 185, 129)") shownGreen = true;
+      }
+      assert(shownGreen, "solid gen div not shown as rgb(16,185,129)");
+
+      session.commit((p) => updateMedia(p, solidId, { generator: { type: "solid", color: "#000000" } }));
+      engine.refresh();
+      await sleep(200);
+      let shownBlack = false;
+      for (const g of Array.from(document.querySelectorAll<HTMLElement>(".stage-layer__gen"))) {
+        if (getComputedStyle(g).backgroundColor === "rgb(0, 0, 0)") shownBlack = true;
+      }
+      assert(shownBlack, "solid gen div did not recolor to black");
+
+      session.undo();
+      session.undo();
+      session.undo();
+      engine.refresh();
+      assert(!findMedia(session.project, solidId), "solid media should be gone after 3 undos");
+      return "solid added → ready(empty url) → green → black → undo x3";
+    });
+
     // ---- v0.6 Phase 3: keyframe UI evaluation + project canvas panel ----
 
     await test("keyframe-ui-eval", async () => {

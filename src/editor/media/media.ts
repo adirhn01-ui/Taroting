@@ -124,6 +124,15 @@ export class MediaManager {
   async ensure(media: MediaRef): Promise<void> {
     if (this.disposed || this.tracked.has(media.id)) return;
     this.tracked.add(media.id);
+
+    // Generated media (solid / text) has no file on disk: no probe, no
+    // playback plan, no thumbnail, no waveform. The preview renders it
+    // directly from the generator; report it ready with an empty url.
+    if (media.generator) {
+      this.patchStatus(media.id, { state: "ready", url: "", sourcePath: "" });
+      return;
+    }
+
     this.patchStatus(media.id, { state: "checking" });
 
     // Thumbnail (visual media) — runs on its own lane, fire and forget.

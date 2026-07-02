@@ -44,6 +44,7 @@ import type {
 import type { PlaybackEngine } from "../playback/engine";
 import type { MediaManager } from "../media/media";
 import { toast } from "../../ui/toast";
+import { buildGeneratedSection } from "./generated";
 
 export interface InspectorCtx {
   session: ProjectSession;
@@ -1009,12 +1010,18 @@ export function mountInspector(
     host.appendChild(header);
 
     const body = el("div", "insp-body");
+    // Generated media (solid / text) get their own editor ABOVE the transform
+    // section — transforms still apply to generated clips.
+    const genSection = buildGeneratedSection(ctx, t);
+    if (genSection) body.appendChild(genSection);
+
     // Video section only for video-track clips
     if (t.onVideoTrack) body.appendChild(buildVideoSection(t));
 
     // Audio section for every audio-track clip, and for video-track clips whose
     // media has audio (detached clips render a "detached" note inside it).
-    if (!t.onVideoTrack || t.media.hasAudio) {
+    // Generated media have no audio, so this is skipped for them.
+    if (!t.media.generator && (!t.onVideoTrack || t.media.hasAudio)) {
       body.appendChild(buildAudioSection(t));
     }
     host.appendChild(body);
