@@ -69,6 +69,24 @@
   padding: 0 var(--sp-3);
   font-size: var(--fs-12);
 }
+
+/* toggled-on state for toolbar toggles (snap, loop, …) */
+.btn--on {
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+  border-color: transparent;
+}
+.btn--on:hover {
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+}
+
+.select--sm {
+  height: 26px;
+  font-size: var(--fs-12);
+  padding-right: var(--sp-6);
+  background-position: right 8px center;
+}
 .btn--lg {
   height: 40px;
   padding: 0 var(--sp-5);

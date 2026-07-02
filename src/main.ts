@@ -41,6 +41,23 @@ setNavigator((route) => void go(route));
 void initSettings();
 void go({ view: "home" });
 
+// Dev-only in-app E2E harness (activated via TAROTING_AUTOTEST=1).
+if (import.meta.env.DEV) {
+  void (async () => {
+    try {
+      const { ipc, inTauri } = await import("./core/ipc");
+      if (!inTauri) return;
+      const info = await ipc.debugInfo();
+      if (info.autotest) {
+        const { runAutotest } = await import("./dev/autotest");
+        void runAutotest(info.fixturesDir);
+      }
+    } catch {
+      /* not in dev backend */
+    }
+  })();
+}
+
 // Warm the editor chunk once the home screen has painted.
 requestIdleCallback?.(() => {
   void import("./editor/editor");

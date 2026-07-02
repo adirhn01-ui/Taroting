@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod cache;
+mod debug;
 mod error;
 mod jobs;
 mod media;
@@ -38,6 +39,8 @@ fn main() {
             project::store::new_project_path,
             settings::get_settings,
             settings::save_settings,
+            debug::debug_info,
+            debug::debug_write_report,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Taroting");

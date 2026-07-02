@@ -44,9 +44,123 @@
   display: flex;
 }
 
-.editor__stage {
+.editor__main {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- preview stage ---------- */
+
+.editor__preview {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.preview {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+.preview__canvas {
+  position: relative;
+  background: #000;
+  overflow: hidden;
+  border-radius: var(--radius-s);
+  box-shadow: var(--shadow-2);
+  outline: 1px solid var(--border);
+}
+
+.stage-layer__pos {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 0;
+  height: 0;
+}
+
+.stage-layer__rot {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+}
+
+.stage-layer__crop {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: hidden;
+}
+
+.stage-layer__media {
+  display: block;
+  max-width: none;
+  max-height: none;
+}
+
+.preview__overlay {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.72);
+  color: var(--text-2);
+  font-size: var(--fs-13);
+  text-align: center;
+  padding: var(--sp-4);
+}
+.preview__overlay.active {
+  display: flex;
+}
+
+/* ---------- timeline panel ---------- */
+
+.timeline-panel {
+  height: 280px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  background: var(--bg-app);
+}
+
+.transport {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  flex: none;
+}
+
+.transport__time {
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  padding: 0 var(--sp-3);
+  min-width: 168px;
+  font-variant-numeric: tabular-nums;
+}
+
+.timeline-host {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.timeline-canvas {
+  display: block;
+  touch-action: none;
 }
 
 /* ---------- media panel ---------- */

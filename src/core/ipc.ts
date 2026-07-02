@@ -112,6 +112,11 @@ export const ipc = {
   clearCache: (keepActive: MediaKey[]) => call<number>("clear_cache", { keepActive }),
   enforceCacheLimit: (capMb: number, keepActive: MediaKey[]) =>
     call<number>("enforce_cache_limit", { capMb, keepActive }),
+
+  /* dev-only (hard error in release builds) */
+  debugInfo: () =>
+    call<{ autotest: boolean; fixturesDir: string; reportPath: string }>("debug_info"),
+  debugWriteReport: (content: string) => call<void>("debug_write_report", { content }),
 };
 
 /* ---------------- job events ---------------- */
