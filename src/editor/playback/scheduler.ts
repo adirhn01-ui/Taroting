@@ -89,8 +89,10 @@ class LayerScheduler {
     private media: MediaManager,
     private stage: Stage,
     private previewSpeed: () => number,
-    /** monotone generation token from the orchestrator (play-race guard) */
-    private gen: () => number,
+    /** the orchestrator's CURRENT desired transport state (play-race guard).
+     *  A play() promise that resolves after the intent flipped to paused — or
+     *  after this element stopped being the shown active slot — must pause back. */
+    private desiredPlaying: () => boolean,
   ) {}
 
   setLayerSet(set: LayerSet): void {
@@ -335,16 +337,26 @@ class LayerScheduler {
     }
   }
 
-  /** Guarded play: if the element became stale (a newer generation paused the
-   *  transport) by the time the promise resolves, pause it back. pause() is
-   *  synchronous and always wins. */
+  /** Guarded play: by the time the play() promise resolves the transport may
+   *  have paused, or this slot may no longer be the shown active video (a swap
+   *  or a switch to image/gen/gap synchronously paused it). In either case pause
+   *  it back so a stale in-flight play() can never keep a should-be-stopped
+   *  element running. pause() is synchronous and always wins.
+   *
+   *  Crucially this checks the LIVE desired state, not a generation token: a
+   *  benign re-activation of the SAME playing clip (seek within a clip, or two
+   *  sub-frame boundaries in one rAF) must NOT pause — the intent is still
+   *  "play this element", so an older promise resolving here is a no-op. */
   private playGuarded(el: HTMLVideoElement): void {
-    const g = this.gen();
     const p = el.play();
     if (p && typeof p.then === "function") {
       p.then(
         () => {
-          if (this.gen() !== g) el.pause();
+          const stillWanted =
+            this.desiredPlaying() &&
+            (this.shown === "A" || this.shown === "B") &&
+            el === this.video(this.activeSlot);
+          if (!stillWanted) el.pause();
         },
         () => {},
       );
@@ -434,7 +446,12 @@ export interface VisibleClip {
 export class Scheduler {
   previewSpeed = 1;
   private layers: LayerScheduler[] = [];
-  private generation = 0;
+  /** The current desired transport state, mirrored from the engine on every
+   *  activate() and forced false by pauseAll(). The play-race guard reads this
+   *  LIVE (not a captured token) so a benign re-activation of a still-playing
+   *  clip never trips it, while a real pause (which sets this false) always
+   *  wins over an in-flight play() promise. */
+  private playing = false;
 
   constructor(
     private stage: Stage,
@@ -463,7 +480,7 @@ export class Scheduler {
         this.media,
         this.stage,
         () => this.previewSpeed,
-        () => this.generation,
+        () => this.playing,
       );
       this.layers.push(ls);
     }
@@ -488,7 +505,7 @@ export class Scheduler {
   /** Activate every layer for time t. Returns the nearest segment boundary
    *  (min over layers of each layer's active segment end). */
   activate(t: number, playing: boolean): { boundary: number } {
-    this.generation++;
+    this.playing = playing;
     this.syncLayers();
     const layers = this.activeLayers();
 
@@ -618,7 +635,10 @@ export class Scheduler {
   }
 
   pauseAll(): void {
-    this.generation++;
+    // A real pause: flip the desired state false BEFORE pausing so any in-flight
+    // play() promise that resolves after this sees stillWanted === false and
+    // pauses back (the v0.6 phase-3 "pause always wins" contract).
+    this.playing = false;
     for (const layer of this.layers) layer.pauseAll();
   }
 

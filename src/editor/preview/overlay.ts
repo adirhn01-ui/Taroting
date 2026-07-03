@@ -55,6 +55,14 @@ const clamp = (v: number, lo: number, hi: number): number => Math.min(Math.max(v
 // distance regardless of how large the canvas is rendered.
 const SNAP_SCREEN_PX = 8;
 
+// Drag dead-zone, in CLIENT px (mirrors the timeline's maybe-move threshold in
+// interactions.ts). A gesture stays "pending" — pure select, zero mutation and
+// zero history — until the pointer travels this far from its down point; only
+// then does it arm, capture the undo baseline, and start editing. Applied deltas
+// still measure from the ORIGINAL down point, so crossing the zone does not shift
+// the gesture's reference frame.
+const MOVE_THRESHOLD_PX = 4;
+
 /** setPointerCapture throws for synthesized/inactive pointers (autotest); the
  *  gesture still works because our listeners live on the overlay element. */
 function capture(el: HTMLElement, pointerId: number): void {
@@ -410,7 +418,13 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
   interface Gesture {
     kind: "move" | "scale";
     clipId: string;
-    before: ProjectFile;
+    // Undo baseline, captured only when the gesture arms (crosses the dead-zone),
+    // so a release inside the zone leaves zero history entries.
+    before: ProjectFile | null;
+    // Dead-zone gate: false until the pointer travels > MOVE_THRESHOLD_PX client
+    // px from startClient. While false the gesture is a pure selection.
+    armed: boolean;
+    startClient: { x: number; y: number };
     startProj: { x: number; y: number };
     startPose: ResolvedPose;
     // Keyframe source time frozen at gesture start. Reused for every auto-key
@@ -440,7 +454,9 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
       gesture = {
         kind: "scale",
         clipId: sel.clip.id,
-        before: session.project,
+        before: null,
+        armed: false,
+        startClient: { x: e.clientX, y: e.clientY },
         startProj: p,
         startPose: pose,
         keySrcTime: sourceTime(sel.clip, engine.time - sel.clip.timelineStart),
@@ -464,7 +480,9 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     gesture = {
       kind: "move",
       clipId: hit,
-      before: session.project,
+      before: null,
+      armed: false,
+      startClient: { x: e.clientX, y: e.clientY },
       startProj: p,
       startPose: pose,
       keySrcTime: sourceTime(found.clip, engine.time - found.clip.timelineStart),
@@ -476,6 +494,16 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
   function onPointerMove(e: PointerEvent): void {
     if (mode === "crop") return onCropPointerMove(e);
     if (!gesture) return;
+    // Dead-zone: stay a pure selection until the pointer leaves the threshold.
+    // Distance is measured in CLIENT px from the down point; deltas applied below
+    // still reference startProj, so arming does not move the gesture's origin.
+    if (!gesture.armed) {
+      const cdx = e.clientX - gesture.startClient.x;
+      const cdy = e.clientY - gesture.startClient.y;
+      if (Math.abs(cdx) + Math.abs(cdy) <= MOVE_THRESHOLD_PX) return;
+      gesture.armed = true;
+      gesture.before = session.project; // undo baseline captured at arm time
+    }
     const p = clientToProject(e.clientX, e.clientY);
     if (gesture.kind === "move") {
       const dx = p.x - gesture.startProj.x;
@@ -509,7 +537,9 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     gesture = null;
     hideGuides(); // drag over → drop the center-snap guides
     try { overlay.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
-    session.commitFrom(g.before);
+    // Release inside the dead-zone: never armed, nothing mutated → pure select,
+    // no history entry. Only commit when the gesture actually edited the project.
+    if (g.armed && g.before) session.commitFrom(g.before);
   }
 
   /** Auto-key or static position write, then live-replace (no history). The

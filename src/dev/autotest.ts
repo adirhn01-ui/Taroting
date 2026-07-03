@@ -333,7 +333,40 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         assert(allVideosPaused(), `round ${round}: a <video> kept playing after the pause click`);
       }
 
-      return `button-click blurs; single Space = one toggle; ${storms} storm-clicks, pause always wins`;
+      // 5) The mirror image of "pause always wins": PLAY must always survive a
+      // benign re-activation. Seeking during playback re-runs scheduler.activate,
+      // which re-arms the SAME active clip and issues a fresh el.play() while an
+      // earlier play() promise is still pending. Under the old generation-token
+      // guard the earlier promise resolved, saw a bumped token, and paused the
+      // master mid-playback — freezing the playhead while the transport still
+      // read "playing". Seek repeatedly DURING playback, then assert the engine
+      // is still playing, the active <video> is NOT paused, and time advances.
+      engine.seek(4);
+      await sleep(60);
+      if (!engine.playing) { engine.play(); await sleep(40); }
+      assert(engine.playing, "precondition: playing before seek storm");
+      // several seeks within the SAME clip at ~50ms spacing (each re-activates)
+      for (let i = 0; i < 6; i++) {
+        engine.seek(4 + i * 0.15); // stays inside the base counter clip
+        await sleep(50);
+      }
+      await sleep(400); // settle: let every in-flight play() promise resolve
+      assert(engine.playing, "seek-during-play stopped the transport (engine.playing false)");
+      const liveVid = dev.activeVideo();
+      assert(liveVid !== null, "no active video after seek storm");
+      assert(!liveVid!.paused, "active <video> was paused by a stale play() guard mid-playback");
+      const seekT0 = engine.time;
+      await sleep(500);
+      const seekT1 = engine.time;
+      assert(
+        seekT1 > seekT0 + 0.2,
+        `playhead frozen after seek storm: advanced only ${(seekT1 - seekT0).toFixed(3)}s in 0.5s`,
+      );
+      engine.pause();
+      await sleep(30);
+      assert(!engine.playing && allVideosPaused(), "cleanup pause after seek storm did not settle");
+
+      return `button-click blurs; single Space = one toggle; ${storms} storm-clicks, pause always wins; seek-during-play keeps playing (+${(seekT1 - seekT0).toFixed(2)}s)`;
     });
 
     await test("playback-across-cut", async () => {

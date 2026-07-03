@@ -916,11 +916,18 @@ enable='gte(t,{start:.6})*lt(t,{end:.6})'{out};"
 
         // Animated opacity: insert the alphamerge trick after crop, before
         // transpose. Post-crop dims size the mask. geq's own time var is capital
-        // T (clip-local, before the setpts shift).
+        // T (clip-local, before the setpts shift). A track with >=1 keyframe is
+        // authoritative (mirrors preview's evalKfs): a single keyframe is a
+        // constant equal to its value; multi-kf uses the ramp. The static
+        // transform opacity is only used when no opacity track exists.
         let opacity_kfs = clip.keyframes.as_ref().and_then(|k| k.opacity.as_ref());
-        if let Some(kfs) = opacity_kfs.filter(|k| k.len() >= 2) {
-            let bps = clamped_breakpoints(kfs, clip.src_in, clip.src_out, clip.speed);
-            let expr = ramp_expr(&bps, "T");
+        if let Some(kfs) = opacity_kfs.filter(|k| !k.is_empty()) {
+            let expr = if kfs.len() == 1 {
+                format!("{:.4}", kfs[0].v)
+            } else {
+                let bps = clamped_breakpoints(kfs, clip.src_in, clip.src_out, clip.speed);
+                ramp_expr(&bps, "T")
+            };
             let (cw, ch) = (p.post_crop_w.max(1), p.post_crop_h.max(1));
             let a = self.next_n();
             chain.push_str(&format!(
@@ -946,23 +953,36 @@ geq=lum='255*({expr})',scale={cw}:{ch}[al{a}];[chain{a}][al{a}]alphamerge"
             _ => {}
         }
 
-        // scale — animated (eval=frame) or static.
+        // scale — a track with >=1 keyframe is authoritative over the static
+        // transform scale (mirrors preview's evalKfs). A single keyframe is a
+        // constant scale factor: emit fixed display dims (fit * v). Multi-kf
+        // uses the per-frame ramp expression (eval=frame).
         let scale_kfs = clip.keyframes.as_ref().and_then(|k| k.scale.as_ref());
-        if let Some(kfs) = scale_kfs.filter(|k| k.len() >= 2) {
-            let bps = clamped_breakpoints(kfs, clip.src_in, clip.src_out, clip.speed);
-            // scale runs before the setpts shift → time var is clip-local "t".
-            let s = ramp_expr(&bps, "t");
-            chain.push_str(&format!(
-                ",scale=w='trunc({:.4}*({s})/2)*2':h='trunc({:.4}*({s})/2)*2':eval=frame",
-                p.fit_w, p.fit_h
-            ));
-        } else {
-            chain.push_str(&format!(",scale={}:{}", p.dw, p.dh));
+        match scale_kfs.filter(|k| !k.is_empty()) {
+            Some(kfs) if kfs.len() == 1 => {
+                let sw = round_even(p.fit_w * kfs[0].v);
+                let sh = round_even(p.fit_h * kfs[0].v);
+                chain.push_str(&format!(",scale={sw}:{sh}"));
+            }
+            Some(kfs) => {
+                let bps = clamped_breakpoints(kfs, clip.src_in, clip.src_out, clip.speed);
+                // scale runs before the setpts shift → time var is clip-local "t".
+                let s = ramp_expr(&bps, "t");
+                chain.push_str(&format!(
+                    ",scale=w='trunc({:.4}*({s})/2)*2':h='trunc({:.4}*({s})/2)*2':eval=frame",
+                    p.fit_w, p.fit_h
+                ));
+            }
+            None => {
+                chain.push_str(&format!(",scale={}:{}", p.dw, p.dh));
+            }
         }
         chain.push_str(&format!(",setsar=1,fps={fps}"));
 
-        // static opacity (only when not animated)
-        if opacity_kfs.filter(|k| k.len() >= 2).is_none() && p.opacity < 0.999 {
+        // static opacity — only when NO opacity keyframe track exists. Any track
+        // (len>=1) is handled by the alphamerge branch above, so the static
+        // transform opacity must not also be applied.
+        if opacity_kfs.filter(|k| !k.is_empty()).is_none() && p.opacity < 0.999 {
             chain.push_str(&format!(",format=rgba,colorchannelmixer=aa={:.4}", p.opacity));
         }
 
@@ -982,33 +1002,38 @@ geq=lum='255*({expr})',scale={cw}:{ch}[al{a}];[chain{a}][al{a}]alphamerge"
     fn overlay_xy(&self, clip: &Clip, p: &Placement, tbase: &str) -> (String, String) {
         let x_kfs = clip.keyframes.as_ref().and_then(|k| k.x.as_ref());
         let y_kfs = clip.keyframes.as_ref().and_then(|k| k.y.as_ref());
-        let scale_anim = clip
+        // A track with >=1 keyframe is authoritative (mirrors preview's evalKfs):
+        // its presence alone forces the centered-expression path. A single-kf
+        // scale re-sizes overlay_w/h off the static transform, and a single-kf
+        // x/y overrides the static offset baked into p.ox/p.oy — both need the
+        // runtime `(main-overlay)/2 + off` form to stay centered/positioned.
+        let scale_kf = clip
             .keyframes
             .as_ref()
             .and_then(|k| k.scale.as_ref())
-            .filter(|k| k.len() >= 2)
-            .is_some();
-        let x_anim = x_kfs.filter(|k| k.len() >= 2).is_some();
-        let y_anim = y_kfs.filter(|k| k.len() >= 2).is_some();
+            .filter(|k| !k.is_empty());
+        let x_kf = x_kfs.filter(|k| !k.is_empty());
+        let y_kf = y_kfs.filter(|k| !k.is_empty());
 
-        // Centered expressions are needed whenever position OR scale animates
-        // (scale changes overlay_w/h per frame, so a fixed ox no longer centers).
-        if !x_anim && !y_anim && !scale_anim {
+        // Centered expressions are needed whenever position OR scale has any
+        // keyframe (scale changes overlay_w/h, so a fixed ox no longer centers).
+        if x_kf.is_none() && y_kf.is_none() && scale_kf.is_none() {
             return (format!("{}", p.ox), format!("{}", p.oy));
         }
 
-        let x_off = if let Some(kfs) = x_kfs.filter(|k| k.len() >= 2) {
-            let bps = clamped_breakpoints(kfs, clip.src_in, clip.src_out, clip.speed);
-            ramp_expr(&bps, tbase)
-        } else {
-            format!("{:.4}", p.x)
+        // Per axis: single kf → constant value; multi-kf → ramp; absent → static.
+        let offset = |kf: Option<&&Vec<Keyframe>>, stat: f64| -> String {
+            match kf {
+                Some(kfs) if kfs.len() == 1 => format!("{:.4}", kfs[0].v),
+                Some(kfs) => {
+                    let bps = clamped_breakpoints(kfs, clip.src_in, clip.src_out, clip.speed);
+                    ramp_expr(&bps, tbase)
+                }
+                None => format!("{stat:.4}"),
+            }
         };
-        let y_off = if let Some(kfs) = y_kfs.filter(|k| k.len() >= 2) {
-            let bps = clamped_breakpoints(kfs, clip.src_in, clip.src_out, clip.speed);
-            ramp_expr(&bps, tbase)
-        } else {
-            format!("{:.4}", p.y)
-        };
+        let x_off = offset(x_kf.as_ref(), p.x);
+        let y_off = offset(y_kf.as_ref(), p.y);
         (
             format!("'(main_w-overlay_w)/2+{x_off}'"),
             format!("'(main_h-overlay_h)/2+{y_off}'"),
@@ -1624,6 +1649,90 @@ mod tests {
         assert!(fc.contains("clip((T-0.0000)"), "{fc}");
         // no static colorchannelmixer when opacity is animated.
         assert!(!fc.contains("colorchannelmixer"), "{fc}");
+    }
+
+    #[test]
+    fn single_keyframe_opacity_exports_constant_from_keyframe() {
+        // One opacity keyframe (v=0.30) with a DIFFERENT static transform opacity
+        // (1.0). Export must honor the keyframe (matches preview's evalKfs), not
+        // the stale static value. The alphamerge geq carries the constant 0.30;
+        // no static colorchannelmixer is emitted.
+        let m = media("m1", r"C:\v.mp4", 1920, 1080, false);
+        let mut top = clip("t1", "m1", 0.0, 0.0, 4.0);
+        top.transform = Some(ClipTransform {
+            crop: None, rotate: 0, flip_h: false, flip_v: false,
+            scale: 1.0, x: 0.0, y: 0.0, opacity: 1.0,
+        });
+        top.keyframes = Some(ClipKeyframes {
+            x: None, y: None, scale: None,
+            opacity: Some(vec![Keyframe { t: 0.0, v: 0.30 }]),
+        });
+        let bottom = clip("b1", "m1", 0.0, 0.0, 4.0);
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 },
+            vec![vtrack_id("vtop", vec![top]), vtrack_id("vbot", vec![bottom])]);
+        let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        let fc = &b.filter_complex;
+        assert!(fc.contains("alphamerge"), "{fc}");
+        // constant 0.30 in the geq lum, no ramp clip() term.
+        assert!(fc.contains("geq=lum='255*(0.3000)'"), "{fc}");
+        // must NOT fall back to the static transform opacity via colorchannelmixer.
+        assert!(!fc.contains("colorchannelmixer"), "{fc}");
+    }
+
+    #[test]
+    fn single_keyframe_scale_exports_constant_display_dims() {
+        // One scale keyframe (v=2.0) with static transform scale left at 1.0.
+        // Export must size the clip off the keyframe (fit*2), NOT the static
+        // scale. 1920x1080 fit into 1920x1080 → fit=1.0, fit_w/h=1920/1080;
+        // constant scale 2.0 → 3840x2160. No eval=frame (plain constant dims).
+        let m = media("m1", r"C:\v.mp4", 1920, 1080, false);
+        let mut top = clip("t1", "m1", 0.0, 0.0, 4.0);
+        top.transform = Some(ClipTransform {
+            crop: None, rotate: 0, flip_h: false, flip_v: false,
+            scale: 1.0, x: 0.0, y: 0.0, opacity: 1.0,
+        });
+        top.keyframes = Some(ClipKeyframes {
+            x: None, y: None,
+            scale: Some(vec![Keyframe { t: 1.0, v: 2.0 }]),
+            opacity: None,
+        });
+        let bottom = clip("b1", "m1", 0.0, 0.0, 4.0);
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 },
+            vec![vtrack_id("vtop", vec![top]), vtrack_id("vbot", vec![bottom])]);
+        let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        let fc = &b.filter_complex;
+        assert!(fc.contains("scale=3840:2160"), "{fc}");
+        // constant, not a per-frame ramp.
+        assert!(!fc.contains("eval=frame"), "{fc}");
+        // a single-kf scale still forces the centered overlay expr (the static ox
+        // was computed off transform.scale=1.0 and would mis-center at 2x).
+        assert!(fc.contains("(main_w-overlay_w)/2"), "{fc}");
+    }
+
+    #[test]
+    fn single_keyframe_position_exports_constant_offset() {
+        // One x keyframe (v=120) and one y keyframe (v=-40), static transform
+        // x/y left at 0. Export must center-offset by the keyframe constants.
+        let m = media("m1", r"C:\v.mp4", 1920, 1080, false);
+        let mut top = clip("t1", "m1", 0.0, 0.0, 4.0);
+        top.transform = Some(ClipTransform {
+            crop: None, rotate: 0, flip_h: false, flip_v: false,
+            scale: 1.0, x: 0.0, y: 0.0, opacity: 1.0,
+        });
+        top.keyframes = Some(ClipKeyframes {
+            x: Some(vec![Keyframe { t: 2.0, v: 120.0 }]),
+            y: Some(vec![Keyframe { t: 2.0, v: -40.0 }]),
+            scale: None, opacity: None,
+        });
+        let bottom = clip("b1", "m1", 0.0, 0.0, 4.0);
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 },
+            vec![vtrack_id("vtop", vec![top]), vtrack_id("vbot", vec![bottom])]);
+        let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        let fc = &b.filter_complex;
+        // constant offsets, no clip() ramp term.
+        assert!(fc.contains("'(main_w-overlay_w)/2+120.0000'"), "{fc}");
+        assert!(fc.contains("'(main_h-overlay_h)/2+-40.0000'"), "{fc}");
+        assert!(!fc.contains("clip("), "{fc}");
     }
 
     #[test]

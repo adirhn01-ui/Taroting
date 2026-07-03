@@ -85,6 +85,27 @@ describe("createProject / addMedia", () => {
     expect(p.timeline.fps).toEqual(rat(30));
     expectClean(p);
   });
+
+  it("clamps adopted odd dimensions to an even, in-range canvas", () => {
+    let p = createProject("New");
+    const gifInfo: MediaInfo = {
+      path: "C:\\media\\odd.gif",
+      size: 100,
+      mtimeMs: 3,
+      kind: "gif",
+      duration: 2,
+      fps: rat(15),
+      width: 301,
+      height: 201,
+      hasAudio: false,
+    };
+    p = addMedia(p, gifInfo).project;
+    expect(p.timeline.width).toBe(302);
+    expect(p.timeline.height).toBe(202);
+    expect(p.timeline.width % 2).toBe(0);
+    expect(p.timeline.height % 2).toBe(0);
+    expectClean(p);
+  });
 });
 
 describe("placement", () => {

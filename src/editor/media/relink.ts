@@ -1,15 +1,15 @@
 // Relink dialog: a self-managed modal that lets the user point missing media
 // files (by id) at their new location on disk. Per row: Locate… → probe the
 // chosen file → sanity-check kind + duration (warn, but allow) → patch the
-// MediaRef (path/size/mtime), clamp any clip srcOut that now overruns the
-// shorter source, and re-track the media so previews rebuild. Unresolved rows
+// MediaRef (path/size/mtime), clamp any clip's source window into the (possibly
+// shorter) source, and re-track the media so previews rebuild. Unresolved rows
 // are surfaced via a toast if the user closes early.
 
 import { escapeHtml, fileExt, fileStem } from "../../core/format";
 import { inTauri, ipc } from "../../core/ipc";
-import { findMedia, updateClip, updateMedia } from "../../core/project";
+import { findMedia, MIN_CLIP_DUR, updateClip, updateMedia } from "../../core/project";
 import type { ProjectSession } from "../../core/session";
-import type { MediaInfo, MediaRef, ProjectFile } from "../../core/types";
+import type { Clip, MediaInfo, MediaRef, ProjectFile } from "../../core/types";
 import { trapTab } from "../../ui/focus";
 import { icon } from "../../ui/icons";
 import { toast } from "../../ui/toast";
@@ -22,14 +22,34 @@ export interface RelinkCtx {
   missing: string[];
 }
 
-/** Clamp every clip's srcOut for `mediaId` down to `maxDur` if it overruns. */
+/**
+ * Clamp a single clip's source window into `[0, dur]` for a source that is now
+ * `dur` seconds long. Both edges move: srcOut drops to EOF, and srcIn is pulled
+ * back if needed so at least one min-length clip's worth of source survives
+ * (`MIN_CLIP_DUR * speed` source-seconds keeps timeline duration >= MIN_CLIP_DUR
+ * without touching speed). Returns null when nothing needs to change. Identity
+ * (timelineStart/speed/keyframes) is the caller's to preserve; this only reports
+ * the new srcIn/srcOut. Degenerate case `dur < minSrcLen`: best-effort [0, dur].
+ */
+export function clampSrcWindow(
+  clip: Pick<Clip, "srcIn" | "srcOut" | "speed">,
+  dur: number,
+): { srcIn: number; srcOut: number } | null {
+  if (clip.srcIn >= 0 && clip.srcOut <= dur) return null; // fits already
+  const minSrcLen = MIN_CLIP_DUR * clip.speed; // source-seconds for one min clip
+  const srcOut = Math.min(clip.srcOut, dur);
+  const srcIn = Math.max(0, Math.min(clip.srcIn, srcOut - minSrcLen));
+  return { srcIn, srcOut };
+}
+
+/** Clamp every clip's source window for `mediaId` into the shorter source `maxDur`. */
 function clampClipsToDuration(p: ProjectFile, mediaId: string, maxDur: number): ProjectFile {
   let q = p;
   for (const track of q.timeline.tracks) {
     for (const c of track.clips) {
-      if (c.mediaId !== mediaId || c.srcOut <= maxDur) continue;
-      const srcOut = Math.max(c.srcIn, maxDur);
-      q = updateClip(q, c.id, (cl) => ({ ...cl, srcOut }));
+      if (c.mediaId !== mediaId) continue;
+      const w = clampSrcWindow(c, maxDur);
+      if (w) q = updateClip(q, c.id, (cl) => ({ ...cl, srcIn: w.srcIn, srcOut: w.srcOut }));
     }
   }
   return q;

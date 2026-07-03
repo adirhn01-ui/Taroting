@@ -100,8 +100,8 @@ export function addMedia(
   if (isVisual && timelineEmpty && info.width && info.height) {
     timeline = {
       ...timeline,
-      width: info.width,
-      height: info.height,
+      width: clampCanvas(info.width),
+      height: clampCanvas(info.height),
       fps: info.fps ?? timeline.fps,
     };
   }

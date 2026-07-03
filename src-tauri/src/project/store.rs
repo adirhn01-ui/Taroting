@@ -170,6 +170,16 @@ pub struct LoadedProject {
     pub recovered: bool,
 }
 
+/// File mtime as ms since the Unix epoch, matching `probe_sync`'s derivation
+/// exactly so the load-time scan compares like-for-like against `mtime_ms`.
+fn mtime_ms_of(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn read_project_value(path: &Path) -> Result<(Value, bool)> {
     match std::fs::read(path) {
         Ok(bytes) => {
@@ -206,8 +216,11 @@ pub fn load_project(path: String) -> Result<LoadedProject> {
         if m.generator.is_some() {
             continue;
         }
+        // Compare both size and mtime. mtime_ms uses the exact derivation from
+        // probe_sync (modified() → ms since epoch, u64) so an unchanged file
+        // compares bit-identical; an exact match is correct (no tolerance).
         let ok = std::fs::metadata(&m.path)
-            .map(|meta| meta.len() == m.size)
+            .map(|meta| meta.len() == m.size && mtime_ms_of(&meta) == m.mtime_ms)
             .unwrap_or(false);
         if !ok {
             missing.push(m.id.clone());
@@ -331,15 +344,17 @@ pub fn new_project_path(name: Option<String>) -> Result<String> {
 }
 
 /// Pick a free `<base>.trt` path in `dir`, deduping to `<base> (2).trt` etc.
-/// when the plain name is taken. `base` must already be sanitized.
-fn free_path_in(dir: &Path, base: &str) -> Result<PathBuf> {
+/// when the plain name is taken. `base` must already be sanitized. `exclude`
+/// (the caller's own current file, if any) is treated as free so renaming a
+/// project to its existing filename stem keeps the plain name — no " (2)".
+fn free_path_in(dir: &Path, base: &str, exclude: Option<&Path>) -> Result<PathBuf> {
     for n in 0..1000 {
         let candidate = if n == 0 {
             dir.join(format!("{base}.trt"))
         } else {
             dir.join(format!("{base} ({}).trt", n + 1))
         };
-        if !candidate.exists() {
+        if !candidate.exists() || exclude == Some(candidate.as_path()) {
             return Ok(candidate);
         }
     }
@@ -365,7 +380,9 @@ pub fn rename_project(path: String, new_name: String) -> Result<String> {
 
     let mut value = read_raw_value(old)?;
     let base = sanitize_filename(&new_name);
-    let new_path = free_path_in(dir, &base)?;
+    // Exclude our own current file so renaming to the same sanitized stem
+    // keeps the filename instead of deduping to "<base> (2).trt".
+    let new_path = free_path_in(dir, &base, Some(old))?;
 
     value["name"] = Value::String(new_name);
     atomic_write(&new_path, serde_json::to_vec_pretty(&value)?.as_slice())?;
@@ -405,7 +422,8 @@ pub fn duplicate_project(path: String, new_name: String, new_id: String) -> Resu
     value["id"] = Value::String(new_id);
 
     let base = sanitize_filename(&new_name);
-    let new_path = free_path_in(dir, &base)?;
+    // No exclusion: a duplicate must never overwrite its source.
+    let new_path = free_path_in(dir, &base, None)?;
     atomic_write(&new_path, serde_json::to_vec_pretty(&value)?.as_slice())?;
 
     let new_path_str = new_path.to_string_lossy().into_owned();
@@ -503,13 +521,19 @@ mod tests {
         std::fs::write(path, serde_json::to_vec_pretty(v).unwrap()).unwrap();
     }
 
+    /// mtime of a just-written file, using the same derivation as the scan.
+    fn disk_mtime_ms(path: &Path) -> u64 {
+        mtime_ms_of(&std::fs::metadata(path).unwrap())
+    }
+
     #[test]
     fn load_skips_generated_media_in_missing_scan() {
         with_isolated("gen-missing", |dir| {
-            // A real file whose size matches its media entry, plus a generated
-            // solid whose `path` is a display label (no file on disk).
+            // A real file whose size + mtime match its media entry, plus a
+            // generated solid whose `path` is a display label (no file on disk).
             let media_file = dir.join("v.bin");
             std::fs::write(&media_file, b"0123456789").unwrap();
+            let m1_mtime = disk_mtime_ms(&media_file);
             let proj = dir.join("Gen.trt");
             write_json(
                 &proj,
@@ -518,7 +542,7 @@ mod tests {
                     "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
                     "media": [{
                         "id": "m1", "path": media_file.to_string_lossy(), "size": 10,
-                        "mtimeMs": 0, "kind": "video", "duration": 1.0, "hasAudio": false
+                        "mtimeMs": m1_mtime, "kind": "video", "duration": 1.0, "hasAudio": false
                     }, {
                         "id": "m2", "path": "Solid #00ff00", "size": 0, "mtimeMs": 0,
                         "kind": "image", "duration": 0.0, "hasAudio": false,
@@ -540,6 +564,60 @@ mod tests {
             let loaded = load_project(proj.to_string_lossy().into_owned()).unwrap();
             // The generator is never "missing"; the bogus file-backed media is.
             assert_eq!(loaded.missing, vec!["m3".to_string()]);
+        });
+    }
+
+    /// Build a one-media project at `proj` referencing `media_file` with the
+    /// given stored size + mtime, then load and return the `missing` ids.
+    fn missing_for(proj: &Path, media_file: &Path, size: u64, mtime_ms: u64) -> Vec<String> {
+        write_json(
+            proj,
+            &serde_json::json!({
+                "schema": 1, "app": "taroting", "id": "p1", "name": "Scan",
+                "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+                "media": [{
+                    "id": "m1", "path": media_file.to_string_lossy(), "size": size,
+                    "mtimeMs": mtime_ms, "kind": "video", "duration": 1.0, "hasAudio": false
+                }],
+                "timeline": {
+                    "fps": {"num": 30, "den": 1}, "width": 640, "height": 360,
+                    "tracks": [{ "id": "t1", "kind": "video", "name": "V1",
+                                 "muted": false, "clips": [] }]
+                },
+                "export": {}
+            }),
+        );
+        load_project(proj.to_string_lossy().into_owned())
+            .unwrap()
+            .missing
+    }
+
+    #[test]
+    fn load_flags_same_size_different_mtime_as_missing() {
+        with_isolated("scan-mtime", |dir| {
+            // Same-size in-place content replacement bumps the file's mtime; the
+            // stored mtime_ms is now stale, so the media must be flagged missing.
+            let media_file = dir.join("v.bin");
+            std::fs::write(&media_file, b"0123456789").unwrap();
+            let size = std::fs::metadata(&media_file).unwrap().len();
+            let stale_mtime = disk_mtime_ms(&media_file).wrapping_sub(5_000);
+
+            let proj = dir.join("Scan.trt");
+            assert_eq!(missing_for(&proj, &media_file, size, stale_mtime), vec!["m1"]);
+        });
+    }
+
+    #[test]
+    fn load_does_not_flag_unchanged_file() {
+        with_isolated("scan-unchanged", |dir| {
+            // Size + mtime both match what's on disk: not missing.
+            let media_file = dir.join("v.bin");
+            std::fs::write(&media_file, b"0123456789").unwrap();
+            let size = std::fs::metadata(&media_file).unwrap().len();
+            let mtime = disk_mtime_ms(&media_file);
+
+            let proj = dir.join("Scan.trt");
+            assert!(missing_for(&proj, &media_file, size, mtime).is_empty());
         });
     }
 
@@ -589,6 +667,22 @@ mod tests {
             let new_path =
                 rename_project(old.to_string_lossy().into_owned(), "Taken".into()).unwrap();
             assert!(new_path.ends_with("Taken (2).trt"), "got {new_path}");
+        });
+    }
+
+    #[test]
+    fn rename_to_own_name_keeps_filename() {
+        with_isolated("rename-self", |dir| {
+            // Renaming to a name whose sanitized form equals the current stem
+            // must keep "Self.trt", not dedupe to "Self (2).trt".
+            let old = dir.join("Self.trt");
+            write_json(&old, &serde_json::json!({ "name": "Self", "id": "1" }));
+
+            let new_path =
+                rename_project(old.to_string_lossy().into_owned(), "Self".into()).unwrap();
+            assert!(new_path.ends_with("Self.trt"), "got {new_path}");
+            assert!(!new_path.ends_with("Self (2).trt"), "got {new_path}");
+            assert!(Path::new(&new_path).exists());
         });
     }
 
