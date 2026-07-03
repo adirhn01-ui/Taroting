@@ -1,12 +1,14 @@
 # Taroting
 
-A free, open-source, ultra-lightweight, fully-offline desktop video editor for Windows.
+A free, open-source, ultra-lightweight, fully-offline desktop video editor.
 
 **Taroting is 100% free and open source** — every feature, forever. No account, no sign-up, no tiers, no trial, no watermark, no strings attached. Released under the [GPL-3.0](LICENSE): download it, use it, study it, and modify it however you like.
 
 Taroting launches in a fraction of a second, stays out of your way, and does the essentials — import, trim, split, arrange, composite, animate, adjust audio, export — without a project account, a cloud round-trip, or a background updater. It is built as a native [Tauri 2](https://tauri.app) (Rust) shell around vanilla TypeScript, with [FFmpeg](https://ffmpeg.org) bundled as a sidecar for all media work. No UI framework, no runtime JS dependencies beyond the Tauri API bindings, no telemetry, no network calls — ever.
 
-> **Status: early development.** Feature-complete for its scope but not yet code-signed; expect a Windows SmartScreen prompt on first run.
+> **Status: early development.** Feature-complete for its scope but not yet code-signed.
+>
+> **Platforms:** Windows is supported today; Linux and macOS support is planned.
 
 ## Highlights
 
