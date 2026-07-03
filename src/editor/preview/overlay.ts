@@ -71,12 +71,17 @@ function transformOf(clip: Clip): ClipTransform {
   return clip.transform ?? defaultTransform();
 }
 
-/** Evaluate a clip's pose at timeline time t (keyframes override statics). */
+/** Evaluate a clip's pose at timeline time t (keyframes override statics). When
+ *  `out` is supplied the result is written into it (zero-alloc, mirroring the
+ *  scheduler's SCRATCH transform) instead of allocating a fresh pose; callers
+ *  that keep the pose past the current frame (gesture snapshots) must NOT pass a
+ *  shared scratch. */
 function resolvePose(
   clip: Clip,
   media: MediaRef,
   project: { width: number; height: number },
   t: number,
+  out?: ResolvedPose,
 ): ResolvedPose {
   const tr = transformOf(clip);
   const srcW = Math.max(1, media.width ?? project.width);
@@ -93,23 +98,47 @@ function resolvePose(
     if (kfs.scale) scale = evalKfs(kfs.scale, s);
     if (kfs.opacity) opacity = evalKfs(kfs.opacity, s);
   }
-  const crop = tr.crop
-    ? { x: tr.crop.x, y: tr.crop.y, w: tr.crop.w, h: tr.crop.h }
-    : { x: 0, y: 0, w: srcW, h: srcH };
-  return {
-    x, y, scale, opacity, crop,
-    axis: { rotate: tr.rotate, flipH: tr.flipH, flipV: tr.flipV },
-    srcW, srcH,
-  };
+  const p = out ?? ({ crop: { x: 0, y: 0, w: 0, h: 0 }, axis: { rotate: 0, flipH: false, flipV: false } } as ResolvedPose);
+  p.x = x; p.y = y; p.scale = scale; p.opacity = opacity;
+  p.srcW = srcW; p.srcH = srcH;
+  if (tr.crop) {
+    p.crop.x = tr.crop.x; p.crop.y = tr.crop.y; p.crop.w = tr.crop.w; p.crop.h = tr.crop.h;
+  } else {
+    p.crop.x = 0; p.crop.y = 0; p.crop.w = srcW; p.crop.h = srcH;
+  }
+  p.axis.rotate = tr.rotate; p.axis.flipH = tr.flipH; p.axis.flipV = tr.flipV;
+  return p;
 }
 
-/** The axis-aligned display rect of a resolved pose, in project px. */
+// One scratch pose reused by the per-tick render() (mirrors scheduler.ts SCRATCH);
+// never escapes the render() frame, so gesture snapshots keep allocating fresh.
+const RENDER_POSE: ResolvedPose = {
+  x: 0, y: 0, scale: 1, opacity: 1,
+  crop: { x: 0, y: 0, w: 0, h: 0 },
+  axis: { rotate: 0, flipH: false, flipV: false },
+  srcW: 1, srcH: 1,
+};
+// Scratch PoseState fed into displayRect() so poseRect() allocates no input
+// literal on the hot path; its crop is re-pointed at the pose's crop each call.
+const POSE_IN: PoseState = { crop: RENDER_POSE.crop, scale: 1, x: 0, y: 0 };
+
+/** The axis-aligned display rect of a resolved pose, in project px. `into`, when
+ *  given, is the PoseState scratch fed to displayRect (avoids the input literal);
+ *  displayRect still returns a fresh rect (canvas-math, out of our control). */
 function poseRect(
   pose: ResolvedPose,
   project: { width: number; height: number },
+  into?: PoseState,
 ): { cx: number; cy: number; w: number; h: number } {
+  let src: PoseState;
+  if (into) {
+    into.crop = pose.crop; into.scale = pose.scale; into.x = pose.x; into.y = pose.y;
+    src = into;
+  } else {
+    src = { crop: pose.crop, scale: pose.scale, x: pose.x, y: pose.y };
+  }
   return displayRect(
-    { crop: pose.crop, scale: pose.scale, x: pose.x, y: pose.y },
+    src,
     pose.srcW,
     pose.srcH,
     project.width,
@@ -194,6 +223,23 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
   let lastSelSig = "";
   let lastCropSig = "";
 
+  // Recompute gate for the selection branch: skip selectedVisible()/resolvePose()/
+  // poseRect() entirely when nothing that can change the box changed. Key inputs:
+  // playhead time, selected id, stage scale, and the project REFERENCE (every
+  // mutation — edit, replace, undo, redo — swaps it via store.set, so this covers
+  // a same-time pose change like undo of a transform edit). During keyframed
+  // playback engine.time advances every frame so the key busts every frame (by
+  // design). `keyed` guards the first call (all-null key is a legal state).
+  let keyed = false;
+  let kTime = 0;
+  let kSelId: string | null = null;
+  let kScale = 0;
+  let kProject: ProjectFile | null = null;
+
+  function invalidateRenderKey(): void {
+    keyed = false;
+  }
+
   /* ---------------- geometry helpers ---------------- */
 
   const project = (): { width: number; height: number } => session.project.timeline;
@@ -221,6 +267,17 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
       renderCrop();
       return;
     }
+    // Recompute gate: bail before any allocation/compute when the key inputs are
+    // unchanged. The box's shown/hidden state and geometry are a pure function of
+    // these four inputs, so an unchanged key means an identical frame.
+    const time = engine.time;
+    const selId = selection.get();
+    const s = S();
+    const proj = session.project;
+    if (keyed && time === kTime && selId === kSelId && s === kScale && proj === kProject) return;
+    keyed = true;
+    kTime = time; kSelId = selId; kScale = s; kProject = proj;
+
     const sel = selectedVisible();
     if (!sel) {
       if (lastSelSig !== "") {
@@ -229,9 +286,8 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
       }
       return;
     }
-    const pose = resolvePose(sel.clip, sel.media, project(), engine.time);
-    const r = poseRect(pose, project());
-    const s = S();
+    const pose = resolvePose(sel.clip, sel.media, project(), engine.time, RENDER_POSE);
+    const r = poseRect(pose, project(), POSE_IN);
     const sig = `${r.cx}|${r.cy}|${r.w}|${r.h}|${s}`;
     if (sig === lastSelSig) return;
     lastSelSig = sig;
@@ -536,6 +592,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     cropClipId = null;
     lastCropSig = "";
     lastSelSig = "";
+    invalidateRenderKey(); // mode isn't in the key; force the idle path to recompute
     chrome.veil.style.display = "none";
     chrome.ghost.style.display = "none";
     chrome.window.style.display = "none";

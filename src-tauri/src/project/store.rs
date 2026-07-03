@@ -199,9 +199,13 @@ pub fn load_project(path: String) -> Result<LoadedProject> {
     let typed: ProjectFile = serde_json::from_value(migrated.clone())
         .map_err(|e| AppError::BadInput(format!("invalid project file: {e}")))?;
 
-    // Verify media identity (path exists + size/mtime match).
+    // Verify media identity (path exists + size/mtime match). Generated media
+    // (text/solid) has no file identity — its `path` is a display label.
     let mut missing = Vec::new();
     for m in &typed.media {
+        if m.generator.is_some() {
+            continue;
+        }
         let ok = std::fs::metadata(&m.path)
             .map(|meta| meta.len() == m.size)
             .unwrap_or(false);
@@ -497,6 +501,46 @@ mod tests {
 
     fn write_json(path: &Path, v: &Value) {
         std::fs::write(path, serde_json::to_vec_pretty(v).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn load_skips_generated_media_in_missing_scan() {
+        with_isolated("gen-missing", |dir| {
+            // A real file whose size matches its media entry, plus a generated
+            // solid whose `path` is a display label (no file on disk).
+            let media_file = dir.join("v.bin");
+            std::fs::write(&media_file, b"0123456789").unwrap();
+            let proj = dir.join("Gen.trt");
+            write_json(
+                &proj,
+                &serde_json::json!({
+                    "schema": 1, "app": "taroting", "id": "p1", "name": "Gen",
+                    "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+                    "media": [{
+                        "id": "m1", "path": media_file.to_string_lossy(), "size": 10,
+                        "mtimeMs": 0, "kind": "video", "duration": 1.0, "hasAudio": false
+                    }, {
+                        "id": "m2", "path": "Solid #00ff00", "size": 0, "mtimeMs": 0,
+                        "kind": "image", "duration": 0.0, "hasAudio": false,
+                        "width": 64, "height": 64,
+                        "generator": { "type": "solid", "color": "#00ff00" }
+                    }, {
+                        "id": "m3", "path": "C:\\definitely\\not\\there.mp4", "size": 1,
+                        "mtimeMs": 0, "kind": "video", "duration": 1.0, "hasAudio": false
+                    }],
+                    "timeline": {
+                        "fps": {"num": 30, "den": 1}, "width": 640, "height": 360,
+                        "tracks": [{ "id": "t1", "kind": "video", "name": "V1",
+                                     "muted": false, "clips": [] }]
+                    },
+                    "export": {}
+                }),
+            );
+
+            let loaded = load_project(proj.to_string_lossy().into_owned()).unwrap();
+            // The generator is never "missing"; the bogus file-backed media is.
+            assert_eq!(loaded.missing, vec!["m3".to_string()]);
+        });
     }
 
     #[test]

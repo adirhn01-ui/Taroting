@@ -350,7 +350,14 @@ export async function mountEditor(
     timeEl.textContent = `${formatTimecode(engine.time, fps)} / ${formatTimecode(engine.duration(), fps)}`;
   };
 
-  playBtn.addEventListener("click", () => engine.toggle());
+  playBtn.addEventListener("click", () => {
+    engine.toggle();
+    // A focused <button> treats Space as a native activation (click). If focus
+    // stays here after clicking, the next Space fires BOTH this click AND the
+    // window "playPause" shortcut → two toggles → no visible change ("pause
+    // didn't work"). Blur so Space is owned solely by the ShortcutManager.
+    playBtn.blur();
+  });
   $("#tr-stop").addEventListener("click", () => engine.stop());
   $("#tr-step-back").addEventListener("click", () => engine.stepFrames(-1));
   $("#tr-step-fwd").addEventListener("click", () => engine.stepFrames(1));

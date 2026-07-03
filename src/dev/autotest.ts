@@ -6,7 +6,15 @@
 
 import { ipc } from "../core/ipc";
 import { navigate } from "../core/nav";
-import { createProject, importMediaAsClip, splitClip } from "../core/project";
+import {
+  addGeneratedMedia,
+  addMarkerAt,
+  createProject,
+  importMediaAsClip,
+  setKeyframe,
+  setPositionKeyframes,
+  splitClip,
+} from "../core/project";
 import type { ProjectSession } from "../core/session";
 import { frameCenter } from "../core/time";
 import type { AudioGraph } from "../editor/playback/audio-graph";
@@ -203,6 +211,68 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       const advanced = t1 - t0;
       assert(advanced > 1.4 && advanced < 2.8, `advanced ${advanced.toFixed(3)}s in 2s wall`);
       return `advanced ${advanced.toFixed(3)}s in 2.0s wall clock`;
+    });
+
+    await test("pause-always-wins", async () => {
+      // Exercises the real transport wiring: the #tr-play button click handler
+      // AND the window "playPause" shortcut (Space) both call engine.toggle().
+      // The button reflects engine state via the tick listener (pause/play icon).
+      const playBtn = document.querySelector<HTMLButtonElement>("#tr-play");
+      assert(playBtn !== null, "no #tr-play transport button");
+      const showsPause = (): boolean => playBtn!.innerHTML.includes("M7 4h3v16"); // pause glyph
+      const showsPlay = (): boolean => playBtn!.innerHTML.includes("m6 4 14 8"); // play glyph
+      // window-level Space, the shortcut path (bubbles to ShortcutManager).
+      const pressSpace = (): void => {
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true }),
+        );
+      };
+
+      engine.seek(5);
+      await sleep(120);
+      if (engine.playing) engine.pause();
+      assert(!engine.playing && showsPlay(), "precondition: paused + play glyph");
+
+      // 1) Space toggles play; button flips to the pause glyph immediately.
+      pressSpace();
+      await sleep(60);
+      assert(engine.playing, "Space did not start playback");
+      assert(showsPause(), "button did not flip to pause glyph after play");
+
+      // 2) The core symptom: after clicking the play button to pause, the button
+      // holds focus. A focused <button> makes Space a native activation (click)
+      // AS WELL AS the window shortcut — two toggles for one press → the pause
+      // is undone. Clicking must blur the button so the next Space is a single
+      // toggle. Reproduce exactly: click to pause, then press Space once.
+      playBtn!.focus();
+      playBtn!.click(); // pause via the transport button
+      await sleep(60);
+      assert(!engine.playing, "transport-button click did not pause");
+      assert(showsPlay(), "button did not flip to play glyph after pause");
+      assert(document.activeElement !== playBtn, "play button must blur after click");
+
+      // now a single Space must produce exactly ONE toggle (→ playing), not two.
+      const wasPlaying = engine.playing;
+      pressSpace();
+      await sleep(60);
+      assert(engine.playing !== wasPlaying, "single Space did not produce exactly one toggle");
+      assert(engine.playing, "expected exactly one toggle → playing");
+      assert(showsPause(), "button glyph out of sync with engine after Space");
+
+      // 3) Rapid Space toggling ends deterministically and pause always wins:
+      // an even number of presses returns to the start state; the button matches.
+      const startPlaying = engine.playing;
+      for (let i = 0; i < 6; i++) { pressSpace(); await sleep(20); }
+      assert(engine.playing === startPlaying, "6 rapid Space presses not idempotent");
+      // explicit pause must stop, and the button must show the play glyph.
+      engine.pause();
+      await sleep(30);
+      assert(!engine.playing, "final pause did not stop playback");
+      assert(showsPlay(), "button glyph shows pause after engine paused");
+      // and no video element is left playing behind a paused engine.
+      const stuck = dev.activeVideo();
+      assert(stuck === null || stuck.paused, "a video element kept playing after pause");
+      return "button-click blurs; single Space = one toggle; pause always wins";
     });
 
     await test("playback-across-cut", async () => {
@@ -583,6 +653,63 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       engine.refresh();
       assert(tl().width === w0 && tl().height === h0, `undo restored ${tl().width}x${tl().height}`);
       return `canvas 1280x720 set + invariants clean + undo restored ${w0}x${h0}`;
+    });
+
+    await test("v06-file-roundtrip", async () => {
+      // Build a full v0.6 project in memory (never touches the live session):
+      // marker + paired position keyframes + opacity keyframe + both generator
+      // kinds. Save through the real IPC path, reload, and assert nothing was
+      // dropped and generated media is not reported "missing" (relink bait).
+      const rtPath = await ipc.newProjectPath("Autotest RT");
+      let rt = createProject("Autotest RT");
+      const src = await ipc.probeMedia(`${fixturesDir}\\counter_h264.mp4`);
+      rt = importMediaAsClip(rt, src).project;
+      const rtClip = rt.timeline.tracks[0]!.clips[0]!.id;
+      rt = addMarkerAt(rt, 2.5, 4).project;
+      rt = setPositionKeyframes(rt, rtClip, 0, 0, 0);
+      rt = setPositionKeyframes(rt, rtClip, 2, 150, -80);
+      rt = setKeyframe(rt, rtClip, "opacity", 1, 0.3);
+      rt = addGeneratedMedia(rt, { type: "solid", color: "#00ff00" }, 320, 240, "Solid #00ff00")
+        .project;
+      rt = addGeneratedMedia(
+        rt,
+        { type: "text", text: "RT", fontFamily: "Georgia", sizePx: 72, color: "#ffffff", bold: true, italic: false },
+        200,
+        80,
+        "Text: RT",
+      ).project;
+      await ipc.saveProject(rtPath, rt);
+
+      const loaded = await ipc.loadProject(rtPath);
+      const lt = loaded.project.timeline;
+      const mk = lt.markers ?? [];
+      assert(
+        mk.length === 1 && Math.abs(mk[0]!.t - 2.5) < 1e-9 && mk[0]!.color === 4,
+        `markers lost: ${JSON.stringify(lt.markers)}`,
+      );
+      const kf = lt.tracks[0]!.clips[0]!.keyframes;
+      const kfx = kf?.x ?? [];
+      const kfy = kf?.y ?? [];
+      assert(
+        kfx.length === 2 && kfy.length === 2 && kf?.opacity?.length === 1,
+        `keyframes lost: ${JSON.stringify(kf)}`,
+      );
+      assert(
+        Math.abs(kfx[1]!.v - 150) < 1e-9 && Math.abs(kfy[1]!.v + 80) < 1e-9,
+        `keyframe values wrong: ${JSON.stringify(kfx)} ${JSON.stringify(kfy)}`,
+      );
+      const gens = loaded.project.media.filter((m) => m.generator);
+      assert(gens.length === 2, `generators lost: ${gens.length} of 2`);
+      const txt = gens.find((m) => m.generator!.type === "text");
+      assert(
+        txt !== undefined && txt.generator!.type === "text" && txt.generator!.text === "RT",
+        "text generator fields lost",
+      );
+      assert(
+        !loaded.missing.some((id) => gens.some((g) => g.id === id)),
+        `generator flagged missing: ${JSON.stringify(loaded.missing)}`,
+      );
+      return "marker+kf(x,y,opacity)+2 generators survive save→load; generators not 'missing'";
     });
 
     await test("canvas-overlay-drag", async () => {
