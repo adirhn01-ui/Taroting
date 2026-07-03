@@ -194,6 +194,52 @@ export function effectiveClip(clip: Clip, drag: DragState): Clip {
   return { ...clip, srcOut: clip.srcIn + dur * clip.speed };
 }
 
+/** Resolve a pending cross-lane move: the moved clip (with its drag override
+ *  applied) and the target lane's track id, but only when the drag is a move
+ *  whose target differs from the clip's source lane. Returns null otherwise so
+ *  same-lane moves and non-move drags cost nothing. */
+function crossLaneMove(
+  drag: DragState,
+  lanes: LaneRect[],
+): { clip: Clip; targetId: string } | null {
+  if (!drag || drag.kind !== "move") return null;
+  let source: Track | null = null;
+  let raw: Clip | null = null;
+  for (const lane of lanes) {
+    for (const c of lane.track.clips) {
+      if (c.id === drag.clipId) {
+        source = lane.track;
+        raw = c;
+        break;
+      }
+    }
+    if (source) break;
+  }
+  if (!source || !raw || drag.toTrackId === source.id) return null;
+  return { clip: effectiveClip(raw, drag), targetId: drag.toTrackId };
+}
+
+/** Dashed accent outline marking a clip's landing position in the target lane. */
+function drawDropGhost(
+  ctx: CanvasRenderingContext2D,
+  colors: TimelineColors,
+  lane: LaneRect,
+  x: number,
+  w: number,
+): void {
+  const y = lane.y + 2;
+  const h = lane.h - 4;
+  const r = Math.min(6, w / 2);
+  ctx.save();
+  ctx.strokeStyle = colors.accent;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([5, 4]);
+  ctx.beginPath();
+  ctx.roundRect(x + 0.5, y + 0.5, Math.max(w, 2) - 1, h - 1, r);
+  ctx.stroke();
+  ctx.restore();
+}
+
 export function draw(ctx: CanvasRenderingContext2D, input: RenderInput): void {
   const { t0, pxPerSec, width, height, colors } = input;
   const xOf = (t: number): number => (t - t0) * pxPerSec;
@@ -260,11 +306,24 @@ export function draw(ctx: CanvasRenderingContext2D, input: RenderInput): void {
   /* ---------------- lanes + clips ---------------- */
   const lanes = laneLayout(input.project);
   const labels = laneLabels(input.project);
+
+  // Cross-lane move preview: when a move drag targets a lane other than the
+  // clip's source lane, resolve the moved clip + its target lane so we can tint
+  // that lane and paint a drop ghost there (the real mutation happens on
+  // pointer-up). Zero cost unless a move drag is active.
+  const cross = crossLaneMove(input.drag, lanes);
+
   for (let li = 0; li < lanes.length; li++) {
     const lane = lanes[li]!;
     if (lane.y > height) break;
     ctx.fillStyle = colors.laneBg;
     ctx.fillRect(0, lane.y, width, lane.h);
+
+    // target-lane tint: a subtle accent wash marking where release will land
+    if (cross && lane.track.id === cross.targetId) {
+      ctx.fillStyle = colors.accentDim;
+      ctx.fillRect(0, lane.y, width, lane.h);
+    }
 
     for (const raw of lane.track.clips) {
       const clip = effectiveClip(raw, input.drag);
@@ -272,6 +331,13 @@ export function draw(ctx: CanvasRenderingContext2D, input: RenderInput): void {
       const w = clipDuration(clip) * pxPerSec;
       if (x + w < 0 || x > width) continue;
       drawClip(ctx, input, clip, lane, x, w);
+    }
+
+    // drop ghost in the target lane (dashed outline at the landing position)
+    if (cross && lane.track.id === cross.targetId) {
+      const gx = xOf(cross.clip.timelineStart);
+      const gw = clipDuration(cross.clip) * pxPerSec;
+      if (gx + gw >= 0 && gx <= width) drawDropGhost(ctx, colors, lane, gx, gw);
     }
 
     // lane label (drawn over clips so it stays legible at the corner)

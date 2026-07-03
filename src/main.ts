@@ -79,7 +79,9 @@ setNavigator((route) => void go(route));
 void go({ view: "home" });
 
 // OS file-open routing: a ".trt" opens the project directly; a supported media
-// file starts a new bin-first project with that file (mirrors home createNew).
+// file starts a new project with that file placed on the timeline (an OS
+// "Open with" implies the user wants to work with it, not just stage it).
+// This differs from in-app import, which is bin-first (see home createNew).
 // Serialized so overlapping launches can't interleave two project creations.
 let openChain: Promise<void> = Promise.resolve();
 
@@ -91,12 +93,12 @@ async function routeOpenPath(path: string): Promise<void> {
   }
   if (!MEDIA_FILE_EXTENSIONS.has(ext)) return; // unknown type: ignore
   const { ipc, describeError } = await import("./core/ipc");
-  const { addMedia, createProject } = await import("./core/project");
+  const { createProject, importMediaAsClip } = await import("./core/project");
   try {
     const projectPath = await ipc.newProjectPath(fileStem(path));
     let project = createProject(fileStem(projectPath));
     const info = await ipc.probeMedia(path);
-    project = addMedia(project, info).project;
+    project = importMediaAsClip(project, info).project;
     await ipc.saveProject(projectPath, project);
     navigate({ view: "editor", projectPath });
   } catch (e) {

@@ -13,6 +13,7 @@ import {
   clipDiamondTimes,
   laneLayout,
 } from "./render";
+import { laneTargetForMove } from "./lane-target";
 import { collectCandidates, snapMove, snapTime } from "./snap";
 import type { TimelineController } from "./timeline";
 
@@ -41,7 +42,15 @@ type Mode =
       startX: number;
       startY: number;
     }
-  | { name: "move"; clip: Clip; track: Track; grabOffset: number; candidates: number[] }
+  | {
+      name: "move";
+      clip: Clip;
+      track: Track;
+      grabOffset: number;
+      candidates: number[];
+      /** sticky lane target, retained across moves for hysteresis */
+      toTrackId: string;
+    }
   | { name: "trim"; clip: Clip; edge: "in" | "out"; candidates: number[] }
   | { name: "marker-move"; markerId: string; before: ProjectFile };
 
@@ -107,13 +116,6 @@ export function attachInteractions(tl: TimelineController): () => void {
     }
     void t;
     return { type: "empty" };
-  };
-
-  const laneAt = (y: number): Track | null => {
-    for (const lane of laneLayout(tl.project())) {
-      if (y >= lane.y && y <= lane.y + lane.h) return lane.track;
-    }
-    return null;
   };
 
   const localPos = (e: PointerEvent): { x: number; y: number } => {
@@ -203,6 +205,7 @@ export function attachInteractions(tl: TimelineController): () => void {
         track: mode.track,
         grabOffset: mode.grabOffset,
         candidates: collectCandidates(tl.project(), mode.clip.id, tl.playhead(), mode.clip),
+        toTrackId: mode.track.id,
       };
       canvas.style.cursor = "grabbing";
     }
@@ -216,9 +219,17 @@ export function attachInteractions(tl: TimelineController): () => void {
         tl.view.pxPerSec,
         tl.snapEnabled() && !e.altKey,
       );
-      const targetLane = laneAt(y);
-      const toTrackId =
-        targetLane && targetLane.kind === mode.track.kind ? targetLane.id : mode.track.id;
+      // Hysteresis: the lane target only switches once the pointer travels
+      // meaningfully into a neighboring same-kind lane, so a clip dragged near a
+      // boundary does not flip-flop between lanes.
+      const toTrackId = laneTargetForMove(
+        y,
+        laneLayout(tl.project()),
+        mode.track.kind,
+        mode.toTrackId,
+        mode.track.id,
+      );
+      mode.toTrackId = toTrackId;
       tl.setDrag(
         { kind: "move", clipId: mode.clip.id, start: Math.max(0, snap.t), toTrackId },
         snap.guide,
