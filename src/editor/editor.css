@@ -515,3 +515,75 @@
 .relink-row__warn .btn {
   margin-left: auto;
 }
+
+/* ---------- canvas direct-manipulation overlay ---------- */
+
+.stage-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1000;
+  outline: none;
+}
+
+/* selection box + corner handles (idle mode) */
+.stage-overlay__selbox {
+  position: absolute;
+  display: none;
+  border: 1px solid var(--accent, #6c7cff);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+  cursor: move;
+  box-sizing: border-box;
+}
+
+.stage-overlay__handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  background: var(--accent, #6c7cff);
+  border: 1px solid #fff;
+  border-radius: 2px;
+  box-sizing: border-box;
+}
+.stage-overlay__handle--nw { left: -5px; top: -5px; cursor: nwse-resize; }
+.stage-overlay__handle--ne { right: -5px; top: -5px; cursor: nesw-resize; }
+.stage-overlay__handle--se { right: -5px; bottom: -5px; cursor: nwse-resize; }
+.stage-overlay__handle--sw { left: -5px; bottom: -5px; cursor: nesw-resize; }
+.stage-overlay__handle--n { left: 50%; top: -5px; transform: translateX(-50%); cursor: ns-resize; }
+.stage-overlay__handle--s { left: 50%; bottom: -5px; transform: translateX(-50%); cursor: ns-resize; }
+.stage-overlay__handle--e { right: -5px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
+.stage-overlay__handle--w { left: -5px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
+
+/* crop mode: dim veil + ghost frame + solid window */
+.stage-overlay__veil {
+  position: absolute;
+  inset: 0;
+  display: none;
+  /* the actual dim is painted by the window's box-shadow so it leaves a crisp
+   * hole; this element is the structural veil layer (kept transparent to avoid
+   * double-dimming) and blocks stray pointer events outside the ghost. */
+  background: transparent;
+  pointer-events: none;
+}
+.stage-overlay__ghost {
+  position: absolute;
+  display: none;
+  opacity: 0.35;
+  overflow: hidden;
+  cursor: grab;
+}
+.stage-overlay__ghost-media {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  pointer-events: none;
+}
+.stage-overlay__window {
+  position: absolute;
+  display: none;
+  border: 1px solid #fff;
+  /* the "hole" over the veil: a huge shadow dims everything outside the window */
+  box-shadow: 0 0 0 4000px rgba(0, 0, 0, 0.45);
+  box-sizing: border-box;
+  cursor: default;
+}

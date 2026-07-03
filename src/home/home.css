@@ -25,8 +25,8 @@
   width: 22px;
   height: 22px;
   border-radius: 6px;
-  background: var(--accent);
-  color: var(--on-accent);
+  background: #7A00A8;
+  color: #ffffff;
   display: grid;
   place-items: center;
   font-size: 12px;

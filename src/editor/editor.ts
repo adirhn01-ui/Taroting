@@ -40,6 +40,7 @@ import { AudioGraph } from "./playback/audio-graph";
 import { PlaybackEngine } from "./playback/engine";
 import { Scheduler } from "./playback/scheduler";
 import { mountStage } from "./preview/preview";
+import { mountCanvasOverlay } from "./preview/overlay";
 import { collectCandidates, snapTime } from "./timeline/snap";
 import { laneLayout } from "./timeline/render";
 import { TimelineController } from "./timeline/timeline";
@@ -182,6 +183,20 @@ export async function mountEditor(
     session,
     media,
     engine,
+    selection,
+    refresh: () => {
+      engine.refresh();
+      timeline.requestRender();
+    },
+  });
+
+  // Canvas direct manipulation: selection box, drag/scale, and crop mode over
+  // the preview stage. Shares the same selection store and refresh path.
+  const overlay = mountCanvasOverlay({
+    stage,
+    scheduler,
+    engine,
+    session,
     selection,
     refresh: () => {
       engine.refresh();
@@ -849,6 +864,7 @@ export async function mountEditor(
       if (dragCleanup) dragCleanup();
       for (const u of unsubs) u();
       unlistenDrop();
+      overlay.dispose();
       inspector.dispose();
       timeline.dispose();
       engine.dispose();

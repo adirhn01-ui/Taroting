@@ -585,6 +585,83 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       return `canvas 1280x720 set + invariants clean + undo restored ${w0}x${h0}`;
     });
 
+    await test("canvas-overlay-drag", async () => {
+      const overlay = document.querySelector<HTMLElement>(".stage-overlay");
+      assert(overlay !== null, "no .stage-overlay mounted");
+      // put the playhead inside the base clip on tracks[0]
+      engine.seek(3);
+      await sleep(150);
+      const clip0 = () => session.project.timeline.tracks[0]!.clips[0]!;
+      const x0 = clip0().transform!.x;
+      const canvas = overlay!.parentElement as HTMLElement; // .preview__canvas
+      const box = canvas.getBoundingClientRect();
+      const cx = box.left + box.width / 2;
+      const cy = box.top + box.height / 2;
+      const projW = session.project.timeline.width;
+      const clientDx = 80; // px on screen
+      const projDx = (clientDx * projW) / box.width; // project-space px dragged
+      const ev = (type: string, x: number, y: number) =>
+        overlay!.dispatchEvent(
+          new PointerEvent(type, { clientX: x, clientY: y, pointerId: 1, button: 0, bubbles: true }),
+        );
+      ev("pointerdown", cx, cy);
+      ev("pointermove", cx + clientDx / 2, cy);
+      ev("pointermove", cx + clientDx, cy);
+      ev("pointerup", cx + clientDx, cy);
+      const x1 = clip0().transform!.x;
+      assert(
+        Math.abs(x1 - x0 - projDx) < 1.5,
+        `x moved ${(x1 - x0).toFixed(2)}, expected ~${projDx.toFixed(2)}`,
+      );
+      // exactly one history entry: one undo restores the original x
+      assert(session.history.canUndo, "expected a history entry from the drag");
+      session.undo();
+      const x2 = clip0().transform!.x;
+      assert(Math.abs(x2 - x0) < 1e-6, `undo did not restore x: ${x2} vs ${x0}`);
+      engine.refresh();
+      return `drag ${projDx.toFixed(1)}px = 1 history entry, undo restores`;
+    });
+
+    await test("crop-mode-cycle", async () => {
+      const overlay = document.querySelector<HTMLElement>(".stage-overlay")!;
+      engine.seek(3);
+      await sleep(120);
+      engine.play();
+      await sleep(200);
+      const canvas = overlay.parentElement as HTMLElement;
+      const box = canvas.getBoundingClientRect();
+      const cx = box.left + box.width / 2;
+      const cy = box.top + box.height / 2;
+      overlay.dispatchEvent(new MouseEvent("dblclick", { clientX: cx, clientY: cy, bubbles: true }));
+      await sleep(50);
+      assert(
+        document.querySelector(".crop-ghost.stage-overlay__ghost") !== null &&
+          getComputedStyle(document.querySelector(".stage-overlay__ghost")!).display !== "none",
+        "crop ghost not shown",
+      );
+      assert(!engine.playing, "entering crop mode should pause playback");
+      // crop mode is modal: a Space keydown on the focused overlay must be
+      // swallowed (stopPropagation) so the global play shortcut can't resume
+      // playback behind the frozen crop chrome. Simulate that global handler on
+      // the window bubble phase and assert it never fires.
+      let globalSawSpace = false;
+      const spy = (ev: KeyboardEvent): void => { if (ev.key === " ") globalSawSpace = true; };
+      window.addEventListener("keydown", spy);
+      overlay.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true }));
+      window.removeEventListener("keydown", spy);
+      await sleep(30);
+      assert(!globalSawSpace, "Space leaked to window during crop mode (not swallowed)");
+      assert(!engine.playing, "Space during crop mode must not resume playback");
+      // Escape exits — chrome gone
+      overlay.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await sleep(50);
+      assert(
+        getComputedStyle(document.querySelector(".stage-overlay__window")!).display === "none",
+        "crop window still visible after Escape",
+      );
+      return "dblclick → ghost + paused; Escape → chrome gone";
+    });
+
     await test("timeline-canvas-painted", () => {
       const canvas = document.querySelector<HTMLCanvasElement>(".timeline-canvas");
       assert(canvas !== null, "timeline canvas missing");

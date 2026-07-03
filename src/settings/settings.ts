@@ -288,6 +288,20 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       </section>`;
   }
 
+  function dangerSection(): string {
+    return `
+      <section class="card settings__card settings__card--danger">
+        <div class="settings__section-head">Danger zone</div>
+        <div class="settings__row">
+          <div class="settings__row-text">
+            <div class="settings__row-label">Uninstall Taroting</div>
+            <div class="settings__hint">Removes the app, its settings and caches. Your projects in Documents\\Taroting and exported files are kept.</div>
+          </div>
+          <button class="btn btn--sm btn--danger settings__uninstall-btn" id="settings-uninstall">Uninstall Taroting…</button>
+        </div>
+      </section>`;
+  }
+
   /* ---------------- rendering ---------------- */
 
   function render(): void {
@@ -299,6 +313,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       performanceSection(s),
       cacheSection(s),
       shortcutsSection(s),
+      dangerSection(),
     ].join("");
     wire();
   }
@@ -360,6 +375,11 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       ?.addEventListener("click", () => {
         void updateSettings({ shortcuts: { ...DEFAULT_SHORTCUTS } });
       });
+
+    // Uninstall (danger zone)
+    inner
+      .querySelector<HTMLButtonElement>("#settings-uninstall")
+      ?.addEventListener("click", () => confirmUninstall());
 
     // Shortcut rows → capture
     inner.querySelectorAll<HTMLElement>(".settings__shortcut").forEach((rowEl) => {
@@ -424,6 +444,51 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       toast.error(`Couldn't clear cache: ${describeError(e)}`);
     }
     await loadCacheStats();
+  }
+
+  /* ---------------- uninstall ---------------- */
+
+  function confirmUninstall(): void {
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true" aria-label="Uninstall Taroting">
+        <div class="modal__header"><span>Uninstall Taroting?</span></div>
+        <div class="modal__body">
+          <p>Your projects in <strong>Documents\\Taroting</strong> and exported files are kept.
+          Settings and caches are removed.</p>
+        </div>
+        <div class="modal__footer">
+          <button class="btn btn--sm" data-cancel>Cancel</button>
+          <button class="btn btn--sm btn--danger" data-confirm>Uninstall</button>
+        </div>
+      </div>`;
+    document.body.appendChild(backdrop);
+
+    const close = (): void => {
+      document.removeEventListener("keydown", onKey, true);
+      backdrop.remove();
+    };
+    function onKey(e: KeyboardEvent): void {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        close();
+      }
+    }
+    document.addEventListener("keydown", onKey, true);
+    backdrop.addEventListener("mousedown", (e) => {
+      if (e.target === backdrop) close();
+    });
+    backdrop.querySelector("[data-cancel]")!.addEventListener("click", close);
+    backdrop.querySelector("[data-confirm]")!.addEventListener("click", () => {
+      // On success the app process exits before this promise resolves; on
+      // failure (e.g. a dev build with no registry entry) surface the error.
+      void ipc.uninstallApp().catch((e) => {
+        close();
+        toast.error(`Couldn't uninstall: ${describeError(e)}`);
+      });
+    });
   }
 
   /* ---------------- shortcut capture ---------------- */

@@ -124,6 +124,14 @@ export const ipc = {
   enforceCacheLimit: (capMb: number, keepActive: MediaKey[]) =>
     call<number>("enforce_cache_limit", { capMb, keepActive }),
 
+  /* OS integration */
+  // Atomically drain the server-side open-path queue. Each queued path is
+  // returned to exactly one caller, so the startup drain and the "open-path"
+  // wake-up handler can both call this without double-opening a file.
+  takePendingOpenPaths: () =>
+    call<string[]>("take_pending_open_paths", undefined, () => []),
+  uninstallApp: () => call<void>("uninstall_app"),
+
   /* dev-only (hard error in release builds) */
   debugInfo: () =>
     call<{ autotest: boolean; fixturesDir: string; reportPath: string }>("debug_info"),
@@ -156,6 +164,18 @@ export async function onJobEvents(handlers: JobEventHandlers): Promise<() => voi
   return () => {
     for (const un of subs) un();
   };
+}
+
+/* ---------------- OS open-path events ---------------- */
+
+/** Subscribe to "open-path" wake-up events (a second launch forwarding a file
+ *  path to the already-running instance). The event payload is ignored: the
+ *  path lives in the server-side queue, and the callback fires so the caller can
+ *  drain it via `ipc.takePendingOpenPaths`. Returns an unlisten function. */
+export async function onOpenPath(cb: () => void): Promise<() => void> {
+  if (!inTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen("open-path", () => cb());
 }
 
 /** URL that the webview can load for a local media/cache file. */

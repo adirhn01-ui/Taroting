@@ -1,8 +1,9 @@
 //! Pure `ExportSpec -> BuiltExport`. Never a shell string: media paths only
 //! ever appear as standalone `-i` argv entries; the filtergraph references
 //! stream indices. The video chain mirrors `src/editor/preview/transforms.ts`
-//! (crop -> rotate -> flip -> scale-to-fit x userScale -> position -> opacity)
-//! exactly so the export matches the preview.
+//! (crop -> flip -> rotate -> scale-to-fit x userScale -> position -> opacity)
+//! exactly so the export matches the preview. Flip precedes rotate so the
+//! composite is source->screen = R*F (see `emit_clip_chain`).
 //!
 //! v0.6 additions:
 //!   * unlimited stacked video layers — the bottom video track keeps the
@@ -873,7 +874,7 @@ enable='gte(t,{start:.6})*lt(t,{end:.6})'{out};"
     /// Emit the full per-clip filter chain into `[out_label]`.
     ///
     /// Order: source/input → setpts speed → crop → [opacity alphamerge] →
-    /// transpose/flips → scale (animated or static) → setsar=1 → fps →
+    /// flips → transpose → scale (animated or static) → setsar=1 → fps →
     /// [static opacity colorchannelmixer] → [setpts timeline shift].
     ///
     /// Animated scale/geq always use the clip-local time var ("t"/"T") since
@@ -928,17 +929,21 @@ geq=lum='255*({expr})',scale={cw}:{ch}[al{a}];[chain{a}][al{a}]alphamerge"
             ));
         }
 
-        match p.rotate {
-            90 => chain.push_str(",transpose=1"),
-            180 => chain.push_str(",transpose=1,transpose=1"),
-            270 => chain.push_str(",transpose=2"),
-            _ => {}
-        }
+        // Flips FIRST, then rotate. ffmpeg applies chain filters left-to-right to
+        // frames, so this composites as R∘F (source->screen = R*F), matching the
+        // preview's `rotate(r) scale(fh,fv)` (CSS right-to-left = R*F). Flip-after-
+        // rotate would give F*R, a full mirror for rotate∈{90,270} with one flip.
         if p.flip_h {
             chain.push_str(",hflip");
         }
         if p.flip_v {
             chain.push_str(",vflip");
+        }
+        match p.rotate {
+            90 => chain.push_str(",transpose=1"),
+            180 => chain.push_str(",transpose=1,transpose=1"),
+            270 => chain.push_str(",transpose=2"),
+            _ => {}
         }
 
         // scale — animated (eval=frame) or static.
@@ -1340,6 +1345,15 @@ mod tests {
         assert!(fc.contains("transpose=1"), "{fc}");
         assert!(fc.contains("hflip"), "{fc}");
         assert!(!fc.contains("vflip"), "{fc}");
+        // Flip must be applied BEFORE transpose so source->screen = R*F, matching
+        // the preview. Order-reversal (flip after rotate) mirrors the export.
+        let hflip_at = fc.find("hflip").expect("hflip present");
+        let transpose_at = fc.find("transpose=1").expect("transpose present");
+        assert!(hflip_at < transpose_at, "hflip must precede transpose: {fc}");
+        assert!(
+            fc.contains("crop=50:50:10:10,hflip,transpose=1"),
+            "chain must be crop,hflip,transpose: {fc}"
+        );
         assert!(fc.contains("scale=100:100"), "{fc}");
         assert!(fc.contains("colorchannelmixer=aa=0.5000"), "{fc}");
         assert!(fc.contains("overlay=0:0:shortest=1"), "{fc}");

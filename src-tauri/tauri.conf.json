@@ -37,9 +37,24 @@
     "targets": ["nsis"],
     "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"],
     "icon": ["icons/icon.ico"],
+    "fileAssociations": [
+      {
+        "ext": ["trt"],
+        "name": "Taroting Project",
+        "description": "Taroting video project",
+        "role": "Editor"
+      },
+      {
+        "ext": ["mp4", "mov", "mkv", "avi", "webm", "gif", "mp3", "wav", "flac", "aac"],
+        "name": "Media file",
+        "description": "Media file openable in Taroting",
+        "role": "Viewer"
+      }
+    ],
     "windows": {
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "installerHooks": "windows/hooks.nsh"
       }
     }
   }
