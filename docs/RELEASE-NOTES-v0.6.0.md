@@ -1,6 +1,6 @@
 # Taroting v0.6.0
 
-A big step up from v0.5: unlimited layers, keyframe animation, timeline markers, on-canvas manipulation, generators, and deeper Windows integration — every feature free and costing nothing when unused, with idle cold-start and RAM at parity with v0.5 (see [`docs/PERFORMANCE.md`](PERFORMANCE.md)).
+A big step up from v0.5: unlimited layers, keyframe animation, timeline markers, on-canvas manipulation, generators, and deeper Windows integration — every feature adds zero resource overhead when unused, with idle cold-start and RAM at parity with v0.5 (see [`docs/PERFORMANCE.md`](PERFORMANCE.md)). Free and open source, as always.
 
 ## New in 0.6
 

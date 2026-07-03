@@ -30,5 +30,5 @@ measured 489 MB — the extra ~130 MB is the WebView2 media decoder process
 that exists only while a video element is active.
 
 v0.6 adds unlimited layers, keyframes, markers, generators, canvas
-manipulation and OS integration; every feature costs nothing when unused — the idle and
-single-layer costs match v0.5 within measurement noise.
+manipulation and OS integration; every feature adds zero resource overhead when
+unused — the idle and single-layer numbers match v0.5 within measurement noise.

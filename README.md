@@ -1,6 +1,8 @@
 # Taroting
 
-An ultra-lightweight, fully-offline desktop video editor for Windows.
+A free, open-source, ultra-lightweight, fully-offline desktop video editor for Windows.
+
+**Taroting is 100% free and open source** — every feature, forever. No account, no sign-up, no tiers, no trial, no watermark, no strings attached. Released under the [GPL-3.0](LICENSE): download it, use it, study it, and modify it however you like.
 
 Taroting launches in a fraction of a second, stays out of your way, and does the essentials — import, trim, split, arrange, composite, animate, adjust audio, export — without a project account, a cloud round-trip, or a background updater. It is built as a native [Tauri 2](https://tauri.app) (Rust) shell around vanilla TypeScript, with [FFmpeg](https://ffmpeg.org) bundled as a sidecar for all media work. No UI framework, no runtime JS dependencies beyond the Tauri API bindings, no telemetry, no network calls — ever.
 
@@ -67,7 +69,7 @@ Performance is the project's #1 veto criterion: a release may not regress the pr
 | Cold start → window (warm) | ~0.17 s |
 | Idle RAM, home screen (app + WebView2) | ~358 MB |
 
-Every feature is free, runs entirely on your hardware, and costs nothing when unused: unlimited layers, keyframes, markers, generators, and canvas manipulation add zero overhead at idle. RAM only grows when you actually load and decode video (a single H.264 clip in the preview adds ~130 MB for the WebView2 media decoder, which is released when no video element is active). See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the full method and numbers.
+Every feature runs entirely on your hardware and adds zero resource overhead when unused: unlimited layers, keyframes, markers, generators, and canvas manipulation sit idle for free. Memory only grows when you actually load and decode video (a single H.264 clip in the preview adds ~130 MB for the WebView2 media decoder, which is released when no video element is active). See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the full method and numbers.
 
 ## Building from source
 
