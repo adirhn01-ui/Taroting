@@ -1,13 +1,14 @@
 #!/usr/bin/env node
-// Generates the Taroting app icon: a bright-purple (#7A00A8) rounded square
-// with a bold white "T", 1024x1024, using the ffmpeg sidecar only (no new deps).
+// Generates the Taroting app icon: an accent-blue (#6c7cff, matches the
+// "New project" button / --accent token) rounded square with a bold white "T",
+// 1024x1024, using the ffmpeg sidecar only (no new deps).
 //
 //   node scripts/make-icon.mjs
 //
 // Output: src-tauri/icon-src-1024.png (source PNG for `npx tauri icon`).
 //
 // Pipeline (single ffmpeg -filter_complex, verified on the bundled ffmpeg 8.1.1):
-//   1. purple canvas + bold white centred "T" (drawtext, cwd=C:\Windows\Fonts
+//   1. accent-blue canvas + bold white centred "T" (drawtext, cwd=C:\Windows\Fonts
 //      so the fontfile needs no filter-path escaping — same trick as
 //      make-fixtures.mjs). format=gbrp so alphamerge can attach an alpha plane.
 //   2. a separate gray alpha mask via geq: transparent (0) outside a radius-180
@@ -28,7 +29,7 @@ const out = path.join(root, "src-tauri", "icon-src-1024.png");
 const S = 1024; // canvas size
 const R = 180; // corner radius
 const FAR = S - 1 - R; // 843: inner edge past which corner rounding begins
-const PURPLE = "0x7A00A8";
+const ACCENT = "0x6C7CFF"; // matches --accent (#6c7cff), the "New project" button color
 
 // geq alpha: dx = distance past the [R, S-1-R] box on X (0 inside), dy likewise.
 // Written with nested 2-arg max() — geq chokes on 3-arg max inside hypot().
@@ -47,7 +48,7 @@ execFileSync(
   ffmpeg,
   [
     "-y", "-hide_banner", "-loglevel", "error",
-    "-f", "lavfi", "-i", `color=c=${PURPLE}:s=${S}x${S}:d=1:r=1`,
+    "-f", "lavfi", "-i", `color=c=${ACCENT}:s=${S}x${S}:d=1:r=1`,
     "-filter_complex", filter,
     "-frames:v", "1",
     out,

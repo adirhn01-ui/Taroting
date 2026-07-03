@@ -12,6 +12,7 @@ import { settingsStore, updateSettings } from "../core/session";
 import { chordOf, findConflicts, normalizeChord } from "../core/shortcuts";
 import type { ActionId, Settings } from "../core/types";
 import { DEFAULT_SHORTCUTS } from "../core/types";
+import { trapTab } from "../ui/focus";
 import { icon } from "../ui/icons";
 import { toast } from "../ui/toast";
 
@@ -36,7 +37,7 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   toggleSnap: "Toggle snapping",
   toggleLoop: "Toggle loop",
   addMarker: "Add marker",
-  export: "Export…",
+  export: "Export",
   goHome: "Close project",
 };
 
@@ -187,7 +188,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
             <div class="settings__path ${dir ? "" : "settings__path--empty"}" title="${dir ? escapeHtml(dir) : ""}">${dir ? escapeHtml(dir) : "Not set"}</div>
           </div>
           <div class="settings__row-actions">
-            <button class="btn btn--sm" id="settings-choose-dir">Choose…</button>
+            <button class="btn btn--sm" id="settings-choose-dir">Choose</button>
             <button class="btn btn--sm btn--ghost" id="settings-clear-dir" ${dir ? "" : "disabled"}>Clear</button>
           </div>
         </div>
@@ -205,6 +206,12 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
           s.proxyMedia,
           "Use lighter preview copies for heavy or 4K files",
         )}
+        ${switchRow(
+          "settings-snap-center",
+          "Snap to center guides",
+          s.snapCenterGuides,
+          "Dragged clips snap to the canvas center",
+        )}
       </section>`;
   }
 
@@ -213,7 +220,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     if (cacheStatsError) {
       usageHtml = `<div class="settings__hint">Couldn't read cache usage.</div>`;
     } else if (!cacheStats) {
-      usageHtml = `<div class="settings__hint">Reading cache usage…</div>`;
+      usageHtml = `<div class="settings__hint">Reading cache usage</div>`;
     } else {
       const parts = CACHE_KIND_ORDER.map(
         (k) => `${k} ${formatBytes(cacheStats!.byKind[k] ?? 0)}`,
@@ -255,7 +262,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       const isCapturing = capturing === action;
       let valueHtml: string;
       if (isCapturing) {
-        valueHtml = `<span class="settings__capturing">Press a key combination… (Esc cancels)</span>`;
+        valueHtml = `<span class="settings__capturing">Press a key combination (Esc cancels)</span>`;
       } else if (chord) {
         valueHtml = chord
           .split("+")
@@ -291,13 +298,13 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   function dangerSection(): string {
     return `
       <section class="card settings__card settings__card--danger">
-        <div class="settings__section-head">Danger zone</div>
+        <div class="settings__section-head">Uninstall</div>
         <div class="settings__row">
           <div class="settings__row-text">
             <div class="settings__row-label">Uninstall Taroting</div>
             <div class="settings__hint">Removes the app, its settings and caches. Your projects in Documents\\Taroting and exported files are kept.</div>
           </div>
-          <button class="btn btn--sm btn--danger settings__uninstall-btn" id="settings-uninstall">Uninstall Taroting…</button>
+          <button class="btn btn--sm btn--danger settings__uninstall-btn" id="settings-uninstall">Uninstall Taroting</button>
         </div>
       </section>`;
   }
@@ -354,6 +361,11 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       .querySelector<HTMLInputElement>("#settings-proxy")
       ?.addEventListener("change", (e) => {
         void updateSettings({ proxyMedia: (e.target as HTMLInputElement).checked });
+      });
+    inner
+      .querySelector<HTMLInputElement>("#settings-snap-center")
+      ?.addEventListener("change", (e) => {
+        void updateSettings({ snapCenterGuides: (e.target as HTMLInputElement).checked });
       });
 
     // Cache limit
@@ -465,8 +477,10 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       </div>`;
     document.body.appendChild(backdrop);
 
+    const releaseTrap = trapTab(backdrop);
     const close = (): void => {
       document.removeEventListener("keydown", onKey, true);
+      releaseTrap();
       backdrop.remove();
     };
     function onKey(e: KeyboardEvent): void {

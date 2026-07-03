@@ -2,8 +2,8 @@
 // layer SETS — one per video track. Each set owns an A/B <video> pair (double-
 // buffering across cuts), one <img> for stills, and one "gen" <div> for
 // generated media (solid / text). Sets are z-ordered so index 0 paints on top
-// (z = count - i); z-index 1000+ is reserved for a future ".stage-overlay".
-// A status overlay sits above everything.
+// (z = count - i); the ".stage-overlay" sits above them at var(--z-stage-overlay)
+// (see the z scale in tokens.css). A status overlay sits above everything.
 
 import type { LayerBoxes } from "./transforms";
 

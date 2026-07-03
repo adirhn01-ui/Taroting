@@ -530,7 +530,7 @@ export class Scheduler {
         const st = this.media.status.get()[seg.media.id];
         setOverlay(
           this.stage,
-          st?.state === "failed" ? `Preview unavailable: ${st.message}` : "Preparing preview…",
+          st?.state === "failed" ? `Preview unavailable: ${st.message}` : "Preparing preview",
         );
         return;
       }

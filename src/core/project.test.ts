@@ -11,6 +11,7 @@ import {
   createProject,
   detachAudio,
   findClip,
+  fitFillScale,
   insertClip,
   moveMarkerTo,
   removeClipAudio,
@@ -654,5 +655,78 @@ describe("audio detach / remove", () => {
     expectClean(removed);
     // already detached → no-op (same reference)
     expect(removeClipAudio(removed, clipId)).toBe(removed);
+  });
+});
+
+describe("fitFillScale", () => {
+  it("fit is always 1 for same-aspect landscape media", () => {
+    // 1280x720 into 1920x1080 (both 16:9): fit letterboxes exactly -> scale 1.
+    expect(fitFillScale(1280, 720, undefined, 1920, 1080, "fit")).toBeCloseTo(1, 6);
+    // fill on matching aspect adds no extra scale.
+    expect(fitFillScale(1280, 720, undefined, 1920, 1080, "fill")).toBeCloseTo(1, 6);
+  });
+
+  it("fill covers the canvas for landscape media on a portrait canvas", () => {
+    // sx = 1080/1280, sy = 1920/720 -> fill = max/min.
+    const sx = 1080 / 1280;
+    const sy = 1920 / 720;
+    expect(fitFillScale(1280, 720, undefined, 1080, 1920, "fill")).toBeCloseTo(
+      Math.max(sx, sy) / Math.min(sx, sy),
+      6,
+    );
+    // fit stays 1 regardless of aspect mismatch.
+    expect(fitFillScale(1280, 720, undefined, 1080, 1920, "fit")).toBeCloseTo(1, 6);
+  });
+
+  it("fill covers the canvas for portrait media on a landscape canvas", () => {
+    const sx = 1920 / 720;
+    const sy = 1080 / 1280;
+    expect(fitFillScale(720, 1280, undefined, 1920, 1080, "fill")).toBeCloseTo(
+      Math.max(sx, sy) / Math.min(sx, sy),
+      6,
+    );
+  });
+
+  it("uses the cropped (visible) region, not the full frame", () => {
+    // crop 500x250 out of a 1000x1000 frame into a 1000x1000 canvas.
+    const crop = { x: 0, y: 0, w: 500, h: 250 };
+    // fitW=500, fitH=250 -> sx=2, sy=4 -> fill = 4/2 = 2.
+    expect(fitFillScale(1000, 1000, crop, 1000, 1000, "fill")).toBeCloseTo(2, 6);
+    expect(fitFillScale(1000, 1000, crop, 1000, 1000, "fit")).toBeCloseTo(1, 6);
+  });
+
+  it("clamps a crop that overhangs the frame to the visible extent", () => {
+    // crop.x=600 with w=800 -> visible cropW = min(800, 1000-600) = 400.
+    const crop = { x: 600, y: 0, w: 800, h: 1000 };
+    // fitW=400, fitH=1000 -> sx=2.5, sy=1 -> fill = 2.5.
+    expect(fitFillScale(1000, 1000, crop, 1000, 1000, "fill")).toBeCloseTo(2.5, 6);
+  });
+
+  it("swaps width/height under 90/270 rotation", () => {
+    // 1280x720 rotated 90 into 1920x1080: fitW=720, fitH=1280.
+    const sx = 1920 / 720;
+    const sy = 1080 / 1280;
+    const expected = Math.max(sx, sy) / Math.min(sx, sy);
+    expect(fitFillScale(1280, 720, undefined, 1920, 1080, "fill", 90)).toBeCloseTo(expected, 6);
+    expect(fitFillScale(1280, 720, undefined, 1920, 1080, "fill", 270)).toBeCloseTo(expected, 6);
+    // 180 keeps the axes, so it matches the unrotated result.
+    expect(fitFillScale(1280, 720, undefined, 1920, 1080, "fill", 180)).toBeCloseTo(
+      fitFillScale(1280, 720, undefined, 1920, 1080, "fill", 0),
+      6,
+    );
+  });
+
+  it("clamps fill to MAX_SCALE for extreme aspect ratios", () => {
+    // 4000x100 into 100x4000: raw fill would be 1600, clamp to 4.
+    expect(fitFillScale(4000, 100, undefined, 100, 4000, "fill")).toBeCloseTo(4, 6);
+  });
+
+  it("guards against zero/degenerate media dimensions", () => {
+    // Falls back to 1px min for width/height; must return a finite scale.
+    const v = fitFillScale(0, 0, undefined, 1920, 1080, "fit");
+    expect(Number.isFinite(v)).toBe(true);
+    expect(v).toBeCloseTo(1, 6);
+    const f = fitFillScale(0, 0, undefined, 1920, 1080, "fill");
+    expect(Number.isFinite(f)).toBe(true);
   });
 });

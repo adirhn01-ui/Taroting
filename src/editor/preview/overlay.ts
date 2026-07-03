@@ -16,6 +16,7 @@ import type { Store } from "../../core/store";
 import { defaultTransform, findClip, setKeyframe, setPositionKeyframes, updateClip } from "../../core/project";
 import { evalKfs } from "../../core/anim";
 import { mediaUrl } from "../../core/ipc";
+import { settingsStore } from "../../core/session";
 import type { Scheduler } from "../playback/scheduler";
 import type { PlaybackEngine } from "../playback/engine";
 import type { ProjectSession } from "../../core/session";
@@ -30,6 +31,7 @@ import {
   fit,
   ghostDrag,
   ghostResize,
+  snapToCenter,
   windowHandleDrag,
   SCALE_MAX,
   SCALE_MIN,
@@ -47,6 +49,11 @@ export interface OverlayCtx {
 const CORNER_HANDLES: WindowHandle[] = ["nw", "ne", "se", "sw"];
 const ALL_HANDLES: WindowHandle[] = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
 const clamp = (v: number, lo: number, hi: number): number => Math.min(Math.max(v, lo), hi);
+
+// Center-snap catch radius, in SCREEN px. Divided by the stage scale at drag
+// time to get the project-px threshold, so the snap zone is a constant on-screen
+// distance regardless of how large the canvas is rendered.
+const SNAP_SCREEN_PX = 8;
 
 /** setPointerCapture throws for synthesized/inactive pointers (autotest); the
  *  gesture still works because our listeners live on the overlay element. */
@@ -162,6 +169,9 @@ interface Chrome {
   ghostMedia: HTMLElement | null; // set on crop enter, cleared on exit
   window: HTMLElement;
   windowHandles: Record<WindowHandle, HTMLElement>;
+  // center-snap guides (vertical + horizontal), toggled during a move drag
+  guideV: HTMLElement;
+  guideH: HTMLElement;
 }
 
 function buildChrome(host: HTMLElement): Chrome {
@@ -197,12 +207,18 @@ function buildChrome(host: HTMLElement): Chrome {
     windowHandles[h] = el;
   }
 
-  // z-order inside the overlay: veil < ghost < window < selbox
-  overlay.append(veil, ghost, win, selBox);
+  const guideV = document.createElement("div");
+  guideV.className = "stage-overlay__guide stage-overlay__guide--v";
+  const guideH = document.createElement("div");
+  guideH.className = "stage-overlay__guide stage-overlay__guide--h";
+
+  // z-order inside the overlay: veil < ghost < window < selbox < guides
+  overlay.append(veil, ghost, win, selBox, guideV, guideH);
   host.appendChild(overlay);
 
   return {
     overlay, selBox, selHandles, veil, ghost, ghostMedia: null, window: win, windowHandles,
+    guideV, guideH,
   };
 }
 
@@ -258,6 +274,27 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
   function clientToProject(clientX: number, clientY: number): { x: number; y: number } {
     const box = stage.canvas.getBoundingClientRect();
     return { x: (clientX - box.left) / S(), y: (clientY - box.top) / S() };
+  }
+
+  /* ---------------- center-snap guides ---------------- */
+
+  // last shown state, so pointermove only writes display when it actually flips.
+  let guideVShown = false;
+  let guideHShown = false;
+
+  function showGuides(v: boolean, h: boolean): void {
+    if (v !== guideVShown) {
+      chrome.guideV.style.display = v ? "block" : "none";
+      guideVShown = v;
+    }
+    if (h !== guideHShown) {
+      chrome.guideH.style.display = h ? "block" : "none";
+      guideHShown = h;
+    }
+  }
+
+  function hideGuides(): void {
+    showGuides(false, false);
   }
 
   /* ---------------- rendering (per tick + on change) ---------------- */
@@ -443,8 +480,18 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     if (gesture.kind === "move") {
       const dx = p.x - gesture.startProj.x;
       const dy = p.y - gesture.startProj.y;
-      const nx = gesture.startPose.x + dx;
-      const ny = gesture.startPose.y + dy;
+      let nx = gesture.startPose.x + dx;
+      let ny = gesture.startPose.y + dy;
+      // Snap the clip center to the project center (0,0), each axis independent.
+      // x/y are already center-relative offsets, so snapping toward 0 IS snapping
+      // to the canvas center. Zero cost when disabled: no compute, guides stay off.
+      if (settingsStore.get().snapCenterGuides) {
+        const threshold = SNAP_SCREEN_PX / S();
+        const snap = snapToCenter(nx, ny, threshold);
+        nx = snap.x;
+        ny = snap.y;
+        showGuides(snap.snappedX, snap.snappedY);
+      }
       applyPosition(gesture.clipId, nx, ny, gesture.keySrcTime);
     } else {
       const center = gesture.centerProj!;
@@ -460,6 +507,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     if (!gesture) return;
     const g = gesture;
     gesture = null;
+    hideGuides(); // drag over → drop the center-snap guides
     try { overlay.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
     session.commitFrom(g.before);
   }
@@ -578,6 +626,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     cropClipId = clipId;
     lastCropSig = "";
     lastSelSig = "";
+    hideGuides(); // never leave a snap guide up when crop chrome takes over
     chrome.selBox.style.display = "none";
     chrome.veil.style.display = "block";
     chrome.ghost.style.display = "block";

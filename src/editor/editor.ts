@@ -281,11 +281,17 @@ export async function mountEditor(
     },
     undo(): void {
       session.undo();
+      // clear selection if it no longer resolves after the history step
+      const sel = selectedClipId();
+      if (sel && !findClip(session.project, sel)) select(null);
       engine.refresh();
       timeline.requestRender();
     },
     redo(): void {
       session.redo();
+      // clear selection if it no longer resolves after the history step
+      const sel = selectedClipId();
+      if (sel && !findClip(session.project, sel)) select(null);
       engine.refresh();
       timeline.requestRender();
     },
@@ -329,7 +335,7 @@ export async function mountEditor(
     showMenu(clientX, clientY, [
       { label: "Copy", onSelect: () => actions.copy() },
       { label: "Split at playhead", disabled: !insideClip, onSelect: () => actions.split() },
-      { label: "Replace media…", onSelect: () => void replaceClipMedia(clip) },
+      { label: "Replace media", onSelect: () => void replaceClipMedia(clip) },
       { label: "Delete", onSelect: () => actions.remove() },
       { label: "Ripple delete", danger: true, onSelect: () => actions.ripple() },
     ]);
@@ -342,8 +348,17 @@ export async function mountEditor(
   const loopBtn = $("#tr-loop");
   const snapBtn = $("#tr-snap");
 
+  // Idempotent: the tick listener runs this ~60×/s during playback. Rewriting
+  // innerHTML every tick would destroy and recreate the inner <svg> under the
+  // cursor mid-press, so a real mouse-down that landed on the old glyph never
+  // pairs with its mouse-up → the browser eats the click and pause is missed
+  // ("hover off and back on to fix"). Only touch the DOM on an actual flip.
+  let playBtnShows: "play" | "pause" | null = null;
   const updatePlayBtn = (): void => {
-    playBtn.innerHTML = icon(engine.playing ? "pause" : "play");
+    const want = engine.playing ? "pause" : "play";
+    if (playBtnShows === want) return;
+    playBtnShows = want;
+    playBtn.innerHTML = icon(want);
   };
   const updateTime = (): void => {
     const fps = engine.fps();
@@ -397,7 +412,7 @@ export async function mountEditor(
   const mediaList = $("#media-list");
   function statusHtml(m: MediaRef): string {
     const s = media.status.get()[m.id];
-    if (!s || s.state === "checking") return `<span class="media-row__status">Checking…</span>`;
+    if (!s || s.state === "checking") return `<span class="media-row__status">Checking</span>`;
     switch (s.state) {
       case "ready":
         return `<span class="media-row__status media-row__status--ok">Ready</span>`;
@@ -465,7 +480,7 @@ export async function mountEditor(
       const badge = $("#ed-save");
       badge.classList.toggle("editor__savestate--error", s === "error");
       badge.textContent =
-        s === "saved" ? "Saved" : s === "saving" ? "Saving…" : s === "dirty" ? "Edited" : "Save failed";
+        s === "saved" ? "Saved" : s === "saving" ? "Saving" : s === "dirty" ? "Edited" : "Save failed";
     }),
   ];
   renderMedia();

@@ -17,6 +17,7 @@ import {
 } from "../core/project";
 import type { ProjectSession } from "../core/session";
 import { frameCenter } from "../core/time";
+import { openGeneratorDialog } from "../editor/media/generators";
 import type { AudioGraph } from "../editor/playback/audio-graph";
 import type { MediaManager } from "../editor/media/media";
 import type { PlaybackEngine } from "../editor/playback/engine";
@@ -272,7 +273,67 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       // and no video element is left playing behind a paused engine.
       const stuck = dev.activeVideo();
       assert(stuck === null || stuck.paused, "a video element kept playing after pause");
-      return "button-click blurs; single Space = one toggle; pause always wins";
+
+      // 4) The reported symptom: spamming physical mouse clicks on the play
+      // button sometimes leaves playback RUNNING even though the last click was
+      // a pause. Root cause modeled faithfully: the browser synthesizes a
+      // `click` from the mouse-DOWN target; while playing, the tick listener
+      // used to rewrite the button's innerHTML ~60×/s, destroying the <svg> the
+      // press landed on before mouse-up, so the click was dropped. We reproduce
+      // by driving native down/up/click sequences through the DOM (NOT the
+      // synthetic .click() helper, which cannot miss) and letting real RAF ticks
+      // run between down and up. A robust build swaps the glyph only on an actual
+      // flip and marks the icon pointer-events:none, so the button is always the
+      // event target and no click is ever eaten.
+      const scheduler2 = (dev as unknown as { scheduler: import("../editor/playback/scheduler").Scheduler }).scheduler;
+      const allVideosPaused = (): boolean => scheduler2.videoElements().every((v) => v.paused);
+      // Dispatch one native activation the way a stationary mouse does: press on
+      // whatever node is currently under the button (svg/path or the button
+      // itself), let the frame advance, then release + click routed through the
+      // DOWN target with bubbling — exactly how the platform pairs a click.
+      const nativeActivate = async (settleMs: number): Promise<void> => {
+        const downTarget: Element = playBtn!.querySelector("svg *") ?? playBtn!.querySelector("svg") ?? playBtn!;
+        const opts = { bubbles: true, cancelable: true, view: window } as MouseEventInit;
+        downTarget.dispatchEvent(new PointerEvent("pointerdown", opts));
+        downTarget.dispatchEvent(new MouseEvent("mousedown", opts));
+        await sleep(settleMs); // a real RAF tick (or several) lands here mid-press
+        const upTarget: Element = downTarget.isConnected ? downTarget : playBtn!;
+        upTarget.dispatchEvent(new PointerEvent("pointerup", opts));
+        upTarget.dispatchEvent(new MouseEvent("mouseup", opts));
+        // The platform fires `click` from the mouse-DOWN target. If that node was
+        // detached mid-press it is no longer in the tree, so a bubbling click
+        // never reaches the button handler — reproducing the eaten click.
+        downTarget.dispatchEvent(new MouseEvent("click", opts));
+      };
+
+      // Storm: several rounds of alternating activations at varied 60–140ms
+      // spacing, always ending on an ODD count so the final intent is PAUSE.
+      // Start each round from a known playing state and assert the button icon
+      // stays consistent with the engine mid-storm (icon-vs-engine coherence).
+      const spacings = [60, 75, 90, 110, 140, 70, 100, 130, 65, 120, 85, 115];
+      let storms = 0;
+      for (let round = 0; round < 12; round++) {
+        // begin the round PLAYING so an odd click count ends on pause
+        if (!engine.playing) { engine.play(); await sleep(40); }
+        assert(engine.playing && showsPause(), `round ${round}: expected playing+pause-glyph at start`);
+        const clicks = 2 * (round % 3) + 1; // 1,3,5,1,3,5,... always odd → ends paused
+        for (let c = 0; c < clicks; c++) {
+          const gap = spacings[(round * 5 + c) % spacings.length]!;
+          await nativeActivate(gap);
+          storms++;
+          // mid-storm coherence: the glyph must match the engine after settle.
+          await sleep(20);
+          const coherent = engine.playing ? showsPause() : showsPlay();
+          assert(coherent, `round ${round} click ${c}: icon out of sync (playing=${engine.playing})`);
+        }
+        // odd clicks from a playing start ⇒ the engine MUST now be paused.
+        await sleep(300); // settle: let any in-flight play() promise resolve
+        assert(!engine.playing, `round ${round}: ${clicks} clicks ending on pause left engine PLAYING`);
+        assert(showsPlay(), `round ${round}: engine paused but button shows pause glyph`);
+        assert(allVideosPaused(), `round ${round}: a <video> kept playing after the pause click`);
+      }
+
+      return `button-click blurs; single Space = one toggle; ${storms} storm-clicks, pause always wins`;
     });
 
     await test("playback-across-cut", async () => {
@@ -710,6 +771,64 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         `generator flagged missing: ${JSON.stringify(loaded.missing)}`,
       );
       return "marker+kf(x,y,opacity)+2 generators survive save→load; generators not 'missing'";
+    });
+
+    await test("modal-above-overlay", async () => {
+      // Regression: the canvas-manipulation .stage-overlay (z var(--z-stage-overlay))
+      // must NOT hit-test above a modal rendered over the preview. Open a real
+      // .modal-backdrop and probe the OVERLAY's own center: the full-screen
+      // backdrop (or the modal panel, depending on window geometry) must win
+      // that hit-test regardless of where the panel happens to sit.
+      const overlay = document.querySelector<HTMLElement>(".stage-overlay");
+      assert(overlay !== null, "no .stage-overlay mounted");
+      assert(
+        document.querySelector(".modal-backdrop") === null,
+        "a modal was already open before the test",
+      );
+
+      openGeneratorDialog("solid", { session, media });
+      const backdrop = await waitFor(
+        () => document.querySelector<HTMLElement>(".modal-backdrop"),
+        2000,
+        "solid dialog modal-backdrop",
+      );
+      try {
+        const ob = overlay!.getBoundingClientRect();
+        const px = ob.left + ob.width / 2;
+        const py = ob.top + ob.height / 2;
+        const hit = document.elementFromPoint(px, py);
+        assert(hit !== null, "elementFromPoint returned null");
+        assert(
+          !overlay!.contains(hit) && hit !== overlay,
+          `.stage-overlay intercepts the modal layer (hit=${(hit as HTMLElement).className})`,
+        );
+        assert(
+          hit === backdrop || backdrop.contains(hit),
+          `hit at overlay center is not the modal layer (hit=${(hit as HTMLElement).className})`,
+        );
+
+        // a real click on the Cancel button must close the dialog
+        const cancel = Array.from(backdrop.querySelectorAll<HTMLButtonElement>("button")).find(
+          (b) => b.textContent?.trim() === "Cancel",
+        );
+        assert(cancel !== undefined, "no Cancel button in the modal");
+        cancel!.click();
+        await waitFor(
+          () => document.querySelector(".modal-backdrop") === null,
+          2000,
+          "modal to close after Cancel click",
+        );
+      } finally {
+        // Never leak an open dialog into later tests: its document-capture
+        // Escape handler would swallow keys meant for the canvas overlay.
+        // [data-close] routes through the dialog's close() (removes listeners).
+        document
+          .querySelector<HTMLButtonElement>(".modal-backdrop [data-close]")
+          ?.click();
+      }
+      // generated media stores its label in `path`; Cancel must add nothing
+      assert(session.project.media.every((m) => m.path !== "Solid #000000"), "Cancel added media");
+      return "modal layer wins the hit-test over the stage overlay; real Cancel click closes it";
     });
 
     await test("canvas-overlay-drag", async () => {

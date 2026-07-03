@@ -11,6 +11,7 @@ import "./generators.css";
 import { addGeneratedMedia } from "../../core/project";
 import type { ProjectSession } from "../../core/session";
 import type { FontFamily, Generator } from "../../core/types";
+import { trapTab } from "../../ui/focus";
 import { toast } from "../../ui/toast";
 import type { MediaManager } from "./media";
 
@@ -111,8 +112,10 @@ function openModal(title: string): Modal {
   const body = backdrop.querySelector<HTMLElement>(".gen-body")!;
   const footer = backdrop.querySelector<HTMLElement>(".gen-footer")!;
 
+  const releaseTrap = trapTab(backdrop);
   const close = (): void => {
     document.removeEventListener("keydown", onKeydown, true);
+    releaseTrap();
     backdrop.remove();
   };
   function onKeydown(e: KeyboardEvent): void {
@@ -277,7 +280,10 @@ function openTextDialog(ctx: GeneratorDialogCtx): void {
   const cancel = makeButton("Cancel", "btn btn--ghost btn--sm");
   cancel.addEventListener("click", m.close);
   const confirm = makeButton("Add text", "btn btn--primary btn--sm");
+  let submitted = false;
   confirm.addEventListener("click", () => {
+    if (submitted) return;
+    submitted = true;
     const g = currentGen();
     const { width, height } = measureText(g);
     ctx.session.commit((p) => addGeneratedMedia(p, g, width, height, textLabel(g.text)).project);
@@ -357,7 +363,10 @@ function openSolidDialog(ctx: GeneratorDialogCtx): void {
   const cancel = makeButton("Cancel", "btn btn--ghost btn--sm");
   cancel.addEventListener("click", m.close);
   const confirm = makeButton("Add solid", "btn btn--primary btn--sm");
+  let submitted = false;
   confirm.addEventListener("click", () => {
+    if (submitted) return;
+    submitted = true;
     const hex = colorInput.value;
     const w = evenDim(Number(wInput.value) || MIN_DIM);
     const h = evenDim(Number(hInput.value) || MIN_DIM);

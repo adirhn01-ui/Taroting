@@ -37,6 +37,11 @@ export const MAX_SPEED = 4;
 export const IMAGE_DEFAULT_DUR = 5;
 const EPS = 1e-6;
 
+// Transform scale clamp — mirrors the inspector slider bounds and canvas-math's
+// SCALE_MIN/SCALE_MAX (kept as local literals so core has no preview-layer dep).
+export const MIN_SCALE = 0.1;
+export const MAX_SCALE = 4;
+
 export const uid = (): string => crypto.randomUUID();
 
 export const defaultAudio = (): ClipAudio => ({
@@ -590,6 +595,45 @@ export function setProjectCanvas(p: ProjectFile, width: number, height: number):
   const h = clampCanvas(height);
   if (w === p.timeline.width && h === p.timeline.height) return p;
   return { ...p, timeline: { ...p.timeline, width: w, height: h } };
+}
+
+/* ------------------------------------------------------------------ */
+/* Transform auto-fit                                                  */
+/* ------------------------------------------------------------------ */
+
+/** Scale that makes a clip's cropped (and possibly rotated) region "fit"
+ *  (letterbox inside the canvas) or "fill" (cover the canvas, cropping edges).
+ *
+ *  The preview/export chain (transforms.ts) already auto-fits the cropped region
+ *  at scale=1 via k = fit * scale where fit = min(projW/fitW, projH/fitH). So the
+ *  fit scale is exactly 1, and the fill scale is the ratio that turns that min
+ *  into the covering max: max(projW/fitW, projH/fitH) / fit. The visible extents
+ *  are the crop clamped to the frame (matching computeTransformInto), with W/H
+ *  swapped under 90/270 rotation. Result is clamped to [MIN_SCALE, MAX_SCALE]. */
+export function fitFillScale(
+  mediaW: number,
+  mediaH: number,
+  crop: { x: number; y: number; w: number; h: number } | undefined,
+  projW: number,
+  projH: number,
+  mode: "fit" | "fill",
+  rotate: 0 | 90 | 180 | 270 = 0,
+): number {
+  const srcW = Math.max(1, mediaW);
+  const srcH = Math.max(1, mediaH);
+  const c = crop ?? { x: 0, y: 0, w: srcW, h: srcH };
+  // visible cropped extents, matching transforms.ts computeTransformInto
+  const cropW = Math.max(1, Math.min(c.w, srcW - c.x));
+  const cropH = Math.max(1, Math.min(c.h, srcH - c.y));
+  const rotated = rotate === 90 || rotate === 270;
+  const fitW = rotated ? cropH : cropW;
+  const fitH = rotated ? cropW : cropH;
+  const sx = projW / fitW;
+  const sy = projH / fitH;
+  // fit uses min (letterbox); scale=1 already fits, so the multiplier is min/min=1.
+  // fill uses max (cover); the multiplier is max/min.
+  const raw = mode === "fill" ? Math.max(sx, sy) / Math.min(sx, sy) : 1;
+  return Math.min(Math.max(raw, MIN_SCALE), MAX_SCALE);
 }
 
 /* ------------------------------------------------------------------ */

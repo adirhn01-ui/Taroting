@@ -324,6 +324,37 @@ export function ghostResize(
 /* Display-rect derivation (cross-check against computeTransform)       */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Center snap — drag-time "snap to canvas center" (Slides-style)       */
+/* ------------------------------------------------------------------ */
+
+/** Result of snapping a dragged clip toward the project center. `x`/`y` are the
+ *  (possibly snapped) center-relative offsets; `snappedX`/`snappedY` say whether
+ *  each axis snapped (drives the guide lines). */
+export interface CenterSnap {
+  x: number;
+  y: number;
+  snappedX: boolean;
+  snappedY: boolean;
+}
+
+/** Snap a dragged clip's center-relative offset toward the project center
+ *  (0,0 = centered, per ClipTransform.x/y). Each axis snaps INDEPENDENTLY when
+ *  its offset is within `threshold` project px of center; otherwise it passes
+ *  through unchanged. The threshold is expressed in PROJECT px — callers derive
+ *  it from a fixed SCREEN px budget divided by the stage scale, so the snap zone
+ *  is a constant on-screen distance regardless of zoom. */
+export function snapToCenter(x: number, y: number, threshold: number): CenterSnap {
+  const snappedX = Math.abs(x) <= threshold;
+  const snappedY = Math.abs(y) <= threshold;
+  return {
+    x: snappedX ? 0 : x,
+    y: snappedY ? 0 : y,
+    snappedX,
+    snappedY,
+  };
+}
+
 /** The on-screen (project-px) display rect of a pose, matching
  *  computeTransform's (cropW*k, cropH*k) centered at (W/2+x, H/2+y). Returned as
  *  the AXIS-ALIGNED bounding box on screen (w/h swap under 90/270 rotation).

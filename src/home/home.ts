@@ -14,6 +14,7 @@ import { navigate } from "../core/nav";
 import { addMedia, createProject } from "../core/project";
 import { MEDIA_FILE_EXTENSIONS } from "../core/types";
 import type { RecentItem } from "../core/types";
+import { trapTab } from "../ui/focus";
 import { icon } from "../ui/icons";
 import { showMenu } from "../ui/menu";
 import { toast } from "../ui/toast";
@@ -71,11 +72,11 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
             <div class="home__title">Projects</div>
             <div class="row" style="gap:var(--sp-2)">
               <button class="btn btn--primary" id="btn-new">${icon("plus")}New project</button>
-              <button class="btn" id="btn-open">${icon("folder")}Open…</button>
+              <button class="btn" id="btn-open">${icon("folder")}Open</button>
             </div>
           </div>
           <div class="home__toolbar">
-            <input class="input home__search" id="home-search" placeholder="Search projects…" spellcheck="false" />
+            <input class="input home__search" id="home-search" placeholder="Search projects" spellcheck="false" />
             <select class="select select--sm home__sort" id="home-sort" title="Sort by">
               ${(Object.keys(SORT_LABELS) as SortKey[])
                 .map((k) => `<option value="${k}">${SORT_LABELS[k]}</option>`)
@@ -198,10 +199,12 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       requestAnimationFrame(() => input.focus());
     }
 
+    const releaseTrap = trapTab(backdrop);
     let closed = false;
     const close = (): void => {
       if (closed) return;
       closed = true;
+      releaseTrap();
       backdrop.remove();
       document.removeEventListener("keydown", onKey, true);
     };
@@ -272,6 +275,11 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   async function openPath(path: string): Promise<void> {
     if (guard()) return;
     try {
+      if (!(await ipc.pathExists(path))) {
+        toast.error("Project file not found");
+        await refresh();
+        return;
+      }
       navigate({ view: "editor", projectPath: path });
     } finally {
       busy = false;
@@ -380,10 +388,10 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     const card = grid.querySelector<HTMLElement>(`.project-card[data-path="${CSS.escape(path)}"]`);
     showMenu(x, y, [
       { label: "Open", onSelect: () => void openPath(path) },
-      { label: "Rename…", onSelect: () => card && startRename(card, item) },
-      { label: "Duplicate…", onSelect: () => promptDuplicate(item) },
+      { label: "Rename", onSelect: () => card && startRename(card, item) },
+      { label: "Duplicate", onSelect: () => promptDuplicate(item) },
       { label: "Remove from list", onSelect: () => removeFromList(path) },
-      { label: "Delete file…", danger: true, onSelect: () => promptDelete(item) },
+      { label: "Delete file", danger: true, onSelect: () => promptDelete(item) },
     ]);
   }
 

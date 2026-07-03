@@ -223,6 +223,8 @@ export interface Settings {
   hardwareAccel: boolean;
   cacheLimitMB: number;
   proxyMedia: boolean;
+  /** drag a clip on the canvas → snap its center to the project center */
+  snapCenterGuides: boolean;
   shortcuts: Record<ActionId, string>;
 }
 
@@ -276,6 +278,7 @@ export const DEFAULT_SETTINGS: Settings = {
   hardwareAccel: true,
   cacheLimitMB: 2048,
   proxyMedia: true,
+  snapCenterGuides: true,
   shortcuts: DEFAULT_SHORTCUTS,
 };
 

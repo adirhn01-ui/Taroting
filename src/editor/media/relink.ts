@@ -10,6 +10,7 @@ import { inTauri, ipc } from "../../core/ipc";
 import { findMedia, updateClip, updateMedia } from "../../core/project";
 import type { ProjectSession } from "../../core/session";
 import type { MediaInfo, MediaRef, ProjectFile } from "../../core/types";
+import { trapTab } from "../../ui/focus";
 import { icon } from "../../ui/icons";
 import { toast } from "../../ui/toast";
 import type { MediaManager } from "./media";
@@ -65,8 +66,11 @@ export function openRelinkDialog(ctx: RelinkCtx): void {
 
   const listEl = backdrop.querySelector<HTMLElement>("#rl-list")!;
 
+  const releaseTrap = trapTab(backdrop);
+
   function close(): void {
     document.removeEventListener("keydown", onKeydown, true);
+    releaseTrap();
     backdrop.remove();
     const left = rows.length - resolved.size;
     if (left > 0) {
@@ -149,7 +153,7 @@ export function openRelinkDialog(ctx: RelinkCtx): void {
     const status = row.querySelector<HTMLElement>(".relink-row__status");
     if (status) {
       status.className = "relink-row__status";
-      status.textContent = "Checking…";
+      status.textContent = "Checking";
     }
 
     let info: MediaInfo;
@@ -188,7 +192,7 @@ export function openRelinkDialog(ctx: RelinkCtx): void {
         <div class="relink-row__path" title="${escapeHtml(m.path)}">${escapeHtml(m.path)}</div>
         <div class="relink-row__status relink-row__status--bad">Missing</div>
       </div>
-      <button class="btn btn--sm" data-locate>${icon("folder", 14)}Locate…</button>
+      <button class="btn btn--sm" data-locate>${icon("folder", 14)}Locate</button>
     `;
     row.querySelector("[data-locate]")!.addEventListener("click", () => void locate(m, row));
     listEl.appendChild(row);

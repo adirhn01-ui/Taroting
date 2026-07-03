@@ -12,6 +12,7 @@ import {
   ghostResize,
   invApply,
   SCALE_MAX,
+  snapToCenter,
   windowHandleDrag,
 } from "./canvas-math";
 import { computeTransform } from "./transforms";
@@ -309,6 +310,67 @@ describe("clamps", () => {
     expect(next.crop.h).toBeLessThan(start.crop.h);
     expect(next.crop.x).toBeGreaterThanOrEqual(0);
     expect(next.crop.y).toBeGreaterThanOrEqual(0);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Center snap — snapToCenter                                           */
+/* ------------------------------------------------------------------ */
+
+describe("snapToCenter", () => {
+  it("snaps both axes to 0 when both are within threshold", () => {
+    const r = snapToCenter(4, -3, 8);
+    expect(r.x).toBe(0);
+    expect(r.y).toBe(0);
+    expect(r.snappedX).toBe(true);
+    expect(r.snappedY).toBe(true);
+  });
+
+  it("snaps only the in-threshold axis, passing the other through", () => {
+    const r = snapToCenter(5, 40, 8);
+    expect(r.x).toBe(0);
+    expect(r.snappedX).toBe(true);
+    // y is outside the threshold: unchanged, not snapped
+    expect(r.y).toBe(40);
+    expect(r.snappedY).toBe(false);
+  });
+
+  it("snaps the y axis independently of x", () => {
+    const r = snapToCenter(-50, 2, 8);
+    expect(r.x).toBe(-50);
+    expect(r.snappedX).toBe(false);
+    expect(r.y).toBe(0);
+    expect(r.snappedY).toBe(true);
+  });
+
+  it("does not snap when both axes are outside the threshold", () => {
+    const r = snapToCenter(20, -30, 8);
+    expect(r.x).toBe(20);
+    expect(r.y).toBe(-30);
+    expect(r.snappedX).toBe(false);
+    expect(r.snappedY).toBe(false);
+  });
+
+  it("snaps at exactly the threshold (inclusive boundary)", () => {
+    const r = snapToCenter(8, -8, 8);
+    expect(r.snappedX).toBe(true);
+    expect(r.snappedY).toBe(true);
+    expect(r.x).toBe(0);
+    expect(r.y).toBe(0);
+  });
+
+  it("scales the zone with the threshold (a wider threshold catches farther offsets)", () => {
+    // offset of 15 project px: outside an 8px zone, inside a 40px zone.
+    // The overlay derives the threshold as screenBudget / stageScale, so a
+    // smaller stage scale (zoomed-out canvas) yields a larger project-px zone.
+    const tight = snapToCenter(15, 15, 8);
+    expect(tight.snappedX).toBe(false);
+    expect(tight.snappedY).toBe(false);
+    const wide = snapToCenter(15, 15, 40);
+    expect(wide.snappedX).toBe(true);
+    expect(wide.snappedY).toBe(true);
+    expect(wide.x).toBe(0);
+    expect(wide.y).toBe(0);
   });
 });
 

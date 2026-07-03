@@ -154,6 +154,14 @@
   flex: none;
 }
 
+/* The play/pause glyph is swapped on transport toggles; keep the <svg> child
+ * transparent to pointer events so a rapid click's mouse-down and mouse-up
+ * always target the BUTTON itself, never an icon node that may be replaced
+ * mid-press (which would make the browser drop the click and miss the pause). */
+.transport .btn svg {
+  pointer-events: none;
+}
+
 .transport__time {
   font-size: var(--fs-12);
   color: var(--text-2);
@@ -338,7 +346,7 @@
 
 .media-drag-ghost {
   position: fixed;
-  z-index: 400;
+  z-index: var(--z-drag-ghost); /* see z-index scale in tokens.css */
   left: 0;
   top: 0;
   pointer-events: none;
@@ -428,7 +436,7 @@
 .editor .drop-overlay {
   position: fixed;
   inset: 0;
-  z-index: 300;
+  z-index: var(--z-editor-chrome); /* see z-index scale in tokens.css */
   display: none;
   padding: var(--sp-5);
   background: color-mix(in srgb, var(--bg-app) 55%, transparent);
@@ -521,7 +529,10 @@
 .stage-overlay {
   position: absolute;
   inset: 0;
-  z-index: 1000;
+  /* just above the media layer sets (JS z 1..n) inside .preview__canvas, but
+   * far BELOW modals/menus/toasts so dialogs over the preview get the clicks.
+   * See the z-index scale in tokens.css. */
+  z-index: var(--z-stage-overlay);
   outline: none;
 }
 
@@ -552,6 +563,30 @@
 .stage-overlay__handle--s { left: 50%; bottom: -5px; transform: translateX(-50%); cursor: ns-resize; }
 .stage-overlay__handle--e { right: -5px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
 .stage-overlay__handle--w { left: -5px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
+
+/* center-snap guides: two 1px lines spanning the canvas, shown only while the
+ * matching axis is snapped during a drag. Toggled via display (no per-frame
+ * layout thrash); non-interactive so they never eat pointer events. */
+.stage-overlay__guide {
+  position: absolute;
+  display: none;
+  background: var(--accent, #6c7cff);
+  pointer-events: none;
+}
+.stage-overlay__guide--v {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-0.5px);
+}
+.stage-overlay__guide--h {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  transform: translateY(-0.5px);
+}
 
 /* crop mode: dim veil + ghost frame + solid window */
 .stage-overlay__veil {

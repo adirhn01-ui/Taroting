@@ -229,7 +229,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 100;
+  z-index: var(--z-modal); /* must beat the stage overlay + editor chrome — see z-index scale in tokens.css */
 }
 .modal {
   background: var(--bg-panel);
@@ -275,7 +275,7 @@
   flex-direction: column;
   align-items: center;
   gap: var(--sp-2);
-  z-index: 200;
+  z-index: var(--z-toast); /* always on top — see z-index scale in tokens.css */
   pointer-events: none;
 }
 .toast {
@@ -354,7 +354,7 @@
 .ctx-menu {
   position: fixed;
   display: none;
-  z-index: 300;
+  z-index: var(--z-menu); /* above stage overlay + editor chrome, below modals — see z-index scale in tokens.css */
   min-width: 160px;
   padding: var(--sp-1);
   background: var(--bg-raised);

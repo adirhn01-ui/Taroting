@@ -8,6 +8,7 @@ import { onJobEvents } from "../../core/ipc";
 import type { JobDone, JobFailed, JobProgress } from "../../core/ipc";
 import { ProjectSession, settingsStore, updateSettings } from "../../core/session";
 import type { ExportPreset, ResolutionPreset } from "../../core/types";
+import { trapTab } from "../../ui/focus";
 import { icon } from "../../ui/icons";
 import { toast } from "../../ui/toast";
 import {
@@ -211,6 +212,8 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   const bodyEl = $("#ex-body");
   const footerEl = $("#ex-footer");
 
+  const releaseTrap = trapTab(backdrop);
+
   let exporting = false;
   let jobId: number | null = null;
   let unlistenJobs: (() => void) | null = null;
@@ -220,6 +223,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   function close(): void {
     if (exporting) return;
     document.removeEventListener("keydown", onKeydown, true);
+    releaseTrap();
     window.clearTimeout(estimateTimer);
     if (unlistenJobs) unlistenJobs();
     void clearTaskbarProgress();
@@ -364,8 +368,8 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
         <div class="export-row">
           <label>Destination</label>
           <div class="export-row__control">
-            <input class="input" id="ex-folder" value="${escapeHtml(folder)}" placeholder="Choose a folder…" spellcheck="false" />
-            <button class="btn" id="ex-choose">${icon("folder", 14)}Choose…</button>
+            <input class="input" id="ex-folder" value="${escapeHtml(folder)}" placeholder="Choose a folder" spellcheck="false" />
+            <button class="btn" id="ex-choose">${icon("folder", 14)}Choose</button>
           </div>
         </div>
 
@@ -528,7 +532,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   function scheduleEstimate(): void {
     window.clearTimeout(estimateTimer);
     const el = backdrop.querySelector<HTMLElement>("#ex-estimate");
-    if (el) el.innerHTML = `Estimated size: <strong>…</strong>`;
+    if (el) el.innerHTML = `Estimated size: <strong>—</strong>`;
     estimateTimer = window.setTimeout(() => void runEstimate(), 300);
   }
 

@@ -22,6 +22,7 @@ import {
   detachAudio,
   findClip,
   findMedia,
+  fitFillScale,
   removeClipAudio,
   removeKeyframesNear,
   setClipSpeed,
@@ -505,6 +506,67 @@ export function mountInspector(
     });
   }
 
+  /** Fit / Fill / Center the selected clip in one history step. Scale (fit/fill)
+   *  and position are written the SAME way the sliders do: an animated group is
+   *  keyed at the playhead source time; a static group writes clip.transform. */
+  function applyAutoFit(t: Target, mode: "fit" | "fill" | "center"): void {
+    const clipId = t.clip.id;
+    const cur = resolve(ctx.session.project, clipId);
+    if (!cur) return;
+    const clip = cur.clip;
+    const tf = clip.transform ?? defaultTransform();
+    const ph = playhead();
+    const s = playheadSource(clip, ph);
+    const inClip = playheadInClip(clip, ph);
+
+    const touchScale = mode !== "center";
+    const scaleAnimated = groupAnimated(clip.keyframes, "scale");
+    const posAnimated = groupAnimated(clip.keyframes, "position");
+    // Mirror the sliders' disabled rule: an animated group can only be edited
+    // while the playhead sits over the clip (otherwise we'd drop a stray kf).
+    if ((posAnimated && !inClip) || (touchScale && scaleAnimated && !inClip)) {
+      toast.error("Move the playhead over the clip to edit its animation.");
+      return;
+    }
+
+    const proj = ctx.session.project.timeline;
+    const scale =
+      mode === "center"
+        ? tf.scale
+        : fitFillScale(
+            cur.media.width ?? proj.width,
+            cur.media.height ?? proj.height,
+            tf.crop,
+            proj.width,
+            proj.height,
+            mode,
+            tf.rotate,
+          );
+
+    commit((p) => {
+      let next = p;
+      // Position → (0, 0), centered.
+      if (posAnimated) {
+        next = setPositionKeyframes(next, clipId, s, 0, 0);
+      } else {
+        const c = resolve(next, clipId);
+        const base = c?.clip.transform ?? defaultTransform();
+        next = updateClip(next, clipId, { transform: { ...base, x: 0, y: 0 } });
+      }
+      // Scale (fit/fill only).
+      if (touchScale) {
+        if (scaleAnimated) {
+          next = setKeyframe(next, clipId, "scale", s, scale);
+        } else {
+          const c = resolve(next, clipId);
+          const base = c?.clip.transform ?? defaultTransform();
+          next = updateClip(next, clipId, { transform: { ...base, scale } });
+        }
+      }
+      return next;
+    });
+  }
+
   /** Clear a group's animation, baking the evaluated pose so nothing jumps. */
   function clearGroupAnimation(t: Target, group: Group): void {
     const clipId = t.clip.id;
@@ -670,6 +732,19 @@ export function mountInspector(
     // Crop
     s.appendChild(buildCrop(t));
 
+    // Auto-fit row: Fit / Fill / Center
+    const fitRow = el("div", "insp-row insp-block");
+    const fitBtn = button("Fit", "btn btn--sm", () => applyAutoFit(t, "fit"));
+    fitBtn.title = "Scale to fit inside the canvas (letterbox) and center";
+    const fillBtn = button("Fill", "btn btn--sm", () => applyAutoFit(t, "fill"));
+    fillBtn.title = "Scale to cover the canvas (crops edges) and center";
+    const centerBtn = button("Center", "btn btn--sm", () => applyAutoFit(t, "center"));
+    centerBtn.title = "Center in the canvas (scale unchanged)";
+    fitRow.appendChild(fitBtn);
+    fitRow.appendChild(fillBtn);
+    fitRow.appendChild(centerBtn);
+    s.appendChild(fitRow);
+
     // Reset transform
     s.appendChild(
       button("Reset transform", "btn btn--ghost btn--sm insp-block", () => {
@@ -827,7 +902,7 @@ export function mountInspector(
     // Normalize
     const normBtn = button("Normalize", "btn btn--sm insp-block", () => {
       normBtn.disabled = true;
-      normBtn.textContent = "Analyzing…";
+      normBtn.textContent = "Analyzing";
       ipc
         .normalizeScan(t.media.path, t.clip.srcIn, t.clip.srcOut)
         .then((r) => {
