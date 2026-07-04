@@ -41,6 +41,7 @@ import { PlaybackEngine } from "./playback/engine";
 import { Scheduler } from "./playback/scheduler";
 import { mountStage } from "./preview/preview";
 import { mountCanvasOverlay } from "./preview/overlay";
+import { mountTheater } from "./preview/theater";
 import { collectCandidates, snapTime } from "./timeline/snap";
 import { laneLayout } from "./timeline/render";
 import { TimelineController } from "./timeline/timeline";
@@ -96,6 +97,7 @@ export async function mountEditor(
               <button class="btn btn--icon" id="tr-play" title="Play/Pause (Space)">${icon("play")}</button>
               <button class="btn btn--ghost btn--icon btn--sm" id="tr-step-fwd" title="Next frame (→)">${icon("stepFwd", 14)}</button>
               <button class="btn btn--ghost btn--icon btn--sm" id="tr-stop" title="Stop">${icon("stop", 14)}</button>
+              <button class="btn btn--ghost btn--icon btn--sm" id="tr-fullscreen" title="Fullscreen (F)">${icon("fullscreen", 14)}</button>
               <div class="transport__time mono" id="tr-time">00:00:00</div>
               <div class="grow"></div>
               <select class="select select--sm" id="tr-speed" title="Playback speed">
@@ -201,6 +203,19 @@ export async function mountEditor(
     refresh: () => {
       engine.refresh();
       timeline.requestRender();
+    },
+  });
+
+  // Fullscreen playback (theater mode). Lives on the preview container so it can
+  // lift the whole stage over the editor chrome; the transport button glyph flips
+  // to reflect the open/close state via onChange.
+  const theater = mountTheater({
+    engine,
+    container: $("#ed-stage"),
+    onChange: (on) => {
+      const btn = $("#tr-fullscreen");
+      btn.innerHTML = icon(on ? "fullscreenExit" : "fullscreen", 14);
+      btn.title = on ? "Exit fullscreen (F)" : "Fullscreen (F)";
     },
   });
 
@@ -374,6 +389,7 @@ export async function mountEditor(
     playBtn.blur();
   });
   $("#tr-stop").addEventListener("click", () => engine.stop());
+  $("#tr-fullscreen").addEventListener("click", () => theater.toggle());
   $("#tr-step-back").addEventListener("click", () => engine.stepFrames(-1));
   $("#tr-step-fwd").addEventListener("click", () => engine.stepFrames(1));
   $("#tr-split").addEventListener("click", () => actions.split());
@@ -849,6 +865,7 @@ export async function mountEditor(
   shortcuts.on("addMarker", addMarker);
   shortcuts.on("export", () => openExportDialog({ session }));
   shortcuts.on("goHome", () => navigate({ view: "home" }));
+  shortcuts.on("fullscreen", () => theater.toggle());
   shortcuts.attach();
 
   const unsubSettings = settingsStore.subscribe((s) => shortcuts.setBindings(s.shortcuts));
@@ -886,6 +903,7 @@ export async function mountEditor(
       if (dragCleanup) dragCleanup();
       for (const u of unsubs) u();
       unlistenDrop();
+      theater.dispose();
       overlay.dispose();
       inspector.dispose();
       timeline.dispose();

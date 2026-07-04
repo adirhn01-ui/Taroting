@@ -101,6 +101,10 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   let recents: RecentItem[] = [];
   let sortKey: SortKey = loadSort();
   let busy = false;
+  let disposed = false;
+  // Paths whose thumbnail backfill we've already kicked off this mount, so
+  // repeated refresh() calls (rename/delete/duplicate) never re-fire ffmpeg.
+  const thumbTried = new Set<string>();
   sortSelect.value = sortKey;
 
   /* ---------------- rendering ---------------- */
@@ -147,6 +151,39 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     grid.innerHTML = items.map(cardHtml).join("");
   }
 
+  /* Backfill missing thumbnails. Projects opened via the OS "Open with" get a
+     recents entry before any thumb is cached, so their card shows a placeholder
+     until the backend can produce one. Fire one shot per thumb-less path per
+     mount (no polling/timers); on a hit, swap just that card's placeholder for
+     an <img> without re-rendering the grid. */
+  function backfillThumbs(): void {
+    for (const item of recents) {
+      if (item.thumb || thumbTried.has(item.path)) continue;
+      thumbTried.add(item.path);
+      const path = item.path;
+      void ipc
+        .refreshRecentThumb(path)
+        .then((thumb) => {
+          if (disposed || !thumb) return;
+          // Keep the in-memory model in sync so a later renderGrid() (sort,
+          // search, rename) carries the thumb through instead of dropping it.
+          const model = recentByPath(path);
+          if (model) model.thumb = thumb;
+          const card = grid.querySelector<HTMLElement>(
+            `.project-card[data-path="${CSS.escape(path)}"]`,
+          );
+          const thumbEl = card?.querySelector<HTMLElement>(".project-card__thumb");
+          if (thumbEl) {
+            thumbEl.innerHTML = `<img src="${escapeHtml(mediaUrl(thumb))}" alt="" loading="lazy" />`;
+          }
+        })
+        .catch(() => {
+          // Best-effort: the backend already fails soft to null. A fresh mount
+          // clears thumbTried, so the next home visit retries.
+        });
+    }
+  }
+
   async function refresh(): Promise<void> {
     try {
       const index = await ipc.listRecents();
@@ -156,6 +193,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       recents = [];
     }
     renderGrid();
+    backfillThumbs();
   }
 
   function recentByPath(path: string): RecentItem | undefined {
@@ -472,6 +510,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
 
   return {
     dispose() {
+      disposed = true;
       unlistenDrop();
     },
   };

@@ -212,7 +212,8 @@ export type ActionId =
   | "toggleLoop"
   | "addMarker"
   | "export"
-  | "goHome";
+  | "goHome"
+  | "fullscreen";
 
 export interface Settings {
   schema: 1;
@@ -267,6 +268,7 @@ export const DEFAULT_SHORTCUTS: Record<ActionId, string> = {
   addMarker: "M",
   export: "Ctrl+E",
   goHome: "Ctrl+W",
+  fullscreen: "F",
 };
 
 export const DEFAULT_SETTINGS: Settings = {

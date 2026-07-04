@@ -24,6 +24,10 @@ const paths: Record<string, string> = {
   mute: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="m22 9-6 6M16 9l6 6"/>',
   warning: '<path d="M12 3 2 20h20z"/><path d="M12 9v5m0 3v.01"/>',
   flag: '<path d="M4 22V4M4 4h11l-2 4 2 4H4"/>',
+  fullscreen: '<path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3m8 0h3a2 2 0 0 0 2-2v-3"/>',
+  fullscreenExit: '<path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3m8 0v-3a2 2 0 0 1 2-2h3"/>',
+  skipBack5: '<path d="M11 19 2 12l9-7z"/><path d="M22 19l-9-7 9-7z"/>',
+  skipFwd5: '<path d="m13 19 9-7-9-7z"/><path d="M2 19l9-7-9-7z"/>',
 };
 
 export function icon(name: keyof typeof paths | string, size = 16): string {

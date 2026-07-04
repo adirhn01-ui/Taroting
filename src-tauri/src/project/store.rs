@@ -270,6 +270,13 @@ pub struct SavedProject {
     pub modified_at: String,
 }
 
+/// The media backing the first clip on the first track — the frame the recents
+/// grid uses as a project's thumbnail. `None` when the project has no clips.
+fn first_clip_media(typed: &ProjectFile) -> Option<&schema::MediaRef> {
+    let clip = typed.timeline.tracks.first()?.clips.first()?;
+    typed.media.iter().find(|m| m.id == clip.media_id)
+}
+
 #[tauri::command]
 pub fn save_project(
     cache: tauri::State<'_, std::sync::Arc<crate::cache::Cache>>,
@@ -286,12 +293,7 @@ pub fn save_project(
     )?;
 
     // Thumbnail for the recents grid: any cached thumb of the first clip's media.
-    let thumb = typed
-        .timeline
-        .tracks
-        .first()
-        .and_then(|t| t.clips.first())
-        .and_then(|c| typed.media.iter().find(|m| m.id == c.media_id))
+    let thumb = first_clip_media(&typed)
         .map(|m| {
             crate::cache::MediaKey {
                 path: m.path.clone(),
@@ -316,6 +318,81 @@ pub fn save_project(
     Ok(SavedProject {
         modified_at: typed.modified_at,
     })
+}
+
+/// The media key + frame offset a project's thumbnail should come from, or
+/// `None` when no real frame is possible: unreadable project, no clips, a
+/// generator/audio first clip (no file / no frame), or a source file that is
+/// missing or changed on disk. Pure and ffmpeg-free so the skip paths are
+/// unit-testable; `refresh_recent_thumb` layers cache lookup + generation on top.
+fn thumb_source_for(path: &str) -> Option<(crate::cache::MediaKey, f64)> {
+    let (raw, _) = read_project_value(Path::new(path)).ok()?;
+    let migrated = schema::migrate(raw).ok()?;
+    let typed: ProjectFile = serde_json::from_value(migrated).ok()?;
+
+    // Generated media (text/solid) has no file; audio has no frame. Both are
+    // skipped exactly as the editor's bin does — placeholder is acceptable.
+    let media = first_clip_media(&typed)?;
+    if media.generator.is_some() || media.kind == "audio" {
+        return None;
+    }
+    // The source must exist and match identity (size + mtime) before we hand a
+    // path to ffmpeg — a stale/replaced file would otherwise yield a wrong or
+    // failed frame. Mirrors load_project's missing-media identity check.
+    let identity_ok = std::fs::metadata(&media.path)
+        .map(|meta| meta.len() == media.size && mtime_ms_of(&meta) == media.mtime_ms)
+        .unwrap_or(false);
+    if !identity_ok {
+        return None;
+    }
+
+    let key = crate::cache::MediaKey {
+        path: media.path.clone(),
+        size: media.size,
+        mtime_ms: media.mtime_ms,
+    };
+    // `at_sec` matches the editor bin's frame choice so both reuse one cached file.
+    let at = (media.duration / 2.0).clamp(0.0, 0.5);
+    Some((key, at))
+}
+
+/// Backfill a recents card's thumbnail after the fact. `load_project` /
+/// `stamp_opened` and the open-with flow can create a recents entry before any
+/// thumbnail is cached (thumbs are generated lazily by the editor's bin), so
+/// cards opened via the OS "Open with" show a placeholder until the next save.
+/// The home screen calls this for every thumb-less card on mount.
+///
+/// Resolves the first clip's file-backed media and returns a thumb path from
+/// the cache — generating one on the thumb lane if absent. Fails soft: any
+/// error (unparseable project, no clips, generator/audio-only media,
+/// missing/changed source file, ffmpeg failure) yields `Ok(None)` so the home
+/// screen is never blocked or toasted. On success the recents entry's `thumb`
+/// is persisted so subsequent mounts hit the cache without ffmpeg.
+#[tauri::command]
+pub fn refresh_recent_thumb(
+    cache: tauri::State<'_, std::sync::Arc<crate::cache::Cache>>,
+    jobs: tauri::State<'_, std::sync::Arc<crate::jobs::Jobs>>,
+    path: String,
+) -> Result<Option<String>> {
+    let Some((key, at)) = thumb_source_for(&path) else {
+        return Ok(None);
+    };
+    // Prefer any already-cached thumb; only spend ffmpeg when the cache is cold.
+    let thumb = crate::media::thumbs::any_thumb_for(&cache, &key.hash())
+        .or_else(|| crate::media::thumbs::ensure_thumb(&cache, &jobs, &key, at).ok());
+    let Some(thumb) = thumb else {
+        return Ok(None);
+    };
+    let thumb = thumb.to_string_lossy().into_owned();
+
+    // Persist so future mounts skip generation. Best-effort: a write failure
+    // just means we regenerate next time.
+    let mut index = read_recents();
+    if let Some(entry) = index.items.iter_mut().find(|r| r.path == path) {
+        entry.thumb = Some(thumb.clone());
+        let _ = write_recents(&index);
+    }
+    Ok(Some(thumb))
 }
 
 #[tauri::command]
@@ -631,6 +708,135 @@ mod tests {
         assert_eq!(&s[10..11], "T");
         let year: i64 = s[0..4].parse().unwrap();
         assert!(year >= 2024 && year < 3000, "implausible year: {year}");
+    }
+
+    /// Build a project at `proj` whose first (and only) clip references the
+    /// first media entry, so `first_clip_media` resolves. `media` is the media
+    /// array; the timeline gets one video track with a clip on `media[0]`.
+    fn write_project_with_clip(proj: &Path, media: Value) {
+        let first_id = media[0]["id"].as_str().unwrap().to_string();
+        write_json(
+            proj,
+            &serde_json::json!({
+                "schema": 1, "app": "taroting", "id": "p1", "name": "Thumb",
+                "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+                "media": media,
+                "timeline": {
+                    "fps": {"num": 30, "den": 1}, "width": 640, "height": 360,
+                    "tracks": [{ "id": "t1", "kind": "video", "name": "V1", "muted": false,
+                        "clips": [{
+                            "id": "c1", "mediaId": first_id,
+                            "timelineStart": 0.0, "srcIn": 0.0, "srcOut": 2.0, "speed": 1.0,
+                            "audio": {"volume": 1.0, "muted": false, "fadeInSec": 0.0,
+                                       "fadeOutSec": 0.0, "gainOffsetDb": 0.0, "detached": false}
+                        }] }]
+                },
+                "export": {}
+            }),
+        );
+    }
+
+    #[test]
+    fn thumb_source_none_for_unreadable_or_clipless_or_missing() {
+        with_isolated("thumb-none", |dir| {
+            // Nonexistent project file → None.
+            let ghost = dir.join("nope.trt");
+            assert!(thumb_source_for(&ghost.to_string_lossy()).is_none());
+
+            // Valid project but no clips → first_clip_media None → None.
+            let clipless = dir.join("Clipless.trt");
+            write_json(
+                &clipless,
+                &serde_json::json!({
+                    "schema": 1, "app": "taroting", "id": "p1", "name": "Clipless",
+                    "createdAt": "x", "modifiedAt": "y",
+                    "media": [], "export": {},
+                    "timeline": { "fps": {"num": 30, "den": 1}, "width": 640, "height": 360,
+                        "tracks": [{ "id": "t1", "kind": "video", "name": "V1",
+                                     "muted": false, "clips": [] }] }
+                }),
+            );
+            assert!(thumb_source_for(&clipless.to_string_lossy()).is_none());
+
+            // First clip's file-backed media is missing on disk → None (never
+            // hands a nonexistent path to ffmpeg).
+            let missing = dir.join("Missing.trt");
+            write_project_with_clip(
+                &missing,
+                serde_json::json!([{
+                    "id": "m1", "path": "C:\\definitely\\not\\there.mp4", "size": 1,
+                    "mtimeMs": 0, "kind": "video", "duration": 2.0, "hasAudio": false
+                }]),
+            );
+            assert!(thumb_source_for(&missing.to_string_lossy()).is_none());
+        });
+    }
+
+    #[test]
+    fn thumb_source_skips_generator_and_audio_first_clip() {
+        with_isolated("thumb-skip", |dir| {
+            // Generator-only first clip (a solid): no file, must skip cleanly.
+            let gen = dir.join("Gen.trt");
+            write_project_with_clip(
+                &gen,
+                serde_json::json!([{
+                    "id": "m1", "path": "Solid #00ff00", "size": 0, "mtimeMs": 0,
+                    "kind": "image", "duration": 0.0, "hasAudio": false,
+                    "width": 64, "height": 64,
+                    "generator": { "type": "solid", "color": "#00ff00" }
+                }]),
+            );
+            assert!(thumb_source_for(&gen.to_string_lossy()).is_none());
+
+            // Audio-only first clip: real file on disk, but no video frame.
+            let audio_file = dir.join("a.bin");
+            std::fs::write(&audio_file, b"0123456789").unwrap();
+            let a_mtime = disk_mtime_ms(&audio_file);
+            let aud = dir.join("Audio.trt");
+            write_project_with_clip(
+                &aud,
+                serde_json::json!([{
+                    "id": "m1", "path": audio_file.to_string_lossy(), "size": 10,
+                    "mtimeMs": a_mtime, "kind": "audio", "duration": 2.0, "hasAudio": true
+                }]),
+            );
+            assert!(thumb_source_for(&aud.to_string_lossy()).is_none());
+        });
+    }
+
+    #[test]
+    fn thumb_source_resolves_key_for_present_video() {
+        with_isolated("thumb-ok", |dir| {
+            // A file whose size + mtime match its media entry: identity ok →
+            // returns the media key + a frame offset clamped into [0, 0.5].
+            let media_file = dir.join("v.bin");
+            std::fs::write(&media_file, b"0123456789").unwrap();
+            let mtime = disk_mtime_ms(&media_file);
+            let proj = dir.join("Ok.trt");
+            write_project_with_clip(
+                &proj,
+                serde_json::json!([{
+                    "id": "m1", "path": media_file.to_string_lossy(), "size": 10,
+                    "mtimeMs": mtime, "kind": "video", "duration": 4.0, "hasAudio": false
+                }]),
+            );
+
+            let (key, at) = thumb_source_for(&proj.to_string_lossy()).expect("should resolve");
+            assert_eq!(key.size, 10);
+            assert_eq!(key.mtime_ms, mtime);
+            assert_eq!(key.path, media_file.to_string_lossy());
+            // duration 4.0 → 4/2 = 2.0, clamped to the 0.5 cap.
+            assert_eq!(at, 0.5);
+
+            // A same-size in-place edit bumps mtime → identity stale → None.
+            std::fs::write(&media_file, b"9876543210").unwrap();
+            // touch mtime forward deterministically via a second write; on the
+            // off chance the clock granularity kept mtime equal, force it.
+            let stale = thumb_source_for(&proj.to_string_lossy());
+            if disk_mtime_ms(&media_file) != mtime {
+                assert!(stale.is_none(), "stale mtime must skip");
+            }
+        });
     }
 
     #[test]

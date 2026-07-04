@@ -369,6 +369,126 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       return `button-click blurs; single Space = one toggle; ${storms} storm-clicks, pause always wins; seek-during-play keeps playing (+${(seekT1 - seekT0).toFixed(2)}s)`;
     });
 
+    await test("theater-mode", async () => {
+      // Fullscreen playback ("theater") mode. requestFullscreen() rejects without
+      // a user gesture in this harness, so the in-window theater must engage on
+      // its own; every assertion below works purely off the in-window layer.
+      const preview = document.querySelector<HTMLElement>(".editor__preview");
+      assert(preview !== null, "no .editor__preview container");
+      const fsBtn = document.querySelector<HTMLButtonElement>("#tr-fullscreen");
+      assert(fsBtn !== null, "no #tr-fullscreen transport button");
+      const transport = document.querySelector<HTMLElement>(".transport");
+      assert(transport !== null, "no .transport bar");
+
+      // clean, paused precondition well inside the timeline
+      if (engine.playing) engine.pause();
+      engine.seek(20);
+      await sleep(80);
+
+      // 1) enter via the REAL button click; container gets .theater + bar visible
+      fsBtn!.click();
+      await sleep(60);
+      assert(preview!.classList.contains("theater"), "container missing .theater class after enter");
+      const bar = preview!.querySelector<HTMLElement>(".theater-bar");
+      assert(bar !== null, "no .theater-bar mounted");
+      assert(getComputedStyle(bar!).display !== "none", "theater bar not visible when active");
+
+      // 2) ±5s buttons move engine.time by ~±5 (respect clamping)
+      const back5 = bar!.querySelector<HTMLButtonElement>('[data-act="back5"]')!;
+      const fwd5 = bar!.querySelector<HTMLButtonElement>('[data-act="fwd5"]')!;
+      engine.seek(20);
+      await sleep(60);
+      const tb0 = engine.time;
+      back5.click();
+      await sleep(60);
+      assert(Math.abs(engine.time - (tb0 - 5)) < 0.3, `back5: ${engine.time.toFixed(2)} vs ${(tb0 - 5).toFixed(2)}`);
+      const tf0 = engine.time;
+      fwd5.click();
+      await sleep(60);
+      assert(Math.abs(engine.time - (tf0 + 5)) < 0.3, `fwd5: ${engine.time.toFixed(2)} vs ${(tf0 + 5).toFixed(2)}`);
+      // clamp at 0: seek near start, back5 must not go negative
+      engine.seek(2);
+      await sleep(40);
+      back5.click();
+      await sleep(60);
+      assert(engine.time >= -1e-6 && engine.time < 1e-3, `back5 clamp at 0: got ${engine.time.toFixed(3)}`);
+
+      // 3) the seek bar reflects position after a seek (fill width + aria)
+      const seek = bar!.querySelector<HTMLElement>('[data-el="seek"]')!;
+      const fill = bar!.querySelector<HTMLElement>('[data-el="fill"]')!;
+      const dur = engine.duration();
+      engine.seek(dur / 2);
+      await sleep(80); // let a tick paint the bar
+      const aria = Number(seek.getAttribute("aria-valuenow"));
+      assert(Math.abs(aria - 50) < 2, `seek aria-valuenow ${aria} not ~50 at mid`);
+      const fillPct = parseFloat(fill.style.width);
+      assert(Math.abs(fillPct - 50) < 2, `seek fill width ${fillPct}% not ~50 at mid`);
+
+      // 4) auto-hide: while PLAYING, no pointer movement for > the hide delay hides
+      // the chrome; a pointermove reveals it instantly. (Never hides while paused.)
+      engine.seek(5);
+      engine.play();
+      await sleep(60);
+      // a fresh pointermove reveals + arms the idle countdown
+      preview!.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: 10, clientY: 10 }));
+      await sleep(50);
+      assert(!preview!.classList.contains("theater--hidden"), "chrome should be visible right after pointermove");
+      await sleep(2700); // > AUTO_HIDE_MS (2500) with NO movement while playing
+      assert(preview!.classList.contains("theater--hidden"), "chrome did not auto-hide after idle while playing");
+      preview!.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: 40, clientY: 40 }));
+      await sleep(50);
+      assert(!preview!.classList.contains("theater--hidden"), "pointermove did not reveal the chrome");
+      engine.pause();
+      await sleep(40);
+
+      // 5) frame-step arrows behave as ±5s INSIDE theater (intercepted before the
+      // global frame-step shortcut). Dispatch on document so the capture handler
+      // sees it, exactly as a real key press would.
+      engine.seek(20);
+      await sleep(50);
+      const ta0 = engine.time;
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+      await sleep(60);
+      assert(Math.abs(engine.time - (ta0 + 5)) < 0.3, `ArrowRight in theater: ${engine.time.toFixed(2)} vs ${(ta0 + 5).toFixed(2)} (expected +5s, not a frame)`);
+      const ta1 = engine.time;
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
+      await sleep(60);
+      assert(Math.abs(engine.time - (ta1 - 5)) < 0.3, `ArrowLeft in theater: ${engine.time.toFixed(2)} vs ${(ta1 - 5).toFixed(2)} (expected -5s)`);
+
+      // 6) Escape exits: .theater removed, the editor transport is visible again
+      engine.seek(20);
+      await sleep(40);
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      await sleep(60);
+      assert(!preview!.classList.contains("theater"), ".theater class not removed after Escape");
+      assert(getComputedStyle(transport!).display !== "none", "transport not visible after exiting theater");
+
+      // frame-step semantics restore on exit: an ArrowRight now steps ONE frame
+      // (via the global shortcut), a sub-second move — NOT ±5s.
+      const fps2 = engine.fps();
+      const frameSec = fps2.den / fps2.num;
+      engine.seek(20);
+      await sleep(40);
+      const te0 = engine.time;
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+      await sleep(60);
+      const stepped = engine.time - te0;
+      assert(
+        stepped > 0 && stepped < 4 * frameSec + 1e-3,
+        `after exit ArrowRight stepped ${stepped.toFixed(4)}s, expected ~1 frame (${frameSec.toFixed(4)}s), not ±5s`,
+      );
+
+      // clean up: fully out of theater, paused, back near the start
+      if (preview!.classList.contains("theater")) {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+        await sleep(40);
+      }
+      engine.pause();
+      engine.seek(0);
+      await sleep(40);
+      return "enter(button)→.theater+bar; ±5s+clamp; seek bar 50%; auto-hide↔pointermove; arrows=±5s inside→frame-step after exit; Escape restores transport";
+    });
+
     await test("playback-across-cut", async () => {
       // split at 8s, then play from 7.5 → should cross the cut and keep going
       const first = session.project.timeline.tracks[0]!.clips[0]!;

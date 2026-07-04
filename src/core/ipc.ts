@@ -91,6 +91,8 @@ export const ipc = {
   loadProject: (path: string) => call<LoadedProject>("load_project", { path }),
   saveProject: (path: string, project: ProjectFile) =>
     call<{ modifiedAt: string }>("save_project", { path, project }),
+  refreshRecentThumb: (path: string) =>
+    call<string | null>("refresh_recent_thumb", { path }, () => null),
   probeMedia: (path: string) => call<MediaInfo>("probe_media", { path }),
   pathExists: (path: string) => call<boolean>("path_exists", { path }),
   newProjectPath: (name?: string) =>

@@ -47,24 +47,22 @@ pub fn any_thumb_for(cache: &Cache, hash: &str) -> Option<PathBuf> {
     None
 }
 
-#[tauri::command]
-pub fn get_thumbnail(
-    jobs: State<'_, Arc<Jobs>>,
-    cache: State<'_, Arc<Cache>>,
-    key: MediaKey,
-    at_sec: f64,
-) -> Result<String> {
+/// Ensure a single thumbnail exists on disk for `key` at `at_sec`, generating
+/// it via the thumb lane when absent, and return its cache path. Reuse-first:
+/// returns the cached file immediately when present. Callers needing the frame
+/// synchronously (recents refresh, editor bin) share this one code path.
+pub fn ensure_thumb(cache: &Cache, jobs: &Jobs, key: &MediaKey, at_sec: f64) -> Result<PathBuf> {
     let hash = key.hash();
     let suffix = format!("_{}.jpg", (at_sec * 1000.0) as u64);
     if let Some(existing) = cache.existing_file(CacheKind::Thumbs, &hash, &suffix) {
-        return Ok(existing.to_string_lossy().into_owned());
+        return Ok(existing);
     }
     cache.ensure_kind_dir(CacheKind::Thumbs)?;
     let dst = cache.file_path(CacheKind::Thumbs, &hash, &suffix);
     let src = PathBuf::from(&key.path);
 
     let dst_for_job = dst.clone();
-    let out = jobs::run_blocking_on_lane(&jobs, Lane::Thumb, move || {
+    jobs::run_blocking_on_lane(jobs, Lane::Thumb, move || {
         let args = thumbnail_args(&src, &dst_for_job, at_sec);
         let out = jobs::ffmpeg::command("ffmpeg")?
             .args(&args)
@@ -76,10 +74,19 @@ pub fn get_thumbnail(
             )));
         }
         Ok(())
-    });
-    out?;
+    })?;
     cache.mark_used(&dst);
-    Ok(dst.to_string_lossy().into_owned())
+    Ok(dst)
+}
+
+#[tauri::command]
+pub fn get_thumbnail(
+    jobs: State<'_, Arc<Jobs>>,
+    cache: State<'_, Arc<Cache>>,
+    key: MediaKey,
+    at_sec: f64,
+) -> Result<String> {
+    ensure_thumb(&cache, &jobs, &key, at_sec).map(|p| p.to_string_lossy().into_owned())
 }
 
 /* ------------------------------------------------------------------ */

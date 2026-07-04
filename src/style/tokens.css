@@ -44,15 +44,19 @@
    *   stage overlay ............. 200   (manip. chrome: above media, below UI)
    *   editor float chrome ....... 300   (drop-overlay guide)
    *   drag ghost ................ 400   (cursor-following drag preview)
+   *   theater mode .............. 500   (fullscreen preview over editor chrome)
    *   context menu .............. 1000
    *   modal backdrop ............ 1100  (MUST beat the stage overlay + chrome)
    *   toast ..................... 1200  (always on top)
    * The stage overlay must beat the media layer sets (z = track count) inside
    * its own .preview__canvas — 200 keeps headroom for absurd layer counts
-   * while sitting far below every dialog. */
+   * while sitting far below every dialog. Theater mode lifts the whole preview
+   * over the editor chrome (500) yet stays under menus/modals/toasts so those
+   * still surface above a fullscreen playback view. */
   --z-stage-overlay: 200;
   --z-editor-chrome: 300;
   --z-drag-ghost: 400;
+  --z-theater: 500;
   --z-menu: 1000;
   --z-modal: 1100;
   --z-toast: 1200;

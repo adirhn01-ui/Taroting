@@ -622,3 +622,111 @@
   box-sizing: border-box;
   cursor: default;
 }
+
+/* ---------- theater mode (fullscreen playback) ---------- */
+
+/* The .editor__preview container is lifted over the editor chrome and filled
+ * black. It also becomes the fullscreen element (best-effort), so :fullscreen
+ * inherits the same look. Sits at var(--z-theater): above chrome, below menus. */
+.editor__preview.theater,
+.editor__preview.theater:fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-theater);
+  background: #000;
+  padding: 0;
+}
+
+/* While theater is active the canvas-manipulation overlay is a viewing surface
+ * only — kill its pointer handling without touching overlay.ts logic. */
+.editor__preview.theater .stage-overlay {
+  pointer-events: none;
+}
+
+/* auto-hide: fade the bar out and blank the cursor after the idle timeout. */
+.editor__preview.theater.theater--hidden {
+  cursor: none;
+}
+
+.theater-bar {
+  position: absolute;
+  left: 50%;
+  bottom: var(--sp-5);
+  transform: translateX(-50%);
+  display: none;
+  align-items: center;
+  gap: var(--sp-2);
+  width: min(880px, calc(100% - var(--sp-8)));
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--radius-l);
+  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-3);
+  backdrop-filter: blur(12px);
+  opacity: 1;
+  transition: opacity var(--dur) var(--ease);
+}
+.editor__preview.theater .theater-bar {
+  display: flex;
+}
+.editor__preview.theater.theater--hidden .theater-bar {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* keep the glyph transparent to pointer events (same reasoning as the transport
+ * play button): a rapid click always targets the button, never a swapped <svg>. */
+.theater-bar__btn svg {
+  pointer-events: none;
+}
+
+.theater-bar__time {
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  padding: 0 var(--sp-2);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.theater-bar__seek {
+  position: relative;
+  flex: 1;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+}
+/* the visible track (thin bar, centered in the taller hit area) */
+.theater-bar__seek::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: var(--bg-active);
+}
+.theater-bar__seek-fill {
+  position: absolute;
+  left: 0;
+  width: 0;
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  pointer-events: none;
+}
+.theater-bar__seek-knob {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 12px;
+  height: 12px;
+  margin-left: -6px;
+  border-radius: var(--radius-full);
+  background: var(--accent-strong);
+  border: 2px solid var(--on-accent);
+  transform: translateY(-50%);
+  box-shadow: var(--shadow-1);
+  pointer-events: none;
+}

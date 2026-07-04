@@ -39,6 +39,7 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   addMarker: "Add marker",
   export: "Export",
   goHome: "Close project",
+  fullscreen: "Fullscreen playback",
 };
 
 /** Action row order — mirrors the ActionId union for a predictable list. */
@@ -51,6 +52,7 @@ const ACTION_ORDER: ActionId[] = [
   "jumpBack",
   "goStart",
   "goEnd",
+  "fullscreen",
   "split",
   "delete",
   "rippleDelete",

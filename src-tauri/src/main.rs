@@ -68,6 +68,7 @@ fn main() {
             project::store::remove_recent,
             project::store::load_project,
             project::store::save_project,
+            project::store::refresh_recent_thumb,
             project::store::path_exists,
             project::store::new_project_path,
             project::store::rename_project,
