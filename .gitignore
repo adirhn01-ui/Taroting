@@ -20,3 +20,5 @@ Thumbs.db
 
 # local editor/assistant tooling
 .claude/
+AGENTS.md
+CLAUDE.md
