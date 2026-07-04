@@ -52,11 +52,16 @@
    * its own .preview__canvas — 200 keeps headroom for absurd layer counts
    * while sitting far below every dialog. Theater mode lifts the whole preview
    * over the editor chrome (500) yet stays under menus/modals/toasts so those
-   * still surface above a fullscreen playback view. */
+   * still surface above a fullscreen playback view.
+   * --z-theater-bar is LOCAL: the theater container (position:fixed + z 500) is
+   * its own stacking context, so the bar's z only competes with the media
+   * layers (1..n) and the stage overlay (200) that live inside that container.
+   * 300 clears both with headroom yet has no meaning outside .theater. */
   --z-stage-overlay: 200;
   --z-editor-chrome: 300;
   --z-drag-ghost: 400;
   --z-theater: 500;
+  --z-theater-bar: 300;
   --z-menu: 1000;
   --z-modal: 1100;
   --z-toast: 1200;

@@ -22,6 +22,12 @@ export interface TheaterCtx {
   container: HTMLElement;
   /** reflect open/close on the transport fullscreen button (title + glyph) */
   onChange?(active: boolean): void;
+  /** refit the stage's letterbox to the container's CURRENT box. Called on every
+   *  size-changing transition (enter/exit theater, gain/lose element fullscreen)
+   *  so the video scales crisply with clean black bars instead of keeping a stale
+   *  windowed size. The stage's ResizeObserver also fires, but the container jump
+   *  to fixed inset-0 can race the observer, so we call this explicitly too. */
+  refit?(): void;
 }
 
 /** How far a ±5s skip jumps, in seconds. */
@@ -249,13 +255,31 @@ export function mountTheater(ctx: TheaterCtx): Theater {
   };
   const onPointerMove = (): void => reveal();
 
+  /* ---------------- stage refit ---------------- */
+
+  // Refit the letterbox to the container's CURRENT box after a size-changing
+  // transition. Two frames: rAF lets the class toggle / fullscreen flip apply
+  // layout first, so getBoundingClientRect() inside fit() reads the new size
+  // rather than the stale windowed one. Cancel any pending refit so rapid
+  // enter→exit doesn't fire a refit against an intermediate size.
+  let refitRaf: number | undefined;
+  function scheduleRefit(): void {
+    if (!ctx.refit) return;
+    window.cancelAnimationFrame(refitRaf ?? 0);
+    refitRaf = window.requestAnimationFrame(() => {
+      refitRaf = window.requestAnimationFrame(() => ctx.refit?.());
+    });
+  }
+
   /* ---------------- fullscreen sync ---------------- */
 
   // OS-level Esc exits element fullscreen but not our in-window layer; catch the
   // resulting fullscreenchange (document.fullscreenElement cleared) and finish
-  // the teardown so the two stages never desync.
+  // the teardown so the two stages never desync. Either direction (gain OR lose
+  // element fullscreen) resizes the container, so refit on every change.
   const onFsChange = (): void => {
     if (active && !document.fullscreenElement) exit();
+    else scheduleRefit();
   };
 
   /* ---------------- enter / exit ---------------- */
@@ -292,6 +316,10 @@ export function mountTheater(ctx: TheaterCtx): Theater {
     const rf = container.requestFullscreen?.();
     if (rf) rf.catch(() => {});
 
+    // the container jumped to fixed inset-0: refit the letterbox to the new box
+    // so the video scales crisply (no stale windowed size / transient stretch).
+    scheduleRefit();
+
     reveal();
     ctx.onChange?.(true);
   }
@@ -310,6 +338,10 @@ export function mountTheater(ctx: TheaterCtx): Theater {
 
     if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
 
+    // the container returned to its windowed flow box: refit back down so the
+    // stage doesn't keep the fullscreen-sized letterbox.
+    scheduleRefit();
+
     ctx.onChange?.(false);
   }
 
@@ -327,6 +359,7 @@ export function mountTheater(ctx: TheaterCtx): Theater {
       exit();
       unTick();
       window.clearTimeout(hideTimer);
+      window.cancelAnimationFrame(refitRaf ?? 0);
       bar.remove();
     },
   };

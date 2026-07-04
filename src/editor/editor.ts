@@ -217,6 +217,10 @@ export async function mountEditor(
       btn.innerHTML = icon(on ? "fullscreenExit" : "fullscreen", 14);
       btn.title = on ? "Exit fullscreen (F)" : "Fullscreen (F)";
     },
+    // refit the letterbox on every theater/fullscreen size transition so the
+    // video scales crisply to the new container box (the ResizeObserver alone
+    // can race the fixed inset-0 jump).
+    refit: () => stage.refit(),
   });
 
   /* ---------------- actions ---------------- */

@@ -129,7 +129,10 @@ export function mountStage(
   function fit(): void {
     const dims = getTimelineDims();
     const box = root.getBoundingClientRect();
-    const pad = 24;
+    // In theater/fullscreen the stage is a plain player: no breathing pad, so the
+    // video letterboxes edge-to-edge against pure-black bars. Windowed keeps the
+    // 24px inset so the canvas doesn't kiss the panel borders.
+    const pad = root.closest(".editor__preview.theater") ? 0 : 24;
     const availW = Math.max(80, box.width - pad * 2);
     const availH = Math.max(60, box.height - pad * 2);
     const scale = Math.min(availW / dims.width, availH / dims.height);

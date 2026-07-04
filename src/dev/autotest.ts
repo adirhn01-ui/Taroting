@@ -385,6 +385,27 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       engine.seek(20);
       await sleep(80);
 
+      // Establish a real selection BEFORE entering so we can prove it survives
+      // the round-trip: click the clip under the playhead via the overlay (its
+      // pointerdown hit-tests + selects), then confirm the selection box paints.
+      const stageOverlay = document.querySelector<HTMLElement>(".stage-overlay")!;
+      const selbox = stageOverlay.querySelector<HTMLElement>(".stage-overlay__selbox")!;
+      const stageCanvas = stageOverlay.parentElement as HTMLElement; // .preview__canvas
+
+      // Teardown runs in a finally so a mid-test assertion failure can NEVER leak
+      // theater state (fixed inset-0, overlay display:none, a live selection) into
+      // the tests that follow (e.g. crop-mode-cycle needs the overlay interactive).
+      try {
+      {
+        const cbox = stageCanvas.getBoundingClientRect();
+        const ccx = cbox.left + cbox.width / 2;
+        const ccy = cbox.top + cbox.height / 2;
+        stageOverlay.dispatchEvent(new PointerEvent("pointerdown", { button: 0, clientX: ccx, clientY: ccy, bubbles: true }));
+        stageOverlay.dispatchEvent(new PointerEvent("pointerup", { button: 0, clientX: ccx, clientY: ccy, bubbles: true }));
+        await sleep(60);
+      }
+      assert(getComputedStyle(selbox).display !== "none", "precondition: selection box should be visible before theater");
+
       // 1) enter via the REAL button click; container gets .theater + bar visible
       fsBtn!.click();
       await sleep(60);
@@ -392,6 +413,65 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       const bar = preview!.querySelector<HTMLElement>(".theater-bar");
       assert(bar !== null, "no .theater-bar mounted");
       assert(getComputedStyle(bar!).display !== "none", "theater bar not visible when active");
+
+      // 1a) OVERLAY GONE: the whole manipulation overlay is display:none while
+      // active (view-only), so no selection box / handles / guides paint over the
+      // video. (Merely pointer-events:none would still leave the chrome painted.)
+      // The selbox keeps its own inline display:block (its render state is frozen,
+      // not cleared — proving selection survives), so we assert it is not RENDERED:
+      // a node inside a display:none subtree has no layout box (offsetParent null,
+      // zero client rects). That is the correct "not visible" semantic.
+      assert(getComputedStyle(stageOverlay).display === "none", "stage-overlay must be display:none in theater (view-only)");
+      assert(
+        selbox.offsetParent === null && selbox.getClientRects().length === 0,
+        "selection box must not be rendered in theater (overlay is display:none)",
+      );
+
+      // 1b) SHARP: the stage/canvas has no rounded corners in theater (plain
+      // player, clean letterbox), regardless of the windowed --radius-s.
+      assert(
+        getComputedStyle(stageCanvas).borderRadius === "0px",
+        `canvas border-radius must be 0px in theater, got ${getComputedStyle(stageCanvas).borderRadius}`,
+      );
+
+      // 1c) PAINT/HIT ORDER: the control bar (and its play button) must be the
+      // topmost thing at their own center — elementFromPoint there returns the bar
+      // / button or a descendant, NEVER a video / canvas / overlay behind it. This
+      // is the exact failure the user saw (bar painted under the z-indexed video).
+      const withinBar = (el: Element | null): boolean => !!el && (el === bar || bar!.contains(el));
+      {
+        const bb = bar!.getBoundingClientRect();
+        const hitBar = document.elementFromPoint(bb.left + bb.width / 2, bb.top + bb.height / 2);
+        assert(
+          withinBar(hitBar),
+          `bar center is occluded: elementFromPoint=${(hitBar as HTMLElement | null)?.className ?? "null"} (bar not on top)`,
+        );
+        const playBtn = bar!.querySelector<HTMLButtonElement>('[data-act="playpause"]')!;
+        const pb = playBtn.getBoundingClientRect();
+        const hitPlay = document.elementFromPoint(pb.left + pb.width / 2, pb.top + pb.height / 2);
+        assert(
+          withinBar(hitPlay),
+          `play button is occluded: elementFromPoint=${(hitPlay as HTMLElement | null)?.className ?? "null"}`,
+        );
+      }
+
+      // 1d) REFIT: after the container jumped to fixed inset-0, the stage refit so
+      // the canvas letterboxes the new box — its rendered size matches an aspect
+      // fit of the project dims into the container (within a couple px). Proves the
+      // fit() path ran on the transition (no stale windowed size / transient tiny).
+      {
+        await sleep(80); // let the refit rAFs run
+        const cont = preview!.getBoundingClientRect();
+        const cvs = stageCanvas.getBoundingClientRect();
+        const dims = session.project.timeline;
+        const k = Math.min(cont.width / dims.width, cont.height / dims.height);
+        const expW = dims.width * k;
+        const expH = dims.height * k;
+        assert(
+          Math.abs(cvs.width - expW) < 3 && Math.abs(cvs.height - expH) < 3,
+          `canvas did not refit to the fullscreen box: got ${cvs.width.toFixed(1)}x${cvs.height.toFixed(1)}, expected ~${expW.toFixed(1)}x${expH.toFixed(1)}`,
+        );
+      }
 
       // 2) ±5s buttons move engine.time by ~±5 (respect clamping)
       const back5 = bar!.querySelector<HTMLButtonElement>('[data-act="back5"]')!;
@@ -463,6 +543,17 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       assert(!preview!.classList.contains("theater"), ".theater class not removed after Escape");
       assert(getComputedStyle(transport!).display !== "none", "transport not visible after exiting theater");
 
+      // OVERLAY RESTORED: exiting theater returns the manipulation overlay exactly
+      // as it was — it paints again (display not none) AND the prior selection is
+      // intact (its box is visible again, never cleared by entering/leaving). The
+      // canvas radius returns to the windowed rounded look, too.
+      assert(getComputedStyle(stageOverlay).display !== "none", "stage-overlay must paint again after exiting theater");
+      assert(
+        getComputedStyle(selbox).display !== "none" && selbox.offsetParent !== null,
+        "prior selection lost after exiting theater (selbox not rendered)",
+      );
+      assert(getComputedStyle(stageCanvas).borderRadius !== "0px", "canvas should regain its windowed radius after exit");
+
       // frame-step semantics restore on exit: an ArrowRight now steps ONE frame
       // (via the global shortcut), a sub-second move — NOT ±5s.
       const fps2 = engine.fps();
@@ -478,15 +569,22 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         `after exit ArrowRight stepped ${stepped.toFixed(4)}s, expected ~1 frame (${frameSec.toFixed(4)}s), not ±5s`,
       );
 
-      // clean up: fully out of theater, paused, back near the start
-      if (preview!.classList.contains("theater")) {
-        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      } finally {
+        // clean up: fully out of theater, drop the selection (Escape on the
+        // focused overlay), paused, back near the start — leave no state for later
+        // tests. Runs even if an assertion above threw, so a theater failure never
+        // cascades into the crop / overlay tests that follow.
+        if (preview!.classList.contains("theater")) {
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+          await sleep(40);
+        }
+        stageOverlay.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        await sleep(30);
+        engine.pause();
+        engine.seek(0);
         await sleep(40);
       }
-      engine.pause();
-      engine.seek(0);
-      await sleep(40);
-      return "enter(button)→.theater+bar; ±5s+clamp; seek bar 50%; auto-hide↔pointermove; arrows=±5s inside→frame-step after exit; Escape restores transport";
+      return "enter→.theater+bar; overlay display:none+selbox gone+radius 0; bar/play hit-topmost; canvas refit to fullscreen box; ±5s+clamp; seek 50%; auto-hide↔pointermove; arrows ±5s→frame-step after exit; Escape restores transport+overlay+selection";
     });
 
     await test("playback-across-cut", async () => {

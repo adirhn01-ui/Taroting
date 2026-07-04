@@ -627,7 +627,10 @@
 
 /* The .editor__preview container is lifted over the editor chrome and filled
  * black. It also becomes the fullscreen element (best-effort), so :fullscreen
- * inherits the same look. Sits at var(--z-theater): above chrome, below menus. */
+ * inherits the same look. Sits at var(--z-theater): above chrome, below menus.
+ * position:fixed + z-index makes this a stacking context, so every z-index
+ * BELOW is local to the container (the bar's z only competes with the media
+ * layers + stage overlay that live inside it — see .theater-bar). */
 .editor__preview.theater,
 .editor__preview.theater:fullscreen {
   position: fixed;
@@ -635,12 +638,30 @@
   z-index: var(--z-theater);
   background: #000;
   padding: 0;
+  margin: 0;
 }
 
-/* While theater is active the canvas-manipulation overlay is a viewing surface
- * only — kill its pointer handling without touching overlay.ts logic. */
+/* Sharp edges to match a plain video player: the stage/canvas loses its
+ * windowed radius + shadow + outline so the video letterboxes with clean black
+ * bars flush to the fixed container. :fullscreen mirrors the same look. */
+.editor__preview.theater .preview,
+.editor__preview.theater:fullscreen .preview {
+  padding: 0;
+}
+.editor__preview.theater .preview__canvas,
+.editor__preview.theater:fullscreen .preview__canvas {
+  border-radius: 0;
+  box-shadow: none;
+  outline: none;
+}
+
+/* While theater is active the canvas is VIEW-ONLY: the entire manipulation
+ * overlay is removed from paint AND hit-testing (not merely pointer-events), so
+ * no selection box, handles, snap guides or resize cursors show over the video.
+ * overlay.ts keeps its state untouched; on exit the overlay returns exactly as
+ * it was (selection intact). */
 .editor__preview.theater .stage-overlay {
-  pointer-events: none;
+  display: none;
 }
 
 /* auto-hide: fade the bar out and blank the cursor after the idle timeout. */
@@ -650,6 +671,11 @@
 
 .theater-bar {
   position: absolute;
+  /* Above the media layer sets (z 1..n) and the stage overlay (z 200) that
+   * share this container's stacking context, so the player controls always
+   * paint on top of the video. Local to .editor__preview.theater — see the
+   * z-index ladder in tokens.css (--z-theater-bar). */
+  z-index: var(--z-theater-bar);
   left: 50%;
   bottom: var(--sp-5);
   transform: translateX(-50%);
