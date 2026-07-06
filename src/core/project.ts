@@ -189,13 +189,23 @@ export function addVideoTrack(p: ProjectFile): { project: ProjectFile; trackId: 
   };
 }
 
-/** Remove a track. Audio tracks always removable. A video track may be removed
- *  only when it is EMPTY and at least 2 video tracks exist (>=1 must remain). */
-export function removeTrack(p: ProjectFile, trackId: string): ProjectFile {
+/** Remove a track (with any clips it holds when `force`). Audio tracks are
+ *  optional — auto-created on demand (detachAudio/importMediaAsClip) — so any
+ *  audio track may be removed, including the last one. A video track may be
+ *  removed only when at least 2 video tracks exist (>=1 must always remain);
+ *  without `force` a NON-EMPTY video track is refused (returns p unchanged).
+ *  The video-prefix contiguity invariant is preserved: filtering never reorders
+ *  the surviving tracks, so the remaining video tracks stay a contiguous prefix. */
+export function removeTrack(
+  p: ProjectFile,
+  trackId: string,
+  opts?: { force?: boolean },
+): ProjectFile {
   const t = findTrack(p, trackId);
   if (!t) return p;
   if (t.kind === "video") {
-    if (t.clips.length > 0 || videoTracks(p).length < 2) return p;
+    if (videoTracks(p).length < 2) return p; // never remove the last video track
+    if (t.clips.length > 0 && !opts?.force) return p; // non-empty needs force
   }
   const tracks = p.timeline.tracks.filter((x) => x.id !== trackId);
   return { ...p, timeline: { ...p.timeline, tracks } };

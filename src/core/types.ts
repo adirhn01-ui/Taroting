@@ -226,6 +226,11 @@ export interface Settings {
   proxyMedia: boolean;
   /** drag a clip on the canvas → snap its center to the project center */
   snapCenterGuides: boolean;
+  /** open-with a media file from Explorer → temporary project (kept only if the
+   *  user presses Back in the editor). Off = the classic permanent-project flow. */
+  tempOpenWith: boolean;
+  /** preview/monitor listening level 0..1 — NOT baked into clips or exports */
+  monitorVolume: number;
   shortcuts: Record<ActionId, string>;
 }
 
@@ -281,6 +286,8 @@ export const DEFAULT_SETTINGS: Settings = {
   cacheLimitMB: 2048,
   proxyMedia: true,
   snapCenterGuides: true,
+  tempOpenWith: false,
+  monitorVolume: 1,
   shortcuts: DEFAULT_SHORTCUTS,
 };
 

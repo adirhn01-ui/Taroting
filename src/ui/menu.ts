@@ -5,6 +5,8 @@ export interface MenuItem {
   label: string;
   danger?: boolean;
   disabled?: boolean;
+  /** Native tooltip — used to explain why a disabled item can't be chosen. */
+  title?: string;
   onSelect(): void;
 }
 
@@ -117,6 +119,7 @@ export function showMenu(x: number, y: number, menuItems: MenuItem[]): void {
     btn.className = "ctx-menu__item";
     if (item.danger) btn.classList.add("ctx-menu__item--danger");
     btn.textContent = item.label;
+    if (item.title) btn.title = item.title;
     if (item.disabled) {
       btn.disabled = true;
     } else {

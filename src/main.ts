@@ -66,7 +66,7 @@ async function go(route: Route): Promise<void> {
   } else {
     const { mountEditor } = await import("./editor/editor");
     if (token !== navToken) return;
-    const view = await mountEditor(app, route.projectPath);
+    const view = await mountEditor(app, route.projectPath, route.temp ?? false);
     if (token !== navToken) {
       await view.dispose();
       return;
@@ -85,22 +85,53 @@ void go({ view: "home" });
 // Serialized so overlapping launches can't interleave two project creations.
 let openChain: Promise<void> = Promise.resolve();
 
+// The temp-projects dir, resolved once per app run (a stable OS path). Cached as
+// a promise so concurrent opens share the single IPC round-trip. Normalized to
+// backslashes + lowercase for a case-insensitive Windows prefix test. Empty in a
+// plain browser (ipc fallback), which makes the prefix test below always false.
+let tempDirPrefix: Promise<string> | null = null;
+function normalizePath(p: string): string {
+  return p.replace(/\//g, "\\").toLowerCase();
+}
+function tempProjectsDirPrefix(): Promise<string> {
+  if (!tempDirPrefix) {
+    tempDirPrefix = import("./core/ipc")
+      .then(({ ipc }) => ipc.tempProjectsDir())
+      .then((dir) => (dir ? normalizePath(dir) : ""))
+      .catch(() => "");
+  }
+  return tempDirPrefix;
+}
+
 async function routeOpenPath(path: string): Promise<void> {
   const ext = fileExt(path);
   if (ext === "trt") {
-    navigate({ view: "editor", projectPath: path });
+    // A .trt that physically lives in the temp-projects dir is a live quick-view
+    // scratch file: route it as temp so the editor shows the Temporary badge and
+    // applies the keep gate on exit, matching the recents exclusion the backend
+    // already enforces for that dir. Anything outside it is a normal project.
+    const prefix = await tempProjectsDirPrefix();
+    const temp = prefix.length > 0 && normalizePath(path).startsWith(prefix);
+    navigate(temp ? { view: "editor", projectPath: path, temp: true } : { view: "editor", projectPath: path });
     return;
   }
   if (!MEDIA_FILE_EXTENSIONS.has(ext)) return; // unknown type: ignore
   const { ipc, describeError } = await import("./core/ipc");
   const { createProject, importMediaAsClip } = await import("./core/project");
+  const { settingsStore } = await import("./core/session");
+  // Quick-view: with the setting on, an open-with media file becomes a
+  // temporary project in the temp dir (never in recents) until the user presses
+  // Back in the editor. Off → the classic permanent flow, byte-identical.
+  const temp = settingsStore.get().tempOpenWith;
   try {
-    const projectPath = await ipc.newProjectPath(fileStem(path));
+    const projectPath = temp
+      ? await ipc.tempProjectPath(fileStem(path))
+      : await ipc.newProjectPath(fileStem(path));
     let project = createProject(fileStem(projectPath));
     const info = await ipc.probeMedia(path);
     project = importMediaAsClip(project, info).project;
     await ipc.saveProject(projectPath, project);
-    navigate({ view: "editor", projectPath });
+    navigate(temp ? { view: "editor", projectPath, temp: true } : { view: "editor", projectPath });
   } catch (e) {
     const { toast } = await import("./ui/toast");
     toast.error(describeError(e));

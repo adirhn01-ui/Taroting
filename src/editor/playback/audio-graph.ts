@@ -28,6 +28,43 @@ function clipBaseGain(clip: Clip, track: Track): number {
   );
 }
 
+/** Pure state for the monitor-volume control shared by the transport and
+ *  theater bars. `level` is the live 0..1 value; `lastNonZero` is what a mute
+ *  toggle restores to (seeded to 1 so an un-mute from a fresh 0 still makes
+ *  sound). Both UIs drive this identically; it holds no DOM/audio references. */
+export interface MonitorVolumeState {
+  level: number;
+  lastNonZero: number;
+}
+
+// Total sanitizer: coerce anything (numeric string, NaN, null, boolean, …)
+// with Number(); a non-finite result falls back to the safe default 1 (a
+// corrupted persisted level must never blank the editor), then clamp to 0..1.
+const clampVol = (v: number): number => {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 1;
+  return n <= 0 ? 0 : n >= 1 ? 1 : n;
+};
+
+/** Seed the state machine from a persisted level (clamped). */
+export function makeMonitorVolume(initial: number): MonitorVolumeState {
+  const level = clampVol(initial);
+  return { level, lastNonZero: level > 0 ? level : 1 };
+}
+
+/** User dragged the slider to `v`. Clamps; a non-zero value becomes the new
+ *  restore point. Returns the next state (does not mutate the input). */
+export function setMonitorLevel(s: MonitorVolumeState, v: number): MonitorVolumeState {
+  const level = clampVol(v);
+  return { level, lastNonZero: level > 0 ? level : s.lastNonZero };
+}
+
+/** Speaker click: mute if audible, else restore the last non-zero level. */
+export function toggleMonitorMute(s: MonitorVolumeState): MonitorVolumeState {
+  if (s.level > 0) return { level: 0, lastNonZero: s.level };
+  return { level: s.lastNonZero, lastNonZero: s.lastNonZero };
+}
+
 export class AudioGraph {
   private ctx: AudioContext;
   private master: GainNode;
@@ -40,6 +77,8 @@ export class AudioGraph {
   private lastPlaying = false;
   private lastProject: ProjectFile | null = null;
   private maxDrift = 0;
+
+  private monitor = 1;
 
   constructor(
     private getProject: () => ProjectFile,
@@ -60,6 +99,29 @@ export class AudioGraph {
       gain.connect(this.master);
       this.voices.push({ el, gain, clipId: null, url: null });
     }
+  }
+
+  /* ---------------- monitor (preview listening) volume ---------------- */
+
+  // The master bus scales EVERYTHING (per-element gains → master → destination),
+  // so this is a pure monitor level: it never touches per-clip audio, the
+  // project, or exports. Only written on user input — no per-frame cost.
+
+  /** Preview listening level, 0..1. */
+  get monitorVolume(): number {
+    return this.monitor;
+  }
+
+  /** Set the preview listening level (clamped 0..1). A short setTargetAtTime
+   *  ramp avoids the zipper noise a step change to master.gain would produce. */
+  setMonitorVolume(v: number): void {
+    // Independent guard: even if a non-finite value reaches this path, never
+    // let it through to setTargetAtTime (it would throw synchronously).
+    this.monitor = clampVol(v);
+    const g = this.master.gain;
+    const now = this.ctx.currentTime;
+    g.cancelScheduledValues(now);
+    g.setTargetAtTime(this.monitor, now, 0.015);
   }
 
   /** Main sync entry — called from the engine on every tick/seek/pause. */

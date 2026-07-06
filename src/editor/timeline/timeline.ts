@@ -4,7 +4,7 @@
 
 import type { ProjectSession } from "../../core/session";
 import { timelineDuration } from "../../core/time";
-import type { Clip, MediaRef, ProjectFile } from "../../core/types";
+import type { Clip, MediaRef, ProjectFile, Track } from "../../core/types";
 import type { MediaManager } from "../media/media";
 import type { PlaybackEngine } from "../playback/engine";
 import { attachInteractions, type DragState } from "./interactions";
@@ -19,6 +19,8 @@ export interface TimelineDeps {
   snapEnabled(): boolean;
   /** Open the clip context menu at a viewport (client) position. */
   onClipMenu(clip: Clip, clientX: number, clientY: number): void;
+  /** Open the lane context menu at a viewport (client) position. */
+  onLaneMenu(track: Track, clientX: number, clientY: number): void;
 }
 
 const MIN_PX_PER_SEC = 0.5;
@@ -184,6 +186,10 @@ export class TimelineController {
   /** Delegate to the editor to build a clip context menu. */
   clipMenu(clip: Clip, clientX: number, clientY: number): void {
     this.deps.onClipMenu(clip, clientX, clientY);
+  }
+  /** Delegate to the editor to build a lane (layer) context menu. */
+  laneMenu(track: Track, clientX: number, clientY: number): void {
+    this.deps.onLaneMenu(track, clientX, clientY);
   }
   setDrag(drag: DragState, guide: number | null): void {
     this.drag = drag;

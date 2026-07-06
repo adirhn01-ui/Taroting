@@ -228,8 +228,11 @@ pub fn load_project(path: String) -> Result<LoadedProject> {
     }
 
     // Stamp openedAt on this path's recents entry (create it if absent — a
-    // freshly opened file may not be in the list yet).
-    stamp_opened(&path, &typed);
+    // freshly opened file may not be in the list yet). Temp quick-view projects
+    // are deliberately excluded from recents, so they are never stamped.
+    if !is_temp_project_path(&path) {
+        stamp_opened(&path, &typed);
+    }
 
     Ok(LoadedProject {
         project: migrated,
@@ -270,11 +273,36 @@ pub struct SavedProject {
     pub modified_at: String,
 }
 
-/// The media backing the first clip on the first track — the frame the recents
-/// grid uses as a project's thumbnail. `None` when the project has no clips.
+/// The media the recents grid uses as a project's thumbnail: the earliest
+/// visual clip across all video tracks. `None` when no video-track clip exists
+/// (generator-only / audio-only projects keep the placeholder by design).
+///
+/// Selection: gather every clip on a `kind == "video"` track, ordered by
+/// `timelineStart` ascending, tie-broken by topmost track (lowest track index).
+/// An empty topmost track no longer hides a lower track's clip. The earliest
+/// candidate whose media resolves to a non-audio source wins; audio-kind media
+/// on a video track (shouldn't happen, but be defensive) is skipped in favor of
+/// the next candidate so the thumbnail is always a real frame.
 fn first_clip_media(typed: &ProjectFile) -> Option<&schema::MediaRef> {
-    let clip = typed.timeline.tracks.first()?.clips.first()?;
-    typed.media.iter().find(|m| m.id == clip.media_id)
+    // (timelineStart, track index) sort key selects the earliest clip, breaking
+    // ties toward the topmost track. Track order is topmost-first, so a lower
+    // index means a higher (more visible) track.
+    let mut candidates: Vec<(f64, usize, &schema::Clip)> = typed
+        .timeline
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.kind == "video")
+        .flat_map(|(ti, t)| t.clips.iter().map(move |c| (c.timeline_start, ti, c)))
+        .collect();
+    candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+
+    candidates.into_iter().find_map(|(_, _, clip)| {
+        let media = typed.media.iter().find(|m| m.id == clip.media_id)?;
+        // Prefer a visual result: skip audio-kind media (defensive — video
+        // tracks shouldn't carry audio) so the next candidate gets a chance.
+        (media.kind != "audio").then_some(media)
+    })
 }
 
 #[tauri::command]
@@ -292,28 +320,33 @@ pub fn save_project(
         serde_json::to_vec_pretty(&project)?.as_slice(),
     )?;
 
-    // Thumbnail for the recents grid: any cached thumb of the first clip's media.
-    let thumb = first_clip_media(&typed)
-        .map(|m| {
-            crate::cache::MediaKey {
-                path: m.path.clone(),
-                size: m.size,
-                mtime_ms: m.mtime_ms,
-            }
-            .hash()
-        })
-        .and_then(|h| crate::media::thumbs::any_thumb_for(&cache, &h))
-        .map(|p| p.to_string_lossy().into_owned());
+    // Temp quick-view projects (autosaved to the temp dir) must never enter
+    // recents. Pressing Back re-saves to a permanent Documents path, which does
+    // upsert. Skip both the thumb lookup and the upsert for temp-dir paths.
+    if !is_temp_project_path(&path) {
+        // Thumbnail for the recents grid: any cached thumb of the first clip's media.
+        let thumb = first_clip_media(&typed)
+            .map(|m| {
+                crate::cache::MediaKey {
+                    path: m.path.clone(),
+                    size: m.size,
+                    mtime_ms: m.mtime_ms,
+                }
+                .hash()
+            })
+            .and_then(|h| crate::media::thumbs::any_thumb_for(&cache, &h))
+            .map(|p| p.to_string_lossy().into_owned());
 
-    upsert_recent(RecentItem {
-        path: path.clone(),
-        name: typed.name.clone(),
-        modified_at: typed.modified_at.clone(),
-        duration_sec: typed.timeline.duration(),
-        thumb,
-        size_bytes: 0, // filled by upsert_recent via fs metadata
-        opened_at: None, // preserved from any prior entry by upsert_recent
-    })?;
+        upsert_recent(RecentItem {
+            path: path.clone(),
+            name: typed.name.clone(),
+            modified_at: typed.modified_at.clone(),
+            duration_sec: typed.timeline.duration(),
+            thumb,
+            size_bytes: 0, // filled by upsert_recent via fs metadata
+            opened_at: None, // preserved from any prior entry by upsert_recent
+        })?;
+    }
 
     Ok(SavedProject {
         modified_at: typed.modified_at,
@@ -400,13 +433,11 @@ pub fn path_exists(path: String) -> bool {
     Path::new(&path).exists()
 }
 
-/// Pick a fresh "Untitled N.trt" path in Documents\Taroting.
-#[tauri::command]
-pub fn new_project_path(name: Option<String>) -> Result<String> {
-    let dir = paths::default_projects_dir()?;
-    paths::ensure_dir(&dir)?;
-    let base = name.unwrap_or_else(|| "Untitled".to_string());
-    let base = sanitize_filename(&base);
+/// Pick a fresh "Untitled N.trt" path in `dir`, deduping with a bare-space
+/// suffix ("<base> 2.trt") the way `new_project_path` always has. `base` must
+/// already be sanitized. Shared by the permanent (Documents) and temp flows so
+/// both name identically.
+fn fresh_untitled_in(dir: &Path, base: &str) -> Result<String> {
     for n in 0..1000 {
         let candidate = if n == 0 {
             dir.join(format!("{base}.trt"))
@@ -418,6 +449,64 @@ pub fn new_project_path(name: Option<String>) -> Result<String> {
         }
     }
     Err(AppError::BadInput("could not find a free project name".into()))
+}
+
+/// Pick a fresh "Untitled N.trt" path in Documents\Taroting.
+#[tauri::command]
+pub fn new_project_path(name: Option<String>) -> Result<String> {
+    let dir = paths::default_projects_dir()?;
+    paths::ensure_dir(&dir)?;
+    let base = sanitize_filename(&name.unwrap_or_else(|| "Untitled".to_string()));
+    fresh_untitled_in(&dir, &base)
+}
+
+/// True when `path` lives inside the temp-projects dir. Used to gate recents
+/// side effects: quick-view projects there must never appear in recents, so
+/// `load_project` skips stamping and `save_project` skips the upsert for them.
+/// A resolution failure (no LOCALAPPDATA) yields `false` — the safe default is
+/// the classic permanent behavior.
+fn is_temp_project_path(path: &str) -> bool {
+    paths::temp_projects_dir()
+        .map(|tmp| Path::new(path).starts_with(&tmp))
+        .unwrap_or(false)
+}
+
+/// The temp-projects dir as a string, for the frontend to classify open-with
+/// paths that physically live there as temp (matching the recents exclusion the
+/// backend already applies). Cached once per app run on the frontend, so this
+/// adds no repeated IPC.
+#[tauri::command]
+pub fn temp_projects_dir() -> Result<String> {
+    Ok(paths::temp_projects_dir()?.to_string_lossy().into_owned())
+}
+
+/// Pick a fresh "Untitled N.trt" path in the temp-projects dir. Mirrors
+/// `new_project_path` but targets scratch storage for the quick-view flow.
+#[tauri::command]
+pub fn temp_project_path(name: Option<String>) -> Result<String> {
+    let dir = paths::temp_projects_dir()?;
+    paths::ensure_dir(&dir)?;
+    let base = sanitize_filename(&name.unwrap_or_else(|| "Untitled".to_string()));
+    fresh_untitled_in(&dir, &base)
+}
+
+/// Best-effort wipe of stale files in the temp-projects dir. Called once at
+/// startup, before any project opens, so it never races a live quick-view
+/// session. ONLY touches the app's own tmp-projects dir; a missing dir or any
+/// per-file error is ignored (the next startup retries).
+pub fn cleanup_temp_projects() {
+    let Ok(dir) = paths::temp_projects_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return; // dir absent or unreadable → nothing to wipe
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_file() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 /// Pick a free `<base>.trt` path in `dir`, deduping to `<base> (2).trt` etc.
@@ -584,12 +673,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let prev = std::env::var_os("APPDATA");
         std::env::set_var("APPDATA", dir.join("appdata"));
+        // The temp-projects dir hangs off LOCALAPPDATA; isolate it too so the
+        // quick-view tests never touch the real %LOCALAPPDATA%\Taroting.
+        let prev_local = std::env::var_os("LOCALAPPDATA");
+        std::env::set_var("LOCALAPPDATA", dir.join("localappdata"));
 
         body(&dir);
 
         match prev {
             Some(v) => std::env::set_var("APPDATA", v),
             None => std::env::remove_var("APPDATA"),
+        }
+        match prev_local {
+            Some(v) => std::env::set_var("LOCALAPPDATA", v),
+            None => std::env::remove_var("LOCALAPPDATA"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -839,6 +936,145 @@ mod tests {
         });
     }
 
+    /// Parse a raw project JSON `Value` into a typed `ProjectFile` for testing
+    /// `first_clip_media` directly (no files on disk, no identity checks).
+    fn typed_project(v: Value) -> ProjectFile {
+        serde_json::from_value(schema::migrate(v).unwrap()).unwrap()
+    }
+
+    /// A file-backed video `MediaRef` JSON with the given id, sized 10 bytes.
+    fn video_media(id: &str) -> Value {
+        serde_json::json!({
+            "id": id, "path": format!("C:\\media\\{id}.mp4"), "size": 10,
+            "mtimeMs": 1, "kind": "video", "duration": 2.0, "hasAudio": false
+        })
+    }
+
+    /// A clip JSON on `media_id` starting at `start` seconds.
+    fn clip_at(id: &str, media_id: &str, start: f64) -> Value {
+        serde_json::json!({
+            "id": id, "mediaId": media_id,
+            "timelineStart": start, "srcIn": 0.0, "srcOut": 2.0, "speed": 1.0,
+            "audio": {"volume": 1.0, "muted": false, "fadeInSec": 0.0,
+                       "fadeOutSec": 0.0, "gainOffsetDb": 0.0, "detached": false}
+        })
+    }
+
+    /// Assemble a project with the given `media` array and `tracks` array.
+    fn project_with_tracks(media: Value, tracks: Value) -> Value {
+        serde_json::json!({
+            "schema": 1, "app": "taroting", "id": "p1", "name": "Multi",
+            "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+            "media": media,
+            "timeline": {
+                "fps": {"num": 30, "den": 1}, "width": 640, "height": 360,
+                "tracks": tracks
+            },
+            "export": {}
+        })
+    }
+
+    #[test]
+    fn first_clip_media_uses_lower_track_when_top_is_empty() {
+        // User's exact repro: V2 (topmost) empty, V1 (below) holds a clip at 0.
+        // The empty top track must NOT hide V1's clip — its media resolves.
+        let proj = typed_project(project_with_tracks(
+            serde_json::json!([video_media("m1")]),
+            serde_json::json!([
+                { "id": "t2", "kind": "video", "name": "V2", "muted": false, "clips": [] },
+                { "id": "t1", "kind": "video", "name": "V1", "muted": false,
+                  "clips": [clip_at("c1", "m1", 0.0)] }
+            ]),
+        ));
+        let media = first_clip_media(&proj).expect("bottom track's clip must resolve");
+        assert_eq!(media.id, "m1");
+    }
+
+    #[test]
+    fn first_clip_media_picks_earliest_across_tracks() {
+        // Two non-empty video tracks: top starts at 5.0, bottom starts at 1.0.
+        // The earliest clip (bottom, t=1.0) wins regardless of track order.
+        let proj = typed_project(project_with_tracks(
+            serde_json::json!([video_media("mTop"), video_media("mBottom")]),
+            serde_json::json!([
+                { "id": "t2", "kind": "video", "name": "V2", "muted": false,
+                  "clips": [clip_at("c2", "mTop", 5.0)] },
+                { "id": "t1", "kind": "video", "name": "V1", "muted": false,
+                  "clips": [clip_at("c1", "mBottom", 1.0)] }
+            ]),
+        ));
+        let media = first_clip_media(&proj).expect("earliest clip must resolve");
+        assert_eq!(media.id, "mBottom");
+
+        // Tie at the same start → topmost (lowest index) track wins.
+        let tied = typed_project(project_with_tracks(
+            serde_json::json!([video_media("mTop"), video_media("mBottom")]),
+            serde_json::json!([
+                { "id": "t2", "kind": "video", "name": "V2", "muted": false,
+                  "clips": [clip_at("c2", "mTop", 2.0)] },
+                { "id": "t1", "kind": "video", "name": "V1", "muted": false,
+                  "clips": [clip_at("c1", "mBottom", 2.0)] }
+            ]),
+        ));
+        assert_eq!(first_clip_media(&tied).unwrap().id, "mTop");
+    }
+
+    #[test]
+    fn first_clip_media_none_when_all_video_tracks_empty() {
+        // No clips on any video track → None (placeholder by design).
+        let proj = typed_project(project_with_tracks(
+            serde_json::json!([video_media("m1")]),
+            serde_json::json!([
+                { "id": "t2", "kind": "video", "name": "V2", "muted": false, "clips": [] },
+                { "id": "t1", "kind": "video", "name": "V1", "muted": false, "clips": [] }
+            ]),
+        ));
+        assert!(first_clip_media(&proj).is_none());
+    }
+
+    #[test]
+    fn first_clip_media_skips_audio_media_on_video_track() {
+        // Defensive: earliest clip resolves to audio-kind media (shouldn't happen
+        // on a video track). Fall back to the next candidate with a real frame.
+        let proj = typed_project(project_with_tracks(
+            serde_json::json!([
+                {
+                    "id": "mAudio", "path": "C:\\media\\a.m4a", "size": 10,
+                    "mtimeMs": 1, "kind": "audio", "duration": 2.0, "hasAudio": true
+                },
+                video_media("mVideo")
+            ]),
+            serde_json::json!([
+                { "id": "t1", "kind": "video", "name": "V1", "muted": false,
+                  "clips": [clip_at("cA", "mAudio", 0.0), clip_at("cV", "mVideo", 3.0)] }
+            ]),
+        ));
+        let media = first_clip_media(&proj).expect("should fall through to video");
+        assert_eq!(media.id, "mVideo");
+    }
+
+    #[test]
+    fn first_clip_media_ignores_audio_tracks() {
+        // An audio track carrying an earlier clip must be ignored entirely; only
+        // the video track's clip is a thumbnail candidate.
+        let proj = typed_project(project_with_tracks(
+            serde_json::json!([
+                {
+                    "id": "mA", "path": "C:\\media\\a.m4a", "size": 10,
+                    "mtimeMs": 1, "kind": "audio", "duration": 2.0, "hasAudio": true
+                },
+                video_media("mV")
+            ]),
+            serde_json::json!([
+                { "id": "tv", "kind": "video", "name": "V1", "muted": false,
+                  "clips": [clip_at("cV", "mV", 4.0)] },
+                { "id": "ta", "kind": "audio", "name": "A1", "muted": false,
+                  "clips": [clip_at("cA", "mA", 0.0)] }
+            ]),
+        ));
+        assert_eq!(first_clip_media(&proj).unwrap().id, "mV");
+    }
+
     #[test]
     fn rename_preserves_unknown_fields_and_updates_name() {
         with_isolated("rename", |dir| {
@@ -998,5 +1234,129 @@ mod tests {
         assert_eq!(std::fs::read(&bak).unwrap(), b"one");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* -------------------- temp quick-view projects -------------------- */
+
+    /// A minimal, clip-less but valid project JSON — enough for load_project to
+    /// parse and (for a non-temp path) stamp a recents entry.
+    fn minimal_project(name: &str) -> Value {
+        serde_json::json!({
+            "schema": 1, "app": "taroting", "id": "p1", "name": name,
+            "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+            "media": [], "export": {},
+            "timeline": {
+                "fps": {"num": 30, "den": 1}, "width": 640, "height": 360,
+                "tracks": [{ "id": "t1", "kind": "video", "name": "V1",
+                             "muted": false, "clips": [] }]
+            }
+        })
+    }
+
+    #[test]
+    fn temp_project_path_lands_in_temp_dir_and_dedupes() {
+        with_isolated("temp-path", |_dir| {
+            let tmp = paths::temp_projects_dir().unwrap();
+
+            // First call → "<base>.trt" directly under the temp dir, nowhere near
+            // Documents\Taroting.
+            let p1 = temp_project_path(Some("Clip".into())).unwrap();
+            let p1_path = Path::new(&p1);
+            assert!(p1_path.starts_with(&tmp), "{p1} should be under {tmp:?}");
+            assert!(p1.ends_with("Clip.trt"), "got {p1}");
+            assert!(is_temp_project_path(&p1), "path must classify as temp");
+
+            // Materialize it, then a second call must dedupe with a bare-space
+            // suffix (mirroring new_project_path's naming).
+            std::fs::write(p1_path, b"{}").unwrap();
+            let p2 = temp_project_path(Some("Clip".into())).unwrap();
+            assert!(p2.ends_with("Clip 2.trt"), "got {p2}");
+
+            // A Documents path is NOT classified as temp.
+            let permanent = new_project_path(Some("Clip".into())).unwrap();
+            assert!(!is_temp_project_path(&permanent), "{permanent} is not temp");
+        });
+    }
+
+    #[test]
+    fn temp_projects_dir_command_matches_creation_dir() {
+        with_isolated("temp-dir-cmd", |_dir| {
+            // The command the frontend uses to classify open-with paths must
+            // report exactly the dir temp_project_path creates into — otherwise a
+            // .trt physically in the temp dir wouldn't be recognized as temp.
+            let reported = temp_projects_dir().unwrap();
+            let created = temp_project_path(Some("Clip".into())).unwrap();
+            assert!(
+                Path::new(&created).starts_with(&reported),
+                "{created} should live under reported dir {reported}"
+            );
+            // And the reported dir is precisely paths::temp_projects_dir().
+            assert_eq!(
+                reported,
+                paths::temp_projects_dir().unwrap().to_string_lossy()
+            );
+        });
+    }
+
+    #[test]
+    fn load_project_on_temp_path_creates_no_recents_entry() {
+        with_isolated("temp-load", |_dir| {
+            // A project living in the temp dir must never be stamped into recents.
+            let temp_path = temp_project_path(Some("Quick".into())).unwrap();
+            write_json(Path::new(&temp_path), &minimal_project("Quick"));
+
+            load_project(temp_path.clone()).unwrap();
+            assert!(
+                read_recents().items.is_empty(),
+                "temp quick-view load must not touch recents"
+            );
+
+            // Sanity: the same load from a permanent path DOES stamp recents, so
+            // the skip is specific to the temp dir (not a broken stamp path).
+            let perm_dir = paths::default_projects_dir().unwrap();
+            paths::ensure_dir(&perm_dir).unwrap();
+            let perm_path = perm_dir.join("Kept.trt");
+            write_json(&perm_path, &minimal_project("Kept"));
+            load_project(perm_path.to_string_lossy().into_owned()).unwrap();
+            assert_eq!(
+                read_recents().items.len(),
+                1,
+                "permanent load should stamp exactly one recents entry"
+            );
+        });
+    }
+
+    #[test]
+    fn cleanup_temp_projects_wipes_only_the_temp_dir() {
+        with_isolated("temp-cleanup", |_dir| {
+            // Seed a stale scratch file in the temp dir and an unrelated project
+            // in Documents\Taroting.
+            let temp_path = temp_project_path(Some("Stale".into())).unwrap();
+            std::fs::write(&temp_path, b"{}").unwrap();
+            let mut bak = temp_path.clone();
+            bak.push_str(".bak");
+            std::fs::write(&bak, b"{}").unwrap();
+
+            let perm_dir = paths::default_projects_dir().unwrap();
+            paths::ensure_dir(&perm_dir).unwrap();
+            let keep = perm_dir.join("Keep.trt");
+            std::fs::write(&keep, b"{}").unwrap();
+
+            cleanup_temp_projects();
+
+            // Everything (including the .bak) in the temp dir is gone; the temp
+            // dir itself remains; the Documents project is untouched.
+            assert!(!Path::new(&temp_path).exists(), "temp file must be wiped");
+            assert!(!Path::new(&bak).exists(), "temp .bak must be wiped");
+            assert!(
+                paths::temp_projects_dir().unwrap().is_dir(),
+                "temp dir itself should survive"
+            );
+            assert!(keep.exists(), "Documents project must be untouched");
+
+            // Idempotent: a second run on the now-empty dir is a clean no-op.
+            cleanup_temp_projects();
+            assert!(keep.exists());
+        });
     }
 }

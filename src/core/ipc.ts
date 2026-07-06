@@ -97,6 +97,9 @@ export const ipc = {
   pathExists: (path: string) => call<boolean>("path_exists", { path }),
   newProjectPath: (name?: string) =>
     call<string>("new_project_path", { name: name ?? null }),
+  tempProjectPath: (name?: string) =>
+    call<string>("temp_project_path", { name: name ?? null }),
+  tempProjectsDir: () => call<string>("temp_projects_dir", undefined, () => ""),
   renameProject: (path: string, newName: string) =>
     call<string>("rename_project", { path, newName }),
   duplicateProject: (path: string, newName: string, newId: string) =>

@@ -293,8 +293,11 @@ export function attachInteractions(tl: TimelineController): () => void {
       e.preventDefault();
       tl.select(hit.clip.id);
       tl.clipMenu(hit.clip, e.clientX, e.clientY);
+    } else if (hit.type === "lane") {
+      e.preventDefault();
+      tl.laneMenu(hit.track, e.clientX, e.clientY);
     }
-    // ruler / lane / empty: leave the global suppression to swallow the default
+    // ruler / empty: leave the global suppression to swallow the default
   };
 
   /* ---------------- wheel: zoom / pan ---------------- */

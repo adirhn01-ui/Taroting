@@ -11,6 +11,7 @@ import {
   createProject,
   detachAudio,
   findClip,
+  findTrack,
   fitFillScale,
   insertClip,
   moveMarkerTo,
@@ -357,12 +358,12 @@ describe("video tracks", () => {
     expectClean(removeTrack(p, only));
   });
 
-  it("removeTrack: non-empty video not removable, empty extra video removable", () => {
+  it("removeTrack: non-empty video not removable without force, empty extra video removable", () => {
     let { p, mediaId } = baseProject();
     const media = p.media.find((m) => m.id === mediaId)!;
     const r = addVideoTrack(p);
     p = r.project;
-    // put a clip on the new top track → not removable
+    // put a clip on the new top track → not removable without force
     p = insertClip(p, r.trackId, makeClip(media, 0));
     expect(removeTrack(p, r.trackId)).toBe(p);
     // clear it → removable now (2 video tracks exist)
@@ -370,6 +371,63 @@ describe("video tracks", () => {
     const removed = removeTrack(p, r.trackId);
     expect(videoTracks(removed)).toHaveLength(1);
     expectClean(removed);
+  });
+
+  it("removeTrack force: removes a non-empty video track WITH its clips", () => {
+    let { p, mediaId } = baseProject();
+    const media = p.media.find((m) => m.id === mediaId)!;
+    const r = addVideoTrack(p);
+    p = r.project;
+    p = insertClip(p, r.trackId, makeClip(media, 0));
+    const clipId = findTrack(p, r.trackId)!.clips[0]!.id;
+    const removed = removeTrack(p, r.trackId, { force: true });
+    expect(findTrack(removed, r.trackId)).toBeUndefined();
+    expect(findClip(removed, clipId)).toBeUndefined();
+    expect(videoTracks(removed)).toHaveLength(1);
+    expectClean(removed);
+  });
+
+  it("removeTrack: last video refused even with force", () => {
+    const { p } = baseProject();
+    const only = topVideoTrack(p).id;
+    expect(removeTrack(p, only, { force: true })).toBe(p);
+    expectClean(removeTrack(p, only, { force: true }));
+  });
+
+  it("removeTrack: surviving video tracks stay a contiguous prefix", () => {
+    let { p } = baseProject();
+    // three video tracks then an audio track (contiguous prefix precondition)
+    p = addVideoTrack(p).project;
+    const mid = addVideoTrack(p);
+    p = mid.project; // tracks: [V?, mid, V?, ...] — mid is tracks[0], remove a middle one
+    const at = addAudioTrack(p);
+    p = at.project;
+    // remove the middle video track (index 1)
+    const midVideoId = p.timeline.tracks[1]!.id;
+    const removed = removeTrack(p, midVideoId);
+    expect(videoTracks(removed)).toHaveLength(2);
+    expectClean(removed); // checkInvariants asserts tracks[0] video + contiguity
+    expect(removed.timeline.tracks.at(-1)!.kind).toBe("audio");
+  });
+
+  it("removeTrack force: undo round-trip restores the track AND its clips exactly", () => {
+    let { p, mediaId } = baseProject();
+    const media = p.media.find((m) => m.id === mediaId)!;
+    const r = addVideoTrack(p);
+    p = r.project;
+    p = insertClip(p, r.trackId, makeClip(media, 0));
+    const before = p;
+
+    const history = new History<ProjectFile>();
+    history.push(before);
+    p = removeTrack(p, r.trackId, { force: true });
+    expect(findTrack(p, r.trackId)).toBeUndefined();
+    expectClean(p);
+
+    p = history.undo(p)!;
+    expect(p).toEqual(before);
+    expect(findTrack(p, r.trackId)!.clips).toHaveLength(1);
+    expectClean(p);
   });
 
   it("moveClip crosses video tracks", () => {

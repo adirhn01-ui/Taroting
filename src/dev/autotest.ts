@@ -587,6 +587,73 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       return "enter→.theater+bar; overlay display:none+selbox gone+radius 0; bar/play hit-topmost; canvas refit to fullscreen box; ±5s+clamp; seek 50%; auto-hide↔pointermove; arrows ±5s→frame-step after exit; Escape restores transport+overlay+selection";
     });
 
+    await test("delete-layer", async () => {
+      const { addVideoTrack, removeTrack, findTrack, findClip, makeClip, insertClip, videoTracks, checkInvariants } =
+        await import("../core/project");
+      const counter = session.project.media[0]!; // the counter fixture (video)
+      const vcount = (): number => videoTracks(session.project).length;
+      const before = vcount();
+
+      // 1) empty layer: add → +1, delete instantly → restored
+      let emptyId = "";
+      session.commit((p) => { const r = addVideoTrack(p); emptyId = r.trackId; return r.project; });
+      engine.refresh();
+      assert(vcount() === before + 1, `add empty layer → ${before + 1} video tracks, got ${vcount()}`);
+      session.commit((p) => removeTrack(p, emptyId));
+      engine.refresh();
+      assert(vcount() === before, `delete empty layer → ${before} video tracks, got ${vcount()}`);
+      assert(findTrack(session.project, emptyId) === undefined, "empty layer should be gone");
+
+      // 2) sole-video guard: removeTrack refuses the last video track (with or
+      //    without force) — the project reference is unchanged.
+      if (before === 1) {
+        const only = videoTracks(session.project)[0]!.id;
+        const guarded = removeTrack(session.project, only, { force: true });
+        assert(guarded === session.project, "last video track must be refused even with force");
+      }
+
+      // 3) force path: add a layer, put a clip on it, force-remove → clips gone +
+      //    invariants clean; undo x1 restores the track AND its clip exactly.
+      let forceId = "";
+      session.commit((p) => { const r = addVideoTrack(p); forceId = r.trackId; return r.project; });
+      let clipId = "";
+      session.commit((p) => {
+        const clip = makeClip(counter, 0);
+        clip.srcOut = clip.srcIn + 3; // 3s footprint
+        clipId = clip.id;
+        return insertClip(p, forceId, clip);
+      });
+      engine.refresh();
+      assert(findTrack(session.project, forceId)!.clips.length === 1, "clip should sit on the new layer");
+      const beforeForce = session.project;
+
+      session.commit((p) => removeTrack(p, forceId, { force: true }));
+      engine.refresh();
+      assert(findTrack(session.project, forceId) === undefined, "force-removed layer should be gone");
+      assert(findClip(session.project, clipId) === undefined, "the layer's clip should be gone too");
+      assert(vcount() === before, `after force-remove → ${before} video tracks, got ${vcount()}`);
+      const errs = checkInvariants(session.project);
+      assert(errs.length === 0, `invariants must stay clean: ${errs.join("; ")}`);
+
+      // undo x1 restores the track AND its clip exactly
+      session.undo();
+      engine.refresh();
+      const restored = findTrack(session.project, forceId);
+      assert(restored !== undefined, "undo should restore the force-removed layer");
+      assert(restored!.clips.length === 1 && restored!.clips[0]!.id === clipId, "undo should restore the clip exactly");
+      assert(
+        JSON.stringify(session.project) === JSON.stringify(beforeForce),
+        "undo should restore the project state exactly",
+      );
+
+      // clean up: undo back to the pristine 'before' state (drop the force layer)
+      session.undo(); // removes the clip-insert commit
+      session.undo(); // removes the addVideoTrack commit
+      engine.refresh();
+      assert(vcount() === before, `cleanup → ${before} video tracks, got ${vcount()}`);
+      return `empty layer add/delete (+1→${before}); force-remove drops 1 clip + clean invariants; undo x1 restored track+clip`;
+    });
+
     await test("playback-across-cut", async () => {
       // split at 8s, then play from 7.5 → should cross the cut and keep going
       const first = session.project.timeline.tracks[0]!.clips[0]!;

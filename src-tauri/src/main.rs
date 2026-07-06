@@ -26,6 +26,11 @@ fn main() {
     let cache = Arc::new(cache::Cache::new().expect("failed to initialize cache directory"));
     let jobs = Arc::new(jobs::Jobs::default());
 
+    // Wipe leftover quick-view (open-with) scratch projects from a prior run.
+    // Runs before the webview starts — no live session can race the wipe, and it
+    // only ever touches the app's own tmp-projects dir.
+    project::store::cleanup_temp_projects();
+
     tauri::Builder::default()
         // Single-instance MUST be registered first: a second launch is routed to
         // the running window (focus + push path + emit "open-path" as a wake-up)
@@ -71,6 +76,8 @@ fn main() {
             project::store::refresh_recent_thumb,
             project::store::path_exists,
             project::store::new_project_path,
+            project::store::temp_project_path,
+            project::store::temp_projects_dir,
             project::store::rename_project,
             project::store::duplicate_project,
             project::store::delete_project,

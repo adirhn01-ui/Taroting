@@ -3,7 +3,7 @@
 
 export type Route =
   | { view: "home" }
-  | { view: "editor"; projectPath: string }
+  | { view: "editor"; projectPath: string; temp?: true }
   | { view: "settings" };
 
 type Navigate = (route: Route) => void;

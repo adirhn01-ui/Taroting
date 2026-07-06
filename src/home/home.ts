@@ -59,6 +59,12 @@ const MORE_SVG =
   '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">' +
   '<circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>';
 
+/* Checkmark for the selection badge (icons.ts has no such icon and isn't ours to edit) */
+const CHECK_SVG =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M5 12.5 10 17.5 19 6.5"/></svg>';
+
 export function mountHome(root: HTMLElement): { dispose(): void } {
   root.innerHTML = `
     <div class="home">
@@ -70,9 +76,16 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
         <div class="home__inner">
           <div class="home__hero">
             <div class="home__title">Projects</div>
-            <div class="row" style="gap:var(--sp-2)">
+            <div class="row home__actions" id="home-actions" style="gap:var(--sp-2)">
               <button class="btn btn--primary" id="btn-new">${icon("plus")}New project</button>
               <button class="btn" id="btn-open">${icon("folder")}Open</button>
+              <button class="btn btn--ghost" id="btn-select" title="Select projects" hidden>Select</button>
+            </div>
+            <div class="row home__select-bar" id="home-select-bar" hidden style="gap:var(--sp-2)">
+              <span class="home__select-count" id="home-select-count">0 selected</span>
+              <button class="btn btn--danger" id="btn-select-delete" title="Delete selected projects" disabled>${icon("trash")}Delete</button>
+              <button class="btn btn--ghost" id="btn-select-all" title="Select all projects matching the current search">Select all</button>
+              <button class="btn btn--ghost" id="btn-select-cancel" title="Leave select mode">Cancel</button>
             </div>
           </div>
           <div class="home__toolbar">
@@ -97,11 +110,26 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   const search = root.querySelector<HTMLInputElement>("#home-search")!;
   const sortSelect = root.querySelector<HTMLSelectElement>("#home-sort")!;
   const overlay = root.querySelector<HTMLElement>("#drop-overlay")!;
+  const actionsBar = root.querySelector<HTMLElement>("#home-actions")!;
+  const selectBar = root.querySelector<HTMLElement>("#home-select-bar")!;
+  const selectBtn = root.querySelector<HTMLButtonElement>("#btn-select")!;
+  const selectCount = root.querySelector<HTMLElement>("#home-select-count")!;
+  const selectDeleteBtn = root.querySelector<HTMLButtonElement>("#btn-select-delete")!;
+  const selectAllBtn = root.querySelector<HTMLButtonElement>("#btn-select-all")!;
+  const selectCancelBtn = root.querySelector<HTMLButtonElement>("#btn-select-cancel")!;
 
   let recents: RecentItem[] = [];
   let sortKey: SortKey = loadSort();
   let busy = false;
   let disposed = false;
+  // Multi-select state. `selection` survives re-renders (search/sort) while the
+  // mode is active; entries that scroll out of the current filter stay selected
+  // unless deleted. `deleting` guards the mass-delete against double-fire.
+  let selectMode = false;
+  let deleting = false;
+  const selection = new Set<string>();
+  // Set true while an inline rename input is live; blocks entering select mode.
+  let renaming = false;
   // Paths whose thumbnail backfill we've already kicked off this mount, so
   // repeated refresh() calls (rename/delete/duplicate) never re-fire ffmpeg.
   const thumbTried = new Set<string>();
@@ -114,8 +142,9 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       ? `<img src="${escapeHtml(mediaUrl(item.thumb))}" alt="" loading="lazy" />`
       : icon("film", 28);
     const size = item.sizeBytes > 0 ? `<span>·</span><span>${formatBytes(item.sizeBytes)}</span>` : "";
+    const selected = selectMode && selection.has(item.path);
     return `
-      <div class="project-card" data-path="${escapeHtml(item.path)}" tabindex="0" role="button">
+      <div class="project-card${selected ? " is-selected" : ""}" data-path="${escapeHtml(item.path)}" tabindex="0" role="button"${selected ? ' aria-pressed="true"' : ""}>
         <div class="project-card__thumb">${thumb}</div>
         <div class="project-card__meta">
           <div class="project-card__name" title="${escapeHtml(item.path)}">${escapeHtml(item.name)}</div>
@@ -126,6 +155,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
           </div>
         </div>
         <button class="project-card__more" data-more="${escapeHtml(item.path)}" title="More">${MORE_SVG}</button>
+        <div class="project-card__check" aria-hidden="true">${CHECK_SVG}</div>
       </div>
     `;
   }
@@ -137,6 +167,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   }
 
   function renderGrid(): void {
+    grid.classList.toggle("recents-grid--select", selectMode);
     const items = currentItems();
     if (items.length === 0) {
       const searching = search.value.trim().length > 0;
@@ -149,6 +180,109 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       return;
     }
     grid.innerHTML = items.map(cardHtml).join("");
+  }
+
+  /* The Select entry point is meaningless with zero projects; hide it there.
+     A live rename would be lost on entering select mode, so disable until it
+     commits. Called after every refresh() and whenever rename state flips. */
+  function syncSelectAvailability(): void {
+    if (selectMode) return;
+    selectBtn.hidden = recents.length === 0;
+    selectBtn.disabled = renaming;
+  }
+
+  /* ---------------- multi-select ---------------- */
+
+  /* Reflect selection count into the bar: label + Delete enablement. */
+  function updateSelectBar(): void {
+    const n = selection.size;
+    selectCount.textContent = `${n} selected`;
+    selectDeleteBtn.disabled = n === 0 || deleting;
+  }
+
+  function enterSelectMode(): void {
+    if (selectMode || renaming || recents.length === 0) return;
+    selectMode = true;
+    selection.clear();
+    actionsBar.hidden = true;
+    selectBar.hidden = false;
+    updateSelectBar();
+    renderGrid();
+    selectCancelBtn.focus();
+  }
+
+  /* Leaving always clears the selection (per spec). Safe to call redundantly.
+     A mid-flight mass-delete owns the exit itself; don't tear the mode down
+     under it. (The delete run calls this once it finishes.) */
+  function leaveSelectMode(): void {
+    if (!selectMode || deleting) return;
+    selectMode = false;
+    selection.clear();
+    selectBar.hidden = true;
+    actionsBar.hidden = false;
+    renderGrid();
+    syncSelectAvailability();
+    if (!selectBtn.hidden && !selectBtn.disabled) selectBtn.focus();
+  }
+
+  function toggleSelection(path: string): void {
+    if (selection.has(path)) selection.delete(path);
+    else selection.add(path);
+    const card = grid.querySelector<HTMLElement>(
+      `.project-card[data-path="${CSS.escape(path)}"]`,
+    );
+    if (card) {
+      const on = selection.has(path);
+      card.classList.toggle("is-selected", on);
+      if (on) card.setAttribute("aria-pressed", "true");
+      else card.removeAttribute("aria-pressed");
+    }
+    updateSelectBar();
+  }
+
+  /* "Select all" targets the CURRENT filter (the visible cards) — not the whole
+     recents list — matching the button title. Paths already selected but hidden
+     by the filter are left untouched. */
+  function selectAllVisible(): void {
+    for (const item of currentItems()) selection.add(item.path);
+    renderGrid();
+    updateSelectBar();
+  }
+
+  function confirmDeleteSelection(): void {
+    const paths = [...selection];
+    if (paths.length === 0 || deleting) return;
+    const n = paths.length;
+    openModal({
+      title: n === 1 ? "Delete 1 project?" : `Delete ${n} projects?`,
+      bodyHtml: `<div class="home-modal__body-text">The ${n === 1 ? "project file" : `${n} project files`} will be permanently deleted from your disk. Media files are not affected.</div>`,
+      confirmLabel: "Delete",
+      danger: true,
+      onConfirm: async () => {
+        // Guard the whole run: a double confirm (Enter + click) can't fire twice.
+        if (deleting || disposed) return;
+        deleting = true;
+        updateSelectBar();
+        let failures = 0;
+        for (const path of paths) {
+          try {
+            await ipc.deleteProject(path);
+          } catch {
+            failures++;
+          }
+        }
+        deleting = false;
+        // The view may have been torn down mid-delete; don't touch dead DOM.
+        if (disposed) return;
+        if (failures === 0) {
+          toast.info(n === 1 ? "Deleted 1 project" : `Deleted ${n} projects`);
+        } else {
+          toast.error(`${failures} of ${n} projects couldn't be deleted`);
+        }
+        leaveSelectMode();
+        await refresh();
+      },
+    });
   }
 
   /* Backfill missing thumbnails. Projects opened via the OS "Open with" get a
@@ -194,6 +328,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     }
     renderGrid();
     backfillThumbs();
+    syncSelectAvailability();
   }
 
   function recentByPath(path: string): RecentItem | undefined {
@@ -371,8 +506,13 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
 
   /* Inline rename: replace the card's name with an input. */
   function startRename(card: HTMLElement, item: RecentItem): void {
+    // Rename is inert during select mode (cards are selection targets there).
+    if (selectMode) return;
     const nameEl = card.querySelector<HTMLElement>(".project-card__name");
     if (!nameEl || nameEl.querySelector("input")) return;
+    // Flag a live rename so entering select mode is blocked until it resolves.
+    renaming = true;
+    syncSelectAvailability();
     const input = document.createElement("input");
     input.className = "input project-card__rename";
     input.value = item.name;
@@ -387,10 +527,15 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     input.addEventListener("click", stop);
     input.addEventListener("keydown", stop);
 
+    const finishRename = (): void => {
+      renaming = false;
+      syncSelectAvailability();
+    };
     const cancel = (): void => {
       if (done) return;
       done = true;
       nameEl.textContent = item.name;
+      finishRename();
     };
     const commit = async (): Promise<void> => {
       if (done) return;
@@ -400,6 +545,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
         return;
       }
       done = true;
+      finishRename();
       try {
         await ipc.renameProject(item.path, value);
         await refresh();
@@ -459,8 +605,29 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     renderGrid();
   });
 
+  selectBtn.addEventListener("click", enterSelectMode);
+  selectCancelBtn.addEventListener("click", leaveSelectMode);
+  selectAllBtn.addEventListener("click", selectAllVisible);
+  selectDeleteBtn.addEventListener("click", confirmDeleteSelection);
+  // Esc leaves select mode. Capture phase so it beats the search field; skipped
+  // when a modal is up so Esc there cancels the dialog, not the whole mode.
+  const onEscape = (e: KeyboardEvent): void => {
+    if (e.key !== "Escape" || !selectMode || deleting) return;
+    if (document.querySelector(".modal-backdrop")) return;
+    e.preventDefault();
+    leaveSelectMode();
+  };
+  document.addEventListener("keydown", onEscape, true);
+
   grid.addEventListener("click", (e) => {
     const target = e.target as HTMLElement;
+    // In select mode a card click toggles selection and never opens; the "..."
+    // menu and rename affordances are inert.
+    if (selectMode) {
+      const card = target.closest<HTMLElement>(".project-card");
+      if (card) toggleSelection(card.dataset.path!);
+      return;
+    }
     const moreBtn = target.closest<HTMLElement>("[data-more]");
     if (moreBtn) {
       e.stopPropagation();
@@ -476,11 +643,22 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   grid.addEventListener("keydown", (e) => {
     if (e.key !== "Enter") return;
     const target = e.target as HTMLElement;
+    // Enter toggles selection in select mode instead of opening.
+    if (selectMode) {
+      const card = target.closest<HTMLElement>(".project-card");
+      if (card) {
+        e.preventDefault();
+        toggleSelection(card.dataset.path!);
+      }
+      return;
+    }
     if (target.closest(".project-card__rename")) return;
     const card = target.closest<HTMLElement>(".project-card");
     if (card) void openPath(card.dataset.path!);
   });
   grid.addEventListener("contextmenu", (e) => {
+    // The per-card menu is inert during select mode.
+    if (selectMode) return;
     const card = (e.target as HTMLElement).closest<HTMLElement>(".project-card");
     if (!card) return;
     e.preventDefault();
@@ -512,6 +690,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     dispose() {
       disposed = true;
       unlistenDrop();
+      document.removeEventListener("keydown", onEscape, true);
     },
   };
 }

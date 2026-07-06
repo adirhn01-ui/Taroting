@@ -23,6 +23,15 @@ pub fn cache_dir() -> Result<PathBuf> {
     Ok(env_dir("LOCALAPPDATA")?.join("Taroting").join("cache"))
 }
 
+/// %LOCALAPPDATA%\Taroting\tmp-projects — scratch projects for the quick-view
+/// (open-with) flow. Files here are never in recents and are wiped at startup;
+/// pressing Back in the editor re-saves the project permanently to Documents.
+pub fn temp_projects_dir() -> Result<PathBuf> {
+    Ok(env_dir("LOCALAPPDATA")?
+        .join("Taroting")
+        .join("tmp-projects"))
+}
+
 /// Default folder for new projects: Documents\Taroting
 pub fn default_projects_dir() -> Result<PathBuf> {
     Ok(env_dir("USERPROFILE")?.join("Documents").join("Taroting"))

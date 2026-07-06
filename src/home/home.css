@@ -62,6 +62,25 @@
   letter-spacing: -0.02em;
 }
 
+/* `.row`/`.btn` set display, which ties with the UA [hidden] rule on
+   specificity — force hidden to win so the attribute toggle actually hides. */
+.home__actions[hidden],
+.home__select-bar[hidden],
+#btn-select[hidden] {
+  display: none;
+}
+
+/* Select-mode toolbar swaps in for the New/Open/Select row (same slot). */
+.home__select-bar {
+  align-items: center;
+}
+.home__select-count {
+  font-size: var(--fs-13);
+  font-weight: 600;
+  color: var(--text-2);
+  margin-right: var(--sp-1);
+}
+
 .home__toolbar {
   display: flex;
   align-items: center;
@@ -157,6 +176,36 @@
 }
 .project-card__more:hover {
   background: rgba(0, 0, 0, 0.75);
+}
+
+/* ---------- select mode ---------- */
+
+/* The "..." menu is inert while selecting — hide it so it isn't a click target. */
+.recents-grid--select .project-card__more {
+  display: none;
+}
+
+/* Selection check badge (top-right, mirrors the more-button slot). Hidden by
+   default; shown only on selected cards. Reuses the card hover/focus idiom. */
+.project-card__check {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-full);
+  display: none;
+  place-items: center;
+  background: var(--accent);
+  color: var(--on-accent);
+  box-shadow: var(--shadow-1);
+}
+.project-card.is-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.project-card.is-selected .project-card__check {
+  display: grid;
 }
 
 /* Inline rename input, sized to sit where the name text was. */

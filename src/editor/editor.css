@@ -170,6 +170,38 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* ---------- monitor volume (transport) ----------
+ * Preview LISTENING level only — never per-clip audio, the project or exports.
+ * Hovering the wrapper reveals a small popover slider ABOVE the speaker button;
+ * the button toggles mute. The popover paints over the preview by DOM order
+ * (the transport follows .editor__preview), z-index just adds headroom. */
+.tr-volume {
+  position: relative;
+  display: flex;
+}
+.tr-volume__flyout {
+  position: absolute;
+  /* flush to the button top (no gap) so a pointer moving up onto the slider
+   * never crosses dead space and re-triggers pointerleave → flicker. */
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: var(--z-editor-chrome);
+  display: flex;
+  align-items: center;
+  padding: var(--sp-3) var(--sp-2);
+  border-radius: var(--radius-m);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-2);
+}
+.tr-volume__flyout[hidden] {
+  display: none;
+}
+.tr-volume__slider {
+  width: 96px;
+}
+
 .timeline-host {
   flex: 1;
   min-height: 0;
@@ -755,4 +787,16 @@
   transform: translateY(-50%);
   box-shadow: var(--shadow-1);
   pointer-events: none;
+}
+
+/* monitor volume: speaker + inline slider, sits between the seek bar and exit.
+ * flex:none so it keeps a fixed width while the seek bar takes the slack. */
+.theater-bar__volume {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: none;
+}
+.theater-bar__volume-slider {
+  width: 84px;
 }

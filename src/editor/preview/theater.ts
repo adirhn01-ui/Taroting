@@ -14,12 +14,25 @@
 
 import { formatTimecode } from "../../core/format";
 import { icon } from "../../ui/icons";
+import type { MonitorVolumeState } from "../playback/audio-graph";
 import type { PlaybackEngine } from "../playback/engine";
+
+/** The shared monitor-volume controller (owned by editor.ts). Both the
+ *  transport flyout and this bar drive the same level; subscribing keeps the
+ *  glyph + slider in sync when the other UI changes it. */
+export interface MonitorVolumeController {
+  get(): MonitorVolumeState;
+  setLevel(v: number): void;
+  toggleMute(): void;
+  subscribe(fn: (s: MonitorVolumeState) => void): () => void;
+}
 
 export interface TheaterCtx {
   engine: PlaybackEngine;
   /** the .editor__preview container that gets lifted fullscreen */
   container: HTMLElement;
+  /** shared monitor-volume control mirrored in the bar's speaker + slider */
+  volume: MonitorVolumeController;
   /** reflect open/close on the transport fullscreen button (title + glyph) */
   onChange?(active: boolean): void;
   /** refit the stage's letterbox to the container's CURRENT box. Called on every
@@ -44,7 +57,7 @@ export interface Theater {
 }
 
 export function mountTheater(ctx: TheaterCtx): Theater {
-  const { engine, container } = ctx;
+  const { engine, container, volume } = ctx;
 
   let active = false;
 
@@ -61,6 +74,10 @@ export function mountTheater(ctx: TheaterCtx): Theater {
       <div class="theater-bar__seek-fill" data-el="fill"></div>
       <div class="theater-bar__seek-knob" data-el="knob"></div>
     </div>
+    <div class="theater-bar__volume">
+      <button class="btn btn--ghost btn--icon theater-bar__btn" data-act="mute" title="Mute / unmute">${icon("volume")}</button>
+      <input class="slider theater-bar__volume-slider" data-el="volume" type="range" min="0" max="1" step="0.01" aria-label="Monitor volume" tabindex="-1" />
+    </div>
     <button class="btn btn--ghost btn--icon theater-bar__btn" data-act="exit" title="Exit fullscreen (F / Esc)">${icon("fullscreenExit")}</button>
   `;
 
@@ -70,6 +87,8 @@ export function mountTheater(ctx: TheaterCtx): Theater {
   const seekEl = $('[data-el="seek"]');
   const fillEl = $('[data-el="fill"]');
   const knobEl = $('[data-el="knob"]');
+  const muteBtn = $<HTMLButtonElement>('[data-act="mute"]');
+  const volSlider = $<HTMLInputElement>('[data-el="volume"]');
 
   container.appendChild(bar);
 
@@ -85,6 +104,23 @@ export function mountTheater(ctx: TheaterCtx): Theater {
     playBtnShows = want;
     playBtn.innerHTML = icon(want);
   };
+
+  /* ---------------- monitor volume (speaker + slider) ---------------- */
+
+  // Mirrors the transport control (same shared controller). Swap the speaker
+  // glyph only on the muted↔audible flip — same idempotent pattern as the play
+  // button — and never write the slider the user is actively dragging.
+  let muteShows: boolean | null = null;
+  const reflectVolume = (s: MonitorVolumeState): void => {
+    const muted = s.level <= 0;
+    if (muteShows !== muted) {
+      muteShows = muted;
+      muteBtn.innerHTML = icon(muted ? "mute" : "volume");
+    }
+    if (document.activeElement !== volSlider) volSlider.value = String(s.level);
+  };
+  reflectVolume(volume.get());
+  const unVolume = volume.subscribe(reflectVolume);
 
   // Time readout + seek geometry are a pure function of (time, duration) at frame
   // resolution. Cache the last rendered strings/positions so steady-state ticks
@@ -184,6 +220,33 @@ export function mountTheater(ctx: TheaterCtx): Theater {
     reveal();
   });
   $<HTMLButtonElement>('[data-act="exit"]').addEventListener("click", () => exit());
+
+  // Volume: the speaker toggles mute, the slider sets the level. A drag reuses
+  // the seek bar's `scrubbing` latch so the bar can't auto-hide (and go
+  // pointer-events:none, killing the drag) even if the thumb is held still. The
+  // <input> is a sibling of the seek bar; we stop its pointerdown so the drag
+  // can never fall through to the seek/scrub handlers.
+  muteBtn.addEventListener("click", () => {
+    volume.toggleMute();
+    muteBtn.blur();
+    reveal();
+  });
+  volSlider.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+    scrubbing = true;
+    reveal();
+  });
+  const endVolDrag = (): void => {
+    if (!scrubbing) return;
+    scrubbing = false;
+    reveal();
+  };
+  volSlider.addEventListener("pointerup", endVolDrag);
+  volSlider.addEventListener("pointercancel", endVolDrag);
+  volSlider.addEventListener("input", () => {
+    volume.setLevel(Number(volSlider.value));
+    reveal();
+  });
 
   /* ---------------- seek bar (click + drag) ---------------- */
 
@@ -358,6 +421,7 @@ export function mountTheater(ctx: TheaterCtx): Theater {
     dispose(): void {
       exit();
       unTick();
+      unVolume();
       window.clearTimeout(hideTimer);
       window.cancelAnimationFrame(refitRaf ?? 0);
       bar.remove();

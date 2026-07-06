@@ -214,6 +214,12 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
           s.snapCenterGuides,
           "Dragged clips snap to the canvas center",
         )}
+        ${switchRow(
+          "settings-temp-open",
+          "Quick view from File Explorer",
+          s.tempOpenWith,
+          "Media opened from File Explorer becomes a temporary project. Press Back in the editor to keep it",
+        )}
       </section>`;
   }
 
@@ -368,6 +374,11 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       .querySelector<HTMLInputElement>("#settings-snap-center")
       ?.addEventListener("change", (e) => {
         void updateSettings({ snapCenterGuides: (e.target as HTMLInputElement).checked });
+      });
+    inner
+      .querySelector<HTMLInputElement>("#settings-temp-open")
+      ?.addEventListener("change", (e) => {
+        void updateSettings({ tempOpenWith: (e.target as HTMLInputElement).checked });
       });
 
     // Cache limit

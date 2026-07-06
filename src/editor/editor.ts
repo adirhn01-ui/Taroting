@@ -11,10 +11,12 @@ import {
   addMedia,
   addVideoTrack,
   findClip,
+  findTrack,
   insertClip,
   makeClip,
   removeClip,
   removeMediaCascade,
+  removeTrack,
   rippleDelete,
   splitClip,
   topVideoTrack,
@@ -22,12 +24,12 @@ import {
   updateClip,
   videoTracks,
 } from "../core/project";
-import { ProjectSession, currentSession, settingsStore } from "../core/session";
+import { ProjectSession, currentSession, settingsStore, updateSettings } from "../core/session";
 import { ShortcutManager } from "../core/shortcuts";
 import { Store } from "../core/store";
 import { clipEnd, locate } from "../core/time";
 import { MEDIA_FILE_EXTENSIONS } from "../core/types";
-import type { Clip, MediaInfo, MediaRef, ProjectFile } from "../core/types";
+import type { Clip, MediaInfo, MediaRef, ProjectFile, Track } from "../core/types";
 import { icon } from "../ui/icons";
 import { showMenu } from "../ui/menu";
 import { toast } from "../ui/toast";
@@ -36,19 +38,27 @@ import { mountInspector } from "./inspector/inspector";
 import { openGeneratorDialog } from "./media/generators";
 import { MediaManager } from "./media/media";
 import { openRelinkDialog } from "./media/relink";
-import { AudioGraph } from "./playback/audio-graph";
+import {
+  AudioGraph,
+  makeMonitorVolume,
+  setMonitorLevel,
+  toggleMonitorMute,
+} from "./playback/audio-graph";
+import type { MonitorVolumeState } from "./playback/audio-graph";
 import { PlaybackEngine } from "./playback/engine";
 import { Scheduler } from "./playback/scheduler";
 import { mountStage } from "./preview/preview";
 import { mountCanvasOverlay } from "./preview/overlay";
 import { mountTheater } from "./preview/theater";
 import { collectCandidates, snapTime } from "./timeline/snap";
-import { laneLayout } from "./timeline/render";
+import { laneLabels, laneLayout } from "./timeline/render";
+import { trapTab } from "../ui/focus";
 import { TimelineController } from "./timeline/timeline";
 
 export async function mountEditor(
   root: HTMLElement,
   projectPath: string,
+  temp = false,
 ): Promise<{ dispose(): Promise<void> }> {
   let loaded;
   try {
@@ -107,6 +117,12 @@ export async function mountEditor(
                 <option value="1.5">1.5×</option>
                 <option value="2">2×</option>
               </select>
+              <div class="tr-volume" id="tr-volume">
+                <button class="btn btn--ghost btn--icon btn--sm" id="tr-volume-btn" title="Monitor volume" aria-haspopup="true" aria-expanded="false">${icon("volume", 14)}</button>
+                <div class="tr-volume__flyout" id="tr-volume-flyout" hidden>
+                  <input class="slider tr-volume__slider" id="tr-volume-slider" type="range" min="0" max="1" step="0.01" aria-label="Monitor volume" />
+                </div>
+              </div>
               <button class="btn btn--ghost btn--icon btn--sm" id="tr-loop" title="Loop playback (L)">${icon("loop", 14)}</button>
               <button class="btn btn--ghost btn--icon btn--sm btn--on" id="tr-snap" title="Snapping (N)">${icon("magnet", 14)}</button>
               <button class="btn btn--ghost btn--icon btn--sm" id="tr-split" title="Split at playhead (S)">${icon("scissors", 14)}</button>
@@ -147,6 +163,45 @@ export async function mountEditor(
   const graph = new AudioGraph(() => session.project, media, scheduler);
   const unGraphTick = engine.onTick((t, playing) => graph.tick(t, playing, engine.previewSpeed));
 
+  /* ---------------- monitor (preview listening) volume ---------------- */
+
+  // Single source of truth for the preview LISTENING level, shared by the
+  // transport flyout and the theater bar. It scales the audio graph's master
+  // bus only — never per-clip audio, the project, or exports. Seeded from the
+  // persisted Settings.monitorVolume; every change applies to the graph, is
+  // persisted via updateSettings, and notifies both UIs so they stay in sync.
+  let volState: MonitorVolumeState = makeMonitorVolume(settingsStore.get().monitorVolume);
+  graph.setMonitorVolume(volState.level);
+  const volSubs = new Set<(s: MonitorVolumeState) => void>();
+  // Persisting to disk on every drag frame would be dozens of writes/sec; the
+  // graph apply is immediate (smooth audio) but the settings write is debounced
+  // so only the settled level lands on disk.
+  let volSaveTimer: number | undefined;
+  let volSavePending = false;
+  const flushVolumeSave = (): void => {
+    window.clearTimeout(volSaveTimer);
+    if (!volSavePending) return;
+    volSavePending = false;
+    void updateSettings({ monitorVolume: volState.level });
+  };
+  const applyVolume = (next: MonitorVolumeState): void => {
+    volState = next;
+    graph.setMonitorVolume(next.level);
+    volSavePending = true;
+    window.clearTimeout(volSaveTimer);
+    volSaveTimer = window.setTimeout(flushVolumeSave, 300);
+    for (const fn of volSubs) fn(next);
+  };
+  const volume = {
+    get: (): MonitorVolumeState => volState,
+    setLevel: (v: number): void => applyVolume(setMonitorLevel(volState, v)),
+    toggleMute: (): void => applyVolume(toggleMonitorMute(volState)),
+    subscribe(fn: (s: MonitorVolumeState) => void): () => void {
+      volSubs.add(fn);
+      return () => volSubs.delete(fn);
+    },
+  };
+
   // Refit the stage when the project canvas w/h changes (resolution adoption,
   // canvas settings). Cheap: compares two numbers per project change.
   let stageW = session.project.timeline.width;
@@ -179,6 +234,7 @@ export async function mountEditor(
     getSelected: () => selection.get(),
     snapEnabled: () => snapOn,
     onClipMenu: (clip, clientX, clientY) => openClipMenu(clip, clientX, clientY),
+    onLaneMenu: (track, clientX, clientY) => openLaneMenu(track, clientX, clientY),
   });
 
   const inspector = mountInspector($("#ed-inspector"), {
@@ -212,6 +268,7 @@ export async function mountEditor(
   const theater = mountTheater({
     engine,
     container: $("#ed-stage"),
+    volume,
     onChange: (on) => {
       const btn = $("#tr-fullscreen");
       btn.innerHTML = icon(on ? "fullscreenExit" : "fullscreen", 14);
@@ -360,6 +417,96 @@ export async function mountEditor(
     ]);
   }
 
+  // The lane's NLE label (e.g. "V2"), matching render.ts laneLabels naming.
+  function laneLabelOf(track: Track): string {
+    const p = session.project;
+    const i = p.timeline.tracks.findIndex((t) => t.id === track.id);
+    return laneLabels(p)[i] ?? track.name;
+  }
+
+  // Remove a track and keep selection/overlay consistent: if the deleted track
+  // held the selected clip, clear the selection first (same idiom as undo/redo).
+  function deleteLayer(trackId: string, force: boolean): void {
+    const sel = selectedClipId();
+    if (sel && findClip(session.project, sel)?.track.id === trackId) select(null);
+    commit((p) => removeTrack(p, trackId, force ? { force: true } : undefined));
+  }
+
+  // Right-click on a lane (no clip hit). One item "Delete layer VN" — disabled
+  // for the sole video layer; empty layers delete instantly, non-empty ones ask
+  // to confirm first (undoable either way).
+  function openLaneMenu(track: Track, clientX: number, clientY: number): void {
+    const label = laneLabelOf(track);
+    const isSoleVideo = track.kind === "video" && videoTracks(session.project).length < 2;
+    showMenu(clientX, clientY, [
+      {
+        label: `Delete layer ${label}`,
+        danger: true,
+        disabled: isSoleVideo,
+        title: isSoleVideo ? "The last video layer can't be deleted" : undefined,
+        onSelect: () => {
+          const t = findTrack(session.project, track.id);
+          if (!t) return;
+          const n = t.clips.length;
+          if (n === 0) {
+            deleteLayer(track.id, false);
+          } else {
+            confirmDeleteLayer(label, n, () => deleteLayer(track.id, true));
+          }
+        },
+      },
+    ]);
+  }
+
+  // Destructive confirm for deleting a non-empty layer. Reuses the app modal
+  // pattern + trapTab (as in home.ts / generators.ts).
+  function confirmDeleteLayer(label: string, n: number, onConfirm: () => void): void {
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true" aria-label="Delete layer ${escapeHtml(label)}">
+        <div class="modal__header">Delete layer ${escapeHtml(label)}</div>
+        <div class="modal__body">
+          <div style="font-size:var(--fs-13);color:var(--text-2);line-height:1.5">Delete layer ${escapeHtml(label)} and its ${n === 1 ? "clip" : `${n} clips`}? This can be undone with Ctrl+Z.</div>
+        </div>
+        <div class="modal__footer">
+          <button class="btn" data-act="cancel">Cancel</button>
+          <button class="btn btn--danger" data-act="confirm">Delete</button>
+        </div>
+      </div>`;
+    document.body.appendChild(backdrop);
+
+    const releaseTrap = trapTab(backdrop);
+    let closed = false;
+    const close = (): void => {
+      if (closed) return;
+      closed = true;
+      releaseTrap();
+      document.removeEventListener("keydown", onKey, true);
+      backdrop.remove();
+    };
+    const confirm = (): void => {
+      close();
+      onConfirm();
+    };
+    function onKey(e: KeyboardEvent): void {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        confirm();
+      }
+    }
+    document.addEventListener("keydown", onKey, true);
+    backdrop.addEventListener("pointerdown", (e) => {
+      if (e.target === backdrop) close();
+    });
+    backdrop.querySelector('[data-act="cancel"]')!.addEventListener("click", close);
+    backdrop.querySelector('[data-act="confirm"]')!.addEventListener("click", confirm);
+    requestAnimationFrame(() => backdrop.querySelector<HTMLButtonElement>('[data-act="confirm"]')!.focus());
+  }
+
   /* ---------------- transport ---------------- */
 
   const playBtn = $("#tr-play");
@@ -412,6 +559,66 @@ export async function mountEditor(
   $("#tr-speed").addEventListener("change", (e) => {
     engine.setPreviewSpeed(Number((e.target as HTMLSelectElement).value));
   });
+
+  /* ---------------- monitor volume (transport flyout) ---------------- */
+
+  // Hover the wrapper to reveal the slider; the button itself only toggles mute.
+  // Keeping those two gestures separate means a click never fights the flyout.
+  const volWrap = $("#tr-volume");
+  const volBtn = $<HTMLButtonElement>("#tr-volume-btn");
+  const volFlyout = $("#tr-volume-flyout");
+  const volSlider = $<HTMLInputElement>("#tr-volume-slider");
+
+  // Same idempotent-glyph discipline as the play button: swap the speaker <svg>
+  // only when it crosses the muted↔audible line, never on every drag frame, so a
+  // mouse-down that landed on the glyph still pairs with its mouse-up.
+  let volBtnMuted: boolean | null = null;
+  const reflectVolume = (s: MonitorVolumeState): void => {
+    const muted = s.level <= 0;
+    if (volBtnMuted !== muted) {
+      volBtnMuted = muted;
+      volBtn.innerHTML = icon(muted ? "mute" : "volume", 14);
+    }
+    // don't fight the user's own drag: only write the field they aren't holding
+    if (document.activeElement !== volSlider) volSlider.value = String(s.level);
+  };
+  reflectVolume(volume.get());
+  const unVolume = volume.subscribe(reflectVolume);
+
+  // The flyout is open while the wrapper is hovered OR holds focus (keyboard
+  // reach: a Tab user can step from the speaker into the range input). Derived
+  // from both flags so blurring the speaker after a mute click — needed so Space
+  // stays owned by the ShortcutManager — doesn't hide a still-hovered slider.
+  let volHover = false;
+  let volFocus = false;
+  const syncFlyout = (): void => {
+    const open = volHover || volFocus;
+    volFlyout.hidden = !open;
+    volBtn.setAttribute("aria-expanded", String(open));
+  };
+  volWrap.addEventListener("pointerenter", () => {
+    volHover = true;
+    syncFlyout();
+  });
+  volWrap.addEventListener("pointerleave", () => {
+    volHover = false;
+    syncFlyout();
+  });
+  volWrap.addEventListener("focusin", () => {
+    volFocus = true;
+    syncFlyout();
+  });
+  volWrap.addEventListener("focusout", (e) => {
+    if (volWrap.contains(e.relatedTarget as Node)) return;
+    volFocus = false;
+    syncFlyout();
+  });
+  volSlider.addEventListener("input", () => volume.setLevel(Number(volSlider.value)));
+  volBtn.addEventListener("click", () => {
+    volume.toggleMute();
+    volBtn.blur();
+  });
+
   loopBtn.addEventListener("click", () => {
     engine.loop = !engine.loop;
     loopBtn.classList.toggle("btn--on", engine.loop);
@@ -499,10 +706,25 @@ export async function mountEditor(
     session.saveState.subscribe((s) => {
       const badge = $("#ed-save");
       badge.classList.toggle("editor__savestate--error", s === "error");
-      badge.textContent =
-        s === "saved" ? "Saved" : s === "saving" ? "Saving" : s === "dirty" ? "Edited" : "Save failed";
+      // A quick-view (temp) session isn't a real project on disk yet — its
+      // autosaves land in the scratch dir. Show "Temporary" so Save-failed is
+      // still surfaced but "Saved"/"Edited" don't imply a kept project.
+      badge.textContent = temp
+        ? s === "error"
+          ? "Save failed"
+          : "Temporary"
+        : s === "saved"
+          ? "Saved"
+          : s === "saving"
+            ? "Saving"
+            : s === "dirty"
+              ? "Edited"
+              : "Save failed";
     }),
   ];
+  // Reflect the temp badge immediately: the initial state is "saved", which
+  // won't fire the subscription, so the hard-coded "Saved" would otherwise show.
+  if (temp) $("#ed-save").textContent = "Temporary";
   renderMedia();
 
   /* ---------------- media bin: generators, placement, drag & drop ---------------- */
@@ -767,8 +989,68 @@ export async function mountEditor(
     media.ensureAll(session.project);
   }
 
-  $("#ed-home").addEventListener("click", () => navigate({ view: "home" }));
-  $("#ed-settings").addEventListener("click", () => navigate({ view: "settings" }));
+  // Promote a live quick-view (temp) session to a permanent project. This is the
+  // "keep it" gesture shared by every in-app navigation away from the editor
+  // (Back, Ctrl+W, the Settings gear): save the project permanently to
+  // Documents\Taroting (which runs the standard recents + thumbnail upsert). The
+  // temp scratch file is left for startup cleanup. Only closing the app discards.
+  //
+  // Save-loop until stable: `session.project` is `store.get()`, and EVERY mutation
+  // path (commit/replace/undo/redo and autosave's touchModified stamp) swaps the
+  // store reference (see core/session.ts), so an edit landing between our read and
+  // the save's completion changes the reference. We re-save until the reference we
+  // saved still matches the current one — otherwise that late edit would live only
+  // in the doomed temp file (lost-update). `keeping` guards BOTH the entry points
+  // below (Back/Ctrl+W and the gear) against re-entrancy while an await is pending.
+  let keeping = false;
+  async function keepTempProject(): Promise<void> {
+    const permPath = await ipc.newProjectPath(session.project.name);
+    let snap: typeof session.project;
+    do {
+      snap = session.project;
+      await ipc.saveProject(permPath, snap);
+    } while (snap !== session.project);
+  }
+
+  // Back to home. For a temp session, keep it first (see keepTempProject).
+  async function goHome(): Promise<void> {
+    if (!temp) {
+      navigate({ view: "home" });
+      return;
+    }
+    if (keeping) return;
+    keeping = true;
+    try {
+      await keepTempProject();
+    } catch (e) {
+      keeping = false;
+      toast.error(`Couldn't save this project: ${describeError(e)}`);
+      return; // stay in the editor so the work isn't lost silently
+    }
+    navigate({ view: "home" });
+  }
+
+  // Settings gear: a temp session must be promoted before navigating away, or the
+  // editor's dispose would flush edits only to the doomed temp path (silent loss).
+  async function goSettings(): Promise<void> {
+    if (!temp) {
+      navigate({ view: "settings" });
+      return;
+    }
+    if (keeping) return;
+    keeping = true;
+    try {
+      await keepTempProject();
+    } catch (e) {
+      keeping = false;
+      toast.error(`Couldn't save this project: ${describeError(e)}`);
+      return; // stay in the editor so the work isn't lost silently
+    }
+    navigate({ view: "settings" });
+  }
+
+  $("#ed-home").addEventListener("click", () => void goHome());
+  $("#ed-settings").addEventListener("click", () => void goSettings());
   $("#ed-export").addEventListener("click", () => openExportDialog({ session }));
   $("#ed-import").addEventListener("click", () => {
     void pickMediaFiles().then((files) => {
@@ -868,7 +1150,7 @@ export async function mountEditor(
   shortcuts.on("toggleLoop", () => loopBtn.click());
   shortcuts.on("addMarker", addMarker);
   shortcuts.on("export", () => openExportDialog({ session }));
-  shortcuts.on("goHome", () => navigate({ view: "home" }));
+  shortcuts.on("goHome", () => void goHome());
   shortcuts.on("fullscreen", () => theater.toggle());
   shortcuts.attach();
 
@@ -902,6 +1184,8 @@ export async function mountEditor(
       unsubSettings();
       unTick();
       unGraphTick();
+      unVolume();
+      flushVolumeSave();
       unRefit();
       unName();
       if (dragCleanup) dragCleanup();
