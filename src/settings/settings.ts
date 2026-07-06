@@ -218,7 +218,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
           "settings-temp-open",
           "Quick view from File Explorer",
           s.tempOpenWith,
-          "Media opened from File Explorer becomes a temporary project. Press Back in the editor to keep it",
+          "Media opened from File Explorer becomes a temporary project. You choose whether to keep it when you leave",
         )}
       </section>`;
   }

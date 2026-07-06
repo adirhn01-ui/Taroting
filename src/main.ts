@@ -120,8 +120,9 @@ async function routeOpenPath(path: string): Promise<void> {
   const { createProject, importMediaAsClip } = await import("./core/project");
   const { settingsStore } = await import("./core/session");
   // Quick-view: with the setting on, an open-with media file becomes a
-  // temporary project in the temp dir (never in recents) until the user presses
-  // Back in the editor. Off → the classic permanent flow, byte-identical.
+  // temporary project in the temp dir (never in recents) until the user chooses
+  // to keep it when leaving the editor. Off → the classic permanent flow,
+  // byte-identical.
   const temp = settingsStore.get().tempOpenWith;
   try {
     const projectPath = temp

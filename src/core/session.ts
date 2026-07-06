@@ -159,9 +159,21 @@ export class ProjectSession {
   async dispose(): Promise<void> {
     window.clearTimeout(this.debounceTimer);
     window.clearInterval(this.intervalTimer);
-    if (this.saveState.get() !== "saved") {
+    if (!this.disposed && this.saveState.get() !== "saved") {
       await this.save();
     }
+    this.disposed = true;
+  }
+
+  /** Abandon this session WITHOUT flushing: cancel timers and mark disposed so
+   *  any in-flight or scheduled autosave becomes a no-op. Used by the quick-view
+   *  "Discard" gesture, where the temp file is deleted right after — a dispose
+   *  flush (which targets that temp path) would otherwise resurrect it. Setting
+   *  `disposed` makes save() short-circuit, so the later dispose() also skips
+   *  its flush. Idempotent. */
+  discard(): void {
+    window.clearTimeout(this.debounceTimer);
+    window.clearInterval(this.intervalTimer);
     this.disposed = true;
   }
 }

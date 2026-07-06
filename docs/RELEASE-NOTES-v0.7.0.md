@@ -6,7 +6,7 @@ Four new features. Free and open source, as always.
 
 - **Volume control** — a speaker button with a slider in the transport bar and in fullscreen playback. It adjusts your listening level only (per-clip audio and exports are untouched), remembers your last level, and click-to-mute restores the previous volume.
 - **Select projects on the home screen** — enter Select mode, pick as many projects as you want, and delete them together after a clear confirmation. Esc leaves the mode; Select all respects your current search filter.
-- **Quick view from File Explorer** (Settings, off by default) — with it on, media opened from File Explorer becomes a *temporary* project so you can use Taroting as a quick viewer without filling your library. Press Back in the editor to keep the project permanently; otherwise it leaves no trace.
+- **Quick view from File Explorer** (Settings, off by default) — with it on, media opened from File Explorer becomes a *temporary* project so you can use Taroting as a quick viewer without filling your library. When you leave the editor, Taroting asks whether to keep the project or discard it — nothing is saved unless you choose to keep it.
 - **Delete layers** — right-click a lane to remove it. Empty layers delete instantly; layers with clips ask first. Fully undoable with Ctrl+Z.
 
 ## Fixed

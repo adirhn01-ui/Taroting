@@ -990,19 +990,17 @@ export async function mountEditor(
   }
 
   // Promote a live quick-view (temp) session to a permanent project. This is the
-  // "keep it" gesture shared by every in-app navigation away from the editor
-  // (Back, Ctrl+W, the Settings gear): save the project permanently to
+  // "Keep project" gesture from the leave-the-editor confirmation (shared by Back,
+  // Ctrl+W and the Settings gear): save the project permanently to
   // Documents\Taroting (which runs the standard recents + thumbnail upsert). The
-  // temp scratch file is left for startup cleanup. Only closing the app discards.
+  // temp scratch file is left for startup cleanup.
   //
   // Save-loop until stable: `session.project` is `store.get()`, and EVERY mutation
   // path (commit/replace/undo/redo and autosave's touchModified stamp) swaps the
   // store reference (see core/session.ts), so an edit landing between our read and
   // the save's completion changes the reference. We re-save until the reference we
   // saved still matches the current one — otherwise that late edit would live only
-  // in the doomed temp file (lost-update). `keeping` guards BOTH the entry points
-  // below (Back/Ctrl+W and the gear) against re-entrancy while an await is pending.
-  let keeping = false;
+  // in the doomed temp file (lost-update).
   async function keepTempProject(): Promise<void> {
     const permPath = await ipc.newProjectPath(session.project.name);
     let snap: typeof session.project;
@@ -1012,45 +1010,127 @@ export async function mountEditor(
     } while (snap !== session.project);
   }
 
-  // Back to home. For a temp session, keep it first (see keepTempProject).
-  async function goHome(): Promise<void> {
+  // Best-effort discard of the temp scratch file. `session.discard()` runs FIRST
+  // so the editor's dispose flush (which targets this same temp path) can't
+  // resurrect the file after we delete it. deleteProject fail-softs: a locked
+  // file is caught by startup cleanup. The media original is never touched — only
+  // the throwaway .trt (+ its .bak) go. No recents entry exists for a temp path,
+  // so deleteProject's recents-retain is a harmless no-op.
+  async function discardTempProject(): Promise<void> {
+    session.discard();
+    try {
+      await ipc.deleteProject(session.path);
+    } catch {
+      // Fail-soft: the temp file stays for the next startup's temp-dir sweep.
+    }
+  }
+
+  // `keeping` guards the WHOLE leave lifecycle for a temp session — from opening
+  // the confirmation to its resolution. It blocks a second modal (Back then gear
+  // while one is open does nothing) and any double promotion/discard. Cleared on
+  // every close path: cancel, keep (success or error → stay), and discard.
+  let keeping = false;
+
+  // Confirm leaving a temp quick-view: Keep promotes then navigates, Discard
+  // deletes then navigates, Cancel stays put with no side effects. Reuses the app
+  // modal pattern + trapTab (as in the delete-layer / home delete dialogs).
+  function confirmLeaveTemp(dest: () => void): void {
+    if (keeping) return;
+    keeping = true;
+
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+    backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true" aria-label="Keep temporary project?">
+        <div class="modal__header"><span>Keep temporary project?</span><button class="btn btn--ghost btn--icon btn--sm" data-act="cancel" title="Cancel" aria-label="Cancel">${icon("x", 14)}</button></div>
+        <div class="modal__body">
+          <div style="font-size:var(--fs-13);color:var(--text-2);line-height:1.5">This project was opened as a quick view and isn't in your library yet. Keep it, or discard it? Discarding removes only this temporary copy — your media file is untouched.</div>
+        </div>
+        <div class="modal__footer">
+          <button class="btn" data-act="discard">Discard</button>
+          <button class="btn btn--primary" data-act="keep">Keep project</button>
+        </div>
+      </div>`;
+    document.body.appendChild(backdrop);
+
+    const releaseTrap = trapTab(backdrop);
+    let closed = false;
+    // Cancel path: tear the modal down and release the lifecycle guard so a later
+    // Back/gear can re-open it. Nothing is saved or deleted — stay in the editor.
+    const close = (): void => {
+      if (closed) return;
+      closed = true;
+      releaseTrap();
+      document.removeEventListener("keydown", onKey, true);
+      backdrop.remove();
+      keeping = false;
+    };
+    // Commit path (keep/discard): tear down the modal but KEEP the guard held —
+    // the async promote/delete is still in flight and must not be re-entered.
+    const dismiss = (): void => {
+      if (closed) return;
+      closed = true;
+      releaseTrap();
+      document.removeEventListener("keydown", onKey, true);
+      backdrop.remove();
+    };
+    const keep = async (): Promise<void> => {
+      dismiss();
+      try {
+        await keepTempProject();
+      } catch (e) {
+        keeping = false;
+        toast.error(`Couldn't save this project: ${describeError(e)}`);
+        return; // stay in the editor so the work isn't lost silently
+      }
+      dest();
+    };
+    const discard = async (): Promise<void> => {
+      dismiss();
+      await discardTempProject();
+      dest();
+    };
+    function onKey(e: KeyboardEvent): void {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close();
+      }
+    }
+    document.addEventListener("keydown", onKey, true);
+    backdrop.addEventListener("pointerdown", (e) => {
+      if (e.target === backdrop) close();
+    });
+    backdrop.querySelector('[data-act="cancel"]')!.addEventListener("click", close);
+    backdrop.querySelector('[data-act="keep"]')!.addEventListener("click", () => void keep());
+    backdrop.querySelector('[data-act="discard"]')!.addEventListener("click", () => void discard());
+    requestAnimationFrame(() =>
+      backdrop.querySelector<HTMLButtonElement>('[data-act="keep"]')!.focus(),
+    );
+  }
+
+  // Back to home / Ctrl+W. For a temp session, confirm keep-or-discard first;
+  // both outcomes navigate home, Cancel stays. Non-temp: straight navigate.
+  function goHome(): void {
     if (!temp) {
       navigate({ view: "home" });
       return;
     }
-    if (keeping) return;
-    keeping = true;
-    try {
-      await keepTempProject();
-    } catch (e) {
-      keeping = false;
-      toast.error(`Couldn't save this project: ${describeError(e)}`);
-      return; // stay in the editor so the work isn't lost silently
-    }
-    navigate({ view: "home" });
+    confirmLeaveTemp(() => navigate({ view: "home" }));
   }
 
-  // Settings gear: a temp session must be promoted before navigating away, or the
-  // editor's dispose would flush edits only to the doomed temp path (silent loss).
-  async function goSettings(): Promise<void> {
+  // Settings gear: a temp session must be resolved (kept or discarded) before
+  // navigating away, or the editor's dispose would flush edits only to the doomed
+  // temp path (silent loss). Non-temp: straight navigate.
+  function goSettings(): void {
     if (!temp) {
       navigate({ view: "settings" });
       return;
     }
-    if (keeping) return;
-    keeping = true;
-    try {
-      await keepTempProject();
-    } catch (e) {
-      keeping = false;
-      toast.error(`Couldn't save this project: ${describeError(e)}`);
-      return; // stay in the editor so the work isn't lost silently
-    }
-    navigate({ view: "settings" });
+    confirmLeaveTemp(() => navigate({ view: "settings" }));
   }
 
-  $("#ed-home").addEventListener("click", () => void goHome());
-  $("#ed-settings").addEventListener("click", () => void goSettings());
+  $("#ed-home").addEventListener("click", () => goHome());
+  $("#ed-settings").addEventListener("click", () => goSettings());
   $("#ed-export").addEventListener("click", () => openExportDialog({ session }));
   $("#ed-import").addEventListener("click", () => {
     void pickMediaFiles().then((files) => {
@@ -1150,7 +1230,7 @@ export async function mountEditor(
   shortcuts.on("toggleLoop", () => loopBtn.click());
   shortcuts.on("addMarker", addMarker);
   shortcuts.on("export", () => openExportDialog({ session }));
-  shortcuts.on("goHome", () => void goHome());
+  shortcuts.on("goHome", () => goHome());
   shortcuts.on("fullscreen", () => theater.toggle());
   shortcuts.attach();
 
