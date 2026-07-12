@@ -4,7 +4,7 @@
 // normalize gain and fades are gain envelopes (sample-accurate ramps);
 // audio-track elements are drift-corrected against the engine clock.
 
-import { clipEnd, locate, sourceTime } from "../../core/time";
+import { clipEnd, locate, sourceTime, timelineTime } from "../../core/time";
 import type { Clip, ProjectFile, Track } from "../../core/types";
 import type { MediaManager } from "../media/media";
 import type { Scheduler } from "./scheduler";
@@ -13,6 +13,14 @@ const POOL_SIZE = 6;
 const LOOKAHEAD_SEC = 1.5;
 const HARD_RESYNC_SEC = 0.12;
 const NUDGE_SEC = 0.04;
+// A video element's active gain envelope is re-armed once its real position
+// drifts this far from where its currently-scheduled (time-absolute) envelope
+// assumes it to be. Any manual seek / ruler scrub repositions the element off
+// its playback trajectory; this catches jumps the 0.3s discontinuity heuristic
+// misses. Kept just above HARD_RESYNC_SEC so a legitimately drift-corrected
+// slaved layer (bounded to <=HARD_RESYNC_SEC) never triggers a spurious re-arm,
+// i.e. zero extra work on healthy continuous playback.
+const SEEK_REARM_SEC = 0.15;
 
 interface Voice {
   el: HTMLAudioElement;
@@ -73,6 +81,27 @@ export class AudioGraph {
   // one-shot per element; new layers appear over time). The WeakMap lets parked
   // elements be GC'd if a set is ever dropped.
   private videoGains = new WeakMap<HTMLVideoElement, GainNode>();
+  // Per video element: what its CURRENTLY-scheduled gain envelope assumes.
+  //  - clipId: which clip the envelope is for. Cleared (map entry deleted) when
+  //    the element is zeroed (goes inactive) so its NEXT activation always
+  //    re-arms — even on a tick with no discontinuity (fresh file load whose
+  //    element becomes ready a few ticks after play, a post-buffering readyState
+  //    blip, or an A/B double-buffer swap crossing a cut boundary).
+  //  - t0/ctx0: the timeline time and AudioContext time at which the envelope
+  //    was scheduled. The envelope is time-ABSOLUTE (breakpoints baked into ctx
+  //    time from that anchor), so it is only still valid while the element is
+  //    where continuous playback from (t0, ctx0) would put it. After ANY manual
+  //    seek / ruler scrub (even a sub-0.3s jump that is NOT a discontinuity, and
+  //    even one that keeps the element "ready" so it never drops out) the
+  //    element's real position diverges from that trajectory → stale envelope
+  //    (its fade/hold/zero breakpoints fire at the wrong ctx time, muting audio
+  //    that must stay full). syncVideoGain re-arms when that divergence exceeds
+  //    SEEK_REARM_SEC, catching every seek size the discontinuity heuristic and
+  //    the drop-out/re-enter dance miss. See syncVideoGain.
+  private videoEnv = new WeakMap<
+    HTMLVideoElement,
+    { clipId: string; t0: number; ctx0: number }
+  >();
   private lastT = -1;
   private lastPlaying = false;
   private lastProject: ProjectFile | null = null;
@@ -179,11 +208,40 @@ export class AudioGraph {
       if (!gain) continue; // never attached → silent already, no source to make
       gain.gain.cancelScheduledValues(this.ctx.currentTime);
       gain.gain.setValueAtTime(0, this.ctx.currentTime);
+      // it went inactive — force its next activation to re-arm the envelope.
+      this.videoEnv.delete(el);
     }
     for (const info of infos) {
       const gain = this.videoGain(info.el);
-      if (discontinuity) {
+      // Re-arm the envelope when it is not provably current for this element's
+      // ACTUAL state:
+      //  (1) discontinuity — seek >0.3s / pause↔play / project change;
+      //  (2) the scheduled envelope is for a DIFFERENT clip (or none yet) — the
+      //      element just became active/ready, or an A/B swap crossed a cut;
+      //  (3) the element's real position has diverged from where its scheduled
+      //      (time-absolute) envelope assumes it to be — i.e. a manual seek /
+      //      ruler scrub of ANY size (including sub-0.3s jumps that are not a
+      //      discontinuity and that keep the element "ready" so it never drops
+      //      out and re-enters). Without (3) a stale envelope's hold/zero/fade
+      //      breakpoints fire at the wrong ctx time and the audio mutes — the
+      //      user-reported "scrub the playhead and it goes mute" bug.
+      const env = this.videoEnv.get(info.el);
+      let rearm = discontinuity || !env || env.clipId !== info.clip.id;
+      if (!rearm && env) {
+        // where continuous playback from the schedule anchor would put the
+        // element now, vs. where it actually is (derived from currentTime).
+        const speed = Math.max(0.25, previewSpeed);
+        const expected = env.t0 + (this.ctx.currentTime - env.ctx0) * speed;
+        const actual = timelineTime(info.clip, info.el.currentTime);
+        if (Math.abs(actual - expected) > SEEK_REARM_SEC) rearm = true;
+      }
+      if (rearm) {
         this.scheduleEnvelope(gain, info.clip, info.track, t, previewSpeed);
+        this.videoEnv.set(info.el, {
+          clipId: info.clip.id,
+          t0: t,
+          ctx0: this.ctx.currentTime,
+        });
       }
     }
   }
@@ -333,6 +391,68 @@ export class AudioGraph {
   /** Reset the drift high-water mark (call at the start of a soak test). */
   resetDriftStats(): void {
     this.maxDrift = 0;
+  }
+
+  /* ---------------- dev/E2E-only measurement hooks ---------------- */
+  // These allocate nothing and are never referenced by production code paths;
+  // the analyser is created lazily on first harness call, so a shipped build
+  // that never calls them pays exactly zero cost.
+
+  private devTap: AnalyserNode | null = null;
+
+  /** DEV ONLY: an AnalyserNode tapping the master bus (post monitor gain), so a
+   *  test can measure REAL output energy at the point that feeds the speakers.
+   *  Fan-out only (never wired to destination) — it cannot alter audible output. */
+  devMasterAnalyser(): AnalyserNode {
+    if (!this.devTap) {
+      const a = this.ctx.createAnalyser();
+      a.fftSize = 2048;
+      this.master.connect(a);
+      this.devTap = a;
+    }
+    return this.devTap;
+  }
+
+  /** DEV ONLY: root-mean-square amplitude of the current master-bus quantum
+   *  (0 when silent). Requires the AudioContext to be running. */
+  devMasterRms(): number {
+    const a = this.devMasterAnalyser();
+    const buf = new Float32Array(a.fftSize);
+    a.getFloatTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i]! * buf[i]!;
+    return Math.sqrt(sum / buf.length);
+  }
+
+  /** DEV ONLY: resume the AudioContext and report whether it actually runs
+   *  (headless harnesses may lack the user activation autoplay needs). */
+  async devEnsureRunning(): Promise<boolean> {
+    // ctx.state is a live getter (resume() can flip it), so read it through a
+    // helper to keep TS from narrowing "running" out of later checks.
+    const running = (): boolean => String(this.ctx.state) === "running";
+    for (let i = 0; i < 20; i++) {
+      if (running()) return true;
+      try {
+        await this.ctx.resume();
+      } catch {
+        /* no user activation — fall through */
+      }
+      if (running()) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return running();
+  }
+
+  /** DEV ONLY: is this video element routed through the WebAudio graph (its
+   *  embedded audio goes through a per-element GainNode, NOT the default output)? */
+  devVideoWired(el: HTMLVideoElement): boolean {
+    return this.videoGains.has(el);
+  }
+
+  /** DEV ONLY: the live scheduled gain value on a wired video element (the
+   *  envelope output feeding the master bus); 0 if the element is not wired. */
+  devVideoGainValue(el: HTMLVideoElement): number {
+    return this.videoGains.get(el)?.gain.value ?? 0;
   }
 
   dispose(): void {

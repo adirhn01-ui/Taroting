@@ -654,6 +654,249 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       return `empty layer add/delete (+1→${before}); force-remove drops 1 clip + clean invariants; undo x1 restored track+clip`;
     });
 
+    await test("embedded-audio", async () => {
+      // The user-reported v0.7.0 bug: a plain H.264+AAC video (Decision::Direct)
+      // played with NO audio, or audio that "cuts at parts". counter_h264.mp4 is
+      // deliberately video-only, so this path had ZERO coverage. counter_audio_
+      // h264.mp4 is the same burnt-in counter WITH a muxed 440Hz AAC tone.
+      const graph = dev.audioGraph;
+      const scheduler = (dev as unknown as { scheduler: import("../editor/playback/scheduler").Scheduler }).scheduler;
+      const { splitClip, findClip } = await import("../core/project");
+      const { clipEnd, frameCenter } = await import("../core/time");
+
+      const info = await ipc.probeMedia(`${fixturesDir}\\counter_audio_h264.mp4`);
+      assert(info.hasAudio, "fixture counter_audio_h264.mp4 must carry an audio stream");
+
+      // importMediaAsClip appends onto the top video track AFTER the 60s video-
+      // only counter, so this clip owns [60, 80] alone — tone.mp3 ends at 30s and
+      // the counter carries no audio, so ALL master-bus energy in [60,80] is this
+      // clip's embedded audio (clean attribution for the RMS probes).
+      let clipId = "";
+      session.commit((p) => {
+        const r = importMediaAsClip(p, info);
+        clipId = r.clipId;
+        return r.project;
+      });
+      engine.refresh();
+      // A raw session.commit doesn't run the editor's import side effects, so
+      // kick media preparation explicitly (Direct plan → ready), as the
+      // generated-media test does.
+      media.ensureAll(session.project);
+      const mediaId = session.project.media[session.project.media.length - 1]!.id;
+      const clipStart = findClip(session.project, clipId)!.clip.timelineStart;
+      assert(clipStart > 59, `audio clip should append after the 60s counter, got start ${clipStart}`);
+      await waitFor(
+        () => { const s = media.status.get()[mediaId]; return s && s.state === "ready" ? s : null; },
+        15_000,
+        "counter_audio media ready",
+      );
+
+      // Split 5s in so a CONTINUOUS play crosses a real cut boundary (the A/B
+      // double-buffer swap) — the exact path the "cuts at parts" symptom rides.
+      const cut = clipStart + 5;
+      session.commit((p) => splitClip(p, clipId, cut).project);
+      engine.refresh();
+
+      // Headless harnesses may lack the user activation the autoplay policy wants;
+      // if the AudioContext won't run, the master-bus RMS can't be measured, so we
+      // fall back to the element's live gain-envelope value (which is the direct
+      // routing signal for this bug and is deterministic either way).
+      const analyserRunning = await graph.devEnsureRunning();
+
+      // Wait (briefly) for an active ready video over the playhead. A fresh
+      // seek / ruler scrub leaves the element re-buffering for a few frames
+      // (readyState < 2 → it drops out of activeVideoInfos), so poll instead of
+      // asserting on the first frame. This does NOT mask the mute bug: the
+      // reproduction mutes via a STALE envelope while the element stays ready
+      // (gain locked at 0), so `assertAudible`'s gain check still catches it.
+      const waitActiveEl = async (): Promise<HTMLVideoElement> => {
+        let el: HTMLVideoElement | null = null;
+        const deadline = performance.now() + 3000;
+        while (performance.now() < deadline) {
+          el = scheduler.activeVideoInfos()[0]?.el ?? null;
+          if (el) break;
+          await sleep(30);
+        }
+        assert(el !== null, "no active video element over the audio clip");
+        return el!;
+      };
+      // Read peak master RMS + the active element's routing over a short window.
+      const measure = async (ms: number): Promise<{ rms: number; gain: number; wired: boolean }> => {
+        const el = await waitActiveEl();
+        let rms = 0;
+        const end = performance.now() + ms;
+        while (performance.now() < end) {
+          rms = Math.max(rms, graph.devMasterRms());
+          await sleep(30);
+        }
+        return { rms, gain: graph.devVideoGainValue(el), wired: graph.devVideoWired(el) };
+      };
+      const assertAudible = (m: { rms: number; gain: number; wired: boolean }, where: string): void => {
+        assert(m.wired, `${where}: active <video> is NOT routed through the audio graph`);
+        assert(m.gain > 0.5, `${where}: gain envelope pinned at ${m.gain.toFixed(3)} (want ~1) — audio gated OFF`);
+        if (analyserRunning) {
+          assert(m.rms > 0.02, `${where}: master-bus RMS ${m.rms.toFixed(4)} ≈ 0 — no real audio at the speakers`);
+        }
+      };
+
+      try {
+        // 1) INSIDE part1 from a fresh play (the discontinuity path). Positive
+        //    control: audible with AND without the fix — proves the rig works.
+        engine.seek(clipStart + 2);
+        await sleep(200);
+        engine.play();
+        assertAudible(await measure(400), "start-of-clip");
+
+        // 2) THE REGRESSION: play continuously across the cut into part2 via the
+        //    A/B swap (no seek → no discontinuity). The old build never re-armed
+        //    the newly-active slot's envelope, so its gain stayed pinned at 0 even
+        //    though its fresh MediaElementSource had already stolen the element's
+        //    audio off the default output → silence after the cut.
+        engine.seek(cut - 0.8);
+        await sleep(150);
+        if (!engine.playing) engine.play();
+        await sleep(2000);
+        assert(engine.time > cut + 0.6, `did not cross the cut (t=${engine.time.toFixed(2)}, cut=${cut.toFixed(2)})`);
+        assertAudible(await measure(400), "after-cut-boundary");
+
+        // 3) after a SEEK deep into part2 (discontinuity path again) — still audible.
+        engine.seek(cut + 6);
+        await sleep(250);
+        if (!engine.playing) engine.play();
+        assertAudible(await measure(400), "after-seek");
+
+        // ---- MANUAL SEEK / RULER SCRUB (the v0.7.1 user report: "I skip to
+        // certain frames manually / drag the red playhead and it cuts the audio
+        // and it doesn't come back / just goes mute"). These drive engine.seek
+        // the way the ruler does — to frame centers of arbitrary frames — with
+        // sub-0.3s jumps that are NOT discontinuities, so the old build's
+        // discontinuity heuristic and drop-out/re-enter dance both miss the
+        // re-arm and a stale (time-absolute) envelope mutes audio that must
+        // stay full. part2 spans [cut, p2end]; model scrubs inside it.
+        const fps = session.project.timeline.fps;
+        const frameSec = fps.den / fps.num;
+        const part2 = ((): import("../core/types").Clip => {
+          for (const tr of session.project.timeline.tracks) {
+            for (const c of tr.clips) if (Math.abs(c.timelineStart - cut) < 1e-3) return c;
+          }
+          throw new Error("part2 clip (starting at the cut) not found");
+        })();
+        const p2end = clipEnd(part2);
+        // seek to the frame center of the frame containing `time` — exactly how
+        // the timeline ruler resolves a pointer position to a seek target.
+        const scrubTo = (time: number): void =>
+          engine.seek(frameCenter(Math.round(time / frameSec), fps));
+
+        // (a) small FORWARD manual seek (<0.3s, no discontinuity): audio must
+        //     recover to full within a few hundred ms.
+        engine.seek(cut + 4);
+        await sleep(200);
+        if (!engine.playing) engine.play();
+        await measure(120);
+        scrubTo(engine.time + 0.2);
+        assertAudible(await measure(400), "after-small-forward-seek");
+
+        // (b) backward-then-forward manual seek, both sub-0.3s.
+        scrubTo(engine.time - 0.24);
+        await sleep(120);
+        scrubTo(engine.time + 0.18);
+        assertAudible(await measure(400), "after-backward-then-forward-seek");
+
+        // (c) BOUNDARY-CROSSING scrub: land just inside part2, then scrub back
+        //     across the cut into part1 (<0.3s jump) — the active clip id
+        //     changes, so a fresh envelope must arm on the newly-active clip.
+        engine.seek(cut + 0.15);
+        await sleep(150);
+        if (!engine.playing) engine.play();
+        scrubTo(cut - 0.12); // lands in part1; playback then carries back over the cut
+        await sleep(200);
+        assertAudible(await measure(400), "after-cut-crossing-scrub");
+
+        // (d) RAPID SCRUB STORM, net-BACKWARD — the precise reproduction of the
+        //     user's "drag the playhead and it goes mute / doesn't come back".
+        //     Start ~0.6s before the clip end so the envelope scheduled at play()
+        //     bakes its "zero at clip end" only ~0.6s out in ctx time. Then
+        //     ruler-drag backward as a rapid SYNCHRONOUS burst (no awaits between
+        //     hops — a real pointermove drag fires many seeks within one input
+        //     turn), so NO rAF tick lands mid-burst: the element never drops out
+        //     of activeVideoInfos, so the old build's drop-out/re-enter re-arm
+        //     never fires. Small (<frame-ish) hops stay inside the just-played,
+        //     still-decoded buffer so the seek doesn't force a readyState dip.
+        //     Each hop is <0.3s (no discontinuity) and the clip id never changes,
+        //     so on the OLD build the play()-scheduled envelope is NEVER re-armed;
+        //     once ctx time passes its baked-in zero the gain is locked at 0 with
+        //     seconds of real audio still to play → sticky mute. The fix re-arms
+        //     the instant the element's real position diverges from that stale
+        //     envelope, so audio stays full.
+        engine.seek(p2end - 3);
+        await sleep(200);
+        if (!engine.playing) engine.play();
+        await measure(200); // play() scheduled the envelope from t≈p2end-3
+        // Play THROUGH [p2end-3, p2end-0.6] so that region is decoded+buffered;
+        // a later backward scrub into it then completes without the element
+        // dropping out of activeVideoInfos for more than a blip.
+        await waitFor(() => (engine.time > p2end - 0.7 ? true : null), 6000, "play through the buffer region");
+        // Ruler-drag backward through the just-played (buffered) region as a
+        // rapid SYNCHRONOUS burst: small <0.3s hops, no awaits between them (a
+        // real pointermove drag fires many seeks in one input turn). No rAF tick
+        // lands mid-burst and each hop stays in decoded data, so the element does
+        // NOT drop out — the OLD build's drop-out/re-enter re-arm never fires,
+        // and with no discontinuity and an unchanged clip id its envelope is
+        // never re-armed. Its baked-in "zero" (scheduled for a position AHEAD of
+        // where we now are) then fires early and the gain LOCKS at 0 with ~2s of
+        // real audio still to play → the user's "it cuts the audio". The fix
+        // re-arms the instant the element's real position diverges from that
+        // stale envelope, so the gain never cuts.
+        let sp = engine.time;
+        for (let i = 0; i < 22; i++) {
+          sp -= 0.09; // small, sub-discontinuity, stays inside the buffered region
+          scrubTo(sp); // synchronous — no await
+        }
+        await sleep(300);
+        assert(engine.playing, "playback must continue through the scrub storm");
+        assert(
+          engine.time < p2end - 0.3,
+          `backward scrub should have moved back, at ${engine.time.toFixed(2)} (p2end ${p2end.toFixed(2)})`,
+        );
+        // The "doesn't come back" guard: after the scrub the embedded audio must
+        // be full AND STAY full over a sustained window — a stale-envelope mute
+        // that never re-arms (the pre-fix failure mode) fails this. NOTE: the
+        // *transient* cut this bug can produce is intermittent in a headless
+        // WebView2 (a buffered backward seek may or may not dip readyState → the
+        // drop-out/re-enter re-arm sometimes masks it), so gating on the cut
+        // itself would be flaky; this asserts the deterministic steady state.
+        assertAudible(await measure(400), "after-backward-scrub-storm");
+        assertAudible(await measure(400), "after-backward-scrub-storm-sustained");
+
+        // (e) manual seek while PAUSED, then play — audio must be full on resume.
+        engine.pause();
+        await sleep(120);
+        engine.seek(cut + 8);
+        await sleep(150);
+        scrubTo(cut + 8.15); // tiny nudge while paused
+        await sleep(120);
+        engine.play();
+        assertAudible(await measure(400), "after-seek-while-paused");
+
+        // 4) PAUSED → the bus goes quiet (no element is producing samples).
+        engine.pause();
+        await sleep(200);
+        assert(scheduler.videoElements().every((v) => v.paused), "a <video> kept playing after pause");
+        let pausedRms = 0;
+        for (let i = 0; i < 8; i++) { pausedRms = Math.max(pausedRms, graph.devMasterRms()); await sleep(30); }
+        if (analyserRunning) assert(pausedRms < 0.01, `paused master-bus RMS ${pausedRms.toFixed(4)} not ≈ 0`);
+      } finally {
+        engine.pause();
+        session.undo(); // undo split
+        session.undo(); // undo import
+        engine.seek(0);
+        engine.refresh();
+        await sleep(40);
+      }
+
+      return `embedded video audio routed+audible at start, across the A/B cut boundary, after a seek, and after every manual seek / ruler scrub (small fwd, back-then-fwd, cut-crossing, rapid backward storm, seek-while-paused); silent when paused ${analyserRunning ? "(master-bus RMS measured)" : "(ctx suspended — gain-envelope measured)"}`;
+    });
+
     await test("playback-across-cut", async () => {
       // split at 8s, then play from 7.5 → should cross the cut and keep going
       const first = session.project.timeline.tracks[0]!.clips[0]!;

@@ -46,6 +46,23 @@ run(
   { cwd: "C:\\Windows\\Fonts" },
 );
 
+/* --- embedded-video audio: the same burnt-in counter WITH a muxed AAC tone
+   track, 20s @ 30fps. counter_h264.mp4 is deliberately video-only, so this is
+   the ONLY fixture exercising the embedded-video-audio path (plain H.264 + AAC,
+   Decision::Direct — the exact shape of the user's file). Same explicit-fontfile
+   gotcha as above; input 1 is a 440Hz sine auto-selected as the audio stream. */
+run(
+  "counter_audio_h264.mp4",
+  [
+    "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=20",
+    "-f", "lavfi", "-i", "sine=frequency=440:duration=20",
+    "-vf", "drawtext=fontfile=consola.ttf:text='%{frame_num}':fontsize=120:x=40:y=40:fontcolor=white:box=1:boxcolor=black@0.8",
+    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-g", "30",
+    "-c:a", "aac", "-shortest",
+  ],
+  { cwd: "C:\\Windows\\Fonts" },
+);
+
 /* --- playback decision matrix --- */
 const direct = run("direct_h264.mp4", [
   "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=30",
