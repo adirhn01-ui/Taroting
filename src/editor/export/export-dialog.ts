@@ -216,6 +216,8 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
 
   let exporting = false;
   let jobId: number | null = null;
+  /** Last whole-percent pushed to the taskbar; -1 = nothing pushed yet. */
+  let lastTaskbarPct = -1;
   let unlistenJobs: (() => void) | null = null;
   let estimateTimer: number | undefined;
 
@@ -663,6 +665,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
      ============================================================ */
 
   async function beginExport(target: string): Promise<void> {
+    lastTaskbarPct = -1;
     const spec: ExportSpec = {
       media: project.media,
       timeline: project.timeline,
@@ -723,7 +726,12 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     if (fillEl) fillEl.style.width = `${pct}%`;
     if (etaEl) etaEl.textContent = e.etaSec !== null ? formatEta(e.etaSec) : "";
     if (speedEl) speedEl.textContent = e.speed > 0 ? `${e.speed.toFixed(1)}×` : "";
-    void setTaskbarProgress(ratio);
+    // Progress events arrive ~10x/s but the taskbar only has 100 states, so
+    // most calls would be an IPC round-trip that sets the value it already has.
+    if (pct !== lastTaskbarPct) {
+      lastTaskbarPct = pct;
+      void setTaskbarProgress(ratio);
+    }
   }
 
   function handleDone(e: JobDone): void {

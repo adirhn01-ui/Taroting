@@ -217,6 +217,9 @@ impl Cache {
 
         entries.sort_by_key(|e| e.1); // oldest first
         let mut freed = 0u64;
+        // Collect the evicted entries and write the index ONCE at the end —
+        // a per-file serialize + blocking write under the mutex is needless.
+        let mut removed: Vec<String> = Vec::new();
         for (path, _, size) in entries {
             if total <= cap_bytes {
                 break;
@@ -237,11 +240,15 @@ impl Cache {
             if ok {
                 total = total.saturating_sub(size);
                 freed += size;
-                let rel = self.rel(&path);
-                let mut index = self.index.lock().unwrap();
-                index.entries.remove(&rel);
-                self.save_index(&index);
+                removed.push(self.rel(&path));
             }
+        }
+        if !removed.is_empty() {
+            let mut index = self.index.lock().unwrap();
+            for rel in &removed {
+                index.entries.remove(rel);
+            }
+            self.save_index(&index);
         }
         freed
     }

@@ -1,5 +1,8 @@
-// Timeline canvas renderer. Draws only the visible time range; zero
-// allocation in the hot path beyond Path2D construction for waveforms.
+// Timeline canvas renderer. Draws only the visible time range. The hot path is
+// kept allocation-light: lane geometry and lane labels are cached on the tracks
+// identity, and static clips cost nothing extra. What still allocates per draw:
+// the xOf closure, ruler tick labels, keyframe-diamond times for animated clips,
+// and Path2D construction for waveforms.
 
 import { fileStem } from "../../core/format";
 import { clipDuration, timelineTime } from "../../core/time";
@@ -87,20 +90,35 @@ export interface LaneRect {
   h: number;
 }
 
+/** Cached on the tracks array identity. Every project mutator in core/project.ts
+ *  rebuilds that array (map/filter/spread) and nothing mutates it in place, so
+ *  an identity hit means the geometry is unchanged. Callers treat the result as
+ *  read-only. Without this, a plain hover over the timeline allocated a fresh
+ *  array plus one LaneRect per track on every pointermove. */
+let laneLayoutCache: { tracks: Track[]; lanes: LaneRect[] } | null = null;
+
 export function laneLayout(project: ProjectFile): LaneRect[] {
+  const tracks = project.timeline.tracks;
+  if (laneLayoutCache && laneLayoutCache.tracks === tracks) return laneLayoutCache.lanes;
   const lanes: LaneRect[] = [];
   let y = RULER_H + LANE_GAP;
-  for (const track of project.timeline.tracks) {
+  for (const track of tracks) {
     const h = track.kind === "video" ? VIDEO_LANE_H : AUDIO_LANE_H;
     lanes.push({ track, y, h });
     y += h + LANE_GAP;
   }
+  laneLayoutCache = { tracks, lanes };
   return lanes;
 }
 
+/** The running `y` after laneLayout's loop, computed without building the
+ *  array — this runs once per rendered frame and only needs the scalar. */
 export function totalLanesHeight(project: ProjectFile): number {
-  const last = laneLayout(project).at(-1);
-  return last ? last.y + last.h + LANE_GAP : RULER_H + LANE_GAP;
+  let y = RULER_H + LANE_GAP;
+  for (const track of project.timeline.tracks) {
+    y += (track.kind === "video" ? VIDEO_LANE_H : AUDIO_LANE_H) + LANE_GAP;
+  }
+  return y;
 }
 
 export interface TimelineColors {

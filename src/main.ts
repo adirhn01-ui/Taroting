@@ -2,10 +2,13 @@ import "./style/tokens.css";
 import "./style/base.css";
 import "./style/components.css";
 import { fileExt, fileStem } from "./core/format";
+import { describeError, inTauri, ipc, onOpenPath } from "./core/ipc";
 import { navigate, setNavigator, type Route } from "./core/nav";
-import { initSettings } from "./core/session";
+import { createProject, importMediaAsClip } from "./core/project";
+import { initSettings, settingsStore } from "./core/session";
 import { MEDIA_FILE_EXTENSIONS } from "./core/types";
 import { mountHome } from "./home/home";
+import { toast } from "./ui/toast";
 
 // Suppress WebView2's native context menu everywhere except editable text
 // fields (which keep native copy/paste). Our own contextmenu handlers still
@@ -95,8 +98,8 @@ function normalizePath(p: string): string {
 }
 function tempProjectsDirPrefix(): Promise<string> {
   if (!tempDirPrefix) {
-    tempDirPrefix = import("./core/ipc")
-      .then(({ ipc }) => ipc.tempProjectsDir())
+    tempDirPrefix = ipc
+      .tempProjectsDir()
       .then((dir) => (dir ? normalizePath(dir) : ""))
       .catch(() => "");
   }
@@ -116,9 +119,6 @@ async function routeOpenPath(path: string): Promise<void> {
     return;
   }
   if (!MEDIA_FILE_EXTENSIONS.has(ext)) return; // unknown type: ignore
-  const { ipc, describeError } = await import("./core/ipc");
-  const { createProject, importMediaAsClip } = await import("./core/project");
-  const { settingsStore } = await import("./core/session");
   // Quick-view: with the setting on, an open-with media file becomes a
   // temporary project in the temp dir (never in recents) until the user chooses
   // to keep it when leaving the editor. Off → the classic permanent flow,
@@ -134,7 +134,6 @@ async function routeOpenPath(path: string): Promise<void> {
     await ipc.saveProject(projectPath, project);
     navigate(temp ? { view: "editor", projectPath, temp: true } : { view: "editor", projectPath });
   } catch (e) {
-    const { toast } = await import("./ui/toast");
     toast.error(describeError(e));
   }
 }
@@ -145,7 +144,6 @@ function enqueueOpen(path: string): void {
 
 void (async () => {
   await initSettings();
-  const { ipc, onOpenPath } = await import("./core/ipc");
   // Atomically drain the server-side open-path queue and route each path. Safe
   // to call repeatedly: the drain returns every queued path to exactly one
   // caller, so the wake-up handler and the startup drain never double-open.
@@ -167,7 +165,6 @@ void (async () => {
 if (import.meta.env.DEV) {
   void (async () => {
     try {
-      const { ipc, inTauri } = await import("./core/ipc");
       if (!inTauri) return;
       const info = await ipc.debugInfo();
       if (info.autotest) {

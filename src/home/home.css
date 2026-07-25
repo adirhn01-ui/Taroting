@@ -242,7 +242,7 @@
 .drop-overlay {
   position: fixed;
   inset: 0;
-  z-index: 300;
+  z-index: var(--z-editor-chrome); /* see z-index scale in tokens.css */
   display: none;
   padding: var(--sp-5);
   background: color-mix(in srgb, var(--bg-app) 55%, transparent);

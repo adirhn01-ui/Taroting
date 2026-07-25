@@ -29,8 +29,6 @@ pub enum JobKind {
     Proxy,
     Waveform,
     Filmstrip,
-    Thumbnail,
-    Scan,
     Export,
 }
 

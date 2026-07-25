@@ -87,12 +87,6 @@
   padding-right: var(--sp-6);
   background-position: right 8px center;
 }
-.btn--lg {
-  height: 40px;
-  padding: 0 var(--sp-5);
-  font-size: var(--fs-14);
-  border-radius: var(--radius-m);
-}
 
 /* Icon-only button */
 .btn--icon {
@@ -299,18 +293,6 @@
 }
 
 /* ---------- Misc ---------- */
-.divider-h {
-  height: 1px;
-  background: var(--border);
-  flex: none;
-}
-.divider-v {
-  width: 1px;
-  background: var(--border);
-  align-self: stretch;
-  flex: none;
-}
-
 .badge {
   display: inline-flex;
   align-items: center;
@@ -324,10 +306,6 @@
   letter-spacing: 0.02em;
   user-select: none;
 }
-.badge--accent {
-  background: var(--accent-dim);
-  color: var(--accent-strong);
-}
 
 .empty-state {
   display: flex;
@@ -339,15 +317,6 @@
   text-align: center;
   padding: var(--sp-10);
   user-select: none;
-}
-
-.spin {
-  animation: spin 0.9s linear infinite;
-}
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
 }
 
 /* ---------- Context menu ---------- */

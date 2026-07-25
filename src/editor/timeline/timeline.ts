@@ -34,7 +34,7 @@ export class TimelineController {
 
   private ctx: CanvasRenderingContext2D;
   private dpr = 1;
-  private dirty = true;
+  private dirty = false;
   private raf = 0;
   private colors: TimelineColors;
   private mediaById = new Map<string, MediaRef>();
@@ -93,7 +93,6 @@ export class TimelineController {
     this.disposers.push(attachInteractions(this));
 
     this.fit();
-    this.startLoop();
   }
 
   /* ---------------- coordinate helpers ---------------- */
@@ -228,20 +227,21 @@ export class TimelineController {
 
   /* ---------------- rendering ---------------- */
 
+  /** Coalesces every render trigger into at most one frame. Schedules on demand
+   *  rather than running a permanent rAF pump, so an idle or paused editor does
+   *  no per-frame work at all. Every render path in the editor goes through
+   *  here, so nothing is missed by not polling. */
   requestRender(): void {
+    if (this.dirty) return;
     this.dirty = true;
+    this.raf = requestAnimationFrame(this.renderFrame);
   }
 
-  private startLoop(): void {
-    const loop = (): void => {
-      if (this.dirty) {
-        this.dirty = false;
-        this.renderNow();
-      }
-      this.raf = requestAnimationFrame(loop);
-    };
-    this.raf = requestAnimationFrame(loop);
-  }
+  private renderFrame = (): void => {
+    this.raf = 0;
+    this.dirty = false;
+    this.renderNow();
+  };
 
   private renderNow(): void {
     const project = this.project();

@@ -100,6 +100,8 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   let clearConfirmArmed = false;
   let capturing: ActionId | null = null;
   let captureCleanup: (() => void) | null = null;
+  // Set by dispose(): in-flight async work must not rebuild a detached DOM.
+  let disposed = false;
 
   /* ---------------- section builders ---------------- */
 
@@ -443,6 +445,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       cacheStats = null;
       cacheStatsError = true;
     }
+    if (disposed) return; // resolved after the view went away — nothing to paint
     if (!capturing) render();
   }
 
@@ -569,6 +572,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
 
   return {
     dispose() {
+      disposed = true;
       unsubscribe();
       endCapture();
       disarmClearConfirm();

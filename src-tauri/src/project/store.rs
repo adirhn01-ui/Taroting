@@ -56,7 +56,7 @@ fn now_iso8601() -> String {
     // civil-from-days (Howard Hinnant), epoch shifted to 0000-03-01.
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let doe = z - era * 146_097; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
@@ -206,7 +206,7 @@ pub fn load_project(path: String) -> Result<LoadedProject> {
     let p = Path::new(&path);
     let (raw, recovered) = read_project_value(p)?;
     let migrated = schema::migrate(raw)?;
-    let typed: ProjectFile = serde_json::from_value(migrated.clone())
+    let typed: ProjectFile = ProjectFile::deserialize(&migrated)
         .map_err(|e| AppError::BadInput(format!("invalid project file: {e}")))?;
 
     // Verify media identity (path exists + size/mtime match). Generated media
@@ -312,7 +312,7 @@ pub fn save_project(
     project: Value,
 ) -> Result<SavedProject> {
     // Validate before writing — never persist something we can't read back.
-    let typed: ProjectFile = serde_json::from_value(project.clone())
+    let typed: ProjectFile = ProjectFile::deserialize(&project)
         .map_err(|e| AppError::BadInput(format!("refusing to save invalid project: {e}")))?;
 
     atomic_write(

@@ -89,6 +89,8 @@ export function mountStage(
   // a parked pool so growing/shrinking the layer count never destroys elements
   // (createMediaElementSource is one-shot per <video>, so sets must persist).
   const pool: LayerSet[] = [];
+  // How many sets are currently mounted, in order. -1 = nothing mounted yet.
+  let liveCount = -1;
 
   const stage: Stage = {
     root,
@@ -97,6 +99,13 @@ export function mountStage(
     overlay,
     scale: 1,
     syncLayerCount(n: number): void {
+      // activate() calls this on every seek — i.e. every scrub pointermove.
+      // The pool is stable and mounted in index order and nothing else
+      // re-parents these sets, so an unchanged n means the DOM is already
+      // right; re-attaching would needlessly tear down the <video> elements'
+      // layout and compositing layers.
+      if (n === liveCount) return;
+      liveCount = n;
       while (pool.length < n) pool.push(buildLayerSet());
       // detach every set, then (re)attach the first n in z-order.
       for (const set of pool) if (set.el.parentElement) set.el.remove();
@@ -150,6 +159,9 @@ export function mountStage(
 }
 
 export function setOverlay(stage: Stage, text: string | null): void {
-  stage.overlay.textContent = text ?? "";
+  // Reached on every seek with `null`; skip the DOM write when nothing changed.
+  const next = text ?? "";
+  if (stage.overlay.textContent === next) return;
+  stage.overlay.textContent = next;
   stage.overlay.classList.toggle("active", text !== null);
 }

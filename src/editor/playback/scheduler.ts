@@ -520,18 +520,15 @@ export class Scheduler {
       }
     }
 
+    // Stays Infinity unless some layer reports a finite end, so no layer
+    // reporting one leaves it Infinity on its own.
     let boundary = Infinity;
-    let anyReal = false;
     for (let i = 0; i < layers.length; i++) {
       const seg = layers[i]!.activate(t, playing, i === masterIdx);
       const end = segmentEnd(seg);
-      if (Number.isFinite(end)) {
-        boundary = Math.min(boundary, end);
-        anyReal = true;
-      }
+      if (Number.isFinite(end)) boundary = Math.min(boundary, end);
       // gaps also bound (their `until` is finite when a later clip exists)
     }
-    if (!anyReal) boundary = Infinity;
     // manage the status overlay from the top layer's state
     this.updateOverlay(t);
     return { boundary };
@@ -608,11 +605,6 @@ export class Scheduler {
       }
     }
     return out;
-  }
-
-  /** Compatibility shim: the topmost active-video info, or null. */
-  activeVideoInfo(): VideoInfo | null {
-    return this.activeVideoInfos()[0] ?? null;
   }
 
   /** Topmost active video element (dev hook). */

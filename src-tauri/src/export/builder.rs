@@ -67,7 +67,7 @@ fn round_even(v: f64) -> i64 {
 /// Map a (family, bold, italic) request to a concrete C:\Windows\Fonts file.
 /// Impact has only a regular face, so bold/italic requests fall back to it.
 fn font_file(family: &str, bold: bool, italic: bool) -> Option<&'static str> {
-    let base = match family {
+    let faces: [&'static str; 4] = match family {
         "Segoe UI" => ["segoeui", "segoeuib", "segoeuii", "segoeuiz"],
         "Arial" => ["arial", "arialbd", "ariali", "arialbi"],
         "Georgia" => ["georgia", "georgiab", "georgiai", "georgiaz"],
@@ -76,21 +76,8 @@ fn font_file(family: &str, bold: bool, italic: bool) -> Option<&'static str> {
         "Impact" => return Some("impact"),
         _ => return None,
     };
-    let idx = match (bold, italic) {
-        (false, false) => 0,
-        (true, false) => 1,
-        (false, true) => 2,
-        (true, true) => 3,
-    };
-    // Map back to a &'static str.
-    Some(match family {
-        "Segoe UI" => ["segoeui", "segoeuib", "segoeuii", "segoeuiz"][idx],
-        "Arial" => ["arial", "arialbd", "ariali", "arialbi"][idx],
-        "Georgia" => ["georgia", "georgiab", "georgiai", "georgiaz"][idx],
-        "Times New Roman" => ["times", "timesbd", "timesi", "timesbi"][idx],
-        "Courier New" => ["cour", "courbd", "couri", "courbi"][idx],
-        _ => base[idx],
-    })
+    // [regular, bold, italic, bold-italic]
+    Some(faces[usize::from(bold) + 2 * usize::from(italic)])
 }
 
 /// Full path to a mapped font file.
@@ -125,19 +112,27 @@ fn escape_filter_path(path: &str) -> Result<String> {
 /// white on anything unparseable.
 fn parse_color(color: &str) -> (String, Option<String>) {
     let hex = color.trim().trim_start_matches('#');
-    let expand3 = |h: &str| -> String {
-        h.chars().flat_map(|c| [c, c]).collect()
-    };
-    let (rgb, alpha) = match hex.len() {
-        3 => (expand3(hex), None),
-        6 => (hex.to_string(), None),
-        8 => (hex[..6].to_string(), Some(hex[6..8].to_string())),
+    // Validate the WHOLE string before any slicing. Two reasons this must come
+    // first: `hex.len()` is a byte count while `hex[..6]` is a byte-index slice,
+    // so a multi-byte char (e.g. "#aaaaaÀa", 8 bytes) lands mid-char and panics
+    // — and with `panic = "abort"` that kills the app mid-export. And the alpha
+    // suffix is spliced straight into the drawtext `fontcolor=` option, so it
+    // has to be hex-validated too, not just the rgb half. `.trt` files are
+    // shareable, so a hand-edited color is attacker-controlled input.
+    // is_ascii_hexdigit() is false for every non-ASCII char, so passing this
+    // guard proves byte length == char count and every index below is a
+    // char boundary.
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return ("ffffff".to_string(), None);
+    }
+    match hex.len() {
+        3 => (
+            hex.chars().flat_map(|c| [c, c]).collect::<String>().to_lowercase(),
+            None,
+        ),
+        6 => (hex.to_lowercase(), None),
+        8 => (hex[..6].to_lowercase(), Some(hex[6..8].to_lowercase())),
         _ => ("ffffff".to_string(), None),
-    };
-    if rgb.chars().all(|c| c.is_ascii_hexdigit()) {
-        (rgb.to_lowercase(), alpha.map(|a| a.to_lowercase()))
-    } else {
-        ("ffffff".to_string(), None)
     }
 }
 
@@ -500,10 +495,10 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     let bottom = video_tracks.last().copied();
     let mut segments: Vec<Segment> = Vec::new();
     if let Some(bt) = bottom {
-        let mut vclips = bt.clips.clone();
+        let mut vclips: Vec<&Clip> = bt.clips.iter().collect();
         vclips.sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
         let mut cursor = 0.0_f64;
-        for clip in &vclips {
+        for clip in vclips {
             let media = media_for(&spec.media, &clip.media_id).ok_or_else(|| {
                 AppError::BadInput(format!("clip references unknown media {}", clip.media_id))
             })?;
@@ -535,10 +530,10 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
         // indices 0..len-1 are the higher tracks; iterate them in REVERSE so we
         // emit bottom-most higher track first, ending with tracks[0].
         for track in video_tracks[..video_tracks.len() - 1].iter().rev() {
-            let mut clips = track.clips.clone();
+            let mut clips: Vec<&Clip> = track.clips.iter().collect();
             clips.sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
             let mut layer: Vec<OverlayClip> = Vec::new();
-            for clip in &clips {
+            for clip in clips {
                 let media = media_for(&spec.media, &clip.media_id).ok_or_else(|| {
                     AppError::BadInput(format!(
                         "clip references unknown media {}",
@@ -555,9 +550,9 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     /* ---- audio inputs (track order, then start) ---- */
     let mut audio_inputs: Vec<AudioInput> = Vec::new();
     for track in &spec.timeline.tracks {
-        let mut clips = track.clips.clone();
+        let mut clips: Vec<&Clip> = track.clips.iter().collect();
         clips.sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
-        for clip in &clips {
+        for clip in clips {
             let media = match media_for(&spec.media, &clip.media_id) {
                 Some(m) => m,
                 None => continue,
@@ -634,12 +629,10 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     for a in ["-y", "-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1"] {
         args.push(a.into());
     }
-    for entry in &inputs {
-        for f in &entry.flags {
-            args.push(f.clone());
-        }
-        match &entry.source {
-            InputSource::File(p) => args.push(p.clone()),
+    for entry in inputs {
+        args.extend(entry.flags);
+        match entry.source {
+            InputSource::File(p) => args.push(p),
         }
     }
 
@@ -1766,6 +1759,78 @@ mod tests {
         // generated media consume no -i input slot.
         let a = argstr(&b);
         assert_eq!(a.iter().filter(|s| s.as_str() == "-i").count(), 0);
+    }
+
+    #[test]
+    fn parse_color_accepts_the_three_valid_forms() {
+        assert_eq!(parse_color("#f0a"), ("ff00aa".to_string(), None));
+        assert_eq!(parse_color("#FF00AA"), ("ff00aa".to_string(), None));
+        assert_eq!(
+            parse_color("#ff00aa80"),
+            ("ff00aa".to_string(), Some("80".to_string()))
+        );
+        // a bare value with no leading '#' is still accepted
+        assert_eq!(parse_color("ff00aa"), ("ff00aa".to_string(), None));
+    }
+
+    #[test]
+    fn parse_color_rejects_non_hex_without_panicking() {
+        // A `.trt` is shareable, so a hand-edited color is untrusted input.
+        // `hex.len()` is a BYTE count while `hex[..6]` slices by byte index, so
+        // an 8-byte-but-not-8-char value used to slice mid-character and panic
+        // — fatal under `panic = "abort"`. It must fall back to white instead.
+        let multibyte = "#aaaaa\u{c0}a"; // 5 ASCII + one 2-byte char + 1 ASCII
+        assert_eq!(multibyte.trim_start_matches('#').len(), 8);
+        assert_eq!(parse_color(multibyte), ("ffffff".to_string(), None));
+
+        // The alpha suffix reaches the drawtext `fontcolor=` option, so it has
+        // to be hex-validated too — not just the rgb half.
+        assert_eq!(parse_color("#ffffff:x"), ("ffffff".to_string(), None));
+        assert_eq!(parse_color("#ffffff'q"), ("ffffff".to_string(), None));
+        assert_eq!(parse_color("#ffffffzz"), ("ffffff".to_string(), None));
+
+        // plain garbage and empties
+        assert_eq!(parse_color("#zzz"), ("ffffff".to_string(), None));
+        assert_eq!(parse_color(""), ("ffffff".to_string(), None));
+        assert_eq!(parse_color("#12345"), ("ffffff".to_string(), None));
+    }
+
+    #[test]
+    fn crafted_color_cannot_inject_into_the_drawtext_filtergraph() {
+        // End-to-end: a crafted color must neither kill the process nor change
+        // the graph. The strongest statement is that a hostile color produces a
+        // filtergraph byte-identical to the plain-white fallback — so no part of
+        // it survived into the graph. (Asserting on the absence of a substring
+        // is too weak here: drawtext's own `x=` option legitimately follows
+        // `fontcolor=`, so `0xffffff:x` appears in perfectly normal output.)
+        let graph_for = |color: &str| {
+            let gm = gen_media(
+                "g1",
+                Generator::Text {
+                    text: "hi".into(),
+                    font_family: "Georgia".into(),
+                    size_px: 48.0,
+                    color: color.into(),
+                    bold: false,
+                    italic: false,
+                },
+            );
+            let c = clip("c1", "g1", 0.0, 0.0, 2.0);
+            let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+            build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc())
+                .unwrap()
+                .filter_complex
+        };
+
+        let white = graph_for("#ffffff");
+        assert!(white.contains("fontcolor=0xffffff:"), "{white}");
+        // option-separator injection, quote injection, non-hex alpha, and the
+        // multi-byte value that used to abort the process
+        for hostile in ["#ffffff:x", "#ffffff'q", "#ffffffzz", "#aaaaa\u{c0}a", "#zzz"] {
+            assert_eq!(graph_for(hostile), white, "hostile color leaked: {hostile}");
+        }
+        // a VALID alpha must still come through, or the guard is too aggressive
+        assert!(graph_for("#ffffff80").contains("fontcolor=0xffffff80:"));
     }
 
     #[test]

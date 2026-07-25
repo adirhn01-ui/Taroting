@@ -12,7 +12,7 @@
 // All sizes are computed in project-canvas pixels, then multiplied by the
 // stage scale (how large the canvas is rendered on screen).
 
-import type { ClipTransform, MediaRef } from "../../core/types";
+import type { ClipTransform } from "../../core/types";
 import { defaultTransform } from "../../core/project";
 
 export interface LayerBoxes {
@@ -113,15 +113,4 @@ export function applyTransform(layer: LayerBoxes, c: ComputedTransform, stageSca
   layer.media.style.width = `${c.mediaW * s}px`;
   layer.media.style.height = `${c.mediaH * s}px`;
   layer.media.style.transform = `translate(${c.offX * s}px, ${c.offY * s}px)`;
-}
-
-/** Convenience: full pipeline for a clip's media on a stage. */
-export function styleLayer(
-  layer: LayerBoxes,
-  transform: ClipTransform | undefined,
-  media: MediaRef,
-  project: { width: number; height: number },
-  stageScale: number,
-): void {
-  applyTransform(layer, computeTransform(transform, media, project), stageScale);
 }

@@ -1,4 +1,4 @@
-// A ~60-line reactive store: get / set / update / subscribe, with
+// A tiny reactive store: get / set / update / subscribe, with
 // microtask-batched notifications so bursts of mutations paint once.
 
 export type Listener<T> = (state: T, prev: T) => void;
@@ -46,21 +46,4 @@ export class Store<T> {
       for (const l of [...this.listeners]) l(this.state, prev);
     });
   }
-}
-
-/** Subscribe to a derived slice; fires only when the selected value changes. */
-export function subscribeSelect<T, K>(
-  store: Store<T>,
-  select: (s: T) => K,
-  cb: (value: K, prev: K) => void,
-): () => void {
-  let last = select(store.get());
-  return store.subscribe((s) => {
-    const v = select(s);
-    if (!Object.is(v, last)) {
-      const p = last;
-      last = v;
-      cb(v, p);
-    }
-  });
 }

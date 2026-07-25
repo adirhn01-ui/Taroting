@@ -526,7 +526,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
       const dist = Math.hypot(p.x - center.x, p.y - center.y);
       const ratio = gesture.downDist! > 1e-3 ? dist / gesture.downDist! : 1;
       const nextScale = clamp(gesture.startPose.scale * ratio, SCALE_MIN, SCALE_MAX);
-      applyScale(gesture.clipId, gesture.startPose.scale, nextScale, gesture.keySrcTime);
+      applyScale(gesture.clipId, nextScale, gesture.keySrcTime);
     }
   }
 
@@ -564,7 +564,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
   /** Auto-key or static scale write. When the clip has scale keyframes we upsert
    *  at the gesture-start source time (keySrcTime, frozen so a moving playhead
    *  edits one keyframe); otherwise edit the static scale. */
-  function applyScale(clipId: string, _startScale: number, scale: number, keySrcTime: number): void {
+  function applyScale(clipId: string, scale: number, keySrcTime: number): void {
     const found = findClip(session.project, clipId);
     if (!found) return;
     const clip = found.clip;

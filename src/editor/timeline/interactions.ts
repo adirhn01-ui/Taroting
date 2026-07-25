@@ -77,7 +77,6 @@ export function attachInteractions(tl: TimelineController): () => void {
       }
       return { type: "ruler" };
     }
-    const t = tl.tOf(x);
     for (const lane of laneLayout(project)) {
       if (y < lane.y || y > lane.y + lane.h) continue;
       for (const clip of lane.track.clips) {
@@ -114,7 +113,6 @@ export function attachInteractions(tl: TimelineController): () => void {
       }
       return { type: "lane", track: lane.track };
     }
-    void t;
     return { type: "empty" };
   };
 
@@ -171,7 +169,9 @@ export function attachInteractions(tl: TimelineController): () => void {
 
     if (mode.name === "idle") {
       const hit = hitTest(x, y);
-      canvas.style.cursor =
+      // Same idempotent-write rule as the play button: the value is identical
+      // across almost every pointermove, so only touch the CSSOM on a change.
+      const cursor =
         hit.type === "marker"
           ? "ew-resize"
           : hit.type === "kf"
@@ -181,6 +181,7 @@ export function attachInteractions(tl: TimelineController): () => void {
                 ? "ew-resize"
                 : "grab"
               : "default";
+      if (canvas.style.cursor !== cursor) canvas.style.cursor = cursor;
       return;
     }
 
