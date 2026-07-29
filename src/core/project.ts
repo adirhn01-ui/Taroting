@@ -804,6 +804,11 @@ export function addGeneratedMedia(
 /* ------------------------------------------------------------------ */
 
 function checkKfArray(errors: string[], clipId: string, prop: string, arr: Keyframe[]): void {
+  // An EMPTY array is a violation, not an absence. writeKeyframes strips them,
+  // but schema.rs types the tracks Option<Vec<Keyframe>> and happily
+  // deserializes `[]` from a shared/hand-edited .trt — and every consumer gates
+  // on truthiness, which `[]` passes, so it reaches evalKfs and throws.
+  if (arr.length === 0) errors.push(`clip ${clipId} kf ${prop}: empty array`);
   let prevT = -Infinity;
   for (const k of arr) {
     if (!Number.isFinite(k.v)) errors.push(`clip ${clipId} kf ${prop}: non-finite v`);

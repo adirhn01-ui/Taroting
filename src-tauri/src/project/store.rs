@@ -13,8 +13,20 @@ use crate::paths;
 /* Atomic writes                                                       */
 /* ------------------------------------------------------------------ */
 
+/// `<path>.bak` — the previous contents, rotated aside by `atomic_write`.
+fn bak_path(path: &Path) -> PathBuf {
+    let mut bak = path.as_os_str().to_owned();
+    bak.push(".bak");
+    PathBuf::from(bak)
+}
+
 /// Write via temp file + rename so a crash never corrupts the target.
 /// If the target exists it is first rotated to `<name>.bak`.
+///
+/// Failure is atomic in BOTH directions: if the second rename fails (an AV /
+/// OneDrive scanner holding the name, power loss, a full volume) the rotated
+/// original is moved straight back. Without that restore the target simply
+/// ceased to exist — a save that failed halfway deleted the project.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path
         .parent()
@@ -26,15 +38,46 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, bytes)?;
 
-    if path.exists() {
-        let mut bak = path.as_os_str().to_owned();
-        bak.push(".bak");
-        let bak = PathBuf::from(bak);
+    let bak = bak_path(path);
+    let rotated = if path.exists() {
         let _ = std::fs::remove_file(&bak);
         std::fs::rename(path, &bak)?;
+        true
+    } else {
+        false
+    };
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Put the original back before surfacing the error. The `.tmp` is left
+        // on disk deliberately: it holds the bytes we failed to commit, and the
+        // next successful write overwrites it anyway.
+        if rotated {
+            let _ = std::fs::rename(&bak, path);
+        }
+        return Err(e.into());
     }
-    std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Read a JSON file, falling back to the `<path>.bak` that `atomic_write`
+/// rotates aside when the primary is missing or unparseable. Returns the parsed
+/// value (when either copy could be read) plus whether the backup supplied it.
+///
+/// Those `.bak` files existed from the start but nothing ever read them, so a
+/// corrupt primary silently became "no data": for settings that meant every
+/// preference reset to defaults, and for recents it meant every project card
+/// disappearing from home. Both then re-saved over the last good backup.
+pub fn read_json_with_bak<T: serde::de::DeserializeOwned>(path: &Path) -> (Option<T>, bool) {
+    let primary = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<T>(&b).ok());
+    if primary.is_some() {
+        return (primary, false);
+    }
+    let backup = std::fs::read(bak_path(path))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<T>(&b).ok());
+    let recovered = backup.is_some();
+    (backup, recovered)
 }
 
 /* ------------------------------------------------------------------ */
@@ -70,12 +113,37 @@ fn now_iso8601() -> String {
     )
 }
 
+/// A duration safe to persist. `Timeline::duration()` can come back non-finite
+/// from a hand-edited or hostile `.trt` (`speed: 0` divides by zero; a
+/// `timelineStart` + `srcOut` near f64::MAX sums to infinity) — both parse
+/// fine. serde_json writes a non-finite f64 as `null`, which used to make the
+/// WHOLE recents index unparseable: every project card vanished from home
+/// because of one bad entry.
+fn finite_duration(d: f64) -> f64 {
+    if d.is_finite() {
+        d
+    } else {
+        0.0
+    }
+}
+
+/// Tolerate a missing or `null` `durationSec` instead of failing the entire
+/// index. `#[serde(default)]` alone only covers an ABSENT field; an index
+/// already written by an older build carries a literal `null` here, and that
+/// still has to degrade to one wrong duration rather than an empty home screen.
+fn de_duration_sec<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(d)?
+        .filter(|n| n.is_finite())
+        .unwrap_or(0.0))
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RecentItem {
     pub path: String,
     pub name: String,
     pub modified_at: String,
+    #[serde(default, deserialize_with = "de_duration_sec")]
     pub duration_sec: f64,
     pub thumb: Option<String>,
     /// on-disk size of the `.trt` file; refreshed by `list_recents`
@@ -108,8 +176,7 @@ fn recents_path() -> Result<PathBuf> {
 fn read_recents() -> RecentsIndex {
     recents_path()
         .ok()
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|b| serde_json::from_slice(&b).ok())
+        .and_then(|p| read_json_with_bak::<RecentsIndex>(&p).0)
         .unwrap_or_default()
 }
 
@@ -138,9 +205,15 @@ fn upsert_recent(mut item: RecentItem) -> Result<()> {
 #[tauri::command]
 pub fn list_recents() -> Result<RecentsIndex> {
     let mut index = read_recents();
-    // Drop entries whose project file vanished (moved/deleted by the user),
-    // and refresh the on-disk size of the survivors.
-    index.items.retain(|r| Path::new(&r.path).is_file());
+    // Drop entries whose project file vanished (moved/deleted by the user), but
+    // KEEP one whose primary is gone while its .bak survives: that combination
+    // means an interrupted save, not a deletion, and read_project_value can
+    // recover it. Without this the card disappears from home and the user has no
+    // way to reach the recovery at all. delete_project and rename_project both
+    // remove the .bak alongside the primary, so an orphan .bak is unambiguous.
+    index
+        .items
+        .retain(|r| Path::new(&r.path).is_file() || bak_path(Path::new(&r.path)).is_file());
     for r in &mut index.items {
         if let Ok(meta) = std::fs::metadata(&r.path) {
             r.size_bytes = meta.len();
@@ -180,6 +253,12 @@ fn mtime_ms_of(meta: &std::fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
+/// The `.bak` sibling, parsed as JSON. `None` when it is absent or corrupt too.
+fn read_bak_value(path: &Path) -> Option<Value> {
+    let bytes = std::fs::read(bak_path(path)).ok()?;
+    serde_json::from_slice::<Value>(&bytes).ok()
+}
+
 fn read_project_value(path: &Path) -> Result<(Value, bool)> {
     match std::fs::read(path) {
         Ok(bytes) => {
@@ -187,15 +266,24 @@ fn read_project_value(path: &Path) -> Result<(Value, bool)> {
                 return Ok((v, false));
             }
             // corrupt main file → try the .bak
-            let mut bak = path.as_os_str().to_owned();
-            bak.push(".bak");
-            let bak_bytes = std::fs::read(PathBuf::from(bak)).map_err(|_| {
-                AppError::BadInput(format!("{} is not valid JSON", path.display()))
-            })?;
-            let v = serde_json::from_slice::<Value>(&bak_bytes).map_err(|_| {
-                AppError::BadInput(format!("{} and its backup are both corrupt", path.display()))
-            })?;
-            Ok((v, true))
+            match read_bak_value(path) {
+                Some(v) => Ok((v, true)),
+                None if bak_path(path).exists() => Err(AppError::BadInput(format!(
+                    "{} and its backup are both corrupt",
+                    path.display()
+                ))),
+                None => Err(AppError::BadInput(format!(
+                    "{} is not valid JSON",
+                    path.display()
+                ))),
+            }
+        }
+        // The primary is GONE — a save whose final rename failed used to leave
+        // exactly this state, and returning NotFound here made the loss look
+        // permanent. The rotated `.bak` is the last good copy, so recover from
+        // it (flagged `recovered`) exactly as for a corrupt primary.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            read_bak_value(path).map(|v| (v, true)).ok_or_else(|| e.into())
         }
         Err(e) => Err(e.into()),
     }
@@ -256,7 +344,7 @@ fn stamp_opened(path: &str, typed: &ProjectFile) {
                 path: path.to_string(),
                 name: typed.name.clone(),
                 modified_at: typed.modified_at.clone(),
-                duration_sec: typed.timeline.duration(),
+                duration_sec: finite_duration(typed.timeline.duration()),
                 thumb: None,
                 size_bytes,
                 opened_at: Some(now),
@@ -341,7 +429,7 @@ pub fn save_project(
             path: path.clone(),
             name: typed.name.clone(),
             modified_at: typed.modified_at.clone(),
-            duration_sec: typed.timeline.duration(),
+            duration_sec: finite_duration(typed.timeline.duration()),
             thumb,
             size_bytes: 0, // filled by upsert_recent via fs metadata
             opened_at: None, // preserved from any prior entry by upsert_recent
@@ -601,7 +689,10 @@ pub fn duplicate_project(path: String, new_name: String, new_id: String) -> Resu
         path: new_path_str.clone(),
         name: new_name,
         modified_at: value["modifiedAt"].as_str().unwrap_or_default().to_string(),
-        duration_sec: src_recent.as_ref().map(|r| r.duration_sec).unwrap_or(0.0),
+        duration_sec: src_recent
+            .as_ref()
+            .map(|r| finite_duration(r.duration_sec))
+            .unwrap_or(0.0),
         thumb: src_recent.and_then(|r| r.thumb),
         size_bytes,
         opened_at: None,
@@ -1234,6 +1325,199 @@ mod tests {
         assert_eq!(std::fs::read(&bak).unwrap(), b"one");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* -------------------- corruption / data-loss guards ---------------- */
+
+    #[test]
+    fn nonfinite_duration_does_not_wipe_recents() {
+        with_isolated("nonfinite-duration", |dir| {
+            // A healthy project already sitting in recents.
+            let healthy = dir.join("Healthy.trt");
+            write_json(&healthy, &minimal_project("Healthy"));
+            upsert_recent(RecentItem {
+                path: healthy.to_string_lossy().into_owned(),
+                name: "Healthy".into(),
+                modified_at: "m".into(),
+                duration_sec: 12.5,
+                thumb: None,
+                size_bytes: 0,
+                opened_at: None,
+            })
+            .unwrap();
+
+            // `speed: 0` makes Clip::duration() infinite and Timeline::duration()
+            // propagates it. serde_json writes a non-finite f64 as `null`, which
+            // used to make the WHOLE index unparseable — 2 entries in, 0 out,
+            // i.e. every project card gone from home.
+            let mut v = minimal_project("Poisoned");
+            v["media"] = serde_json::json!([video_media("m1")]);
+            v["timeline"]["tracks"] = serde_json::json!([{
+                "id": "t1", "kind": "video", "name": "V1", "muted": false,
+                "clips": [{
+                    "id": "c1", "mediaId": "m1",
+                    "timelineStart": 0.0, "srcIn": 0.0, "srcOut": 2.0, "speed": 0.0,
+                    "audio": {"volume": 1.0, "muted": false, "fadeInSec": 0.0,
+                               "fadeOutSec": 0.0, "gainOffsetDb": 0.0, "detached": false}
+                }]
+            }]);
+            let poisoned = dir.join("Poisoned.trt");
+            write_json(&poisoned, &v);
+
+            // The hazard is real: this project's duration IS non-finite, and it
+            // passes deserialization unchallenged.
+            let typed = typed_project(v);
+            assert!(!typed.timeline.duration().is_finite());
+
+            // load_project → stamp_opened persists it into the index.
+            load_project(poisoned.to_string_lossy().into_owned()).unwrap();
+
+            let listed = list_recents().unwrap();
+            assert_eq!(listed.items.len(), 2, "index was wiped: {listed:?}");
+            let bad = listed.items.iter().find(|r| r.name == "Poisoned").unwrap();
+            assert_eq!(bad.duration_sec, 0.0, "non-finite must be stored as 0");
+            let ok = listed.items.iter().find(|r| r.name == "Healthy").unwrap();
+            assert_eq!(ok.duration_sec, 12.5, "the other entry must be intact");
+        });
+    }
+
+    #[test]
+    fn null_duration_in_a_stored_index_does_not_wipe_it() {
+        // An index written by an older build carries a literal `null` here.
+        // Parsing must degrade to one wrong duration, never to an empty home.
+        let raw = r#"{"schema":1,"items":[
+            {"path":"C:\\a.trt","name":"A","modifiedAt":"m","durationSec":null},
+            {"path":"C:\\b.trt","name":"B","modifiedAt":"m","durationSec":4.5},
+            {"path":"C:\\c.trt","name":"C","modifiedAt":"m"}]}"#;
+        let index: RecentsIndex = serde_json::from_str(raw).unwrap();
+        assert_eq!(index.items.len(), 3);
+        assert_eq!(index.items[0].duration_sec, 0.0);
+        assert_eq!(index.items[1].duration_sec, 4.5);
+        assert_eq!(index.items[2].duration_sec, 0.0);
+    }
+
+    #[test]
+    fn load_recovers_from_bak_when_primary_missing() {
+        with_isolated("bak-missing-primary", |dir| {
+            // A save whose final rename failed used to leave exactly this on
+            // disk: no project, only the rotated `.bak`. Reading it returned
+            // NotFound, so the project looked permanently lost even though a
+            // good copy was sitting right next to it.
+            let proj = dir.join("Rescued.trt");
+            write_json(&dir.join("Rescued.trt.bak"), &minimal_project("Rescued"));
+            assert!(!proj.exists());
+
+            let loaded = load_project(proj.to_string_lossy().into_owned()).unwrap();
+            assert!(loaded.recovered, "must be flagged as recovered from .bak");
+            assert_eq!(loaded.project["name"], "Rescued");
+
+            // With neither copy present the error still surfaces.
+            let ghost = dir.join("Ghost.trt");
+            assert!(load_project(ghost.to_string_lossy().into_owned()).is_err());
+        });
+    }
+
+    /// The recovery above is only useful if the user can still REACH the
+    /// project. list_recents drops entries whose file is gone, which would hide
+    /// exactly the interrupted-save case it is meant to rescue.
+    #[test]
+    fn recents_keeps_a_project_surviving_only_as_bak() {
+        with_isolated("recents-bak-survivor", |dir| {
+            let alive = dir.join("Alive.trt");
+            write_json(&alive, &minimal_project("Alive"));
+
+            // Interrupted save: primary rotated to .bak, replacement never landed.
+            let wounded = dir.join("Wounded.trt");
+            write_json(&dir.join("Wounded.trt.bak"), &minimal_project("Wounded"));
+            assert!(!wounded.exists());
+
+            // Genuinely deleted: neither copy on disk.
+            let gone = dir.join("Gone.trt");
+
+            for (p, name) in [(&alive, "Alive"), (&wounded, "Wounded"), (&gone, "Gone")] {
+                upsert_recent(RecentItem {
+                    path: p.to_string_lossy().into_owned(),
+                    name: name.into(),
+                    modified_at: String::new(),
+                    duration_sec: 0.0,
+                    thumb: None,
+                    size_bytes: 0,
+                    opened_at: None,
+                })
+                .unwrap();
+            }
+
+            let names: Vec<String> = list_recents()
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|r| r.path)
+                .collect();
+            let has = |p: &std::path::Path| names.iter().any(|n| n == &*p.to_string_lossy());
+
+            assert!(has(&alive), "a normal project must stay listed");
+            assert!(has(&wounded), "a .bak-only project must stay reachable");
+            assert!(!has(&gone), "a deleted project must still be dropped");
+        });
+    }
+
+    /// Both halves of the ".bak was written but never read" bug. The settings
+    /// half lives here rather than in `settings.rs` because APPDATA is a
+    /// process-global: only `ENV_LOCK` + `with_isolated` keep it from racing the
+    /// other tests in this file.
+    #[test]
+    fn corrupt_primary_recovers_from_bak_for_recents_and_settings() {
+        with_isolated("bak-recovery", |_dir| {
+            let data = paths::data_dir().unwrap();
+            paths::ensure_dir(&data).unwrap();
+
+            // Recents: a truncated index used to silently mean "no projects".
+            let good = RecentsIndex {
+                schema: 1,
+                items: vec![RecentItem {
+                    path: "C:\\projects\\Kept.trt".into(),
+                    name: "Kept".into(),
+                    modified_at: "m".into(),
+                    duration_sec: 3.5,
+                    thumb: None,
+                    size_bytes: 0,
+                    opened_at: None,
+                }],
+            };
+            std::fs::write(
+                data.join("recents.json.bak"),
+                serde_json::to_vec(&good).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(data.join("recents.json"), b"{\"schema\":1,\"items\":[{\"pa").unwrap();
+
+            let items = read_recents().items;
+            assert_eq!(items.len(), 1, "should have recovered from the .bak");
+            assert_eq!(items[0].name, "Kept");
+            assert_eq!(items[0].duration_sec, 3.5);
+
+            // Settings: a corrupt file used to silently apply ALL defaults, and
+            // the next save then destroyed the last good backup for good.
+            let settings = data.join("settings.json");
+            std::fs::write(
+                data.join("settings.json.bak"),
+                serde_json::to_vec(&serde_json::json!({ "theme": "dark", "monitorVolume": 0.42 }))
+                    .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(&settings, b"not json at all").unwrap();
+
+            let loaded = crate::settings::get_settings()
+                .unwrap()
+                .expect("settings should be recovered from the .bak");
+            assert_eq!(loaded["theme"], "dark");
+            assert_eq!(loaded["monitorVolume"], 0.42);
+
+            // Nothing on disk at all is still a clean first run → frontend defaults.
+            std::fs::remove_file(&settings).unwrap();
+            std::fs::remove_file(data.join("settings.json.bak")).unwrap();
+            assert!(crate::settings::get_settings().unwrap().is_none());
+        });
     }
 
     /* -------------------- temp quick-view projects -------------------- */

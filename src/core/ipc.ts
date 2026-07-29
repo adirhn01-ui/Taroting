@@ -3,6 +3,7 @@
 // inert fallbacks and mutations reject, so screens stay previewable.
 
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import type { EncoderSummary, FfmpegFailure } from "./diagnostics";
 import type { MediaInfo, MediaRef, ProjectFile, RecentsIndex, Settings } from "./types";
 
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -27,6 +28,20 @@ export interface IpcError {
 export function describeError(e: unknown): string {
   if (e && typeof e === "object" && "message" in e) return String((e as IpcError).message);
   return String(e);
+}
+
+/** Like describeError, but keeps the AppError `code` the backend sent. The code
+ *  is otherwise discarded at the IPC boundary and never reaches a human, which
+ *  is exactly the identifier that makes a bug report actionable. */
+export function errorDetail(e: unknown): { code: string; message: string } {
+  if (e && typeof e === "object" && "message" in e) {
+    const err = e as Partial<IpcError>;
+    return {
+      code: typeof err.code === "string" ? err.code : "",
+      message: String(err.message),
+    };
+  }
+  return { code: "", message: String(e) };
 }
 
 export interface LoadedProject {
@@ -137,11 +152,44 @@ export const ipc = {
     call<string[]>("take_pending_open_paths", undefined, () => []),
   uninstallApp: () => call<void>("uninstall_app"),
 
+  /* diagnostics — all three are on-demand only; nothing is buffered, probed
+   * or written unless the user asked for a report. */
+  /** Which encoder ffmpeg resolved per family (cached backend-side). The
+   *  export dialog has its own richer wrapper; this one exists so Settings can
+   *  answer "no hardware encoder detected" without pulling in the export
+   *  module graph. */
+  detectEncoders: () => call<EncoderSummary>("detect_encoders", { force: false }),
+  /** Everything the backend remembers about the last failed ffmpeg run, or
+   *  null when nothing has failed this session. */
+  exportFailureReport: () =>
+    call<FfmpegFailure | null>("export_failure_report", undefined, () => null),
+  /** Write a diagnostic report next to the user's projects; returns the path. */
+  saveDiagnosticReport: (content: string) =>
+    call<string>("save_diagnostic_report", { content }),
+
   /* dev-only (hard error in release builds) */
   debugInfo: () =>
     call<{ autotest: boolean; fixturesDir: string; reportPath: string }>("debug_info"),
   debugWriteReport: (content: string) => call<void>("debug_write_report", { content }),
 };
+
+/* ---------------- app identity ---------------- */
+
+let cachedVersion: string | null = null;
+
+/** The packaged app version, for diagnostic reports. Resolved once, lazily —
+ *  nothing on the startup path asks for it. */
+export async function appVersion(): Promise<string> {
+  if (cachedVersion !== null) return cachedVersion;
+  if (!inTauri) return "dev";
+  try {
+    const { getVersion } = await import("@tauri-apps/api/app");
+    cachedVersion = await getVersion();
+  } catch {
+    cachedVersion = "unknown";
+  }
+  return cachedVersion;
+}
 
 /* ---------------- job events ---------------- */
 

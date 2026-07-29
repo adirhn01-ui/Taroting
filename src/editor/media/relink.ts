@@ -1,9 +1,10 @@
 // Relink dialog: a self-managed modal that lets the user point missing media
 // files (by id) at their new location on disk. Per row: Locate… → probe the
-// chosen file → sanity-check kind + duration (warn, but allow) → patch the
-// MediaRef (path/size/mtime), clamp any clip's source window into the (possibly
-// shorter) source, and re-track the media so previews rebuild. Unresolved rows
-// are surfaced via a toast if the user closes early.
+// chosen file → sanity-check kind + duration (warn, but allow) → replace the
+// whole probed MediaRef record, clamp any clip's source window into the
+// (possibly shorter) source and its crop into the (possibly smaller) frame, and
+// re-track the media so previews rebuild. Unresolved rows are surfaced via a
+// toast if the user closes early.
 
 import { escapeHtml, fileExt, fileStem } from "../../core/format";
 import { inTauri, ipc } from "../../core/ipc";
@@ -13,6 +14,7 @@ import type { Clip, MediaInfo, MediaRef, ProjectFile } from "../../core/types";
 import { trapTab } from "../../ui/focus";
 import { icon } from "../../ui/icons";
 import { toast } from "../../ui/toast";
+import { clampCrop } from "../preview/canvas-math";
 import type { MediaManager } from "./media";
 
 export interface RelinkCtx {
@@ -30,11 +32,18 @@ export interface RelinkCtx {
  * without touching speed). Returns null when nothing needs to change. Identity
  * (timelineStart/speed/keyframes) is the caller's to preserve; this only reports
  * the new srcIn/srcOut. Degenerate case `dur < minSrcLen`: best-effort [0, dur].
+ *
+ * A non-positive (or non-finite) `dur` carries NO information about the source
+ * and is refused outright: ffprobe reports images as `duration: 0` (png_pipe
+ * has no duration field at all), and clamping into [0, 0] would silently
+ * collapse the clip to zero length, drop it off the timeline and let autosave
+ * write that loss to disk 500 ms later.
  */
 export function clampSrcWindow(
   clip: Pick<Clip, "srcIn" | "srcOut" | "speed">,
   dur: number,
 ): { srcIn: number; srcOut: number } | null {
+  if (!(dur > 0)) return null; // no usable source length (image / unknown)
   if (clip.srcIn >= 0 && clip.srcOut <= dur) return null; // fits already
   const minSrcLen = MIN_CLIP_DUR * clip.speed; // source-seconds for one min clip
   const srcOut = Math.min(clip.srcOut, dur);
@@ -42,8 +51,13 @@ export function clampSrcWindow(
   return { srcIn, srcOut };
 }
 
-/** Clamp every clip's source window for `mediaId` into the shorter source `maxDur`. */
-function clampClipsToDuration(p: ProjectFile, mediaId: string, maxDur: number): ProjectFile {
+/** Clamp every clip's source window for `mediaId` into the shorter source
+ *  `maxDur`. Images are skipped entirely: they legitimately have no source
+ *  duration (`trimClip` gives them `srcMax = Infinity` for the same reason), so
+ *  their probed 0 is an absence of information, not a zero-length file.
+ *  Exported for the regression tests. */
+export function clampClipsToDuration(p: ProjectFile, mediaId: string, maxDur: number): ProjectFile {
+  if (findMedia(p, mediaId)?.kind === "image") return p;
   let q = p;
   for (const track of q.timeline.tracks) {
     for (const c of track.clips) {
@@ -52,6 +66,73 @@ function clampClipsToDuration(p: ProjectFile, mediaId: string, maxDur: number): 
       if (w) q = updateClip(q, c.id, (cl) => ({ ...cl, srcIn: w.srcIn, srcOut: w.srcOut }));
     }
   }
+  return q;
+}
+
+/** Clamp every clip's crop rect for `mediaId` into the media's CURRENT frame.
+ *  A relinked file may be smaller than the original, which would leave the crop
+ *  window hanging outside the frame — the preview and the export filtergraph
+ *  then disagree about the visible region. No-op when the media has no known
+ *  dimensions (audio) or no clip crops anything. Exported for the tests. */
+export function clampClipCrops(p: ProjectFile, mediaId: string): ProjectFile {
+  const m = findMedia(p, mediaId);
+  const w = m?.width;
+  const h = m?.height;
+  if (!w || !h) return p;
+  let q = p;
+  for (const track of q.timeline.tracks) {
+    for (const c of track.clips) {
+      if (c.mediaId !== mediaId) continue;
+      const crop = c.transform?.crop;
+      if (!crop) continue;
+      const next = clampCrop(crop, w, h);
+      if (next.x === crop.x && next.y === crop.y && next.w === crop.w && next.h === crop.h) continue;
+      q = updateClip(q, c.id, (cl) => ({
+        ...cl,
+        transform: { ...cl.transform!, crop: next },
+      }));
+    }
+  }
+  return q;
+}
+
+/** Every OPTIONAL MediaRef field, blanked. `updateMedia` merges, so a patch
+ *  built only from the fresh probe would leave the OLD file's value in place
+ *  for any field the new file doesn't report (a relinked audio file has no
+ *  width/height; a plain file has no generator). Spreading this first makes the
+ *  probe authoritative for the whole record. `undefined` values vanish on
+ *  JSON.stringify, so nothing extra is written to the `.trt`. */
+const BLANK_OPTIONAL_MEDIA: Partial<MediaRef> = {
+  fps: undefined,
+  width: undefined,
+  height: undefined,
+  container: undefined,
+  vcodec: undefined,
+  acodec: undefined,
+  pixFmt: undefined,
+  bitDepth: undefined,
+  audioRate: undefined,
+  audioChannels: undefined,
+  generator: undefined,
+};
+
+/** Point `mediaId` at a freshly probed file and repair everything that derives
+ *  from the media's identity. Pure — exported for the regression tests. */
+export function applyRelink(
+  p: ProjectFile,
+  mediaId: string,
+  path: string,
+  info: MediaInfo,
+): ProjectFile {
+  // Replace the ENTIRE probed record, not just path/size/mtime/duration. The
+  // dialog explicitly allows a mismatched file ("Use anyway"), so kind, width,
+  // height, fps and hasAudio can all change — and stale dims make
+  // computeTransformInto fit to the OLD aspect (stretching the video), clamp
+  // crop against the old frame, and size the export's alphamerge mask from
+  // dimensions the source no longer has.
+  let q = updateMedia(p, mediaId, { ...BLANK_OPTIONAL_MEDIA, ...info, path });
+  q = clampClipsToDuration(q, mediaId, info.duration);
+  q = clampClipCrops(q, mediaId);
   return q;
 }
 
@@ -114,16 +195,7 @@ export function openRelinkDialog(ctx: RelinkCtx): void {
 
   /** Apply a probed replacement for a media id. */
   function apply(m: MediaRef, path: string, info: MediaInfo): void {
-    session.commit((p) => {
-      let q = updateMedia(p, m.id, {
-        path,
-        size: info.size,
-        mtimeMs: info.mtimeMs,
-        duration: info.duration,
-      });
-      q = clampClipsToDuration(q, m.id, info.duration);
-      return q;
-    });
+    session.commit((p) => applyRelink(p, m.id, path, info));
     media.retrack(m.id);
     resolved.add(m.id);
     markResolved(m.id, path);

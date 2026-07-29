@@ -108,10 +108,14 @@ function resolvePose(
   let opacity = tr.opacity;
   if (kfs) {
     const s = sourceTime(clip, t - clip.timelineStart);
-    if (kfs.x) x = evalKfs(kfs.x, s);
-    if (kfs.y) y = evalKfs(kfs.y, s);
-    if (kfs.scale) scale = evalKfs(kfs.scale, s);
-    if (kfs.opacity) opacity = evalKfs(kfs.opacity, s);
+    // Length-based gates, NOT truthiness: schema.rs types keyframes as
+    // Option<Vec<Keyframe>>, so a shared .trt can legally carry "x": [] — and
+    // [] is truthy while evalKfs throws on an empty array (which, from here,
+    // takes down the whole editor mount). An empty track means "not animated".
+    if (kfs.x?.length) x = evalKfs(kfs.x, s);
+    if (kfs.y?.length) y = evalKfs(kfs.y, s);
+    if (kfs.scale?.length) scale = evalKfs(kfs.scale, s);
+    if (kfs.opacity?.length) opacity = evalKfs(kfs.opacity, s);
   }
   const p = out ?? ({ crop: { x: 0, y: 0, w: 0, h: 0 }, axis: { rotate: 0, flipH: false, flipV: false } } as ResolvedPose);
   p.x = x; p.y = y; p.scale = scale; p.opacity = opacity;
@@ -386,6 +390,14 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
 
     place(chrome.window, win.cx, win.cy, win.w, win.h, s);
     place(chrome.ghost, ghostCx, ghostCy, ghostW, ghostH, s);
+    // Generated media renders at intrinsic px in the ghost too, so it must be
+    // SCALED like the live layer (applyIntrinsicScale) rather than stretched by
+    // a 100%-sized box around unscaled glyphs. Same k * stageScale factor; k
+    // moves with the ghostzoom gesture, so this belongs in the render pass (the
+    // sig above already busts whenever ghostW/s change).
+    if (media.generator && chrome.ghostMedia) {
+      chrome.ghostMedia.style.transform = `scale(${k * s})`;
+    }
     // veil covers the whole overlay; the window "hole" is faked with a box-shadow
     // on the window element (see CSS). Nothing to size on the veil.
   }
@@ -549,7 +561,9 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     const found = findClip(session.project, clipId);
     if (!found) return;
     const clip = found.clip;
-    const hasPosKf = !!(clip.keyframes?.x || clip.keyframes?.y);
+    // length-based, matching resolvePose: an empty track is NOT animated, so a
+    // drag must edit the static transform rather than convert [] into a keyframe.
+    const hasPosKf = !!(clip.keyframes?.x?.length || clip.keyframes?.y?.length);
     let next: ProjectFile;
     if (hasPosKf) {
       next = setPositionKeyframes(session.project, clipId, keySrcTime, x, y);
@@ -568,7 +582,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     const found = findClip(session.project, clipId);
     if (!found) return;
     const clip = found.clip;
-    const hasScaleKf = !!clip.keyframes?.scale;
+    const hasScaleKf = !!clip.keyframes?.scale?.length; // length-based, see applyPosition
     let next: ProjectFile;
     if (hasScaleKf) {
       next = setKeyframe(session.project, clipId, "scale", keySrcTime, scale);
@@ -685,10 +699,14 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     destroyGhostMedia();
     let el: HTMLElement;
     if (media.generator) {
-      // clone the live gen div for this layer if present, else an empty box
+      // A box at the generator's INTRINSIC size, scaled by renderCrop — the same
+      // treatment the live gen layer gets (styleGen + applyIntrinsicScale), so
+      // ghost and layer show identically-sized glyphs. A 100%-sized flex-centred
+      // box did neither: it stretched around text that never scaled.
       el = document.createElement("div");
-      el.style.width = "100%";
-      el.style.height = "100%";
+      el.style.width = `${media.width ?? 0}px`;
+      el.style.height = `${media.height ?? 0}px`;
+      el.style.transformOrigin = "0 0";
       if (media.generator.type === "solid") {
         el.style.background = media.generator.color;
       } else {
@@ -696,9 +714,6 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
         el.style.color = g.color;
         el.style.whiteSpace = "pre";
         el.style.lineHeight = "1.25";
-        el.style.display = "flex";
-        el.style.alignItems = "center";
-        el.style.justifyContent = "center";
         const style = g.italic ? "italic" : "normal";
         const weight = g.bold ? "bold" : "normal";
         el.style.font = `${style} ${weight} ${g.sizePx}px ${g.fontFamily}`;
@@ -758,12 +773,17 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
      *  values already mutated earlier in the same gesture. */
     startScaleKfs: { t: number; v: number }[] | null;
     startEffScale: number;
+    /** Keyframe source time frozen at gesture start, mirroring the move/scale
+     *  gesture's keySrcTime: every position upsert during the gesture edits ONE
+     *  keyframe instead of scattering a new one per pointermove. */
+    keySrcTime: number;
   }
   let cropGesture: CropGesture | null = null;
 
   function cropContext(): {
     pose: PoseState; axis: Axis; srcW: number; srcH: number; k: number;
     startScaleKfs: { t: number; v: number }[] | null; startEffScale: number;
+    keySrcTime: number;
   } | null {
     if (!cropClipId) return null;
     const found = findClip(session.project, cropClipId);
@@ -773,12 +793,15 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     const rp = resolvePose(found.clip, media, project(), engine.time);
     const proj = project();
     const k = fit(rp.crop.w, rp.crop.h, rp.axis.rotate, proj.width, proj.height) * rp.scale;
-    const scaleKfs = found.clip.keyframes?.scale ?? null;
+    // length-based: an empty scale track is static, so writeCropPose must take
+    // its static branch (the truthy [] otherwise swallowed the crop-zoom scale).
+    const scaleKfs = found.clip.keyframes?.scale?.length ? found.clip.keyframes.scale : null;
     return {
       pose: { crop: rp.crop, scale: rp.scale, x: rp.x, y: rp.y },
       axis: rp.axis, srcW: rp.srcW, srcH: rp.srcH, k,
       startScaleKfs: scaleKfs ? scaleKfs.map((k2) => ({ t: k2.t, v: k2.v })) : null,
       startEffScale: rp.scale,
+      keySrcTime: sourceTime(found.clip, engine.time - found.clip.timelineStart),
     };
   }
 
@@ -799,6 +822,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
         startClient: { x: e.clientX, y: e.clientY },
         k: cc.k, axis: cc.axis, srcW: cc.srcW, srcH: cc.srcH,
         startScaleKfs: cc.startScaleKfs, startEffScale: cc.startEffScale,
+        keySrcTime: cc.keySrcTime,
       };
       capture(overlay, e.pointerId);
       e.preventDefault();
@@ -834,6 +858,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
         ghostDiag: diag,
         ghostCenterClient: { x: gcx, y: gcy },
         startScaleKfs: cc.startScaleKfs, startEffScale: cc.startEffScale,
+        keySrcTime: cc.keySrcTime,
       };
       capture(overlay, e.pointerId);
       e.preventDefault();
@@ -892,7 +917,8 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
    *  keyframes, multiply every scale keyframe value by scale'/scale (relative to
    *  the FROZEN gesture-start values, so multi-move gestures don't compound) and
    *  write transform+keyframes atomically (per plan). Otherwise write the static
-   *  transform. Position/crop are always static fields on the transform. */
+   *  transform. Crop is always a static field on the transform; position follows
+   *  whichever channel actually drives the clip (see below). */
   function writeCropPose(clipId: string, pose: PoseState, g: CropGesture): void {
     const found = findClip(session.project, clipId);
     if (!found) return;
@@ -900,19 +926,41 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     const tr = transformOf(clip);
     const crop = clampCrop(pose.crop, media_srcW(clip), media_srcH(clip));
 
+    // Position write target. resolvePose IGNORES transform.x/y whenever the clip
+    // has x/y keyframes, so a new position written there is silently dropped and
+    // the media slides out from under the crop window while a window handle is
+    // dragged. Route it through setPositionKeyframes at the frozen gesture time
+    // instead — exactly what applyPosition already does for a plain drag. Only
+    // op 1 (window handle) moves the position at all; ghostpan/ghostzoom return
+    // the start x/y unchanged, so they must not upsert a keyframe.
+    const hasPosKf = !!(clip.keyframes?.x?.length || clip.keyframes?.y?.length);
+    const nextTr = hasPosKf ? { ...tr, crop } : { ...tr, crop, x: pose.x, y: pose.y };
+
     let next: ProjectFile;
     if (g.startScaleKfs && g.startEffScale > 1e-6) {
       const factor = pose.scale / g.startEffScale;
-      const scaledKfs = g.startScaleKfs.map((k) => ({ t: k.t, v: k.v * factor }));
+      // Clamp EVERY scaled value, not just the pose. canvas-math clamps
+      // pose.scale to [SCALE_MIN, SCALE_MAX], but the factor it implies is
+      // unbounded: animate 0.2 → 4, park the playhead on the 0.2 keyframe and
+      // zoom the ghost to the clamp and factor = 20, i.e. [4, 80] — correct at
+      // the playhead, 20x oversized everywhere else. checkInvariants only
+      // rejects v <= 0, so nothing downstream catches it.
+      const scaledKfs = g.startScaleKfs.map((k) => ({
+        t: k.t,
+        v: clamp(k.v * factor, SCALE_MIN, SCALE_MAX),
+      }));
       next = updateClip(session.project, clipId, (c) => ({
         ...c,
-        transform: { ...tr, crop, x: pose.x, y: pose.y },
+        transform: nextTr,
         keyframes: { ...c.keyframes, scale: scaledKfs },
       }));
     } else {
       next = updateClip(session.project, clipId, {
-        transform: { ...tr, crop, x: pose.x, y: pose.y, scale: pose.scale },
+        transform: { ...nextTr, scale: pose.scale },
       });
+    }
+    if (hasPosKf && g.kind === "window") {
+      next = setPositionKeyframes(next, clipId, g.keySrcTime, pose.x, pose.y);
     }
     session.replace(next);
     ctx.refresh();

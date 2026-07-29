@@ -6,20 +6,23 @@ use serde_json::Value;
 
 use crate::error::Result;
 use crate::paths;
-use crate::project::store::atomic_write;
+use crate::project::store::{atomic_write, read_json_with_bak};
 
 fn settings_path() -> Result<std::path::PathBuf> {
     Ok(paths::data_dir()?.join("settings.json"))
 }
 
+/// The stored settings, or `None` when there are none to restore (first run, or
+/// both copies unreadable) so the frontend applies its defaults.
+///
+/// A truncated/corrupt settings.json used to silently return `None` here — every
+/// preference reset to defaults, and the next save then rotated the last GOOD
+/// copy out of `settings.json.bak` for good. `atomic_write` has been keeping
+/// that backup all along; now it is actually consulted.
 #[tauri::command]
 pub fn get_settings() -> Result<Option<Value>> {
     let path = settings_path()?;
-    match std::fs::read(&path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    Ok(read_json_with_bak::<Value>(&path).0)
 }
 
 #[tauri::command]

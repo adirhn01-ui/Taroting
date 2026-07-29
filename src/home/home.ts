@@ -9,7 +9,7 @@ import {
   formatDuration,
   formatRelative,
 } from "../core/format";
-import { describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles, pickProjectFile } from "../core/ipc";
+import { appVersion, describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles, pickProjectFile } from "../core/ipc";
 import { navigate } from "../core/nav";
 import { addMedia, createProject } from "../core/project";
 import { MEDIA_FILE_EXTENSIONS } from "../core/types";
@@ -69,7 +69,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   root.innerHTML = `
     <div class="home">
       <header class="home__header">
-        <div class="home__brand"><span class="home__brand-mark">T</span>Taroting</div>
+        <div class="home__brand"><span class="home__brand-mark">T</span>Taroting<span class="home__version" id="home-version"></span></div>
         <button class="btn btn--ghost btn--icon" id="home-settings" title="Settings">${icon("gear")}</button>
       </header>
       <main class="home__main">
@@ -685,6 +685,14 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
 
   void refresh();
   search.focus();
+
+  // Answers "which build am I actually running" at a glance, with no trip to
+  // Settings. Filled in after first paint so it never delays the home screen.
+  void appVersion().then((v) => {
+    if (disposed || !v) return;
+    const el = root.querySelector("#home-version");
+    if (el) el.textContent = v;
+  });
 
   return {
     dispose() {

@@ -11,6 +11,7 @@ import {
   addMedia,
   addVideoTrack,
   findClip,
+  findMedia,
   findTrack,
   insertClip,
   makeClip,
@@ -29,7 +30,7 @@ import { ShortcutManager } from "../core/shortcuts";
 import { Store } from "../core/store";
 import { clipEnd, locate } from "../core/time";
 import { MEDIA_FILE_EXTENSIONS } from "../core/types";
-import type { Clip, MediaInfo, MediaRef, ProjectFile, Track } from "../core/types";
+import type { ActionId, Clip, MediaInfo, MediaRef, ProjectFile, Track } from "../core/types";
 import { icon } from "../ui/icons";
 import { showMenu } from "../ui/menu";
 import { toast } from "../ui/toast";
@@ -71,6 +72,21 @@ export async function mountEditor(
 
   const session = new ProjectSession(projectPath, loaded.project);
   currentSession.set(session);
+  // A quick-view session is a throwaway file that startup cleanup deletes, so
+  // ANY route away from it must offer keep-or-discard first. Back/Ctrl+W/gear
+  // already call confirmLeaveTemp directly; this guard covers the one path that
+  // did not — an OS "open with" request arriving from File Explorer, which
+  // navigated straight past the prompt and silently destroyed the work.
+  // (confirmLeaveTemp is a hoisted declaration; the guard only runs later.)
+  if (temp) {
+    session.leaveGuard = () =>
+      new Promise<boolean>((resolve) =>
+        confirmLeaveTemp(
+          () => resolve(true),
+          () => resolve(false),
+        ),
+      );
+  }
   const media = new MediaManager(() => session.project);
   await media.init();
   media.ensureAll(session.project);
@@ -335,6 +351,13 @@ export async function mountEditor(
     },
     paste(): void {
       if (!clipboard) return;
+      // The clipboard outlives its media: removeMediaCascade drops the media and
+      // every clip that references it, but knows nothing about this module-local
+      // deep clone. Pasting it would insert a clip whose mediaId resolves to
+      // nothing — checkInvariants reports "unknown media", it renders as a
+      // nameless gap with no inspector, and the dangling reference reaches the
+      // exporter. Bail instead.
+      if (!findMedia(session.project, clipboard.clip.mediaId)) return;
       const at = engine.time;
       const { clip, kind } = clipboard;
       commit((p) => {
@@ -1034,8 +1057,15 @@ export async function mountEditor(
   // Confirm leaving a temp quick-view: Keep promotes then navigates, Discard
   // deletes then navigates, Cancel stays put with no side effects. Reuses the app
   // modal pattern + trapTab (as in the delete-layer / home delete dialogs).
-  function confirmLeaveTemp(dest: () => void): void {
-    if (keeping) return;
+  // `onCancel` MUST fire on every path that does not reach `dest()`, including
+  // the re-entrancy bail below: an OS open-path request awaits this decision, and
+  // a promise that never settles would stall the open queue for the rest of the
+  // session.
+  function confirmLeaveTemp(dest: () => void, onCancel?: () => void): void {
+    if (keeping) {
+      onCancel?.();
+      return;
+    }
     keeping = true;
 
     const backdrop = document.createElement("div");
@@ -1064,6 +1094,7 @@ export async function mountEditor(
       document.removeEventListener("keydown", onKey, true);
       backdrop.remove();
       keeping = false;
+      onCancel?.();
     };
     // Commit path (keep/discard): tear down the modal but KEEP the guard held —
     // the async promote/delete is still in flight and must not be re-entered.
@@ -1081,6 +1112,7 @@ export async function mountEditor(
       } catch (e) {
         keeping = false;
         toast.error(`Couldn't save this project: ${describeError(e)}`);
+        onCancel?.();
         return; // stay in the editor so the work isn't lost silently
       }
       dest();
@@ -1210,28 +1242,54 @@ export async function mountEditor(
 
   const shortcuts = new ShortcutManager();
   shortcuts.setBindings(settingsStore.get().shortcuts);
-  shortcuts.on("playPause", () => engine.toggle());
-  shortcuts.on("stop", () => engine.stop());
-  shortcuts.on("stepFwd", () => engine.stepFrames(1));
-  shortcuts.on("stepBack", () => engine.stepFrames(-1));
-  shortcuts.on("jumpFwd", () => engine.jumpSeconds(1));
-  shortcuts.on("jumpBack", () => engine.jumpSeconds(-1));
-  shortcuts.on("goStart", () => engine.seek(0));
-  shortcuts.on("goEnd", () => engine.seek(engine.duration()));
-  shortcuts.on("split", () => actions.split());
-  shortcuts.on("delete", () => actions.remove());
-  shortcuts.on("rippleDelete", () => actions.ripple());
-  shortcuts.on("undo", () => actions.undo());
-  shortcuts.on("redo", () => actions.redo());
-  shortcuts.on("save", () => void session.save());
-  shortcuts.on("copy", () => actions.copy());
-  shortcuts.on("paste", () => actions.paste());
-  shortcuts.on("toggleSnap", () => snapBtn.click());
-  shortcuts.on("toggleLoop", () => loopBtn.click());
-  shortcuts.on("addMarker", addMarker);
-  shortcuts.on("export", () => openExportDialog({ session }));
-  shortcuts.on("goHome", () => goHome());
-  shortcuts.on("fullscreen", () => theater.toggle());
+
+  // Modal guard. Nothing else stops a global shortcut from firing behind an open
+  // dialog: trapTab only cycles focus, each dialog's own keydown handler takes
+  // Escape (+ sometimes Enter) and nothing more, and isTypingTarget returns
+  // FALSE for <button>, <body> and checkboxes. So with the export dialog open,
+  // clicking any Format button re-renders the form — focus falls back to <body>
+  // — and Delete then deleted the selected clip invisibly behind the modal; S
+  // split, M dropped a marker, Space started playback.
+  //
+  // A predicate, not detach()/attach(): dialogs are opened from files this
+  // module doesn't own (export, generators, relink, inspector) and none of them
+  // expose a close callback to re-attach on, so an attach/detach pair would need
+  // a new seam in each — and would silently regress the moment someone adds a
+  // dialog. `.modal-backdrop` is the app-wide modal marker (every dialog in the
+  // tree builds one) and home.ts already guards its Esc handler exactly this
+  // way. Cost is one querySelector per BOUND chord press, i.e. human-rate.
+  // Every dialog in the app builds a `.modal-backdrop`, so this covers current
+  // and future modals with no per-dialog wiring — none of them expose a close
+  // callback to hook. Held by the manager rather than each handler so a
+  // suppressed chord is not preventDefault()ed either: before this, pressing
+  // Delete with the export dialog open silently deleted the selected clip
+  // behind it, and Space started playback.
+  const modalOpen = (): boolean => document.querySelector(".modal-backdrop") !== null;
+  shortcuts.setSuppressed(modalOpen);
+  const bind = (action: ActionId, handler: () => void): void => shortcuts.on(action, handler);
+
+  bind("playPause", () => engine.toggle());
+  bind("stop", () => engine.stop());
+  bind("stepFwd", () => engine.stepFrames(1));
+  bind("stepBack", () => engine.stepFrames(-1));
+  bind("jumpFwd", () => engine.jumpSeconds(1));
+  bind("jumpBack", () => engine.jumpSeconds(-1));
+  bind("goStart", () => engine.seek(0));
+  bind("goEnd", () => engine.seek(engine.duration()));
+  bind("split", () => actions.split());
+  bind("delete", () => actions.remove());
+  bind("rippleDelete", () => actions.ripple());
+  bind("undo", () => actions.undo());
+  bind("redo", () => actions.redo());
+  bind("save", () => void session.save());
+  bind("copy", () => actions.copy());
+  bind("paste", () => actions.paste());
+  bind("toggleSnap", () => snapBtn.click());
+  bind("toggleLoop", () => loopBtn.click());
+  bind("addMarker", addMarker);
+  bind("export", () => openExportDialog({ session }));
+  bind("goHome", () => goHome());
+  bind("fullscreen", () => theater.toggle());
   shortcuts.attach();
 
   const unsubSettings = settingsStore.subscribe((s) => shortcuts.setBindings(s.shortcuts));

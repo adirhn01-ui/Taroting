@@ -280,6 +280,16 @@ pub fn execute_ffmpeg(
     let stderr = child.stderr.take();
     handle.attach_child(child);
 
+    // Re-check: a cancel landing between the check above and this attach found
+    // no child to kill, so ffmpeg ran the whole export at 100% CPU with no way
+    // to stop it. Now that the child is reachable, honor that cancel.
+    if handle.is_canceled() {
+        if let Some(mut c) = handle.take_child() {
+            let _ = c.kill();
+        }
+        return Err(JobFailure::new("canceled"));
+    }
+
     // stderr tail collector
     let tail = Arc::new(Mutex::new(Vec::<String>::new()));
     let tail_writer = Arc::clone(&tail);

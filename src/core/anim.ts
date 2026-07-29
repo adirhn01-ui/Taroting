@@ -80,8 +80,20 @@ export class KfCursor {
   }
 }
 
-/** Return a NEW sorted array with a keyframe upserted at source time t:
- *  replaces any keyframe within eps of t, otherwise inserts in order. */
+/** Return a NEW strictly-ascending array with a keyframe upserted at source
+ *  time t: replaces the NEAREST keyframe within eps of t, otherwise inserts in
+ *  order.
+ *
+ *  Nearest — not first — because eps can span more than one existing keyframe.
+ *  eps is half a source frame at 60fps, but adjacent frames are only
+ *  `frameDuration * speed` apart in SOURCE seconds, so at speed <= 0.5 (both
+ *  offered in the Speed dropdown) neighbouring frames fall inside eps of each
+ *  other. Overwriting the first match in place then wrote the new `t` into a
+ *  slot that no longer precedes its successor, producing a DESCENDING pair —
+ *  which floorIndex/KfCursor binary-search wrongly and clampedBreakpoints
+ *  emits as decreasing timestamps into the export expression. Removing the
+ *  matched entry and re-inserting at the ordered position keeps the array
+ *  strictly ascending by construction. */
 export function upsertKf(
   kfs: Keyframe[] | undefined,
   t: number,
@@ -90,13 +102,17 @@ export function upsertKf(
 ): Keyframe[] {
   const out: Keyframe[] = kfs ? [...kfs] : [];
   const kf: Keyframe = { t, v };
-  // replace within eps
+  // drop the nearest keyframe within eps (same rule as kfNear/removeKfNear)
+  let match = -1;
+  let bestD = eps;
   for (let i = 0; i < out.length; i++) {
-    if (Math.abs(out[i]!.t - t) <= eps) {
-      out[i] = kf;
-      return out;
+    const d = Math.abs(out[i]!.t - t);
+    if (d <= bestD) {
+      bestD = d;
+      match = i;
     }
   }
+  if (match >= 0) out.splice(match, 1);
   // insert keeping ascending order
   let idx = out.length;
   for (let i = 0; i < out.length; i++) {

@@ -22,3 +22,6 @@ Thumbs.db
 .claude/
 AGENTS.md
 CLAUDE.md
+
+# local process notes (manual QA regime)
+TESTING.md

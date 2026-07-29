@@ -129,6 +129,19 @@
   font-style: italic;
 }
 
+/* ---------- About ---------- */
+/* Selectable on purpose: the screen root sets user-select:none, and a version
+   you can read but can't copy is the same papercut as the un-copyable error log
+   that prompted the v0.7.3 reporting work. */
+.settings__version {
+  font-size: var(--fs-13);
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  user-select: text;
+  cursor: text;
+}
+
 /* ---------- Cache ---------- */
 .settings__cache-total {
   font-size: var(--fs-14);

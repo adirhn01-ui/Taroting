@@ -5,7 +5,7 @@ import { fileExt, fileStem } from "./core/format";
 import { describeError, inTauri, ipc, onOpenPath } from "./core/ipc";
 import { navigate, setNavigator, type Route } from "./core/nav";
 import { createProject, importMediaAsClip } from "./core/project";
-import { initSettings, settingsStore } from "./core/session";
+import { confirmLeaveCurrentSession, initSettings, settingsStore } from "./core/session";
 import { MEDIA_FILE_EXTENSIONS } from "./core/types";
 import { mountHome } from "./home/home";
 import { toast } from "./ui/toast";
@@ -108,7 +108,21 @@ function tempProjectsDirPrefix(): Promise<string> {
 
 async function routeOpenPath(path: string): Promise<void> {
   const ext = fileExt(path);
-  if (ext === "trt") {
+  const isProject = ext === "trt";
+  if (!isProject && !MEDIA_FILE_EXTENSIONS.has(ext)) return; // unknown type: ignore
+
+  // An OS open-path replaces whatever is on screen WITHOUT going through any of
+  // the editor's own exits (Back, Ctrl+W, the Settings gear), so it has to
+  // honour the same leave gate they do. Without this, opening a second file
+  // while a quick-view project is live disposes the editor past its
+  // keep/discard prompt: the session flushes into the temp scratch file, which
+  // the next launch's temp sweep deletes — and temp projects are excluded from
+  // recents, so there is no way back. Resolves true (no gate installed, or the
+  // user chose Keep/Discard); false cancels this open entirely, before any
+  // project file is created.
+  if (!(await confirmLeaveCurrentSession())) return;
+
+  if (isProject) {
     // A .trt that physically lives in the temp-projects dir is a live quick-view
     // scratch file: route it as temp so the editor shows the Temporary badge and
     // applies the keep gate on exit, matching the recents exclusion the backend
@@ -118,7 +132,6 @@ async function routeOpenPath(path: string): Promise<void> {
     navigate(temp ? { view: "editor", projectPath: path, temp: true } : { view: "editor", projectPath: path });
     return;
   }
-  if (!MEDIA_FILE_EXTENSIONS.has(ext)) return; // unknown type: ignore
   // Quick-view: with the setting on, an open-with media file becomes a
   // temporary project in the temp dir (never in recents) until the user chooses
   // to keep it when leaving the editor. Off → the classic permanent flow,

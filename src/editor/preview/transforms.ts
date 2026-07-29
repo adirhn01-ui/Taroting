@@ -35,6 +35,10 @@ export interface ComputedTransform {
   offX: number;
   offY: number;
   opacity: number;
+  /** The composite magnitude factor fit * userScale, in project px per source
+   *  px. cropW/mediaW already bake it in; it is exposed for layers that must be
+   *  SCALED rather than resized (see applyIntrinsicScale). */
+  k: number;
 }
 
 /** Alloc-free core: writes the computed transform into a caller-owned scratch
@@ -81,6 +85,7 @@ export function computeTransformInto(
   out.offX = 0 - crop.x * k;
   out.offY = 0 - crop.y * k;
   out.opacity = opacity;
+  out.k = k;
 }
 
 /** Pure math: everything in project-canvas px, pre stage scaling. */
@@ -91,7 +96,7 @@ export function computeTransform(
 ): ComputedTransform {
   const out: ComputedTransform = {
     posX: 0, posY: 0, rotate: 0, flipH: false, flipV: false,
-    cropW: 0, cropH: 0, mediaW: 0, mediaH: 0, offX: 0, offY: 0, opacity: 1,
+    cropW: 0, cropH: 0, mediaW: 0, mediaH: 0, offX: 0, offY: 0, opacity: 1, k: 1,
   };
   computeTransformInto(out, transform, media, project);
   return out;
@@ -113,4 +118,23 @@ export function applyTransform(layer: LayerBoxes, c: ComputedTransform, stageSca
   layer.media.style.width = `${c.mediaW * s}px`;
   layer.media.style.height = `${c.mediaH * s}px`;
   layer.media.style.transform = `translate(${c.offX * s}px, ${c.offY * s}px)`;
+}
+
+/** Generated media renders at intrinsic px, so it must be SCALED, not resized:
+ *  keep the box at source size and apply k * stageScale.
+ *
+ *  Resizing works for <video>/<img> because the raster content stretches with
+ *  the box, but a <div>'s width says nothing about its glyphs — a text
+ *  generator resized to mediaW*s keeps drawing sizePx-tall letters inside a
+ *  correctly-sized box. Composing translate() with scale() (transform-origin
+ *  0 0, see .stage-layer__gen) reproduces applyTransform's exact geometry —
+ *  top-left at (offX*s, offY*s), extent srcW*k*s — while actually scaling the
+ *  content. Call it AFTER applyTransform: it deliberately overwrites the
+ *  width/height/transform that applyTransform just wrote. */
+export function applyIntrinsicScale(
+  el: HTMLElement, c: ComputedTransform, srcW: number, srcH: number, s: number,
+): void {
+  el.style.width = `${srcW}px`;
+  el.style.height = `${srcH}px`;
+  el.style.transform = `translate(${c.offX * s}px, ${c.offY * s}px) scale(${c.k * s})`;
 }

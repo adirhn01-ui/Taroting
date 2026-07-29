@@ -6,12 +6,19 @@
 
 import "./settings.css";
 import { escapeHtml, formatBytes } from "../core/format";
-import { describeError, ipc } from "../core/ipc";
+import { appVersion, describeError, ipc } from "../core/ipc";
 import { navigate } from "../core/nav";
-import { settingsStore, updateSettings } from "../core/session";
+import { currentSession, settingsStore, updateSettings } from "../core/session";
 import { chordOf, findConflicts, normalizeChord } from "../core/shortcuts";
 import type { ActionId, Settings } from "../core/types";
 import { DEFAULT_SHORTCUTS } from "../core/types";
+import {
+  copyText,
+  formatRecentErrors,
+  openErrorDialog,
+  recentErrors,
+  recordError,
+} from "../ui/errors";
 import { trapTab } from "../ui/focus";
 import { icon } from "../ui/icons";
 import { toast } from "../ui/toast";
@@ -93,7 +100,9 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     .addEventListener("click", () => navigate({ view: "home" }));
 
   let cacheStats: CacheStats | null = null;
-  let cacheStatsError = false;
+  /** null = fine; a string = the reason, kept so the user can read it instead
+   *  of only being told "something went wrong". */
+  let cacheStatsError: string | null = null;
   // Two-step "Clear cache" confirm and shortcut-capture state live outside the
   // render so we can suppress full re-renders while capturing.
   let clearConfirmTimer: number | undefined;
@@ -102,6 +111,8 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   let captureCleanup: (() => void) | null = null;
   // Set by dispose(): in-flight async work must not rebuild a detached DOM.
   let disposed = false;
+  /** Resolved once on mount; empty until then so the first paint isn't blocked. */
+  let appVer = "";
 
   /* ---------------- section builders ---------------- */
 
@@ -227,8 +238,10 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
 
   function cacheSection(s: Settings): string {
     let usageHtml: string;
-    if (cacheStatsError) {
-      usageHtml = `<div class="settings__hint">Couldn't read cache usage.</div>`;
+    if (cacheStatsError !== null) {
+      usageHtml = `
+        <div class="settings__hint">Couldn't read cache usage.</div>
+        <div class="err-pane__actions"><button class="btn btn--sm btn--ghost" id="settings-cache-error">Details</button></div>`;
     } else if (!cacheStats) {
       usageHtml = `<div class="settings__hint">Reading cache usage</div>`;
     } else {
@@ -305,6 +318,50 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       </section>`;
   }
 
+  function diagnosticsSection(): string {
+    const n = recentErrors().length;
+    return `
+      <section class="card settings__card">
+        <div class="settings__section-head">Diagnostics</div>
+        <div class="settings__row">
+          <div class="settings__row-text">
+            <div class="settings__row-label">Recent errors</div>
+            <div class="settings__hint">${n === 0 ? "Nothing has failed this session." : `${n} this session. Kept in memory only, never written to disk.`}</div>
+          </div>
+          <button class="btn btn--sm" id="settings-view-errors" ${n === 0 ? "disabled" : ""}>View</button>
+        </div>
+        <div class="settings__row">
+          <div class="settings__row-text">
+            <div class="settings__row-label">System report</div>
+            <div class="settings__hint">App version, detected encoders and your settings, with file names and personal details removed. Nothing is sent anywhere — you choose where it goes.</div>
+          </div>
+          <div class="settings__row-actions">
+            <button class="btn btn--sm" id="settings-copy-report">Copy details</button>
+            <button class="btn btn--sm" id="settings-save-report">Save report</button>
+          </div>
+        </div>
+      </section>`;
+  }
+
+  // Sits between Diagnostics and Uninstall on purpose: the version is the first
+  // line of any bug report, so it belongs next to the report buttons — and the
+  // destructive card stays last. Deliberately app version only: the FFmpeg
+  // version would mean calling detectEncoders, which on a cold cache runs real
+  // test encodes and would stall this screen on open.
+  function aboutSection(): string {
+    return `
+      <section class="card settings__card">
+        <div class="settings__section-head">About</div>
+        <div class="settings__row">
+          <div class="settings__row-text">
+            <div class="settings__row-label">Version</div>
+            <div class="settings__hint">Free and open source. Taroting works entirely offline and makes no network calls.</div>
+          </div>
+          <div class="settings__version">${appVer ? escapeHtml(`Taroting ${appVer}`) : "Taroting"}</div>
+        </div>
+      </section>`;
+  }
+
   function dangerSection(): string {
     return `
       <section class="card settings__card settings__card--danger">
@@ -330,6 +387,8 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       performanceSection(s),
       cacheSection(s),
       shortcutsSection(s),
+      diagnosticsSection(),
+      aboutSection(),
       dangerSection(),
     ].join("");
     wire();
@@ -403,6 +462,35 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
         void updateSettings({ shortcuts: { ...DEFAULT_SHORTCUTS } });
       });
 
+    // Cache read failure → let the user actually read the reason
+    inner
+      .querySelector<HTMLButtonElement>("#settings-cache-error")
+      ?.addEventListener("click", () => {
+        openErrorDialog({
+          title: "Cache usage",
+          message: "Couldn't read cache usage.",
+          report: cacheStatsError ?? "",
+        });
+      });
+
+    // Diagnostics
+    inner
+      .querySelector<HTMLButtonElement>("#settings-view-errors")
+      ?.addEventListener("click", () => {
+        const list = recentErrors();
+        openErrorDialog({
+          title: "Recent errors",
+          message: `${list.length} error${list.length === 1 ? "" : "s"} this session. This list lives in memory only and is never written to disk.`,
+          report: formatRecentErrors(list),
+        });
+      });
+    inner
+      .querySelector<HTMLButtonElement>("#settings-copy-report")
+      ?.addEventListener("click", () => void copySystemReport());
+    inner
+      .querySelector<HTMLButtonElement>("#settings-save-report")
+      ?.addEventListener("click", () => void saveSystemReport());
+
     // Uninstall (danger zone)
     inner
       .querySelector<HTMLButtonElement>("#settings-uninstall")
@@ -431,7 +519,74 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
         await updateSettings({ defaultExportDir: result });
       }
     } catch (e) {
-      toast.error(`Couldn't pick a folder: ${describeError(e)}`);
+      toast.error("Couldn't pick a folder.", {
+        detail: describeError(e),
+        op: "Settings",
+        title: "Choose export folder",
+      });
+    }
+  }
+
+  /* ---------------- diagnostics ---------------- */
+
+  /** The same builder the export-failure view uses, with no failing operation:
+   *  a user can file a good "no hardware encoder detected" report before
+   *  anything has crashed. Built only when a button is pressed. */
+  async function systemReport(full: boolean): Promise<string> {
+    // Loaded on the button press, not on mount: opening Settings costs nothing.
+    const [{ buildReport }, version, encoders] = await Promise.all([
+      import("../core/diagnostics"),
+      appVersion(),
+      ipc.detectEncoders().catch(() => null),
+    ]);
+    const session = currentSession.get();
+    return buildReport({
+      at: new Date().toISOString(),
+      appVersion: version,
+      platform: navigator.platform || "",
+      userAgent: navigator.userAgent,
+      encoders,
+      project: session ? session.project : null,
+      settings: settingsStore.get(),
+      recentErrors: recentErrors(),
+      full,
+    });
+  }
+
+  async function copySystemReport(): Promise<void> {
+    const report = await systemReport(false);
+    // Building the report costs an ffmpeg probe on first run, which can outlive
+    // the click's transient activation — if the write is refused, hand the text
+    // over in a pane the user can copy from directly.
+    if (await copyText(report)) return;
+    openErrorDialog({
+      title: "System report",
+      message: "Select the text below and copy it.",
+      report,
+    });
+  }
+
+  async function saveSystemReport(): Promise<void> {
+    const report = await systemReport(true);
+    let path: string;
+    try {
+      path = await ipc.saveDiagnosticReport(report);
+    } catch (e) {
+      // The report itself rides along as the detail, so a failed write never
+      // costs the user the text they asked for.
+      toast.error("Couldn't save the report.", {
+        detail: `${describeError(e)}\n\n${report}`,
+        op: "Settings",
+        title: "System report",
+      });
+      return;
+    }
+    toast.info("Report saved");
+    try {
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(path);
+    } catch {
+      /* the file is written; showing it in Explorer is a nicety */
     }
   }
 
@@ -440,10 +595,12 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   async function loadCacheStats(): Promise<void> {
     try {
       cacheStats = await ipc.cacheStats();
-      cacheStatsError = false;
-    } catch {
+      cacheStatsError = null;
+    } catch (e) {
       cacheStats = null;
-      cacheStatsError = true;
+      cacheStatsError = describeError(e);
+      // Shown inline (with a Details button), so it belongs in the ring too.
+      recordError({ at: Date.now(), op: "Settings", message: "Couldn't read cache usage.", detail: cacheStatsError });
     }
     if (disposed) return; // resolved after the view went away — nothing to paint
     if (!capturing) render();
@@ -469,7 +626,11 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       const freed = await ipc.clearCache([]);
       toast.info(`Cleared ${formatBytes(freed)} of cache.`);
     } catch (e) {
-      toast.error(`Couldn't clear cache: ${describeError(e)}`);
+      toast.error("Couldn't clear cache.", {
+        detail: describeError(e),
+        op: "Settings",
+        title: "Clear cache",
+      });
     }
     await loadCacheStats();
   }
@@ -514,9 +675,13 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     backdrop.querySelector("[data-confirm]")!.addEventListener("click", () => {
       // On success the app process exits before this promise resolves; on
       // failure (e.g. a dev build with no registry entry) surface the error.
-      void ipc.uninstallApp().catch((e) => {
+      void ipc.uninstallApp().catch((e: unknown) => {
         close();
-        toast.error(`Couldn't uninstall: ${describeError(e)}`);
+        toast.error("Couldn't uninstall Taroting.", {
+          detail: describeError(e),
+          op: "Settings",
+          title: "Uninstall",
+        });
       });
     });
   }
@@ -569,6 +734,12 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
 
   render();
   void loadCacheStats();
+  // Cheap: appVersion() is a cached lazy import, so this only pays once per run.
+  void appVersion().then((v) => {
+    if (disposed || !v) return;
+    appVer = v;
+    if (!capturing) render();
+  });
 
   return {
     dispose() {

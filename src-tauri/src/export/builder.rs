@@ -85,6 +85,19 @@ pub fn font_path(family: &str, bold: bool, italic: bool) -> Option<String> {
     font_file(family, bold, italic).map(|f| format!(r"C:\Windows\Fonts\{f}.ttf"))
 }
 
+/// FreeType's line height as a fraction of font size, per whitelisted family.
+/// drawtext's pitch is `max_glyph_h + line_spacing`, so this makes the exported
+/// pitch equal the preview's fixed `line-height: 1.25`.
+fn line_height_em(family: &str) -> f64 {
+    match family {
+        "Segoe UI" => 1.3301,
+        "Georgia" => 1.1362,
+        "Courier New" => 1.1328,
+        "Impact" => 1.2197,
+        _ => 1.1499, // Arial, Times New Roman
+    }
+}
+
 /// Escape a filesystem path for use inside a drawtext filter option value:
 /// backslashes -> forward slashes, ':' -> '\:', then wrap in single quotes.
 /// A path containing a single quote cannot be represented and is rejected.
@@ -242,6 +255,10 @@ struct Placement {
     /// Post-crop source dims (before rotate), used to size the alphamerge mask.
     post_crop_w: i64,
     post_crop_h: i64,
+    /// Pre-crop source dims. A generated frame MUST be synthesized at this size:
+    /// crop/scale/alphamerge downstream all assume the chain starts here.
+    src_w: i64,
+    src_h: i64,
     /// fitW/fitH for animated scale (cropW*fit, cropH*fit) — the pre-userScale
     /// display size that the scale expression multiplies by S(t).
     fit_w: f64,
@@ -319,6 +336,8 @@ fn placement(clip: &Clip, media: &MediaRef, canvas_w: u32, canvas_h: u32) -> Pla
         opacity,
         post_crop_w: crop_w.round() as i64,
         post_crop_h: crop_h.round() as i64,
+        src_w: src_w.round().clamp(1.0, 16384.0) as i64,
+        src_h: src_h.round().clamp(1.0, 16384.0) as i64,
         fit_w: crop_w * fit,
         fit_h: crop_h * fit,
         x,
@@ -701,8 +720,14 @@ impl<'a> GraphGen<'a> {
     /// Emit the lavfi source chain for a generator, producing frames of the
     /// generated media at `dur` seconds. The returned expression is the head of
     /// the per-clip chain (a source, not a filtered stream label).
-    fn generator_source(&mut self, gen: &Generator, dur: f64) -> Result<String> {
-        let (w, h, fps) = (self.w, self.h, self.fps);
+    ///
+    /// `w`/`h` are the generated media's OWN recorded dims (`Placement::src_w/h`),
+    /// never the export canvas: crop, scale and the opacity alpha-mask are all
+    /// derived from `media.width/height`, so synthesizing at canvas size makes
+    /// the frame disagree with every downstream filter (an `alphamerge` "Input
+    /// frame sizes do not match" abort, and wrong geometry even without it).
+    fn generator_source(&mut self, gen: &Generator, w: i64, h: i64, dur: f64) -> Result<String> {
+        let fps = self.fps;
         match gen {
             Generator::Solid { color } => {
                 let (rgb, _) = parse_color(color);
@@ -723,7 +748,9 @@ impl<'a> GraphGen<'a> {
                 let (rgb, alpha) = parse_color(color);
                 let aa = alpha.unwrap_or_default();
                 let px = size_px.round().max(1.0) as i64;
-                let line_spacing = (0.25 * size_px).round() as i64;
+                // 1.25 mirrors LINE_HEIGHT in src/editor/media/generators.ts.
+                let line_spacing = (1.25 * size_px).round() as i64
+                    - (line_height_em(font_family) * size_px).round() as i64;
                 let idx = self.text_payloads.len();
                 let placeholder = text_placeholder(idx);
                 self.text_payloads.push((placeholder.clone(), text.clone()));
@@ -731,10 +758,14 @@ impl<'a> GraphGen<'a> {
                 // caller substitutes the escaped real path for the placeholder
                 // BEFORE deciding inline-vs-script filter mode.
                 let text_ref = escape_filter_path(&placeholder)?;
+                // boxw/boxh pin the layout box to the measured text box and
+                // text_align=L+M reproduces the DOM's `text-align: start` plus
+                // the half-leading that vertically centres the lines in it.
+                // No `box=1` — nothing is drawn, the box only positions.
                 Ok(format!(
                     "color=black@0.0:s={w}x{h}:r={fps}:d={dur:.6},format=rgba,\
 drawtext=fontfile={font_esc}:textfile={text_ref}:fontsize={px}:fontcolor=0x{rgb}{aa}:\
-x=0:y=0:line_spacing={line_spacing}:expansion=none"
+x=0:y=0:boxw={w}:boxh={h}:text_align=L+M:line_spacing={line_spacing}:expansion=none"
                 ))
             }
         }
@@ -896,7 +927,7 @@ enable='gte(t,{start:.6})*lt(t,{end:.6})'{out};"
             ClipInput::Generated(gen) => {
                 // generated media trim to clip_dur locally; speed still applies.
                 let src = self
-                    .generator_source(gen, clip_dur * clip.speed)
+                    .generator_source(gen, p.src_w, p.src_h, clip_dur * clip.speed)
                     .expect("generator source (font pre-checked)");
                 chain.push_str(&src);
                 chain.push_str(&format!(",trim=0:{:.6},setpts=(PTS-STARTPTS)/{:.6}", clip_dur * clip.speed, clip.speed));
@@ -923,9 +954,17 @@ enable='gte(t,{start:.6})*lt(t,{end:.6})'{out};"
             };
             let (cw, ch) = (p.post_crop_w.max(1), p.post_crop_h.max(1));
             let a = self.next_n();
+            // The mask MULTIPLIES the source alpha, it must not replace it: a
+            // bare alphamerge overwrites the alpha channel, so a text generator
+            // (or an alpha PNG) with an opacity keyframe exported as an opaque
+            // black rectangle with the text on it. Extract the incoming alpha,
+            // multiply it by the ramp mask, merge the product back. The three
+            // extra passes are paid only by clips that have an opacity keyframe.
             chain.push_str(&format!(
-                "[chain{a}];color=black:s=16x16:r={fps}:d={clip_dur:.6},format=gray,\
-geq=lum='255*({expr})',scale={cw}:{ch}[al{a}];[chain{a}][al{a}]alphamerge"
+                ",format=rgba[chain{a}];[chain{a}]split[cm{a}][ca{a}];[ca{a}]alphaextract[cx{a}];\
+color=black:s=16x16:r={fps}:d={clip_dur:.6},format=gray,geq=lum='255*({expr})',\
+scale={cw}:{ch}[al{a}];[cx{a}][al{a}]blend=all_mode=multiply[am{a}];\
+[cm{a}][am{a}]alphamerge"
             ));
         }
 
@@ -1228,7 +1267,11 @@ mod tests {
         }
     }
 
-    fn gen_media(id: &str, generator: Generator) -> MediaRef {
+    /// Generated media with EXPLICIT intrinsic dims. They are a parameter, not a
+    /// constant, because issue #1 was a canvas-vs-media size confusion: a fixture
+    /// whose dims happen to equal the canvas turns every generator test into a
+    /// no-op. Callers must pass dims that differ from the timeline on both axes.
+    fn gen_media(id: &str, generator: Generator, w: u32, h: u32) -> MediaRef {
         MediaRef {
             id: id.into(),
             path: "gen".into(),
@@ -1237,8 +1280,8 @@ mod tests {
             kind: "image".into(),
             duration: 0.0,
             fps: None,
-            width: Some(400),
-            height: Some(200),
+            width: Some(w),
+            height: Some(h),
             container: None,
             vcodec: None,
             acodec: None,
@@ -1750,12 +1793,14 @@ mod tests {
 
     #[test]
     fn solid_generator_is_lavfi_no_extra_input() {
-        let gm = gen_media("g1", Generator::Solid { color: "#ff0000".into() });
+        let gm = gen_media("g1", Generator::Solid { color: "#ff0000".into() }, 400, 200);
         let c = clip("c1", "g1", 0.0, 0.0, 3.0);
         let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
         let b = build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
         let fc = &b.filter_complex;
-        assert!(fc.contains("color=c=0xff0000:s=1920x1080"), "{fc}");
+        // The source is synthesized at the MEDIA's dims, not the canvas: the old
+        // `s=1920x1080` assertion pinned the bug behind issue #1.
+        assert!(fc.contains("color=c=0xff0000:s=400x200"), "{fc}");
         // generated media consume no -i input slot.
         let a = argstr(&b);
         assert_eq!(a.iter().filter(|s| s.as_str() == "-i").count(), 0);
@@ -1814,6 +1859,8 @@ mod tests {
                     bold: false,
                     italic: false,
                 },
+                400,
+                200,
             );
             let c = clip("c1", "g1", 0.0, 0.0, 2.0);
             let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
@@ -1842,7 +1889,7 @@ mod tests {
             color: "#ffffff".into(),
             bold: false,
             italic: false,
-        });
+        }, 620, 120);
         let c = clip("c1", "g1", 0.0, 0.0, 2.0);
         let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
         let b = build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
@@ -1873,7 +1920,7 @@ mod tests {
 
     #[test]
     fn generated_clip_with_speed_applies_setpts() {
-        let gm = gen_media("g1", Generator::Solid { color: "#00ff00".into() });
+        let gm = gen_media("g1", Generator::Solid { color: "#00ff00".into() }, 400, 200);
         let mut c = clip("c1", "g1", 0.0, 0.0, 4.0);
         c.speed = 2.0; // dur = (4-0)/2 = 2s
         let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
@@ -1894,10 +1941,178 @@ mod tests {
             size_px: 40.0,
             color: "#ffffff".into(),
             bold: false, italic: false,
-        });
+        }, 400, 200);
         let c = clip("c1", "g1", 0.0, 0.0, 2.0);
         let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
         let r = build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc());
         assert!(r.is_err());
+    }
+
+    /* -------- generator size / text metrics / alpha (issue #1) -------- */
+
+    #[test]
+    fn generator_with_opacity_keyframe_matches_alphamerge_sizes() {
+        // GitHub issue #1, with the reporter's exact numbers. A generator whose
+        // intrinsic size differs from the canvas plus ONE opacity keyframe used
+        // to abort ffmpeg with "[Parsed_alphamerge_N] Input frame sizes do not
+        // match (398x934 vs 270x114)": the source was synthesized at the CANVAS
+        // size while the alpha mask was sized from the MEDIA. Both halves of that
+        // pair must now read 270x114 — the frame and its mask agree.
+        let gm = gen_media("g1", Generator::Solid { color: "#ff0000".into() }, 270, 114);
+        let mut c = clip("c1", "g1", 0.0, 0.0, 3.0);
+        c.keyframes = Some(ClipKeyframes {
+            x: None, y: None, scale: None,
+            opacity: Some(vec![Keyframe { t: 0.0, v: 1.0 }]),
+        });
+        let tl = timeline(398, 934, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+        let b = build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc());
+        assert!(b.is_ok(), "build must succeed: {:?}", b.err());
+        let fc = &b.unwrap().filter_complex;
+        // the lavfi source frame …
+        assert!(fc.contains("color=c=0xff0000:s=270x114:"), "{fc}");
+        // … and the alpha mask scaled to meet it.
+        assert!(fc.contains("scale=270:114"), "{fc}");
+        // The generator must NOT be synthesized at the canvas size. (Asserting on
+        // a bare "s=398x934" would be wrong: the per-segment black base is
+        // legitimately canvas-sized. The bug lives in the GENERATOR source, so
+        // that is what this pins.)
+        assert!(!fc.contains("color=c=0xff0000:s=398x934"), "{fc}");
+    }
+
+    #[test]
+    fn generator_source_uses_media_dims_not_canvas() {
+        // 400x200 media on a 1920x1080 canvas: synthesize at 400x200, then let the
+        // normal fit-scale do the enlarging. fit = min(1920/400, 1080/200) = 4.8
+        // → 400*4.8 x 200*4.8 = 1920x960 (letterboxed, aspect preserved).
+        let gm = gen_media("g1", Generator::Solid { color: "#0000ff".into() }, 400, 200);
+        let c = clip("c1", "g1", 0.0, 0.0, 3.0);
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+        let b = build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        let fc = &b.filter_complex;
+        assert!(fc.contains("color=c=0x0000ff:s=400x200"), "{fc}");
+        assert!(fc.contains("scale=1920:960"), "{fc}");
+    }
+
+    #[test]
+    fn text_line_spacing_matches_preview_line_height() {
+        // The preview's line pitch is a fixed `line-height: 1.25`; drawtext's is
+        // `max_glyph_h + line_spacing`, and max_glyph_h is font-dependent. So
+        // line_spacing must be the DIFFERENCE, per family — never a flat 0.25em.
+        let size = 96.0_f64;
+        for family in [
+            "Segoe UI",
+            "Arial",
+            "Georgia",
+            "Times New Roman",
+            "Courier New",
+            "Impact",
+        ] {
+            let gm = gen_media(
+                "g1",
+                Generator::Text {
+                    text: "two\nlines".into(),
+                    font_family: family.into(),
+                    size_px: size,
+                    color: "#ffffff".into(),
+                    bold: false,
+                    italic: false,
+                },
+                620,
+                240,
+            );
+            let c = clip("c1", "g1", 0.0, 0.0, 2.0);
+            let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+            let b = build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+            let expect = (1.25 * size).round() as i64
+                - (line_height_em(family) * size).round() as i64;
+            assert!(
+                b.filter_complex.contains(&format!("line_spacing={expect}:")),
+                "{family}: expected line_spacing={expect} in {}",
+                b.filter_complex
+            );
+        }
+
+        // Segoe UI — the DEFAULT family — has a line height TALLER than 1.25em,
+        // so its correct line_spacing is NEGATIVE. ffmpeg honours that; clamping
+        // it to zero would over-space every default-font export.
+        let segoe = (1.25 * size).round() as i64
+            - (line_height_em("Segoe UI") * size).round() as i64;
+        assert_eq!(segoe, -8, "Segoe UI line_spacing at 96px");
+        assert!(segoe < 0, "Segoe UI must stay negative");
+        // …while the other five stay positive, so the sign is genuinely per-font.
+        for family in ["Arial", "Georgia", "Times New Roman", "Courier New", "Impact"] {
+            let v = (1.25 * size).round() as i64
+                - (line_height_em(family) * size).round() as i64;
+            assert!(v > 0, "{family} line_spacing should be positive, got {v}");
+        }
+    }
+
+    #[test]
+    fn text_is_centred_in_its_intrinsic_box() {
+        // drawtext now lays out inside a box the size of the MEASURED text box.
+        // Without it, P1's tighter canvas clips the glyphs. L = left (the DOM's
+        // `text-align: start`), M = middle (the DOM's half-leading).
+        let gm = gen_media(
+            "g1",
+            Generator::Text {
+                text: "Hi".into(),
+                font_family: "Georgia".into(),
+                size_px: 48.0,
+                color: "#ffffff".into(),
+                bold: false,
+                italic: false,
+            },
+            318,
+            126,
+        );
+        let c = clip("c1", "g1", 0.0, 0.0, 2.0);
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+        let b = build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        let fc = &b.filter_complex;
+        assert!(fc.contains("boxw=318:boxh=126"), "{fc}");
+        assert!(fc.contains("text_align=L+M"), "{fc}");
+        // no drawn box — the box only positions.
+        assert!(!fc.contains("box=1"), "{fc}");
+    }
+
+    #[test]
+    fn opacity_keyframes_preserve_source_alpha() {
+        // alphamerge REPLACES the alpha channel, so a text generator (or an alpha
+        // PNG) with an opacity keyframe exported as a translucent black rectangle
+        // with the text on it — an empty area read luma 128 instead of 255. The
+        // ramp mask must MULTIPLY the source alpha instead.
+        let gm = gen_media(
+            "g1",
+            Generator::Text {
+                text: "fade".into(),
+                font_family: "Georgia".into(),
+                size_px: 48.0,
+                color: "#ffffff".into(),
+                bold: false,
+                italic: false,
+            },
+            318,
+            126,
+        );
+        let mut c = clip("c1", "g1", 0.0, 0.0, 3.0);
+        c.keyframes = Some(ClipKeyframes {
+            x: None, y: None, scale: None,
+            opacity: Some(vec![Keyframe { t: 0.0, v: 0.0 }, Keyframe { t: 3.0, v: 1.0 }]),
+        });
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+        let b = build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        let fc = &b.filter_complex;
+        assert!(fc.contains("alphaextract"), "{fc}");
+        assert!(fc.contains("blend=all_mode=multiply"), "{fc}");
+        // the product, not the raw ramp, is what gets merged back in.
+        assert!(fc.contains("alphamerge"), "{fc}");
+
+        // A clip WITHOUT an opacity keyframe pays none of it (the perf veto).
+        let gm2 = gen_media("g2", Generator::Solid { color: "#ff0000".into() }, 400, 200);
+        let c2 = clip("c2", "g2", 0.0, 0.0, 3.0);
+        let tl2 = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c2])]);
+        let b2 = build(&spec(vec![gm2], tl2, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        assert!(!b2.filter_complex.contains("alphaextract"), "{}", b2.filter_complex);
+        assert!(!b2.filter_complex.contains("blend="), "{}", b2.filter_complex);
     }
 }

@@ -23,6 +23,19 @@ pub struct EncoderReport {
     pub detail: Vec<String>,
 }
 
+/// Wire shape for `detect_encoders`: the report plus the ffmpeg version it was
+/// probed against. The version rides on this view rather than on
+/// `EncoderReport` itself so the on-disk `encoders.json` shape stays untouched
+/// — an existing cache keeps deserializing and nobody pays for a full re-probe
+/// (real test encodes) on the first launch after an upgrade.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncoderReportView {
+    #[serde(flatten)]
+    pub report: EncoderReport,
+    pub ffmpeg_version: String,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CachedReport {
@@ -107,8 +120,7 @@ fn cache_file() -> Result<std::path::PathBuf> {
     Ok(dir.join("encoders.json"))
 }
 
-fn read_cache(version: &str) -> Option<EncoderReport> {
-    let path = cache_file().ok()?;
+fn read_cache(path: &std::path::Path, version: &str) -> Option<EncoderReport> {
     let bytes = std::fs::read(path).ok()?;
     let cached: CachedReport = serde_json::from_slice(&bytes).ok()?;
     if cached.ffmpeg_version == version {
@@ -118,8 +130,7 @@ fn read_cache(version: &str) -> Option<EncoderReport> {
     }
 }
 
-fn write_cache(version: &str, report: &EncoderReport) {
-    let Ok(path) = cache_file() else { return };
+fn write_cache(path: &std::path::Path, version: &str, report: &EncoderReport) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -141,24 +152,40 @@ pub fn probe_all() -> EncoderReport {
     EncoderReport { h264, hevc, av1, detail }
 }
 
-/// Detect (or load cached) the best encoder per codec.
-pub fn detect(force: bool) -> EncoderReport {
+/// Detect (or load cached) the best encoder per codec, together with the ffmpeg
+/// version string the probe was keyed by. The version is computed anyway to key
+/// the cache, so callers that need it (the export failure report) get it here
+/// instead of paying for a second `ffmpeg -version` spawn.
+pub fn detect(force: bool) -> (EncoderReport, String) {
+    match cache_file() {
+        Ok(path) => detect_with_cache(force, &path),
+        // No %APPDATA% to cache into: probe rather than fail the export.
+        Err(_) => (probe_all(), ffmpeg_version()),
+    }
+}
+
+/// `detect` against an explicit cache file. Tests point this at their own temp
+/// file so a parallel run cannot race the shared `%APPDATA%` one.
+fn detect_with_cache(force: bool, cache: &std::path::Path) -> (EncoderReport, String) {
     let version = ffmpeg_version();
     if !force {
-        if let Some(cached) = read_cache(&version) {
-            return cached;
+        if let Some(cached) = read_cache(cache, &version) {
+            return (cached, version);
         }
     }
     let report = probe_all();
-    write_cache(&version, &report);
-    report
+    write_cache(cache, &version, &report);
+    (report, version)
 }
 
 #[tauri::command]
-pub async fn detect_encoders(force: bool) -> Result<EncoderReport> {
-    tauri::async_runtime::spawn_blocking(move || detect(force))
-        .await
-        .map_err(|e| crate::error::AppError::Ffmpeg(format!("encoder detection failed: {e}")))
+pub async fn detect_encoders(force: bool) -> Result<EncoderReportView> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (report, ffmpeg_version) = detect(force);
+        EncoderReportView { report, ffmpeg_version }
+    })
+    .await
+    .map_err(|e| crate::error::AppError::Ffmpeg(format!("encoder detection failed: {e}")))
 }
 
 #[cfg(test)]
@@ -174,10 +201,17 @@ mod tests {
     }
 
     /// End-to-end: force a probe, expect at least a usable h264 encoder
-    /// (libx264 at minimum) and that the cache file is written.
+    /// (libx264 at minimum) and that the cache file is written. Runs against
+    /// its OWN cache file — sharing the real `%APPDATA%` one made this flaky
+    /// under parallel load (a half-written file reads back as a cache miss and
+    /// silently re-probes).
     #[test]
     fn detect_returns_usable_h264_and_writes_cache() {
-        let report = detect(true);
+        let path = std::env::temp_dir()
+            .join(format!("taroting-encoders-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let (report, _version) = detect_with_cache(true, &path);
         // must resolve to SOME encoder for each codec
         assert!(!report.h264.is_empty());
         assert!(!report.hevc.is_empty());
@@ -187,10 +221,64 @@ mod tests {
             .contains(&report.h264.as_str());
         assert!(ok_h264, "unexpected h264 encoder: {}", report.h264);
         // cache file exists after detect
-        let path = cache_file().unwrap();
         assert!(path.exists(), "cache not written at {}", path.display());
         // second call (non-forced) should read cache and match version-keyed value
-        let again = detect(false);
+        let (again, _) = detect_with_cache(false, &path);
         assert_eq!(again.h264, report.h264);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A version string keyed with the report so the export failure report can
+    /// name the exact binary without a second `ffmpeg -version` spawn. Non-empty
+    /// even when the sidecar is missing ("unknown").
+    #[test]
+    fn ffmpeg_version_is_never_empty() {
+        let version = ffmpeg_version();
+        assert!(!version.trim().is_empty(), "empty ffmpeg version");
+    }
+
+    /// A stale cache keyed to a different ffmpeg version must be ignored.
+    #[test]
+    fn cache_is_keyed_by_ffmpeg_version() {
+        let path = std::env::temp_dir()
+            .join(format!("taroting-encoders-key-{}.json", std::process::id()));
+        let report = EncoderReport {
+            h264: "h264_nvenc".into(),
+            hevc: "libx265".into(),
+            av1: "libsvtav1".into(),
+            detail: vec![],
+        };
+        write_cache(&path, "ffmpeg version 8.1.1", &report);
+        assert_eq!(
+            read_cache(&path, "ffmpeg version 8.1.1").map(|r| r.h264),
+            Some("h264_nvenc".to_string())
+        );
+        assert!(
+            read_cache(&path, "ffmpeg version 9.0.0").is_none(),
+            "a different ffmpeg version must invalidate the cache"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The wire shape must stay a flat superset of `EncoderReport` — the cached
+    /// on-disk form is unchanged, but the frontend sees `ffmpegVersion`.
+    #[test]
+    fn encoder_report_view_flattens_to_camel_case_superset() {
+        let view = EncoderReportView {
+            report: EncoderReport {
+                h264: "libx264".into(),
+                hevc: "libx265".into(),
+                av1: "libsvtav1".into(),
+                detail: vec!["libx264: assumed".into()],
+            },
+            ffmpeg_version: "ffmpeg version 8.1.1".into(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&view).unwrap();
+        assert_eq!(v["h264"], "libx264");
+        assert_eq!(v["detail"][0], "libx264: assumed");
+        assert_eq!(v["ffmpegVersion"], "ffmpeg version 8.1.1");
+        // no nested "report" key — the view is flat.
+        assert!(v.get("report").is_none());
     }
 }

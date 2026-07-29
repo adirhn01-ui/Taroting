@@ -8,7 +8,16 @@ import {
   removeKfNear,
   upsertKf,
 } from "./anim";
-import type { Keyframe } from "./types";
+import {
+  addMedia,
+  checkInvariants,
+  createProject,
+  insertClip,
+  makeClip,
+  updateClip,
+} from "./project";
+import { rat } from "./time";
+import type { Keyframe, MediaInfo } from "./types";
 
 const kfs = (...pairs: [number, number][]): Keyframe[] =>
   pairs.map(([t, v]) => ({ t, v }));
@@ -112,6 +121,127 @@ describe("upsertKf / removeKfNear / kfNear", () => {
     expect(kfNear(k, 2 + EPS_KF / 2, EPS_KF)!.v).toBe(2);
     expect(kfNear(k, 2.5, EPS_KF)).toBeNull();
     expect(kfNear(undefined, 0, EPS_KF)).toBeNull();
+  });
+});
+
+/** The strictly-ascending invariant that floorIndex / KfCursor binary-search on
+ *  and clampedBreakpoints emits from. upsertKf used to break it by overwriting
+ *  the FIRST match within eps in place: eps is half a source frame at 60fps,
+ *  but adjacent frames are only `frameDuration * speed` apart in SOURCE
+ *  seconds, so at the Speed dropdown's 0.25 and 0.5 the new t could land past
+ *  the successor it was written in front of. */
+describe("upsertKf keeps keyframes strictly ascending", () => {
+  /** SOURCE time of timeline frame `n` for a clip trimmed from 0 at `speed`. */
+  const srcT = (n: number, fps: number, speed: number): number => (n / fps) * speed;
+
+  const isAscending = (k: Keyframe[]): boolean =>
+    k.every((x, i) => i === 0 || x.t > k[i - 1]!.t);
+
+  it("survives the frame 0 → 3 → 2 → 4 sequence at 60fps / speed 0.25", () => {
+    // At 0.25x, 60fps frames are 1/240 s apart in source time while EPS_KF is
+    // 1/120 — two frames fit inside the replace window, which is what let the
+    // in-place overwrite cross its neighbour (captured trace: a descending
+    // [0.01875, 0.0145833] pair).
+    let k: Keyframe[] = [];
+    let v = 1;
+    for (const frame of [0, 3, 2, 4]) {
+      k = upsertKf(k, srcT(frame, 60, 0.25), (v += 0.1), EPS_KF);
+      expect(isAscending(k)).toBe(true);
+    }
+    expect(k[k.length - 1]!.t).toBeCloseTo(srcT(4, 60, 0.25), 12);
+  });
+
+  it("stays ascending over a dense random walk at every offered speed", () => {
+    for (const speed of [0.25, 0.5, 1, 2, 4]) {
+      let k: Keyframe[] = [];
+      // deterministic pseudo-random frame order, revisiting the same few frames
+      let seed = 7;
+      for (let i = 0; i < 200; i++) {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        const frame = seed % 12;
+        k = upsertKf(k, srcT(frame, 60, speed), i, EPS_KF);
+        expect(isAscending(k)).toBe(true);
+      }
+    }
+  });
+
+  it("replaces the NEAREST keyframe within eps, not the first one seen", () => {
+    // t sits eps away from k[0] but only eps/4 away from k[1]: k[1] is the one
+    // the user meant, and replacing k[0] would push it past k[1].
+    const k0: Keyframe[] = [
+      { t: 0, v: 0 },
+      { t: EPS_KF * 0.75, v: 10 },
+    ];
+    const k = upsertKf(k0, EPS_KF, 99, EPS_KF);
+    expect(k.map((x) => x.t)).toEqual([0, EPS_KF]);
+    expect(k[1]!.v).toBe(99);
+    expect(isAscending(k)).toBe(true);
+  });
+
+  it("leaves evalKfs interpolating (a descending pair clamped to the wrong end)", () => {
+    let k: Keyframe[] = [];
+    for (const [frame, value] of [
+      [0, 1],
+      [3, 4],
+      [2, 3],
+      [4, 5],
+    ] as [number, number][]) {
+      k = upsertKf(k, srcT(frame, 60, 0.25), value, EPS_KF);
+    }
+    const mid = (k[0]!.t + k[k.length - 1]!.t) / 2;
+    const got = evalKfs(k, mid);
+    const lo = Math.min(...k.map((x) => x.v));
+    const hi = Math.max(...k.map((x) => x.v));
+    expect(got).toBeGreaterThanOrEqual(lo);
+    expect(got).toBeLessThanOrEqual(hi);
+  });
+});
+
+/** An empty keyframe array can only arrive from outside: writeKeyframes strips
+ *  them, but schema.rs types each track Option<Vec<Keyframe>> and deserializes
+ *  `[]` happily — and `[]` is TRUTHY, so every consumer gate passes it to
+ *  evalKfs, which throws and kills the editor mount. checkInvariants must
+ *  refuse it. */
+describe("empty keyframe arrays are an invariant violation", () => {
+  const videoInfo: MediaInfo = {
+    path: "C:\\media\\clip.mp4",
+    size: 4096,
+    mtimeMs: 11,
+    kind: "video",
+    duration: 30,
+    fps: rat(30),
+    width: 1280,
+    height: 720,
+    hasAudio: false,
+  };
+
+  it("checkInvariants flags a clip whose keyframe track is []", () => {
+    let p = createProject("Shared");
+    const added = addMedia(p, videoInfo);
+    p = added.project;
+    const clip = makeClip(added.media, 0);
+    p = insertClip(p, p.timeline.tracks[0]!.id, clip);
+    expect(checkInvariants(p)).toEqual([]);
+
+    const empty = updateClip(p, clip.id, (c) => ({ ...c, keyframes: { opacity: [] } }));
+    expect(checkInvariants(empty).some((e) => e.includes("empty array"))).toBe(true);
+
+    // the paired x/y case too: both empty, both reported
+    const emptyXY = updateClip(p, clip.id, (c) => ({ ...c, keyframes: { x: [], y: [] } }));
+    expect(checkInvariants(emptyXY).filter((e) => e.includes("empty array"))).toHaveLength(2);
+  });
+
+  it("still accepts a populated keyframe track", () => {
+    let p = createProject("Fine");
+    const added = addMedia(p, videoInfo);
+    p = added.project;
+    const clip = makeClip(added.media, 0);
+    p = insertClip(p, p.timeline.tracks[0]!.id, clip);
+    const animated = updateClip(p, clip.id, (c) => ({
+      ...c,
+      keyframes: { opacity: [{ t: 0, v: 1 }, { t: 2, v: 0 }] },
+    }));
+    expect(checkInvariants(animated)).toEqual([]);
   });
 });
 

@@ -116,6 +116,8 @@ export class ShortcutManager {
   private chordToAction = new Map<string, ActionId>();
   private handlers = new Map<ActionId, ActionHandler>();
   private listener: (e: KeyboardEvent) => void;
+  /** While this returns true the app's chords are inert. */
+  private suppressed: (() => boolean) | null = null;
 
   constructor() {
     this.listener = (e) => {
@@ -126,10 +128,20 @@ export class ShortcutManager {
       if (!action) return;
       const handler = this.handlers.get(action);
       if (!handler) return;
+      // Checked BEFORE preventDefault so a suppressed chord falls through to the
+      // browser untouched — that is what lets Space/Enter activate a focused
+      // button in an open dialog instead of being swallowed by a dead binding.
+      if (this.suppressed?.()) return;
       e.preventDefault();
       if (e.repeat && !REPEATABLE.has(action)) return;
       handler(e);
     };
+  }
+
+  /** Install a predicate that makes every chord inert while it returns true.
+   *  Pass null to clear. */
+  setSuppressed(fn: (() => boolean) | null): void {
+    this.suppressed = fn;
   }
 
   setBindings(shortcuts: Record<ActionId, string>): void {

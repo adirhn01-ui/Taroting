@@ -21,6 +21,20 @@
   letter-spacing: -0.01em;
 }
 
+/* Muted and secondary so the wordmark still reads as the wordmark. Empty until
+   the version resolves, so it occupies no space on first paint. Selectable
+   because the whole point is being able to quote it in a bug report. */
+.home__version {
+  font-size: var(--fs-11);
+  font-weight: 500;
+  color: var(--text-3);
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+  margin-left: -4px;
+  user-select: text;
+  cursor: text;
+}
+
 .home__brand-mark {
   width: 22px;
   height: 22px;

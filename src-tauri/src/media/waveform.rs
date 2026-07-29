@@ -48,6 +48,20 @@ fn write_pk(path: &std::path::Path, pairs: &[(i8, i8)]) -> Result<()> {
     Ok(())
 }
 
+/// Capacity hint for the pairs buffer, clamped to 24 h of audio.
+///
+/// `duration` arrives unvalidated from the `.trt` via the frontend, and this is
+/// ONLY a hint — the Vec grows on demand, so a low guess costs a few reallocs
+/// while a high one is fatal: `duration = 1e12` asked for 200 GB ("memory
+/// allocation of 200000000000032 bytes failed") and `1e17` overflowed capacity
+/// outright. Under `panic = "abort"` that killed the app just for OPENING a
+/// project, since the timeline requests waveforms as it draws.
+fn pairs_capacity_hint(duration: f64) -> usize {
+    const MAX_PAIRS: f64 = 24.0 * 3600.0 * PAIRS_PER_SEC as f64;
+    // NaN.max(0.0) == 0.0, so a NaN duration lands on an empty hint.
+    (duration.max(0.0) * PAIRS_PER_SEC as f64).min(MAX_PAIRS) as usize
+}
+
 /// Decode + bucket the whole stream (runs on a worker thread). Emits progress
 /// through the job system using the known duration.
 fn extract(
@@ -74,8 +88,7 @@ fn extract(
     let mut child = cmd.spawn()?;
     let mut stdout = child.stdout.take().expect("piped stdout");
 
-    let total_pairs_hint = (duration * PAIRS_PER_SEC as f64) as usize;
-    let mut pairs: Vec<(i8, i8)> = Vec::with_capacity(total_pairs_hint + 16);
+    let mut pairs: Vec<(i8, i8)> = Vec::with_capacity(pairs_capacity_hint(duration) + 16);
 
     let mut carry: Vec<i16> = Vec::with_capacity(SAMPLES_PER_PAIR);
     let mut buf = [0u8; 65536];
@@ -220,6 +233,33 @@ mod tests {
         assert_eq!(pairs.len(), 3); // 4+4+2
         let expected = ((1000_i16 >> 8) as i8, (1000_i16 >> 8) as i8);
         assert!(pairs.iter().all(|&p| p == expected));
+    }
+
+    #[test]
+    fn capacity_hint_is_clamped_for_absurd_durations() {
+        // 24 h is the ceiling; the hint is only a hint, the Vec still grows.
+        const MAX: usize = 24 * 3600 * PAIRS_PER_SEC as usize; // 8_640_000
+
+        // Sane durations are exact.
+        assert_eq!(pairs_capacity_hint(0.0), 0);
+        assert_eq!(pairs_capacity_hint(10.0), 1000);
+        assert_eq!(pairs_capacity_hint(3600.0), 360_000);
+
+        // A crafted `.trt` used to abort the process here: 1e12 asked for 200 GB
+        // and 1e17 overflowed capacity outright.
+        assert_eq!(pairs_capacity_hint(1e12), MAX);
+        assert_eq!(pairs_capacity_hint(1e17), MAX);
+        assert_eq!(pairs_capacity_hint(f64::MAX), MAX);
+        assert_eq!(pairs_capacity_hint(f64::INFINITY), MAX);
+
+        // Nonsense durations degrade to an empty hint, never a negative/huge cast.
+        assert_eq!(pairs_capacity_hint(-1.0), 0);
+        assert_eq!(pairs_capacity_hint(f64::NEG_INFINITY), 0);
+        assert_eq!(pairs_capacity_hint(f64::NAN), 0);
+
+        // And the buffer that hint feeds is actually allocatable.
+        let v: Vec<(i8, i8)> = Vec::with_capacity(pairs_capacity_hint(f64::MAX) + 16);
+        assert!(v.capacity() >= MAX);
     }
 
     #[test]

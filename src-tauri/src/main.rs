@@ -2,6 +2,7 @@
 
 mod cache;
 mod debug;
+mod diagnostics;
 mod error;
 mod export;
 mod hw;
@@ -23,7 +24,17 @@ fn main() {
     let open_paths = os::OpenPathQueue::default();
     os::capture_launch_arg(&open_paths);
 
-    let cache = Arc::new(cache::Cache::new().expect("failed to initialize cache directory"));
+    // A blocked or missing %LOCALAPPDATA% must NOT abort before a window
+    // exists — that is a double-click that does nothing, forever, with no
+    // message. Degrade instead: the app launches and only the cache-backed
+    // features (thumbnails, waveforms, proxies) report an error when used.
+    let cache = match cache::Cache::new() {
+        Ok(c) => Some(Arc::new(c)),
+        Err(e) => {
+            eprintln!("Taroting: derived-file cache disabled ({e})");
+            None
+        }
+    };
     let jobs = Arc::new(jobs::Jobs::default());
 
     // Wipe leftover quick-view (open-with) scratch projects from a prior run.
@@ -31,7 +42,7 @@ fn main() {
     // only ever touches the app's own tmp-projects dir.
     project::store::cleanup_temp_projects();
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         // Single-instance MUST be registered first: a second launch is routed to
         // the running window (focus + push path + emit "open-path" as a wake-up)
         // instead of starting a new process. `argv[0]` is the exe; a file path
@@ -54,10 +65,10 @@ fn main() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(cache)
         .manage(jobs)
         .manage(open_paths)
         .manage(media::playability::Inflight::default())
+        .manage(export::LastExportFailure::default())
         .invoke_handler(tauri::generate_handler![
             media::probe::probe_media,
             media::playability::plan_playback,
@@ -86,11 +97,19 @@ fn main() {
             hw::detect_encoders,
             export::estimate::estimate_export,
             export::start_export,
+            export::export_failure_report,
+            diagnostics::save_diagnostic_report,
             debug::debug_info,
             debug::debug_write_report,
             os::take_pending_open_paths,
             os::uninstall_app,
-        ])
+        ]);
+
+    if let Some(cache) = cache {
+        builder = builder.manage(cache);
+    }
+
+    builder
         .run(tauri::generate_context!())
         .expect("failed to run Taroting");
 }

@@ -16,6 +16,7 @@ import type { Clip, Generator, MediaRef, ProjectFile, Track } from "../../core/t
 import type { MediaManager } from "../media/media";
 import { setOverlay, type LayerSet, type Stage } from "../preview/preview";
 import {
+  applyIntrinsicScale,
   applyTransform,
   computeTransformInto,
   type ComputedTransform,
@@ -53,7 +54,7 @@ type Slot = "A" | "B";
 // one scratch transform reused across every layer/tick — never escapes.
 const SCRATCH: ComputedTransform = {
   posX: 0, posY: 0, rotate: 0, flipH: false, flipV: false,
-  cropW: 0, cropH: 0, mediaW: 0, mediaH: 0, offX: 0, offY: 0, opacity: 1,
+  cropW: 0, cropH: 0, mediaW: 0, mediaH: 0, offX: 0, offY: 0, opacity: 1, k: 1,
 };
 
 /** Overrides object reused per layer to feed keyframe poses into the transform
@@ -219,10 +220,14 @@ class LayerScheduler {
       const s = sourceTime(clip, t - clip.timelineStart);
       const base = clip.transform;
       const ov = this.ov;
-      ov.x = kfs.x ? this.curX.eval(kfs.x, s) : undefined;
-      ov.y = kfs.y ? this.curY.eval(kfs.y, s) : undefined;
-      ov.scale = kfs.scale ? this.curScale.eval(kfs.scale, s) : undefined;
-      ov.opacity = kfs.opacity ? this.curOpacity.eval(kfs.opacity, s) : undefined;
+      // Length-based gates, NOT truthiness: schema.rs types keyframes as
+      // Option<Vec<Keyframe>>, so a shared .trt can legally carry "x": [] — and
+      // [] is truthy while evalKfs/KfCursor.eval throw on an empty array. An
+      // empty track means "not animated", exactly like undefined.
+      ov.x = kfs.x?.length ? this.curX.eval(kfs.x, s) : undefined;
+      ov.y = kfs.y?.length ? this.curY.eval(kfs.y, s) : undefined;
+      ov.scale = kfs.scale?.length ? this.curScale.eval(kfs.scale, s) : undefined;
+      ov.opacity = kfs.opacity?.length ? this.curOpacity.eval(kfs.opacity, s) : undefined;
       computeTransformInto(SCRATCH, base, media, project, ov);
     }
     applyTransform(boxes, SCRATCH, this.stage.scale);
@@ -241,7 +246,20 @@ class LayerScheduler {
     }
     // geometry (position/scale/rotate/crop/opacity, incl. keyframes) rides the
     // same tower as any other layer.
+    this.applyGenPose(clip, media, t);
+  }
+
+  /** applyPose for the gen <div>, then re-express the media box as a SCALE.
+   *  applyTransform sizes the box to mediaW*s, which moves nothing inside a
+   *  <div>; applyIntrinsicScale restores the intrinsic box and scales it
+   *  instead, producing identical geometry with correctly-sized glyphs. Every
+   *  path that poses the gen layer must go through here — a bare applyPose
+   *  (e.g. from animate()) would silently drop the scale again. */
+  private applyGenPose(clip: Clip, media: MediaRef, t: number): void {
     this.applyPose(this.set.gen, clip, media, t);
+    applyIntrinsicScale(
+      this.set.gen.media, SCRATCH, media.width ?? 0, media.height ?? 0, this.stage.scale,
+    );
   }
 
   /** Show/seek/play THIS layer for time t. Returns its segment (for boundary
@@ -329,11 +347,16 @@ class LayerScheduler {
       if (!clip || clip.keyframes === undefined) return;
       const media = this.mediaOf(clip);
       if (media) this.applyPose(this.boxes(this.activeSlot), clip, media, t);
-    } else if (this.shown === "image" || this.shown === "gen") {
+    } else if (this.shown === "image") {
       const clip = this.stillClip;
       if (!clip || clip.keyframes === undefined) return;
       const media = this.stillMedia;
-      if (media) this.applyPose(this.shown === "image" ? this.set.image : this.set.gen, clip, media, t);
+      if (media) this.applyPose(this.set.image, clip, media, t);
+    } else if (this.shown === "gen") {
+      const clip = this.stillClip;
+      if (!clip || clip.keyframes === undefined) return;
+      const media = this.stillMedia;
+      if (media) this.applyGenPose(clip, media, t);
     }
   }
 

@@ -8,7 +8,7 @@ pub mod model;
 use std::ffi::OsString;
 use std::sync::Arc;
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::{AppError, Result};
@@ -45,7 +45,21 @@ impl ExportTemps {
 /// Escape a materialized textfile path for drawtext (mirrors the builder's
 /// `escape_filter_path`): backslashes → forward slashes, ':' → '\:', wrapped in
 /// single quotes.
-fn escape_text_path(path: &str) -> String {
+///
+/// A single quote is REJECTED for the same reason the builder rejects it:
+/// ffmpeg's filter-option syntax has no escape that survives inside a quoted
+/// value (neither `\'` nor `'\''`), so the path would silently truncate and
+/// ffmpeg would report a missing file. This path is `%TEMP%`, so on an account
+/// like `O'Brien` that would break EVERY export containing text — hence the
+/// message names the way out instead of just failing.
+fn escape_text_path(path: &str) -> Result<String> {
+    if path.contains('\'') {
+        return Err(AppError::BadInput(format!(
+            "text export needs a temp folder path without an apostrophe; \
+             set the TMP environment variable to a path like C:\\Temp \
+             and restart Taroting (current temp path: {path})"
+        )));
+    }
     let mut out = String::with_capacity(path.len() + 4);
     out.push('\'');
     for ch in path.chars() {
@@ -56,7 +70,7 @@ fn escape_text_path(path: &str) -> String {
         }
     }
     out.push('\'');
-    out
+    Ok(out)
 }
 
 /// Splice the built filtergraph into the argv. Text payloads are materialized to
@@ -89,7 +103,15 @@ fn finalize_args(built: &BuiltExport, out_path: &str) -> Result<(Vec<OsString>, 
             return Err(e.into());
         }
         texts.push(file.clone());
-        let esc = escape_text_path(&file.to_string_lossy());
+        let esc = match escape_text_path(&file.to_string_lossy()) {
+            Ok(esc) => esc,
+            Err(e) => {
+                for t in &texts {
+                    let _ = std::fs::remove_file(t);
+                }
+                return Err(e);
+            }
+        };
         // The placeholder was embedded escaped-quoted (`'…'`); replace the
         // quoted placeholder with the quoted real path.
         let quoted_placeholder = format!("'{placeholder}'");
@@ -119,13 +141,246 @@ fn finalize_args(built: &BuiltExport, out_path: &str) -> Result<(Vec<OsString>, 
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Failure detail + redaction                                          */
+/* ------------------------------------------------------------------ */
+
+/// The two most diagnostic artifacts of a failed export (the argv and the
+/// filtergraph) plus the error itself. Held ONLY between a failed export and
+/// the next successful one — a healthy export clears it, so nothing is retained
+/// in the normal case.
+pub struct ExportFailureDetail {
+    argv: Vec<String>,
+    filter_complex: String,
+    message: String,
+    log_tail: Vec<String>,
+    ffmpeg_version: String,
+}
+
+/// The redacted, shareable form of `ExportFailureDetail`. Field names are the
+/// locked wire seam (camelCase).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedactedFailure {
+    argv: Vec<String>,
+    filter_complex: String,
+    message: String,
+    log_tail: Vec<String>,
+    ffmpeg_version: String,
+}
+
+/// Managed state: the last failed export, or `None` after a successful one.
+#[derive(Default)]
+pub struct LastExportFailure(std::sync::Mutex<Option<ExportFailureDetail>>);
+
+impl LastExportFailure {
+    fn guard(&self) -> std::sync::MutexGuard<'_, Option<ExportFailureDetail>> {
+        // A poisoned lock still holds a perfectly good report; never let a
+        // diagnostics path be the thing that fails.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn store(&self, detail: ExportFailureDetail) {
+        *self.guard() = Some(detail);
+    }
+    fn clear(&self) {
+        *self.guard() = None;
+    }
+    /// PEEK, not take: the frontend's Copy and Save both need to work.
+    fn peek_redacted(&self) -> Option<RedactedFailure> {
+        self.guard().as_ref().map(redact_paths)
+    }
+}
+
+/// Snapshot argv for the failure report. `to_string_lossy` so a non-UTF8 path
+/// (perfectly legal on Windows) can never panic here.
+fn argv_snapshot(args: &[OsString]) -> Vec<String> {
+    args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+}
+
+const VIDEO_EXT: &[&str] = &[
+    "mp4", "mov", "mkv", "webm", "avi", "m4v", "wmv", "flv", "mpg", "mpeg", "ts", "m2ts", "mts",
+    "ogv", "3gp", "gif",
+];
+const AUDIO_EXT: &[&str] = &["wav", "mp3", "aac", "m4a", "flac", "ogg", "opus", "wma", "aif", "aiff"];
+const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff"];
+
+/// Lowercase extension of a path-ish string, without touching the filesystem.
+fn ext_of(path: &str) -> String {
+    let tail = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    match tail.rfind('.') {
+        Some(i) if i + 1 < tail.len() => tail[i + 1..].to_ascii_lowercase(),
+        _ => String::new(),
+    }
+}
+
+fn kind_for(ext: &str) -> &'static str {
+    if VIDEO_EXT.contains(&ext) {
+        "video"
+    } else if AUDIO_EXT.contains(&ext) {
+        "audio"
+    } else if IMAGE_EXT.contains(&ext) {
+        "image"
+    } else {
+        "file"
+    }
+}
+
+/// Case-insensitive (ASCII) literal replace. `to_ascii_lowercase` preserves
+/// byte length, so every index taken from the folded copy is a valid char
+/// boundary in the original — validate before you slice.
+fn replace_ci(hay: &str, needle: &str, with: &str) -> String {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return hay.to_string();
+    }
+    let folded = hay.to_ascii_lowercase();
+    let want = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(hay.len());
+    let mut i = 0;
+    while let Some(off) = folded[i..].find(&want) {
+        let start = i + off;
+        out.push_str(&hay[i..start]);
+        out.push_str(with);
+        i = start + want.len();
+    }
+    out.push_str(&hay[i..]);
+    out
+}
+
+/// Build the stable real-path → pseudonym map for ONE report. Inputs are the
+/// argv entries following `-i`; the final argv entry is the output. Keys are
+/// sorted longest-first so `<out>.part` wins over `<out>` and no alias can be
+/// applied inside another.
+fn build_alias_map(argv: &[String]) -> Vec<(String, String)> {
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    let mut counts = std::collections::HashMap::<&'static str, u32>::new();
+    let push = |path: &str, alias: String, aliases: &mut Vec<(String, String)>| {
+        if !path.is_empty() && !aliases.iter().any(|(k, _)| k == path) {
+            aliases.push((path.to_string(), alias));
+        }
+    };
+
+    // Output first: ffmpeg writes "<out>.part", but stderr and the message can
+    // mention either form. Both collapse to the same placeholder.
+    if let Some(last) = argv.last() {
+        let real = last.strip_suffix(".part").unwrap_or(last);
+        let ext = ext_of(real);
+        let alias = if ext.is_empty() {
+            "<out>".to_string()
+        } else {
+            format!("<out.{ext}>")
+        };
+        push(last, alias.clone(), &mut aliases);
+        push(real, alias, &mut aliases);
+    }
+
+    for (i, a) in argv.iter().enumerate() {
+        if a != "-i" {
+            continue;
+        }
+        let Some(path) = argv.get(i + 1) else { continue };
+        if aliases.iter().any(|(k, _)| k == path) {
+            continue;
+        }
+        let ext = ext_of(path);
+        let kind = kind_for(&ext);
+        let n = counts.entry(kind).or_insert(0);
+        *n += 1;
+        let alias = if ext.is_empty() {
+            format!("{kind}{n}")
+        } else {
+            format!("{kind}{n}.{ext}")
+        };
+        push(path, alias, &mut aliases);
+    }
+
+    aliases.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    aliases
+}
+
+/// The deny-list swept LAST over every field: our own known-sensitive strings.
+/// ffmpeg's stderr is free text from a third-party binary, so a deny-list on
+/// strings we know identify this machine is the correct shape there — an
+/// allow-list cannot be written for text we do not author.
+fn env_terms() -> Vec<(String, &'static str)> {
+    let mut terms: Vec<(String, &'static str)> = Vec::new();
+    let add = |var: &str, tag: &'static str, terms: &mut Vec<(String, &'static str)>| {
+        let Some(raw) = std::env::var_os(var) else { return };
+        let raw = raw.to_string_lossy().trim_end_matches(['\\', '/']).to_string();
+        if raw.len() < 3 {
+            return; // too short to be a safe literal to sweep
+        }
+        // The same directory appears in three shapes: as-is, forward-slashed
+        // (drawtext path escaping), and forward-slashed with '\:' colons.
+        let fwd = raw.replace('\\', "/");
+        let esc = fwd.replace(':', "\\:");
+        for v in [raw, fwd, esc] {
+            if !terms.iter().any(|(k, _)| *k == v) {
+                terms.push((v, tag));
+            }
+        }
+    };
+    add("TEMP", "<temp>", &mut terms);
+    add("TMP", "<temp>", &mut terms);
+    add("LOCALAPPDATA", "<localappdata>", &mut terms);
+    add("APPDATA", "<appdata>", &mut terms);
+    add("USERPROFILE", "<home>", &mut terms);
+    add("USERNAME", "<user>", &mut terms);
+    // Longest first: %TEMP% lives under %LOCALAPPDATA%, and every one of them
+    // contains the bare username.
+    terms.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    terms
+}
+
+/// Apply the alias map, then the deny-list sweep. Pure.
+fn scrub(s: &str, aliases: &[(String, String)], terms: &[(String, &'static str)]) -> String {
+    let mut out = s.to_string();
+    for (real, alias) in aliases {
+        out = replace_ci(&out, real, alias);
+    }
+    for (term, tag) in terms {
+        out = replace_ci(&out, term, tag);
+    }
+    out
+}
+
+/// Redact a failure into its shareable form. Media *properties* (w×h, fps,
+/// codec, pix_fmt, duration, size) survive untouched — they are the
+/// reproduction and are not personal. Text-generator content never reaches
+/// here: the builder emits `textfile=<path>`, never inline `text=`.
+fn redact_paths(detail: &ExportFailureDetail) -> RedactedFailure {
+    redact_with(detail, &env_terms())
+}
+
+/// Pure core of `redact_paths` with the machine-specific terms injected.
+fn redact_with(detail: &ExportFailureDetail, terms: &[(String, &'static str)]) -> RedactedFailure {
+    let aliases = build_alias_map(&detail.argv);
+    RedactedFailure {
+        argv: detail.argv.iter().map(|a| scrub(a, &aliases, terms)).collect(),
+        filter_complex: scrub(&detail.filter_complex, &aliases, terms),
+        message: scrub(&detail.message, &aliases, terms),
+        log_tail: detail.log_tail.iter().map(|l| scrub(l, &aliases, terms)).collect(),
+        ffmpeg_version: detail.ffmpeg_version.clone(),
+    }
+}
+
+/// Redacted detail of the last failed export, or `null` when the last export
+/// succeeded (or none has run). Peeks — repeated calls return the same report.
+#[tauri::command]
+pub fn export_failure_report(state: State<'_, LastExportFailure>) -> Option<RedactedFailure> {
+    state.peek_redacted()
+}
+
+/* ------------------------------------------------------------------ */
+/* Export command                                                      */
+/* ------------------------------------------------------------------ */
+
 #[tauri::command]
 pub fn start_export(
     app: AppHandle,
     jobs: State<'_, Arc<Jobs>>,
     spec: ExportSpec,
 ) -> Result<JobId> {
-    let encoders = hw::detect(false);
+    let (encoders, ffmpeg_version) = hw::detect(false);
     let built = builder::build(&spec, &encoders)?;
     let out_path = spec.out_path.clone();
 
@@ -139,6 +394,12 @@ pub fn start_export(
     final_args[last] = OsString::from(&part_path);
 
     let total = built.duration_sec;
+    // MOVE the graph out of `built` (not a clone — `built` is dead after
+    // `finalize_args` + `duration_sec`), so the report costs no extra
+    // allocation. The argv snapshot is one small Vec per export start.
+    let filter_complex = built.filter_complex;
+    let argv = argv_snapshot(&final_args);
+
     let handle = jobs.allocate(JobKind::Export);
     let job_id = handle.id;
 
@@ -158,6 +419,25 @@ pub fn start_export(
             // outcome: success, failure, or cancel.
             temps.cleanup();
 
+            // Record (or clear) the diagnostic detail for `export_failure_report`.
+            // Nothing is retained after a healthy export. A user-initiated
+            // cancel is not a failure: it neither stores a bogus report nor
+            // discards a real one the user has not copied out yet.
+            let remember = |message: &str, log_tail: &[String]| {
+                if handle.is_canceled() {
+                    return;
+                }
+                if let Some(state) = app_clone.try_state::<LastExportFailure>() {
+                    state.store(ExportFailureDetail {
+                        argv: argv.clone(),
+                        filter_complex: filter_complex.clone(),
+                        message: message.to_string(),
+                        log_tail: log_tail.to_vec(),
+                        ffmpeg_version: ffmpeg_version.clone(),
+                    });
+                }
+            };
+
             match result {
                 Ok(()) => {
                     // publish: remove any existing output, then rename .part → out
@@ -167,6 +447,9 @@ pub fn start_export(
                     }
                     match std::fs::rename(&part_path, &final_pb) {
                         Ok(()) => {
+                            if let Some(state) = app_clone.try_state::<LastExportFailure>() {
+                                state.clear();
+                            }
                             jobs::complete_job(
                                 &app_clone,
                                 &jobs_arc,
@@ -175,17 +458,20 @@ pub fn start_export(
                             );
                         }
                         Err(e) => {
+                            let message = format!("failed to finalize output: {e}");
+                            remember(&message, &[]);
                             jobs::fail_job(
                                 &app_clone,
                                 &jobs_arc,
                                 &handle,
-                                format!("failed to finalize output: {e}"),
+                                message,
                                 Vec::new(),
                             );
                         }
                     }
                 }
                 Err(failure) => {
+                    remember(&failure.message, &failure.log_tail);
                     jobs::fail_job(
                         &app_clone,
                         &jobs_arc,
@@ -199,6 +485,248 @@ pub fn start_export(
     );
 
     Ok(job_id)
+}
+
+/* ------------------------------------------------------------------ */
+/* Unit: path escaping + redaction                                     */
+/* ------------------------------------------------------------------ */
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+
+    /// Machine-specific sweep terms, injected so the tests stay pure (no env
+    /// mutation, no dependency on whoever is running them).
+    fn terms() -> Vec<(String, &'static str)> {
+        let mut t: Vec<(String, &'static str)> = vec![
+            (r"C:\Users\adele\AppData\Local\Temp".into(), "<temp>"),
+            ("C:/Users/adele/AppData/Local/Temp".into(), "<temp>"),
+            (r"C\:/Users/adele/AppData/Local/Temp".into(), "<temp>"),
+            (r"C:\Users\adele\AppData\Local".into(), "<localappdata>"),
+            (r"C:\Users\adele\AppData\Roaming".into(), "<appdata>"),
+            (r"C:\Users\adele".into(), "<home>"),
+            ("adele".into(), "<user>"),
+        ];
+        t.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        t
+    }
+
+    fn detail(argv: &[&str], filter: &str, message: &str, tail: &[&str]) -> ExportFailureDetail {
+        ExportFailureDetail {
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            filter_complex: filter.to_string(),
+            message: message.to_string(),
+            log_tail: tail.iter().map(|s| s.to_string()).collect(),
+            ffmpeg_version: "ffmpeg version 8.1.1-full_build".into(),
+        }
+    }
+
+    /* -------- (1) the apostrophe crash -------- */
+
+    #[test]
+    fn escape_text_path_rejects_an_apostrophe_with_an_actionable_message() {
+        let err = escape_text_path(r"C:\Users\O'Brien\AppData\Local\Temp\taroting-text-0.txt")
+            .unwrap_err();
+        assert!(matches!(err, AppError::BadInput(_)), "wrong variant: {err:?}");
+        let msg = err.to_string();
+        // must name the workaround, not just complain
+        assert!(msg.contains("apostrophe"), "message: {msg}");
+        assert!(msg.contains("TMP"), "message must name the TMP variable: {msg}");
+        assert!(msg.contains(r"C:\Temp"), "message must give a concrete path: {msg}");
+    }
+
+    #[test]
+    fn escape_text_path_leaves_a_normal_path_unchanged() {
+        let esc = escape_text_path(r"C:\Users\adele\AppData\Local\Temp\taroting-text-ab-0.txt")
+            .unwrap();
+        assert_eq!(
+            esc,
+            r"'C\:/Users/adele/AppData/Local/Temp/taroting-text-ab-0.txt'"
+        );
+    }
+
+    /* -------- (2) redaction -------- */
+
+    #[test]
+    fn redaction_uses_one_consistent_map_across_argv_graph_and_stderr() {
+        let src = r"C:\Users\adele\Videos\Trip To Rome.mp4";
+        let d = detail(
+            &[
+                "-i", src,
+                "-i", r"D:\Sound\Theme Song.wav",
+                // the SAME source registered a second time must reuse its alias
+                "-i", src,
+                "-filter_complex", "",
+                r"D:\Exports\Final Cut.mp4.part",
+            ],
+            &format!("[0:v]scale=1920:1080[v];movie='{src}'[m]"),
+            "ffmpeg exited with 0xffffffea",
+            &[format!("[in#0 @ 0000] Error opening input: {src}").as_str()],
+        );
+        let r = redact_with(&d, &terms());
+
+        // one map: the same file is video1.mp4 in argv, graph AND stderr
+        assert_eq!(r.argv[1], "video1.mp4");
+        assert_eq!(r.argv[5], "video1.mp4", "same path must reuse its alias");
+        assert!(r.filter_complex.contains("movie='video1.mp4'"), "{}", r.filter_complex);
+        assert!(r.log_tail[0].ends_with("video1.mp4"), "{}", r.log_tail[0]);
+
+        // and nothing real survives anywhere
+        for s in r.argv.iter().chain([&r.filter_complex, &r.message]).chain(r.log_tail.iter()) {
+            assert!(!s.contains("adele"), "username leaked: {s}");
+            assert!(!s.contains("Trip To Rome"), "real filename leaked: {s}");
+            assert!(!s.contains("Users"), "directory component leaked: {s}");
+        }
+        // media properties are the reproduction — they must NOT be scrubbed
+        assert!(r.filter_complex.contains("scale=1920:1080"));
+        assert_eq!(r.ffmpeg_version, "ffmpeg version 8.1.1-full_build");
+    }
+
+    #[test]
+    fn redaction_sweeps_a_path_seen_only_in_stderr() {
+        let d = detail(
+            &["-i", r"D:\Clips\a.mp4", r"D:\out.mp4.part"],
+            "",
+            "",
+            &[
+                r"[Parsed_drawtext_3] Cannot find file C:\Users\adele\AppData\Local\Temp\taroting-text-1.txt",
+                r"Conversion failed for C:\Users\adele\Documents\Taroting\My Wedding.trt",
+            ],
+        );
+        let r = redact_with(&d, &terms());
+        // never an argv entry, so it has no alias — the deny-list still gets it
+        assert!(r.log_tail[0].starts_with("[Parsed_drawtext_3] Cannot find file <temp>"), "{}", r.log_tail[0]);
+        assert!(r.log_tail[1].contains("<home>"), "{}", r.log_tail[1]);
+        for line in &r.log_tail {
+            assert!(!line.contains("adele"), "username leaked: {line}");
+        }
+    }
+
+    #[test]
+    fn redaction_preserves_the_extension_per_media_kind() {
+        let d = detail(
+            &[
+                "-i", r"C:\a\one.MOV",
+                "-i", r"C:\a\two.wav",
+                "-i", r"C:\a\three.png",
+                "-i", r"C:\a\four.srt",
+                "-i", r"C:\a\five.mkv",
+                r"C:\a\out.webm.part",
+            ],
+            "",
+            "",
+            &[],
+        );
+        let r = redact_with(&d, &terms());
+        assert_eq!(r.argv[1], "video1.mov", "extension preserved, kind classified");
+        assert_eq!(r.argv[3], "audio1.wav");
+        assert_eq!(r.argv[5], "image1.png");
+        assert_eq!(r.argv[7], "file1.srt", "unknown kinds still keep their extension");
+        assert_eq!(r.argv[9], "video2.mkv", "counter is per-kind and stable");
+        assert_eq!(r.argv[10], "<out.webm>");
+    }
+
+    #[test]
+    fn redaction_collapses_the_part_file_and_the_final_output() {
+        let d = detail(
+            &["-i", r"C:\a\clip.mp4", r"D:\My Exports\Holiday Reel.mp4.part"],
+            "",
+            r"failed to finalize output: rename D:\My Exports\Holiday Reel.mp4.part failed",
+            &[r"Could not write header for D:\My Exports\Holiday Reel.mp4"],
+        );
+        let r = redact_with(&d, &terms());
+        assert_eq!(r.argv[2], "<out.mp4>");
+        assert!(r.message.contains("<out.mp4>"), "{}", r.message);
+        // the non-.part form, which only ffmpeg mentions, collapses identically
+        assert_eq!(r.log_tail[0], "Could not write header for <out.mp4>");
+        for s in [&r.message, &r.log_tail[0]] {
+            assert!(!s.contains("Holiday Reel"), "output name leaked: {s}");
+            assert!(!s.contains("My Exports"), "output directory leaked: {s}");
+        }
+    }
+
+    /// A non-UTF8 path is legal on Windows; snapshotting must go through
+    /// `to_string_lossy` so it can never panic on the way into a report.
+    #[cfg(windows)]
+    #[test]
+    fn redaction_survives_a_non_utf8_path() {
+        use std::os::windows::ffi::OsStringExt;
+        // lone surrogate: not valid UTF-16, so not convertible to UTF-8
+        let bad = OsString::from_wide(&[0x0044u16, 0xD800, 0x002E, 0x006D, 0x0070, 0x0034]);
+        let argv = vec![OsString::from("-i"), bad, OsString::from("D:\\out.mp4.part")];
+        let snapshot = argv_snapshot(&argv);
+        assert_eq!(snapshot.len(), 3);
+        assert!(snapshot[1].contains('\u{FFFD}'), "expected a replacement char");
+
+        let d = ExportFailureDetail {
+            argv: snapshot,
+            filter_complex: String::new(),
+            message: String::new(),
+            log_tail: Vec::new(),
+            ffmpeg_version: String::new(),
+        };
+        let r = redact_with(&d, &terms());
+        assert_eq!(r.argv.len(), 3);
+        assert_eq!(r.argv[1], "video1.mp4", "lossy path still aliases by extension");
+    }
+
+    #[test]
+    fn replace_ci_is_case_insensitive_and_boundary_safe() {
+        assert_eq!(replace_ci(r"C:\USERS\Adele\x", r"c:\users\adele", "<home>"), "<home>\\x");
+        // a multi-byte char either side of the match must survive intact
+        assert_eq!(replace_ci("é-adele-é", "ADELE", "<user>"), "é-<user>-é");
+        assert_eq!(replace_ci("nothing", "", "x"), "nothing");
+    }
+
+    /// The wire seam the frontend codes against: `null`, or exactly
+    /// `{ argv, filterComplex, message, logTail, ffmpegVersion }`.
+    #[test]
+    fn export_failure_report_wire_shape_is_the_locked_seam() {
+        let none: Option<RedactedFailure> = None;
+        assert_eq!(serde_json::to_string(&none).unwrap(), "null");
+
+        let state = LastExportFailure::default();
+        state.store(detail(
+            &["-i", r"C:\a\clip.mp4", r"C:\a\out.mp4.part"],
+            "[0:v]null[vout]",
+            "ffmpeg exited with 1",
+            &["boom"],
+        ));
+        let v = serde_json::to_value(state.peek_redacted().unwrap()).unwrap();
+        let obj = v.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["argv", "ffmpegVersion", "filterComplex", "logTail", "message"]
+        );
+        assert!(v["argv"].is_array());
+        assert!(v["logTail"].is_array());
+        assert!(v["filterComplex"].is_string());
+    }
+
+    /* -------- (3) the managed state -------- */
+
+    #[test]
+    fn last_export_failure_stores_peeks_and_clears() {
+        let state = LastExportFailure::default();
+        assert!(state.peek_redacted().is_none(), "nothing retained before a failure");
+
+        state.store(detail(
+            &["-i", r"C:\a\clip.mp4", r"C:\a\out.mp4.part"],
+            "[0:v]null[vout]",
+            "ffmpeg exited with 1",
+            &["boom"],
+        ));
+        let first = state.peek_redacted().expect("failure retained");
+        assert_eq!(first.message, "ffmpeg exited with 1");
+        // PEEK, not take: Copy and Save both have to work
+        let second = state.peek_redacted().expect("peek must not consume");
+        assert_eq!(second.argv, first.argv);
+
+        state.clear();
+        assert!(state.peek_redacted().is_none(), "a healthy export must clear it");
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -513,11 +1041,16 @@ mod e2e {
     fn e2e_text_over_solid_renders() {
         let dir = fixtures_dir();
         // bottom: a black solid. top: white text on transparent, centered.
+        //
+        // The text media is a REALISTIC measured box (560x120 for one 96px
+        // line) and differs from the 640x360 canvas on BOTH axes on purpose:
+        // the old fixture declared 640x360, and identical numbers turned this
+        // test into a no-op that hid a real size-mismatch bug (issue #1).
         let base = solid_media("base", "#000000");
         let text = MediaRef {
             id: "txt".into(), path: "Text".into(), size: 0, mtime_ms: 0,
             kind: "image".into(), duration: 0.0, fps: None,
-            width: Some(640), height: Some(360),
+            width: Some(560), height: Some(120),
             container: None, vcodec: None, acodec: None, pix_fmt: None,
             bit_depth: None, has_audio: false, audio_rate: None, audio_channels: None,
             generator: Some(Generator::Text {
@@ -541,14 +1074,19 @@ mod e2e {
         };
         let out = encode(&spec, &dir, "textsolid.mp4");
 
-        // Drawtext renders at top-left (x=0,y=0). The text region has bright
-        // pixels; a far-bottom empty region stays (near-)black.
-        let text_region = yavg(&out, 1.0, 0, 0, 400, 120);
-        let empty_region = yavg(&out, 1.0, 0, 300, 400, 60);
-        assert!(empty_region < 20.0, "empty region should be dark: {empty_region}");
+        // The 560x120 text box is centred on the 640x360 canvas, and drawtext
+        // centres the glyphs vertically inside it (text_align=L+M, mirroring
+        // the DOM's half-leading). So the glyphs land in the middle band, not
+        // at the top-left. Both bands are asserted so the test still pins
+        // GEOMETRY rather than merely "something rendered".
+        let text_band = yavg(&out, 1.0, 0, 130, 640, 100);
+        let empty_band = yavg(&out, 1.0, 0, 300, 640, 55);
+        let top_band = yavg(&out, 1.0, 0, 0, 640, 100);
+        assert!(empty_band < 20.0, "band below the text box should be dark: {empty_band}");
+        assert!(top_band < 20.0, "band above the text box should be dark: {top_band}");
         assert!(
-            text_region - empty_region > 5.0,
-            "text region should be brighter than empty: text={text_region} empty={empty_region}"
+            text_band - empty_band > 5.0,
+            "text band should be brighter than empty: text={text_band} empty={empty_band}"
         );
     }
 

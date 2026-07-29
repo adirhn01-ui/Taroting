@@ -111,10 +111,14 @@
   max-height: none;
 }
 
-/* generated media (solid / text) rides the same transform tower */
+/* generated media (solid / text) rides the same transform tower, but is SCALED
+ * rather than resized (applyIntrinsicScale) so its glyphs scale with the box —
+ * which needs the top-left origin. <video>/<img> keep the default origin: they
+ * are resized, never scaled, and must not be perturbed. */
 .stage-layer__gen {
   box-sizing: border-box;
   overflow: hidden;
+  transform-origin: 0 0;
 }
 
 .preview__overlay {

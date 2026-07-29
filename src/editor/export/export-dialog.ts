@@ -3,11 +3,13 @@
 // cancel and a success / error result view.
 
 import "./export.css";
+import type { ReportContext } from "../../core/diagnostics";
 import { escapeHtml, fileExt, formatBytes } from "../../core/format";
-import { onJobEvents } from "../../core/ipc";
+import { appVersion, describeError, errorDetail, ipc, onJobEvents } from "../../core/ipc";
 import type { JobDone, JobFailed, JobProgress } from "../../core/ipc";
 import { ProjectSession, settingsStore, updateSettings } from "../../core/session";
 import type { ExportPreset, ResolutionPreset } from "../../core/types";
+import { detailPane, recentErrors, recordError } from "../../ui/errors";
 import { trapTab } from "../../ui/focus";
 import { icon } from "../../ui/icons";
 import { toast } from "../../ui/toast";
@@ -154,10 +156,12 @@ function formatEta(sec: number): string {
 
 export function openExportDialog(ctx: { session: ProjectSession }): void {
   const { session } = ctx;
-  const project = session.project;
 
-  /* -------- working preset (a mutable copy of the persisted one) -------- */
-  const start = project.export;
+  /* -------- working preset (a mutable copy of the persisted one) --------
+     Only the OPENING values are snapshotted here. Everything that feeds an
+     estimate or the export itself reads `session.project` live, so an edit made
+     while this dialog is open is the one that gets exported. */
+  const start = session.project.export;
   let format: Format = start.format;
   let codec: Codec = start.vcodec;
   let resolution: ResolutionPreset = start.resolution;
@@ -168,7 +172,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
 
   const settings = settingsStore.get();
   let folder = settings.lastExportDir ?? settings.defaultExportDir ?? "";
-  let filename = sanitizeFileName(project.name);
+  let filename = sanitizeFileName(session.project.name);
 
   let encoders: EncoderReport | null = null;
 
@@ -266,8 +270,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     const resSelValue = isCustomRes ? "custom" : (resolution as string);
     const fpsSelValue = fps === "original" ? "original" : isCustomFps ? "custom" : String(fps);
 
-    const customW = isCustomRes ? (resolution as { w: number; h: number }).w : project.timeline.width;
-    const customH = isCustomRes ? (resolution as { w: number; h: number }).h : project.timeline.height;
+    const canvas = session.project.timeline;
+    const customW = isCustomRes ? (resolution as { w: number; h: number }).w : canvas.width;
+    const customH = isCustomRes ? (resolution as { w: number; h: number }).h : canvas.height;
     const customFps = isCustomFps ? (fps as number) : 30;
 
     bodyEl.innerHTML = `
@@ -418,7 +423,8 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     resSel.addEventListener("change", () => {
       const v = resSel.value;
       if (v === "custom") {
-        resolution = { w: project.timeline.width, h: project.timeline.height };
+        const canvas = session.project.timeline;
+        resolution = { w: canvas.width, h: canvas.height };
       } else {
         resolution = v as ResolutionPreset;
       }
@@ -541,9 +547,12 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   async function runEstimate(): Promise<void> {
     const el = backdrop.querySelector<HTMLElement>("#ex-estimate");
     if (!el) return;
+    // Read the project live: an edit made while the dialog is open must be the
+    // one we estimate (and export).
+    const live = session.project;
     const spec: ExportSpec = {
-      media: project.media,
-      timeline: project.timeline,
+      media: live.media,
+      timeline: live.timeline,
       preset: buildPreset(),
       outPath: outPath(),
     };
@@ -666,9 +675,10 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
 
   async function beginExport(target: string): Promise<void> {
     lastTaskbarPct = -1;
+    const live = session.project;
     const spec: ExportSpec = {
-      media: project.media,
-      timeline: project.timeline,
+      media: live.media,
+      timeline: live.timeline,
       preset: buildPreset(),
       outPath: target,
     };
@@ -695,7 +705,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
         unlistenJobs();
         unlistenJobs = null;
       }
-      renderError(describe(e), []);
+      renderError(errorDetail(e), []);
     }
   }
 
@@ -758,7 +768,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
       // user-initiated cancel is handled in onCancelExport; ignore here
       return;
     }
-    renderError(e.message, e.logTail);
+    renderError({ code: "", message: e.message }, e.logTail);
   }
 
   async function onCancelExport(): Promise<void> {
@@ -801,19 +811,113 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     footerEl.querySelector("[data-close-btn]")!.addEventListener("click", close);
   }
 
-  function renderError(message: string, logTail: string[]): void {
+  /** Assemble the diagnostic report for a failed export. Everything here is
+   *  on-demand: nothing is collected or kept while exports succeed. */
+  async function collectReport(
+    err: { code: string; message: string },
+    logTail: string[],
+  ): Promise<{ short: string; full: string }> {
+    // The report builder is loaded here and nowhere else: a session that never
+    // sees an export fail never downloads or parses it.
+    const [{ buildReport }, version, failure] = await Promise.all([
+      import("../../core/diagnostics"),
+      appVersion(),
+      // The backend command may not answer (older build); the log tail we were
+      // handed with the failure event still carries the useful part.
+      ipc.exportFailureReport().catch(() => null),
+    ]);
+    const base: ReportContext = {
+      at: new Date().toISOString(),
+      appVersion: version,
+      platform: navigator.platform || "",
+      userAgent: navigator.userAgent,
+      operation: "Export",
+      error: { code: err.code, message: err.message },
+      ffmpeg: {
+        argv: failure?.argv ?? [],
+        filterComplex: failure?.filterComplex ?? "",
+        message: failure?.message ?? err.message,
+        logTail: failure?.logTail?.length ? failure.logTail : logTail,
+        ffmpegVersion: failure?.ffmpegVersion ?? "",
+      },
+      preset: buildPreset(),
+      destinationSet: folder !== "",
+      encoders,
+      project: session.project,
+      settings: settingsStore.get(),
+      recentErrors: recentErrors(),
+    };
+    return {
+      short: buildReport({ ...base, full: false }),
+      full: buildReport({ ...base, full: true }),
+    };
+  }
+
+  function renderError(err: { code: string; message: string }, logTail: string[]): void {
     jobId = null;
-    const log = logTail.length
-      ? `<details class="export-log"><summary>Details</summary><pre>${escapeHtml(logTail.join("\n"))}</pre></details>`
-      : "";
     bodyEl.innerHTML = `
       <div class="export-result">
         <div class="export-result__icon export-result__icon--bad">${icon("warning", 22)}</div>
         <div class="export-result__title">Export failed</div>
-        <div class="export-result__msg">${escapeHtml(message)}</div>
-        ${log}
+        <div class="export-result__msg">${escapeHtml(err.message)}</div>
       </div>
     `;
+    const seed = logTail.length ? logTail.join("\n") : err.message;
+    recordError({ at: Date.now(), op: "Export", message: err.message, detail: seed });
+
+    // The detail pane is ALWAYS visible and always a <textarea>: an export
+    // failure is not a "you might want this" moment, and a <pre> here is what
+    // locked the issue-#1 reporter out of copying their own log.
+    const pane = detailPane(seed);
+    const ta = pane.querySelector<HTMLTextAreaElement>(".err-detail")!;
+    const actions = pane.querySelector<HTMLElement>(".err-pane__actions")!;
+
+    const saveBtn = document.createElement("button");
+    saveBtn.className = "btn btn--sm";
+    saveBtn.textContent = "Save report";
+    actions.appendChild(saveBtn);
+
+    const hint = document.createElement("div");
+    hint.className = "err-hint";
+    hint.textContent = "The saved file also includes the full filter graph.";
+    pane.appendChild(hint);
+    bodyEl.querySelector(".export-result")!.appendChild(pane);
+
+    // Swap the raw log for the full report as soon as it is assembled.
+    let fullReport: string | null = null;
+    void collectReport(err, logTail)
+      .then((built) => {
+        if (!ta.isConnected) return;
+        ta.value = built.short;
+        fullReport = built.full;
+      })
+      .catch(() => {
+        /* the pane already holds the raw log — nothing is lost */
+      });
+
+    saveBtn.addEventListener("click", () => {
+      const content = fullReport ?? ta.value;
+      saveBtn.disabled = true;
+      void ipc
+        .saveDiagnosticReport(content)
+        .then((path) => {
+          toast.info("Report saved");
+          void revealInExplorer(path);
+        })
+        .catch((e: unknown) => {
+          // The report rides along as the detail, so a failed write never costs
+          // the user the text they asked for.
+          toast.error("Couldn't save the report.", {
+            detail: `${describeError(e)}\n\n${content}`,
+            op: "Export",
+            title: "Diagnostic report",
+          });
+        })
+        .finally(() => {
+          saveBtn.disabled = false;
+        });
+    });
+
     footerEl.innerHTML = `
       <button class="btn" id="ex-back">Back</button>
       <button class="btn btn--primary" data-close-btn>Close</button>
@@ -840,10 +944,4 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     .catch(() => {
       /* estimate + export still work; badge just stays hidden */
     });
-}
-
-/** Best-effort error message extraction (mirrors ipc.describeError). */
-function describe(e: unknown): string {
-  if (e && typeof e === "object" && "message" in e) return String((e as { message: unknown }).message);
-  return String(e);
 }

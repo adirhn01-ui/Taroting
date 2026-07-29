@@ -259,6 +259,56 @@
   border-top: 1px solid var(--border);
 }
 
+/* ---------- Error detail pane ----------
+   Always a <textarea>, never a <pre>: the app suppresses the native context
+   menu outside editable fields and binds Ctrl+C to "copy clip" outside typing
+   targets, so a <pre> is selectable but impossible to copy out of. A textarea
+   is whitelisted by both guards and joins the trapTab ring. */
+.err-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  width: 100%;
+  text-align: left;
+}
+.err-detail {
+  width: 100%;
+  height: 180px;
+  min-height: 96px;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  background: var(--bg-input);
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  line-height: 1.5;
+  /* drag it taller instead of scroll-hunting through a fixed 180px window */
+  resize: vertical;
+}
+.err-detail:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.err-pane__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.err-hint {
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+.err-msg {
+  margin-bottom: var(--sp-3);
+  font-size: var(--fs-13);
+  color: var(--text-1);
+  word-break: break-word;
+}
+.err-modal {
+  width: min(720px, calc(100vw - 48px));
+}
+
 /* ---------- Toast ---------- */
 .toast-host {
   position: fixed;

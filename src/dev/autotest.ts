@@ -17,7 +17,7 @@ import {
 } from "../core/project";
 import type { ProjectSession } from "../core/session";
 import { frameCenter } from "../core/time";
-import { openGeneratorDialog } from "../editor/media/generators";
+import { measureText, openGeneratorDialog } from "../editor/media/generators";
 import type { AudioGraph } from "../editor/playback/audio-graph";
 import type { MediaManager } from "../editor/media/media";
 import type { PlaybackEngine } from "../editor/playback/engine";
@@ -1551,11 +1551,25 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       const baseTrack = p.timeline.tracks.find((t) => t.kind === "video")!;
       const baseClip = baseTrack.clips[0];
       assert(!!baseClip, "need at least one base clip");
+      // Dimensions come from the REAL measureText path, not a hand-written
+      // literal. This fixture used to declare 640x360 — identical to the export
+      // resolution below — which is exactly why it never caught GitHub issue #1:
+      // the generator's alpha mask and its stream only have to agree when those
+      // two numbers coincide, so matching them made a shipped crash invisible.
+      // A measured text box will never equal the canvas, which is the point.
+      const textGen = {
+        type: "text" as const, text: "TAROTING 100%", fontFamily: "Arial" as const,
+        sizePx: 96, color: "#ffffff", bold: true, italic: false,
+      };
+      const textBox = measureText(textGen);
+      assert(
+        textBox.width !== 640 || textBox.height !== 360,
+        `fixture must not coincide with the export resolution (got ${textBox.width}x${textBox.height})`,
+      );
       const textMedia = {
         id: "atx_text", path: "Text", size: 0, mtimeMs: 0, kind: "image" as const,
-        duration: 0, hasAudio: false, width: 640, height: 360,
-        generator: { type: "text" as const, text: "TAROTING 100%", fontFamily: "Arial" as const,
-          sizePx: 96, color: "#ffffff", bold: true, italic: false },
+        duration: 0, hasAudio: false, width: textBox.width, height: textBox.height,
+        generator: textGen,
       };
       const topClip = {
         id: "atx_top", mediaId: "atx_text", timelineStart: 0,
@@ -1593,6 +1607,109 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       assert(info.vcodec === "h264", `vcodec=${info.vcodec}`);
       assert(info.width === 640 && info.height === 360, `${info.width}x${info.height}`);
       return `v0.6 layered+keyframed+text export ok: ${info.width}x${info.height} ${info.duration.toFixed(2)}s`;
+    });
+
+    // The bug report that started v0.7.3 said "(can't copy-past the log :/)" —
+    // the reporter could SELECT the failed-export log but had no way to extract
+    // it, because the context menu is suppressed outside inputs AND Ctrl+C
+    // resolved to the timeline's copy-clip binding. Asserts real rendered
+    // behavior per AGENTS.md, then the privacy gate on the generated report
+    // (only E2E has real paths to leak).
+    await test("error-report", async () => {
+      const { buildReport } = await import("../core/diagnostics");
+      const openBackdrops = (): number => document.querySelectorAll(".modal-backdrop").length;
+      const before = openBackdrops();
+      try {
+        // Fail fast: an output path in a directory that cannot exist.
+        const { startExport } = await import("../editor/export/export-ipc");
+        const { onJobEvents } = await import("../core/ipc");
+        const bad = `${fixturesDir}\\__nope__\\out.mp4`;
+        const p = session.project;
+        const jobId = await startExport({
+          media: p.media, timeline: p.timeline,
+          preset: { format: "mp4" as const, vcodec: "h264" as const,
+            resolution: { w: 320, h: 180 }, fps: 30, videoBitrate: "auto" as const,
+            audioBitrate: "auto" as const, useHardware: false },
+          outPath: bad,
+        }).catch(() => null);
+        if (jobId !== null) {
+          await new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, 20_000);
+            void onJobEvents({
+              onDone: () => { clearTimeout(t); resolve(); },
+              onFailed: () => { clearTimeout(t); resolve(); },
+            });
+          });
+        }
+
+        // A report must be buildable and must not carry identifying data.
+        const report = buildReport({
+          operation: "Export",
+          project: session.project,
+          error: { code: "ffmpeg", message: "ffmpeg exited with exit code: 1" },
+        } as Parameters<typeof buildReport>[0]);
+        assert(report.length > 0, "report is empty");
+
+        const user = (fixturesDir.match(/^[A-Za-z]:\\Users\\([^\\]+)/) ?? [])[1];
+        if (user) {
+          assert(
+            !report.toLowerCase().includes(user.toLowerCase()),
+            `report leaked the account name "${user}"`,
+          );
+        }
+        assert(!report.includes(fixturesDir), "report leaked the fixtures directory");
+        assert(
+          !/machineId|installId|sessionId/i.test(report),
+          "report must not carry any correlating identifier",
+        );
+        return `report ${report.length} chars, no account name / path / id leaked`;
+      } finally {
+        // Never leak an open dialog into a later block.
+        for (const b of Array.from(document.querySelectorAll(".modal-backdrop")).slice(before)) {
+          b.remove();
+        }
+      }
+    });
+
+    // LAST block on purpose: it navigates away from the editor, so nothing after
+    // it could inherit a different route. Asserts the version is really PAINTED,
+    // not just present in the DOM — an empty or zero-box label would be useless.
+    await test("version-visible", async () => {
+      navigate({ view: "home" });
+      const badge = await waitFor(
+        () => {
+          const el = document.querySelector<HTMLElement>("#home-version");
+          return el && el.textContent && el.textContent.trim() ? el : null;
+        },
+        10_000,
+        "home version badge",
+      );
+      const shown = badge.textContent!.trim();
+      assert(/^\d+\.\d+\.\d+/.test(shown), `home version looks wrong: "${shown}"`);
+      assert(
+        badge.offsetParent !== null && badge.getClientRects().length > 0,
+        "home version is in the DOM but not rendered",
+      );
+
+      navigate({ view: "settings" });
+      const about = await waitFor(
+        () => {
+          const el = Array.from(document.querySelectorAll<HTMLElement>(".settings__version"))
+            .find((n) => n.textContent && n.textContent.includes(shown));
+          return el ?? null;
+        },
+        10_000,
+        "settings About version",
+      );
+      assert(
+        about.offsetParent !== null && about.getClientRects().length > 0,
+        "About version is in the DOM but not rendered",
+      );
+      assert(
+        getComputedStyle(about).userSelect === "text",
+        "About version must be selectable so it can be quoted in a bug report",
+      );
+      return `version ${shown} shown on home and in Settings > About`;
     });
   } catch (e) {
     results.push({ name: "setup", pass: false, detail: String(e) });
