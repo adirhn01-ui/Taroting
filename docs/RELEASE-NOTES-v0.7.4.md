@@ -78,6 +78,23 @@ risk either way** — no version of the installer has ever touched them.
 - **The version is shown in Settings → About**, selectable so you can copy it
   into a bug report.
 
+## About the installer
+
+Windows Defender was blocking the 0.7.2 and 0.7.3 installers as
+`Trojan:Win32/Wacatac.B!ml`. It was a false positive, and it only ever affected
+the installer — the app itself, the bundled FFmpeg and the portable build all
+scan clean in every version.
+
+The cause was the compression used inside the installer, not anything the
+program does: the packed archive looked statistically suspicious to Defender's
+machine-learning check, which never sees past the wrapper to the (clean)
+contents. Switching to a different compression method fixes it. The installer is
+about 35 MB larger as a result, which is a fair trade.
+
+This build was verified by downloading it back from this page and scanning it
+the way Windows treats a real download. If you already have a copy Windows
+refuses to open, re-download it from here.
+
 ## Downloads
 
 - **`Taroting-v0.7.4-portable-win64.zip`** — unzip and run `Taroting.exe`; no installation.
