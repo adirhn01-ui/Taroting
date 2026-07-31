@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::schema::{self, ProjectFile};
@@ -477,6 +478,106 @@ fn thumb_source_for(path: &str) -> Option<(crate::cache::MediaKey, f64)> {
     Some((key, at))
 }
 
+/// One lazily-taken listing of the thumbs cache directory, reused for a whole
+/// batch of lookups.
+///
+/// `media::thumbs::any_thumb_for` does a full `read_dir` per call, so resolving
+/// N recents cards meant N complete scans of that directory on every home mount.
+/// The listing is only taken once a lookup actually needs it, so a batch whose
+/// projects all skip (generator-only, audio-only, missing source) still scans
+/// nothing at all.
+struct ThumbListing<'a> {
+    cache: &'a crate::cache::Cache,
+    entries: Option<Vec<(String, PathBuf)>>,
+}
+
+impl<'a> ThumbListing<'a> {
+    fn new(cache: &'a crate::cache::Cache) -> Self {
+        ThumbListing { cache, entries: None }
+    }
+
+    /// First cached thumb whose file name starts with `hash`, in `read_dir`
+    /// order — the same choice `any_thumb_for` makes for the same directory.
+    fn find(&mut self, hash: &str) -> Option<PathBuf> {
+        let cache = self.cache;
+        let entries = self.entries.get_or_insert_with(|| {
+            let dir = cache
+                .root()
+                .join(crate::cache::CacheKind::Thumbs.dir_name());
+            std::fs::read_dir(dir)
+                .map(|read| {
+                    read.flatten()
+                        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        entries
+            .iter()
+            .find(|(name, _)| name.starts_with(hash))
+            .map(|(_, path)| path.clone())
+    }
+
+    /// Register a thumb generated during this batch so a later card sharing the
+    /// same source media hits the listing instead of the filesystem.
+    fn record(&mut self, path: &Path) {
+        let (Some(entries), Some(name)) = (self.entries.as_mut(), path.file_name()) else {
+            return;
+        };
+        entries.push((name.to_string_lossy().into_owned(), path.to_path_buf()));
+    }
+}
+
+/// Resolve a thumbnail for each of `paths`, then persist all of them with ONE
+/// recents read + write. Returns `(project path, thumb path)` for the projects
+/// that resolved, in input order; the rest are simply absent (fail-soft).
+///
+/// The batching is the whole point: `atomic_write` is five filesystem
+/// operations, so a home mount with a dozen thumb-less cards used to spend ~48
+/// of them on recents.json — plus one full thumbs-directory scan per card.
+fn refresh_thumbs_for(
+    cache: &crate::cache::Cache,
+    jobs: &crate::jobs::Jobs,
+    paths: &[String],
+) -> Vec<(String, String)> {
+    let mut listing = ThumbListing::new(cache);
+    let mut resolved: Vec<(String, String)> = Vec::new();
+
+    for path in paths {
+        let Some((key, at)) = thumb_source_for(path) else {
+            continue;
+        };
+        // Prefer an already-cached thumb; only spend ffmpeg when it is cold.
+        let thumb = match listing.find(&key.hash()) {
+            Some(hit) => Some(hit),
+            None => crate::media::thumbs::ensure_thumb(cache, jobs, &key, at).ok(),
+        };
+        let Some(thumb) = thumb else { continue };
+        listing.record(&thumb);
+        resolved.push((path.clone(), thumb.to_string_lossy().into_owned()));
+    }
+
+    // Persist so future mounts skip generation. Best-effort: a write failure
+    // just means we regenerate next time.
+    if !resolved.is_empty() {
+        let mut index = read_recents();
+        let mut changed = false;
+        for (path, thumb) in &resolved {
+            if let Some(entry) = index.items.iter_mut().find(|r| r.path == *path) {
+                if entry.thumb.as_deref() != Some(thumb.as_str()) {
+                    entry.thumb = Some(thumb.clone());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let _ = write_recents(&index);
+        }
+    }
+
+    resolved
+}
+
 /// Backfill a recents card's thumbnail after the fact. `load_project` /
 /// `stamp_opened` and the open-with flow can create a recents entry before any
 /// thumbnail is cached (thumbs are generated lazily by the editor's bin), so
@@ -489,31 +590,38 @@ fn thumb_source_for(path: &str) -> Option<(crate::cache::MediaKey, f64)> {
 /// missing/changed source file, ffmpeg failure) yields `Ok(None)` so the home
 /// screen is never blocked or toasted. On success the recents entry's `thumb`
 /// is persisted so subsequent mounts hit the cache without ffmpeg.
+///
+/// A whole mount's worth of cards should go through `refresh_recent_thumbs`
+/// instead; this single-path form is kept for one-off callers and is a literal
+/// one-element batch, so the two can never drift apart.
 #[tauri::command]
 pub fn refresh_recent_thumb(
     cache: tauri::State<'_, std::sync::Arc<crate::cache::Cache>>,
     jobs: tauri::State<'_, std::sync::Arc<crate::jobs::Jobs>>,
     path: String,
 ) -> Result<Option<String>> {
-    let Some((key, at)) = thumb_source_for(&path) else {
-        return Ok(None);
-    };
-    // Prefer any already-cached thumb; only spend ffmpeg when the cache is cold.
-    let thumb = crate::media::thumbs::any_thumb_for(&cache, &key.hash())
-        .or_else(|| crate::media::thumbs::ensure_thumb(&cache, &jobs, &key, at).ok());
-    let Some(thumb) = thumb else {
-        return Ok(None);
-    };
-    let thumb = thumb.to_string_lossy().into_owned();
+    // At most one entry can come back for one input path.
+    refresh_recent_thumbs(cache, jobs, vec![path]).map(|m| m.into_values().next())
+}
 
-    // Persist so future mounts skip generation. Best-effort: a write failure
-    // just means we regenerate next time.
-    let mut index = read_recents();
-    if let Some(entry) = index.items.iter_mut().find(|r| r.path == path) {
-        entry.thumb = Some(thumb.clone());
-        let _ = write_recents(&index);
-    }
-    Ok(Some(thumb))
+/// Batched `refresh_recent_thumb`: same resolution rules, same fail-soft
+/// behavior, but one thumbs-directory scan and one recents read/write for the
+/// entire home mount instead of one of each per card.
+///
+/// Returns a map of project path → thumb path containing ONLY the projects that
+/// resolved; a project that skips (or whose generation fails) is absent, which
+/// is the batched equivalent of the single-path `null`.
+///
+/// Generation is sequential, so on a cold thumbnail cache the whole batch
+/// answers together rather than card by card — callers wanting progressive fill
+/// should chunk their paths.
+#[tauri::command]
+pub fn refresh_recent_thumbs(
+    cache: tauri::State<'_, std::sync::Arc<crate::cache::Cache>>,
+    jobs: tauri::State<'_, std::sync::Arc<crate::jobs::Jobs>>,
+    paths: Vec<String>,
+) -> Result<HashMap<String, String>> {
+    Ok(refresh_thumbs_for(&cache, &jobs, &paths).into_iter().collect())
 }
 
 #[tauri::command]
@@ -1024,6 +1132,127 @@ mod tests {
             if disk_mtime_ms(&media_file) != mtime {
                 assert!(stale.is_none(), "stale mtime must skip");
             }
+        });
+    }
+
+    /* -------------------- batched thumbnail backfill ------------------- */
+
+    /// Build a project at `<dir>/<name>.trt` backed by a real media file, seed a
+    /// cached thumbnail for it, and put a thumb-less recents entry in place —
+    /// i.e. exactly the state a home mount backfills. Returns the project path.
+    fn seed_thumbless_card(dir: &Path, cache: &crate::cache::Cache, name: &str) -> String {
+        let media_file = dir.join(format!("{name}.bin"));
+        std::fs::write(&media_file, b"0123456789").unwrap();
+        let mtime = disk_mtime_ms(&media_file);
+        let proj = dir.join(format!("{name}.trt"));
+        write_project_with_clip(
+            &proj,
+            serde_json::json!([{
+                "id": "m1", "path": media_file.to_string_lossy(), "size": 10,
+                "mtimeMs": mtime, "kind": "video", "duration": 4.0, "hasAudio": false
+            }]),
+        );
+
+        // A thumb already in the cache: the batch must reuse it, so the test
+        // never depends on ffmpeg.
+        let hash = crate::cache::MediaKey {
+            path: media_file.to_string_lossy().into_owned(),
+            size: 10,
+            mtime_ms: mtime,
+        }
+        .hash();
+        cache
+            .ensure_kind_dir(crate::cache::CacheKind::Thumbs)
+            .unwrap();
+        std::fs::write(
+            cache.file_path(crate::cache::CacheKind::Thumbs, &hash, "_500.jpg"),
+            b"jpg",
+        )
+        .unwrap();
+
+        let path = proj.to_string_lossy().into_owned();
+        upsert_recent(RecentItem {
+            path: path.clone(),
+            name: name.into(),
+            modified_at: "m".into(),
+            duration_sec: 4.0,
+            thumb: None,
+            size_bytes: 0,
+            opened_at: None,
+        })
+        .unwrap();
+        path
+    }
+
+    /// The batching property, observed through `atomic_write`'s own `.bak`
+    /// rotation: after the batch, `recents.json.bak` still holds the PRE-batch
+    /// state. A second write would have rotated the once-updated file into the
+    /// backup, so this pins "one write for the whole mount", not merely "the
+    /// right end state".
+    #[test]
+    fn batched_thumb_refresh_writes_recents_exactly_once() {
+        with_isolated("thumb-batch", |dir| {
+            let cache = crate::cache::Cache::new_at(dir.join("cache"));
+            let jobs = crate::jobs::Jobs::default();
+            let a = seed_thumbless_card(dir, &cache, "Alpha");
+            let b = seed_thumbless_card(dir, &cache, "Beta");
+
+            let resolved = refresh_thumbs_for(&cache, &jobs, &[a.clone(), b.clone()]);
+            assert_eq!(resolved.len(), 2, "both cards should resolve: {resolved:?}");
+            assert_eq!(resolved[0].0, a, "results follow input order");
+
+            // End state: both entries carry their thumb.
+            let items = read_recents().items;
+            for path in [&a, &b] {
+                let entry = items.iter().find(|r| r.path == *path).unwrap();
+                assert!(entry.thumb.is_some(), "{path} should have a thumb");
+            }
+
+            // ...and the backup proves only ONE write produced it.
+            let bak = paths::data_dir().unwrap().join("recents.json.bak");
+            let prior: RecentsIndex =
+                serde_json::from_slice(&std::fs::read(&bak).unwrap()).unwrap();
+            assert_eq!(prior.items.len(), 2, "backup should be the pre-batch index");
+            assert!(
+                prior.items.iter().all(|r| r.thumb.is_none()),
+                "a second write would have rotated a half-updated index into .bak: {prior:?}"
+            );
+        });
+    }
+
+    /// The single-path form still behaves exactly as before now that it shares
+    /// the batched core: it returns the thumb, persists it, and stays silent for
+    /// a project that cannot produce one.
+    #[test]
+    fn single_thumb_refresh_still_resolves_and_fails_soft() {
+        with_isolated("thumb-single", |dir| {
+            let cache = crate::cache::Cache::new_at(dir.join("cache"));
+            let jobs = crate::jobs::Jobs::default();
+            let path = seed_thumbless_card(dir, &cache, "Solo");
+
+            let resolved = refresh_thumbs_for(&cache, &jobs, std::slice::from_ref(&path));
+            let thumb = resolved.first().map(|(_, t)| t.clone()).unwrap();
+            assert!(thumb.ends_with("_500.jpg"), "got {thumb}");
+            let items = read_recents().items;
+            assert_eq!(
+                items.iter().find(|r| r.path == path).unwrap().thumb.as_deref(),
+                Some(thumb.as_str())
+            );
+
+            // A generator-only project yields nothing and touches no thumbs dir.
+            let gen = dir.join("Gen.trt");
+            write_project_with_clip(
+                &gen,
+                serde_json::json!([{
+                    "id": "m1", "path": "Solid #00ff00", "size": 0, "mtimeMs": 0,
+                    "kind": "image", "duration": 0.0, "hasAudio": false,
+                    "width": 64, "height": 64,
+                    "generator": { "type": "solid", "color": "#00ff00" }
+                }]),
+            );
+            assert!(
+                refresh_thumbs_for(&cache, &jobs, &[gen.to_string_lossy().into_owned()]).is_empty()
+            );
         });
     }
 

@@ -1,6 +1,41 @@
 /* ============================================================
    Taroting design tokens
    Neutral grayscale, one indigo accent, dark-first.
+
+   CUSTOM THEME (Settings → Appearance → Custom)
+   `applyTheme` in src/core/session.ts sets `data-theme` to whichever palette
+   below matches the chosen background's luminance, then overrides TWENTY-ONE
+   tokens as inline properties on <html>:
+
+     from "background" --bg-app  --bg-panel  --bg-raised  --bg-input
+                       --bg-hover  --bg-active  --border  --border-strong
+                       --ruler-tick  --on-accent
+     from "accent"     --accent  --accent-strong  --accent-dim
+                       --clip-video-bg  --clip-video-border
+                       --clip-audio-bg  --clip-audio-border  --wave
+     from "text"       --text-1  --text-2  --text-3
+
+   --bg-app, --accent and --text-1 are the user's three picks, used LITERALLY.
+   There is no contrast floor and nothing is nudged for readability: the app
+   shows exactly what was chosen, whatever that is. Everything else is derived
+   from those three — see deriveCustomTheme. --on-accent (the ink on
+   accent-filled surfaces) is simply the background colour, which is what makes
+   the home brand mark a background-coloured "T" in an accent-coloured tile.
+
+   NOT overridable, on purpose: --danger / --danger-dim / --ok / --warn carry
+   meaning, --playhead must always be findable, and the --shadow-* triple is
+   alpha-on-black either way. Those come from whichever palette below the
+   direction selected. Adding a token a custom theme should follow means adding
+   it to CUSTOM_THEME_VARS as well, or it will silently keep the palette value.
+
+   THE ESCAPE HATCH. Because nothing above is nudged, a theme CAN be made
+   invisible. `applyTheme` therefore also stamps `data-custom-theme` on <html>
+   and publishes a --safe-* group (--safe-panel, --safe-text-1, --safe-accent, …)
+   holding this file's own Dark or Light values. Settings → Appearance and the
+   colour picker map their palette onto that group — see the escape-hatch block
+   in src/settings/settings.css — so the one card that can undo a bad theme is
+   never rendered in it. Both the group and the attribute exist only while a
+   custom theme is active.
    ============================================================ */
 
 :root {

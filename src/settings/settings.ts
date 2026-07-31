@@ -2,16 +2,25 @@
 // export defaults, performance, cache, and rebindable keyboard shortcuts.
 // Everything persists immediately via updateSettings and reflects settingsStore
 // live. The screen fully re-renders on store changes EXCEPT during shortcut
-// capture (where we mutate a single row in place).
+// capture and while a colour picker is open — both of those mutate the single
+// row they own in place instead, because a rebuild would drop the element the
+// interaction is anchored to.
 
 import "./settings.css";
 import { escapeHtml, formatBytes } from "../core/format";
 import { appVersion, describeError, ipc } from "../core/ipc";
 import { navigate } from "../core/nav";
-import { currentSession, settingsStore, updateSettings } from "../core/session";
+import {
+  currentSession,
+  normalizeHexColor,
+  previewCustomTheme,
+  settingsStore,
+  updateSettings,
+} from "../core/session";
 import { chordOf, findConflicts, normalizeChord } from "../core/shortcuts";
-import type { ActionId, Settings } from "../core/types";
-import { DEFAULT_SHORTCUTS } from "../core/types";
+import type { ActionId, CustomTheme, Settings } from "../core/types";
+import { DEFAULT_CUSTOM_THEME, DEFAULT_SHORTCUTS } from "../core/types";
+import type { ColorPickerHandle } from "../ui/color-picker";
 import {
   copyText,
   formatRecentErrors,
@@ -75,6 +84,37 @@ const ACTION_ORDER: ActionId[] = [
   "goHome",
 ];
 
+/** The three user-settable colours of the custom theme, in the order they are
+ *  offered: what the app sits on, what it highlights with, what it says. */
+type ColorRole = "background" | "accent" | "text";
+const ROLE_LABELS: Record<ColorRole, string> = {
+  background: "Background",
+  accent: "Accent",
+  text: "Text",
+};
+const ROLE_HINTS: Record<ColorRole, string> = {
+  background: "The app background. Panels, inputs, borders and the ruler follow it.",
+  accent: "Buttons, selection, focus rings, clips and waveforms.",
+  text: "Every label, value and caption in the app.",
+};
+
+/** Swatches worth offering per role. The picker's own default spread is a set
+ *  of accent hues, which is exactly wrong for the other two: a background wants
+ *  near-blacks and papers, and text wants inks. Both lists carry the shipped
+ *  dark and light values first, so the two built-in themes are one click away.
+ *  Twelve each, matching the row the popover lays out. */
+const ROLE_PRESETS: Record<ColorRole, readonly string[] | undefined> = {
+  background: [
+    "#111113", "#000000", "#0d1117", "#171214", "#101a16", "#1a1524",
+    "#f6f6f8", "#ffffff", "#f4f1ea", "#eef3f8", "#f7eef2", "#edf4ee",
+  ],
+  accent: undefined, // the picker's own hue spread is already the right shelf
+  text: [
+    "#ececf1", "#ffffff", "#e6e0d4", "#dde6f2", "#f0e2e8", "#c8c8d2",
+    "#1b1b20", "#000000", "#2a2118", "#16202c", "#2c1c24", "#55555f",
+  ],
+};
+
 const AUTOSAVE_OPTIONS = [1, 3, 5, 10, 30];
 const CACHE_LIMIT_OPTIONS_MB = [1024, 2048, 5120, 10240, 20480];
 const CACHE_KIND_ORDER = ["remux", "proxy", "waveform", "thumbs", "filmstrip"];
@@ -109,6 +149,12 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   let clearConfirmArmed = false;
   let capturing: ActionId | null = null;
   let captureCleanup: (() => void) | null = null;
+  // An open colour picker is anchored to a button inside `inner`, so a full
+  // re-render would tear its anchor out from under it — suppressed exactly the
+  // way shortcut capture already is.
+  let picker: ColorPickerHandle | null = null;
+  /** Guards the dynamic import against a double click landing two pickers. */
+  let pickerLoading = false;
   // Set by dispose(): in-flight async work must not rebuild a detached DOM.
   let disposed = false;
   /** Resolved once on mount; empty until then so the first paint isn't blocked. */
@@ -153,6 +199,44 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       </div>`;
   }
 
+  /** One colour row: a label, a hint, and a button whose swatch and caption are
+   *  the current colour. The hex is interpolated directly because
+   *  `normalizeHexColor` has already proven it is exactly `#rrggbb` — see the
+   *  note on that function in core/session.ts. */
+  function colorRow(role: ColorRole, hex: string): string {
+    const label = ROLE_LABELS[role];
+    return `
+      <div class="settings__row">
+        <div class="settings__row-text">
+          <div class="settings__row-label">${escapeHtml(label)}</div>
+          <div class="settings__hint">${escapeHtml(ROLE_HINTS[role])}</div>
+        </div>
+        <button class="btn btn--sm settings__color-btn" id="settings-color-${role}"
+                aria-label="${escapeHtml(label)}, ${hex}" aria-haspopup="dialog">
+          <span class="settings__color-swatch" style="background:${hex}"></span>
+          <span class="mono">${hex}</span>
+        </button>
+      </div>`;
+  }
+
+  /** The area the "Custom" option expands into. Rendered only for that option,
+   *  so every other theme costs exactly what it did before. Each pick is shown
+   *  exactly as chosen — nothing here is second-guessed. */
+  function customThemeArea(c: CustomTheme): string {
+    const safe = validCustomTheme(c);
+    return `
+      <div class="settings__custom">
+        ${colorRow("background", safe.background)}
+        ${colorRow("accent", safe.accent)}
+        ${colorRow("text", safe.text)}
+      </div>`;
+  }
+
+  // `settings__card--appearance` is not just a layout hook: it is the escape
+  // hatch's selector. That card (and the colour picker it opens) renders in a
+  // fixed palette instead of the user's colours, so a theme that hides
+  // everything can still be undone — see SAFE_APPEARANCE in core/session.ts and
+  // the matching block in settings.css. Do not drop the class.
   function appearanceSection(s: Settings): string {
     const seg = segmented(
       s.theme,
@@ -160,16 +244,18 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
         { value: "dark", label: "Dark" },
         { value: "light", label: "Light" },
         { value: "system", label: "System" },
+        { value: "custom", label: "Custom" },
       ],
       "data-theme-opt",
     );
     return `
-      <section class="card settings__card">
+      <section class="card settings__card settings__card--appearance">
         <div class="settings__section-head">Appearance</div>
         <div class="settings__row">
           <div class="settings__row-label">Theme</div>
           ${seg}
         </div>
+        ${s.theme === "custom" ? customThemeArea(s.customTheme) : ""}
       </section>`;
   }
 
@@ -404,6 +490,14 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       });
     });
 
+    // Custom theme: one button per colour. There is no dark/light switch any
+    // more — the direction is read off the background colour itself.
+    for (const role of ["background", "accent", "text"] as const) {
+      inner
+        .querySelector<HTMLButtonElement>(`#settings-color-${role}`)
+        ?.addEventListener("click", (e) => openColor(role, e.currentTarget as HTMLElement));
+    }
+
     // Autosave interval
     inner
       .querySelector<HTMLSelectElement>("#settings-autosave")
@@ -509,6 +603,97 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     });
   }
 
+  /* ---------------- custom theme colours ---------------- */
+
+  /** Three proven `#rrggbb` colours. The store is seeded from an opaque
+   *  settings.json, so this is the last place before a colour reaches a
+   *  `background:` declaration or the picker. */
+  function validCustomTheme(c: CustomTheme): CustomTheme {
+    return {
+      background: normalizeHexColor(c.background, DEFAULT_CUSTOM_THEME.background),
+      accent: normalizeHexColor(c.accent, DEFAULT_CUSTOM_THEME.accent),
+      text: normalizeHexColor(c.text, DEFAULT_CUSTOM_THEME.text),
+    };
+  }
+
+  function customTheme(): CustomTheme {
+    return validCustomTheme(settingsStore.get().customTheme);
+  }
+
+  function withRole(c: CustomTheme, role: ColorRole, value: string): CustomTheme {
+    if (role === "background") return { ...c, background: value };
+    if (role === "accent") return { ...c, accent: value };
+    return { ...c, text: value };
+  }
+
+  /** Update one colour button in place rather than re-rendering the screen:
+   *  the button is the picker's anchor, and rebuilding it mid-gesture would
+   *  pull the popover's positioning reference out from under it. Same reason
+   *  shortcut capture mutates a single row. */
+  function paintColorButton(role: ColorRole, value: string): void {
+    const btn = inner.querySelector<HTMLElement>(`#settings-color-${role}`);
+    if (!btn) return;
+    const swatch = btn.querySelector<HTMLElement>(".settings__color-swatch");
+    const caption = btn.querySelector<HTMLElement>(".mono");
+    if (swatch) swatch.style.background = value;
+    if (caption) caption.textContent = value;
+    btn.setAttribute("aria-label", `${ROLE_LABELS[role]}, ${value}`);
+  }
+
+  function openColor(role: ColorRole, anchor: HTMLElement): void {
+    if (picker) {
+      // A second click on the same button toggles it shut (the popover treats
+      // its own anchor as "inside", so it does not self-close first).
+      picker.close();
+      return;
+    }
+    if (pickerLoading) return;
+    pickerLoading = true;
+    // Loaded on the click, not on mount: opening Settings — or using any other
+    // theme — never pays for the picker.
+    void import("../ui/color-picker")
+      .then(({ openColorPicker }) => {
+        if (disposed) return;
+        picker = openColorPicker({
+          anchor,
+          label: `${ROLE_LABELS[role]} color`,
+          value: customTheme()[role],
+          defaultValue: DEFAULT_CUSTOM_THEME[role],
+          presets: ROLE_PRESETS[role],
+          onPreview: (value) => {
+            paintColorButton(role, value);
+            previewCustomTheme(withRole(customTheme(), role, value));
+          },
+          onCommit: (value) => {
+            paintColorButton(role, value);
+            void updateSettings({ customTheme: withRole(customTheme(), role, value) });
+          },
+          onClose: () => {
+            // Cleared on a microtask, deliberately: the closing commit has
+            // already queued a store notification, and letting that one fire a
+            // full re-render would swap out the very buttons the in-flight
+            // pointer sequence is about to land a click on. Nothing needs
+            // rebuilding anyway — paintColorButton has already updated the
+            // swatch in place, and the rest of the screen is painted from the
+            // same custom properties the whole app reads.
+            queueMicrotask(() => {
+              picker = null;
+            });
+          },
+        });
+      })
+      .catch((e: unknown) => {
+        toast.error("Couldn't open the color picker.", {
+          detail: describeError(e),
+          op: "Settings",
+          title: "Appearance",
+        });
+      })
+      .finally(() => {
+        pickerLoading = false;
+      });
+  }
+
   /* ---------------- export folder ---------------- */
 
   async function chooseExportDir(): Promise<void> {
@@ -603,7 +788,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       recordError({ at: Date.now(), op: "Settings", message: "Couldn't read cache usage.", detail: cacheStatsError });
     }
     if (disposed) return; // resolved after the view went away — nothing to paint
-    if (!capturing) render();
+    if (!capturing && !picker) render();
   }
 
   function disarmClearConfirm(): void {
@@ -617,7 +802,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       render();
       clearConfirmTimer = window.setTimeout(() => {
         clearConfirmArmed = false;
-        if (!capturing) render();
+        if (!capturing && !picker) render();
       }, 3000);
       return;
     }
@@ -728,7 +913,9 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     // Never blow away the DOM mid-capture (would drop the "Press a key…" row and
     // the focused listener context feels jumpy). Capture completion nulls it out
     // before updateSettings fires, so completed rebinds still re-render.
-    if (capturing) return;
+    // Same for an open colour picker: its anchor lives in this DOM, and the
+    // swatch it commits is already repainted in place by paintColorButton.
+    if (capturing || picker) return;
     render();
   });
 
@@ -738,7 +925,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   void appVersion().then((v) => {
     if (disposed || !v) return;
     appVer = v;
-    if (!capturing) render();
+    if (!capturing && !picker) render();
   });
 
   return {
@@ -747,6 +934,10 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       unsubscribe();
       endCapture();
       disarmClearConfirm();
+      // Closing commits the value on screen, so leaving Settings mid-pick can
+      // never strand a previewed colour that was never persisted.
+      picker?.close();
+      picker = null;
     },
   };
 }

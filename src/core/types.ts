@@ -215,9 +215,48 @@ export type ActionId =
   | "goHome"
   | "fullscreen";
 
+/** The three user-settable colours of the "custom" theme.
+ *
+ *  Every one of them is a colour — there is no dark/light switch any more. The
+ *  app's light-or-dark character is READ OFF the background's relative
+ *  luminance (`deriveCustomTheme` in core/session.ts), so a near-black and a
+ *  near-white background both produce a coherent app without asking.
+ *
+ *  All three are used EXACTLY as picked — no contrast floor, no readability
+ *  nudge. The app can therefore be themed into something illegible on purpose;
+ *  Settings → Appearance is deliberately exempt from the custom palette so that
+ *  is always reversible (`SAFE_APPEARANCE` in core/session.ts).
+ *
+ *  All three are stored as validated lowercase `#rrggbb` and are re-validated
+ *  at every sink (see `normalizeHexColor` in core/session.ts): settings.json is
+ *  opaque to the backend, so a hand-edited or corrupt value reaches the
+ *  frontend completely untyped.
+ *
+ *  MIGRATION: v0.7.4 pre-release carried `base: "dark" | "light"` plus
+ *  `primary` / `secondary`. `sanitizeSettings` reads that shape — `base` maps
+ *  to the matching stock background, `primary` to `accent`, `secondary` is
+ *  dropped (audio clips and waveforms now follow the accent) — so an existing
+ *  settings.json neither crashes nor produces a nonsense colour. */
+export interface CustomTheme {
+  /** The app background, exactly as picked. The whole surface ramp — panel,
+   *  raised, input, hover, active, borders, ruler ticks — is derived from it,
+   *  its luminance decides whether the app renders dark or light, and it is
+   *  also the ink drawn on accent-filled surfaces (`--on-accent`). */
+  background: string;
+  /** Buttons, selection, focus rings, the toggled-on state, drop overlays, and
+   *  the timeline's video clips, audio clips and waveforms. Used verbatim. */
+  accent: string;
+  /** The text ramp: --text-1 exactly as picked, plus the two quieter steps
+   *  mixed from it toward the panel. */
+  text: string;
+}
+
 export interface Settings {
   schema: 1;
-  theme: "dark" | "light" | "system";
+  theme: "dark" | "light" | "system" | "custom";
+  /** Only consulted when `theme === "custom"`; always present so the picker
+   *  has something to open on. */
+  customTheme: CustomTheme;
   autosaveSeconds: number;
   defaultExportDir: string | null;
   lastExportDir: string | null;
@@ -276,9 +315,28 @@ export const DEFAULT_SHORTCUTS: Record<ActionId, string> = {
   fullscreen: "F",
 };
 
+/** The stock DARK palette's --bg-app, --accent and --text-1 — so switching to
+ *  "Custom" starts from what the app already looks like rather than a jolt.
+ *  Feeding these three back through `deriveCustomTheme` reproduces the built-in
+ *  Dark theme; a test pins that. */
+export const DEFAULT_CUSTOM_THEME: CustomTheme = {
+  background: "#111113",
+  accent: "#6c7cff",
+  text: "#ececf1",
+};
+
+/** What the pre-release `base` enum meant, kept only so an already-written
+ *  settings.json migrates to a sensible colour instead of a fallback. Values
+ *  are the two shipped palettes' --bg-app / --text-1. */
+export const LEGACY_BASE_COLORS = {
+  dark: { background: "#111113", text: "#ececf1" },
+  light: { background: "#f6f6f8", text: "#1b1b20" },
+} as const;
+
 export const DEFAULT_SETTINGS: Settings = {
   schema: 1,
   theme: "dark",
+  customTheme: DEFAULT_CUSTOM_THEME,
   autosaveSeconds: 3,
   defaultExportDir: null,
   lastExportDir: null,

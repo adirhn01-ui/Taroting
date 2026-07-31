@@ -1,0 +1,775 @@
+{
+  "cases": [
+    {
+      "name": "issue1-text-generator-on-a-tall-canvas",
+      "why": "GitHub issue #1's exact numbers: a Text generator measured at 270x114 on a 398x934 canvas. Every axis differs, so no value can coincide and hide a mix-up.",
+      "in": {
+        "mediaW": 270,
+        "mediaH": 114,
+        "canvasW": 398,
+        "canvasH": 934,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 398,
+        "dh": 168,
+        "ox": 0,
+        "oy": 383,
+        "dwExact": 398,
+        "dhExact": 168.04444444444445,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 1.474074074074074,
+        "srcW": 270,
+        "srcH": 114,
+        "postCropW": 270,
+        "postCropH": 114,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "wide-media-height-bound-on-a-wide-canvas",
+      "why": "Height is the constraining axis and the fit ratio (1.1225...) is non-integral; the exact width 1434.6 rounds to ODD 1435, so round_even must pull it to 1434.",
+      "in": {
+        "mediaW": 1278,
+        "mediaH": 718,
+        "canvasW": 1922,
+        "canvasH": 806,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 1434,
+        "dh": 806,
+        "ox": 244,
+        "oy": 0,
+        "dwExact": 1434.635097493036,
+        "dhExact": 806,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 1.1225626740947074,
+        "srcW": 1278,
+        "srcH": 718,
+        "postCropW": 1278,
+        "postCropH": 718,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "tall-media-height-bound-on-a-wide-canvas",
+      "why": "The opposite media orientation to the previous row, still height-bound: proves the min() picks the axis, not the orientation.",
+      "in": {
+        "mediaW": 606,
+        "mediaH": 1078,
+        "canvasW": 1918,
+        "canvasH": 802,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 450,
+        "dh": 802,
+        "ox": 734,
+        "oy": 0,
+        "dwExact": 450.8460111317254,
+        "dhExact": 802,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.7439703153988868,
+        "srcW": 606,
+        "srcH": 1078,
+        "postCropW": 606,
+        "postCropH": 1078,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "tall-media-width-bound-on-a-narrow-canvas",
+      "why": "Width-bound with a tall canvas — the mirror of the issue-#1 row, so both constraining axes appear with both media orientations.",
+      "in": {
+        "mediaW": 606,
+        "mediaH": 1078,
+        "canvasW": 482,
+        "canvasH": 1922,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 482,
+        "dh": 856,
+        "ox": 0,
+        "oy": 533,
+        "dwExact": 482,
+        "dhExact": 857.4191419141914,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.7953795379537953,
+        "srcW": 606,
+        "srcH": 1078,
+        "postCropW": 606,
+        "postCropH": 1078,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "rotate90-nonsquare-media-on-a-nonsquare-canvas",
+      "why": "Rotation swaps the axes BEFORE the fit, so the display width (1427) legitimately exceeds the canvas width (802). Any implementation that fits unrotated lands on 802 instead.",
+      "in": {
+        "mediaW": 1278,
+        "mediaH": 718,
+        "canvasW": 802,
+        "canvasH": 1442,
+        "rotate": 90,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 1428,
+        "dh": 802,
+        "ox": -313,
+        "oy": 320,
+        "dwExact": 1427.5153203342618,
+        "dhExact": 802,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 1.116991643454039,
+        "srcW": 1278,
+        "srcH": 718,
+        "postCropW": 1278,
+        "postCropH": 718,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "rotate270-nonsquare-media-on-a-nonsquare-canvas",
+      "why": "270 must take the same swapped-axis branch as 90; here the overlay y goes negative.",
+      "in": {
+        "mediaW": 903,
+        "mediaH": 1607,
+        "canvasW": 1276,
+        "canvasH": 718,
+        "rotate": 270,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 716,
+        "dh": 1276,
+        "ox": 280,
+        "oy": -279,
+        "dwExact": 717.005600497822,
+        "dhExact": 1276,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.7940261356565028,
+        "srcW": 903,
+        "srcH": 1607,
+        "postCropW": 903,
+        "postCropH": 1607,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "rotate180-uses-the-unrotated-fit",
+      "why": "Identical inputs to the rotate-90 row except the angle. 180 must NOT swap the fit axes, so every output differs — that contrast is the test.",
+      "in": {
+        "mediaW": 1278,
+        "mediaH": 718,
+        "canvasW": 802,
+        "canvasH": 1442,
+        "rotate": 180,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 802,
+        "dh": 450,
+        "ox": 0,
+        "oy": 496,
+        "dwExact": 801.9999999999999,
+        "dhExact": 450.57589984350545,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.6275430359937402,
+        "srcW": 1278,
+        "srcH": 718,
+        "postCropW": 1278,
+        "postCropH": 718,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "crop-that-actually-narrows",
+      "why": "A crop rect strictly inside the source. The fit is computed from the CROPPED size (851x479), not the media size (1920x1080).",
+      "in": {
+        "mediaW": 1920,
+        "mediaH": 1080,
+        "canvasW": 1280,
+        "canvasH": 722,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": {
+          "x": 213,
+          "y": 97,
+          "w": 851,
+          "h": 479
+        },
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 1280,
+        "dh": 720,
+        "ox": 0,
+        "oy": 1,
+        "dwExact": 1280,
+        "dhExact": 720.4700352526439,
+        "offXExact": -320.37602820211515,
+        "offYExact": -145.89894242068155,
+        "k": 1.5041128084606346,
+        "srcW": 1920,
+        "srcH": 1080,
+        "postCropW": 851,
+        "postCropH": 479,
+        "cropFilter": [
+          851,
+          479,
+          213,
+          97
+        ]
+      }
+    },
+    {
+      "name": "crop-clamped-to-the-source-edge",
+      "why": "crop.w/h overrun the source from a large x/y, so both must clamp to srcW-crop.x / srcH-crop.y (474x216) before anything else.",
+      "in": {
+        "mediaW": 1274,
+        "mediaH": 716,
+        "canvasW": 906,
+        "canvasH": 1602,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": {
+          "x": 800,
+          "y": 500,
+          "w": 900,
+          "h": 900
+        },
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 906,
+        "dh": 412,
+        "ox": 0,
+        "oy": 595,
+        "dwExact": 906,
+        "dhExact": 412.86075949367086,
+        "offXExact": -1529.113924050633,
+        "offYExact": -955.6962025316456,
+        "k": 1.9113924050632911,
+        "srcW": 1274,
+        "srcH": 716,
+        "postCropW": 474,
+        "postCropH": 216,
+        "cropFilter": [
+          474,
+          216,
+          800,
+          500
+        ]
+      }
+    },
+    {
+      "name": "crop-offset-only-still-clamps-the-width",
+      "why": "A pure x offset with a full-width w: the clamp alone narrows it to 1244, and the crop filter must still be emitted.",
+      "in": {
+        "mediaW": 1274,
+        "mediaH": 716,
+        "canvasW": 906,
+        "canvasH": 1602,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": {
+          "x": 30,
+          "y": 0,
+          "w": 1274,
+          "h": 716
+        },
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 906,
+        "dh": 520,
+        "ox": 0,
+        "oy": 541,
+        "dwExact": 906.0000000000001,
+        "dhExact": 521.4598070739551,
+        "offXExact": -21.84887459807074,
+        "offYExact": 0,
+        "k": 0.7282958199356914,
+        "srcW": 1274,
+        "srcH": 716,
+        "postCropW": 1244,
+        "postCropH": 716,
+        "cropFilter": [
+          1244,
+          716,
+          30,
+          0
+        ]
+      }
+    },
+    {
+      "name": "full-frame-crop-emits-no-crop-filter",
+      "why": "A crop identical to the source must produce cropFilter=null — the builder only emits crop= when it actually narrows.",
+      "in": {
+        "mediaW": 1274,
+        "mediaH": 716,
+        "canvasW": 802,
+        "canvasH": 1442,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": {
+          "x": 0,
+          "y": 0,
+          "w": 1274,
+          "h": 716
+        },
+        "scale": 1.19,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 954,
+        "dh": 536,
+        "ox": -76,
+        "oy": 453,
+        "dwExact": 954.38,
+        "dhExact": 536.3705494505494,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.7491208791208791,
+        "srcW": 1274,
+        "srcH": 716,
+        "postCropW": 1274,
+        "postCropH": 716,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "scale-down-with-positive-offsets",
+      "why": "userScale 0.63 multiplies the fit, and non-zero x/y shift the overlay off centre in both axes.",
+      "in": {
+        "mediaW": 1918,
+        "mediaH": 1082,
+        "canvasW": 1276,
+        "canvasH": 718,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 0.63,
+        "x": 137,
+        "y": -89
+      },
+      "out": {
+        "dw": 802,
+        "dh": 452,
+        "ox": 374,
+        "oy": 44,
+        "dwExact": 801.8374491682071,
+        "dhExact": 452.34,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.41805914972273567,
+        "srcW": 1918,
+        "srcH": 1082,
+        "postCropW": 1918,
+        "postCropH": 1082,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "scale-up-past-the-canvas-with-negative-offsets",
+      "why": "userScale 1.85 pushes the display size well past the canvas, so both overlay offsets go negative.",
+      "in": {
+        "mediaW": 642,
+        "mediaH": 362,
+        "canvasW": 1278,
+        "canvasH": 714,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 1.85,
+        "x": -211,
+        "y": 63
+      },
+      "out": {
+        "dw": 2342,
+        "dh": 1320,
+        "ox": -743,
+        "oy": -240,
+        "dwExact": 2342.590607734807,
+        "dhExact": 1320.9,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 3.6488950276243095,
+        "srcW": 642,
+        "srcH": 362,
+        "postCropW": 642,
+        "postCropH": 362,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "crop-rotate90-and-scale-compose",
+      "why": "All three at once: the crop feeds the rotated fit, which feeds userScale, which feeds the offsets. Any wrong ordering moves the result.",
+      "in": {
+        "mediaW": 1274,
+        "mediaH": 718,
+        "canvasW": 802,
+        "canvasH": 1442,
+        "rotate": 90,
+        "flipH": false,
+        "flipV": false,
+        "crop": {
+          "x": 107,
+          "y": 53,
+          "w": 611,
+          "h": 409
+        },
+        "scale": 1.37,
+        "x": 41,
+        "y": -77
+      },
+      "out": {
+        "dw": 1640,
+        "dh": 1098,
+        "ox": -378,
+        "oy": 95,
+        "dwExact": 1641.3939853300735,
+        "dhExact": 1098.74,
+        "offXExact": -287.44542787286065,
+        "offYExact": -142.379511002445,
+        "k": 2.6864058679706604,
+        "srcW": 1274,
+        "srcH": 718,
+        "postCropW": 611,
+        "postCropH": 409,
+        "cropFilter": [
+          611,
+          409,
+          107,
+          53
+        ]
+      }
+    },
+    {
+      "name": "flip-h-does-not-move-the-geometry",
+      "why": "flipH is carried through but must not touch dw/dh/ox/oy.",
+      "in": {
+        "mediaW": 853,
+        "mediaH": 1279,
+        "canvasW": 1274,
+        "canvasH": 718,
+        "rotate": 0,
+        "flipH": true,
+        "flipV": false,
+        "crop": null,
+        "scale": 0.91,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 436,
+        "dh": 652,
+        "ox": 419,
+        "oy": 33,
+        "dwExact": 435.75695074276774,
+        "dhExact": 653.38,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.510852228303362,
+        "srcW": 853,
+        "srcH": 1279,
+        "postCropW": 853,
+        "postCropH": 1279,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "flip-v-does-not-move-the-geometry",
+      "why": "flipV alone, with the opposite constraining axis to the flipH row.",
+      "in": {
+        "mediaW": 727,
+        "mediaH": 1291,
+        "canvasW": 1918,
+        "canvasH": 1078,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": true,
+        "crop": null,
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 606,
+        "dh": 1078,
+        "ox": 656,
+        "oy": 0,
+        "dwExact": 607.0534469403564,
+        "dhExact": 1078,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.8350116189000775,
+        "srcW": 727,
+        "srcH": 1291,
+        "postCropW": 727,
+        "postCropH": 1291,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "flip-both-axes-with-offsets",
+      "why": "Both flips plus userScale and offsets, to prove the flags stay independent of the placement math.",
+      "in": {
+        "mediaW": 1601,
+        "mediaH": 901,
+        "canvasW": 1082,
+        "canvasH": 1922,
+        "rotate": 0,
+        "flipH": true,
+        "flipV": true,
+        "crop": null,
+        "scale": 1.13,
+        "x": -35,
+        "y": 47
+      },
+      "out": {
+        "dw": 1222,
+        "dh": 688,
+        "ox": -105,
+        "oy": 664,
+        "dwExact": 1222.6599999999999,
+        "dhExact": 688.080362273579,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.76368519675203,
+        "srcW": 1601,
+        "srcH": 901,
+        "postCropW": 1601,
+        "postCropH": 901,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "rotate90-rebinds-which-canvas-edge-constrains",
+      "why": "Wide media on a wide canvas: unrotated it would be width-bound, rotated it is height-bound. The rotate flag alone decides.",
+      "in": {
+        "mediaW": 1601,
+        "mediaH": 443,
+        "canvasW": 1278,
+        "canvasH": 722,
+        "rotate": 90,
+        "flipH": false,
+        "flipV": true,
+        "crop": null,
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 722,
+        "dh": 200,
+        "ox": 278,
+        "oy": 261,
+        "dwExact": 722,
+        "dhExact": 199.7788881948782,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.4509681449094316,
+        "srcW": 1601,
+        "srcH": 443,
+        "postCropW": 1601,
+        "postCropH": 443,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "odd-display-width-is-rounded-down-to-even",
+      "why": "The exact display width is the ODD integer 401. ffmpeg needs even dims for yuv420p, so round_even drops it to 400 and the overlay shifts half a pixel.",
+      "in": {
+        "mediaW": 802,
+        "mediaH": 300,
+        "canvasW": 401,
+        "canvasH": 1000,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 400,
+        "dh": 150,
+        "ox": 1,
+        "oy": 425,
+        "dwExact": 401,
+        "dhExact": 150,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.5,
+        "srcW": 802,
+        "srcH": 300,
+        "postCropW": 802,
+        "postCropH": 300,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "negative-half-offset-rounds-away-from-zero",
+      "why": "ox lands on exactly -0.5. Rust's f64::round() gives -1; JS Math.round() gives -0. The fixture follows ffmpeg/Rust, so the preview-side helper must too.",
+      "in": {
+        "mediaW": 802,
+        "mediaH": 300,
+        "canvasW": 401,
+        "canvasH": 1000,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 1,
+        "x": -1,
+        "y": 0
+      },
+      "out": {
+        "dw": 400,
+        "dh": 150,
+        "ox": -1,
+        "oy": 425,
+        "dwExact": 401,
+        "dhExact": 150,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.5,
+        "srcW": 802,
+        "srcH": 300,
+        "postCropW": 802,
+        "postCropH": 300,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "absent-media-dims-fall-back-to-the-canvas",
+      "why": "media.width/height missing → both sides substitute the canvas size, so fit is exactly 1 and only userScale/offsets move it.",
+      "in": {
+        "mediaW": null,
+        "mediaH": null,
+        "canvasW": 1278,
+        "canvasH": 714,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 0.77,
+        "x": 61,
+        "y": -23
+      },
+      "out": {
+        "dw": 984,
+        "dh": 550,
+        "ox": 208,
+        "oy": 59,
+        "dwExact": 984.0600000000001,
+        "dhExact": 549.78,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 0.77,
+        "srcW": 1278,
+        "srcH": 714,
+        "postCropW": 1278,
+        "postCropH": 714,
+        "cropFilter": null
+      }
+    },
+    {
+      "name": "extreme-aspect-ratio-scaled-far-up",
+      "why": "A 17x43 sliver blown up ~16.6x: a large fit ratio with a long non-terminating decimal.",
+      "in": {
+        "mediaW": 17,
+        "mediaH": 43,
+        "canvasW": 1278,
+        "canvasH": 714,
+        "rotate": 0,
+        "flipH": false,
+        "flipV": false,
+        "crop": null,
+        "scale": 1,
+        "x": 0,
+        "y": 0
+      },
+      "out": {
+        "dw": 282,
+        "dh": 714,
+        "ox": 498,
+        "oy": 0,
+        "dwExact": 282.27906976744185,
+        "dhExact": 714,
+        "offXExact": 0,
+        "offYExact": 0,
+        "k": 16.6046511627907,
+        "srcW": 17,
+        "srcH": 43,
+        "postCropW": 17,
+        "postCropH": 43,
+        "cropFilter": null
+      }
+    }
+  ]
+}

@@ -21,30 +21,71 @@
   letter-spacing: -0.01em;
 }
 
-/* Muted and secondary so the wordmark still reads as the wordmark. Empty until
-   the version resolves, so it occupies no space on first paint. Selectable
-   because the whole point is being able to quote it in a bug report. */
-.home__version {
-  font-size: var(--fs-11);
-  font-weight: 500;
-  color: var(--text-3);
-  letter-spacing: 0;
-  font-variant-numeric: tabular-nums;
-  margin-left: -4px;
-  user-select: text;
-  cursor: text;
-}
-
 .home__brand-mark {
   width: 22px;
   height: 22px;
   border-radius: 6px;
+  /* The brand rule, stated in tokens rather than in a literal: the tile is the
+     accent and the "T" is --on-accent, which a custom theme sets to the user's
+     BACKGROUND colour. So the mark reads as the base colour punched out of an
+     accent chip. Nothing here clamps or second-guesses the pick — a user who
+     chooses an accent that swallows the "T" gets exactly that, and Settings >
+     Appearance stays legible so they can change their mind. The built-in Dark
+     and Light palettes keep --on-accent white (see tokens.css); this rule
+     follows whatever the active theme defines, which is the point of it. */
   background: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   display: grid;
   place-items: center;
   font-size: 12px;
   font-weight: 700;
+}
+
+/* ---------- The nav rescue ----------
+   READ THIS BEFORE MAKING THE GEAR ALWAYS LOOK LIKE THIS, OR BEFORE DELETING IT.
+
+   Settings > Appearance is guaranteed readable (the escape hatch in
+   settings.css). This is what guarantees you can REACH it. The gear is the
+   home screen's only route into Settings, and as a .btn--ghost.btn--icon its
+   only ink is a 1.33px icon stroke in --text-1 on --bg-app — so a text colour
+   picked on top of the background makes the way out of a bad theme disappear.
+
+   Two differences from the Appearance card, and both are deliberate:
+
+     * It is CONDITIONAL. `data-rescue-nav` is stamped by applyTheme only when
+       the gear's ink measures under NAV_RESCUE_RATIO (1.5:1) against the
+       surface behind it — "you actually cannot see it", not "this is hard to
+       read". An ugly, low-contrast, WCAG-failing but visible theme is left
+       exactly as the user chose it, which is the entire point of this release.
+       See src/core/session.ts for why 1.5 and not 3.
+     * It is LIGHTER. No region-wide token re-point: three declarations on one
+       button. Fill and ink so it is findable and reads as a button, hover so it
+       does not vanish again under the cursor, and the focus ring so the
+       keyboard route out survives too (the global ring is --accent, which can
+       equally well be the background colour).
+
+   The guarantee is the GLYPH, not the chip: --safe-text-1 on --safe-raised is
+   14.3:1 dark / 17.2:1 light for ANY three picks, because both are constants.
+   The chip itself can coincide with the page (a user may pick exactly #1d1d21),
+   and that is fine — the gear inside it is still fully drawn. Deriving a fill
+   from the user's background to avoid that would put the guarantee back at the
+   mercy of the picks, which is precisely what the --safe-* group exists to
+   avoid.
+
+   The attribute only exists while a custom theme is active, so under Dark/Light
+   these rules never match and the --safe-* properties they read are never
+   needed. */
+html[data-rescue-nav] #home-settings {
+  background: var(--safe-raised);
+  border-color: var(--safe-border-strong);
+  color: var(--safe-text-1);
+}
+html[data-rescue-nav] #home-settings:hover {
+  background: var(--safe-hover);
+  border-color: var(--safe-border-strong);
+}
+html[data-rescue-nav] #home-settings:focus-visible {
+  outline-color: var(--safe-accent);
 }
 
 .home__main {
@@ -178,6 +219,11 @@
   border: none;
   display: grid;
   place-items: center;
+  /* Deliberately NOT themed. This button floats over the card thumbnail — an
+     arbitrary frame of the user's video, not a themed surface — so it carries
+     its own scrim and its own ink. The pair is self-contrasting against
+     anything underneath, which is exactly what a themed token could not
+     promise here. */
   background: rgba(0, 0, 0, 0.55);
   color: #fff;
   cursor: pointer;

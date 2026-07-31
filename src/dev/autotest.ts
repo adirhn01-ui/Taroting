@@ -4,7 +4,7 @@
 // split/undo, playback advancement) against the actual video elements.
 // Results are written to %TEMP%\taroting-autotest-report.json.
 
-import { ipc } from "../core/ipc";
+import { appVersion, ipc } from "../core/ipc";
 import { navigate } from "../core/nav";
 import {
   addGeneratedMedia,
@@ -1017,7 +1017,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       return "suppressed on body, preserved on <input>";
     });
 
-    // ---- v0.6 Phase 3: multi-layer playback, stepping, canvas refit ----
+    // ---- v0.6 Phase 3: multi-layer playback, frame stepping ----
 
     await test("multi-layer-composite", async () => {
       const { addVideoTrack, makeClip, insertClip } = await import("../core/project");
@@ -1080,19 +1080,8 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       return "rapid stepping lands exactly: 100 → 110 → 100";
     });
 
-    await test("canvas-refit", async () => {
-      const { setProjectCanvas } = await import("../core/project");
-      const canvas = document.querySelector<HTMLElement>(".preview__canvas")!;
-      session.commit((p) => setProjectCanvas(p, 1280, 720));
-      await sleep(120); // let stage.refit() from the store subscription run
-      const w = parseFloat(canvas.style.width);
-      const h = parseFloat(canvas.style.height);
-      const ratio = w / h;
-      assert(Math.abs(ratio - 16 / 9) < 0.02, `canvas ratio ${ratio.toFixed(3)} not 16:9`);
-      session.undo();
-      engine.refresh();
-      return `refit to 16:9 ok (${w}x${h}, ratio ${ratio.toFixed(3)})`;
-    });
+    // (the old `canvas-refit` block lived here; it was a no-op — see the merged
+    //  `project-canvas-refit` block below.)
 
     // ---- v0.6 Phase 4: bin-first import, add-layer, generated media ----
 
@@ -1219,62 +1208,364 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       return "solid added → ready(empty url) → green → black → undo x3";
     });
 
-    // ---- v0.6 Phase 3: keyframe UI evaluation + project canvas panel ----
+    // ---- v0.6 Phase 3: keyframe UI evaluation + project canvas refit ----
 
     await test("keyframe-ui-eval", async () => {
-      const { setPositionKeyframes, clearAnimation, findClip } = await import("../core/project");
+      // REWRITTEN — the old fixture was degenerate on four axes at once:
+      // SYMMETRIC keyframes (-50 / +50) sampled at their exact MIDPOINT
+      // (expected 0), on a clip with timelineStart 0 / srcIn 0 / speed 1, then
+      // baked with { x: evalX } = { x: 0 } — which is already
+      // defaultTransform().x. An evalKfs that ignored `t` and averaged, or
+      // inverted the lerp factor, or dropped srcIn / speed / timelineStart from
+      // the source-time mapping, AND a bake that silently did nothing, all
+      // still produced 0 and passed.
+      //
+      // The fixture below is asymmetric, sampled OFF the midpoint, on a clip
+      // whose timelineStart, srcIn and speed are all non-default, and bakes a
+      // NONZERO value. Hand arithmetic, straight from the definitions
+      // (core/time.ts `sourceTime`, core/anim.ts `lerpSeg`/`evalKfs`):
+      //
+      //   clip    timelineStart 3, srcIn 1.5, srcOut 9.5, speed 2
+      //           footprint = (srcOut - srcIn) / speed = 8 / 2 = 4 s → [3, 7]
+      //   kfs     x: (t=2, v=-30), (t=6, v= 90)     (t is SOURCE seconds)
+      //           y: (t=2, v= 20), (t=6, v=-60)
+      //   probe   seek(4)  →  clipLocal = 4 - 3 = 1
+      //           s = srcIn + clipLocal * speed = 1.5 + 1*2 = 3.5
+      //           f = (s - 2) / (6 - 2) = 1.5 / 4 = 0.375
+      //           x = -30 + (90 - (-30)) * 0.375 = -30 + 45 =  15
+      //           y =  20 + (-60 -  20) * 0.375 =  20 - 30 = -10
+      //
+      //   Every degeneracy the old fixture hid now lands somewhere else:
+      //     ignore t / average                        →  x =  30
+      //     inverted lerp factor (f = 0.625)          →  x =  45
+      //     srcIn dropped        (s = 2.0)            →  x = -30
+      //     speed dropped        (s = 2.5)            →  x = -15
+      //     timelineStart dropped (s = 9.5 ≥ last kf) →  x =  90
+      //   The nearest wrong answer (30) is 15 away from the true 15, so the
+      //   ±0.5 band below discriminates every one of them.
+      type P = import("../core/types").ProjectFile;
+      const {
+        addVideoTrack, makeClip, insertClip, setPositionKeyframes, clearAnimation,
+        findClip, findTrack, defaultTransform, checkInvariants,
+      } = await import("../core/project");
       const { evalKfs } = await import("../core/anim");
-      const { sourceTime } = await import("../core/time");
+      const { sourceTime, clipDuration } = await import("../core/time");
       const { computeTransform } = await import("../editor/preview/transforms");
 
-      const clip0 = session.project.timeline.tracks[0]!.clips[0]!;
-      const id = clip0.id;
+      const counter = session.project.media[0]!; // the counter fixture (imported first)
+      assert(counter.duration > 9.5, `fixture too short for srcOut 9.5 (${counter.duration}s)`);
 
-      session.commit((p) => setPositionKeyframes(p, id, 0, -50, 0));
-      session.commit((p) => setPositionKeyframes(p, id, 2, 50, 0));
+      // Count only the history entries THIS block really created (commit is a
+      // no-op when the mutator returns the same reference), so teardown can
+      // never pop another block's undo step.
+      let steps = 0;
+      const step = (mutate: (p: P) => P): boolean => {
+        const before = session.project;
+        session.commit(mutate);
+        const changed = session.project !== before;
+        if (changed) steps++;
+        return changed;
+      };
+      const drain = (): void => {
+        while (steps > 0) {
+          session.undo();
+          steps--;
+        }
+        engine.refresh();
+      };
 
-      engine.seek(1);
-      await sleep(120);
-      const clip = findClip(session.project, id)!.clip;
-      const s = sourceTime(clip, engine.time - clip.timelineStart);
-      const evalX = evalKfs(clip.keyframes!.x!, s);
-      const expected = -50 + (50 - -50) * 0.5; // lerp(-50, 50, 0.5) = 0
-      assert(Math.abs(evalX - expected) < 1e-6, `evalX=${evalX}, expected ${expected}`);
+      let trackId = "";
+      let clipId = "";
+      try {
+        // A dedicated layer, so the fixture clip can own a non-zero
+        // timelineStart without colliding with (or disturbing) the base clip.
+        assert(
+          step((p) => { const r = addVideoTrack(p); trackId = r.trackId; return r.project; }),
+          "addVideoTrack must create a layer",
+        );
+        assert(
+          step((p) => {
+            const clip = makeClip(counter, 3); // timelineStart 3
+            clip.srcIn = 1.5;
+            clip.srcOut = 9.5;
+            clip.speed = 2; // → 4 s on the timeline: [3, 7]
+            clipId = clip.id;
+            return insertClip(p, trackId, clip);
+          }),
+          "insertClip must place the fixture clip",
+        );
+        engine.refresh();
 
-      const media2 = session.project.media.find((m) => m.id === clip.mediaId)!;
-      const proj = session.project.timeline;
-      const ct = computeTransform(clip.transform, media2, proj);
-      assert(Math.abs(ct.posX - clip.transform!.x) < 1e-6, "computeTransform reads static x");
+        const placed = findClip(session.project, clipId)!.clip;
+        assert(
+          placed.timelineStart === 3 && placed.srcIn === 1.5 && placed.speed === 2,
+          `fixture clip must keep start/srcIn/speed, got ${placed.timelineStart}/${placed.srcIn}/${placed.speed}`,
+        );
+        assert(
+          Math.abs(clipDuration(placed) - 4) < 1e-9,
+          `fixture footprint ${clipDuration(placed)}s, expected 4s`,
+        );
 
-      session.commit((p) => clearAnimation(p, id, "position", { x: evalX, y: 0 }));
-      const baked = findClip(session.project, id)!.clip;
-      assert(baked.keyframes?.x === undefined, "position kfs should be cleared");
-      assert(Math.abs(baked.transform!.x - evalX) < 1e-6, `baked x=${baked.transform!.x}`);
+        assert(step((p) => setPositionKeyframes(p, clipId, 2, -30, 20)), "keyframe @ s=2 not written");
+        assert(step((p) => setPositionKeyframes(p, clipId, 6, 90, -60)), "keyframe @ s=6 not written");
+        const kfErrs = checkInvariants(session.project);
+        assert(kfErrs.length === 0, `invariants with keyframes: ${kfErrs.join("; ")}`);
 
-      session.undo();
-      session.undo();
-      session.undo();
-      engine.refresh();
-      const restored = findClip(session.project, id)!.clip;
-      assert(restored.keyframes === undefined, "keyframes should be gone after undo x3");
-      return `evalX=${evalX.toFixed(3)} (expected ${expected}); bake+undo round-trip exact`;
+        engine.seek(4);
+        await sleep(120);
+        const clip = findClip(session.project, clipId)!.clip;
+        const clipLocal = engine.time - clip.timelineStart;
+        // The mapping is spelled out here rather than called, so a broken
+        // sourceTime cannot define its own expectation.
+        const sExpected = 1.5 + clipLocal * 2;
+        const s = sourceTime(clip, clipLocal);
+        assert(
+          Math.abs(s - sExpected) < 1e-9,
+          `sourceTime=${s}, expected srcIn + local*speed = ${sExpected}`,
+        );
+        assert(
+          Math.abs(s - 3.5) < 0.05,
+          `probe landed at source ${s.toFixed(4)}s, expected 3.5s (seek 4 → clipLocal 1)`,
+        );
+
+        const f = (s - 2) / (6 - 2);
+        const expX = -30 + (90 - -30) * f;
+        const expY = 20 + (-60 - 20) * f;
+        const evalX = evalKfs(clip.keyframes!.x!, s);
+        const evalY = evalKfs(clip.keyframes!.y!, s);
+        assert(Math.abs(evalX - expX) < 1e-9, `evalKfs x=${evalX}, expected ${expX}`);
+        assert(Math.abs(evalY - expY) < 1e-9, `evalKfs y=${evalY}, expected ${expY}`);
+        assert(
+          Math.abs(evalX - 15) < 0.5 && Math.abs(evalY + 10) < 0.5,
+          `hand-computed check failed: evalX=${evalX.toFixed(3)} (want 15), evalY=${evalY.toFixed(3)} (want -10)`,
+        );
+
+        // Bake those NONZERO values. A bake that silently did nothing would
+        // leave the DEFAULT transform (x=0, y=0) — indistinguishable from the
+        // old block's expectation, which is why it could not fail.
+        const dt = defaultTransform();
+        assert(
+          step((p) => clearAnimation(p, clipId, "position", { x: evalX, y: evalY })),
+          "clearAnimation must clear + bake",
+        );
+        const baked = findClip(session.project, clipId)!.clip;
+        assert(
+          baked.keyframes?.x === undefined && baked.keyframes?.y === undefined,
+          "position keyframes should be cleared",
+        );
+        assert(Math.abs(baked.transform!.x - evalX) < 1e-9, `baked x=${baked.transform!.x}, expected ${evalX}`);
+        assert(Math.abs(baked.transform!.y - evalY) < 1e-9, `baked y=${baked.transform!.y}, expected ${evalY}`);
+        assert(
+          Math.abs(baked.transform!.x - dt.x) > 1 && Math.abs(baked.transform!.y - dt.y) > 1,
+          `baked transform must differ from defaultTransform(): ${baked.transform!.x}/${baked.transform!.y} vs ${dt.x}/${dt.y}`,
+        );
+
+        // and that nonzero pose must survive the preview's pure transform math
+        const mediaRef = session.project.media.find((m) => m.id === baked.mediaId)!;
+        const ct = computeTransform(baked.transform, mediaRef, session.project.timeline);
+        assert(
+          Math.abs(ct.posX - evalX) < 1e-9 && Math.abs(ct.posY - evalY) < 1e-9,
+          `computeTransform pos=${ct.posX}/${ct.posY}, expected ${evalX}/${evalY}`,
+        );
+
+        const undos = steps;
+        drain();
+        assert(findClip(session.project, clipId) === undefined, "undo should remove the fixture clip");
+        assert(findTrack(session.project, trackId) === undefined, "undo should remove the fixture layer");
+        return `s=${s.toFixed(3)} (srcIn 1.5 + local ${clipLocal.toFixed(3)} × speed 2) → x=${evalX.toFixed(3)} y=${evalY.toFixed(3)} (hand: 15 / -10); bake ≠ default; undo x${undos} clean`;
+      } finally {
+        drain();
+      }
     });
 
-    await test("project-canvas-panel", async () => {
+    await test("project-canvas-refit", async () => {
+      // MERGED (was `canvas-refit` + `project-canvas-panel`). Both old blocks
+      // committed setProjectCanvas(1280, 720) onto a canvas that was ALREADY
+      // 1280x720 — addMedia adopts counter_h264.mp4's dims (testsrc2 1280x720)
+      // as the project canvas — and setProjectCanvas returns the SAME reference
+      // when nothing changes, so session.commit no-op'd and pushed no history.
+      // Every assertion (including "undo restored WxH", which compared 1280 to
+      // 1280) was true BEFORE the call: both blocks passed with setProjectCanvas
+      // deleted, and the whole store-subscription → stage.refit() path could
+      // have been dead code. Worse, the unconditional session.undo() that
+      // followed a no-op commit popped an EARLIER block's history entry.
+      //
+      // Merged into one block rather than kept as two because they exercise a
+      // single seam (canvas change → refit → letterbox). One honest test that
+      // walks TWO genuinely different canvases (1:1, then 32:9 — which flips
+      // which axis the min() fit binds on) covers strictly more than the two
+      // no-ops did. Judged by RENDERED geometry: the .preview__canvas box
+      // against preview.ts fit() (scale = min(availW/W, availH/H), 24px pad
+      // windowed) plus an elementFromPoint probe of a real letterbox bar.
+      type P = import("../core/types").ProjectFile;
       const { setProjectCanvas, checkInvariants } = await import("../core/project");
       const tl = (): import("../core/types").Timeline => session.project.timeline;
+      const canvas = document.querySelector<HTMLElement>(".preview__canvas");
+      assert(canvas !== null, "no .preview__canvas mounted");
+      const root = canvas!.parentElement as HTMLElement; // .preview — the letterbox container
+      assert(
+        root.closest(".editor__preview.theater") === null,
+        "precondition: theater mode is still active (fit() would use pad 0)",
+      );
+      const PAD = 24; // windowed breathing pad, per preview.ts fit()
+
       const w0 = tl().width;
       const h0 = tl().height;
+      const r0 = canvas!.getBoundingClientRect();
+      const a0 = r0.width / r0.height;
 
-      session.commit((p) => setProjectCanvas(p, 1280, 720));
-      assert(tl().width === 1280 && tl().height === 720, `${tl().width}x${tl().height}`);
-      const errs = checkInvariants(session.project);
-      assert(errs.length === 0, `invariants: ${errs.join("; ")}`);
+      let steps = 0;
+      const step = (mutate: (p: P) => P): boolean => {
+        const before = session.project;
+        session.commit(mutate);
+        const changed = session.project !== before;
+        if (changed) steps++;
+        return changed;
+      };
+      const undoStep = (): void => {
+        if (steps > 0) {
+          session.undo();
+          steps--;
+        }
+      };
 
-      session.undo();
-      engine.refresh();
-      assert(tl().width === w0 && tl().height === h0, `undo restored ${tl().width}x${tl().height}`);
-      return `canvas 1280x720 set + invariants clean + undo restored ${w0}x${h0}`;
+      const avail = (): { w: number; h: number } => {
+        const box = root.getBoundingClientRect();
+        return { w: Math.max(80, box.width - PAD * 2), h: Math.max(60, box.height - PAD * 2) };
+      };
+
+      /** Wait for the store-subscription → stage.refit() path to land the
+       *  letterbox for WxH, then assert the RENDERED box really is it. */
+      const expectFit = async (W: number, H: number, label: string): Promise<DOMRect> => {
+        const a = avail();
+        const k = Math.min(a.w / W, a.h / H);
+        const expW = Math.round(W * k);
+        const expH = Math.round(H * k);
+        const rect = await waitFor(
+          () => {
+            const r = canvas!.getBoundingClientRect();
+            return Math.abs(r.width - expW) < 1.5 && Math.abs(r.height - expH) < 1.5 ? r : null;
+          },
+          3000,
+          `${label}: .preview__canvas to refit to ${expW}x${expH}`,
+        );
+        // Letterbox invariant: fits inside the available box on BOTH axes and
+        // touches at least one. A max()-fit (cover) or a single-axis fit fails.
+        assert(
+          rect.width <= a.w + 1.5 && rect.height <= a.h + 1.5,
+          `${label}: canvas ${rect.width.toFixed(1)}x${rect.height.toFixed(1)} overflows avail ${a.w.toFixed(1)}x${a.h.toFixed(1)}`,
+        );
+        assert(
+          rect.width >= a.w - 1.5 || rect.height >= a.h - 1.5,
+          `${label}: canvas ${rect.width.toFixed(1)}x${rect.height.toFixed(1)} touches neither axis of avail ${a.w.toFixed(1)}x${a.h.toFixed(1)}`,
+        );
+        return rect;
+      };
+
+      /** Probe a REAL letterbox bar: a point midway between the canvas edge and
+       *  the container edge must not hit the canvas (or anything inside it),
+       *  while the canvas centre must. */
+      const probeBar = (rect: DOMRect, label: string): string => {
+        const box = root.getBoundingClientRect();
+        const gapX = box.width - rect.width;
+        const gapY = box.height - rect.height;
+        const horiz = gapX >= gapY;
+        const bar = (horiz ? gapX : gapY) / 2;
+        // the thinnest possible bar is the 24px windowed pad, so this only trips
+        // if the canvas is NOT letterboxed on either axis
+        assert(
+          bar >= 10,
+          `${label}: no letterbox bar to probe (gapX=${gapX.toFixed(1)}, gapY=${gapY.toFixed(1)})`,
+        );
+        const px = horiz ? (box.left + rect.left) / 2 : rect.left + rect.width / 2;
+        const py = horiz ? rect.top + rect.height / 2 : (box.top + rect.top) / 2;
+        const hitBar = document.elementFromPoint(px, py);
+        assert(
+          hitBar !== null && !canvas!.contains(hitBar),
+          `${label}: the ${horiz ? "side" : "top"} letterbox point is covered by the canvas (elementFromPoint=${(hitBar as HTMLElement | null)?.className ?? "null"})`,
+        );
+        const hitIn = document.elementFromPoint(
+          rect.left + rect.width / 2,
+          rect.top + rect.height / 2,
+        );
+        assert(
+          hitIn !== null && canvas!.contains(hitIn),
+          `${label}: the canvas centre does not hit the canvas (elementFromPoint=${(hitIn as HTMLElement | null)?.className ?? "null"})`,
+        );
+        return `${horiz ? "side" : "top/bottom"} bars ${bar.toFixed(0)}px`;
+      };
+
+      try {
+        // ---- A) square 1:1 — the canvas is NOT this, so the commit must bite
+        assert(
+          step((p) => setProjectCanvas(p, 1080, 1080)),
+          `setProjectCanvas(1080,1080) was a no-op — canvas already 1080x1080? (start ${w0}x${h0})`,
+        );
+        assert(
+          tl().width === 1080 && tl().height === 1080,
+          `model ${tl().width}x${tl().height}, expected 1080x1080`,
+        );
+        let errs = checkInvariants(session.project);
+        assert(errs.length === 0, `invariants after 1:1: ${errs.join("; ")}`);
+        const rA = await expectFit(1080, 1080, "1:1");
+        const aA = rA.width / rA.height;
+        assert(Math.abs(aA - 1) < 0.02, `rendered aspect ${aA.toFixed(3)} is not 1:1`);
+        assert(
+          Math.abs(aA - a0) > 0.2,
+          `rendered aspect did not actually change (${a0.toFixed(3)} → ${aA.toFixed(3)})`,
+        );
+        const barA = probeBar(rA, "1:1");
+        const bindWA = rA.width >= avail().w - 1.5;
+
+        // ---- B) ultrawide 32:9 — a genuinely different canvas; for any panel
+        //         between 1:1 and 32:9 the OTHER fit axis binds.
+        assert(step((p) => setProjectCanvas(p, 2560, 720)), "setProjectCanvas(2560,720) was a no-op");
+        assert(
+          tl().width === 2560 && tl().height === 720,
+          `model ${tl().width}x${tl().height}, expected 2560x720`,
+        );
+        errs = checkInvariants(session.project);
+        assert(errs.length === 0, `invariants after 32:9: ${errs.join("; ")}`);
+        const rB = await expectFit(2560, 720, "32:9");
+        const aB = rB.width / rB.height;
+        assert(Math.abs(aB - 2560 / 720) < 0.05, `rendered aspect ${aB.toFixed(3)} is not 32:9`);
+        const barB = probeBar(rB, "32:9");
+        const bindWB = rB.width >= avail().w - 1.5;
+        const panel = avail().w / avail().h;
+        if (panel > 1.05 && panel < 3.5) {
+          assert(
+            bindWA !== bindWB,
+            `the binding fit axis did not flip between 1:1 and 32:9 on a ${panel.toFixed(2)}:1 panel`,
+          );
+        }
+
+        // ---- undo x2 restores BOTH the model and the rendered letterbox
+        undoStep();
+        undoStep();
+        engine.refresh();
+        assert(
+          tl().width === w0 && tl().height === h0,
+          `undo x2 restored ${tl().width}x${tl().height}, expected ${w0}x${h0}`,
+        );
+        const rZ = await waitFor(
+          () => {
+            const r = canvas!.getBoundingClientRect();
+            return Math.abs(r.width - r0.width) < 1.5 && Math.abs(r.height - r0.height) < 1.5
+              ? r
+              : null;
+          },
+          3000,
+          `.preview__canvas to refit back to ${r0.width.toFixed(0)}x${r0.height.toFixed(0)}`,
+        );
+        assert(
+          Math.abs(rZ.width / rZ.height - a0) < 0.02,
+          `restored aspect ${(rZ.width / rZ.height).toFixed(3)} vs ${a0.toFixed(3)}`,
+        );
+        return `${w0}x${h0} → 1080x1080 (${rA.width.toFixed(0)}x${rA.height.toFixed(0)}, ${barA}) → 2560x720 (${rB.width.toFixed(0)}x${rB.height.toFixed(0)}, ${barB}) → undo x2 back to ${rZ.width.toFixed(0)}x${rZ.height.toFixed(0)}`;
+      } finally {
+        while (steps > 0) undoStep();
+        engine.refresh();
+      }
     });
 
     await test("v06-file-roundtrip", async () => {
@@ -1674,42 +1965,421 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     // LAST block on purpose: it navigates away from the editor, so nothing after
     // it could inherit a different route. Asserts the version is really PAINTED,
     // not just present in the DOM — an empty or zero-box label would be useless.
-    await test("version-visible", async () => {
-      navigate({ view: "home" });
-      const badge = await waitFor(
-        () => {
-          const el = document.querySelector<HTMLElement>("#home-version");
-          return el && el.textContent && el.textContent.trim() ? el : null;
-        },
-        10_000,
-        "home version badge",
-      );
-      const shown = badge.textContent!.trim();
-      assert(/^\d+\.\d+\.\d+/.test(shown), `home version looks wrong: "${shown}"`);
+    //
+    // The version lives ONLY in Settings > About now (the home badge is gone),
+    // so the expected string has to come from somewhere other than the page:
+    // `appVersion()` is the same source Settings renders from, which turns this
+    // from "shows a version" into "shows the RIGHT version" — a label stuck on a
+    // stale or hardcoded string would still pass a bare semver match.
+    await test("settings-version-visible", async () => {
+      try {
+        const expected = await appVersion();
+        // "dev" (outside Tauri) or "unknown" (getVersion threw) mean the version
+        // plumbing itself is broken — the label would then agree with a wrong
+        // value, so check the source before comparing against it.
+        assert(
+          /^\d+\.\d+\.\d+/.test(expected),
+          `appVersion() did not return a real version: "${expected}"`,
+        );
+
+        navigate({ view: "settings" });
+        const about = await waitFor(
+          () => {
+            const el = Array.from(document.querySelectorAll<HTMLElement>(".settings__version"))
+              .find((n) => n.textContent && n.textContent.includes(expected));
+            return el ?? null;
+          },
+          10_000,
+          "settings About version",
+        );
+        const shown = about.textContent!.trim();
+        assert(
+          /^Taroting \d+\.\d+\.\d+/.test(shown),
+          `About version looks wrong: "${shown}"`,
+        );
+        assert(
+          about.offsetParent !== null && about.getClientRects().length > 0,
+          "About version is in the DOM but not rendered",
+        );
+        assert(
+          getComputedStyle(about).userSelect === "text",
+          "About version must be selectable so it can be quoted in a bug report",
+        );
+        return `"${shown}" matches appVersion() ${expected} in Settings > About`;
+      } finally {
+        // Leave the app on a neutral route even if an assertion threw, so a
+        // failure here cannot park the harness inside Settings.
+        navigate({ view: "home" });
+      }
+    });
+
+    // Custom theme: assert the tokens the whole app reads ACTUALLY change, not
+    // that a setting was stored. A custom theme that persists but never repaints
+    // would pass any state-level check while being completely broken.
+    //
+    // THE CONTRACT THIS PINS — colours are no longer clamped to contrast floors:
+    //   1. background / accent / text land VERBATIM, however unreadable. The
+    //      user's pick is the user's pick.
+    //   2. --on-accent IS the background colour, so the ink on every accent
+    //      surface is the user's base colour — the home brand mark above all.
+    //   3. The surface ramp is still DERIVED (--bg-panel != --bg-app): "no
+    //      clamping" must not have quietly become "no derivation".
+    //   4. Settings > Appearance is the escape hatch and stays legible whatever
+    //      is picked, so someone who paints the app invisible can still get back
+    //      and fix it. It is the ONE surface allowed to disobey the colours.
+    // 1 and 4 are deliberately opposites, and that tension IS the feature — so
+    // both halves are asserted here, against the same live document.
+    await test("custom-theme-applies", async () => {
+      const { NAV_RESCUE_RATIO, settingsStore, updateSettings } = await import("../core/session");
+      const before = settingsStore.get();
+      const root = document.documentElement;
+      const tok = (name: string): string => getComputedStyle(root).getPropertyValue(name).trim();
       assert(
-        badge.offsetParent !== null && badge.getClientRects().length > 0,
-        "home version is in the DOM but not rendered",
+        tok("--accent") !== "" && tok("--bg-app") !== "",
+        "theme tokens must resolve before we start",
       );
 
-      navigate({ view: "settings" });
-      const about = await waitFor(
-        () => {
-          const el = Array.from(document.querySelectorAll<HTMLElement>(".settings__version"))
-            .find((n) => n.textContent && n.textContent.includes(shown));
-          return el ?? null;
-        },
-        10_000,
-        "settings About version",
-      );
+      /* ---------------- colour maths ---------------- */
+
+      interface Rgba {
+        rgb: number[];
+        a: number;
+      }
+      /** A computed custom property comes back as rgb(...) or #rrggbb depending
+       *  on how it was written, and a computed color/background-color as
+       *  rgb()/rgba() — so everything is compared as parsed channels. */
+      const parse = (s: string): Rgba => {
+        const t = s.trim();
+        if (t.startsWith("#")) {
+          const b = t.slice(1);
+          const h = b.length === 3 ? b.split("").map((c) => c + c).join("") : b;
+          return { rgb: [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)), a: 1 };
+        }
+        const n = t.match(/-?[\d.]+/g);
+        if (!n || n.length < 3) return { rgb: [0, 0, 0], a: 0 };
+        return { rgb: n.slice(0, 3).map(Number), a: n.length > 3 ? Number(n[3]) : 1 };
+      };
+      const chan = (s: string): number[] => parse(s).rgb;
+      /** The real WCAG 2.1 relative luminance, gamma-corrected — NOT a channel
+       *  average. An earlier version of this block averaged channels, which
+       *  measures nothing: it calls #0000ff and #808080 equally bright. */
+      const lum = (c: number[]): number => {
+        const f = (v: number): number => {
+          const x = v / 255;
+          return x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+        };
+        return 0.2126 * f(c[0]!) + 0.7152 * f(c[1]!) + 0.0722 * f(c[2]!);
+      };
+      const ratio = (a: number[], b: number[]): number => {
+        const la = lum(a);
+        const lb = lum(b);
+        return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+      };
+      /** Same colour, allowing one channel step for a hex/rgb round trip. Any
+       *  contrast clamp moves a colour very much further than that. */
+      const same = (got: string, want: string): boolean => {
+        const g = chan(got);
+        const w = chan(want);
+        return g.length === 3 && w.every((c, i) => Math.abs(c - g[i]!) <= 1);
+      };
+      /** What a run of text is REALLY drawn on: walk up the tree compositing
+       *  every translucent layer onto the first opaque one. Reading
+       *  background-color off the text element alone returns rgba(0,0,0,0) on
+       *  nearly every element in this app and would score a meaningless ratio. */
+      const bgUnder = (el: HTMLElement): number[] => {
+        const layers: Rgba[] = [];
+        for (let n: HTMLElement | null = el; n; n = n.parentElement) {
+          const p = parse(getComputedStyle(n).backgroundColor);
+          if (p.a <= 0) continue;
+          layers.push(p);
+          if (p.a >= 0.999) break;
+        }
+        // Nothing opaque all the way to the root: the canvas underneath is white.
+        let out =
+          layers.length > 0 && layers[layers.length - 1]!.a >= 0.999
+            ? layers.pop()!.rgb
+            : [255, 255, 255];
+        for (let i = layers.length - 1; i >= 0; i--) {
+          const l = layers[i]!;
+          out = out.map((v, k) => l.rgb[k]! * l.a + v * (1 - l.a));
+        }
+        return out;
+      };
+
+      /* ---------------- fixtures ---------------- */
+
+      // Nothing like either stock palette, so "it changed" cannot be satisfied
+      // by a default leaking through — and TEXT is picked almost on top of the
+      // BACKGROUND, which is the exact two-click route to an unreadable app that
+      // the old code clamped away. Keeping it verbatim is now the contract.
+      const BG = "#241a3d";
+      const ACCENT = "#ff5fa2";
+      const TEXT = "#3a2f55";
+      // Fixture self-check. If someone ever "tidies" TEXT into a readable colour
+      // the clamp regression below silently stops testing anything at all.
+      const pickRatio = ratio(chan(TEXT), chan(BG));
       assert(
-        about.offsetParent !== null && about.getClientRects().length > 0,
-        "About version is in the DOM but not rendered",
+        pickRatio < 2,
+        `fixture no longer triggers the old clamp: text is ${pickRatio.toFixed(2)}:1 on the background`,
       );
-      assert(
-        getComputedStyle(about).userSelect === "text",
-        "About version must be selectable so it can be quoted in a bug report",
-      );
-      return `version ${shown} shown on home and in Settings > About`;
+      // Background == accent == text: the app renders as one flat rectangle.
+      // This is the state the Settings escape hatch exists for.
+      const PATHO = "#3d1f6e";
+      /** Body text on the one card that has to stay usable. WCAG 2.1 AA — below
+       *  that, "you can still get back and fix it" is not a true statement. */
+      const ESCAPE_FLOOR = 4.5;
+      /** An UGLY but genuinely visible text on BG: 2.78:1, a WCAG failure for a
+       *  UI component and still perfectly findable. The nav rescue must leave it
+       *  completely alone — that is the whole difference between it and the
+       *  Appearance card, which is unconditional. */
+      const UGLY_TEXT = "#6a5f85";
+      /** What a FIRED rescue has to deliver. The trigger is much lower (see
+       *  NAV_RESCUE_RATIO — "you cannot see it at all"), but once it fires the
+       *  gear is drawn from the fixed safe palette and has to be a properly
+       *  visible control: WCAG 2.1 SC 1.4.11's UI-component floor. */
+      const RESCUED_GEAR_FLOOR = 3;
+
+      try {
+        navigate({ view: "settings" });
+        const seg = await waitFor(
+          () => document.querySelector<HTMLElement>('[data-theme-opt="custom"]'),
+          10_000,
+          "Custom theme option",
+        );
+        seg.click();
+
+        // Choosing Custom must expand the card — that is the owner-visible half.
+        const area = await waitFor(
+          () => document.querySelector<HTMLElement>(".settings__custom"),
+          5_000,
+          "expanded custom area",
+        );
+        assert(
+          area.offsetParent !== null && area.getClientRects().length > 0,
+          "custom area is in the DOM but not rendered",
+        );
+        assert(
+          !!document.querySelector("#settings-color-background") &&
+            !!document.querySelector("#settings-color-accent") &&
+            !!document.querySelector("#settings-color-text"),
+          "custom area must offer background, accent and text",
+        );
+
+        /* ---- 1. every pick lands verbatim ---- */
+
+        await updateSettings({
+          theme: "custom",
+          customTheme: { background: BG, accent: ACCENT, text: TEXT },
+        });
+        await waitFor(
+          () => (same(tok("--accent"), ACCENT) ? true : null),
+          5_000,
+          "--accent to repaint",
+        );
+        const accent = tok("--accent");
+        const bg = tok("--bg-app");
+        const text1 = tok("--text-1");
+        assert(same(bg, BG), `--bg-app is not the chosen background: got ${bg}, want ${BG}`);
+        assert(
+          same(accent, ACCENT),
+          `--accent is not the chosen accent: got ${accent}, want ${ACCENT}`,
+        );
+        // THE regression test for the behaviour change. This pick is ~1.3:1 on
+        // its own background and the old code walked it out to 4.5:1. If any
+        // form of clamping comes back, this is the assertion that says so.
+        assert(
+          same(text1, TEXT),
+          `--text-1 was rewritten — clamping is back: got ${text1}, want ${TEXT}`,
+        );
+
+        /* ---- 2. --on-accent IS the background colour ---- */
+
+        const onAccent = tok("--on-accent");
+        assert(onAccent !== "", "--on-accent must always be set");
+        assert(
+          same(onAccent, BG),
+          `--on-accent must be the background colour ${BG} (the brand-mark rule), got ${onAccent}`,
+        );
+
+        /* ---- 3. the surface ramp still derives ---- */
+
+        const panel = tok("--bg-panel");
+        assert(
+          panel !== "" && !same(panel, bg),
+          `--bg-panel must still be derived off --bg-app ${bg}, got ${panel}`,
+        );
+
+        /* ---- the brand mark, in really painted pixels ---- */
+
+        // The owner asked for this one by name: the "T" is the base colour, its
+        // tile is the accent. Assert the RENDERED element and not just the
+        // tokens behind it — home.css could stop reading them tomorrow.
+        navigate({ view: "home" });
+        const mark = await waitFor(
+          () => document.querySelector<HTMLElement>(".home__brand-mark"),
+          10_000,
+          "home brand mark",
+        );
+        assert(
+          mark.offsetParent !== null && mark.getClientRects().length > 0,
+          "brand mark is in the DOM but not rendered",
+        );
+        const markCs = getComputedStyle(mark);
+        assert(
+          same(markCs.backgroundColor, ACCENT),
+          `brand mark tile is ${markCs.backgroundColor}, want the accent ${ACCENT}`,
+        );
+        assert(
+          same(markCs.color, BG),
+          `the brand "T" is ${markCs.color}, want the background colour ${BG}`,
+        );
+
+        /* ---- 4. the escape hatch ---- */
+
+        await updateSettings({
+          theme: "custom",
+          customTheme: { background: PATHO, accent: PATHO, text: PATHO },
+        });
+        // This also proves the theme repaints while ALREADY on custom, which is
+        // the harder case — which is why nothing above compares against the
+        // pre-test baseline (a previous run's leftovers could equal it).
+        await waitFor(
+          () => (same(tok("--bg-app"), PATHO) ? true : null),
+          5_000,
+          "pathological theme to paint",
+        );
+        assert(
+          same(tok("--accent"), PATHO) && same(tok("--text-1"), PATHO),
+          `the pathological pick was rewritten: accent ${tok("--accent")}, text ${tok("--text-1")}`,
+        );
+
+        navigate({ view: "settings" });
+        const opt = await waitFor(
+          () => document.querySelector<HTMLElement>('[data-theme-opt="custom"]'),
+          10_000,
+          "theme control under the pathological theme",
+        );
+        const card = opt.closest<HTMLElement>(".settings__card, .card");
+        assert(card !== null, "the theme control must live inside a Settings card");
+        assert(
+          card!.offsetParent !== null && card!.getClientRects().length > 0,
+          "the Appearance card is in the DOM but not rendered",
+        );
+        assert(
+          opt.offsetParent !== null && opt.getClientRects().length > 0,
+          "the theme control is not rendered — there would be no way back",
+        );
+        const row = await waitFor(
+          () => document.querySelector<HTMLElement>("#settings-color-background"),
+          5_000,
+          "background colour row",
+        );
+        assert(
+          row.offsetParent !== null && row.getClientRects().length > 0,
+          "the background colour row is not rendered — the bad colour cannot be changed",
+        );
+
+        // Measured, not assumed. The row label re-resolves `color: var(--text-1)`
+        // at its own position in the tree, so a card-scoped override shows up
+        // here while the root token stays the user's (unreadable) pick — which
+        // is why this reads the label and not the card's inherited colour.
+        const label = card!.querySelector<HTMLElement>(".settings__row-label");
+        assert(label !== null, "the Appearance card must have a readable row label");
+        const labelRatio = ratio(chan(getComputedStyle(label!).color), bgUnder(label!));
+        assert(
+          labelRatio >= ESCAPE_FLOOR,
+          `Appearance card text is only ${labelRatio.toFixed(2)}:1 on its own background — the escape hatch does not work`,
+        );
+        // Reported rather than asserted: the two controls are already proven
+        // rendered above, and these are the numbers to look at first if a run
+        // ever shows the card passing while feeling dead.
+        const optRatio = ratio(chan(getComputedStyle(opt).color), bgUnder(opt));
+        const rowRatio = ratio(chan(getComputedStyle(row).color), bgUnder(row));
+
+        /* ---- 5. the way IN to that card ---- */
+
+        // A readable Appearance card is worth nothing if the control that
+        // reaches it is invisible, and on home that control is one ghost icon
+        // button whose only ink is a 1.33 px --text-1 stroke on --bg-app. Under
+        // PATHO (still active) that stroke is the background, so the rescue has
+        // to have fired. Asserted on the PAINTED result: what actually hit-tests
+        // at the button's centre, and the ratio of the ink really being drawn
+        // against the surface really behind it — a `display` check would have
+        // passed here even when the theme erased the thing.
+        navigate({ view: "home" });
+        const gear = await waitFor(
+          () => document.querySelector<HTMLElement>("#home-settings"),
+          10_000,
+          "home Settings gear under the pathological theme",
+        );
+        assert(
+          root.dataset.rescueNav === "1",
+          `the gear is invisible under ${PATHO} but data-rescue-nav was not stamped`,
+        );
+        assert(
+          gear.offsetParent !== null && gear.getClientRects().length > 0,
+          "the Settings gear is in the DOM but not rendered — there is no way into Settings",
+        );
+        /** Whatever the compositor says is on top at the middle of the button.
+         *  The icon <svg> is a legitimate answer (only the transport and theater
+         *  bars make their glyphs pointer-transparent); anything OUTSIDE the
+         *  button is not — that would be a click landing somewhere else. */
+        const hitsGear = (): boolean => {
+          const r = gear.getBoundingClientRect();
+          const hit = document.elementFromPoint(
+            Math.round(r.left + r.width / 2),
+            Math.round(r.top + r.height / 2),
+          );
+          return hit !== null && (hit === gear || gear.contains(hit));
+        };
+        assert(hitsGear(), "the Settings gear is rendered but not hit-testable at its own centre");
+        const gearRatio = ratio(chan(getComputedStyle(gear).color), bgUnder(gear));
+        assert(
+          gearRatio >= RESCUED_GEAR_FLOOR,
+          `the rescued gear is only ${gearRatio.toFixed(2)}:1 on what is behind it — it is not a visible control`,
+        );
+
+        // …and the other direction, which is the harder promise: an ugly,
+        // WCAG-failing, but VISIBLE theme must be left exactly as picked. If
+        // this ever fires the feature has become contrast clamping.
+        await updateSettings({
+          theme: "custom",
+          customTheme: { background: BG, accent: ACCENT, text: UGLY_TEXT },
+        });
+        await waitFor(
+          () => (same(tok("--text-1"), UGLY_TEXT) ? true : null),
+          5_000,
+          "the ugly-but-visible theme to paint",
+        );
+        const uglyRatio = ratio(chan(UGLY_TEXT), chan(BG));
+        assert(
+          uglyRatio > NAV_RESCUE_RATIO && uglyRatio < RESCUED_GEAR_FLOOR,
+          `fixture no longer tests anything: ${uglyRatio.toFixed(2)}:1 is not "ugly but visible"`,
+        );
+        assert(
+          root.dataset.rescueNav === undefined,
+          `the gear is visible at ${uglyRatio.toFixed(2)}:1 and was restyled anyway — that is clamping`,
+        );
+        assert(
+          same(getComputedStyle(gear).color, UGLY_TEXT),
+          `the gear is drawn in ${getComputedStyle(gear).color}, not the user's own text colour ${UGLY_TEXT}`,
+        );
+        assert(hitsGear(), "the Settings gear stopped hit-testing under a normal custom theme");
+
+        return `verbatim bg ${bg} / accent ${accent} / text ${text1} (${pickRatio.toFixed(2)}:1, unclamped), on-accent ${onAccent} == bg, panel ${panel} derived; escape hatch on ${PATHO}: label ${labelRatio.toFixed(2)}:1 (theme btn ${optRatio.toFixed(2)}:1, colour btn ${rowRatio.toFixed(2)}:1); nav rescue fired on ${PATHO}: gear hit-tests at ${gearRatio.toFixed(2)}:1, and stayed OFF at ${uglyRatio.toFixed(2)}:1`;
+      } finally {
+        // Never leave the owner's real theme changed by a test run — and nothing
+        // clamps any more, so a leaked pathological theme would leave the app
+        // genuinely unusable. The repaint inside updateSettings is synchronous;
+        // the await is only so the restore is the LAST write to settings.json.
+        try {
+          await updateSettings({ theme: before.theme, customTheme: before.customTheme });
+        } catch {
+          // The repaint already happened. A failed disk write must not mask the
+          // assertion failure that sent us here.
+        }
+        navigate({ view: "home" });
+      }
     });
   } catch (e) {
     results.push({ name: "setup", pass: false, detail: String(e) });

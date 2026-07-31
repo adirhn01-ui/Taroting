@@ -9,7 +9,7 @@ import {
   formatDuration,
   formatRelative,
 } from "../core/format";
-import { appVersion, describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles, pickProjectFile } from "../core/ipc";
+import { describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles, pickProjectFile } from "../core/ipc";
 import { navigate } from "../core/nav";
 import { addMedia, createProject } from "../core/project";
 import { MEDIA_FILE_EXTENSIONS } from "../core/types";
@@ -69,7 +69,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   root.innerHTML = `
     <div class="home">
       <header class="home__header">
-        <div class="home__brand"><span class="home__brand-mark">T</span>Taroting<span class="home__version" id="home-version"></span></div>
+        <div class="home__brand"><span class="home__brand-mark">T</span>Taroting</div>
         <button class="btn btn--ghost btn--icon" id="home-settings" title="Settings">${icon("gear")}</button>
       </header>
       <main class="home__main">
@@ -290,30 +290,50 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
      until the backend can produce one. Fire one shot per thumb-less path per
      mount (no polling/timers); on a hit, swap just that card's placeholder for
      an <img> without re-rendering the grid. */
+  /** Cards per backend call. The batched command does ONE recents read/write and
+   *  ONE thumbs-dir scan per call, so a whole mount used to cost ~7 filesystem
+   *  ops per card. Batching all of them would be cheapest, but generation inside
+   *  a batch is sequential — on a cold thumb cache the grid would then sit blank
+   *  and fill in one jump. Four keeps the fill progressive while still cutting
+   *  the writes several-fold. */
+  const THUMB_BATCH = 4;
+
+  function paintThumb(path: string, thumb: string): void {
+    // Keep the in-memory model in sync so a later renderGrid() (sort, search,
+    // rename) carries the thumb through instead of dropping it.
+    const model = recentByPath(path);
+    if (model) model.thumb = thumb;
+    const card = grid.querySelector<HTMLElement>(
+      `.project-card[data-path="${CSS.escape(path)}"]`,
+    );
+    const thumbEl = card?.querySelector<HTMLElement>(".project-card__thumb");
+    if (thumbEl) {
+      thumbEl.innerHTML = `<img src="${escapeHtml(mediaUrl(thumb))}" alt="" loading="lazy" />`;
+    }
+  }
+
   function backfillThumbs(): void {
+    const pending: string[] = [];
     for (const item of recents) {
       if (item.thumb || thumbTried.has(item.path)) continue;
       thumbTried.add(item.path);
-      const path = item.path;
+      pending.push(item.path);
+    }
+    for (let i = 0; i < pending.length; i += THUMB_BATCH) {
+      const batch = pending.slice(i, i + THUMB_BATCH);
       void ipc
-        .refreshRecentThumb(path)
-        .then((thumb) => {
-          if (disposed || !thumb) return;
-          // Keep the in-memory model in sync so a later renderGrid() (sort,
-          // search, rename) carries the thumb through instead of dropping it.
-          const model = recentByPath(path);
-          if (model) model.thumb = thumb;
-          const card = grid.querySelector<HTMLElement>(
-            `.project-card[data-path="${CSS.escape(path)}"]`,
-          );
-          const thumbEl = card?.querySelector<HTMLElement>(".project-card__thumb");
-          if (thumbEl) {
-            thumbEl.innerHTML = `<img src="${escapeHtml(mediaUrl(thumb))}" alt="" loading="lazy" />`;
+        .refreshRecentThumbs(batch)
+        .then((found) => {
+          if (disposed) return;
+          // Only projects that resolved come back; a missing key is the batch
+          // equivalent of the single-path `null`.
+          for (const [path, thumb] of Object.entries(found)) {
+            if (thumb) paintThumb(path, thumb);
           }
         })
         .catch(() => {
-          // Best-effort: the backend already fails soft to null. A fresh mount
-          // clears thumbTried, so the next home visit retries.
+          // Best-effort: the backend already fails soft. A fresh mount clears
+          // thumbTried, so the next home visit retries.
         });
     }
   }
@@ -673,7 +693,12 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     });
   });
 
-  let unlistenDrop: () => void = () => {};
+  // Registration is async, so dispose() can land BEFORE the listener exists.
+  // Start from null (not a no-op) and hand the real unlisten straight back if
+  // teardown already happened: calling a placeholder would leak the listener
+  // for the rest of the process, and a later drop would then run this dead
+  // handler as well as the live screen's.
+  let unlistenDrop: (() => void) | null = null;
   void onDragDrop({
     onHover: () => overlay.classList.add("active"),
     onCancel: () => overlay.classList.remove("active"),
@@ -681,23 +706,19 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       overlay.classList.remove("active");
       handleDroppedPaths(paths);
     },
-  }).then((u) => (unlistenDrop = u));
+  }).then((u) => {
+    if (disposed) u();
+    else unlistenDrop = u;
+  });
 
   void refresh();
   search.focus();
 
-  // Answers "which build am I actually running" at a glance, with no trip to
-  // Settings. Filled in after first paint so it never delays the home screen.
-  void appVersion().then((v) => {
-    if (disposed || !v) return;
-    const el = root.querySelector("#home-version");
-    if (el) el.textContent = v;
-  });
-
   return {
     dispose() {
       disposed = true;
-      unlistenDrop();
+      unlistenDrop?.();
+      unlistenDrop = null;
       document.removeEventListener("keydown", onEscape, true);
     },
   };

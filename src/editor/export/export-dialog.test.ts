@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { joinPath, renameWithSuffix, sanitizeFileName, splitPath } from "./export-dialog";
+import type { ExportPreset } from "../../core/types";
+import { DEFAULT_EXPORT_PRESET } from "../../core/types";
+import {
+  joinPath,
+  mergeExportPreset,
+  renameWithSuffix,
+  sanitizeFileName,
+  splitPath,
+  type PresetEdits,
+} from "./export-dialog";
 
 describe("sanitizeFileName", () => {
   it("strips characters Windows forbids", () => {
@@ -47,6 +56,88 @@ describe("joinPath", () => {
   });
   it("returns the file when the dir is empty", () => {
     expect(joinPath("", "out.mp4")).toBe("out.mp4");
+  });
+});
+
+describe("mergeExportPreset", () => {
+  /* Deliberately different from DEFAULT_EXPORT_PRESET on EVERY axis, so a field
+     that silently kept its old value cannot hide behind a coincidence. */
+  const edits: PresetEdits = {
+    format: "mov",
+    vcodec: "hevc",
+    resolution: "1080p",
+    fps: 60,
+    videoBitrate: 12000,
+    audioBitrate: 256,
+    useHardware: false,
+  };
+
+  it("writes every field the dialog owns", () => {
+    expect(mergeExportPreset(DEFAULT_EXPORT_PRESET, edits)).toEqual(edits);
+  });
+
+  it("preserves unknown keys written by a newer build (.trt is additive-only)", () => {
+    const base = {
+      ...DEFAULT_EXPORT_PRESET,
+      twoPass: true,
+      colorSpace: "bt2020nc",
+    } as unknown as ExportPreset;
+    const out = mergeExportPreset(base, edits) as unknown as Record<string, unknown>;
+    expect(out.twoPass).toBe(true);
+    expect(out.colorSpace).toBe("bt2020nc");
+    // …and the owned fields still won
+    expect(out.format).toBe("mov");
+    expect(out.useHardware).toBe(false);
+  });
+
+  it("an unknown key survives repeated save round-trips", () => {
+    let stored = { ...DEFAULT_EXPORT_PRESET, futureKnob: 7 } as unknown as ExportPreset;
+    for (let i = 0; i < 4; i++) stored = mergeExportPreset(stored, edits);
+    expect((stored as unknown as Record<string, unknown>).futureKnob).toBe(7);
+  });
+
+  it("never resurrects a stale value for a field the dialog owns", () => {
+    // Includes the falsy / "auto" values a `??`- or truthiness-based merge
+    // would silently drop back to the persisted value.
+    const base: ExportPreset = {
+      format: "gif",
+      vcodec: "av1",
+      resolution: "480p",
+      fps: "original",
+      videoBitrate: 500,
+      audioBitrate: 64,
+      useHardware: true,
+    };
+    const owned: PresetEdits = {
+      format: "mp4",
+      vcodec: "h264",
+      resolution: "original",
+      fps: 24,
+      videoBitrate: "auto",
+      audioBitrate: "auto",
+      useHardware: false,
+    };
+    expect(mergeExportPreset(base, owned)).toEqual(owned);
+  });
+
+  it("carries a custom resolution object through unchanged", () => {
+    const out = mergeExportPreset(DEFAULT_EXPORT_PRESET, {
+      ...edits,
+      resolution: { w: 1234, h: 566 },
+    });
+    expect(out.resolution).toEqual({ w: 1234, h: 566 });
+  });
+
+  it("does not mutate the persisted preset", () => {
+    const base = Object.freeze({ ...DEFAULT_EXPORT_PRESET }) as ExportPreset;
+    const out = mergeExportPreset(base, edits);
+    expect(base).toEqual(DEFAULT_EXPORT_PRESET);
+    expect(out).not.toBe(base);
+  });
+
+  it("works when a project carries no preset at all", () => {
+    expect(mergeExportPreset(undefined, edits)).toEqual(edits);
+    expect(mergeExportPreset(null, edits)).toEqual(edits);
   });
 });
 

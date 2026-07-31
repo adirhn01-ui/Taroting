@@ -75,6 +75,39 @@ export function renameWithSuffix(name: string, taken: (candidate: string) => boo
   return candidate;
 }
 
+/** The export-preset fields this dialog owns. Anything else on a project's
+ *  persisted preset belongs to a different (or newer) build. */
+export interface PresetEdits {
+  format: Format;
+  vcodec: Codec;
+  resolution: ResolutionPreset;
+  fps: "original" | number;
+  videoBitrate: "auto" | number;
+  audioBitrate: "auto" | number;
+  useHardware: boolean;
+}
+
+/**
+ * Rebuild a project's export preset from the dialog's current values.
+ *
+ * The `.trt` schema is **additive optional fields only** and round-tripping
+ * must not lose unknown data — but this used to be reconstructed from seven
+ * literals, so any field added later, or already present in a project written
+ * by a newer build, was silently dropped on every save. So: spread whatever is
+ * persisted first, then write the owned fields over it.
+ *
+ * The order matters in both directions. Base-first keeps unknown keys; every
+ * one of the seven owned fields is then assigned UNCONDITIONALLY (never
+ * conditionally, never via `??`), so a stale persisted value can never survive
+ * for a field the dialog controls — including `false`, `0` and `"auto"`.
+ */
+export function mergeExportPreset(
+  base: ExportPreset | null | undefined,
+  edits: PresetEdits,
+): ExportPreset {
+  return { ...base, ...edits };
+}
+
 /* ---------------- option tables ---------------- */
 
 const FORMATS: { value: Format; label: string }[] = [
@@ -178,7 +211,10 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
 
   /* -------- build the current preset object -------- */
   function buildPreset(): ExportPreset {
-    return {
+    // Read the persisted preset LIVE (same rule as everything else here), so a
+    // field this dialog does not own survives even if it changed while the
+    // dialog was open. See mergeExportPreset for why the spread order matters.
+    return mergeExportPreset(session.project.export, {
       format,
       vcodec: codec,
       resolution,
@@ -186,7 +222,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
       videoBitrate,
       audioBitrate,
       useHardware,
-    };
+    });
   }
 
   function currentExt(): string {
@@ -219,6 +255,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   const releaseTrap = trapTab(backdrop);
 
   let exporting = false;
+  /** Set by close() so an in-flight async listener registration can tell that
+   *  the dialog is already gone (see beginExport). */
+  let closed = false;
   let jobId: number | null = null;
   /** Last whole-percent pushed to the taskbar; -1 = nothing pushed yet. */
   let lastTaskbarPct = -1;
@@ -228,10 +267,14 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   /* -------- lifecycle -------- */
   function close(): void {
     if (exporting) return;
+    closed = true;
     document.removeEventListener("keydown", onKeydown, true);
     releaseTrap();
     window.clearTimeout(estimateTimer);
-    if (unlistenJobs) unlistenJobs();
+    if (unlistenJobs) {
+      unlistenJobs();
+      unlistenJobs = null;
+    }
     void clearTaskbarProgress();
     backdrop.remove();
   }
@@ -688,11 +731,17 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
 
     // Listen before starting so we don't miss the first progress event.
     try {
-      unlistenJobs = await onJobEvents({
+      const un = await onJobEvents({
         onProgress: (e) => handleProgress(e),
         onDone: (e) => handleDone(e),
         onFailed: (e) => handleFailed(e),
       });
+      // Registration is async. The `exporting` flag makes close() a no-op while
+      // this is in flight today, but never rely on that: if the dialog did go
+      // away, drop the listener here rather than leaking it for the rest of the
+      // process (a later job event would then drive a detached dialog).
+      if (closed) un();
+      else unlistenJobs = un;
     } catch {
       // event listener unavailable (non-tauri) — export will still reject below
     }

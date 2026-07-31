@@ -70,10 +70,45 @@ fn now_ms() -> u64 {
 /* Index                                                               */
 /* ------------------------------------------------------------------ */
 
+/// How long a burst of `mark_used` calls may accumulate in memory before the
+/// index is written to disk.
+///
+/// The in-memory map is updated on EVERY call, so LRU order stays exact for this
+/// process — only the persisted copy lags. That matters because opening a
+/// project fires `getThumbnail` + `ensureWaveform` + `planPlayback` per media
+/// item, so a 20-media project used to perform ~60 full index serializations and
+/// blocking writes, each one under the mutex, on the cold-launch path. Within
+/// one window that whole burst becomes a single write.
+///
+/// A hard process kill can therefore lose up to this much last-use history. The
+/// cost is bounded to a STALE TIMESTAMP on entries touched inside the final
+/// window (they look older than they are, so eviction may reach one of them
+/// sooner than a perfect LRU would) — never a corrupt index: `save_index`
+/// renames a fully-written temp file over the target, so `index.json` is only
+/// ever replaced whole.
+const FLUSH_INTERVAL_MS: u64 = 2_000;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Index {
     /// path relative to the cache root → last-used unix ms
     entries: HashMap<String, u64>,
+    /// Coalescing bookkeeping. `skip` keeps `index.json`'s on-disk shape byte
+    /// for byte what it always was, so an index written by any earlier build
+    /// still loads and no user pays a cache reset for this.
+    #[serde(skip)]
+    dirty: bool,
+    #[serde(skip)]
+    last_flush_ms: u64,
+}
+
+/// Load the index from `root`, defaulting when it is absent or unreadable.
+/// Deliberately reads only `index.json`: a stray `index.json.tmp` left behind by
+/// a kill mid-flush is never authoritative.
+fn read_index(root: &Path) -> Index {
+    std::fs::read(root.join("index.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
 }
 
 pub struct Cache {
@@ -85,10 +120,7 @@ impl Cache {
     pub fn new() -> Result<Self> {
         let root = paths::cache_dir()?;
         std::fs::create_dir_all(&root)?;
-        let index = std::fs::read(root.join("index.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let index = read_index(&root);
         Ok(Cache {
             root,
             index: Mutex::new(index),
@@ -98,9 +130,10 @@ impl Cache {
     #[cfg(test)]
     pub fn new_at(root: PathBuf) -> Self {
         std::fs::create_dir_all(&root).unwrap();
+        let index = read_index(&root);
         Cache {
             root,
-            index: Mutex::new(Index::default()),
+            index: Mutex::new(index),
         }
     }
 
@@ -108,9 +141,33 @@ impl Cache {
         &self.root
     }
 
-    fn save_index(&self, index: &Index) {
-        if let Ok(bytes) = serde_json::to_vec(index) {
-            let _ = std::fs::write(self.root.join("index.json"), bytes);
+    /// Persist the index whole, via a temp file renamed over the target: a kill
+    /// mid-write can then only lose the newest stamps, never truncate the file
+    /// that is already there.
+    fn save_index(&self, index: &mut Index) {
+        // Stamp the attempt whether or not it lands. A full or read-only volume
+        // must not turn every cache hit back into a failed blocking write.
+        index.last_flush_ms = now_ms();
+        let Ok(bytes) = serde_json::to_vec(&*index) else {
+            return;
+        };
+        let tmp = self.root.join("index.json.tmp");
+        if std::fs::write(&tmp, &bytes).is_ok()
+            && std::fs::rename(&tmp, self.root.join("index.json")).is_ok()
+        {
+            index.dirty = false;
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// Write out any stamps still coalesced in memory. Poison-tolerant because
+    /// this also runs from `Drop`: with `panic = "abort"`, a panicking shutdown
+    /// path would take the whole process down over a last-use timestamp.
+    fn flush(&self) {
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        if index.dirty {
+            self.save_index(&mut index);
         }
     }
 
@@ -132,11 +189,21 @@ impl Cache {
     }
 
     /// Record (or refresh) an entry's last-use.
+    ///
+    /// Always exact in memory; the disk copy is written at most once per
+    /// `FLUSH_INTERVAL_MS` so a cache hit costs a hash insert rather than a full
+    /// serialize + blocking write held under the mutex.
     pub fn mark_used(&self, path: &Path) {
         let rel = self.rel(path);
+        let now = now_ms();
         let mut index = self.index.lock().unwrap();
-        index.entries.insert(rel, now_ms());
-        self.save_index(&index);
+        index.entries.insert(rel, now);
+        index.dirty = true;
+        // `last_flush_ms` starts at 0, so the first touch of a run persists
+        // immediately and the rest of that burst rides along with it.
+        if now.saturating_sub(index.last_flush_ms) >= FLUSH_INTERVAL_MS {
+            self.save_index(&mut index);
+        }
     }
 
     /// An existing, ready file for this key (refreshes LRU when found).
@@ -248,7 +315,9 @@ impl Cache {
             for rel in &removed {
                 index.entries.remove(rel);
             }
-            self.save_index(&index);
+            // Eviction is the one moment the persisted stamps really matter, so
+            // this write also lands whatever `mark_used` still had coalesced.
+            self.save_index(&mut index);
         }
         freed
     }
@@ -256,6 +325,15 @@ impl Cache {
     /// Remove everything except entries protected by `keep` hashes.
     pub fn clear(&self, keep: &HashSet<String>) -> u64 {
         self.enforce_limit(0, keep)
+    }
+}
+
+impl Drop for Cache {
+    /// Best-effort flush on a clean shutdown. A hard kill skips this, which is
+    /// exactly why `mark_used` also flushes on an interval rather than relying
+    /// on teardown.
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -367,6 +445,104 @@ mod tests {
         assert!(b.exists());
         assert!(!c.exists());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Three 1000-byte proxy entries in a fresh cache root, marked oldest-first
+    /// with a gap wide enough that their millisecond stamps cannot collide.
+    fn seeded_cache(tag: &str) -> (PathBuf, Cache, [PathBuf; 3]) {
+        let root = std::env::temp_dir().join(format!(
+            "taroting-cache-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = Cache::new_at(root.clone());
+        cache.ensure_kind_dir(CacheKind::Proxy).unwrap();
+        let files = [
+            cache.file_path(CacheKind::Proxy, "aaaa", ".mp4"),
+            cache.file_path(CacheKind::Proxy, "bbbb", ".mp4"),
+            cache.file_path(CacheKind::Proxy, "cccc", ".mp4"),
+        ];
+        for f in &files {
+            std::fs::write(f, vec![0u8; 1000]).unwrap();
+        }
+        (root, cache, files)
+    }
+
+    /// The property the coalescing relies on: a burst of hits updates the
+    /// in-memory LRU exactly while touching the disk only once, and eviction
+    /// reads that in-memory order — so cheapening the write cannot change which
+    /// entry goes first.
+    #[test]
+    fn mark_used_coalesces_writes_without_blurring_lru_order() {
+        let (root, cache, [a, b, c]) = seeded_cache("coalesce");
+
+        // First touch of the run persists immediately (last_flush_ms == 0).
+        cache.mark_used(&a);
+        assert_eq!(
+            read_index(&root).entries.len(),
+            1,
+            "the first mark of a run should reach disk"
+        );
+
+        // The rest of the burst lands well inside FLUSH_INTERVAL_MS, so it must
+        // NOT produce further writes — this is the ~60-writes-per-project-open
+        // saving, observed through the on-disk copy standing still.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        cache.mark_used(&b);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        cache.mark_used(&c);
+        let on_disk = read_index(&root);
+        assert_eq!(
+            on_disk.entries.len(),
+            1,
+            "marks inside the window must coalesce, got {on_disk:?}"
+        );
+        assert!(on_disk.entries.contains_key("proxy/aaaa.mp4"));
+
+        // ...and yet eviction still sees the exact order, because it reads the
+        // in-memory map, not the file: `a` is the oldest and goes first.
+        assert_eq!(cache.enforce_limit(2000, &HashSet::new()), 1000);
+        assert!(!a.exists(), "the least recently used entry must be evicted");
+        assert!(b.exists() && c.exists());
+
+        // Eviction flushes, so the pending stamps for b and c land with it.
+        let flushed = read_index(&root);
+        assert!(!flushed.entries.contains_key("proxy/aaaa.mp4"));
+        assert!(flushed.entries.contains_key("proxy/bbbb.mp4"));
+        assert!(flushed.entries.contains_key("proxy/cccc.mp4"));
+
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The durability property the coalescing is allowed to lean on: the index
+    /// is replaced by a rename, so a kill mid-flush leaves the previous copy
+    /// whole and the half-written temp file is never read back as the index.
+    #[test]
+    fn index_is_replaced_atomically_and_a_crashed_tmp_is_ignored() {
+        let (root, cache, [a, _b, _c]) = seeded_cache("atomic");
+        cache.mark_used(&a);
+        drop(cache);
+
+        let tmp = root.join("index.json.tmp");
+        assert!(!tmp.exists(), "a completed flush must leave no temp file");
+        assert!(read_index(&root).entries.contains_key("proxy/aaaa.mp4"));
+
+        // Simulate a kill in the middle of the NEXT flush: a truncated temp file
+        // next to a still-intact index.json.
+        std::fs::write(&tmp, b"{\"entries\":{\"proxy/bbbb").unwrap();
+
+        let reloaded = Cache::new_at(root.clone());
+        let entries = reloaded.index.lock().unwrap().entries.clone();
+        assert_eq!(entries.len(), 1, "the good index must survive: {entries:?}");
+        assert!(
+            entries.contains_key("proxy/aaaa.mp4"),
+            "the orphan temp file must never be loaded as the index"
+        );
+
+        drop(reloaded);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

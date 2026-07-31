@@ -8,6 +8,7 @@ import { describeError, inTauri, ipc, mediaUrl, onJobEvents } from "../../core/i
 import { settingsStore } from "../../core/session";
 import { Store } from "../../core/store";
 import type { MediaRef, ProjectFile } from "../../core/types";
+import { recordError } from "../../ui/errors";
 
 export type MediaState =
   | { state: "checking" }
@@ -64,13 +65,13 @@ export class MediaManager {
 
   private jobs = new Map<number, JobTarget>();
   private tracked = new Set<string>();
-  private unlisten: () => void = () => {};
+  private unlisten: (() => void) | null = null;
   private disposed = false;
 
   constructor(private getProject: () => ProjectFile) {}
 
   async init(): Promise<void> {
-    this.unlisten = await onJobEvents({
+    const unlisten = await onJobEvents({
       onProgress: (e) => {
         const target = this.jobs.get(e.id);
         if (!target || target.type !== "playback") return;
@@ -105,6 +106,12 @@ export class MediaManager {
         }
       },
     });
+    // Registration is async, so dispose() can land BEFORE the listener exists.
+    // It had nothing to call, so hand the unlisten back here — otherwise the
+    // listener leaks for the rest of the process and keeps feeding job events
+    // into a disposed manager.
+    if (this.disposed) unlisten();
+    else this.unlisten = unlisten;
   }
 
   /** Track every media item in the project (idempotent). */
@@ -144,7 +151,13 @@ export class MediaManager {
           if (this.disposed) return;
           this.thumbs.update((t) => ({ ...t, [media.id]: path }));
         })
-        .catch(() => {});
+        .catch((e: unknown) =>
+          this.noteSoftFailure(
+            "Thumbnail",
+            `Couldn't create a thumbnail for ${media.path}`,
+            describeError(e),
+          ),
+        );
     }
 
     // Waveform peaks
@@ -158,7 +171,13 @@ export class MediaManager {
             this.jobs.set(wf.jobId, { type: "waveform", mediaId: media.id, output: wf.output });
           }
         })
-        .catch(() => {});
+        .catch((e: unknown) =>
+          this.noteSoftFailure(
+            "Waveform",
+            `Couldn't build the audio waveform for ${media.path}`,
+            describeError(e),
+          ),
+        );
     }
 
     // Playback plan
@@ -184,15 +203,47 @@ export class MediaManager {
     this.status.update((s) => ({ ...s, [mediaId]: state }));
   }
 
+  /**
+   * Record a soft media failure in the diagnostics ring, deliberately WITHOUT a
+   * toast. Thumbnails and waveforms are progressive enhancement — a missing one
+   * must never nag — but until v0.7.3 they were dropped without a trace, so
+   * "why is this thumbnail missing?" had no answer. The ring is in memory only,
+   * bounded, and only ever written on a failure, so a healthy session still
+   * costs nothing; a broken one becomes explainable from Settings →
+   * Diagnostics and from a diagnostic report.
+   */
+  private noteSoftFailure(op: string, message: string, detail: string): void {
+    recordError({ at: Date.now(), op, message, detail });
+  }
+
+  /** Source path behind a media id (falls back to `alt` if it has gone away). */
+  private mediaPath(mediaId: string, alt: string): string {
+    return this.getProject().media.find((m) => m.id === mediaId)?.path ?? alt;
+  }
+
   private async loadWaveform(mediaId: string, path: string): Promise<void> {
+    // Still progressive enhancement: clips render without a waveform and the
+    // user is never interrupted. Both failure modes are now traceable.
     try {
       const res = await fetch(mediaUrl(path));
       const data = parsePk(await res.arrayBuffer());
-      if (data && !this.disposed) {
+      if (this.disposed) return;
+      if (data) {
         this.waveforms.update((w) => ({ ...w, [mediaId]: data }));
+      } else {
+        this.noteSoftFailure(
+          "Waveform",
+          `Waveform data for ${this.mediaPath(mediaId, path)} couldn't be read`,
+          `Peaks cache file: ${path}`,
+        );
       }
-    } catch {
-      // waveform is progressive enhancement — clips render without it
+    } catch (e) {
+      if (this.disposed) return;
+      this.noteSoftFailure(
+        "Waveform",
+        `Couldn't load the audio waveform for ${this.mediaPath(mediaId, path)}`,
+        `${describeError(e)}\nPeaks cache file: ${path}`,
+      );
     }
   }
 
@@ -203,7 +254,8 @@ export class MediaManager {
 
   dispose(): void {
     this.disposed = true;
-    this.unlisten();
+    this.unlisten?.();
+    this.unlisten = null;
     this.jobs.clear();
   }
 }

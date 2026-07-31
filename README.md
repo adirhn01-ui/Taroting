@@ -109,7 +109,9 @@ For the in-app end-to-end harness, launch dev with `TAROTING_AUTOTEST=1`. It bui
 | Settings | `%APPDATA%\Taroting` |
 | Cache | `%LOCALAPPDATA%\Taroting\cache` (safe to clear from Settings) |
 
-Uninstalling (from Settings, or via the installer's uninstaller) removes the app and its cache/settings but **keeps your projects** in `Documents\Taroting`. Nothing else is left on the system — no registry cruft beyond the file associations it created, no background services.
+Uninstalling (from Settings, or via the installer's uninstaller) removes the app and its file associations, and offers a **Delete the application data** checkbox — tick it to also clear your settings and cache, leave it to keep them for a future install. Either way it **keeps your projects** in `Documents\Taroting`. Nothing else is left on the system — no registry cruft beyond the file associations it created, no background services.
+
+Installing a new version over an old one keeps your settings, recent projects and cache.
 
 ## License
 

@@ -5,6 +5,7 @@
 //! version string (re-probe when the version changes or `force` is set).
 
 use std::process::Stdio;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -152,16 +153,60 @@ pub fn probe_all() -> EncoderReport {
     EncoderReport { h264, hevc, av1, detail }
 }
 
+/// The report resolved for this process run, with the ffmpeg version it was
+/// keyed by. Empty until the first `detect`.
+///
+/// The on-disk cache cannot be consulted without first spawning
+/// `ffmpeg -version` — that string IS its key, and weakening the key is exactly
+/// the invalidation a swapped binary depends on. So the spawn is removed one
+/// level up instead: every detect after the first in a run answers from here and
+/// spawns nothing at all.
+///
+/// A sidecar replaced WHILE the app runs is therefore not noticed until it
+/// restarts. That is the correct trade: the version key exists so an app update
+/// — which rewrites the sidecar and restarts the process — re-probes, and
+/// `detect(true)` still bypasses this memo (and refreshes it), so an explicit
+/// re-detect keeps working mid-session.
+static MEMO: Mutex<Option<(EncoderReport, String)>> = Mutex::new(None);
+
+/// Serve `resolve` once per run, unless `force` demands a fresh probe.
+///
+/// The lock is deliberately held across `resolve`: the export dialog kicks off a
+/// background detect on open while the Export button starts another, and on a
+/// cold cache each of those is up to nine real ~0.5 s test encodes. Serializing
+/// makes the second wait for the first instead of duplicating the whole probe.
+fn memoized<F>(
+    memo: &Mutex<Option<(EncoderReport, String)>>,
+    force: bool,
+    resolve: F,
+) -> (EncoderReport, String)
+where
+    F: FnOnce() -> (EncoderReport, String),
+{
+    // A poisoned lock still holds a perfectly good report, and encoder
+    // detection must never be the thing that fails an export.
+    let mut slot = memo.lock().unwrap_or_else(|e| e.into_inner());
+    if !force {
+        if let Some(hit) = slot.as_ref() {
+            return hit.clone();
+        }
+    }
+    let fresh = resolve();
+    // Store even on a forced probe, so a re-detect can't leave the memo stale.
+    *slot = Some(fresh.clone());
+    fresh
+}
+
 /// Detect (or load cached) the best encoder per codec, together with the ffmpeg
 /// version string the probe was keyed by. The version is computed anyway to key
 /// the cache, so callers that need it (the export failure report) get it here
 /// instead of paying for a second `ffmpeg -version` spawn.
 pub fn detect(force: bool) -> (EncoderReport, String) {
-    match cache_file() {
+    memoized(&MEMO, force, || match cache_file() {
         Ok(path) => detect_with_cache(force, &path),
         // No %APPDATA% to cache into: probe rather than fail the export.
         Err(_) => (probe_all(), ffmpeg_version()),
-    }
+    })
 }
 
 /// `detect` against an explicit cache file. Tests point this at their own temp
@@ -259,6 +304,49 @@ mod tests {
             "a different ffmpeg version must invalidate the cache"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The memo is what makes a repeat export click free, so pin all three of
+    /// its properties: it serves the second call without resolving again, a
+    /// forced detect still re-probes, and a forced detect REFRESHES it rather
+    /// than leaving a stale report behind. Driven through an owned memo cell
+    /// with a counting resolver, so no real ffmpeg is spawned.
+    #[test]
+    fn memo_serves_repeat_detects_and_force_refreshes_it() {
+        let memo: Mutex<Option<(EncoderReport, String)>> = Mutex::new(None);
+        let calls = std::cell::Cell::new(0u32);
+        let probe = |tag: &str| {
+            calls.set(calls.get() + 1);
+            (
+                EncoderReport {
+                    h264: tag.to_string(),
+                    hevc: "libx265".into(),
+                    av1: "libsvtav1".into(),
+                    detail: vec![],
+                },
+                format!("ffmpeg version {tag}"),
+            )
+        };
+
+        let first = memoized(&memo, false, || probe("a"));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(first.0.h264, "a");
+
+        // The export click after the dialog's background detect: no spawn.
+        let again = memoized(&memo, false, || probe("b"));
+        assert_eq!(calls.get(), 1, "a repeat detect must not re-probe");
+        assert_eq!(again.0.h264, "a");
+        assert_eq!(again.1, "ffmpeg version a", "the version rides with the memo");
+
+        // force still bypasses it...
+        let forced = memoized(&memo, true, || probe("c"));
+        assert_eq!(calls.get(), 2, "force must re-probe");
+        assert_eq!(forced.0.h264, "c");
+
+        // ...and the refreshed value is what later callers see.
+        let after = memoized(&memo, false, || probe("d"));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(after.0.h264, "c", "force must not leave a stale memo");
     }
 
     /// The wire shape must stay a flat superset of `EncoderReport` — the cached

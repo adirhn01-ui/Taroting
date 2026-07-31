@@ -9,6 +9,15 @@ import type { Clip, ProjectFile, Track } from "../../core/types";
 import type { MediaManager } from "../media/media";
 import type { Scheduler } from "./scheduler";
 
+// Simultaneous audio-track voices. Every voice is an <audio> element + a
+// MediaElementSource + a GainNode, all allocated EAGERLY in the constructor, so
+// the pool is a permanent idle cost paid by every project — including one with
+// no audio track at all. Raising it would tax the common case to buy headroom
+// for a rare one, which the perf veto forbids. Instead the allocator is
+// priority-ordered (see claimVoiceSlot): audible clips claim voices first,
+// lookaheads only get what is left over, and an audible clip may reclaim a
+// voice a lookahead is squatting on. The pool therefore degrades by dropping
+// pre-roll smoothing, never by muting something the user can hear.
 const POOL_SIZE = 6;
 const LOOKAHEAD_SEC = 1.5;
 const HARD_RESYNC_SEC = 0.12;
@@ -27,6 +36,54 @@ interface Voice {
   gain: GainNode;
   clipId: string | null;
   url: string | null;
+}
+
+/** One clip the mixer wants a voice for on this tick. `active` = it is audible
+ *  right now; `false` = it is only pre-rolled lookahead. */
+interface WantedClip {
+  clip: Clip;
+  track: Track;
+  active: boolean;
+}
+
+/**
+ * Pick the pool slot a clip should play through — the whole voice-allocation
+ * policy, kept pure and DOM-free (it only reads `clipId`s) so it is testable
+ * without an AudioContext.
+ *
+ * Order of preference:
+ *  1. the slot already holding this clip (keeps playback continuous);
+ *  2. any free slot;
+ *  3. **only for an audible clip**, a slot a lookahead is squatting on.
+ *
+ * Rule 3 is not optional. Voice ownership persists across ticks, so with more
+ * audio tracks than half the pool an earlier track's LOOKAHEAD could take the
+ * last slot and keep it — and a clip that became audible under it afterwards
+ * would stay silent for its entire duration (preview only; export is built
+ * from the project, not from this pool, so the bug reads as "preview audio
+ * randomly missing"). Sacrificing pre-roll for something the user can hear is
+ * always the right trade.
+ *
+ * Returns null when every slot is already carrying audible audio — at that
+ * point there is genuinely nothing to give up.
+ */
+export function claimVoiceSlot<V extends { clipId: string | null }>(
+  voices: readonly V[],
+  clipId: string,
+  active: boolean,
+  isLookahead: (heldClipId: string) => boolean,
+): V | null {
+  let free: V | null = null;
+  let squatter: V | null = null;
+  for (const v of voices) {
+    if (v.clipId === clipId) return v;
+    if (v.clipId === null) {
+      free ??= v;
+    } else if (active && squatter === null && isLookahead(v.clipId)) {
+      squatter = v;
+    }
+  }
+  return free ?? squatter;
 }
 
 function clipBaseGain(clip: Clip, track: Track): number {
@@ -73,6 +130,26 @@ export function toggleMonitorMute(s: MonitorVolumeState): MonitorVolumeState {
   return { level: s.lastNonZero, lastNonZero: s.lastNonZero };
 }
 
+/**
+ * True only while the in-app E2E harness is driving the app. The flag is
+ * stamped on `window` by a webview initialization script that the Rust side
+ * registers ONLY when `TAROTING_AUTOTEST=1` (see `autotest_flag_plugin` in
+ * `src-tauri/src/main.rs`); it runs before any module of ours, so this is a
+ * synchronous property read — no IPC, nothing async, nothing in a hot path.
+ *
+ * `import.meta.env.DEV` is checked first so the whole branch is dead code a
+ * production bundle drops: a shipped build can never reach the `window` read,
+ * let alone skip the destination connection. The `typeof window` guard keeps
+ * the module importable from the node-environment unit tests.
+ */
+function autotestSilentOutput(): boolean {
+  return (
+    import.meta.env.DEV &&
+    typeof window !== "undefined" &&
+    (window as unknown as { __tarotingAutotest?: boolean }).__tarotingAutotest === true
+  );
+}
+
 export class AudioGraph {
   private ctx: AudioContext;
   private master: GainNode;
@@ -116,7 +193,26 @@ export class AudioGraph {
   ) {
     this.ctx = new AudioContext({ latencyHint: "interactive" });
     this.master = this.ctx.createGain();
-    this.master.connect(this.ctx.destination);
+    // Under the in-app E2E harness the master bus is deliberately left
+    // UNCONNECTED from ctx.destination, so a test run is silent on the
+    // developer's speakers while it plays fixtures.
+    //
+    // This is lossless for every audio assertion, and the reason is subtle
+    // enough to be worth spelling out so nobody "fixes" it back: the harness
+    // measures audio through devMasterAnalyser()/devMasterRms(), which do
+    // `this.master.connect(analyser)` — a SEPARATE fan-out off `master`, not a
+    // tap on `destination`. A Web Audio node feeds every one of its outputs
+    // independently, so the analyser sees the identical signal whether or not
+    // the speakers are also connected. The `embedded-audio` block therefore
+    // measures exactly what it measured before.
+    //
+    // Note this is the ONLY lossless way to silence the run: `master.gain` IS
+    // the monitor volume and the analyser taps POST that gain, so muting the
+    // monitor instead would zero the measurement and quietly gut the block.
+    //
+    // A release build never evaluates the flag (see autotestSilentOutput) and
+    // connects to the destination exactly as it always has.
+    if (!autotestSilentOutput()) this.master.connect(this.ctx.destination);
 
     for (let i = 0; i < POOL_SIZE; i++) {
       const el = new Audio();
@@ -256,7 +352,7 @@ export class AudioGraph {
     discontinuity: boolean,
   ): void {
     const lookahead = LOOKAHEAD_SEC * Math.max(0.25, previewSpeed);
-    const wanted = new Map<string, { clip: Clip; track: Track; active: boolean }>();
+    const wanted = new Map<string, WantedClip>();
 
     for (const track of project.timeline.tracks) {
       if (track.kind !== "audio") continue;
@@ -272,62 +368,79 @@ export class AudioGraph {
 
     // release voices whose clip is no longer relevant
     for (const voice of this.voices) {
-      if (voice.clipId && !wanted.has(voice.clipId)) {
-        voice.el.pause();
-        voice.clipId = null;
-        voice.gain.gain.cancelScheduledValues(this.ctx.currentTime);
-        voice.gain.gain.setValueAtTime(0, this.ctx.currentTime);
-      }
+      if (voice.clipId && !wanted.has(voice.clipId)) this.parkVoice(voice);
     }
 
-    for (const { clip, track, active } of wanted.values()) {
-      const media = project.media.find((m) => m.id === clip.mediaId);
-      if (!media) continue;
-      const status = this.media.status.get()[media.id];
-      if (status?.state !== "ready") continue;
+    // Allocate in TWO passes, audible clips first. `wanted` is filled in track
+    // order with up to two entries per track (the playing clip AND its
+    // lookahead), so a single ordered pass let track 1's pre-roll take the slot
+    // track 4's PLAYING clip needed. Hoisted once per tick: one closure instead
+    // of the per-clip `.find` predicates this replaces.
+    const isLookahead = (heldClipId: string): boolean =>
+      wanted.get(heldClipId)?.active === false;
 
-      let voice = this.voices.find((v) => v.clipId === clip.id) ?? null;
-      const fresh = voice === null;
-      if (!voice) voice = this.voices.find((v) => v.clipId === null) ?? null;
-      if (!voice) continue; // pool exhausted — more than 6 simultaneous clips
+    for (let pass = 0; pass < 2; pass++) {
+      const wantActive = pass === 0;
+      for (const { clip, track, active } of wanted.values()) {
+        if (active !== wantActive) continue;
+        const media = project.media.find((m) => m.id === clip.mediaId);
+        if (!media) continue;
+        const status = this.media.status.get()[media.id];
+        if (status?.state !== "ready") continue;
 
-      voice.clipId = clip.id;
-      if (voice.url !== status.url) {
-        voice.url = status.url;
-        voice.el.src = status.url;
-      }
+        const voice = claimVoiceSlot(this.voices, clip.id, active, isLookahead);
+        if (!voice) continue; // pool exhausted — every slot is already audible
+        const fresh = voice.clipId !== clip.id;
+        // Reclaimed from a lookahead: stop it and drop its envelope before
+        // this clip takes over the element.
+        if (fresh && voice.clipId !== null) this.parkVoice(voice);
 
-      const rate = clip.speed * previewSpeed;
-      const expected = active
-        ? sourceTime(clip, t - clip.timelineStart)
-        : clip.srcIn;
+        voice.clipId = clip.id;
+        if (voice.url !== status.url) {
+          voice.url = status.url;
+          voice.el.src = status.url;
+        }
 
-      if (active && playing) {
-        const drift = voice.el.currentTime - expected;
-        // observe drift on already-running voices (a fresh voice hasn't been
-        // seeked to `expected` yet, so its "drift" is not meaningful)
-        if (!fresh) this.maxDrift = Math.max(this.maxDrift, Math.abs(drift));
-        if (fresh || Math.abs(drift) > HARD_RESYNC_SEC) {
-          voice.el.currentTime = expected;
-          voice.el.playbackRate = rate;
-        } else if (Math.abs(drift) > NUDGE_SEC) {
-          // inaudible ±2% nudge until converged
-          voice.el.playbackRate = rate * (drift > 0 ? 0.98 : 1.02);
+        const rate = clip.speed * previewSpeed;
+        const expected = active
+          ? sourceTime(clip, t - clip.timelineStart)
+          : clip.srcIn;
+
+        if (active && playing) {
+          const drift = voice.el.currentTime - expected;
+          // observe drift on already-running voices (a fresh voice hasn't been
+          // seeked to `expected` yet, so its "drift" is not meaningful)
+          if (!fresh) this.maxDrift = Math.max(this.maxDrift, Math.abs(drift));
+          if (fresh || Math.abs(drift) > HARD_RESYNC_SEC) {
+            voice.el.currentTime = expected;
+            voice.el.playbackRate = rate;
+          } else if (Math.abs(drift) > NUDGE_SEC) {
+            // inaudible ±2% nudge until converged
+            voice.el.playbackRate = rate * (drift > 0 ? 0.98 : 1.02);
+          } else {
+            voice.el.playbackRate = rate;
+          }
+          if (voice.el.paused) void voice.el.play().catch(() => {});
         } else {
-          voice.el.playbackRate = rate;
+          if (!voice.el.paused) voice.el.pause();
+          if (fresh || Math.abs(voice.el.currentTime - expected) > 0.05) {
+            voice.el.currentTime = expected;
+          }
         }
-        if (voice.el.paused) void voice.el.play().catch(() => {});
-      } else {
-        if (!voice.el.paused) voice.el.pause();
-        if (fresh || Math.abs(voice.el.currentTime - expected) > 0.05) {
-          voice.el.currentTime = expected;
-        }
-      }
 
-      if (fresh || discontinuity) {
-        this.scheduleEnvelope(voice.gain, clip, track, t, previewSpeed);
+        if (fresh || discontinuity) {
+          this.scheduleEnvelope(voice.gain, clip, track, t, previewSpeed);
+        }
       }
     }
+  }
+
+  /** Park a voice: stop its element, forget its clip and zero its gain now. */
+  private parkVoice(voice: Voice): void {
+    voice.el.pause();
+    voice.clipId = null;
+    voice.gain.gain.cancelScheduledValues(this.ctx.currentTime);
+    voice.gain.gain.setValueAtTime(0, this.ctx.currentTime);
   }
 
   /* ---------------- gain envelopes (volume + fades) ---------------- */

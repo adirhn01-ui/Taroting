@@ -2115,4 +2115,433 @@ mod tests {
         assert!(!b2.filter_complex.contains("alphaextract"), "{}", b2.filter_complex);
         assert!(!b2.filter_complex.contains("blend="), "{}", b2.filter_complex);
     }
+
+    /* ------------------------------------------------------------------ */
+    /* Preview <-> export placement parity (SHARED golden table)           */
+    /* ------------------------------------------------------------------ */
+    //
+    // `placement()` above and `computeTransformInto` in
+    // `src/editor/preview/transforms.ts` implement the same math twice. Both
+    // files claim in a comment to mirror each other and, until this table,
+    // nothing checked it — which is how GitHub issue #1 shipped: the preview and
+    // the export disagreed about every text generator's size and the suite could
+    // not see it.
+    //
+    // THE TABLE IS SHARED, one file asserted by two suites:
+    //   * here, through `placement()`;
+    //   * `src/editor/preview/export-parity.test.ts` (vitest), through the real
+    //     `computeTransform`.
+    // It lives on the TypeScript side because that is where the reference
+    // implementation is, and `include_str!` is deliberate: moving or renaming
+    // the JSON breaks THIS BUILD, not just the vitest run, so the two
+    // implementations cannot drift apart quietly.
+    //
+    // The expected values were generated from `computeTransformInto` (the
+    // preview is the arbiter — builder.rs's own header says this chain mirrors
+    // it "so the export matches the preview") and are asserted here unchanged.
+    // A failing row means one of the two implementations moved; it is never a
+    // reason to edit the number.
+
+    const PARITY_TABLE: &str =
+        include_str!("../../../src/editor/preview/preview-export-parity.json");
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct ParityCrop { x: f64, y: f64, w: f64, h: f64 }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct ParityIn {
+        media_w: Option<u32>,
+        media_h: Option<u32>,
+        canvas_w: u32,
+        canvas_h: u32,
+        rotate: u32,
+        flip_h: bool,
+        flip_v: bool,
+        crop: Option<ParityCrop>,
+        scale: f64,
+        x: f64,
+        y: f64,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct ParityOut {
+        /// even-rounded display size — ffmpeg `scale=dw:dh`
+        dw: i64,
+        dh: i64,
+        /// integer overlay position — ffmpeg `overlay=ox:oy`
+        ox: i64,
+        oy: i64,
+        /// the preview's exact, un-rounded extent and media shift, project px
+        dw_exact: f64,
+        dh_exact: f64,
+        off_x_exact: f64,
+        off_y_exact: f64,
+        /// fit * userScale, project px per source px
+        k: f64,
+        src_w: i64,
+        src_h: i64,
+        post_crop_w: i64,
+        post_crop_h: i64,
+        /// ffmpeg `crop=cw:ch:cx:cy`, or null when nothing narrows
+        crop_filter: Option<[i64; 4]>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ParityCase {
+        name: String,
+        why: String,
+        #[serde(rename = "in")]
+        input: ParityIn,
+        out: ParityOut,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ParityTable { cases: Vec<ParityCase> }
+
+    /// Relative closeness. Only used where IEEE non-associativity makes bitwise
+    /// equality unreachable — see the `fit_w` assertion below for the
+    /// justification. Everything else is compared exactly.
+    fn rel_close(a: f64, b: f64, rel: f64) -> bool {
+        (a - b).abs() <= rel * a.abs().max(b.abs()).max(1.0)
+    }
+
+    #[test]
+    fn placement_matches_the_shared_preview_parity_table() {
+        let table: ParityTable =
+            serde_json::from_str(PARITY_TABLE).expect("parity table must parse");
+        // A truncated or emptied fixture must fail loudly rather than pass
+        // vacuously — the whole point is that the rows exist.
+        assert!(
+            table.cases.len() >= 20,
+            "parity table shrank to {} rows",
+            table.cases.len()
+        );
+
+        for case in &table.cases {
+            let n = &case.name;
+            assert!(case.why.len() > 30, "{n}: every row states why it exists");
+            let i = &case.input;
+            let o = &case.out;
+
+            let mut m = media("pm", r"C:\parity.mp4", 1, 1, false);
+            m.width = i.media_w;
+            m.height = i.media_h;
+            let mut c = clip("pc", "pm", 0.0, 0.0, 1.0);
+            c.transform = Some(ClipTransform {
+                crop: i.crop.as_ref().map(|k| ClipCrop { x: k.x, y: k.y, w: k.w, h: k.h }),
+                rotate: i.rotate,
+                flip_h: i.flip_h,
+                flip_v: i.flip_v,
+                scale: i.scale,
+                x: i.x,
+                y: i.y,
+                opacity: 1.0,
+            });
+
+            let p = placement(&c, &m, i.canvas_w, i.canvas_h);
+
+            // --- the four values ffmpeg actually receives -------------------
+            assert_eq!(p.dw, o.dw, "{n}: scale width");
+            assert_eq!(p.dh, o.dh, "{n}: scale height");
+            assert_eq!(p.ox, o.ox, "{n}: overlay x");
+            assert_eq!(p.oy, o.oy, "{n}: overlay y");
+
+            // --- the discretisation, re-derived from the PREVIEW's floats ---
+            // This is the actual cross-implementation check: this crate's own
+            // `round_even` applied to the number the preview produced must land
+            // on the number `placement` emitted.
+            assert_eq!(round_even(o.dw_exact), p.dw, "{n}: round_even(preview dw)");
+            assert_eq!(round_even(o.dh_exact), p.dh, "{n}: round_even(preview dh)");
+
+            // --- how far the integer export may sit from the preview --------
+            // The preview positions its crop box continuously; the export must
+            // land on integers with even extents. Pin the bound rather than
+            // trusting it: round_even moves the extent by < 1.5 px, halved by
+            // the centring (< 0.75), plus the final round (<= 0.5) → < 1.25.
+            let preview_left = (i.canvas_w as f64 - o.dw_exact) / 2.0 + i.x;
+            let preview_top = (i.canvas_h as f64 - o.dh_exact) / 2.0 + i.y;
+            assert!((p.ox as f64 - preview_left).abs() < 1.25, "{n}: ox drift");
+            assert!((p.oy as f64 - preview_top).abs() < 1.25, "{n}: oy drift");
+            assert!((p.dw as f64 - o.dw_exact).abs() < 1.5, "{n}: dw drift");
+            assert!((p.dh as f64 - o.dh_exact).abs() < 1.5, "{n}: dh drift");
+
+            // --- pass-through fields ---------------------------------------
+            assert_eq!(p.rotate, i.rotate, "{n}: rotate");
+            assert_eq!(p.flip_h, i.flip_h, "{n}: flipH");
+            assert_eq!(p.flip_v, i.flip_v, "{n}: flipV");
+            assert_eq!(p.x, i.x, "{n}: x");
+            assert_eq!(p.y, i.y, "{n}: y");
+            assert_eq!(p.opacity, 1.0, "{n}: opacity");
+
+            // --- the sizes issue #1 got wrong -------------------------------
+            // `src_w/src_h` is what a generator is synthesized at; the
+            // `post_crop_*` pair is what sizes the opacity alpha mask. When
+            // those disagree with the preview, alphamerge aborts the export.
+            assert_eq!(p.src_w, o.src_w, "{n}: generator source width");
+            assert_eq!(p.src_h, o.src_h, "{n}: generator source height");
+            assert_eq!(p.post_crop_w, o.post_crop_w, "{n}: alpha-mask width");
+            assert_eq!(p.post_crop_h, o.post_crop_h, "{n}: alpha-mask height");
+            assert_eq!(
+                p.crop,
+                o.crop_filter.map(|a| (a[0], a[1], a[2], a[3])),
+                "{n}: crop filter"
+            );
+
+            // --- the animated-scale path agrees with the static one ---------
+            // `fit_w/fit_h` are pre-userScale (crop_w * fit) and feed the
+            // keyframed `scale=` expression, so a divergence here would show up
+            // only on animated clips. Compared with a relative tolerance
+            // because Rust evaluates (crop_w * fit) * scale while the preview
+            // evaluates crop_w * (fit * scale): IEEE multiplication is not
+            // associative, so the two differ by a few ULP and nothing more.
+            assert!(
+                rel_close(p.fit_w * i.scale, o.dw_exact, 1e-9),
+                "{n}: fit_w*scale {} vs preview {}", p.fit_w * i.scale, o.dw_exact
+            );
+            assert!(
+                rel_close(p.fit_h * i.scale, o.dh_exact, 1e-9),
+                "{n}: fit_h*scale {} vs preview {}", p.fit_h * i.scale, o.dh_exact
+            );
+
+            // --- the table's own derived columns stay self-consistent -------
+            assert!(rel_close(o.post_crop_w as f64 * o.k, o.dw_exact, 1e-9), "{n}: k vs dwExact");
+            assert!(rel_close(o.post_crop_h as f64 * o.k, o.dh_exact, 1e-9), "{n}: k vs dhExact");
+            let crop_x = o.crop_filter.map_or(0.0, |a| a[2] as f64);
+            let crop_y = o.crop_filter.map_or(0.0, |a| a[3] as f64);
+            assert!(rel_close(-o.off_x_exact, crop_x * o.k, 1e-9), "{n}: offX vs crop x");
+            assert!(rel_close(-o.off_y_exact, crop_y * o.k, 1e-9), "{n}: offY vs crop y");
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Hardware encoding — the DEFAULT path                                */
+    /* ------------------------------------------------------------------ */
+    //
+    // `DEFAULT_EXPORT_PRESET.useHardware` is `true` (src/core/types.ts), so the
+    // hardware branch of `chosen_encoder` and every NVENC/QSV/AMF arm of
+    // `push_quality` are what most exports actually run — and no test in the
+    // tree set the flag: the `enc()` fixture built an nvenc-capable report and
+    // then every case selected software anyway.
+    //
+    // These pin ARGUMENT CONSTRUCTION only. Nothing here encodes: real NVENC is
+    // machine-dependent and unrepeatable, while the arg-building is pure.
+
+    fn report(h264: &str, hevc: &str, av1: &str) -> EncoderReport {
+        EncoderReport {
+            h264: h264.into(),
+            hevc: hevc.into(),
+            av1: av1.into(),
+            detail: vec![],
+        }
+    }
+
+    fn hw_preset(format: &str, vcodec: &str) -> ExportPreset {
+        let mut p = preset(format, vcodec);
+        p.use_hardware = true;
+        p
+    }
+
+    /// Media dims deliberately differ from the canvas on both axes — issue #1's
+    /// lesson holds even in tests that are not about geometry.
+    fn built_with(p: ExportPreset, encoders: &EncoderReport) -> BuiltExport {
+        let out = format!(r"C:\o.{}", p.format);
+        let m = media("m1", r"C:\v.mp4", 1918, 1078, false);
+        let c = clip("c1", "m1", 0.0, 0.0, 2.0);
+        let tl = timeline(1280, 720, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+        build(&spec(vec![m], tl, p, &out), encoders).unwrap()
+    }
+
+    /// Everything `push_video_codec` emits: `-c:v <enc>` plus the quality or
+    /// bitrate run that follows it, up to the trailing `-pix_fmt`.
+    fn vcodec_args(b: &BuiltExport) -> Vec<String> {
+        let a = argstr(b);
+        let i = a.iter().position(|s| s == "-c:v").expect("-c:v must be emitted");
+        let j = a.iter().position(|s| s == "-pix_fmt").expect("-pix_fmt must follow");
+        assert!(j > i, "-pix_fmt must come after -c:v: {a:?}");
+        a[i..j].to_vec()
+    }
+
+    fn assert_vcodec_args(b: &BuiltExport, expect: &[&str]) {
+        let want: Vec<String> = expect.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(vcodec_args(b), want);
+    }
+
+    #[test]
+    fn hardware_nvenc_is_selected_with_its_exact_args_per_codec() {
+        let r = report("h264_nvenc", "hevc_nvenc", "av1_nvenc");
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "h264"), &r),
+            &["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "23", "-b:v", "0"],
+        );
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "hevc"), &r),
+            &["-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "26", "-b:v", "0"],
+        );
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "av1"), &r),
+            &["-c:v", "av1_nvenc", "-cq", "30"],
+        );
+    }
+
+    #[test]
+    fn hardware_qsv_is_selected_with_its_exact_args_per_codec() {
+        let r = report("h264_qsv", "hevc_qsv", "av1_qsv");
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "h264"), &r),
+            &["-c:v", "h264_qsv", "-global_quality", "23"],
+        );
+        assert_vcodec_args(
+            &built_with(hw_preset("mov", "hevc"), &r),
+            &["-c:v", "hevc_qsv", "-global_quality", "26"],
+        );
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "av1"), &r),
+            &["-c:v", "av1_qsv", "-global_quality", "30"],
+        );
+    }
+
+    #[test]
+    fn hardware_amf_is_selected_with_its_exact_args_per_codec() {
+        let r = report("h264_amf", "hevc_amf", "av1_amf");
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "h264"), &r),
+            &["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "22", "-qp_p", "24"],
+        );
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "hevc"), &r),
+            &["-c:v", "hevc_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "25", "-qp_p", "27"],
+        );
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "av1"), &r),
+            &["-c:v", "av1_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "28", "-qp_p", "30"],
+        );
+    }
+
+    #[test]
+    fn the_use_hardware_flag_changes_the_encoder_for_every_codec() {
+        // The flag has to be READ, not merely present: with the same report,
+        // hardware and software must resolve to different encoders AND
+        // different quality args for all three codecs. (A test that only
+        // asserted the hardware side would still pass if the branch were
+        // inverted and both arms returned the same thing.)
+        let r = report("h264_nvenc", "hevc_nvenc", "av1_nvenc");
+        for (codec, sw) in [("h264", "libx264"), ("hevc", "libx265"), ("av1", "libsvtav1")] {
+            let hw = vcodec_args(&built_with(hw_preset("mp4", codec), &r));
+            let soft = vcodec_args(&built_with(preset("mp4", codec), &r));
+            assert_ne!(hw, soft, "{codec}: use_hardware changed nothing");
+            assert_eq!(hw[1], format!("{codec}_nvenc"), "{codec}: hardware encoder");
+            assert_eq!(soft[1], sw, "{codec}: software encoder");
+        }
+    }
+
+    #[test]
+    fn hardware_requested_but_only_software_probed_degrades_to_software() {
+        // A machine with no GPU encoder: `hw::choose` falls through to the
+        // software candidate for every family, so the report holds lib* names
+        // even though the user asked for hardware. The args must then be the
+        // SOFTWARE ones — never NVENC flags pinned onto libx264, which ffmpeg
+        // rejects outright.
+        let r = report("libx264", "libx265", "libsvtav1");
+        for (codec, expect) in [
+            ("h264", ["-c:v", "libx264", "-preset", "medium", "-crf", "20"]),
+            ("hevc", ["-c:v", "libx265", "-preset", "medium", "-crf", "23"]),
+            ("av1", ["-c:v", "libsvtav1", "-preset", "8", "-crf", "32"]),
+        ] {
+            let hw = built_with(hw_preset("mp4", codec), &r);
+            assert_vcodec_args(&hw, &expect);
+            // …and byte-identical to what use_hardware:false would emit.
+            assert_eq!(
+                vcodec_args(&hw),
+                vcodec_args(&built_with(preset("mp4", codec), &r)),
+                "{codec}: hardware fallback must equal the software path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_codec_with_no_hardware_option_degrades_without_dragging_its_siblings() {
+        // The common real shape: the driver exposes h264 acceleration only.
+        // Each codec resolves independently, so one fallback must not turn the
+        // others off.
+        let r = report("h264_nvenc", "libx265", "libsvtav1");
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "h264"), &r),
+            &["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "23", "-b:v", "0"],
+        );
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "hevc"), &r),
+            &["-c:v", "libx265", "-preset", "medium", "-crf", "23"],
+        );
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "av1"), &r),
+            &["-c:v", "libsvtav1", "-preset", "8", "-crf", "32"],
+        );
+    }
+
+    #[test]
+    fn hardware_with_an_unknown_codec_falls_back_to_libx264() {
+        // `chosen_encoder`'s hardware arm has no entry for anything outside
+        // h264/hevc/av1, and a `.trt` carries the codec string verbatim.
+        let r = report("h264_nvenc", "hevc_nvenc", "av1_nvenc");
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "vp9"), &r),
+            &["-c:v", "libx264", "-preset", "medium", "-crf", "20"],
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_encoder_name_gets_the_generic_quality_args() {
+        // `encoders.json` is deserialized straight into `EncoderReport` with no
+        // whitelist (`hw::read_cache`), so a stale or hand-edited cache can put
+        // any string into `-c:v`. It must fall through to the generic `-crf`
+        // rather than pairing an unknown encoder with NVENC-only flags.
+        let r = report("h264_vaapi", "hevc_nvenc", "av1_nvenc");
+        assert_vcodec_args(
+            &built_with(hw_preset("mp4", "h264"), &r),
+            &["-c:v", "h264_vaapi", "-crf", "23"],
+        );
+    }
+
+    #[test]
+    fn hardware_with_an_explicit_bitrate_replaces_the_quality_args() {
+        let r = report("h264_nvenc", "hevc_nvenc", "av1_nvenc");
+        let mut p = hw_preset("mp4", "h264");
+        p.video_bitrate = BitratePreset::Kbps(12000);
+        let b = built_with(p, &r);
+        assert_vcodec_args(
+            &b,
+            &["-c:v", "h264_nvenc", "-b:v", "12000k", "-maxrate", "24000k", "-bufsize", "48000k"],
+        );
+        let a = argstr(&b);
+        assert!(!a.contains(&"-cq".to_string()), "{a:?}");
+        assert!(!a.contains(&"-rc".to_string()), "{a:?}");
+    }
+
+    #[test]
+    fn hardware_av1_in_webm_keeps_both_the_encoder_and_the_container() {
+        // webm is the one container that REJECTS h264/hevc, so it is the only
+        // place the hardware av1 arm can be reached alongside a non-mp4 muxer.
+        let r = report("h264_nvenc", "hevc_nvenc", "av1_qsv");
+        let b = built_with(hw_preset("webm", "av1"), &r);
+        assert_vcodec_args(&b, &["-c:v", "av1_qsv", "-global_quality", "30"]);
+        let a = argstr(&b);
+        assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "webm"), "{a:?}");
+    }
+
+    #[test]
+    fn gif_emits_no_video_codec_even_with_hardware_requested() {
+        // The palette pipeline owns the gif output, so `push_video_codec` is
+        // skipped entirely: an `-c:v h264_nvenc` leaking in here would make the
+        // gif muxer fail.
+        let r = report("h264_nvenc", "hevc_nvenc", "av1_nvenc");
+        let a = argstr(&built_with(hw_preset("gif", "h264"), &r));
+        assert!(!a.contains(&"-c:v".to_string()), "{a:?}");
+        assert!(!a.contains(&"h264_nvenc".to_string()), "{a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "gif"), "{a:?}");
+    }
 }

@@ -108,6 +108,11 @@ export const ipc = {
     call<{ modifiedAt: string }>("save_project", { path, project }),
   refreshRecentThumb: (path: string) =>
     call<string | null>("refresh_recent_thumb", { path }, () => null),
+  /** Batched form: ONE recents read/write and ONE thumbs-dir scan for the whole
+   *  set, instead of ~7 filesystem ops per card. Only projects that resolved
+   *  appear in the result — a missing key is the batch equivalent of `null`. */
+  refreshRecentThumbs: (paths: string[]) =>
+    call<Record<string, string>>("refresh_recent_thumbs", { paths }, () => ({})),
   probeMedia: (path: string) => call<MediaInfo>("probe_media", { path }),
   pathExists: (path: string) => call<boolean>("path_exists", { path }),
   newProjectPath: (name?: string) =>

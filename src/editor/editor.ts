@@ -1171,7 +1171,14 @@ export async function mountEditor(
   });
 
   const dropOverlay = $("#ed-drop");
-  let unlistenDrop: () => void = () => {};
+  // `disposed` closes a real leak: dispose() can land while this registration is
+  // still in flight. The old code assigned the handle to a no-op placeholder, so
+  // teardown unlistened NOTHING and the listener survived for the life of the
+  // process — a later drop then fired both the dead handler (committing into a
+  // disposed session and toasting from whatever screen the user was now on) and
+  // the live editor's. Claim it immediately if teardown already happened.
+  let disposed = false;
+  let unlistenDrop: (() => void) | null = null;
   void onDragDrop({
     onHover: () => dropOverlay.classList.add("active"),
     onCancel: () => dropOverlay.classList.remove("active"),
@@ -1179,7 +1186,10 @@ export async function mountEditor(
       dropOverlay.classList.remove("active");
       void importPaths(paths);
     },
-  }).then((u) => (unlistenDrop = u));
+  }).then((u) => {
+    if (disposed) u();
+    else unlistenDrop = u;
+  });
 
   /* ---------------- inline project rename (top bar) ---------------- */
 
@@ -1318,6 +1328,7 @@ export async function mountEditor(
 
   return {
     async dispose() {
+      disposed = true;
       shortcuts.detach();
       unsubSettings();
       unTick();
@@ -1328,7 +1339,8 @@ export async function mountEditor(
       unName();
       if (dragCleanup) dragCleanup();
       for (const u of unsubs) u();
-      unlistenDrop();
+      unlistenDrop?.();
+      unlistenDrop = null;
       theater.dispose();
       overlay.dispose();
       inspector.dispose();

@@ -78,7 +78,12 @@ export class TimelineController {
     });
     this.themeObserver.observe(document.documentElement, {
       attributes: true,
-      attributeFilter: ["data-theme"],
+      // "style" as well as "data-theme": a custom theme writes its derived
+      // tokens as inline custom properties on <html>, so editing one never
+      // touches data-theme. Without this the canvas keeps the colours it read at
+      // mount — and it now takes its background, text and ruler tint from those
+      // same variables, so the whole timeline would go stale, not just a clip.
+      attributeFilter: ["data-theme", "style"],
     });
     this.disposers.push(() => this.themeObserver.disconnect());
 

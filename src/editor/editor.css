@@ -15,6 +15,33 @@
   flex: none;
 }
 
+/* ---------- Route-out rescue (see the long note in src/home/home.css) ----------
+   The editor's Back and gear are the only ways out of a project, so they get the
+   same conditional treatment as the home gear: stamped by applyTheme ONLY when
+   the ink is effectively invisible, styled from the fixed --safe-* palette, and
+   otherwise left exactly as the user chose.
+
+   Separate flag from data-rescue-nav on purpose. These sit on the topbar's
+   --bg-panel, a DERIVED shade, while the home gear sits on --bg-app — and the
+   two genuinely disagree: {bg #241a3d, text #453274} is 1.52:1 on the app
+   background but 1.43:1 on the panel, so one flag would leave this chrome
+   invisible and unrescued. See needsChromeRescue in src/core/session.ts. */
+html[data-rescue-chrome] #ed-home,
+html[data-rescue-chrome] #ed-settings {
+  background: var(--safe-raised);
+  border-color: var(--safe-border-strong);
+  color: var(--safe-text-1);
+}
+html[data-rescue-chrome] #ed-home:hover,
+html[data-rescue-chrome] #ed-settings:hover {
+  background: var(--safe-hover);
+  border-color: var(--safe-border-strong);
+}
+html[data-rescue-chrome] #ed-home:focus-visible,
+html[data-rescue-chrome] #ed-settings:focus-visible {
+  outline-color: var(--safe-accent);
+}
+
 .editor__name {
   font-size: var(--fs-13);
   font-weight: 600;
