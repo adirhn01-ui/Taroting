@@ -79,18 +79,17 @@ Every feature runs entirely on your hardware and adds zero resource overhead whe
 
 - [Node.js](https://nodejs.org) 24+ and npm
 - [Rust](https://rustup.rs) stable (MSVC toolchain)
-- FFmpeg + ffprobe on your `PATH` — e.g. `winget install Gyan.FFmpeg`
 
 **Build**
 
 ```sh
 npm install
-npm run fetch-ffmpeg   # copies ffmpeg/ffprobe from PATH into src-tauri/binaries/
+npm run fetch-ffmpeg   # downloads the pinned ffmpeg/ffprobe into src-tauri/binaries/
 npm run tauri dev      # run in development
 npm run tauri build    # produce the NSIS installer + portable exe
 ```
 
-The FFmpeg sidecars are **not** committed to the repo (they are large GPL binaries); `npm run fetch-ffmpeg` places them in `src-tauri/binaries/` using Tauri's target-triple naming convention and verifies the build's encoder coverage. `npm run fixtures` generates synthetic test media.
+The FFmpeg sidecars are **not** committed to the repo (they are large GPL binaries). `npm run fetch-ffmpeg` downloads one pinned build — gyan.dev `ffmpeg 8.1.1-full_build`, dated 2026-05-04 — checks the archive and both binaries against SHA-256 digests recorded in the script, confirms the encoder coverage the exporter needs, and installs them in `src-tauri/binaries/` using Tauri's target-triple naming convention. Every release ships that exact build; any mismatch aborts the run and leaves an existing install untouched. `npm run fixtures` generates synthetic test media.
 
 **Tests**
 

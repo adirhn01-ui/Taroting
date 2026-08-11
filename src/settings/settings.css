@@ -159,12 +159,25 @@
    get back out of it is not.
 
    This card is the only screen that can undo it, and the colour picker it opens
-   is where "Reset to default" lives, so both render in a palette of their own:
-   the built-in Dark or Light token values, published by applyTheme as
+   is where "Reset to default" lives, so both can render in a palette of their
+   own: the built-in Dark or Light token values, published by applyTheme as
    --safe-* while a custom theme is active and picked by the direction the
    background implies. Nothing below is computed FROM the user's colours, which
-   is exactly why the card stays legible against itself for any three picks —
-   including all-identical, all-black and all-white.
+   is exactly why this palette stays legible against itself for any three picks
+   — including all-identical, all-black and all-white.
+
+   IT IS CONDITIONAL, and that is the point (v0.7.5). It used to apply to every
+   custom theme, which left a permanently mismatched card sitting in an app the
+   user had deliberately coloured. data-rescue-appearance is now stamped by
+   applyTheme only when the card's WEAKEST tier — --text-3, the section head and
+   the row hints — drops under CARD_RESCUE_RATIO against the surface behind it.
+   An ugly, low-contrast, WCAG-failing but readable theme keeps the user's own
+   colours here, exactly like the home gear and the editor chrome. See
+   needsAppearanceRescue in src/core/session.ts for why the trigger measures
+   four tiers rather than the row label, and why 1.5.
+
+   Both selectors carry the flag on purpose: a readable card that opens an
+   unreadable "Reset to default" is the same dead end as an unreadable card.
 
    Two things are deliberately NOT overridden:
      * the colour swatches, which must show the literal picks — they carry a
@@ -173,11 +186,12 @@
      * every other card on this screen, and the whole rest of the app, which
        stay fully in the user's colours.
 
-   The html[data-custom-theme] gate is load-bearing: under Dark/Light the
-   --safe-* properties do not exist, and a var() with no fallback would resolve
-   to the guaranteed-invalid value rather than to the palette. */
-html[data-custom-theme] .settings__card--appearance,
-html[data-custom-theme] .cp {
+   The attribute gate is load-bearing: it is only ever stamped inside
+   applyTheme's custom branch, so under Dark/Light these rules cannot match —
+   there the --safe-* properties do not exist, and a var() with no fallback
+   would resolve to the guaranteed-invalid value rather than to the palette. */
+html[data-rescue-appearance] .settings__card--appearance,
+html[data-rescue-appearance] .cp {
   --bg-panel: var(--safe-panel);
   --bg-raised: var(--safe-raised);
   --bg-input: var(--safe-input);
@@ -195,7 +209,7 @@ html[data-custom-theme] .cp {
 /* The card's own edge: --border can be a whisper away from the page on a
    near-white or near-black background, and an Appearance card you cannot find
    is the same dead end as one you cannot read. */
-html[data-custom-theme] .settings__card--appearance {
+html[data-rescue-appearance] .settings__card--appearance {
   border-color: var(--safe-border-strong);
 }
 

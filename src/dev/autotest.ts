@@ -2024,9 +2024,17 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     //      surface is the user's base colour — the home brand mark above all.
     //   3. The surface ramp is still DERIVED (--bg-panel != --bg-app): "no
     //      clamping" must not have quietly become "no derivation".
-    //   4. Settings > Appearance is the escape hatch and stays legible whatever
-    //      is picked, so someone who paints the app invisible can still get back
-    //      and fix it. It is the ONE surface allowed to disobey the colours.
+    //   4. Settings > Appearance is the escape hatch, so someone who paints the
+    //      app invisible can still get back and fix it. It and the colour picker
+    //      it opens are the surfaces allowed to disobey the colours — but only
+    //      when the colours have actually stopped working.
+    //   5. That disobedience is CONDITIONAL (v0.7.5). data-rescue-appearance is
+    //      stamped when the card's weakest tier drops under CARD_RESCUE_RATIO
+    //      and NOT before, so an ugly-but-usable theme keeps the user's own
+    //      colours on the very card they were picked from. Both directions are
+    //      painted and measured below, because a rescue that fires for
+    //      everything and a rescue that fires for nothing pass exactly the same
+    //      one-directional test.
     // 1 and 4 are deliberately opposites, and that tension IS the feature — so
     // both halves are asserted here, against the same live document.
     await test("custom-theme-applies", async () => {
@@ -2130,14 +2138,111 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       const ESCAPE_FLOOR = 4.5;
       /** An UGLY but genuinely visible text on BG: 2.78:1, a WCAG failure for a
        *  UI component and still perfectly findable. The nav rescue must leave it
-       *  completely alone — that is the whole difference between it and the
-       *  Appearance card, which is unconditional. */
+       *  completely alone. */
       const UGLY_TEXT = "#6a5f85";
+      /** A theme that must keep the user's colours on the APPEARANCE CARD too.
+       *  Row labels 4.70:1, row hints 2.00:1 — low contrast, a WCAG failure, and
+       *  entirely operable.
+       *
+       *  Deliberately NOT UGLY_TEXT, which is no longer a card fixture: #6a5f85
+       *  leaves the home gear alone (2.78:1 on --bg-app) while its HINTS measure
+       *  1.37:1 on the card, so it legitimately fires the card rescue and not the
+       *  nav one. That pair is not a problem to be tidied away — it is the result
+       *  section 6 exists to show, and the nav assertions still depend on
+       *  UGLY_TEXT meaning what it says. */
+      const CALM_BG = "#3b3b46";
+      const CALM_ACCENT = "#8a8ad0";
+      const CALM_TEXT = "#b0b0c0";
       /** What a FIRED rescue has to deliver. The trigger is much lower (see
        *  NAV_RESCUE_RATIO — "you cannot see it at all"), but once it fires the
        *  gear is drawn from the fixed safe palette and has to be a properly
        *  visible control: WCAG 2.1 SC 1.4.11's UI-component floor. */
       const RESCUED_GEAR_FLOOR = 3;
+
+      /** Open the colour picker on one of the three colour buttons and hand the
+       *  popover to `check`.
+       *
+       *  It is opened by clicking the real button, so the dynamic import, the
+       *  anchor wiring and the CSS gate are all exercised the way a user gets
+       *  them — the picker is half of the recovery gesture ("Reset to default"
+       *  lives in it) and is gated on the same attribute as the card, so a card
+       *  that rescues while the popover does not is still a dead end.
+       *
+       *  Always closed again, through the real Done button, because the popover
+       *  installs document-level capture listeners that only its own dismiss path
+       *  removes. The bare remove() at the end is a last resort so a broken close
+       *  cannot leak a popover into the next block. */
+      const withPicker = async (
+        role: string,
+        check: (cp: HTMLElement) => void,
+      ): Promise<void> => {
+        const btn = await waitFor(
+          () => document.querySelector<HTMLElement>(`#settings-color-${role}`),
+          5_000,
+          `the ${role} colour button`,
+        );
+        btn.click();
+        try {
+          const cp = await waitFor(
+            () => document.querySelector<HTMLElement>(".cp"),
+            5_000,
+            "the colour picker popover",
+          );
+          // NOT offsetParent, unlike every other element in this block: .cp is
+          // position:fixed, for which offsetParent is null even when the popover
+          // is perfectly visible. Its own box and what hit-tests at its centre
+          // are the honest questions here.
+          const box = cp.getBoundingClientRect();
+          assert(
+            cp.getClientRects().length > 0 && box.width > 0 && box.height > 0,
+            "the colour picker is in the DOM but has no box",
+          );
+          const hit = document.elementFromPoint(
+            Math.round(box.left + box.width / 2),
+            Math.round(box.top + box.height / 2),
+          );
+          assert(
+            hit !== null && (hit === cp || cp.contains(hit)),
+            "the colour picker is rendered but something else hit-tests at its centre",
+          );
+          check(cp);
+        } finally {
+          document.querySelector<HTMLElement>(".cp__done")?.click();
+          for (let i = 0; i < 20 && document.querySelector(".cp"); i++) await sleep(50);
+          document.querySelector(".cp")?.remove();
+        }
+      };
+
+      /** The Appearance card and the two runs of text whose tiers decide whether
+       *  it gets rescued: a row label (--text-1) and a row hint (--text-3, the
+       *  faintest tier and the one the trigger is calibrated on). Re-queried on
+       *  every use rather than captured once — each updateSettings notifies the
+       *  settings store, which rebuilds these nodes underneath. Selected through
+       *  `.settings__card--appearance`, the same class the CSS gate keys on. */
+      const appearanceCard = async (): Promise<{ label: HTMLElement; hint: HTMLElement }> => {
+        const themeOpt = await waitFor(
+          () => document.querySelector<HTMLElement>('[data-theme-opt="custom"]'),
+          10_000,
+          "the theme control",
+        );
+        const box = themeOpt.closest<HTMLElement>(".settings__card--appearance");
+        assert(box !== null, "the theme control must live inside the Appearance card");
+        const label = box!.querySelector<HTMLElement>(".settings__row-label");
+        const hint = box!.querySelector<HTMLElement>(".settings__hint");
+        assert(
+          label !== null && hint !== null,
+          "the Appearance card must carry a row label and a row hint",
+        );
+        assert(
+          label!.offsetParent !== null && label!.getClientRects().length > 0,
+          "the Appearance card's row label is not rendered",
+        );
+        assert(
+          hint!.offsetParent !== null && hint!.getClientRects().length > 0,
+          "the Appearance card's row hint is not rendered",
+        );
+        return { label: label!, hint: hint! };
+      };
 
       try {
         navigate({ view: "settings" });
@@ -2279,6 +2384,16 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
           "the background colour row is not rendered — the bad colour cannot be changed",
         );
 
+        // The escape hatch is CONDITIONAL since v0.7.5, so the flag is asserted
+        // before anything it produces. Under PATHO every tier of this card is
+        // collapsed (the weakest measures 1.03:1), so if this attribute is not
+        // stamped the card below is being read in the user's own colours and the
+        // ratio that follows would be measuring an accident.
+        assert(
+          root.dataset.rescueAppearance === "1",
+          `every tier of the Appearance card is gone under ${PATHO} but data-rescue-appearance was not stamped — there is no way back`,
+        );
+
         // Measured, not assumed. The row label re-resolves `color: var(--text-1)`
         // at its own position in the tree, so a card-scoped override shows up
         // here while the root token stays the user's (unreadable) pick — which
@@ -2290,11 +2405,85 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
           labelRatio >= ESCAPE_FLOOR,
           `Appearance card text is only ${labelRatio.toFixed(2)}:1 on its own background — the escape hatch does not work`,
         );
-        // Reported rather than asserted: the two controls are already proven
-        // rendered above, and these are the numbers to look at first if a run
-        // ever shows the card passing while feeling dead.
+        // …and it really is the fixed palette doing that, not a lucky pick: the
+        // ink must be the published --safe-text-1 and not the user's --text-1.
+        assert(
+          same(getComputedStyle(label!).color, tok("--safe-text-1")) &&
+            !same(getComputedStyle(label!).color, PATHO),
+          `the rescued label is drawn in ${getComputedStyle(label!).color}, not the escape-hatch ink ${tok("--safe-text-1")}`,
+        );
         const optRatio = ratio(chan(getComputedStyle(opt).color), bgUnder(opt));
         const rowRatio = ratio(chan(getComputedStyle(row).color), bgUnder(row));
+
+        // The SELECTED theme option, asserted rather than reported — this is the
+        // number that settles what the trigger's segment term should measure.
+        //
+        // It has TWO legitimate painted states, and which one this reads depends
+        // on where the pointer happens to be sitting, which the harness does not
+        // control (it clicks by dispatching events, it never moves the mouse).
+        // At rest the option sits on the segmented control's BARE track:
+        // `.settings__segmented .btn { background: transparent }` is two classes
+        // to `.btn--on`'s one, so no --accent-dim fill lands. Under the pointer
+        // it does land, because `.settings__segmented .btn--on:hover` ties
+        // `.settings__segmented .btn:hover` at (0,3,0) and wins on source order.
+        // The two differ by about a ratio point.
+        //
+        // So both predictions are computed and the measurement has to match ONE
+        // of them. Matching neither means the ink or the surface is something
+        // this model does not know about — and needsAppearanceRescue takes the
+        // minimum of exactly these two, so a surface it does not know about is a
+        // trigger measuring the wrong thing. Derived from the live tokens rather
+        // than hardcoded, so a palette retune moves prediction and measurement
+        // together.
+        const dim = parse(tok("--safe-accent-dim"));
+        const track = chan(tok("--safe-input"));
+        const hoveredFill = track.map((v2, i) => dim.rgb[i]! * dim.a + v2 * (1 - dim.a));
+        const segAtRest = ratio(chan(tok("--safe-accent-strong")), track);
+        const segHovered = ratio(chan(tok("--safe-accent-strong")), hoveredFill);
+        const segState =
+          Math.abs(optRatio - segAtRest) < 0.05
+            ? "at rest"
+            : Math.abs(optRatio - segHovered) < 0.05
+              ? "hovered"
+              : "neither";
+        assert(
+          segState !== "neither",
+          `the selected theme option measures ${optRatio.toFixed(2)}:1, which is neither its resting track (${segAtRest.toFixed(2)}:1) nor its hovered fill (${segHovered.toFixed(2)}:1) — the segmented control's cascade changed, and the rescue trigger measures the wrong surface now`,
+        );
+        // Whichever state it is in, it has to be a control the user can read:
+        // the whole point of the segment tier is "which theme is active".
+        assert(
+          optRatio >= ESCAPE_FLOOR,
+          `the selected theme option is only ${optRatio.toFixed(2)}:1 — the user cannot see which theme is active`,
+        );
+
+        // The second half of the same gesture. A readable card that opens an
+        // unreadable "Reset to default" is the same dead end, and the popover is
+        // a separate selector under the same flag — so it is opened for real and
+        // measured, rather than assumed to follow.
+        let resetRatio = 0;
+        await withPicker("background", (cp) => {
+          const cpBg = getComputedStyle(cp).backgroundColor;
+          assert(
+            same(cpBg, tok("--safe-raised")),
+            `the picker popover is painted ${cpBg}, not the escape-hatch surface ${tok("--safe-raised")}`,
+          );
+          assert(
+            !same(cpBg, tok("--bg-raised")),
+            `the picker popover is still on the user's own surface ${tok("--bg-raised")} under ${PATHO}`,
+          );
+          const reset = cp.querySelector<HTMLElement>(".cp__reset");
+          assert(reset !== null, 'the picker must offer "Reset to default"');
+          assert(
+            reset!.getClientRects().length > 0,
+            '"Reset to default" is in the DOM but not rendered',
+          );
+          resetRatio = ratio(chan(getComputedStyle(reset!).color), bgUnder(reset!));
+          assert(
+            resetRatio >= ESCAPE_FLOOR,
+            `"Reset to default" is only ${resetRatio.toFixed(2)}:1 on the popover — the last way back is unreadable`,
+          );
+        });
 
         /* ---- 5. the way IN to that card ---- */
 
@@ -2366,8 +2555,109 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         );
         assert(hitsGear(), "the Settings gear stopped hit-testing under a normal custom theme");
 
-        return `verbatim bg ${bg} / accent ${accent} / text ${text1} (${pickRatio.toFixed(2)}:1, unclamped), on-accent ${onAccent} == bg, panel ${panel} derived; escape hatch on ${PATHO}: label ${labelRatio.toFixed(2)}:1 (theme btn ${optRatio.toFixed(2)}:1, colour btn ${rowRatio.toFixed(2)}:1); nav rescue fired on ${PATHO}: gear hit-tests at ${gearRatio.toFixed(2)}:1, and stayed OFF at ${uglyRatio.toFixed(2)}:1`;
+        /* ---- 6. the card rescue is its own decision ---- */
+
+        // The two flags are independent, and THIS theme is where that stops
+        // being a claim: #6a5f85 is 2.78:1 on --bg-app, so the gear above was
+        // correctly left in the user's colours — and 1.37:1 on the card's
+        // faintest tier, so the card is correctly rescued at the same instant.
+        // One shared flag would have to be wrong about one of them.
+        assert(
+          root.dataset.rescueAppearance === "1",
+          `the card's hints are gone at ${UGLY_TEXT} but data-rescue-appearance was not stamped`,
+        );
+        navigate({ view: "settings" });
+        const uglyCard = await appearanceCard();
+        assert(
+          !same(getComputedStyle(uglyCard.label).color, UGLY_TEXT),
+          `the card was left in the user's ${UGLY_TEXT} even though its hints are gone`,
+        );
+        const uglyCardRatio = ratio(
+          chan(getComputedStyle(uglyCard.label).color),
+          bgUnder(uglyCard.label),
+        );
+        assert(
+          uglyCardRatio >= ESCAPE_FLOOR,
+          `the rescued card reads ${uglyCardRatio.toFixed(2)}:1 under ${UGLY_TEXT}`,
+        );
+
+        // …and the other direction for the CARD, which is the promise this
+        // release actually added: a theme whose faintest tier is merely poor
+        // keeps the user's own colours on the one screen they were chosen from.
+        // Before v0.7.5 this card was rescued unconditionally, so a permanently
+        // mismatched panel sat in the middle of an app somebody had deliberately
+        // coloured. If this half ever fires, that is back.
+        await updateSettings({
+          theme: "custom",
+          customTheme: { background: CALM_BG, accent: CALM_ACCENT, text: CALM_TEXT },
+        });
+        await waitFor(
+          () => (same(tok("--text-1"), CALM_TEXT) ? true : null),
+          5_000,
+          "the ugly-but-usable theme to paint",
+        );
+        const calm = await appearanceCard();
+        assert(
+          root.dataset.rescueAppearance === undefined,
+          "the Appearance card was overridden for a theme it can be read in — that is clamping",
+        );
+        assert(
+          root.dataset.rescueNav === undefined && root.dataset.rescueChrome === undefined,
+          "a readable theme stamped a nav rescue",
+        );
+        // The card is really in the user's ink, not merely un-stamped: the row
+        // label must compute to the exact pick, and NOT to the safe palette's
+        // --safe-text-1, which is still published on the root the whole time.
+        const calmLabelColor = getComputedStyle(calm.label).color;
+        assert(
+          same(calmLabelColor, CALM_TEXT),
+          `the card's label is ${calmLabelColor}, not the user's own text colour ${CALM_TEXT}`,
+        );
+        assert(
+          !same(calmLabelColor, tok("--safe-text-1")),
+          `the card is still painted from the escape-hatch palette ${tok("--safe-text-1")}`,
+        );
+        const calmLabelRatio = ratio(chan(calmLabelColor), bgUnder(calm.label));
+        const calmHintRatio = ratio(chan(getComputedStyle(calm.hint).color), bgUnder(calm.hint));
+        // Fixture self-check, on the painted pixels rather than on the hex: the
+        // label has to be comfortably readable and the HINT has to be genuinely
+        // poor — a WCAG failure that is still above the trigger. If either drifts
+        // this case stops being "ugly but usable" and stops testing anything.
+        assert(
+          calmLabelRatio > 4 && calmLabelRatio < 6,
+          `fixture drifted: the card's label is ${calmLabelRatio.toFixed(2)}:1, not the ~4.7:1 this case is about`,
+        );
+        assert(
+          calmHintRatio > NAV_RESCUE_RATIO && calmHintRatio < 3,
+          `fixture drifted: the card's hint is ${calmHintRatio.toFixed(2)}:1, which is no longer "poor but above the line"`,
+        );
+        // The picker follows the same flag in this direction too — it is a
+        // separate selector, so "the card kept the user's colours" says nothing
+        // about the popover until the popover is opened and measured.
+        await withPicker("text", (cp) => {
+          const cpBg = getComputedStyle(cp).backgroundColor;
+          assert(
+            same(cpBg, tok("--bg-raised")),
+            `the picker is painted ${cpBg}, not the user's own surface ${tok("--bg-raised")}`,
+          );
+          assert(
+            !same(cpBg, tok("--safe-raised")),
+            `the picker fell back to the escape-hatch surface ${tok("--safe-raised")} for a readable theme`,
+          );
+        });
+
+        return `verbatim bg ${bg} / accent ${accent} / text ${text1} (${pickRatio.toFixed(2)}:1, unclamped), on-accent ${onAccent} == bg, panel ${panel} derived; card rescue fired on ${PATHO}: label ${labelRatio.toFixed(2)}:1 (theme btn ${optRatio.toFixed(2)}:1 ${segState}, predicted ${segAtRest.toFixed(2)}:1 at rest / ${segHovered.toFixed(2)}:1 hovered; colour btn ${rowRatio.toFixed(2)}:1), picker Reset ${resetRatio.toFixed(2)}:1; nav rescue fired on ${PATHO}: gear hit-tests at ${gearRatio.toFixed(2)}:1, and stayed OFF at ${uglyRatio.toFixed(2)}:1 where the card WAS rescued (${uglyCardRatio.toFixed(2)}:1); both flags stayed OFF on ${CALM_TEXT}: card in the user's own ink, label ${calmLabelRatio.toFixed(2)}:1, hint ${calmHintRatio.toFixed(2)}:1`;
       } finally {
+        // Never leak an open colour picker into a later block: it holds
+        // document-level capture listeners for pointerdown and Escape, and a
+        // dismiss firing later would commit a colour long after this block
+        // finished. Closed through its own Done button so those listeners are
+        // really released — the remove() only catches a popover that arrived
+        // after the wait for it had already given up.
+        for (const cp of Array.from(document.querySelectorAll<HTMLElement>(".cp"))) {
+          cp.querySelector<HTMLElement>(".cp__done")?.click();
+          cp.remove();
+        }
         // Never leave the owner's real theme changed by a test run — and nothing
         // clamps any more, so a leaked pathological theme would leave the app
         // genuinely unusable. The repaint inside updateSettings is synchronous;

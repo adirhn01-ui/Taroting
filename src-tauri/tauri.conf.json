@@ -35,6 +35,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "publisher": "Taroting",
     "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"],
     "icon": ["icons/icon.ico"],
     "fileAssociations": [

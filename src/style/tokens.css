@@ -30,12 +30,19 @@
 
    THE ESCAPE HATCH. Because nothing above is nudged, a theme CAN be made
    invisible. `applyTheme` therefore also stamps `data-custom-theme` on <html>
-   and publishes a --safe-* group (--safe-panel, --safe-text-1, --safe-accent, …)
-   holding this file's own Dark or Light values. Settings → Appearance and the
-   colour picker map their palette onto that group — see the escape-hatch block
-   in src/settings/settings.css — so the one card that can undo a bad theme is
-   never rendered in it. Both the group and the attribute exist only while a
-   custom theme is active.
+   (a plain marker that a custom theme is live) and publishes a --safe-* group
+   (--safe-panel, --safe-text-1, --safe-accent, …) holding this file's own Dark
+   or Light values. Both exist only while a custom theme is active.
+
+   THREE separate flags decide who actually READS that group, each stamped only
+   while the thing it protects is measurably invisible — never for a theme that
+   is merely ugly, which would be contrast clamping by another route:
+     data-rescue-nav         the home Settings gear      (src/home/home.css)
+     data-rescue-chrome      the editor Back + gear      (src/editor/editor.css)
+     data-rescue-appearance  the Appearance card + the colour picker
+                                                         (src/settings/settings.css)
+   They genuinely disagree — different ink, different surfaces, different tiers
+   — so do not collapse them into one. See src/core/session.ts.
    ============================================================ */
 
 :root {

@@ -314,24 +314,39 @@ export interface DerivedTheme {
  * allowed. What is NOT allowed is being STUCK there.
  *
  * So Settings → Appearance — the one screen that can undo it — and the colour
- * picker it opens render in a palette of their own: the built-in Dark or Light
- * values, chosen by the direction the background implies so the card still
- * matches the app's overall character, but never computed FROM the user's
- * colours. The card and the popover are therefore legible against themselves
- * no matter what the three picks are, because nothing about them depends on
- * the picks. Contrast is a property of these constants and is pinned by a test.
+ * picker it opens can render in a palette of their own: the built-in Dark or
+ * Light values, chosen by the direction the background implies so the card
+ * still matches the app's overall character, but never computed FROM the user's
+ * colours. Whatever the three picks are, that palette is legible against
+ * itself, because nothing about it depends on the picks.
  *
  * The picker gets the same treatment on purpose: it is the second half of the
  * same recovery gesture (it is where "Reset to default" lives), and an
- * unreadable Reset button is exactly the dead end this exists to prevent.
+ * unreadable Reset button is exactly the dead end this exists to prevent. One
+ * flag covers both; a readable card that opens an unreadable popover is still
+ * a dead end.
  *
- * Scope: `applyTheme` writes these ONLY while a custom theme is active, and
- * `settings.css` consumes them ONLY under `.settings__card--appearance` and
- * `.cp`, gated on `html[data-custom-theme]`. The rest of Settings, and the rest
- * of the app, stay fully in the user's colours. The gate is load-bearing: with
- * no custom theme these properties do not exist, and a `var(--safe-…)` with no
- * fallback would resolve to the guaranteed-invalid value rather than to the
- * palette.
+ * CONDITIONAL, since v0.7.5 — see `needsAppearanceRescue` below for the
+ * trigger and how it is calibrated. Until then the card rendered from these
+ * constants for EVERY custom theme, which made its legibility a structural
+ * guarantee but also left a permanently mismatched card sitting in the middle
+ * of an app the user had deliberately coloured. It now behaves like the nav
+ * rescue: the user's own colours until they measurably stop working.
+ *
+ * That trade is worth naming. A guarantee that held by construction now holds
+ * by measurement, so the predicate is the whole feature — if it is wrong in the
+ * "did not fire" direction a user is permanently stranded. The tests in
+ * `session.test.ts` are load-bearing, not a formality.
+ *
+ * Scope: `applyTheme` writes these ONLY while a custom theme is active (the
+ * home and editor rescues read them too, so they are published whenever custom
+ * is on, not only when this card needs them), and `settings.css` consumes them
+ * ONLY under `.settings__card--appearance` and `.cp`, gated on
+ * `html[data-rescue-appearance]`. The rest of Settings, and the rest of the
+ * app, stay fully in the user's colours. The gate is load-bearing: that
+ * attribute is only ever stamped inside the custom branch, and with no custom
+ * theme these properties do not exist — a `var(--safe-…)` with no fallback
+ * would resolve to the guaranteed-invalid value rather than to the palette.
  *
  * The colour SWATCHES are deliberately still the user's literal picks — that is
  * the whole point of the card — so each one carries a `--border-strong` outline
@@ -467,6 +482,175 @@ export function needsChromeRescue(derived: DerivedTheme): boolean {
   return contrastRatioHex(derived.vars["--text-1"], derived.vars["--bg-panel"]) < NAV_RESCUE_RATIO;
 }
 
+/* ---------------- the Appearance card rescue ----------------
+ *
+ * The third flag, and the one with the least margin for error: it decides
+ * whether the escape hatch above renders at all.
+ *
+ * WHY IT IS NOT THE SAME QUESTION AS THE GEAR. The two nav predicates each
+ * measure ONE ink on ONE surface, because a ghost icon button is one ink on one
+ * surface. This card is a stack of tiers that fail at very different points:
+ *
+ *   --text-1        row labels ("Background", "Accent", "Text")
+ *   --text-2        the mono hex captions — what you read to type a value back
+ *   --text-3        the "Appearance" section head and every row hint; the
+ *                   faintest tier and the first to go
+ *   --accent-strong the SELECTED segment of the theme control, on an
+ *                   --accent-dim fill — which tells you which theme is live
+ *
+ * and they land on five different surfaces: `--bg-panel` (the card),
+ * `--bg-raised` (the buttons, and the picker popover itself), `--bg-input` (the
+ * segmented control's track and the picker's fields), and `--bg-hover` /
+ * `--bg-active` under the pointer. Gating on `--text-1` alone would ship a card
+ * whose labels read fine while its hints and section head have vanished, so
+ * every pair that is actually painted is measured and the WEAKEST decides.
+ * Which pairs those are is not the obvious cross product — see `CARD_PAIRS`.
+ *
+ * The tiers are not independent — `--text-2`/`--text-3` are `--text-1` walked
+ * 66.2%/40.8% of the way to the panel — but the accent tier genuinely is, and
+ * the mix target is the panel while most of the surfaces are not, so the cheap
+ * thing to do is measure them all rather than reason about which dominates.
+ * Eleven ratios with an early exit costs ~2 µs on a theme that needs no rescue
+ * and ~0.2 µs on one that does: more than the derivation it follows, and 0.04%
+ * of a 165 Hz frame, against twenty-one `setProperty` calls on the root that
+ * each invalidate style for the whole document. It is not what costs anything
+ * here, but it is not free either — do not grow this list carelessly.
+ *
+ * WHY 1.5:1 — calibrated on real derived values, not chosen by analogy.
+ *
+ * The weakest pair is usually `--text-3` on `--bg-raised` or `--bg-panel`, and
+ * that tier compresses toward 1:1 far faster than `--text-1` does, so the
+ * number that belongs on it is NOT the number that belongs on a row label.
+ * Measured over the pairs above:
+ *
+ *   left alone   3.31 / 3.22  both shipped palettes fed back in as custom
+ *                2.04 – 3.11  Nord, Gruvbox, Dracula, Tokyo Night, One Dark,
+ *                             Catppuccin Latte, GitHub Light — real palettes
+ *                             at their real body foreground
+ *                1.82         a muted mid-gray theme, labels at 4.7:1
+ *                1.68         a Solarized-like dark, labels at 4.9:1
+ *                1.55         true Solarized Dark on its own base0 foreground
+ *                1.53         Solarized Light on base1 — the thinnest real
+ *                             margin there is, and the reason for the fixture
+ *                             pinning it: raising this bar past 1.53 costs a
+ *                             genuine palette its colours
+ *   ---- 1.5 ----
+ *   rescued      1.37         labels 2.6:1 and readable, hints GONE — this is
+ *                             exactly the case a --text-1 gate would miss
+ *                1.00 – 1.27  themes whose text is picked on the background
+ *                1.00 – 1.10  every all-one-colour theme
+ *
+ * 1.5 is the gap: above the worst labels-fine-hints-gone theme, below the
+ * weakest theme that is genuinely still usable. The headroom above is only 2%,
+ * which is deliberate — the failure directions are not symmetric (see below) —
+ * but it means the fixtures either side are load-bearing and a drift in the
+ * derivation must fail them loudly rather than quietly move the bar.
+ *
+ * It is numerically equal to NAV_RESCUE_RATIO and that is a coincidence of
+ * calibration, not a dependency — they measure different ink at different sizes
+ * on different surfaces and are free to move apart.
+ *
+ * WHICH WAY TO BE WRONG. Firing when it was not needed costs a mismatched card
+ * for one screen: mildly ugly, and the user can see it and re-pick. Failing to
+ * fire when it was needed leaves someone permanently unable to undo their own
+ * theme, with no other route out of the app's own settings. Those are not
+ * comparable, so the bar is set to fire on doubt.
+ */
+
+/** Below this contrast ratio a tier of the Appearance card counts as gone, and
+ *  the card plus the colour picker fall back to the fixed `--safe-*` palette.
+ *  Calibrated on `--text-3`, the faintest tier — see the note above before
+ *  moving it, and note that this is NOT the same decision as the two nav
+ *  predicates even though the value currently matches. */
+export const CARD_RESCUE_RATIO = 1.5;
+
+/**
+ * Every (ink, surface) pair the Appearance card and the colour picker ACTUALLY
+ * paint, read off the two stylesheets rather than assumed.
+ *
+ * The obvious shape — three inks × three surfaces — is shorter and wrong in
+ * both directions. It measures `--text-2`/`--bg-panel`, `--text-2`/`--bg-input`
+ * and `--text-3`/`--bg-input`, none of which exists (the quiet inks only ever
+ * appear on buttons and inside the popover, and nothing here has a
+ * `::placeholder`), while missing `--bg-hover` and `--bg-active` entirely. That
+ * is not a wash: on a light ramp `raised == panel` while `input` sits on the
+ * far side, so the phantom `--text-3`/`--bg-input` pair decides a large share of
+ * the near-threshold cases and wrongly rescues genuinely readable light themes.
+ *
+ * Hover and active are in the list on purpose, for the same reason the home
+ * gear's rescue restyles `:hover`: a label that is legible until the pointer
+ * reaches it has still failed at the moment it is being used.
+ *
+ * The order is not load-bearing — the predicate takes the minimum — but the
+ * early exit makes the commonest failures cheapest to reach.
+ */
+const CARD_PAIRS = [
+  // .settings__row-label, on the .card itself.
+  ["--text-1", "--bg-panel"],
+  // .btn labels: each colour button, and the picker's Done / Reset to default.
+  ["--text-1", "--bg-raised"],
+  // The segmented control's own track, and the picker's .cp__hex field.
+  ["--text-1", "--bg-input"],
+  // The same buttons under the pointer, and pressed.
+  ["--text-1", "--bg-hover"],
+  ["--text-1", "--bg-active"],
+  // The mono hex caption inside each colour button, and .cp__title.
+  ["--text-2", "--bg-raised"],
+  ["--text-2", "--bg-hover"],
+  ["--text-2", "--bg-active"],
+  // The "Appearance" section head and every row hint — the faintest tier.
+  ["--text-3", "--bg-panel"],
+  // .cp__slider-label, inside the popover.
+  ["--text-3", "--bg-raised"],
+] as const;
+
+/**
+ * Would Settings → Appearance (and the picker it opens) be unreadable in the
+ * user's own colours?
+ *
+ * Measured off the EMITTED tokens, like the two predicates above, so it stays
+ * true to what is actually painted rather than to the three raw picks.
+ */
+export function needsAppearanceRescue(derived: DerivedTheme): boolean {
+  const v = derived.vars;
+  for (const [ink, surface] of CARD_PAIRS) {
+    if (contrastRatioHex(v[ink], v[surface]) < CARD_RESCUE_RATIO) return true;
+  }
+  // The SELECTED segment of the theme control, which is the one tier that does
+  // not depend on the text ramp at all: an accent picked on top of the
+  // background erases "which theme is active" while every label around it still
+  // reads perfectly, so it needs its own term.
+  //
+  // This one has TWO painted states and they are not the same colour.
+  //
+  // At rest the fill is bare --bg-input, NOT an --accent-dim fill:
+  // `.settings__segmented .btn { background: transparent }` in settings.css is a
+  // two-class selector and outranks components.css's one-class
+  // `.btn--on { background: var(--accent-dim) }`, so the selected option is
+  // distinguished only by its --accent-strong ink. (The export dialog
+  // re-declares `.export-seg .btn--on` at matching specificity precisely to win
+  // that cascade; Settings has no equivalent. If that is ever equalised, the
+  // resting state becomes the hovered one below and this collapses to one term.)
+  //
+  // Under the pointer the dim fill DOES land — `.settings__segmented
+  // .btn--on:hover` ties `.settings__segmented .btn:hover` at (0,3,0) and wins
+  // on source order — and because that fill moves the surface toward the accent
+  // while the ink is derived FROM the accent, the hovered state is always the
+  // weaker of the two. Taking the minimum is the same rule the text tiers get:
+  // a control that is legible until the pointer reaches it has still failed at
+  // the moment it is being used.
+  const spec = derived.surface === "light" ? LIGHT_SURFACE : DARK_SURFACE;
+  const hovered = rgbToHex(
+    mix(hexToRgb(v["--accent"]), hexToRgb(v["--bg-input"]), spec.dimAlpha),
+  );
+  return (
+    Math.min(
+      contrastRatioHex(v["--accent-strong"], v["--bg-input"]),
+      contrastRatioHex(v["--accent-strong"], hovered),
+    ) < CARD_RESCUE_RATIO
+  );
+}
+
 /**
  * Turn the three user colours into the custom properties above. Pure, so it is
  * unit-testable without a DOM.
@@ -552,6 +736,11 @@ let rescueNavOn = false;
  *  against `--bg-panel` and genuinely crosses at different picks. */
 let rescueChromeOn = false;
 
+/** Same, for the Appearance card and the colour picker. Crosses at different
+ *  picks again: it is the minimum over four tiers, not one ink on one surface,
+ *  so it fires for themes both nav flags leave alone. */
+let rescueAppearanceOn = false;
+
 export function applyTheme(theme: Settings["theme"], custom?: CustomTheme): DerivedTheme | null {
   const root = document.documentElement;
 
@@ -591,6 +780,14 @@ export function applyTheme(theme: Settings["theme"], custom?: CustomTheme): Deri
       else delete root.dataset.rescueChrome;
       rescueChromeOn = chrome;
     }
+    // And the card those two exits lead to. Same shape, same reason for the
+    // guard: a colour drag must not rewrite the attribute on every frame.
+    const appearance = needsAppearanceRescue(derived);
+    if (rescueAppearanceOn !== appearance) {
+      if (appearance) root.dataset.rescueAppearance = "1";
+      else delete root.dataset.rescueAppearance;
+      rescueAppearanceOn = appearance;
+    }
     return derived;
   }
 
@@ -609,9 +806,11 @@ export function applyTheme(theme: Settings["theme"], custom?: CustomTheme): Deri
     // of a flag the custom branch set, never a value this path computes.
     delete root.dataset.rescueNav;
     delete root.dataset.rescueChrome;
+    delete root.dataset.rescueAppearance;
     safeVarsSurface = null;
     rescueNavOn = false;
     rescueChromeOn = false;
+    rescueAppearanceOn = false;
     customVarsWritten = false;
   }
   return null;

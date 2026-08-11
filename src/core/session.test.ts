@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  CARD_RESCUE_RATIO,
   contrastRatioHex,
   CUSTOM_THEME_VARS,
   deriveCustomTheme,
   NAV_RESCUE_RATIO,
+  needsAppearanceRescue,
   needsChromeRescue,
   needsNavRescue,
   normalizeHexColor,
@@ -715,28 +717,71 @@ describe("deriveCustomTheme", () => {
 
 /* ---------------- the escape hatch ---------------- */
 
-/** Composite an `rgba(r, g, b, a)` string over an opaque `#rrggbb`, the way the
- *  compositor does for a translucent fill on a card. `--accent-dim` is the only
- *  non-opaque token, and the selected theme button is drawn on it. */
-function overlay(rgba: string, base: string): string {
-  const m = /^rgba\((\d{1,3}), (\d{1,3}), (\d{1,3}), ([\d.]+)\)$/.exec(rgba);
-  expect(m, `not an rgba literal: ${rgba}`).not.toBeNull();
-  const a = Number(m![4]);
-  const b = channels(base);
-  const out = [1, 2, 3].map((i, k) => Math.round(Number(m![i]!) * a + b[k]! * (1 - a)));
-  return `#${out.map((n) => n.toString(16).padStart(2, "0")).join("")}`;
-}
+/**
+ * Every (ink, surface) pair the Appearance card and the colour picker actually
+ * paint, in the form `[ink, surface]` — the same list `CARD_PAIRS` in session.ts
+ * carries, rebuilt here from the stylesheets rather than imported, so the two
+ * have to agree instead of moving together.
+ *
+ * NOT the three-ink × three-surface cross product it looks like it should be.
+ * That shape measures `--text-2`/`--bg-panel`, `--text-2`/`--bg-input` and
+ * `--text-3`/`--bg-input`, none of which is painted anywhere (the quiet inks
+ * only appear on buttons and inside the popover), while missing `--bg-hover` and
+ * `--bg-active` entirely. Both errors are load-bearing: the phantom
+ * `--text-3`/`--bg-input` pair wrongly rescued real palettes — Rosé Pine Dawn
+ * and Solarized Light among them — and the missing hover/active pairs let a
+ * theme through whose row label vanishes the moment the pointer reaches it.
+ */
+const CARD_PAIRS = [
+  // .settings__row-label, on the .card itself.
+  ["--text-1", "--bg-panel"],
+  // .btn labels: each colour button, and the picker's Done / Reset to default.
+  ["--text-1", "--bg-raised"],
+  // The segmented control's own track, and the picker's .cp__hex field.
+  ["--text-1", "--bg-input"],
+  // The same buttons under the pointer, and pressed.
+  ["--text-1", "--bg-hover"],
+  ["--text-1", "--bg-active"],
+  // The mono hex caption inside each colour button, and .cp__title.
+  ["--text-2", "--bg-raised"],
+  ["--text-2", "--bg-hover"],
+  ["--text-2", "--bg-active"],
+  // The "Appearance" section head and every row hint — the faintest tier.
+  ["--text-3", "--bg-panel"],
+  // .cp__slider-label, inside the popover.
+  ["--text-3", "--bg-raised"],
+] as const;
+
+type SafeVar = keyof (typeof SAFE_APPEARANCE)["dark"];
+
+/** The same pairs in the fixed escape-hatch palette, for measuring what a fired
+ *  rescue actually delivers. One `--safe-*` token per token above, derived from
+ *  that list rather than written out again so the two cannot drift apart. */
+const SAFE_PAIRS = CARD_PAIRS.map(
+  ([ink, surface]) =>
+    [`--safe-${ink.slice(2)}` as SafeVar, `--safe-${surface.slice(5)}` as SafeVar] as const,
+);
 
 /**
- * Settings → Appearance is the ONE surface that does not follow the user's
+ * Settings → Appearance is the ONE surface allowed to stop following the user's
  * colours, because it is the only place a theme that hid everything can be
- * undone. Its palette (and the colour picker's, since "Reset to default" lives
- * there) is a pair of fixed constants selected by the background's direction —
- * so its legibility is a property of those constants and nothing else.
+ * undone. When it does, its palette (and the colour picker's, since "Reset to
+ * default" lives there) is a pair of fixed constants selected by the
+ * background's direction — so its legibility is a property of those constants
+ * and nothing else.
  *
  * These tests measure the real contrast ratios of what actually ships. If one
- * fails, the card can no longer be read, which means a user can be permanently
- * locked out of their own app — do not relax the bar, fix the constants.
+ * fails, a rescued card can no longer be read, which means a user can be
+ * permanently locked out of their own app — do not relax the bar, fix the
+ * constants.
+ *
+ * EVERY CASE HERE FIRST ASSERTS THAT THE RESCUE ACTUALLY FIRES for the theme it
+ * is measuring. Before v0.7.5 the card rendered from these constants for every
+ * custom theme, so measuring them alone was the whole story; now it is
+ * conditional, and a block that measures the safe palette without ever checking
+ * it is in use would keep passing while the card had quietly stopped using it.
+ * That is the hollow test this file exists to avoid — the trigger itself is
+ * covered in "the Appearance card rescue" below.
  */
 /** Themes that leave the app with nothing visible at all. Every one is legal —
  *  that is the point of removing the clamps — so every one has to stay
@@ -751,21 +796,23 @@ const PATHOLOGICAL: CustomTheme[] = [
   { background: "#f6f6f8", accent: "#f6f6f8", text: "#f6f6f8" },
 ];
 
+/** What the card actually renders in, for a given user theme — consulted only
+ *  when `needsAppearanceRescue` says so, which is why every case below asserts
+ *  that first. */
+function paletteFor(c: CustomTheme): Record<string, string> {
+  return SAFE_APPEARANCE[deriveCustomTheme(c).surface];
+}
+
+/** Every all-one-colour theme in the cube, the sweep both the escape hatch and
+ *  its trigger are held to: the pathological case is not one colour, it is
+ *  every colour. */
+const ALL_ONE_COLOUR: CustomTheme[] = rgbCube(51).map((h) => ({
+  background: h,
+  accent: h,
+  text: h,
+}));
+
 describe("the Appearance escape hatch", () => {
-  /** What the card actually renders in, for a given user theme. */
-  function paletteFor(c: CustomTheme): Record<string, string> {
-    return SAFE_APPEARANCE[deriveCustomTheme(c).surface];
-  }
-
-  /** Card surfaces a label, a value or a control can land on. */
-  const SAFE_SURFACES = [
-    "--safe-panel",
-    "--safe-raised",
-    "--safe-input",
-    "--safe-hover",
-    "--safe-active",
-  ] as const;
-
   it("publishes one literal for every variable, in both directions", () => {
     expect(SAFE_THEME_VARS).toHaveLength(13);
     for (const dir of ["dark", "light"] as const) {
@@ -777,57 +824,110 @@ describe("the Appearance escape hatch", () => {
     }
   });
 
-  it("does not depend on the user's colours at all", () => {
+  it("names a real published token for every painted pair", () => {
+    // The --safe-* names below are DERIVED from CARD_PAIRS by string surgery,
+    // and a wrong one would not throw: the palette is read as a plain record, so
+    // a miss reads as undefined and contrastRatioHex quietly scores it against
+    // its #000000 fallback — every ratio would pass and nothing would be tested.
+    // Checked once, here, so the rest of the block can index freely.
+    expect(SAFE_PAIRS).toHaveLength(10);
+    for (const [ink, surface] of SAFE_PAIRS) {
+      expect(SAFE_THEME_VARS, `${ink} is not a published token`).toContain(ink);
+      expect(SAFE_THEME_VARS, `${surface} is not a published token`).toContain(surface);
+      for (const dir of ["dark", "light"] as const) {
+        expect(HEX6.test(SAFE_APPEARANCE[dir][ink]), `${dir} ${ink}`).toBe(true);
+        expect(HEX6.test(SAFE_APPEARANCE[dir][surface]), `${dir} ${surface}`).toBe(true);
+      }
+    }
+  });
+
+  it("hands a rescued card one of exactly two fixed objects, never a derived one", () => {
     // Identity, not equality: the card is handed one of exactly two fixed
     // objects, so there is no path by which a pick can reach it. This is the
     // whole mechanism — everything below is just measuring those two objects.
-    for (const c of [...PATHOLOGICAL, ...rgbCube(51).map((h) => ({ background: h, accent: h, text: h }))]) {
+    // The rescue is asserted first because that mechanism is only reached when
+    // it fires; without this line the case would still pass for a build in
+    // which the card had stopped consulting the palette entirely.
+    for (const c of [...PATHOLOGICAL, ...ALL_ONE_COLOUR]) {
+      expect(needsAppearanceRescue(deriveCustomTheme(c)), c.background).toBe(true);
       const p = paletteFor(c);
       expect(p === SAFE_APPEARANCE.dark || p === SAFE_APPEARANCE.light, c.background).toBe(true);
     }
   });
 
-  it("keeps every label and hex value in the card readable, in every pathological case", () => {
+  it("keeps every label and hex value readable in a card it has rescued", () => {
+    // Measured on the pairs the card and the picker really paint, not on a
+    // cross product: asserting a ratio for ink that never lands on that surface
+    // makes the block look thorough while proving nothing about what a user
+    // sees, and it was exactly that shape of mistake in the TRIGGER that
+    // rescued readable palettes.
     for (const c of PATHOLOGICAL) {
-      const p = paletteFor(c);
       const where = `all-${c.background}`;
-      for (const surface of SAFE_SURFACES) {
-        // Row labels, the theme buttons and the mono hex captions.
-        expect(contrastRatioHex(p["--safe-text-1"]!, p[surface]!), `${where} ${surface}`)
-          .toBeGreaterThanOrEqual(4.5);
+      expect(needsAppearanceRescue(deriveCustomTheme(c)), `${where}: not rescued at all`).toBe(true);
+      const p = paletteFor(c);
+      for (const [ink, surface] of SAFE_PAIRS) {
+        // The quiet tiers are held lower than the loud ones, but every pair has
+        // to clear the bar for a section head or a row hint to be legible at
+        // all: --text-3 is the tier the trigger is calibrated on, so a rescue
+        // that delivered it at the ratio that triggered it would be pointless.
+        const floor = ink === "--safe-text-3" ? 3 : 4.5;
+        expect(contrastRatioHex(p[ink]!, p[surface]!), `${where} ${ink} on ${surface}`)
+          .toBeGreaterThanOrEqual(floor);
       }
-      // The hex caption on a colour button, which is what a user reads to type
-      // a value back in — held to the body-text bar, not the UI one.
-      expect(contrastRatioHex(p["--safe-text-2"]!, p["--safe-panel"]!), where)
-        .toBeGreaterThanOrEqual(4.5);
-      expect(contrastRatioHex(p["--safe-text-2"]!, p["--safe-raised"]!), where)
-        .toBeGreaterThanOrEqual(4.5);
-      // Section head and row hints.
-      expect(contrastRatioHex(p["--safe-text-3"]!, p["--safe-panel"]!), where)
-        .toBeGreaterThanOrEqual(3);
-      expect(contrastRatioHex(p["--safe-text-3"]!, p["--safe-raised"]!), where)
-        .toBeGreaterThanOrEqual(3);
     }
+    // What a fired rescue is worth at its weakest, pinned so a retune of
+    // SAFE_APPEARANCE cannot quietly erode it: 3.20:1 on the faintest painted
+    // pair, 2.1x the 1.5 that triggered the rescue in the first place.
+    let worst = Infinity;
+    for (const dir of ["dark", "light"] as const) {
+      for (const [ink, surface] of SAFE_PAIRS) {
+        worst = Math.min(worst, contrastRatioHex(SAFE_APPEARANCE[dir][ink]!, SAFE_APPEARANCE[dir][surface]!));
+      }
+    }
+    expect(worst).toBeCloseTo(3.2, 1);
+    expect(worst).toBeGreaterThan(CARD_RESCUE_RATIO * 2);
   });
 
-  it("keeps the theme control operable, in every pathological case", () => {
+  it("keeps the theme control operable in a card it has rescued", () => {
     for (const c of PATHOLOGICAL) {
-      const p = paletteFor(c);
       const where = `all-${c.background}`;
-      // The SELECTED segment (Dark / Light / System / Custom) is
-      // --accent-strong text on an --accent-dim fill composited over the card.
-      // If this goes, the user cannot see which theme is active.
-      const selected = overlay(p["--safe-accent-dim"]!, p["--safe-panel"]!);
-      expect(contrastRatioHex(p["--safe-accent-strong"]!, selected), `${where} selected`)
+      expect(needsAppearanceRescue(deriveCustomTheme(c)), `${where}: not rescued at all`).toBe(true);
+      const p = paletteFor(c);
+      // The SELECTED segment (Dark / Light / System / Custom) is --accent-strong
+      // ink on the segmented control's BARE track, which is --bg-input.
+      //
+      // Not on an --accent-dim fill, however much the `.btn--on` rule suggests
+      // it: `.settings__segmented .btn { background: transparent }` is a
+      // two-class selector and outranks the one-class `.btn--on { background:
+      // var(--accent-dim) }` in components.css, so at rest there is no fill to
+      // composite. The in-app E2E measures this button at 6.24:1, which is
+      // --safe-accent-strong on bare --safe-input to two decimals and NOT the
+      // 5.13:1 it would read on a dim fill — the painted pixels agree with the
+      // cascade, so this is the number to hold.
+      expect(contrastRatioHex(p["--safe-accent-strong"]!, p["--safe-input"]!), `${where} selected`)
         .toBeGreaterThanOrEqual(4.5);
-      // …and the selected fill has to be distinguishable from an unselected one.
-      expect(channelDistance(selected, p["--safe-panel"]!), `${where} fill`).toBeGreaterThan(6);
+      // With no fill of its own, selection is conveyed by INK ALONE — so what
+      // has to be true is not "this fill differs from that fill" (it does not
+      // differ; there is one track) but "the selected option's ink is plainly
+      // not the unselected options' ink". Measured as a channel distance as well
+      // as a ratio, because two colours can be equally bright and still
+      // obviously different, which is the entire mechanism here.
+      expect(channelDistance(p["--safe-accent-strong"]!, p["--safe-text-1"]!), `${where} selected ink`)
+        .toBeGreaterThan(60);
+      expect(contrastRatioHex(p["--safe-accent-strong"]!, p["--safe-text-1"]!), `${where} selected ink`)
+        .toBeGreaterThan(2);
       // The focus ring, which is how this card is operated from the keyboard.
-      expect(contrastRatioHex(p["--safe-accent"]!, p["--safe-panel"]!), `${where} ring`)
-        .toBeGreaterThanOrEqual(3);
-      expect(contrastRatioHex(p["--safe-accent"]!, p["--safe-raised"]!), `${where} ring`)
-        .toBeGreaterThanOrEqual(3);
+      for (const surface of ["--safe-panel", "--safe-raised", "--safe-input"] as const) {
+        expect(contrastRatioHex(p["--safe-accent"]!, p[surface]!), `${where} ring on ${surface}`)
+          .toBeGreaterThanOrEqual(3);
+      }
     }
+    // The two numbers the selected segment collapses to, pinned. 6.24 is the
+    // one the E2E reports from real pixels.
+    expect(contrastRatioHex(SAFE_APPEARANCE.dark["--safe-accent-strong"], SAFE_APPEARANCE.dark["--safe-input"]))
+      .toBeCloseTo(6.24, 2);
+    expect(contrastRatioHex(SAFE_APPEARANCE.light["--safe-accent-strong"], SAFE_APPEARANCE.light["--safe-input"]))
+      .toBeCloseTo(5.55, 2);
   });
 
   it("keeps a colour swatch findable even when the pick matches the card", () => {
@@ -846,9 +946,11 @@ describe("the Appearance escape hatch", () => {
   });
 
   it("tracks the direction the background implies, so the card is not alien", () => {
-    // Legibility does not depend on this — both palettes are internally
-    // legible — but a dark card on a white app (or the reverse) reads as a
-    // rendering bug rather than as the one thing still working.
+    // WHICH of the two palettes a rescue would use, independent of whether this
+    // particular theme triggers one. Legibility does not depend on it — both
+    // palettes are internally legible — but a dark card on a white app (or the
+    // reverse) reads as a rendering bug rather than as the one thing still
+    // working.
     expect(paletteFor({ background: "#000000", accent: "#fff", text: "#fff" })).toBe(
       SAFE_APPEARANCE.dark,
     );
@@ -861,6 +963,514 @@ describe("the Appearance escape hatch", () => {
     expect(paletteFor({ background: "#fff4e0", accent: "#000", text: "#000" })).toBe(
       SAFE_APPEARANCE.light,
     );
+  });
+});
+
+/* ---------------- the Appearance card rescue ---------------- */
+
+/**
+ * The trigger for everything above, and the reason that block is worth
+ * anything.
+ *
+ * Until v0.7.5 the card's palette was a STRUCTURAL guarantee: those constants
+ * were used for every custom theme, so no user input could reach them. It is
+ * now a MEASURED one — the user keeps their own colours until this predicate
+ * says the card has stopped working. The two failure directions are not
+ * comparable. Firing when it was not needed costs one mismatched card the user
+ * can see and re-pick around; failing to fire when it was needed leaves someone
+ * permanently unable to undo their own theme, with no other route out. So both
+ * directions are asserted here, every fixture carries the ratio it was chosen
+ * for, and the ratio is asserted BEFORE the predicate: a fixture that drifts
+ * across the line then fails loudly and says which one, instead of silently
+ * ceasing to test anything.
+ *
+ * The ratios are recomputed here from the emitted tokens rather than read back
+ * out of the implementation, so a change to which surfaces or inks are measured
+ * shows up as a disagreement rather than as two things moving together.
+ */
+describe("the Appearance card rescue", () => {
+  /** The `--accent-dim` fill composited over the segmented control's track —
+   *  what the selected option sits on WHILE THE POINTER IS ON IT.
+   *
+   *  Recomputed from the emitted `rgba()` literal rather than from the spec
+   *  constant that produced it, so this arrives at the compositor's answer by a
+   *  different route than the implementation does. */
+  function dimFillOverTrack(c: CustomTheme): string {
+    const { vars: v } = deriveCustomTheme(c);
+    const m = /^rgba\((\d{1,3}), (\d{1,3}), (\d{1,3}), ([\d.]+)\)$/.exec(v["--accent-dim"]);
+    expect(m, `not an rgba literal: ${v["--accent-dim"]}`).not.toBeNull();
+    const a = Number(m![4]);
+    const base = channels(v["--bg-input"]);
+    const out = [1, 2, 3].map((i, k) => Math.round(Number(m![i]!) * a + base[k]! * (1 - a)));
+    return `#${out.map((n) => n.toString(16).padStart(2, "0")).join("")}`;
+  }
+
+  /** Every tier the card is made of, measured off what `deriveCustomTheme`
+   *  actually emits: the painted (ink, surface) pairs above, plus the selected
+   *  segment of the theme control, which is the one tier that does not depend on
+   *  the text ramp at all.
+   *
+   *  The segment has TWO painted states and they are different colours. At rest
+   *  it is `--accent-strong` on the BARE `--bg-input` track: the `.btn--on` rule
+   *  that would put an `--accent-dim` fill under it loses the cascade to
+   *  `.settings__segmented .btn { background: transparent }` (one class against
+   *  two). Under the pointer that fill DOES land, because
+   *  `.settings__segmented .btn--on:hover` ties `.settings__segmented .btn:hover`
+   *  at (0,3,0) and wins on source order. The weaker of the two decides, the
+   *  same rule the text tiers get for `--bg-hover` and `--bg-active`.
+   *
+   *  Neither state dominates in general — over the cube, 1460 themes fail only
+   *  hovered and 469 fail only at rest — so both are load-bearing and each has a
+   *  fixture below. */
+  function cardTiers(c: CustomTheme): Record<string, number> {
+    const { vars: v } = deriveCustomTheme(c);
+    const out: Record<string, number> = {};
+    for (const [ink, surface] of CARD_PAIRS) {
+      out[`${ink} on ${surface}`] = contrastRatioHex(v[ink], v[surface]);
+    }
+    out["the selected theme segment"] = Math.min(
+      contrastRatioHex(v["--accent-strong"], v["--bg-input"]),
+      contrastRatioHex(v["--accent-strong"], dimFillOverTrack(c)),
+    );
+    return out;
+  }
+
+  /** What the predicate compares against CARD_RESCUE_RATIO: the weakest tier. */
+  const cardMin = (c: CustomTheme): number => Math.min(...Object.values(cardTiers(c)));
+  /** Which tier that is, for a failure message worth reading. */
+  const weakestTier = (c: CustomTheme): string =>
+    Object.entries(cardTiers(c)).sort((a, b) => a[1] - b[1])[0]![0];
+  const rescued = (c: CustomTheme): boolean => needsAppearanceRescue(deriveCustomTheme(c));
+
+  it("pins the threshold, because the threshold IS the decision", () => {
+    // Calibrated on --text-3, the faintest tier, which compresses toward 1:1 far
+    // faster than a row label does: it sits above the worst theme whose labels
+    // read while its hints have gone (1.37) and below the weakest theme that is
+    // genuinely still usable (1.68). It is numerically equal to NAV_RESCUE_RATIO
+    // and that is a coincidence of calibration, not a dependency — different ink
+    // at a different size on a different surface, free to move apart.
+    expect(CARD_RESCUE_RATIO).toBe(1.5);
+    expect(CARD_RESCUE_RATIO).toBeGreaterThan(1);
+    expect(CARD_RESCUE_RATIO).toBeLessThan(3);
+  });
+
+  it("leaves both shipped palettes, fed back in as custom, completely alone", () => {
+    for (const [name, c] of [["dark", DEFAULT_CUSTOM_THEME], ["light", LIGHT_STOCK]] as const) {
+      expect(cardMin(c), name).toBeGreaterThan(3.2);
+      expect(rescued(c), name).toBe(false);
+    }
+  });
+
+  it("leaves an ugly, low-contrast, WCAG-failing but usable theme in the user's colours", () => {
+    // The half of this feature that is easy to get wrong in the comfortable
+    // direction: an app that quietly restyles a card the user CAN read is
+    // contrast clamping by another route, and clamping is what this release
+    // removed. Every row carries its measured weakest pair, so a fixture that
+    // drifts fails on the ratio first and names itself.
+    const usable: [CustomTheme, number, string][] = [
+      // Both shipped palettes as a user would re-enter them.
+      [{ background: "#111113", accent: "#6c7cff", text: "#ececf1" }, 3.31, "stock dark"],
+      [{ background: "#f6f6f8", accent: "#5563e8", text: "#1b1b20" }, 3.22, "stock light"],
+      // Ordinary themes somebody would actually choose and keep.
+      [{ background: "#1c1917", accent: "#f59e0b", text: "#fafaf9" }, 3.43, "warm dark"],
+      [{ background: "#0d1b2a", accent: "#4cc9f0", text: "#e0e1dd" }, 2.93, "navy on cyan"],
+      [{ background: "#fbf7ef", accent: "#b45309", text: "#3f3f46" }, 2.57, "paper"],
+      // Deliberately low contrast, and still nobody's emergency.
+      [{ background: "#e5e5e5", accent: "#555555", text: "#4a4a4a" }, 2.32, "gray on gray"],
+      // Row labels at 4.70:1 — comfortably readable, hints merely quiet.
+      [{ background: "#3b3b46", accent: "#8a8ad0", text: "#b0b0c0" }, 1.82, "muted mid-gray"],
+      // Row labels 4.94:1, hints quiet but legible.
+      [{ background: "#002b36", accent: "#268bd2", text: "#93a1a1" }, 1.68, "Solarized-like dark"],
+    ];
+    for (const [c, ratio, where] of usable) {
+      expect(cardMin(c), `${where} fixture drifted (weakest: ${weakestTier(c)})`)
+        .toBeCloseTo(ratio, 2);
+      expect(cardMin(c), `${where} is no longer above the line`).toBeGreaterThan(CARD_RESCUE_RATIO);
+      expect(rescued(c), `${where}: the user's readable card was overridden — that is clamping`)
+        .toBe(false);
+    }
+  });
+
+  it("leaves the palettes people actually paste in alone", () => {
+    // Named palettes at their real body foreground. A user who reproduces the
+    // editor theme they already read code in all day must not be told their
+    // Settings card is unreadable, and these are the concrete themes a retune of
+    // the threshold would break first. Every one is a WCAG-failing HINT tier and
+    // a perfectly ordinary app.
+    const palettes: [CustomTheme, number, string][] = [
+      [{ background: "#2e3440", accent: "#88c0d0", text: "#d8dee9" }, 2.51, "Nord"],
+      [{ background: "#282828", accent: "#d79921", text: "#ebdbb2" }, 2.67, "Gruvbox Dark"],
+      [{ background: "#282a36", accent: "#bd93f9", text: "#f8f8f2" }, 3.11, "Dracula"],
+      [{ background: "#eff1f5", accent: "#1e66f5", text: "#4c4f69" }, 2.31, "Catppuccin Latte"],
+      [{ background: "#1a1b26", accent: "#7aa2f7", text: "#c0caf5" }, 2.61, "Tokyo Night"],
+      [{ background: "#282c34", accent: "#61afef", text: "#abb2bf" }, 2.04, "One Dark"],
+      [{ background: "#ffffff", accent: "#0969da", text: "#1f2328" }, 3.08, "GitHub Light"],
+    ];
+    for (const [c, ratio, where] of palettes) {
+      expect(cardMin(c), `${where} fixture drifted (weakest: ${weakestTier(c)})`)
+        .toBeCloseTo(ratio, 2);
+      expect(rescued(c), `${where} was rescued — a real palette lost the user's colours`).toBe(false);
+    }
+  });
+
+  it("leaves the three thinnest real margins alone, which is where the bar is set", () => {
+    // The themes that decide whether this threshold is right. All three sit
+    // between 1.53 and 1.62, and the first two were WRONGLY RESCUED until the
+    // predicate stopped measuring pairs nothing paints: the phantom
+    // --text-3/--bg-input pair scored them 1.47 and 1.44, because on a light
+    // ramp --bg-raised equals --bg-panel while --bg-input sits on the far side
+    // of the background, so a pair that never appears decided the verdict.
+    const thin: [CustomTheme, number, string][] = [
+      [{ background: "#faf4ed", accent: "#907aa9", text: "#9893a5" }, 1.61, "Rosé Pine Dawn muted"],
+      [{ background: "#002b36", accent: "#268bd2", text: "#839496" }, 1.55, "Solarized Dark on base0"],
+      // THE thinnest margin any real palette has: 2% of headroom. Pinned on its
+      // own because it is the constraint on CARD_RESCUE_RATIO from above —
+      // raising the bar past 1.53 costs Solarized Light its colours on the one
+      // card those colours were chosen from, and the number to weigh that
+      // against is that firing wrongly only ever costs one mismatched panel.
+      [{ background: "#fdf6e3", accent: "#268bd2", text: "#93a1a1" }, 1.53, "Solarized Light on base1"],
+    ];
+    for (const [c, ratio, where] of thin) {
+      expect(cardMin(c), `${where} fixture drifted (weakest: ${weakestTier(c)})`)
+        .toBeCloseTo(ratio, 2);
+      expect(rescued(c), `${where}: a real palette was overridden`).toBe(false);
+    }
+    // Stated as an inequality as well as a fixture, so the constraint survives
+    // someone reading only one of the two.
+    const solarizedLight: CustomTheme = { background: "#fdf6e3", accent: "#268bd2", text: "#93a1a1" };
+    expect(CARD_RESCUE_RATIO, "the threshold has been raised past a real palette")
+      .toBeLessThan(cardMin(solarizedLight));
+  });
+
+  it("fires when a tier of the card has gone", () => {
+    const gone: [CustomTheme, number, string][] = [
+      // Labels at 2.62:1 and perfectly readable; hints and section head GONE.
+      // A --text-1 gate would leave this user with a card they cannot read the
+      // hints on, which is also the card the nav rescue deliberately does not
+      // fire for — the two flags are independent, see below.
+      [{ background: "#241a3d", accent: "#ff5fa2", text: "#6a5f85" }, 1.37, "hints gone"],
+      // From here down the weakest pair is a HOVER or ACTIVE one — the label or
+      // the hex caption on a button the pointer is already on. Those pairs are
+      // in the list precisely so a control does not vanish at the moment it is
+      // being used, and dropping them changes these four numbers.
+      [{ background: "#241a3d", accent: "#ff5fa2", text: "#4d4266" }, 1.11, "text picked on bg"],
+      [{ background: "#241a3d", accent: "#ff5fa2", text: "#463b60" }, 1.03, "closer still"],
+      [{ background: "#241a3d", accent: "#ff5fa2", text: "#453274" }, 1.00, "editor chrome gone too"],
+      // The exact pick the E2E pins as legal-but-unreadable.
+      [{ background: "#241a3d", accent: "#ff5fa2", text: "#3a2f55" }, 1.00, "the E2E fixture"],
+      // The same on a LIGHT surface, where the ramp derives the other way: a
+      // trigger keyed off the wrong end of the ink crossover shows up here and
+      // nowhere else.
+      [{ background: "#ffffff", accent: "#5563e8", text: "#c8c8c8" }, 1.27, "light"],
+      [{ background: "#ffffff", accent: "#5563e8", text: "#d0d0d0" }, 1.21, "light, closer"],
+      [{ background: "#000000", accent: "#00ff00", text: "#333333" }, 1.09, "black"],
+      // The theme the in-app E2E paints to prove this in real pixels. Pinned
+      // here so that block's assumption is guarded by a test that runs in a
+      // second rather than only by a run that needs a window.
+      [{ background: "#3d1f6e", accent: "#3d1f6e", text: "#3d1f6e" }, 1.03, "the E2E's PATHO"],
+    ];
+    for (const [c, ratio, where] of gone) {
+      expect(cardMin(c), `${where} fixture drifted (weakest: ${weakestTier(c)})`)
+        .toBeCloseTo(ratio, 2);
+      expect(rescued(c), `${where}: the user cannot undo their own theme`).toBe(true);
+    }
+  });
+
+  it("fires for an all-one-colour theme at every point in the RGB cube", () => {
+    // The state the escape hatch exists for, swept rather than sampled: a
+    // trigger that only handled dark backgrounds would pass every named fixture
+    // above. The worst of these (a #999900 app) still only reaches 1.09:1.
+    for (const c of [...PATHOLOGICAL, ...ALL_ONE_COLOUR]) {
+      expect(cardMin(c), `${c.background} is no longer a pathological theme`)
+        .toBeLessThan(CARD_RESCUE_RATIO);
+      expect(rescued(c), c.background).toBe(true);
+    }
+    // The least-bad one, pinned: if a derivation change ever walks this toward
+    // 1.5 the sweep above stops being a meaningful margin long before it starts
+    // failing.
+    const worst = Math.max(...ALL_ONE_COLOUR.map((c) => cardMin(c)));
+    expect(worst).toBeCloseTo(1.09, 2);
+  });
+
+  it("fires on a theme whose row labels read fine and whose hints have gone", () => {
+    // THE case the multi-tier design exists for: --text-1 comfortably clear of
+    // the line on every surface the card paints it on, --text-3 under it on
+    // both of its. Restricting the predicate to --text-1 makes exactly this
+    // test fail.
+    const c: CustomTheme = { background: "#241a3d", accent: "#ff5fa2", text: "#6a5f85" };
+    const t = cardTiers(c);
+    for (const [ink, surface] of CARD_PAIRS) {
+      const r = t[`${ink} on ${surface}`]!;
+      if (ink === "--text-1") {
+        expect(r, `label on ${surface} drifted`).toBeGreaterThan(2);
+      }
+      if (ink === "--text-3") {
+        expect(r, `hint on ${surface} drifted`).toBeLessThan(CARD_RESCUE_RATIO);
+      }
+    }
+    // The row label a --text-1 gate would have been looking at, pinned: 2.62:1
+    // on the card, i.e. 1.7x the bar and plainly readable.
+    expect(t["--text-1 on --bg-panel"]!).toBeCloseTo(2.62, 2);
+    expect(t["--text-3 on --bg-raised"]!).toBeCloseTo(1.37, 2);
+    expect(rescued(c)).toBe(true);
+  });
+
+  it("fires on a theme where ONLY the faintest tier has gone", () => {
+    // The tier-specific version of the case above, because #6a5f85 no longer
+    // isolates --text-3: its --text-2 caption on a pressed button measures
+    // 1.4946, so that theme would still fire with the hint tier removed. This
+    // fixture was found by search rather than by taste — every --text-1 and
+    // --text-2 pair clears the line, the segment clears it four times over, and
+    // ONLY the two --text-3 pairs are under. Drop them and nothing is left to
+    // notice that the section head and every row hint have gone.
+    const c: CustomTheme = { background: "#3b3b46", accent: "#ff5fa2", text: "#0f142d" };
+    const t = cardTiers(c);
+    let loudest = Infinity;
+    for (const [ink, surface] of CARD_PAIRS) {
+      if (ink === "--text-3") continue;
+      loudest = Math.min(loudest, t[`${ink} on ${surface}`]!);
+    }
+    expect(loudest, "the loud tiers stopped being clear of the line").toBeGreaterThan(
+      CARD_RESCUE_RATIO,
+    );
+    expect(t["the selected theme segment"]!, "the segment must not be what fires this")
+      .toBeGreaterThan(CARD_RESCUE_RATIO * 2);
+    expect(t["--text-3 on --bg-panel"]!, "the section head and hints").toBeCloseTo(1.31, 2);
+    expect(t["--text-3 on --bg-raised"]!, "the picker's slider labels").toBeCloseTo(1.44, 2);
+    expect(rescued(c), "the faintest tier is gone and nothing noticed").toBe(true);
+  });
+
+  it("fires on a theme whose label survives until the pointer reaches it", () => {
+    // The pairs that are easiest to forget, and the reason they are in the list:
+    // this theme's row label clears the bar on the card, the popover and the
+    // segmented track, and then goes under on --bg-hover and --bg-active — so
+    // the label on a colour button is legible right up to the moment a user puts
+    // the pointer on it to click it.
+    //
+    // Under a pair set without hover and active this theme measured 1.5020 and
+    // was SILENT, by two thousandths. Dropping either surface from CARD_PAIRS
+    // makes this test fail.
+    const c: CustomTheme = { background: "#66aa00", accent: "#6c7cff", text: "#c000f0" };
+    const t = cardTiers(c);
+    expect(t["--text-1 on --bg-panel"]!, "at rest on the card").toBeCloseTo(1.94, 2);
+    expect(t["--text-1 on --bg-input"]!, "at rest on the track").toBeCloseTo(1.50, 2);
+    expect(t["--text-1 on --bg-hover"]!, "under the pointer").toBeCloseTo(1.40, 2);
+    expect(t["--text-1 on --bg-active"]!, "pressed").toBeCloseTo(1.18, 2);
+    // Every pair that is NOT a hover or active one is above the line, which is
+    // what makes this a test of those two surfaces and nothing else.
+    let atRest = Infinity;
+    for (const [ink, surface] of CARD_PAIRS) {
+      if (surface === "--bg-hover" || surface === "--bg-active") continue;
+      atRest = Math.min(atRest, t[`${ink} on ${surface}`]!);
+    }
+    expect(atRest, "the at-rest pairs stopped being clear of the line").toBeGreaterThan(
+      CARD_RESCUE_RATIO,
+    );
+    expect(t["the selected theme segment"]!).toBeGreaterThan(CARD_RESCUE_RATIO);
+    expect(rescued(c), "a label that dies under the pointer went unnoticed").toBe(true);
+  });
+
+  it("fires when only the selected theme segment has collapsed", () => {
+    // The tier that does not come from the text ramp at all. An accent picked on
+    // top of the background erases WHICH THEME IS ACTIVE while every label
+    // around it still reads perfectly, so it has to be its own term rather than
+    // something the text tiers can be trusted to notice.
+    //
+    // Measured on the BARE --bg-input track: `.settings__segmented .btn` sets
+    // `background: transparent` at two-class specificity and beats
+    // `.btn--on { background: var(--accent-dim) }`, so there is no fill under
+    // the selected option at rest. Both fixtures are chosen so this tier clearly
+    // dominates — text at 3.2:1 or better, labels above 15:1, segment ~17%
+    // under. Deliberately NOT the near-miss accent theme at 1.51, which sits
+    // within 1% of the bar and would pin nothing but rounding.
+    const accentGone: [CustomTheme, number, number, string][] = [
+      // Accent black on the stock dark app: labels 15.19:1, segment 1.28:1.
+      [{ background: "#111113", accent: "#000000", text: "#ececf1" }, 1.28, 3.31, "dark"],
+      // …and the mirror on a white app: labels 17.15:1, segment 1.24:1.
+      [{ background: "#ffffff", accent: "#ffffff", text: "#1b1b20" }, 1.24, 3.22, "light"],
+    ];
+    for (const [c, segment, textFloor, where] of accentGone) {
+      const t = cardTiers(c);
+      expect(t["the selected theme segment"]!, `${where} segment drifted`).toBeCloseTo(segment, 2);
+      // The text half of the card is fine, so nothing else in the predicate can
+      // be doing this work — which is what makes it a test of the accent term.
+      const textMin = Math.min(
+        ...CARD_PAIRS.map(([ink, surface]) => t[`${ink} on ${surface}`]!),
+      );
+      expect(textMin, `${where}: the text tiers stopped being comfortable`)
+        .toBeCloseTo(textFloor, 2);
+      expect(textMin, `${where}: the text tiers must not be what fires this`)
+        .toBeGreaterThan(CARD_RESCUE_RATIO * 2);
+      expect(weakestTier(c), where).toBe("the selected theme segment");
+      expect(rescued(c), `${where}: the theme control is unreadable and was not rescued`).toBe(true);
+    }
+  });
+
+  /** The selected segment's two painted states, measured separately. The tier in
+   *  `cardTiers` is the minimum of these; the two cases below pin each one. */
+  const segmentAtRest = (c: CustomTheme): number =>
+    contrastRatioHex(deriveCustomTheme(c).vars["--accent-strong"], deriveCustomTheme(c).vars["--bg-input"]);
+  const segmentHovered = (c: CustomTheme): number =>
+    contrastRatioHex(deriveCustomTheme(c).vars["--accent-strong"], dimFillOverTrack(c));
+
+  it("fires when the selected segment reads at rest and dies under the pointer", () => {
+    // The hovered half of the segment tier. Both themes are legible while the
+    // pointer is elsewhere and go under the moment it arrives on the option —
+    // which is the moment the user is trying to click it to change theme.
+    //
+    // The second row is worth its history. It used to be pinned here as a
+    // MUST-NOT-FIRE, proving the term measured the bare track (1.68:1) rather
+    // than the dim fill (1.33:1) that loses the cascade at rest. That reading
+    // was right about the resting state and wrong about the control: the fill
+    // does land on hover. Its numbers are unchanged; its verdict flipped when
+    // the hovered state was added, and the guard it used to provide now lives in
+    // the case below.
+    const hoverOnly: [CustomTheme, number, number, number, string][] = [
+      [{ background: "#0033ff", accent: "#330000", text: "#33ffff" }, 1.63, 1.31, 1.83, "blue"],
+      [{ background: "#00cc33", accent: "#ff00ff", text: "#000000" }, 1.68, 1.33, 3.39, "green"],
+    ];
+    for (const [c, atRest, hovered, textFloor, where] of hoverOnly) {
+      expect(segmentAtRest(c), `${where}: fixture drifted, it no longer reads at rest`)
+        .toBeCloseTo(atRest, 2);
+      expect(segmentHovered(c), `${where}: fixture drifted, it no longer dies hovered`)
+        .toBeCloseTo(hovered, 2);
+      expect(segmentAtRest(c), where).toBeGreaterThan(CARD_RESCUE_RATIO);
+      expect(segmentHovered(c), where).toBeLessThan(CARD_RESCUE_RATIO);
+      // Every text pair is clear of the line, so the segment alone decides.
+      const textMin = Math.min(
+        ...CARD_PAIRS.map(([ink, surface]) =>
+          contrastRatioHex(deriveCustomTheme(c).vars[ink], deriveCustomTheme(c).vars[surface]),
+        ),
+      );
+      expect(textMin, `${where}: the text pairs stopped being irrelevant`).toBeCloseTo(textFloor, 2);
+      expect(textMin, where).toBeGreaterThan(CARD_RESCUE_RATIO);
+      expect(rescued(c), `${where}: the theme control dies under the pointer and nothing noticed`)
+        .toBe(true);
+    }
+  });
+
+  it("fires when the selected segment dies at rest even though hovering it would pass", () => {
+    // The resting half, and the direction that is easy to lose: the hovered
+    // state is USUALLY the weaker one, so a term that measured only the
+    // composited fill would look right nearly everywhere and still strand this
+    // user. It happens when the accent is much darker than the track — the dim
+    // fill then drags the surface AWAY from the lifted --accent-strong ink and
+    // hovering makes the option easier to see, not harder.
+    //
+    // This is the guard the #00cc33 fixture above used to provide, restated for
+    // an implementation that takes the minimum of two states rather than picking
+    // one: it fails if the resting term is ever dropped.
+    const c: CustomTheme = { background: "#cc0033", accent: "#0066cc", text: "#000000" };
+    expect(segmentAtRest(c), "fixture drifted: the segment no longer dies at rest")
+      .toBeCloseTo(1.33, 2);
+    expect(segmentHovered(c), "fixture drifted: hovering no longer rescues it")
+      .toBeCloseTo(1.68, 2);
+    expect(segmentAtRest(c)).toBeLessThan(CARD_RESCUE_RATIO);
+    expect(segmentHovered(c)).toBeGreaterThan(CARD_RESCUE_RATIO);
+    const { vars: v } = deriveCustomTheme(c);
+    const textMin = Math.min(...CARD_PAIRS.map(([ink, surface]) => contrastRatioHex(v[ink], v[surface])));
+    expect(textMin, "the text pairs stopped being irrelevant here").toBeCloseTo(2.07, 2);
+    expect(textMin).toBeGreaterThan(CARD_RESCUE_RATIO);
+    expect(rescued(c), "the theme control is unreadable until you hover it, and nothing noticed")
+      .toBe(true);
+  });
+
+  it("delivers a readable card AND a readable picker wherever it fires", () => {
+    // What firing is worth, measured on the surfaces the two halves of the
+    // recovery gesture actually use: the card is --bg-panel, the picker popover
+    // is --bg-raised, and the segmented control and the picker's hex field are
+    // --bg-input. All three are overridden by the same flag, because a readable
+    // card that opens an unreadable "Reset to default" is the same dead end.
+    for (const c of [...PATHOLOGICAL, ...ALL_ONE_COLOUR]) {
+      expect(rescued(c), c.background).toBe(true);
+      const p = paletteFor(c);
+      for (const [ink, surface] of SAFE_PAIRS) {
+        // The same painted pairs the trigger measures, in the palette it swaps
+        // in: row labels and button captions at body-text AA, and the hint tier
+        // that fired the rescue delivered at more than twice the 1.5 that
+        // triggered it.
+        const floor = ink === "--safe-text-3" ? 3 : 4.5;
+        expect(contrastRatioHex(p[ink]!, p[surface]!), `${c.background} ${ink} on ${surface}`)
+          .toBeGreaterThanOrEqual(floor);
+      }
+      // "Which theme is active", on the segmented control's own bare track.
+      expect(
+        contrastRatioHex(p["--safe-accent-strong"]!, p["--safe-input"]!),
+        `${c.background} selected segment`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  /* ---------------- independence from the two nav flags ---------------- */
+
+  it("is strictly more eager than the editor chrome flag, which it contains", () => {
+    // A CONTAINMENT, not a coincidence: `--text-1` against `--bg-panel` is
+    // literally one of the ten tiers this predicate takes the minimum over, so
+    // an unreadable editor topbar cannot happen without an unreadable card. It
+    // is asserted as the fact it is rather than straddled, because no fixture in
+    // the other direction can exist while that term is in the set.
+    for (const c of [
+      { background: "#241a3d", accent: "#ff5fa2", text: "#453274" },
+      { background: "#3d1f6e", accent: "#ff5fa2", text: "#3d1f6e" },
+      ...PATHOLOGICAL,
+      ...ALL_ONE_COLOUR,
+    ]) {
+      const d = deriveCustomTheme(c);
+      if (needsChromeRescue(d)) {
+        expect(needsAppearanceRescue(d), `${c.background}/${c.text}: chrome gone, card not rescued`)
+          .toBe(true);
+      }
+    }
+    // …and the containment is strict: a card can be gone while the topbar and
+    // the home gear are both fine. This is the fixture the E2E paints to show
+    // the same theme leaving the gear alone and rescuing the card.
+    const cardOnly: CustomTheme = { background: "#241a3d", accent: "#ff5fa2", text: "#6a5f85" };
+    const d = deriveCustomTheme(cardOnly);
+    expect(contrastRatioHex(d.vars["--text-1"], d.vars["--bg-app"])).toBeCloseTo(2.78, 2);
+    expect(needsNavRescue(d)).toBe(false);
+    expect(needsChromeRescue(d)).toBe(false);
+    expect(needsAppearanceRescue(d)).toBe(true);
+  });
+
+  it("does not contain the home gear flag, which measures a surface it never uses", () => {
+    // The straddler in the direction that DOES exist — found by sweeping the
+    // cube rather than by taste, which is why it is a green app with purple
+    // text. The gear is invisible on --bg-app (1.43:1) so the nav rescue fires,
+    // while every tier of the card clears the line on the DERIVED surfaces
+    // (1.70:1 at worst) so the card correctly keeps the user's colours.
+    //
+    // This is also the case that catches a predicate measuring the wrong base
+    // surface: swap --bg-panel for --bg-app in the card's surface set and this
+    // theme starts being rescued, because --bg-app is the one surface the card
+    // is never painted on.
+    const gearOnly: CustomTheme = { background: "#006600", accent: "#00cc00", text: "#660099" };
+    const d = deriveCustomTheme(gearOnly);
+    expect(contrastRatioHex(d.vars["--text-1"], d.vars["--bg-app"]), "gear fixture drifted")
+      .toBeCloseTo(1.43, 2);
+    expect(cardMin(gearOnly), `card fixture drifted (weakest: ${weakestTier(gearOnly)})`)
+      .toBeCloseTo(1.70, 2);
+    expect(needsNavRescue(d)).toBe(true);
+    expect(needsChromeRescue(d)).toBe(false);
+    expect(needsAppearanceRescue(d), "the card reads fine and was overridden anyway").toBe(false);
+    // A second one, so the containment is refuted by more than a single point.
+    const other: CustomTheme = { background: "#006633", accent: "#cc6666", text: "#660099" };
+    const e = deriveCustomTheme(other);
+    expect(contrastRatioHex(e.vars["--text-1"], e.vars["--bg-app"])).toBeCloseTo(1.46, 2);
+    expect(cardMin(other)).toBeCloseTo(1.68, 2);
+    expect(needsNavRescue(e)).toBe(true);
+    expect(needsAppearanceRescue(e)).toBe(false);
+  });
+
+  it("keys off the card's own inks and surfaces, not the app background", () => {
+    // Role confusion, the same failure the nav rescue guards against, from the
+    // other side: --bg-app is not a surface this card is ever painted on, and
+    // its own tiers are what decide. The pair below differs only in the app
+    // background's relationship to the text, and the verdict must follow the
+    // card, not the page.
+    const cardGoneAppFine: CustomTheme = { background: "#ffffff", accent: "#5563e8", text: "#c8c8c8" };
+    const appGoneCardFine: CustomTheme = { background: "#006600", accent: "#00cc00", text: "#660099" };
+    expect(rescued(cardGoneAppFine)).toBe(true);
+    expect(rescued(appGoneCardFine)).toBe(false);
   });
 });
 
