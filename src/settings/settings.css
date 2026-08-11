@@ -169,12 +169,14 @@
    IT IS CONDITIONAL, and that is the point (v0.7.5). It used to apply to every
    custom theme, which left a permanently mismatched card sitting in an app the
    user had deliberately coloured. data-rescue-appearance is now stamped by
-   applyTheme only when the card's WEAKEST tier — --text-3, the section head and
-   the row hints — drops under CARD_RESCUE_RATIO against the surface behind it.
-   An ugly, low-contrast, WCAG-failing but readable theme keeps the user's own
-   colours here, exactly like the home gear and the editor chrome. See
-   needsAppearanceRescue in src/core/session.ts for why the trigger measures
-   four tiers rather than the row label, and why 1.5.
+   applyTheme only when --text-1 — the ink every label, button and the picker's
+   "Reset to default" is drawn in, i.e. the actual way out — drops under
+   CARD_RESCUE_RATIO against a surface the card paints it on. An ugly,
+   low-contrast, WCAG-failing but readable theme keeps the user's own colours
+   here, exactly like the home gear and the editor chrome, and so does a theme
+   whose HINTS have gone quiet while its labels still read. The bar is "you
+   truly cannot see it", effectively the all-one-colour case. See
+   needsAppearanceRescue in src/core/session.ts for the surface list and why 1.5.
 
    Both selectors carry the flag on purpose: a readable card that opens an
    unreadable "Reset to default" is the same dead end as an unreadable card.

@@ -2028,13 +2028,17 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     //      app invisible can still get back and fix it. It and the colour picker
     //      it opens are the surfaces allowed to disobey the colours — but only
     //      when the colours have actually stopped working.
-    //   5. That disobedience is CONDITIONAL (v0.7.5). data-rescue-appearance is
-    //      stamped when the card's weakest tier drops under CARD_RESCUE_RATIO
-    //      and NOT before, so an ugly-but-usable theme keeps the user's own
-    //      colours on the very card they were picked from. Both directions are
-    //      painted and measured below, because a rescue that fires for
-    //      everything and a rescue that fires for nothing pass exactly the same
-    //      one-directional test.
+    //   5. That disobedience is CONDITIONAL (v0.7.5), and narrowly so.
+    //      data-rescue-appearance is stamped only when --text-1 — the row
+    //      labels, the unselected theme options and the picker's "Reset to
+    //      default", i.e. the controls that get you back out — drops under
+    //      CARD_RESCUE_RATIO against a surface the card paints it on. Quiet
+    //      tiers do not count: a theme whose HINTS are unreadable keeps the
+    //      user's colours, which is a cost the owner accepted to stop the card
+    //      being rescued on ordinary themes. Both directions are painted and
+    //      measured below, because a rescue that fires for everything and a
+    //      rescue that fires for nothing pass exactly the same one-directional
+    //      test.
     // 1 and 4 are deliberately opposites, and that tension IS the feature — so
     // both halves are asserted here, against the same live document.
     await test("custom-theme-applies", async () => {
@@ -2140,16 +2144,16 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
        *  UI component and still perfectly findable. The nav rescue must leave it
        *  completely alone. */
       const UGLY_TEXT = "#6a5f85";
-      /** A theme that must keep the user's colours on the APPEARANCE CARD too.
-       *  Row labels 4.70:1, row hints 2.00:1 — low contrast, a WCAG failure, and
-       *  entirely operable.
+      /** A theme that must keep the user's colours on the APPEARANCE CARD too,
+       *  with room to spare: row labels 4.70:1, row hints 2.00:1 — low contrast,
+       *  a WCAG failure, and entirely operable.
        *
-       *  Deliberately NOT UGLY_TEXT, which is no longer a card fixture: #6a5f85
-       *  leaves the home gear alone (2.78:1 on --bg-app) while its HINTS measure
-       *  1.37:1 on the card, so it legitimately fires the card rescue and not the
-       *  nav one. That pair is not a problem to be tidied away — it is the result
-       *  section 6 exists to show, and the nav assertions still depend on
-       *  UGLY_TEXT meaning what it says. */
+       *  Kept alongside UGLY_TEXT rather than merged with it because the two
+       *  bracket the rule from different distances. This one is comfortable
+       *  (3.42:1 at its weakest gated pair); UGLY_TEXT is the uncomfortable one
+       *  (2.09:1, hints gone at 1.37:1) that the card is nonetheless required to
+       *  leave alone. A rule that only ever saw the comfortable case would not
+       *  be pinned anywhere near where it actually sits. */
       const CALM_BG = "#3b3b46";
       const CALM_ACCENT = "#8a8ad0";
       const CALM_TEXT = "#b0b0c0";
@@ -2555,30 +2559,70 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         );
         assert(hitsGear(), "the Settings gear stopped hit-testing under a normal custom theme");
 
-        /* ---- 6. the card rescue is its own decision ---- */
+        /* ---- 6. the card keeps the user's colours unless it is truly gone ---- */
 
-        // The two flags are independent, and THIS theme is where that stops
-        // being a claim: #6a5f85 is 2.78:1 on --bg-app, so the gear above was
-        // correctly left in the user's colours — and 1.37:1 on the card's
-        // faintest tier, so the card is correctly rescued at the same instant.
-        // One shared flag would have to be wrong about one of them.
+        // THE ACCEPTED TRADE, in painted pixels. #6a5f85 used to be the case
+        // that PROVED the card rescue was its own decision: 2.78:1 on --bg-app
+        // so the gear was left alone, 1.37:1 on the card's hint tier so the card
+        // was rescued. The owner reversed that. The card is now gated on
+        // --text-1 only — the row labels, the unselected theme options and the
+        // picker's "Reset to default", i.e. exactly the controls that get you
+        // back out — so a theme whose HINTS have gone keeps the user's colours.
+        //
+        // The cost is asserted rather than glossed: the label here is genuinely
+        // below the body-text bar, and the hint below it is worse. What has to
+        // hold is that the route out still clears the trigger.
         assert(
-          root.dataset.rescueAppearance === "1",
-          `the card's hints are gone at ${UGLY_TEXT} but data-rescue-appearance was not stamped`,
+          root.dataset.rescueAppearance === undefined,
+          `the card was rescued at ${UGLY_TEXT}, whose labels read at 2.62:1 — the gate has been widened back past --text-1 and the over-fire is back`,
         );
         navigate({ view: "settings" });
         const uglyCard = await appearanceCard();
         assert(
-          !same(getComputedStyle(uglyCard.label).color, UGLY_TEXT),
-          `the card was left in the user's ${UGLY_TEXT} even though its hints are gone`,
+          same(getComputedStyle(uglyCard.label).color, UGLY_TEXT),
+          `the card's label is ${getComputedStyle(uglyCard.label).color}, not the user's own ${UGLY_TEXT}`,
         );
         const uglyCardRatio = ratio(
           chan(getComputedStyle(uglyCard.label).color),
           bgUnder(uglyCard.label),
         );
+        const uglyHintRatio = ratio(
+          chan(getComputedStyle(uglyCard.hint).color),
+          bgUnder(uglyCard.hint),
+        );
+        // Fixture self-check AND the statement of the trade: the label is under
+        // the escape floor and still well clear of the trigger, and the hint is
+        // worse than the label. If the label ever climbs past 4.5 this theme has
+        // stopped being the uncomfortable case it is kept for.
         assert(
-          uglyCardRatio >= ESCAPE_FLOOR,
-          `the rescued card reads ${uglyCardRatio.toFixed(2)}:1 under ${UGLY_TEXT}`,
+          uglyCardRatio < ESCAPE_FLOOR && uglyCardRatio > NAV_RESCUE_RATIO,
+          `fixture drifted: the card's label is ${uglyCardRatio.toFixed(2)}:1, no longer "poor but a working way out"`,
+        );
+        assert(
+          uglyHintRatio < uglyCardRatio,
+          `the hint (${uglyHintRatio.toFixed(2)}:1) should be fainter than the label (${uglyCardRatio.toFixed(2)}:1)`,
+        );
+        // The control that actually undoes the theme, on the surface it is
+        // really painted on. Deliberately the UNSELECTED "Dark" option and not
+        // the selected one: clicking it is the escape, its ink is --text-1 on
+        // the segmented track, and that pair is in the gate. (The SELECTED
+        // option is --accent-strong and is no longer gated at all — losing it
+        // costs you the marker saying which theme is live, not the way out.)
+        // Re-queried rather than reusing the reference from section 4, which
+        // several re-renders ago stopped being attached to this document.
+        const escapeOpt = await waitFor(
+          () => document.querySelector<HTMLElement>('[data-theme-opt="dark"]'),
+          5_000,
+          "the Dark theme option",
+        );
+        assert(
+          escapeOpt.offsetParent !== null && escapeOpt.getClientRects().length > 0,
+          "the Dark option is not rendered — there is no way to undo the theme",
+        );
+        const escapeRatio = ratio(chan(getComputedStyle(escapeOpt).color), bgUnder(escapeOpt));
+        assert(
+          escapeRatio > NAV_RESCUE_RATIO,
+          `the way out reads ${escapeRatio.toFixed(2)}:1 under ${UGLY_TEXT} and the card was not rescued`,
         );
 
         // …and the other direction for the CARD, which is the promise this
@@ -2646,7 +2690,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
           );
         });
 
-        return `verbatim bg ${bg} / accent ${accent} / text ${text1} (${pickRatio.toFixed(2)}:1, unclamped), on-accent ${onAccent} == bg, panel ${panel} derived; card rescue fired on ${PATHO}: label ${labelRatio.toFixed(2)}:1 (theme btn ${optRatio.toFixed(2)}:1 ${segState}, predicted ${segAtRest.toFixed(2)}:1 at rest / ${segHovered.toFixed(2)}:1 hovered; colour btn ${rowRatio.toFixed(2)}:1), picker Reset ${resetRatio.toFixed(2)}:1; nav rescue fired on ${PATHO}: gear hit-tests at ${gearRatio.toFixed(2)}:1, and stayed OFF at ${uglyRatio.toFixed(2)}:1 where the card WAS rescued (${uglyCardRatio.toFixed(2)}:1); both flags stayed OFF on ${CALM_TEXT}: card in the user's own ink, label ${calmLabelRatio.toFixed(2)}:1, hint ${calmHintRatio.toFixed(2)}:1`;
+        return `verbatim bg ${bg} / accent ${accent} / text ${text1} (${pickRatio.toFixed(2)}:1, unclamped), on-accent ${onAccent} == bg, panel ${panel} derived; card rescue fired on ${PATHO}: label ${labelRatio.toFixed(2)}:1 (theme btn ${optRatio.toFixed(2)}:1 ${segState}, predicted ${segAtRest.toFixed(2)}:1 at rest / ${segHovered.toFixed(2)}:1 hovered; colour btn ${rowRatio.toFixed(2)}:1), picker Reset ${resetRatio.toFixed(2)}:1; nav rescue fired on ${PATHO}: gear hit-tests at ${gearRatio.toFixed(2)}:1, and stayed OFF at ${uglyRatio.toFixed(2)}:1; BOTH flags stayed off on ${UGLY_TEXT} too — card in the user's own ink at label ${uglyCardRatio.toFixed(2)}:1 / hint ${uglyHintRatio.toFixed(2)}:1, way out ${escapeRatio.toFixed(2)}:1 (the accepted trade: hints unreadable, escape intact) — and on ${CALM_TEXT}: label ${calmLabelRatio.toFixed(2)}:1, hint ${calmHintRatio.toFixed(2)}:1`;
       } finally {
         // Never leak an open colour picker into a later block: it holds
         // document-level capture listeners for pointerdown and Escape, and a
