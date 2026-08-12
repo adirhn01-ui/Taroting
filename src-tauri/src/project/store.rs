@@ -69,9 +69,14 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 /// stored" is a legitimate empty state that a caller may freely write over;
 /// "something is stored but we could not read it" is NOT, because writing the
 /// empty value over it rotates the last good copy into `.bak` and then hides it
-/// forever — the fresh primary parses fine, so `read_json_with_bak` never
-/// consults the backup again. That is the exact sequence that wiped a user's
-/// whole recents list.
+/// forever — the fresh primary parses fine, so the `.bak` fallback below never
+/// fires again. That is the exact sequence that wiped a user's whole recents
+/// list.
+///
+/// Every caller takes the three states directly. A convenience wrapper that
+/// mapped `Absent` and `Unreadable` onto one `None` used to sit here, and it
+/// was the only thing settings ever called — which is precisely how the
+/// settings read kept the bug this enum exists to prevent.
 pub enum JsonRead<T> {
     /// Parsed. `recovered` is true when the `.bak` supplied it.
     Parsed { value: T, recovered: bool },
@@ -113,18 +118,6 @@ pub fn read_json_status<T: serde::de::DeserializeOwned>(path: &Path) -> JsonRead
         JsonRead::Unreadable
     } else {
         JsonRead::Absent
-    }
-}
-
-/// `read_json_status` for callers that only need the value: the parsed value
-/// (when either copy could be read) plus whether the backup supplied it.
-///
-/// Collapsing `Absent` and `Unreadable` into the same `None` is exactly what a
-/// caller that goes on to WRITE must not do — see `JsonRead`.
-pub fn read_json_with_bak<T: serde::de::DeserializeOwned>(path: &Path) -> (Option<T>, bool) {
-    match read_json_status(path) {
-        JsonRead::Parsed { value, recovered } => (Some(value), recovered),
-        JsonRead::Absent | JsonRead::Unreadable => (None, false),
     }
 }
 
@@ -791,6 +784,34 @@ pub fn cleanup_temp_projects() {
     }
 }
 
+/// Whether two paths name the same file on disk.
+///
+/// `Unknown` is not a shrug. It is the state where the filesystem could not be
+/// asked — a path vanished mid-operation, or could not be opened at all — and
+/// the two callers below resolve it in OPPOSITE directions, each toward the
+/// answer whose failure is cosmetic rather than destructive. Collapsing it into
+/// a bool would silently pick one of them for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathIdentity {
+    /// Provably one and the same file.
+    Same,
+    /// Provably two different files.
+    Different,
+    /// The filesystem gave no answer; nothing may be inferred from that.
+    Unknown,
+}
+
+/// The path the filesystem itself reports for `p`, in the directory entry's
+/// true case (`GetFinalPathNameByHandle` on Windows). `None` when the file
+/// cannot be resolved: it is gone, or it cannot be opened at all.
+///
+/// It opens the file only to ask its name, so an exclusive lock held by
+/// another process (an AV scanner, a sync agent) does not defeat it the way it
+/// defeats a read.
+fn real_path(p: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(p).ok()
+}
+
 /// Do two paths name the same file?
 ///
 /// This has to agree with `Path::exists`, and on Windows `exists` asks a
@@ -798,29 +819,44 @@ pub fn cleanup_temp_projects() {
 /// renaming "My Film" to "my film" found the candidate taken (by the original)
 /// but not excluded (byte-unequal), deduped to "my film (2).trt", and then
 /// deleted "My Film.trt" — a case-only rename silently renumbered the project.
-#[cfg(windows)]
-fn same_path(a: &Path, b: &Path) -> bool {
-    match (a.to_str(), b.to_str()) {
-        // Unicode-aware where possible, so "Ünsteady" → "ünsteady" is also
-        // recognised as the same file rather than deduping.
-        (Some(a), Some(b)) => a == b || a.to_lowercase() == b.to_lowercase(),
-        // A non-UTF8 name is legal on Windows and cannot be folded without a
-        // lossy conversion that could make two DIFFERENT names compare equal.
-        // The cost of that mistake is overwriting somebody else's file, so fall
-        // back to exact equality.
-        _ => a == b,
+///
+/// Folding both names in Rust does not agree with it either, and it fails in
+/// the far more dangerous direction. Rust's `to_lowercase` is full Unicode;
+/// NTFS folds with its own `$UpCase` table, which is much narrower. Measured on
+/// this platform: "Straße.trt" (U+00DF) and "Straẞe.trt" (U+1E9E) are TWO files
+/// on disk, as are "Kelvin.trt" and "Kelvin.trt" (U+212A KELVIN SIGN) — and
+/// `to_lowercase` calls both pairs equal. Claiming equality there is what turns
+/// a rename into a deletion: `free_path_in` reports the neighbour's path free,
+/// and `atomic_write` rotates that innocent project into `.bak` and writes over
+/// it. A name-folding rule cannot be right in general anyway — a case-sensitive
+/// directory (`fsutil file setCaseSensitiveInfo`), a FAT stick or a network
+/// share all fold differently, and none of them tell us in advance.
+///
+/// So ask the filesystem instead of imitating it. `canonicalize` resolves each
+/// name to the directory entry's real case, so equal canonical paths mean
+/// literally the same file — exactly what this volume folds, and nothing else.
+fn path_identity(a: &Path, b: &Path) -> PathIdentity {
+    // Byte-identical needs no filesystem, and answers even for a path that
+    // does not exist yet.
+    if a == b {
+        return PathIdentity::Same;
     }
-}
-
-#[cfg(not(windows))]
-fn same_path(a: &Path, b: &Path) -> bool {
-    a == b
+    match (real_path(a), real_path(b)) {
+        (Some(a), Some(b)) if a == b => PathIdentity::Same,
+        (Some(_), Some(_)) => PathIdentity::Different,
+        _ => PathIdentity::Unknown,
+    }
 }
 
 /// Pick a free `<base>.trt` path in `dir`, deduping to `<base> (2).trt` etc.
 /// when the plain name is taken. `base` must already be sanitized. `exclude`
 /// (the caller's own current file, if any) is treated as free so renaming a
 /// project to its existing filename stem keeps the plain name — no " (2)".
+///
+/// Only a PROVEN `Same` counts as free. An unprovable answer dedupes, because
+/// the two outcomes are not equally bad: a needless " (2)" is a cosmetic wart
+/// on the file the user is renaming, while a wrong "that's mine" hands back an
+/// occupied path and destroys somebody else's project.
 fn free_path_in(dir: &Path, base: &str, exclude: Option<&Path>) -> Result<PathBuf> {
     for n in 0..1000 {
         let candidate = if n == 0 {
@@ -828,7 +864,11 @@ fn free_path_in(dir: &Path, base: &str, exclude: Option<&Path>) -> Result<PathBu
         } else {
             dir.join(format!("{base} ({}).trt", n + 1))
         };
-        if !candidate.exists() || exclude.is_some_and(|e| same_path(e, &candidate)) {
+        // `exists()` short-circuits, so the identity check only runs — and only
+        // touches the disk — for a candidate that is actually taken.
+        if !candidate.exists()
+            || exclude.is_some_and(|e| path_identity(e, &candidate) == PathIdentity::Same)
+        {
             return Ok(candidate);
         }
     }
@@ -861,10 +901,12 @@ pub fn rename_project(path: String, new_name: String) -> Result<String> {
     value["name"] = Value::String(new_name);
     atomic_write(&new_path, serde_json::to_vec_pretty(&value)?.as_slice())?;
 
-    // Clean up the old location only when it is genuinely a DIFFERENT file. A
+    // Clean up the old location only when it is PROVABLY a different file. A
     // case-only rename lands on the same file on Windows, so deleting "the old
-    // one" here would delete the project we just wrote.
-    if !same_path(&new_path, old) {
+    // one" here would delete the project we just wrote. An unprovable answer
+    // must not be resolved that way either: leaving a stale copy behind is
+    // recoverable, deleting the live one is not.
+    if path_identity(&new_path, old) == PathIdentity::Different {
         let _ = std::fs::remove_file(old);
         let mut bak = old.as_os_str().to_owned();
         bak.push(".bak");
@@ -1620,6 +1662,154 @@ mod tests {
         });
     }
 
+    /// Two names Rust's `to_lowercase` folds together and Windows does NOT.
+    /// Renaming one onto the other must dedupe, never overwrite.
+    ///
+    /// This is measured against real files rather than string rules, because
+    /// string rules are exactly what got this wrong: folding in Rust reported
+    /// the neighbour's path free, `atomic_write` rotated that innocent project
+    /// into `.bak` and wrote over it, and the rename's own cleanup then
+    /// mis-fired too, so the original was orphaned. One rename, two projects
+    /// destroyed.
+    #[test]
+    fn rename_never_overwrites_a_unicode_neighbour() {
+        with_isolated("rename-unicode", |dir| {
+            // U+00DF vs U+1E9E, and ASCII "K" vs U+212A KELVIN SIGN. Both pairs
+            // lowercase to the same string in Rust; both are two files on NTFS.
+            let pairs = [
+                ("Stra\u{00df}e", "Stra\u{1e9e}e"),
+                ("Kelvin", "\u{212a}elvin"),
+            ];
+            for (i, (mine, neighbour)) in pairs.into_iter().enumerate() {
+                let case = dir.join(format!("case{i}"));
+                std::fs::create_dir_all(&case).unwrap();
+                let mine_path = case.join(format!("{mine}.trt"));
+                let neighbour_path = case.join(format!("{neighbour}.trt"));
+                write_json(&mine_path, &serde_json::json!({ "name": mine, "id": "mine" }));
+                write_json(
+                    &neighbour_path,
+                    &serde_json::json!({ "name": neighbour, "id": "neighbour" }),
+                );
+
+                // The premise, measured rather than assumed: this filesystem
+                // keeps the two names apart even though Rust folds them.
+                assert_eq!(mine.to_lowercase(), neighbour.to_lowercase());
+                assert_eq!(
+                    trt_names(&case).len(),
+                    2,
+                    "{mine} and {neighbour} must be two files on disk"
+                );
+
+                // Rename mine to the neighbour's exact name.
+                let new_path = rename_project(
+                    mine_path.to_string_lossy().into_owned(),
+                    neighbour.to_string(),
+                )
+                .unwrap();
+
+                // The name belongs to somebody else, so this must dedupe...
+                assert!(
+                    new_path.ends_with(&format!("{neighbour} (2).trt")),
+                    "got {new_path}"
+                );
+                // ...and the neighbour must be exactly as it was: not rotated
+                // into a `.bak`, not written over.
+                let victim: Value = read_raw_value(&neighbour_path).unwrap();
+                assert_eq!(victim["id"], "neighbour", "the neighbour was overwritten");
+                assert!(
+                    !case.join(format!("{neighbour}.trt.bak")).exists(),
+                    "the neighbour was rotated into a .bak"
+                );
+                // The renamed project kept its own contents under the new name.
+                let renamed: Value = read_raw_value(Path::new(&new_path)).unwrap();
+                assert_eq!(renamed["id"], "mine");
+                assert_eq!(renamed["name"], neighbour);
+                assert_eq!(trt_names(&case).len(), 2, "no third file, and none lost");
+            }
+        });
+    }
+
+    /// The case-only rename fix has to keep working for names Windows folds but
+    /// ASCII rules do not: NTFS folds Ü/ü, so "Ünsteady" → "ünsteady" is one
+    /// file and must stay one file. An ASCII-only comparison would under-match
+    /// here and dedupe to " (2)" — harmless, but avoidable by asking the
+    /// filesystem which names it actually folds.
+    #[test]
+    fn rename_changing_only_non_ascii_case_keeps_a_single_file() {
+        with_isolated("rename-case-unicode", |dir| {
+            let old = dir.join("\u{dc}nsteady.trt");
+            write_json(
+                &old,
+                &serde_json::json!({ "name": "\u{dc}nsteady", "id": "1" }),
+            );
+
+            let new_path =
+                rename_project(old.to_string_lossy().into_owned(), "\u{fc}nsteady".into()).unwrap();
+
+            assert!(new_path.ends_with("\u{fc}nsteady.trt"), "got {new_path}");
+            assert!(
+                !new_path.contains("(2)"),
+                "case-only rename must not dedupe: {new_path}"
+            );
+            assert_eq!(
+                trt_names(dir),
+                vec!["\u{fc}nsteady.trt".to_string()],
+                "exactly one project file, under the new casing"
+            );
+            let written: Value = read_raw_value(Path::new(&new_path)).unwrap();
+            assert_eq!(written["id"], "1");
+            assert_eq!(written["name"], "\u{fc}nsteady");
+        });
+    }
+
+    /// The predicate itself, against files that really exist. `Same` must mean
+    /// the filesystem says so, not that some folding rule says so.
+    #[test]
+    fn path_identity_answers_from_the_filesystem() {
+        with_isolated("path-identity", |dir| {
+            let one = dir.join("My Film.trt");
+            std::fs::write(&one, b"x").unwrap();
+            // One file, three spellings this filesystem folds together.
+            for spelling in ["My Film.trt", "my film.trt", "MY FILM.TRT"] {
+                assert_eq!(
+                    path_identity(&one, &dir.join(spelling)),
+                    PathIdentity::Same,
+                    "{spelling} names the same file"
+                );
+            }
+
+            // Pairs Rust's to_lowercase folds and Windows keeps apart. Each is
+            // written with distinct contents and read back, so "two files" is
+            // observed, not assumed.
+            for (a, b) in [
+                ("Stra\u{00df}e.trt", "Stra\u{1e9e}e.trt"),
+                ("Kelvin.trt", "\u{212a}elvin.trt"),
+            ] {
+                let (pa, pb) = (dir.join(a), dir.join(b));
+                std::fs::write(&pa, b"aaa").unwrap();
+                std::fs::write(&pb, b"bbb").unwrap();
+                assert_eq!(std::fs::read(&pa).unwrap(), b"aaa", "{a} was clobbered by {b}");
+                assert_eq!(
+                    path_identity(&pa, &pb),
+                    PathIdentity::Different,
+                    "{a} and {b} are two files on disk"
+                );
+            }
+
+            // Nothing to open → no answer at all. Callers must not read one
+            // into it; each picks the direction whose failure is cosmetic.
+            assert_eq!(
+                path_identity(&dir.join("ghost.trt"), &one),
+                PathIdentity::Unknown
+            );
+            // ...though two identical paths need no filesystem to compare.
+            assert_eq!(
+                path_identity(&dir.join("ghost.trt"), &dir.join("ghost.trt")),
+                PathIdentity::Same
+            );
+        });
+    }
+
     #[test]
     fn duplicate_gives_fresh_id_and_leaves_original() {
         with_isolated("dup", |dir| {
@@ -1923,22 +2113,113 @@ mod tests {
             .unwrap();
             std::fs::write(&settings, b"not json at all").unwrap();
 
-            let loaded = crate::settings::get_settings()
-                .unwrap()
+            let loaded = crate::settings::get_settings().unwrap();
+            assert_eq!(loaded.status, crate::settings::SettingsStatus::Ok);
+            assert!(loaded.recovered, "the .bak supplied the value");
+            let value = loaded
+                .settings
                 .expect("settings should be recovered from the .bak");
-            assert_eq!(loaded["theme"], "dark");
-            assert_eq!(loaded["monitorVolume"], 0.42);
+            assert_eq!(value["theme"], "dark");
+            assert_eq!(value["monitorVolume"], 0.42);
 
             // Nothing on disk at all is still a clean first run → frontend defaults.
             std::fs::remove_file(&settings).unwrap();
             std::fs::remove_file(data.join("settings.json.bak")).unwrap();
-            assert!(crate::settings::get_settings().unwrap().is_none());
+            let fresh = crate::settings::get_settings().unwrap();
+            assert_eq!(fresh.status, crate::settings::SettingsStatus::Absent);
+            assert!(fresh.settings.is_none());
+        });
+    }
+
+    /// `get_settings` must tell the three read outcomes apart. Collapsing
+    /// "exists but unreadable" into the same `null` as "nothing there yet" made
+    /// the frontend treat a corrupt or locked settings.json as a FIRST RUN: no
+    /// toast, the overwrite guard marked itself verified, and the next save put
+    /// `{ ...DEFAULTS, ...patch }` over the user's real preferences.
+    #[test]
+    fn get_settings_separates_absent_from_unreadable() {
+        use crate::settings::{get_settings, SettingsStatus};
+
+        with_isolated("settings-status", |_dir| {
+            let data = paths::data_dir().unwrap();
+            paths::ensure_dir(&data).unwrap();
+            let settings = data.join("settings.json");
+            let bak = data.join("settings.json.bak");
+
+            // Neither copy on disk → a clean first run; defaults are safe.
+            let r = get_settings().unwrap();
+            assert_eq!(r.status, SettingsStatus::Absent);
+            assert!(r.settings.is_none());
+            assert!(!r.recovered);
+
+            // A readable primary → Ok, no recovery involved.
+            std::fs::write(&settings, br#"{"theme":"dark","monitorVolume":0.42}"#).unwrap();
+            let r = get_settings().unwrap();
+            assert_eq!(r.status, SettingsStatus::Ok);
+            assert!(!r.recovered);
+            assert_eq!(r.settings.unwrap()["monitorVolume"], 0.42);
+
+            // Corrupt primary + good backup → still Ok, flagged as recovered.
+            std::fs::write(&bak, br#"{"theme":"light"}"#).unwrap();
+            std::fs::write(&settings, b"not json at all").unwrap();
+            let r = get_settings().unwrap();
+            assert_eq!(r.status, SettingsStatus::Ok);
+            assert!(r.recovered, "the .bak supplied the value");
+            assert_eq!(r.settings.unwrap()["theme"], "light");
+
+            // Both copies corrupt → Unreadable, NOT Absent. Something is stored;
+            // we simply cannot read it, so nothing may be written over it.
+            std::fs::write(&bak, b"also not json").unwrap();
+            let r = get_settings().unwrap();
+            assert_eq!(r.status, SettingsStatus::Unreadable);
+            assert!(r.settings.is_none());
+        });
+    }
+
+    /// The cause named in `get_settings`'s own comment: a Windows lock making
+    /// `std::fs::read` fail. The file is present and perfectly VALID — the read
+    /// just cannot happen right now — which is the case most easily mistaken
+    /// for a first run, and the most expensive one to get wrong.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_settings_file_reads_as_unreadable_not_absent() {
+        use crate::settings::{get_settings, SettingsStatus};
+        use std::os::windows::fs::OpenOptionsExt;
+
+        with_isolated("settings-locked", |_dir| {
+            let data = paths::data_dir().unwrap();
+            paths::ensure_dir(&data).unwrap();
+            let settings = data.join("settings.json");
+            std::fs::write(&settings, br#"{"theme":"dark"}"#).unwrap();
+
+            // FILE_SHARE_NONE, as an AV scanner or a sync agent would hold it:
+            // every byte is intact, `std::fs::read` just gets a sharing
+            // violation (os error 32) rather than NotFound.
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&settings)
+                .unwrap();
+
+            let r = get_settings().unwrap();
+            assert_eq!(
+                r.status,
+                SettingsStatus::Unreadable,
+                "a locked settings.json is present, not absent"
+            );
+            assert!(r.settings.is_none());
+
+            // Released → readable again, and the file was never touched.
+            drop(lock);
+            let r = get_settings().unwrap();
+            assert_eq!(r.status, SettingsStatus::Ok);
+            assert_eq!(r.settings.unwrap()["theme"], "dark");
         });
     }
 
     /// An index that exists but cannot be read is NOT an empty index. Writing
     /// the empty default over it rotated the last good copy into `.bak`, and
-    /// because the fresh primary then parsed fine `read_json_with_bak` never
+    /// because the fresh primary then parsed fine the recovery path never
     /// looked at that backup again — one unreadable file plus one ordinary save
     /// lost the user's entire recents list.
     #[test]

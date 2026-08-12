@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ipc } from "./ipc";
+import { ipc, normalizeSettingsRead } from "./ipc";
 import { createProject } from "./project";
 import {
   CARD_RESCUE_RATIO,
@@ -1842,10 +1842,24 @@ describe("autosave after a failed write", () => {
 
 /**
  * The other data loss: a settings.json that could not be READ at boot, silently
- * replaced by defaults on the very next write. Both halves are covered — a
- * rejecting `get_settings`, and the `null` it returns when a Windows file lock
- * (an antivirus scanner, a sync client) defeats both the file and its `.bak`,
- * which the backend cannot tell apart from a first run.
+ * replaced by defaults on the very next write.
+ *
+ * WHY THIS BLOCK WAS REWRITTEN. It used to model "unreadable" as a REJECTING
+ * `get_settings` — which is exactly why every case here passed while the real
+ * path did not. The backend does not reject: `read_json_with_bak` collapsed both
+ * "there is no file yet" and "the file is there but neither it nor its .bak
+ * could be read" into `Ok(None)`, so what the app actually meets when a Windows
+ * file lock (an antivirus scanner, a sync client) defeats a perfectly intact
+ * settings.json is a RESOLUTION — and it walked straight through a guard whose
+ * only trigger was a throw. `initSettings` reported `{ok:true,
+ * source:"defaults"}`, main.ts showed no toast, and `reconcileSettings` marked
+ * itself verified and let `{...DEFAULTS, ...patch}` go over the user's file.
+ *
+ * So the unreadable cases below are modelled as `ipc.readSettings` RESOLVING
+ * `{ status: "unreadable" }`. The rejection is kept, but as its own separate
+ * case: the command can still fail on its own terms (an unresolvable data
+ * directory, a dead IPC bridge), and that is a different question from what the
+ * file on disk is.
  */
 describe("settings that could not be read at start-up", () => {
   beforeEach(() => {
@@ -1861,17 +1875,22 @@ describe("settings that could not be read at start-up", () => {
     vi.restoreAllMocks();
   });
 
-  it("reports a failed read instead of coming up as a fresh install", async () => {
-    vi.spyOn(ipc, "getSettings").mockRejectedValue(new Error("the file is in use"));
+  /* ---- the file is there, and unreadable (the path that used to be silent) ---- */
 
-    expect(await initSettings()).toEqual({ ok: false, error: "the file is in use" });
+  it("reports a present-but-unreadable file instead of coming up as a fresh install", async () => {
+    vi.spyOn(ipc, "readSettings").mockResolvedValue({ status: "unreadable" });
+
+    const load = await initSettings();
+    // NOT {ok:true, source:"defaults"} — that is what made main.ts stay quiet
+    // while every preference on screen was a lie.
+    expect(load.ok).toBe(false);
     // …and still reachable from a screen mounted later, which is exactly the
     // screen a user opens when their preferences look wrong.
-    expect(settingsLoadFailure()).toBe("the file is in use");
+    expect(settingsLoadFailure()).toMatch(/settings\.json is on disk/);
   });
 
-  it("refuses to overwrite a settings file it never managed to read", async () => {
-    vi.spyOn(ipc, "getSettings").mockRejectedValue(new Error("the file is in use"));
+  it("refuses to overwrite a settings file it could not read", async () => {
+    vi.spyOn(ipc, "readSettings").mockResolvedValue({ status: "unreadable" });
     const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
 
     await initSettings();
@@ -1885,15 +1904,51 @@ describe("settings that could not be read at start-up", () => {
     expect(settingsStore.get().defaultExportDir).toBeNull();
   });
 
+  it("does not mark itself verified, so the next write asks about the file again", async () => {
+    const stored: Settings = { ...DEFAULT_SETTINGS, defaultExportDir: "D:\\Exports" };
+    const readSettings = vi
+      .spyOn(ipc, "readSettings")
+      .mockResolvedValueOnce({ status: "unreadable" }) // boot
+      .mockResolvedValueOnce({ status: "unreadable" }) // still locked
+      .mockResolvedValueOnce({ status: "ok", settings: stored, recovered: false }); // the lock cleared
+    const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
+
+    await initSettings();
+    await expect(updateSettings({ proxyMedia: false })).rejects.toThrow(/nothing was written/);
+    // Refusing is only half of it. Marking the session verified on the way out
+    // would let this second write go straight through — over the same file.
+    await updateSettings({ proxyMedia: false });
+
+    expect(readSettings).toHaveBeenCalledTimes(3);
+    expect(saveSettings).toHaveBeenCalledTimes(1);
+    // …and the write that finally landed carried the recovered value, not a
+    // default, which is only possible because the re-read happened.
+    expect(saveSettings.mock.calls[0]![0].defaultExportDir).toBe("D:\\Exports");
+  });
+
+  it("refuses when a file appears between boot and the first write", async () => {
+    vi.spyOn(ipc, "readSettings")
+      .mockResolvedValueOnce({ status: "absent" }) // a genuine-looking first run…
+      .mockResolvedValueOnce({ status: "unreadable" }); // …but there IS one now
+    const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
+
+    expect(await initSettings()).toEqual({ ok: true, source: "defaults", recovered: false });
+    await expect(updateSettings({ proxyMedia: false })).rejects.toThrow(/nothing was written/);
+
+    expect(saveSettings).not.toHaveBeenCalled();
+    // A boot that saw nothing recorded no failure; the reconcile did.
+    expect(settingsLoadFailure()).toMatch(/settings\.json is on disk/);
+  });
+
   it("merges the next change onto the real file once a read finally succeeds", async () => {
     const stored: Settings = {
       ...DEFAULT_SETTINGS,
       defaultExportDir: "D:\\Exports",
       shortcuts: { ...DEFAULT_SHORTCUTS, split: "Q" },
     };
-    vi.spyOn(ipc, "getSettings")
-      .mockRejectedValueOnce(new Error("the file is in use"))
-      .mockResolvedValueOnce(stored);
+    vi.spyOn(ipc, "readSettings")
+      .mockResolvedValueOnce({ status: "unreadable" })
+      .mockResolvedValueOnce({ status: "ok", settings: stored, recovered: false });
     const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
 
     expect((await initSettings()).ok).toBe(false);
@@ -1907,25 +1962,49 @@ describe("settings that could not be read at start-up", () => {
     expect(written.shortcuts.split).toBe("Q");
   });
 
-  it("re-reads before the first write when start-up found nothing at all", async () => {
-    const stored: Settings = { ...DEFAULT_SETTINGS, monitorVolume: 0.25 };
-    const getSettings = vi
-      .spyOn(ipc, "getSettings")
-      .mockResolvedValueOnce(null) // locked at boot, so the backend saw nothing
-      .mockResolvedValueOnce(stored); // …and perfectly readable a moment later
+  /* ---- the command itself failing: a different question, kept separate ---- */
+
+  it("reports a rejecting get_settings too", async () => {
+    vi.spyOn(ipc, "readSettings").mockRejectedValue(new Error("the file is in use"));
+
+    expect(await initSettings()).toEqual({ ok: false, error: "the file is in use" });
+    expect(settingsLoadFailure()).toBe("the file is in use");
+  });
+
+  it("refuses to overwrite when the call fails at boot and fails again", async () => {
+    vi.spyOn(ipc, "readSettings").mockRejectedValue(new Error("the file is in use"));
     const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
 
-    expect(await initSettings()).toEqual({ ok: true, source: "defaults" });
+    await initSettings();
+    await expect(updateSettings({ defaultExportDir: "D:\\Exports" })).rejects.toThrow(
+      /could not be read/,
+    );
+
+    expect(saveSettings).not.toHaveBeenCalled();
+    expect(settingsStore.get().defaultExportDir).toBeNull();
+  });
+
+  /* ---- and the states that must stay permissive ---- */
+
+  it("re-reads before the first write when start-up found nothing at all", async () => {
+    const stored: Settings = { ...DEFAULT_SETTINGS, monitorVolume: 0.25 };
+    const readSettings = vi
+      .spyOn(ipc, "readSettings")
+      .mockResolvedValueOnce({ status: "absent" })
+      .mockResolvedValueOnce({ status: "ok", settings: stored, recovered: false });
+    const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
+
+    expect(await initSettings()).toEqual({ ok: true, source: "defaults", recovered: false });
     await updateSettings({ proxyMedia: false });
 
-    expect(getSettings).toHaveBeenCalledTimes(2);
+    expect(readSettings).toHaveBeenCalledTimes(2);
     const written = saveSettings.mock.calls[0]![0];
     expect(written.monitorVolume).toBe(0.25);
     expect(written.proxyMedia).toBe(false);
   });
 
   it("still saves on a genuine first run, and re-reads only once", async () => {
-    const getSettings = vi.spyOn(ipc, "getSettings").mockResolvedValue(null);
+    const readSettings = vi.spyOn(ipc, "readSettings").mockResolvedValue({ status: "absent" });
     const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
 
     await initSettings();
@@ -1935,22 +2014,106 @@ describe("settings that could not be read at start-up", () => {
     expect(saveSettings).toHaveBeenCalledTimes(2);
     // Boot plus one reconcile — the gate must not turn every preference change
     // into a disk round trip.
-    expect(getSettings).toHaveBeenCalledTimes(2);
+    expect(readSettings).toHaveBeenCalledTimes(2);
     expect(saveSettings.mock.calls[1]![0].proxyMedia).toBe(false);
   });
 
   it("costs nothing extra when start-up read the file", async () => {
-    const getSettings = vi
-      .spyOn(ipc, "getSettings")
-      .mockResolvedValue({ ...DEFAULT_SETTINGS, cacheLimitMB: 4096 });
+    const readSettings = vi
+      .spyOn(ipc, "readSettings")
+      .mockResolvedValue({ status: "ok", settings: { ...DEFAULT_SETTINGS, cacheLimitMB: 4096 }, recovered: false });
     const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
 
-    expect(await initSettings()).toEqual({ ok: true, source: "disk" });
+    expect(await initSettings()).toEqual({ ok: true, source: "disk", recovered: false });
     expect(settingsLoadFailure()).toBeNull();
     await updateSettings({ proxyMedia: false });
 
-    expect(getSettings).toHaveBeenCalledTimes(1);
+    expect(readSettings).toHaveBeenCalledTimes(1);
     expect(saveSettings.mock.calls[0]![0].cacheLimitMB).toBe(4096);
+  });
+
+  it("says so when the settings came back from the .bak", async () => {
+    const stored: Settings = { ...DEFAULT_SETTINGS, cacheLimitMB: 4096 };
+    vi.spyOn(ipc, "readSettings").mockResolvedValue({
+      status: "ok",
+      settings: stored,
+      recovered: true,
+    });
+
+    // Nothing is missing and nothing needs doing — but settings.json itself was
+    // corrupt and a backup supplied these, which main.ts turns into a toast
+    // rather than letting the repair happen invisibly.
+    expect(await initSettings()).toEqual({ ok: true, source: "disk", recovered: true });
+    expect(settingsStore.get().cacheLimitMB).toBe(4096);
+    expect(settingsLoadFailure()).toBeNull();
+  });
+});
+
+/**
+ * The wire shape itself. `normalizeSettingsRead` is the ONE place that knows how
+ * `get_settings` answers, so it is the one place a backend change can silently
+ * re-collapse the three states into two — which is the bug this whole block
+ * exists to keep closed.
+ */
+describe("normalizeSettingsRead", () => {
+  it("reads the three payloads settings.rs actually serialises", () => {
+    // Asserted against the LITERAL objects, copied from the serialization test
+    // in src-tauri/src/settings.rs — not against the TS type, which would agree
+    // with itself while the wire drifted. A rename on either side fails here.
+    expect(
+      normalizeSettingsRead({ status: "ok", settings: { theme: "dark" }, recovered: true }),
+    ).toEqual({ status: "ok", settings: { theme: "dark" }, recovered: true });
+    expect(normalizeSettingsRead({ status: "absent", settings: null, recovered: false })).toEqual({
+      status: "absent",
+    });
+    expect(
+      normalizeSettingsRead({ status: "unreadable", settings: null, recovered: false }),
+    ).toEqual({ status: "unreadable" });
+  });
+
+  it("keeps the settings usable end to end", () => {
+    const read = normalizeSettingsRead({
+      status: "ok",
+      settings: { schema: 1, theme: "light", cacheLimitMB: 4096 },
+      recovered: false,
+    });
+    expect(sanitizeSettings(read.status === "ok" ? read.settings : null).theme).toBe("light");
+  });
+
+  /**
+   * The fail-safe half, and the reason this function exists at all.
+   *
+   * The tempting fallback — "an object I don't recognise must be the settings" —
+   * is how the bug comes back wearing a fix: the real `unreadable` payload would
+   * be read AS settings, `sanitizeSettings` would turn `{status, settings,
+   * recovered}` into pure defaults, boot would report a clean read, and the
+   * overwrite guard would never fire again. Anything not positively recognised
+   * therefore lands on the one state that refuses to write.
+   */
+  it("treats anything it does not recognise as unreadable", () => {
+    for (const raw of [
+      null,
+      undefined,
+      42,
+      "unreadable",
+      {},
+      { status: "nonsense" },
+      { status: "OK", settings: { theme: "dark" } }, // wrong case
+      { state: "parsed", value: { theme: "dark" } }, // a shape that was never shipped
+      { schema: 1, theme: "dark" }, // the settings alone, with no envelope
+      // …and the contradiction the Rust type forbids: "ok" with nothing in it.
+      { status: "ok", settings: null, recovered: false },
+    ]) {
+      expect(normalizeSettingsRead(raw)).toEqual({ status: "unreadable" });
+    }
+  });
+
+  it("defaults recovered to false rather than trusting a missing flag", () => {
+    expect(normalizeSettingsRead({ status: "ok", settings: { theme: "dark" } })).toEqual({
+      status: "ok",
+      settings: { theme: "dark" },
+      recovered: false,
+    });
   });
 });
 

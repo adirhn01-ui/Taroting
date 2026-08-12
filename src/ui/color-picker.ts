@@ -13,6 +13,16 @@
 // support, pointer capture and touch behaviour come for free and correct, which
 // is not true of a hand-rolled div. Only the 2-D field needs its own pointer
 // handling.
+//
+// EVERY COLOUR HERE IS WRITTEN THROUGH THE CSSOM, never as an inline `style`
+// attribute in the innerHTML below — the preview swatch, the twelve presets,
+// the --cp-hue-color / --cp-bright-to gradient stops and the popover's own
+// placement. That is not incidental tidiness: the packaged app's CSP refuses
+// style attributes outright (Tauri appends a nonce to `style-src`, which makes
+// its `'unsafe-inline'` inert), so a preset moved into the template for brevity
+// would render as a row of empty boxes — in the packaged build only, and never
+// under `npm run dev`. The full chain is documented above `colorRow` in
+// src/settings/settings.ts.
 
 import { escapeHtml } from "../core/format";
 import { normalizeHexColor } from "../core/session";

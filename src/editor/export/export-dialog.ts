@@ -778,7 +778,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     bodyEl.innerHTML = `
       <div class="export-progress">
         <div class="export-progress__pct" id="ex-pct">0%</div>
-        <div class="export-bar"><div class="export-bar__fill" id="ex-fill" style="width:0%"></div></div>
+        <div class="export-bar"><div class="export-bar__fill" id="ex-fill"></div></div>
         <div class="export-progress__meta">
           <span id="ex-eta"></span>
           <span id="ex-speed"></span>

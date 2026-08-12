@@ -2,7 +2,7 @@
 // open project with autosave + undo/redo orchestration.
 
 import { History } from "./history";
-import { describeError, ipc } from "./ipc";
+import { describeError, ipc, type SettingsRead } from "./ipc";
 import { touchModified } from "./project";
 import { Store } from "./store";
 import type { ActionId, CustomTheme, ProjectFile, Settings } from "./types";
@@ -883,29 +883,45 @@ export function sanitizeSettings(raw: unknown): Settings {
  * the last good `.bak` away too, so the recovery copy the Rust side keeps for
  * exactly this case was gone as well.
  *
- * `get_settings` returning `null` is the same trap wearing a friendlier face.
- * `read_json_with_bak` maps BOTH "there is no file yet" and "neither the file
- * nor its .bak could be read" to `Ok(None)`, and a Windows file lock — an
- * antivirus scanner, a backup agent, a roaming profile still syncing — makes
- * `std::fs::read` fail on a settings.json that is perfectly intact. Boot then
- * concludes "first run" about a file full of the user's preferences.
+ * `get_settings` RESOLVING was the same trap wearing a friendlier face, and it
+ * is why the guard below never actually fired. `read_json_with_bak` mapped BOTH
+ * "there is no file yet" and "neither the file nor its .bak could be read" to
+ * `Ok(None)`, and a Windows file lock — an antivirus scanner, a backup agent, a
+ * roaming profile still syncing — makes `std::fs::read` fail on a settings.json
+ * that is perfectly intact. Boot concluded "first run" about a file full of the
+ * user's preferences, `initSettings` reported a cheerful `{ok:true,
+ * source:"defaults"}`, main.ts showed no toast, and the re-read below found the
+ * same `null` and treated it as permission to write.
  *
- * So the store carries an explicit answer to "is what I hold actually what is
- * on disk?", and a write is only allowed to be a blind overwrite when it is.
- * When it is not, the first write of the session RE-READS first:
+ * `ipc.readSettings` keeps the two apart (see `SettingsRead`), so the store can
+ * carry an explicit answer to "is what I hold actually what is on disk?", and a
+ * write is only allowed to be a blind overwrite when it is. When it is not, the
+ * first write of the session RE-READS first:
  *
- *   read succeeds with settings → they were there all along. Adopt them (which
- *       repairs the UI too) and merge the patch onto THEM, not onto defaults.
- *   read succeeds with null     → the backend is sure there is nothing to
- *       restore, so there is nothing to lose. Write.
- *   read fails again            → we still do not know what is on disk. REFUSE,
- *       and let the caller say so, rather than overwrite it to find out.
+ *   ok         → they were there all along. Adopt them (which repairs the UI
+ *       too) and merge the patch onto THEM, not onto defaults.
+ *   absent     → the backend is sure there is nothing to restore, so there is
+ *       nothing to lose. Write.
+ *   unreadable → a settings.json IS there and we cannot see inside it. REFUSE,
+ *       and let the caller say so, rather than overwrite it to find out. The
+ *       session stays unverified, so the NEXT write asks again — the file may
+ *       simply have been locked for a moment.
+ *   the call itself rejects → we know nothing at all. Refuse if boot already
+ *       failed or found an unreadable file; stay permissive if boot positively
+ *       established there is nothing on disk, so a genuine first run with a
+ *       flaky backend is not locked out of saving forever.
  *
  * That costs one extra IPC round trip, once, and only in a session whose boot
  * read came back empty or failed. Every session that read real settings — which
  * is every session of every user who has ever changed a setting — pays nothing:
  * `settingsVerified` is true from boot and never consulted again.
  */
+
+/** What the user is told when settings.json is present but unreadable. Shared
+ *  by the boot report and the refused write so both name the same condition. */
+const SETTINGS_UNREADABLE =
+  "settings.json is on disk but neither it nor its backup could be read — " +
+  "another program may have it open.";
 
 /** Whether `settingsStore` is known to match settings.json. False until a read
  *  (or a write) has proven it, which is what gates the re-read above. */
@@ -917,11 +933,19 @@ let settingsReadFailure: string | null = null;
 
 /** How the one-time boot read of settings.json went.
  *
- *  `source` distinguishes the two SUCCESSFUL outcomes that used to be
- *  indistinguishable from a failure: "disk" means stored settings were read and
- *  applied, "defaults" means the backend reported nothing to restore. */
+ *  `source` distinguishes the two SUCCESSFUL outcomes: "disk" means stored
+ *  settings were read and applied, "defaults" means the backend positively
+ *  established there is nothing to restore. A settings.json that exists but
+ *  could not be read is NOT one of them — it is `{ok:false}`, so main.ts's
+ *  toast fires and the user learns why the app looks factory-fresh.
+ *
+ *  `recovered` is true when settings.json itself was corrupt and the `.bak`
+ *  supplied the settings instead. The preferences are intact and already
+ *  applied — but the user's file was silently repaired underneath them, which is
+ *  worth saying out loud rather than leaving to be discovered. Always false for
+ *  "defaults": there was nothing to recover. */
 export type SettingsLoad =
-  | { ok: true; source: "disk" | "defaults" }
+  | { ok: true; source: "disk" | "defaults"; recovered: boolean }
   | { ok: false; error: string };
 
 /** The boot read's failure, or null when it went fine. For a caller that was
@@ -945,16 +969,22 @@ export async function initSettings(): Promise<SettingsLoad> {
   settingsVerified = false;
   settingsReadFailure = null;
   try {
-    const loaded = await ipc.getSettings();
-    if (loaded) {
-      settingsStore.set(sanitizeSettings(loaded));
+    const read = await ipc.readSettings();
+    if (read.status === "ok") {
+      settingsStore.set(sanitizeSettings(read.settings));
       settingsVerified = true;
-      result = { ok: true, source: "disk" };
+      result = { ok: true, source: "disk", recovered: read.recovered };
+    } else if (read.status === "unreadable") {
+      // A file IS there. Running on defaults is a symptom, not the state of the
+      // world — say so, and stay unverified so the first write re-reads.
+      settingsReadFailure = SETTINGS_UNREADABLE;
+      console.error("Could not read settings; running on defaults", SETTINGS_UNREADABLE);
+      result = { ok: false, error: settingsReadFailure };
     } else {
-      // Probably a first run — but possibly a settings.json that could not be
-      // opened, which the backend cannot tell apart. Left unverified so the
-      // first write re-reads before it overwrites anything.
-      result = { ok: true, source: "defaults" };
+      // Nothing on disk: a first run. Still left unverified so the first write
+      // re-reads — the answer costs one round trip and it is the only thing
+      // standing between a momentary lock and a wiped settings.json.
+      result = { ok: true, source: "defaults", recovered: false };
     }
   } catch (e) {
     settingsReadFailure = describeError(e);
@@ -977,16 +1007,23 @@ export async function initSettings(): Promise<SettingsLoad> {
  * Re-read settings.json before the first write of a session that never
  * confirmed one. Returns true when real settings were found and adopted.
  *
- * Throws only in the case where writing would be destructive AND we have no
- * idea what we would be destroying: the boot read failed and this one failed
- * too. A boot that merely found nothing is left permissive — two independent
- * "there is nothing here" answers must not lock a genuine first run out of
- * saving its preferences forever.
+ * Throws whenever writing would be destructive AND we cannot see what we would
+ * be destroying — a settings.json that is present but unreadable, or a read
+ * that failed outright in a session whose boot read had already failed. A boot
+ * that positively found NOTHING is left permissive: two independent "there is
+ * nothing here" answers must not lock a genuine first run out of saving its
+ * preferences forever.
+ *
+ * `settingsVerified` is deliberately NOT set on the refusing paths. Marking the
+ * session verified would let the very next write go straight through without
+ * asking again, which is the whole thing this exists to prevent; leaving it
+ * false means a lock that clears in the next few seconds is picked up on the
+ * next attempt.
  */
 async function reconcileSettings(): Promise<boolean> {
-  let loaded: Settings | null;
+  let read: SettingsRead;
   try {
-    loaded = await ipc.getSettings();
+    read = await ipc.readSettings();
   } catch (e) {
     if (settingsReadFailure !== null) {
       throw new Error(
@@ -999,10 +1036,23 @@ async function reconcileSettings(): Promise<boolean> {
     settingsVerified = true;
     return false;
   }
+  if (read.status === "unreadable") {
+    // Recorded even when boot saw nothing: a file has appeared since, and a
+    // Settings screen mounted later should be able to say so.
+    settingsReadFailure = SETTINGS_UNREADABLE;
+    throw new Error(
+      "Your settings file is on disk but could not be read. Saving now would replace " +
+        `it with defaults, so nothing was written. ${SETTINGS_UNREADABLE}`,
+    );
+  }
   settingsVerified = true;
   settingsReadFailure = null;
-  if (!loaded) return false;
-  settingsStore.set(sanitizeSettings(loaded));
+  if (read.status === "absent") return false;
+  // `read.recovered` is deliberately not surfaced here: this is mid-write, with
+  // no reporting channel, and the write that follows immediately rewrites the
+  // primary from exactly these settings — which repairs the corrupt file rather
+  // than merely noting it.
+  settingsStore.set(sanitizeSettings(read.settings));
   return true;
 }
 

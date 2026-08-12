@@ -1,6 +1,12 @@
-// Timeline controller: canvas lifecycle (DPR, resize), view state (scroll +
-// zoom), dirty-flag rAF rendering, playhead following, and the glue between
-// interactions, the project session, and the playback engine.
+// Timeline controller: canvas lifecycle (DPR, resize), view state (horizontal
+// scroll + zoom, vertical lane scroll), dirty-flag rAF rendering, playhead
+// following, and the glue between interactions, the project session, and the
+// playback engine.
+//
+// The panel is a fixed height and the lane stack is not, so the lanes scroll
+// vertically inside the host. The offset itself lives in render.ts, folded into
+// laneLayout, which is what keeps drawing and hit-testing on one set of
+// coordinates — see the note on laneScrollY there before changing any of this.
 
 import type { ProjectSession } from "../../core/session";
 import { timelineDuration } from "../../core/time";
@@ -8,7 +14,17 @@ import type { Clip, MediaRef, ProjectFile, Track } from "../../core/types";
 import type { MediaManager } from "../media/media";
 import type { PlaybackEngine } from "../playback/engine";
 import { attachInteractions, type DragState } from "./interactions";
-import { draw, readColors, totalLanesHeight, type TimelineColors } from "./render";
+import {
+  RULER_H,
+  clampLaneScroll,
+  draw,
+  laneScroll,
+  maxLaneScroll,
+  readColors,
+  setLaneScroll,
+  totalLanesHeight,
+  type TimelineColors,
+} from "./render";
 
 export interface TimelineDeps {
   session: ProjectSession;
@@ -44,12 +60,25 @@ export class TimelineController {
   private readonly host: HTMLElement;
   /** Reused overlay guide for external drag-and-drop (created lazily). */
   private dropGuide: HTMLElement | null = null;
+  /** Vertical scrollbar chrome, created on first overflow (see syncScrollbar). */
+  private scrollBar: HTMLElement | null = null;
+  private scrollThumb: HTMLElement | null = null;
+  /** Last geometry written to the scrollbar. Compared before every write so a
+   *  frame that changes nothing — every frame of playback, since the playhead
+   *  moves and the lanes do not — touches the CSSOM zero times. */
+  private barShown = false;
+  private barTop = -1;
+  private barH = -1;
 
   constructor(
     host: HTMLElement,
     private deps: TimelineDeps,
   ) {
     this.host = host;
+    // laneScrollY is module state in render.ts (deliberately — see the note
+    // there), so a freshly mounted editor starts at the top rather than
+    // inheriting wherever the previous project was scrolled to.
+    setLaneScroll(0);
     this.canvas = document.createElement("canvas");
     this.canvas.className = "timeline-canvas";
     host.appendChild(this.canvas);
@@ -97,6 +126,29 @@ export class TimelineController {
     );
     this.disposers.push(attachInteractions(this));
 
+    // Vertical lane scrolling on ALT + wheel. Deliberately not plain, Shift or
+    // Ctrl wheel: those are the existing horizontal pan / fast pan / zoom
+    // gestures and stay exactly as they were. Bound on the HOST in the capture
+    // phase so it runs before the canvas's own wheel handler, and
+    // stopPropagation stops the same notch from also panning sideways. A wheel
+    // over the scrollbar itself scrolls without the modifier, as expected of a
+    // scrollbar.
+    //
+    // When there is nothing to scroll the event is left completely alone, so on
+    // a project that already fits, ALT + wheel still pans exactly as before.
+    const onWheelCapture = (e: WheelEvent): void => {
+      const onBar = this.scrollBar !== null && this.scrollBar.contains(e.target as Node);
+      if (!onBar && (!e.altKey || e.ctrlKey)) return;
+      if (maxLaneScroll(this.project(), this.view.height) <= 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.scrollLanesBy(e.deltaY);
+    };
+    host.addEventListener("wheel", onWheelCapture, { capture: true, passive: false });
+    this.disposers.push(() =>
+      host.removeEventListener("wheel", onWheelCapture, { capture: true }),
+    );
+
     this.fit();
   }
 
@@ -132,6 +184,118 @@ export class TimelineController {
   panBy(px: number): void {
     this.view.t0 = Math.max(0, this.view.t0 + px / this.view.pxPerSec);
     this.requestRender();
+  }
+
+  /* ---------------- vertical lane scrolling ----------------
+   * The panel is a fixed 280px and "Add video layer" / detachAudio are
+   * unbounded, so the lane stack can be arbitrarily taller than the host. The
+   * offset lives in render.ts and is baked into laneLayout, which is what keeps
+   * drawing and hit-testing on the same coordinates — see the note there. */
+
+  /** Scroll the lane stack by `dy` px (positive scrolls down). */
+  scrollLanesBy(dy: number): void {
+    this.scrollLanesTo(laneScroll() + dy);
+  }
+
+  /** Scroll the lane stack to an absolute offset; clamped to the legal range. */
+  scrollLanesTo(px: number): void {
+    if (setLaneScroll(clampLaneScroll(this.project(), px, this.view.height))) {
+      this.requestRender();
+    }
+  }
+
+  /** Height of the scrollbar track: the host minus the pinned ruler, which is
+   *  also the band the lanes are drawn into and the distance a "page" scrolls. */
+  private trackHeight(): number {
+    return Math.max(0, this.view.height - RULER_H);
+  }
+
+  /** Build the scrollbar on first overflow and wire its drag. Everything here
+   *  is owned by the controller: the thumb is a plain absolutely-positioned div
+   *  over the canvas, so dragging it never goes near the canvas pointer
+   *  handlers. Geometry comes from values we last WROTE, never from
+   *  offsetTop/clientHeight, so a scrollbar drag forces no layout. */
+  private ensureScrollbar(): HTMLElement {
+    if (this.scrollBar) return this.scrollBar;
+    const bar = document.createElement("div");
+    bar.className = "tl-vscroll";
+    bar.style.top = `${RULER_H}px`;
+    const thumb = document.createElement("div");
+    thumb.className = "tl-vscroll__thumb";
+    bar.appendChild(thumb);
+    this.host.appendChild(bar);
+    this.scrollBar = bar;
+    this.scrollThumb = thumb;
+
+    let dragging = false;
+    let grabY = 0;
+    let grabScroll = 0;
+
+    const onDown = (e: PointerEvent): void => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const localY = e.clientY - bar.getBoundingClientRect().top;
+      if (localY < this.barTop || localY > this.barTop + this.barH) {
+        // Track click: page towards the pointer, like a native scrollbar.
+        this.scrollLanesBy(localY < this.barTop ? -this.trackHeight() : this.trackHeight());
+        return;
+      }
+      bar.setPointerCapture(e.pointerId);
+      dragging = true;
+      grabY = e.clientY;
+      grabScroll = laneScroll();
+      thumb.classList.add("tl-vscroll__thumb--active");
+    };
+    const onMove = (e: PointerEvent): void => {
+      if (!dragging) return;
+      // The thumb travels (track - thumb) px while the content travels max px.
+      const travel = Math.max(1, this.trackHeight() - this.barH);
+      const max = maxLaneScroll(this.project(), this.view.height);
+      this.scrollLanesTo(grabScroll + ((e.clientY - grabY) * max) / travel);
+    };
+    const onUp = (e: PointerEvent): void => {
+      if (bar.hasPointerCapture(e.pointerId)) bar.releasePointerCapture(e.pointerId);
+      dragging = false;
+      thumb.classList.remove("tl-vscroll__thumb--active");
+    };
+
+    bar.addEventListener("pointerdown", onDown);
+    bar.addEventListener("pointermove", onMove);
+    bar.addEventListener("pointerup", onUp);
+    bar.addEventListener("pointercancel", onUp);
+    return bar;
+  }
+
+  /** Reflect the current scroll on the scrollbar, creating it on first need and
+   *  hiding it entirely while everything fits (a one-lane project shows no
+   *  chrome at all). Called from renderNow with the content height it already
+   *  had to compute, so this adds no traversal of the tracks. */
+  private syncScrollbar(contentH: number): void {
+    const track = this.trackHeight();
+    const max = Math.max(0, contentH - this.view.height);
+    if (max <= 0 || track <= 0) {
+      if (this.barShown) {
+        this.scrollBar!.style.display = "none";
+        this.barShown = false;
+      }
+      return;
+    }
+    const bar = this.ensureScrollbar();
+    const h = Math.min(track, Math.max(24, Math.round((track * this.view.height) / contentH)));
+    const top = Math.round(((track - h) * laneScroll()) / max);
+    if (!this.barShown) {
+      bar.style.display = "block";
+      this.barShown = true;
+    }
+    if (h !== this.barH) {
+      this.scrollThumb!.style.height = `${h}px`;
+      this.barH = h;
+    }
+    if (top !== this.barTop) {
+      this.scrollThumb!.style.top = `${top}px`;
+      this.barTop = top;
+    }
   }
 
   /** Fit the whole timeline (plus headroom) into the view. */
@@ -171,10 +335,6 @@ export class TimelineController {
     this.deps.session.commit(mutate);
     this.deps.engine.refresh();
     this.requestRender();
-  }
-  /** Current project snapshot (for capturing a gesture's `before`). */
-  projectSnapshot(): ProjectFile {
-    return this.deps.session.project;
   }
   /** Live, history-free replace during a gesture (drag). */
   liveReplace(mutate: (p: ProjectFile) => ProjectFile): void {
@@ -221,8 +381,12 @@ export class TimelineController {
     g.style.display = "block";
     const lane = g.firstElementChild as HTMLElement;
     const line = g.lastElementChild as HTMLElement;
-    lane.style.top = `${laneY}px`;
-    lane.style.height = `${laneH}px`;
+    // Clamped to the lane band: a half-scrolled target lane must not tint over
+    // the pinned ruler (the canvas clips its own lanes for the same reason).
+    const top = Math.max(RULER_H, laneY);
+    const bottom = Math.min(this.view.height, laneY + laneH);
+    lane.style.top = `${top}px`;
+    lane.style.height = `${Math.max(0, bottom - top)}px`;
     line.style.transform = `translateX(${Math.round(x)}px)`;
   }
 
@@ -255,13 +419,29 @@ export class TimelineController {
       this.mediaById.clear();
       for (const m of project.media) this.mediaById.set(m.id, m);
     }
+
+    // One traversal of the tracks, reused for the clamp and the scrollbar (this
+    // call is not new — the old code already ran totalLanesHeight once a frame,
+    // to inflate the draw height past the canvas, which is what made lanes 4+
+    // paint into pixels that do not exist).
+    //
+    // Re-clamping every frame is what keeps the view honest when the lane count
+    // shrinks under a scrolled timeline — delete a layer while scrolled to the
+    // bottom and the stack slides back up instead of leaving a void.
+    const contentH = totalLanesHeight(project);
+    const maxScroll = Math.max(0, contentH - this.view.height);
+    if (laneScroll() > maxScroll) setLaneScroll(maxScroll);
+    this.syncScrollbar(contentH);
+
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     draw(this.ctx, {
       project,
       t0: this.view.t0,
       pxPerSec: this.view.pxPerSec,
       width: this.view.width,
-      height: Math.max(this.view.height, totalLanesHeight(project)),
+      // The canvas is exactly the host's size and the lane stack scrolls inside
+      // it. Handing draw a taller height than the canvas was the original bug.
+      height: this.view.height,
       playhead: this.playhead(),
       selectedClipId: this.deps.getSelected(),
       drag: this.drag,
@@ -276,6 +456,7 @@ export class TimelineController {
     cancelAnimationFrame(this.raf);
     for (const d of this.disposers) d();
     this.dropGuide?.remove();
+    this.scrollBar?.remove();
     this.canvas.remove();
   }
 }

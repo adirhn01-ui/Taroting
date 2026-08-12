@@ -9,11 +9,15 @@ import {
   checkInvariants,
   clearAnimation,
   createProject,
+  defaultAudio,
+  defaultTransform,
   detachAudio,
   findClip,
   findTrack,
   fitFillScale,
   insertClip,
+  MAX_CANVAS,
+  MIN_CANVAS,
   moveMarkerTo,
   removeClipAudio,
   removeKeyframesNear,
@@ -25,6 +29,7 @@ import {
   removeClip,
   resolvePosition,
   rippleDelete,
+  sanitizeProject,
   setClipSpeed,
   setKeyframe,
   setPositionKeyframes,
@@ -32,11 +37,12 @@ import {
   splitClip,
   topVideoTrack,
   trimClip,
+  updateClip,
   videoTracks,
 } from "./project";
 import { EPS_KF } from "./anim";
-import { clipDuration, clipEnd, rat } from "./time";
-import type { Generator, MediaInfo, ProjectFile } from "./types";
+import { clipDuration, clipEnd, fpsValue, rat, snapToFrame, timelineDuration } from "./time";
+import type { Clip, Generator, MediaInfo, ProjectFile } from "./types";
 
 const videoInfo = (duration = 60): MediaInfo => ({
   path: "C:\\media\\test video.mp4",
@@ -807,5 +813,314 @@ describe("fitFillScale", () => {
     expect(v).toBeCloseTo(1, 6);
     const f = fitFillScale(0, 0, undefined, 1920, 1080, "fill");
     expect(Number.isFinite(f)).toBe(true);
+  });
+});
+
+/**
+ * `load_project` hands the frontend the RAW json — the typed Rust struct it
+ * deserializes on the way past feeds only the missing-media scan and the recents
+ * stamp — so `de_speed` in `schema.rs` protects the EXPORT path and nothing
+ * else, and `save_project` writes the raw value back unrepaired. Every value
+ * below therefore reached `ProjectSession` unexamined, and `checkInvariants` is
+ * test-only, so nothing at runtime ever looked.
+ *
+ * The rule under test is narrow on purpose: repair values with NO honest
+ * meaning, leave legal-but-unusual ones exactly as authored. Anything repaired
+ * here is a divergence from the file on disk until the session's next write, so
+ * it is confined to values whose alternative is `inf`/`nan` reaching ffmpeg.
+ */
+describe("sanitizeProject", () => {
+  /** The single clip of `baseProject`, hand-edited to `patch` and sanitized. */
+  function withClip(patch: Partial<Clip>): { p: ProjectFile; clip: () => Clip } {
+    const { p, clipId } = baseProject();
+    const out = sanitizeProject(updateClip(p, clipId, patch));
+    return { p: out, clip: () => findClip(out, clipId)!.clip };
+  }
+
+  /* ---- the one structural repair: there must be a video track at index 0 ---- */
+
+  it("restores a video track when the timeline has none, so import cannot crash", () => {
+    // `topVideoTrack` is `tracks[0]!`. An empty array makes it undefined and the
+    // first `.id` throws — a hard crash importing a hand-edited or truncated
+    // .trt, which is this app's main threat surface.
+    const { p } = baseProject();
+    const out = sanitizeProject({ ...p, timeline: { ...p.timeline, tracks: [] } });
+    expect(out.timeline.tracks).toHaveLength(1);
+    expect(out.timeline.tracks[0]!.kind).toBe("video");
+    expect(() => topVideoTrack(out).id).not.toThrow();
+  });
+
+  it("puts a video track in front of an audio-only timeline, keeping the audio", () => {
+    // The subtler half: with only audio tracks, `tracks[0]` IS a track, so
+    // nothing throws — `topVideoTrack` just silently hands back an AUDIO track
+    // and an imported clip lands on a lane that cannot show it.
+    const { p } = baseProject();
+    const audio = { id: "a1", kind: "audio" as const, name: "Audio 1", muted: false, clips: [] };
+    const out = sanitizeProject({ ...p, timeline: { ...p.timeline, tracks: [audio] } });
+    expect(out.timeline.tracks).toHaveLength(2);
+    expect(out.timeline.tracks[0]!.kind).toBe("video");
+    expect(out.timeline.tracks[1]).toBe(audio);
+    expect(topVideoTrack(out).kind).toBe("video");
+  });
+
+  it("leaves a healthy track list untouched, by reference", () => {
+    // The repair must not cost a healthy open an allocation, and must not
+    // reorder tracks that were already correct.
+    const { p } = baseProject();
+    expect(sanitizeProject(p)).toBe(p);
+  });
+
+  /* ---- speed: the confirmed bug, and the shape of the fix ---- */
+
+  it("normalises a speed that cannot divide, exactly as de_speed does", () => {
+    for (const speed of [0, -1, -0.5, NaN, Infinity, -Infinity]) {
+      expect(withClip({ speed }).clip().speed).toBe(1);
+    }
+  });
+
+  it("gives the editor a finite clip duration for a speed:0 file", () => {
+    const { p, clip } = withClip({ speed: 0 });
+    // Before: (60 - 0) / 0 = Infinity in the editor, while the export path's
+    // typed struct saw de_speed's 1.0 and computed 60 — a silent preview/export
+    // disagreement about how long the clip is.
+    expect(clipDuration(clip())).toBe(60);
+    expect(Number.isFinite(clipEnd(clip()))).toBe(true);
+    // …and the second-order failure: an infinite timelineDuration serialises to
+    // JSON `null`, and the export dialog's estimate input types it as a number.
+    expect(JSON.parse(JSON.stringify({ d: timelineDuration(p.timeline) })).d).toBe(60);
+  });
+
+  it("leaves a legal-but-out-of-range speed alone, so it stays in step with Rust", () => {
+    // 8 is outside the editor's [0.25, 4] but works, and is what the video chain
+    // will render. Clamping it here would change a project that plays fine.
+    expect(withClip({ speed: 8 }).clip().speed).toBe(8);
+    expect(withClip({ speed: 0.1 }).clip().speed).toBe(0.1);
+  });
+
+  it("catches the one bad speed that survives Rust too: an unrepresentable duration", () => {
+    // Finite and positive, so de_speed keeps it — and (60 - 0) / 5e-324 is
+    // Infinity on both sides of the wire.
+    const { clip } = withClip({ speed: 5e-324 });
+    expect(clip().speed).toBe(1);
+    expect(Number.isFinite(clipDuration(clip()))).toBe(true);
+  });
+
+  /* ---- the other numbers that reach arithmetic or ffmpeg ---- */
+
+  it("repairs source and timeline times", () => {
+    expect(withClip({ srcIn: -5 }).clip().srcIn).toBe(0);
+    expect(withClip({ srcIn: NaN }).clip().srcIn).toBe(0);
+    expect(withClip({ timelineStart: -3 }).clip().timelineStart).toBe(0);
+    expect(withClip({ timelineStart: Infinity }).clip().timelineStart).toBe(0);
+    // srcOut must leave the clip a positive length: a reversed or infinite
+    // out-point gives clipDuration a negative or non-finite value, and both
+    // reach ffmpeg's `-t`.
+    const reversed = withClip({ srcIn: 10, srcOut: 4 }).clip();
+    expect(reversed.srcOut).toBeGreaterThan(reversed.srcIn);
+    for (const c of [
+      withClip({ srcOut: Infinity }).clip(),
+      withClip({ srcOut: NaN }).clip(),
+      withClip({ srcIn: 1e308, srcOut: NaN }).clip(), // adding a frame does not move srcIn
+      withClip({ srcIn: -Infinity, srcOut: -Infinity }).clip(),
+    ]) {
+      expect(clipDuration(c)).toBeGreaterThan(0);
+      expect(Number.isFinite(clipEnd(c))).toBe(true);
+    }
+  });
+
+  it("repairs the canvas, which u32 lets through as zero", () => {
+    const { p } = baseProject();
+    const zero = sanitizeProject({ ...p, timeline: { ...p.timeline, width: 0, height: 0 } });
+    expect(zero.timeline.width).toBe(MIN_CANVAS);
+    expect(zero.timeline.height).toBe(MIN_CANVAS);
+    const huge = sanitizeProject({
+      ...p,
+      timeline: { ...p.timeline, width: 100000, height: NaN },
+    });
+    expect(huge.timeline.width).toBe(MAX_CANVAS);
+    expect(Number.isInteger(huge.timeline.height)).toBe(true);
+    expect(huge.timeline.height % 2).toBe(0);
+  });
+
+  it("repairs an fps whose denominator is zero", () => {
+    // `Rational` is a u32 pair, so a zero den parses fine — and then fpsValue is
+    // Infinity, frameOf returns Infinity and snapToFrame returns NaN, which is
+    // the playhead, the ruler and the exporter's `-r` all at once.
+    const { p } = baseProject();
+    for (const fps of [rat(30, 0), rat(0, 1), { num: NaN, den: 1 }]) {
+      const out = sanitizeProject({ ...p, timeline: { ...p.timeline, fps } });
+      expect(fpsValue(out.timeline.fps)).toBe(30);
+      expect(Number.isFinite(snapToFrame(1.234, out.timeline.fps))).toBe(true);
+    }
+    // A legitimate NTSC rate is untouched.
+    const ntsc = sanitizeProject({ ...p, timeline: { ...p.timeline, fps: rat(30000, 1001) } });
+    expect(ntsc.timeline.fps).toEqual(rat(30000, 1001));
+  });
+
+  it("repairs keyframe times and values", () => {
+    const kfs = {
+      // one unplaceable, one uninterpolable, and a descending pair
+      x: [{ t: 0, v: 0 }, { t: NaN, v: 5 }, { t: 2, v: Infinity }, { t: 1, v: 10 }],
+      opacity: [],
+      scale: [{ t: 0, v: 1 }],
+    };
+    const out = withClip({ keyframes: kfs }).clip().keyframes!;
+    expect(out.x).toEqual([{ t: 0, v: 0 }, { t: 1, v: 10 }]);
+    // An empty array is a violation rather than an absence — writeKeyframes
+    // strips them, and a consumer that gates on truthiness alone hands one to
+    // evalKfs, which throws.
+    expect(out.opacity).toBeUndefined();
+    expect(out.scale).toEqual([{ t: 0, v: 1 }]);
+    // …and a keyframes object with nothing left in it disappears entirely.
+    expect(withClip({ keyframes: { x: [{ t: NaN, v: 1 }] } }).clip().keyframes).toBeUndefined();
+  });
+
+  it("repairs audio gains and fades", () => {
+    const a = defaultAudio();
+    // The preview graph applies Math.max(0, volume); the exporter passes the
+    // negative straight into `volume=`. That is a live preview/export
+    // disagreement, not merely an odd number.
+    expect(withClip({ audio: { ...a, volume: -2 } }).clip().audio.volume).toBe(0);
+    expect(withClip({ audio: { ...a, volume: NaN } }).clip().audio.volume).toBe(1);
+    expect(withClip({ audio: { ...a, gainOffsetDb: NaN } }).clip().audio.gainOffsetDb).toBe(0);
+    expect(withClip({ audio: { ...a, fadeInSec: -1 } }).clip().audio.fadeInSec).toBe(0);
+    expect(withClip({ audio: { ...a, fadeOutSec: Infinity } }).clip().audio.fadeOutSec).toBe(0);
+    // Both sinks multiply the pair: a GainNode THROWS on a non-finite
+    // assignment, and ffmpeg is handed the literal `inf`.
+    const loud = withClip({ audio: { ...a, gainOffsetDb: 99999 } }).clip().audio;
+    expect(Number.isFinite(loud.volume * 10 ** (loud.gainOffsetDb / 20))).toBe(true);
+    // A real Normalize result is left exactly as the scan set it.
+    expect(withClip({ audio: { ...a, gainOffsetDb: -6.2 } }).clip().audio.gainOffsetDb).toBe(-6.2);
+  });
+
+  it("repairs transform values that would print as nan in a filter graph", () => {
+    const t = defaultTransform();
+    expect(withClip({ transform: { ...t, scale: 0 } }).clip().transform!.scale).toBe(1);
+    expect(withClip({ transform: { ...t, scale: NaN } }).clip().transform!.scale).toBe(1);
+    expect(withClip({ transform: { ...t, x: Infinity } }).clip().transform!.x).toBe(0);
+    expect(withClip({ transform: { ...t, opacity: NaN } }).clip().transform!.opacity).toBe(1);
+    // `rotate` is u32 in the schema but 0|90|180|270 everywhere it is read.
+    const odd = { ...t, rotate: 37 as unknown as 0 };
+    expect(withClip({ transform: odd }).clip().transform!.rotate).toBe(0);
+    expect(withClip({ transform: { ...t, rotate: 270 } }).clip().transform!.rotate).toBe(270);
+    // A crop that cannot describe a rectangle becomes NO crop — the identity —
+    // rather than a guessed-at region.
+    const bad = { ...t, crop: { x: 0, y: 0, w: NaN, h: 100 } };
+    expect(withClip({ transform: bad }).clip().transform!.crop).toBeUndefined();
+    const good = { ...t, crop: { x: 10, y: 10, w: 100, h: 50 } };
+    expect(withClip({ transform: good }).clip().transform!.crop).toEqual(good.crop);
+  });
+
+  it("drops a marker that cannot be placed on the ruler", () => {
+    let { p } = baseProject();
+    p = addMarkerAt(p, 5).project;
+    p = addMarkerAt(p, NaN).project;
+    const out = sanitizeProject(p);
+    expect(out.timeline.markers).toHaveLength(1);
+    expect(out.timeline.markers![0]!.t).toBe(5);
+  });
+
+  it("clears a non-finite media duration, which reaches ffmpeg as a job argument", () => {
+    const { p } = baseProject();
+    const out = sanitizeProject({
+      ...p,
+      media: p.media.map((m) => ({ ...m, duration: Infinity })),
+    });
+    expect(out.media[0]!.duration).toBe(0);
+  });
+
+  /* ---- what it costs, and what it guarantees ---- */
+
+  it("returns the very same project when nothing needs repair", () => {
+    const { p } = baseProject();
+    // Reference identity, not deep equality: this runs on every project open,
+    // and ProjectSession compares references to decide whether anything changed.
+    expect(sanitizeProject(p)).toBe(p);
+    const marked = addMarkerAt(p, 5).project;
+    expect(sanitizeProject(marked)).toBe(marked);
+  });
+
+  it("leaves a repaired project passing the invariant check", () => {
+    const { p, clipId } = baseProject();
+    const hostile = updateClip(p, clipId, {
+      speed: 0,
+      srcIn: -1,
+      timelineStart: -2,
+      audio: { ...defaultAudio(), volume: NaN, fadeInSec: -1 },
+      transform: { ...defaultTransform(), scale: 0, opacity: NaN },
+      keyframes: { x: [{ t: NaN, v: 0 }] },
+    });
+    expect(checkInvariants(hostile).length).toBeGreaterThan(0);
+    expect(checkInvariants(sanitizeProject(hostile))).toEqual([]);
+  });
+});
+
+/**
+ * A drag that moves nothing must not become an undo step.
+ *
+ * `moveClip` always returned a fresh reference, and `session.commit` reads a new
+ * reference as "something changed" — so it pushed a history entry for a drag
+ * that ended exactly where it began. With snapping on that is the NORMAL outcome
+ * of nudging a clip against its neighbour, so the first Ctrl+Z after a nudge
+ * appeared to do nothing at all.
+ *
+ * The comparison has to be against the RESOLVED start, not the requested one:
+ * the two differ whenever the requested span is occupied, which is the whole
+ * reason the mutator exists.
+ */
+describe("moveClip no-op detection", () => {
+  /** One 60s media, two back-to-back clips on the video track: [0,60) [60,120). */
+  function twoClips(): { p: ProjectFile; trackId: string; aId: string; bId: string } {
+    let p = createProject("Test");
+    const added = addMedia(p, videoInfo());
+    p = added.project;
+    const trackId = p.timeline.tracks[0]!.id;
+    const a = makeClip(added.media, 0);
+    p = insertClip(p, trackId, a);
+    const b = makeClip(added.media, 60);
+    p = insertClip(p, trackId, b);
+    return { p, trackId, aId: a.id, bId: b.id };
+  }
+
+  it("returns the same project when the clip is asked for the start it already has", () => {
+    const { p, bId } = twoClips();
+    expect(moveClip(p, bId, 60)).toBe(p);
+  });
+
+  it("returns the same project when the resolved start snaps back to the current one", () => {
+    const { p, bId } = twoClips();
+    // Dragged left, into the span its neighbour occupies: resolvePosition pushes
+    // it back to 60, which is exactly where it started. This is the case that
+    // made Ctrl+Z look broken, and the one a requested-start comparison misses.
+    expect(moveClip(p, bId, 30)).toBe(p);
+    expect(moveClip(p, bId, 0)).toBe(p);
+  });
+
+  it("still moves — and still reports a change — when the resolved start differs", () => {
+    const { p, bId } = twoClips();
+    const moved = moveClip(p, bId, 100);
+    expect(moved).not.toBe(p);
+    expect(findClip(moved, bId)!.clip.timelineStart).toBe(100);
+    expectClean(moved);
+  });
+
+  it("counts a change of track at the same start as a change", () => {
+    const { p, aId } = twoClips();
+    const added = addVideoTrack(p);
+    const moved = moveClip(added.project, aId, 0, added.trackId);
+    expect(moved).not.toBe(added.project);
+    expect(findClip(moved, aId)!.track.id).toBe(added.trackId);
+    expect(findClip(moved, aId)!.clip.timelineStart).toBe(0);
+    expectClean(moved);
+  });
+
+  it("resolves the destination without letting the clip block itself", () => {
+    // The moving clip is excluded from the gap scan, so a same-track move into
+    // its own span is not treated as occupied.
+    const { p, aId } = twoClips();
+    const moved = moveClip(p, aId, 10);
+    expect(findClip(moved, aId)!.clip.timelineStart).toBe(0);
+    // …and because that resolves back to 0, it is a no-op, not a new reference.
+    expect(moved).toBe(p);
   });
 });

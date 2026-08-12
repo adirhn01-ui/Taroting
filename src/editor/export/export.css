@@ -150,6 +150,19 @@
   overflow: hidden;
 }
 .export-bar__fill {
+  /* The zero start MUST be declared here, not in the markup.
+     It used to be a `style="width:0%"` attribute, and the packaged build refuses
+     every inline style: Tauri stamps a nonce onto index.html's <style> block and
+     appends it to `style-src`, which under CSP Level 3 makes our own
+     `'unsafe-inline'` inert — a style ATTRIBUTE can never carry a nonce. With the
+     attribute dropped this is a block child with no width, i.e. `auto`, i.e.
+     100% — so the export bar rendered COMPLETELY FULL the moment the panel
+     opened and stayed there until the first progress tick.
+     Only visible in a packaged build: `npm run dev` and the in-app E2E serve HTML
+     Tauri never rewrites. See the note above colorRow in settings.ts.
+     Progress itself is written through the CSSOM (`fillEl.style.width`), which
+     the nonce policy does not gate. */
+  width: 0;
   height: 100%;
   border-radius: var(--radius-full);
   background: var(--accent);

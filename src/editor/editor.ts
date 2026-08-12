@@ -32,7 +32,7 @@ import { clipEnd, locate } from "../core/time";
 import { MEDIA_FILE_EXTENSIONS } from "../core/types";
 import type { ActionId, Clip, MediaInfo, MediaRef, ProjectFile, Track } from "../core/types";
 import { icon } from "../ui/icons";
-import { showMenu } from "../ui/menu";
+import { closeMenu, showMenu } from "../ui/menu";
 import { toast } from "../ui/toast";
 import { openExportDialog } from "./export/export-dialog";
 import { mountInspector } from "./inspector/inspector";
@@ -500,7 +500,7 @@ export async function mountEditor(
       <div class="modal" role="dialog" aria-modal="true" aria-label="Delete layer ${escapeHtml(label)}">
         <div class="modal__header">Delete layer ${escapeHtml(label)}</div>
         <div class="modal__body">
-          <div style="font-size:var(--fs-13);color:var(--text-2);line-height:1.5">Delete layer ${escapeHtml(label)} and its ${n === 1 ? "clip" : `${n} clips`}? This can be undone with Ctrl+Z.</div>
+          <div class="modal__text">Delete layer ${escapeHtml(label)} and its ${n === 1 ? "clip" : `${n} clips`}? This can be undone with Ctrl+Z.</div>
         </div>
         <div class="modal__footer">
           <button class="btn" data-act="cancel">Cancel</button>
@@ -678,8 +678,14 @@ export async function mountEditor(
         return `<span class="media-row__status media-row__status--ok">Ready</span>`;
       case "preparing": {
         const pct = s.ratio === null ? "" : ` ${Math.round(s.ratio * 100)}%`;
+        // The fill is emitted EMPTY and UNSTYLED — `paintMediaRows` sizes it
+        // immediately below. Its width cannot live here: the packaged build's
+        // style-src names a nonce (tauri stamps index.html's <style> and
+        // replace_csp_nonce rewrites the directive), which under CSP3 makes
+        // 'unsafe-inline' in that directive inert, and a style ATTRIBUTE cannot
+        // carry a nonce. Nor can it live in editor.css — width IS the progress.
         return `<span class="media-row__status">Preparing${pct}</span>
-          <div class="media-row__bar"><div style="width:${Math.round((s.ratio ?? 0.05) * 100)}%"></div></div>`;
+          <div class="media-row__bar"><div></div></div>`;
       }
       case "failed":
         return `<span class="media-row__status media-row__status--bad" title="${escapeHtml(s.message)}">Failed</span>`;
@@ -702,9 +708,15 @@ export async function mountEditor(
         if (gen) {
           name = gen.type === "text" ? gen.text || "Text" : "Solid";
           sub = gen.type;
+          // Swatch emitted empty for the same reason as the progress fill above;
+          // `paintMediaRows` fills it. And NOT via a `background: var(--accent)`
+          // style rule as a shortcut — this is a literal colour the user picked
+          // for this generator, and `html[data-rescue-appearance]` re-points the
+          // theme tokens inside some containers, which would show the escape
+          // hatch's palette instead of the pick.
           thumb =
             gen.type === "solid"
-              ? `<div class="media-row__swatch" style="background:${escapeHtml(gen.color)}"></div>`
+              ? `<div class="media-row__swatch"></div>`
               : `<span class="gen-glyph gen-glyph--lg">T</span>`;
         } else {
           name = fileStem(m.path);
@@ -724,6 +736,37 @@ export async function mountEditor(
         </div>`;
       })
       .join("");
+    paintMediaRows(items);
+  }
+
+  /**
+   * Write the two per-row values that cannot survive in the markup — the
+   * generator swatch colour and the "Preparing" bar's width — through the CSSOM,
+   * which no CSP gates. Called in the same synchronous turn as the innerHTML
+   * above, so there is never a painted frame with a blank swatch or a zero-width
+   * bar.
+   *
+   * Indexed rather than queried by id: renderMedia emits exactly one row per
+   * item in order, so `children[i]` is `items[i]` and no selector has to escape
+   * a media id.
+   */
+  function paintMediaRows(items: MediaRef[]): void {
+    const status = media.status.get();
+    const rows = mediaList.children;
+    items.forEach((m, i) => {
+      const row = rows[i];
+      if (!(row instanceof HTMLElement)) return;
+      const gen = m.generator;
+      if (gen?.type === "solid") {
+        const swatch = row.querySelector<HTMLElement>(".media-row__swatch");
+        if (swatch) swatch.style.background = gen.color;
+      }
+      const s = status[m.id];
+      if (s?.state === "preparing") {
+        const fill = row.querySelector<HTMLElement>(".media-row__bar > div");
+        if (fill) fill.style.width = `${Math.round((s.ratio ?? 0.05) * 100)}%`;
+      }
+    });
   }
 
   const unsubs = [
@@ -825,7 +868,7 @@ export async function mountEditor(
       if (gen) {
         inner =
           gen.type === "solid"
-            ? `<span class="media-drag-ghost__swatch" style="background:${escapeHtml(gen.color)}"></span>`
+            ? `<span class="media-drag-ghost__swatch"></span>`
             : `<span class="gen-glyph">T</span>`;
       } else if (thumbUrl) {
         inner = `<img src="${escapeHtml(mediaUrl(thumbUrl))}" alt="" />`;
@@ -834,6 +877,15 @@ export async function mountEditor(
       }
       const label = gen ? (gen.type === "text" ? gen.text || "Text" : "Solid") : fileStem(m.path);
       g.innerHTML = `<div class="media-drag-ghost__thumb">${inner}</div><span>${escapeHtml(label)}</span>`;
+      // The generator's literal colour, through the CSSOM and not the markup:
+      // the packaged build's style-src is a nonce policy, so a `style` attribute
+      // is refused, and a theme token would show the rescue palette rather than
+      // the user's pick. Written before the ghost is in the document, so the
+      // first frame it is ever painted in already has it.
+      if (gen?.type === "solid") {
+        const swatch = g.querySelector<HTMLElement>(".media-drag-ghost__swatch");
+        if (swatch) swatch.style.background = gen.color;
+      }
       document.body.appendChild(g);
       ghost = g;
     };
@@ -1098,7 +1150,7 @@ export async function mountEditor(
       <div class="modal" role="dialog" aria-modal="true" aria-label="Keep temporary project?">
         <div class="modal__header"><span>Keep temporary project?</span><button class="btn btn--ghost btn--icon btn--sm" data-act="cancel" title="Cancel" aria-label="Cancel">${icon("x", 14)}</button></div>
         <div class="modal__body">
-          <div style="font-size:var(--fs-13);color:var(--text-2);line-height:1.5">This project was opened as a quick view and isn't in your library yet. Keep it, or discard it? Discarding removes only this temporary copy — your media file is untouched.</div>
+          <div class="modal__text">This project was opened as a quick view and isn't in your library yet. Keep it, or discard it? Discarding removes only this temporary copy — your media file is untouched.</div>
         </div>
         <div class="modal__footer">
           <button class="btn" data-act="discard">Discard</button>
@@ -1298,6 +1350,15 @@ export async function mountEditor(
   // suppressed chord is not preventDefault()ed either: before this, pressing
   // Delete with the export dialog open silently deleted the selected clip
   // behind it, and Space started playback.
+  //
+  // THIS IS NO LONGER THE ONLY GUARD, and it is the older of the two. It only
+  // ever saw modals, because a class name is only found by something that
+  // already knows to look for it — the context menu has no backdrop, and every
+  // chord fired behind an open one (see `blockShortcuts` in core/shortcuts).
+  // Surfaces now register themselves; the manager checks the registry as well
+  // as this predicate. Keep the predicate for the dialogs above, which are not
+  // this module's to change, and DO NOT extend it with more class names — a new
+  // floating surface should take a token instead.
   const modalOpen = (): boolean => document.querySelector(".modal-backdrop") !== null;
   shortcuts.setSuppressed(modalOpen);
   const bind = (action: ActionId, handler: () => void): void => shortcuts.on(action, handler);
@@ -1353,6 +1414,12 @@ export async function mountEditor(
   return {
     async dispose() {
       disposed = true;
+      // The teardown ui/menu documents every screen owing it. The host div lives
+      // on document.body, which a route change never clears, so a menu open at
+      // teardown would survive onto the next screen still pointing at this one's
+      // callbacks — and, now that an open menu holds the keyboard, would leave
+      // the next editor's shortcuts inert until something dismissed it.
+      closeMenu();
       shortcuts.detach();
       unsubSettings();
       unTick();

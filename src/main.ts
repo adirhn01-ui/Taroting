@@ -170,6 +170,12 @@ void (async () => {
       op: "Settings",
       title: "Load",
     });
+  } else if (load.recovered) {
+    // settings.json itself was corrupt and the `.bak` supplied the preferences.
+    // Nothing is missing and nothing needs doing — but a file was silently
+    // repaired underneath the user, and the same courtesy the editor extends
+    // for a recovered project applies here.
+    toast.info("Your settings were restored from their automatic backup.");
   }
   // Atomically drain the server-side open-path queue and route each path. Safe
   // to call repeatedly: the drain returns every queued path to exactly one

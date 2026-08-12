@@ -164,6 +164,17 @@ html[data-custom-theme] .settings__segmented .btn--on {
   font-size: var(--fs-12);
   color: var(--text-2);
 }
+/* NO `background` HERE, AND THE ELEMENT IS NOT SELF-SUFFICIENT.
+   The fill is the user's literal pick, written per element from the store by
+   paintColorButton in settings.ts. It cannot come from this stylesheet:
+     * `var(--accent)` / `var(--text-1)` look right and are wrong — the
+       data-rescue-appearance block below re-points both at the fixed --safe-*
+       palette INSIDE this card, so the swatches would stop showing the picks;
+     * an inline `style` attribute in the markup is refused outright by the
+       packaged app's CSP (see the long note above colorRow in settings.ts).
+   A swatch with no JS behind it is therefore an EMPTY BOX, which is exactly the
+   bug this replaced. The --border-strong outline is what keeps it findable when
+   the fill matches the card. */
 .settings__color-swatch {
   width: 16px;
   height: 16px;

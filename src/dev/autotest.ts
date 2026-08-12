@@ -2013,6 +2013,91 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       }
     });
 
+    /* ---------------- shared colour measurement ----------------
+     *
+     * Every theme block below measures with THESE, not with a private copy. A
+     * second, slightly different `parse` or `bgUnder` is how two blocks end up
+     * disagreeing about the same pixel and one of them quietly stops testing
+     * anything — and `bgUnder` in particular is the difference between a real
+     * number and a meaningless one, so there is exactly one of it.
+     */
+
+    const root = document.documentElement;
+    const tok = (name: string): string => getComputedStyle(root).getPropertyValue(name).trim();
+
+    interface Rgba {
+      rgb: number[];
+      a: number;
+    }
+    /** A computed custom property comes back as rgb(...) or #rrggbb depending
+     *  on how it was written, and a computed color/background-color as
+     *  rgb()/rgba() — so everything is compared as parsed channels. */
+    const parse = (s: string): Rgba => {
+      const t = s.trim();
+      if (t.startsWith("#")) {
+        const b = t.slice(1);
+        const h = b.length === 3 ? b.split("").map((c) => c + c).join("") : b;
+        return { rgb: [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)), a: 1 };
+      }
+      const n = t.match(/-?[\d.]+/g);
+      if (!n || n.length < 3) return { rgb: [0, 0, 0], a: 0 };
+      return { rgb: n.slice(0, 3).map(Number), a: n.length > 3 ? Number(n[3]) : 1 };
+    };
+    const chan = (s: string): number[] => parse(s).rgb;
+    /** The real WCAG 2.1 relative luminance, gamma-corrected — NOT a channel
+     *  average. An earlier version of this block averaged channels, which
+     *  measures nothing: it calls #0000ff and #808080 equally bright. */
+    const lum = (c: number[]): number => {
+      const f = (v: number): number => {
+        const x = v / 255;
+        return x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+      };
+      return 0.2126 * f(c[0]!) + 0.7152 * f(c[1]!) + 0.0722 * f(c[2]!);
+    };
+    const ratio = (a: number[], b: number[]): number => {
+      const la = lum(a);
+      const lb = lum(b);
+      return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+    };
+    /** Same colour, allowing one channel step for a hex/rgb round trip. Any
+     *  contrast clamp moves a colour very much further than that. */
+    const same = (got: string, want: string): boolean => {
+      const g = chan(got);
+      const w = chan(want);
+      return g.length === 3 && w.every((c, i) => Math.abs(c - g[i]!) <= 1);
+    };
+    /** The largest single-channel gap between two colours, in 0..255 steps.
+     *  Contrast ratio is the right instrument for ink-on-surface and the wrong
+     *  one for "are these two FILLS different": a 15% accent tint over its own
+     *  track can be plainly visible and still measure 1.05:1, because the two
+     *  differ mostly in hue. This is what "you can see that one is selected"
+     *  actually reduces to for a flat fill. */
+    const maxDelta = (a: number[], b: number[]): number =>
+      Math.max(...a.map((v, i) => Math.abs(v - (b[i] ?? 0))));
+    /** What a run of text is REALLY drawn on: walk up the tree compositing
+     *  every translucent layer onto the first opaque one. Reading
+     *  background-color off the text element alone returns rgba(0,0,0,0) on
+     *  nearly every element in this app and would score a meaningless ratio. */
+    const bgUnder = (el: HTMLElement): number[] => {
+      const layers: Rgba[] = [];
+      for (let n: HTMLElement | null = el; n; n = n.parentElement) {
+        const p = parse(getComputedStyle(n).backgroundColor);
+        if (p.a <= 0) continue;
+        layers.push(p);
+        if (p.a >= 0.999) break;
+      }
+      // Nothing opaque all the way to the root: the canvas underneath is white.
+      let out =
+        layers.length > 0 && layers[layers.length - 1]!.a >= 0.999
+          ? layers.pop()!.rgb
+          : [255, 255, 255];
+      for (let i = layers.length - 1; i >= 0; i--) {
+        const l = layers[i]!;
+        out = out.map((v, k) => l.rgb[k]! * l.a + v * (1 - l.a));
+      }
+      return out;
+    };
+
     // Custom theme: assert the tokens the whole app reads ACTUALLY change, not
     // that a setting was stored. A custom theme that persists but never repaints
     // would pass any state-level check while being completely broken.
@@ -2044,79 +2129,10 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     await test("custom-theme-applies", async () => {
       const { NAV_RESCUE_RATIO, settingsStore, updateSettings } = await import("../core/session");
       const before = settingsStore.get();
-      const root = document.documentElement;
-      const tok = (name: string): string => getComputedStyle(root).getPropertyValue(name).trim();
       assert(
         tok("--accent") !== "" && tok("--bg-app") !== "",
         "theme tokens must resolve before we start",
       );
-
-      /* ---------------- colour maths ---------------- */
-
-      interface Rgba {
-        rgb: number[];
-        a: number;
-      }
-      /** A computed custom property comes back as rgb(...) or #rrggbb depending
-       *  on how it was written, and a computed color/background-color as
-       *  rgb()/rgba() — so everything is compared as parsed channels. */
-      const parse = (s: string): Rgba => {
-        const t = s.trim();
-        if (t.startsWith("#")) {
-          const b = t.slice(1);
-          const h = b.length === 3 ? b.split("").map((c) => c + c).join("") : b;
-          return { rgb: [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)), a: 1 };
-        }
-        const n = t.match(/-?[\d.]+/g);
-        if (!n || n.length < 3) return { rgb: [0, 0, 0], a: 0 };
-        return { rgb: n.slice(0, 3).map(Number), a: n.length > 3 ? Number(n[3]) : 1 };
-      };
-      const chan = (s: string): number[] => parse(s).rgb;
-      /** The real WCAG 2.1 relative luminance, gamma-corrected — NOT a channel
-       *  average. An earlier version of this block averaged channels, which
-       *  measures nothing: it calls #0000ff and #808080 equally bright. */
-      const lum = (c: number[]): number => {
-        const f = (v: number): number => {
-          const x = v / 255;
-          return x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
-        };
-        return 0.2126 * f(c[0]!) + 0.7152 * f(c[1]!) + 0.0722 * f(c[2]!);
-      };
-      const ratio = (a: number[], b: number[]): number => {
-        const la = lum(a);
-        const lb = lum(b);
-        return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
-      };
-      /** Same colour, allowing one channel step for a hex/rgb round trip. Any
-       *  contrast clamp moves a colour very much further than that. */
-      const same = (got: string, want: string): boolean => {
-        const g = chan(got);
-        const w = chan(want);
-        return g.length === 3 && w.every((c, i) => Math.abs(c - g[i]!) <= 1);
-      };
-      /** What a run of text is REALLY drawn on: walk up the tree compositing
-       *  every translucent layer onto the first opaque one. Reading
-       *  background-color off the text element alone returns rgba(0,0,0,0) on
-       *  nearly every element in this app and would score a meaningless ratio. */
-      const bgUnder = (el: HTMLElement): number[] => {
-        const layers: Rgba[] = [];
-        for (let n: HTMLElement | null = el; n; n = n.parentElement) {
-          const p = parse(getComputedStyle(n).backgroundColor);
-          if (p.a <= 0) continue;
-          layers.push(p);
-          if (p.a >= 0.999) break;
-        }
-        // Nothing opaque all the way to the root: the canvas underneath is white.
-        let out =
-          layers.length > 0 && layers[layers.length - 1]!.a >= 0.999
-            ? layers.pop()!.rgb
-            : [255, 255, 255];
-        for (let i = layers.length - 1; i >= 0; i--) {
-          const l = layers[i]!;
-          out = out.map((v, k) => l.rgb[k]! * l.a + v * (1 - l.a));
-        }
-        return out;
-      };
 
       /* ---------------- fixtures ---------------- */
 
@@ -2711,6 +2727,587 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         } catch {
           // The repaint already happened. A failed disk write must not mask the
           // assertion failure that sent us here.
+        }
+        navigate({ view: "home" });
+      }
+    });
+
+    /* ---------------- settings across a navigation round trip ----------------
+     *
+     * WHY THIS EXISTS, and what it is for. The owner set a custom theme, went
+     * home, came back to Settings, and the colour swatches were EMPTY — the hex
+     * captions beside them still correct. Reported twice. 708 TS tests, 173 Rust
+     * tests and thirty E2E blocks saw none of it, and the reason is exactly one
+     * gap: not one of them ever left the Settings screen and came back.
+     * `custom-theme-applies` above sets a theme and measures what it paints, but
+     * it measures the screen it is standing on. Nothing anywhere asserted that
+     * what is RENDERED after a re-mount still equals what is STORED.
+     *
+     * So the two blocks below do only that, and they compare three things that
+     * have to agree WITH EACH OTHER rather than each with a constant:
+     *
+     *   swatch   the COMPUTED background-color of .settings__color-swatch.
+     *            Deliberately not the style attribute (that is the string we
+     *            wrote, which reads perfectly on a swatch the compositor is
+     *            drawing nothing for) and not innerHTML (that is markup, not
+     *            paint). The reported symptom is rgba(0, 0, 0, 0) here.
+     *   caption  the .mono hex beside it — which in the report was RIGHT, which
+     *            is precisely why a one-sided assertion would have shipped past
+     *            this bug without a murmur.
+     *   store    settingsStore.get().customTheme, what the app believes.
+     *
+     * …plus a fourth read that is not in the DOM at all: settings.json, through
+     * the same ipc the app uses. A theme that repaints and is never written is
+     * the other half of what the owner described, and it is invisible until the
+     * next launch.
+     *
+     * WHAT THESE BLOCKS CANNOT DO, stated up front so nobody trusts them for it.
+     * The original fault was Tauri's CSP refusing the swatch's inline `style`
+     * ATTRIBUTE in a PACKAGED build — see the long note above `colorRow` in
+     * settings/settings.ts. This harness runs against Vite's dev server, which
+     * Tauri never rewrites, so an inline style attribute is honoured here and the
+     * original defect is not reproducible in the E2E at all, by these blocks or
+     * by any others. That invariant ("no colour reaches a swatch through the
+     * markup") is a property of the emitted string and belongs in a unit test
+     * against the now-exported, pure `colorRow`.
+     *
+     * What IS pinned here is the shape the fix left behind, which is the part
+     * that regresses in dev exactly as it would in a shipped build: the swatch is
+     * emitted empty and filled from the store on EVERY render, so dropping that
+     * repaint — the single most likely way this bug comes back — leaves an empty
+     * swatch beside a correct caption in dev too, and section 4 below proves that
+     * is what these assertions go red on.
+     */
+
+    const THEME_ROLES = ["background", "accent", "text"] as const;
+    type ThemeRole = (typeof THEME_ROLES)[number];
+
+    /** The picks both round-trip blocks use.
+     *
+     *  A plum background, a mint accent and a cream text: pairwise MILES apart
+     *  in every channel, and that is the whole point. If any two coincided, a
+     *  swatch painted from the wrong role would still look correct — this
+     *  project's documented way of making a bug invisible — so the fixture
+     *  self-check below refuses to let anyone quietly tidy them together.
+     *
+     *  (Nothing here needs to be checked against DEFAULT_CUSTOM_THEME: `same`
+     *  allows one channel step, so a default leaking through already fails the
+     *  exact-match assertions. What those CANNOT catch is one role standing in
+     *  for another, which is what the pairwise check covers.)
+     *
+     *  Chosen so no rescue flag fires — see the assertions in
+     *  `checkSelectedSegment` — because a rescued Appearance card is painted
+     *  from the fixed --safe-* palette, and every prediction below is read off
+     *  the user's own tokens. */
+    const TRIP: Record<ThemeRole, string> = {
+      background: "#2a1420",
+      accent: "#4fd6a8",
+      text: "#f0e3c8",
+    };
+
+    /** One channel step: a hex/rgb round trip, and nothing else. */
+    const SEG_SAME = 1;
+    /** How far apart the selected segment's fill and an unselected one have to
+     *  be before the control is telling the user anything. TRIP measures ~28
+     *  steps at rest and ~21 under the pointer, so this is a floor with real
+     *  room under it rather than a restatement of the measurement. */
+    const SEG_FILL_MIN_DELTA = 10;
+
+    const need = <T extends HTMLElement>(sel: string): T => {
+      const el = document.querySelector<T>(sel);
+      assert(el !== null, `expected ${sel} to be in the document and it is not`);
+      return el!;
+    };
+
+    /** The three-way agreement, on whatever Settings is showing RIGHT NOW.
+     *  Everything is re-queried, never captured: each settings write notifies
+     *  the store, which rebuilds these nodes underneath. Throws on the first
+     *  disagreement; returns what it measured so the report carries the values
+     *  and not the word "ok". */
+    const checkRows = (
+      want: Record<ThemeRole, string>,
+      stored: Record<ThemeRole, string>,
+      where: string,
+    ): string => {
+      const parts: string[] = [];
+      for (const role of THEME_ROLES) {
+        const btn = document.querySelector<HTMLElement>(`#settings-color-${role}`);
+        assert(btn !== null, `${where}: the ${role} colour row is not in the DOM at all`);
+        assert(
+          btn!.offsetParent !== null && btn!.getClientRects().length > 0,
+          `${where}: the ${role} colour row is in the DOM but not rendered`,
+        );
+        const swatch = btn!.querySelector<HTMLElement>(".settings__color-swatch");
+        const caption = btn!.querySelector<HTMLElement>(".mono");
+        assert(
+          swatch !== null && caption !== null,
+          `${where}: the ${role} row lost its swatch or its hex caption`,
+        );
+        const box = swatch!.getBoundingClientRect();
+        assert(
+          swatch!.offsetParent !== null && box.width > 0 && box.height > 0,
+          `${where}: the ${role} swatch has no box — there is nothing to paint`,
+        );
+        const painted = getComputedStyle(swatch!).backgroundColor;
+        const alpha = parse(painted).a;
+        // THE REPORTED SYMPTOM, called by its name so the report says it.
+        assert(
+          alpha >= 0.999,
+          `${where}: the ${role} swatch is EMPTY — its computed background-color is ${painted}. This is the bug that was reported twice.`,
+        );
+        assert(
+          same(painted, want[role]),
+          `${where}: the ${role} swatch is painted ${painted}, not the pick ${want[role]}`,
+        );
+        const shown = (caption!.textContent ?? "").trim().toLowerCase();
+        assert(
+          shown === want[role],
+          `${where}: the ${role} caption reads "${shown}", not the pick ${want[role]}`,
+        );
+        const held = (stored[role] ?? "").trim().toLowerCase();
+        assert(
+          held === want[role],
+          `${where}: the store holds ${role} ${held || "(nothing)"}, not the pick ${want[role]}`,
+        );
+        // …and now the three against EACH OTHER. The reported state is a right
+        // caption beside a wrong swatch, so agreeing with a constant is not the
+        // same question and would not have caught it.
+        assert(
+          same(painted, shown) && shown === held,
+          `${where}: the ${role} row disagrees with itself — swatch ${painted}, caption ${shown}, store ${held}`,
+        );
+        // The fourth copy of the same value, and the only one a screen-reader
+        // user gets: the swatch is decorative to them, the label is the colour.
+        const aria = (btn!.getAttribute("aria-label") ?? "").toLowerCase();
+        assert(
+          aria.includes(want[role]),
+          `${where}: the ${role} button's accessible name is "${aria}", which never mentions ${want[role]}`,
+        );
+        // Really on screen and really on top. A swatch sitting behind a sibling
+        // measures perfectly and shows the user nothing.
+        const hit = document.elementFromPoint(
+          Math.round(box.left + box.width / 2),
+          Math.round(box.top + box.height / 2),
+        );
+        assert(
+          hit !== null && (hit === swatch! || swatch!.contains(hit) || btn!.contains(hit)),
+          `${where}: the ${role} swatch is rendered but something else hit-tests at its centre`,
+        );
+        parts.push(`${role} ${painted} == ${shown}`);
+      }
+      return parts.join(", ");
+    };
+
+    /** The theme control's SELECTED state, measured rather than assumed.
+     *
+     *  Under a custom theme the live option is filled with --accent-dim —
+     *  `html[data-custom-theme] .settings__segmented .btn--on` in settings.css —
+     *  while the unselected ones sit on the bare segmented track. That fill is
+     *  the signal that survives an arbitrary accent: the ink alone (
+     *  --accent-strong against --text-1) can be almost nothing, and for TRIP it
+     *  IS almost nothing, which is asserted below so the fill assertions stay
+     *  load-bearing.
+     *
+     *  DELIBERATELY NOT ASSERTED FOR DARK AND LIGHT. The fill is scoped to
+     *  custom themes on purpose — the shipped palettes keep the ink-only
+     *  treatment they ship with — so pinning the same thing there would pin the
+     *  opposite of what the CSS says. */
+    const checkSelectedSegment = (where: string): string => {
+      const opts = Array.from(document.querySelectorAll<HTMLElement>("[data-theme-opt]"));
+      assert(opts.length >= 2, `${where}: the theme control is not rendered`);
+      const on = opts.filter((o) => o.classList.contains("btn--on"));
+      assert(
+        on.length === 1 && on[0]!.dataset.themeOpt === "custom",
+        `${where}: ${on.length} theme options are marked selected (${on.map((o) => String(o.dataset.themeOpt)).join(", ") || "none"}) — expected exactly Custom`,
+      );
+      const sel = on[0]!;
+      assert(
+        sel.offsetParent !== null && sel.getClientRects().length > 0,
+        `${where}: the selected theme option is in the DOM but not rendered`,
+      );
+      // The fill only exists while this is stamped, so a lost flag would make
+      // every measurement below a measurement of the wrong thing — and the flag
+      // is written by applyTheme, which navigation does NOT re-run.
+      assert(
+        root.dataset.customTheme === "1",
+        `${where}: data-custom-theme is not stamped, so the selected option's fill cannot apply at all`,
+      );
+      // …and every escape hatch must be OFF, or the card is painted from the
+      // fixed --safe-* palette while the predictions below are read off the
+      // user's own tokens.
+      assert(
+        root.dataset.rescueAppearance === undefined &&
+          root.dataset.rescueNav === undefined &&
+          root.dataset.rescueChrome === undefined,
+        `${where}: fixture drifted — this theme fired a rescue (appearance ${String(root.dataset.rescueAppearance)}, nav ${String(root.dataset.rescueNav)}, chrome ${String(root.dataset.rescueChrome)}), so the segment is being read in the safe palette and not the user's`,
+      );
+
+      const dim = parse(tok("--accent-dim"));
+      const trackRest = chan(tok("--bg-input"));
+      const trackHover = chan(tok("--bg-hover"));
+      const predicted = trackRest.map((v, i) => dim.rgb[i]! * dim.a + v * (1 - dim.a));
+      const selFill = bgUnder(sel);
+      assert(
+        maxDelta(selFill, predicted) <= SEG_SAME,
+        `${where}: the selected option is filled ${selFill.map(Math.round).join(",")}, not the --accent-dim over --bg-input this theme predicts (${predicted.map(Math.round).join(",")}) — the html[data-custom-theme] fill is not landing`,
+      );
+      // Fixture self-check. If --accent-dim's alpha or the accent itself ever
+      // drifts toward the track, the separation assertions stop separating.
+      const headroom = maxDelta(predicted, trackRest);
+      assert(
+        headroom >= SEG_FILL_MIN_DELTA * 1.8,
+        `fixture drifted: the selected fill is only ${headroom.toFixed(1)} channel steps off the bare track, too near the floor to be a real test`,
+      );
+
+      const selInk = getComputedStyle(sel).color;
+      assert(
+        same(selInk, tok("--accent-strong")),
+        `${where}: the selected option's ink is ${selInk}, not --accent-strong ${tok("--accent-strong")}`,
+      );
+      const states: string[] = [];
+      for (const u of opts) {
+        if (u === sel) continue;
+        assert(
+          u.offsetParent !== null && u.getClientRects().length > 0,
+          `${where}: the ${String(u.dataset.themeOpt)} option is not rendered`,
+        );
+        const uFill = bgUnder(u);
+        // Two legitimate resting states, exactly as in custom-theme-applies: the
+        // harness clicks by dispatching events and never moves the mouse, so
+        // whichever option the pointer happens to sit over gets --bg-hover
+        // instead of the bare track. (The SELECTED one has no such ambiguity
+        // under a custom theme — its at-rest rule and its :hover rule are both
+        // --accent-dim.)
+        const state =
+          maxDelta(uFill, trackRest) <= SEG_SAME
+            ? "at rest"
+            : maxDelta(uFill, trackHover) <= SEG_SAME
+              ? "hovered"
+              : "neither";
+        assert(
+          state !== "neither",
+          `${where}: the ${String(u.dataset.themeOpt)} option is filled ${uFill.map(Math.round).join(",")}, which is neither the track (${trackRest.join(",")}) nor its hover shade (${trackHover.join(",")}) — the segmented control's cascade changed`,
+        );
+        const gap = maxDelta(selFill, uFill);
+        assert(
+          gap >= SEG_FILL_MIN_DELTA,
+          `${where}: the selected option and ${String(u.dataset.themeOpt)} are painted only ${gap.toFixed(1)} channel steps apart (${state}) — the user cannot see which theme is active`,
+        );
+        assert(
+          same(getComputedStyle(u).color, tok("--text-1")),
+          `${where}: the unselected ${String(u.dataset.themeOpt)} option's ink is ${getComputedStyle(u).color}, not --text-1 ${tok("--text-1")}`,
+        );
+        states.push(`${String(u.dataset.themeOpt)} ${gap.toFixed(0)} steps ${state}`);
+      }
+      // The ink must NOT be what is carrying "selected" here — that is the whole
+      // reason the fill rule exists (settings.css: a dull accent draws the live
+      // option FAINTER than the ones you can pick). If a future fixture makes
+      // the two inks obviously different, everything above stops being
+      // load-bearing and this is what says so.
+      const inkRatio = ratio(chan(tok("--accent-strong")), chan(tok("--text-1")));
+      assert(
+        inkRatio < 1.6,
+        `fixture drifted: the selected ink and the unselected ink are ${inkRatio.toFixed(2)}:1 apart, so ink alone already says which option is live and the fill is no longer what is under test`,
+      );
+      // …and it still has to be a control someone can READ: WCAG 2.1 SC 1.4.11's
+      // UI-component floor, measured on the fill it is actually drawn on.
+      const selReadable = ratio(chan(selInk), selFill);
+      assert(
+        selReadable >= 3,
+        `${where}: the selected option's label is only ${selReadable.toFixed(2)}:1 on its own fill`,
+      );
+      return `selected fill ${selFill.map(Math.round).join(",")} vs ${states.join(" / ")}; its ink reads ${selReadable.toFixed(2)}:1 on that fill and is only ${inkRatio.toFixed(2)}:1 from the unselected ink, so the fill is the signal`;
+    };
+
+    /** PERSISTENCE, not paint. `get_settings` re-reads settings.json from disk
+     *  on every call, so this is a genuine file round trip and not the store
+     *  wearing a different hat. A write that repainted and never landed looks
+     *  identical on screen until the next launch — the other half of what the
+     *  owner described. */
+    const checkOnDisk = async (want: Record<ThemeRole, string>): Promise<string> => {
+      const onDisk = await ipc.getSettings();
+      assert(
+        onDisk !== null,
+        "ipc.getSettings() came back empty — nothing reached settings.json at all",
+      );
+      assert(
+        onDisk!.theme === "custom",
+        `settings.json says theme "${String(onDisk!.theme)}", not "custom" — the theme repainted but was never persisted`,
+      );
+      // settings.json is opaque to the backend (serde_json::Value), so nothing
+      // read back is trusted to be the shape the type claims.
+      const stored = onDisk!.customTheme as Partial<Record<ThemeRole, unknown>> | null | undefined;
+      assert(!!stored, "settings.json carries no customTheme block");
+      for (const role of THEME_ROLES) {
+        const got = String(stored![role] ?? "").trim().toLowerCase();
+        assert(
+          got === want[role],
+          `settings.json holds ${role} ${got || "(nothing)"}, not the pick ${want[role]}`,
+        );
+      }
+      return `theme "custom" + ${THEME_ROLES.map((r) => `${r} ${want[r]}`).join(" / ")}`;
+    };
+
+    /** Prove the guard can actually go red, on the live DOM, every run.
+     *
+     *  A block that cannot fail is worse than no block, and this one guards a
+     *  bug that walked past 708 unit tests and thirty E2E blocks — so "it
+     *  passes" is not evidence of anything on its own. `mutate` reproduces a
+     *  real fault and hands back its own undo; the checker MUST throw; the DOM
+     *  is put back and re-checked before anything else runs, so a self-check
+     *  that failed to restore cannot poison every assertion after it. */
+    const mustFail = (what: string, mutate: () => () => void, check: () => void): void => {
+      const undo = mutate();
+      let threw = false;
+      try {
+        check();
+      } catch {
+        threw = true;
+      } finally {
+        undo();
+      }
+      assert(threw, `the check does NOT fail when ${what} — it is not testing anything`);
+      check();
+    };
+
+    // THE OWNER'S REPRO, in one block: Settings → home → Settings, in and out
+    // through the real Back button and the real gear rather than through
+    // navigate(), so the router, both dispose() paths and the re-mount are all
+    // exercised the way a user gets them.
+    await test("custom-theme-survives-home-round-trip", async () => {
+      const { settingsStore, updateSettings } = await import("../core/session");
+      const before = settingsStore.get();
+
+      // Fixture self-check, before anything is applied: three picks that cannot
+      // stand in for one another. 60 steps is far past "different colour"; TRIP
+      // is 161 apart at its closest pair.
+      for (let i = 0; i < THEME_ROLES.length; i++) {
+        for (let j = i + 1; j < THEME_ROLES.length; j++) {
+          const a = THEME_ROLES[i]!;
+          const b = THEME_ROLES[j]!;
+          const d = maxDelta(chan(TRIP[a]), chan(TRIP[b]));
+          assert(
+            d >= 60,
+            `fixture no longer tests anything: ${a} ${TRIP[a]} and ${b} ${TRIP[b]} are ${d} channel steps apart, so a swatch painted from the wrong role would still look right`,
+          );
+        }
+      }
+
+      try {
+        /* ---- 1. apply it, from the screen it is applied from ---- */
+
+        navigate({ view: "settings" });
+        const firstInner = await waitFor(
+          () => document.querySelector<HTMLElement>("#settings-inner"),
+          10_000,
+          "the Settings screen",
+        );
+        await updateSettings({ theme: "custom", customTheme: { ...TRIP } });
+        await waitFor(
+          () => (same(tok("--bg-app"), TRIP.background) ? true : null),
+          5_000,
+          "the round-trip theme to paint",
+        );
+        // Measured BEFORE the trip as well, so that a failure after it can only
+        // be the trip's doing and the report says which side broke.
+        const beforeTrip = checkRows(TRIP, settingsStore.get().customTheme, "before the round trip");
+
+        /* ---- 2. leave, and come back ---- */
+
+        need<HTMLElement>("#settings-back").click();
+        const gear = await waitFor(
+          () => document.querySelector<HTMLElement>("#home-settings"),
+          10_000,
+          "the home Settings gear",
+        );
+        // The screen really was torn down. Without this the whole block could be
+        // re-measuring the nodes it already measured and passing for free.
+        assert(
+          !document.contains(firstInner),
+          "home is showing but the old Settings DOM is still in the document — nothing below would be testing a re-render",
+        );
+        gear.click();
+        // #settings-inner is built by mountSettings and NOT by render(), so a
+        // new one means a real re-mount and not merely a store notification.
+        await waitFor(
+          () => {
+            const el = document.querySelector<HTMLElement>("#settings-inner");
+            return el && el !== firstInner ? el : null;
+          },
+          10_000,
+          "Settings to re-mount",
+        );
+
+        /* ---- 3. what is painted still equals what is stored ---- */
+
+        const afterTrip = checkRows(TRIP, settingsStore.get().customTheme, "after home → Settings");
+
+        /* ---- 4. …and that check is proven to go red ---- */
+
+        const recheck = (): void => {
+          checkRows(TRIP, settingsStore.get().customTheme, "self-check");
+        };
+        // 4a. THE REPORTED FAULT: an empty swatch beside a correct caption.
+        mustFail(
+          "the background swatch's fill is removed (the reported bug)",
+          () => {
+            const el = need<HTMLElement>("#settings-color-background .settings__color-swatch");
+            const had = el.style.background;
+            el.style.background = "";
+            return () => {
+              el.style.background = had;
+            };
+          },
+          recheck,
+        );
+        // 4b. One role's colour standing in for another's — the failure that is
+        //     invisible to any fixture whose picks coincide.
+        mustFail(
+          "the accent swatch is painted with the background colour",
+          () => {
+            const el = need<HTMLElement>("#settings-color-accent .settings__color-swatch");
+            const had = el.style.background;
+            el.style.background = TRIP.background;
+            return () => {
+              el.style.background = had;
+            };
+          },
+          recheck,
+        );
+        // 4c. The other side of the three-way: a caption disagreeing with a
+        //     perfectly good swatch.
+        mustFail(
+          "the text row's hex caption is rewritten",
+          () => {
+            const el = need<HTMLElement>("#settings-color-text .mono");
+            const had = el.textContent ?? "";
+            el.textContent = "#000000";
+            return () => {
+              el.textContent = had;
+            };
+          },
+          recheck,
+        );
+
+        /* ---- 5. the theme control still says which theme is live ---- */
+
+        const seg = checkSelectedSegment("after home → Settings");
+
+        /* ---- 6. and it is on disk, not just in the store ---- */
+
+        const disk = await checkOnDisk(TRIP);
+
+        return `Settings → home → Settings via the real Back and gear: ${afterTrip} (unchanged from ${beforeTrip}); ${seg}; persisted ${disk}; and the guard was proven red on a blanked swatch, a swatch painted from the wrong role, and a rewritten caption`;
+      } finally {
+        // Never leave the owner's real theme changed by a test run. Nothing
+        // clamps any more, so a leaked theme is a genuinely unusable app. The
+        // repaint inside updateSettings is synchronous; the await is only so the
+        // restore is the LAST write to settings.json.
+        try {
+          await updateSettings({ theme: before.theme, customTheme: before.customTheme });
+        } catch {
+          // The repaint already happened. A failed disk write must not mask the
+          // assertion failure that sent us here.
+        }
+        navigate({ view: "home" });
+      }
+    });
+
+    // The same round trip through the EDITOR. The router tears every screen down
+    // the same way, but the editor's dispose() is by far the heaviest in the app
+    // — playback engine, audio graph, media manager, timeline controller and the
+    // project session all go down together, and any one of them clearing
+    // something off <html> takes the theme with it. The owner's repro went
+    // through home, which is the block above; this is the harder teardown, and
+    // the one a user is actually standing in when they go to Settings to change
+    // a colour without closing their project.
+    await test("custom-theme-survives-editor-round-trip", async () => {
+      const { settingsStore, updateSettings } = await import("../core/session");
+      const before = settingsStore.get();
+      try {
+        navigate({ view: "settings" });
+        await waitFor(
+          () => document.querySelector<HTMLElement>("#settings-inner"),
+          10_000,
+          "the Settings screen",
+        );
+        await updateSettings({ theme: "custom", customTheme: { ...TRIP } });
+        await waitFor(
+          () => (same(tok("--bg-app"), TRIP.background) ? true : null),
+          5_000,
+          "the round-trip theme to paint",
+        );
+        const firstInner = need<HTMLElement>("#settings-inner");
+        const beforeTrip = checkRows(
+          TRIP,
+          settingsStore.get().customTheme,
+          "before the editor round trip",
+        );
+
+        /* ---- into the project, and back out through the editor's own gear ---- */
+
+        // A fresh dev hook is mountEditor's own completion signal — the previous
+        // one is still on window from the top of this run, so presence alone
+        // would resolve instantly against a screen that no longer exists.
+        const prevHook = (window as unknown as { __tarotingDev?: DevHook }).__tarotingDev;
+        navigate({ view: "editor", projectPath });
+        await waitFor(
+          () => {
+            const h = (window as unknown as { __tarotingDev?: DevHook }).__tarotingDev;
+            return h && h !== prevHook ? h : null;
+          },
+          // mountEditor awaits only loadProject and media.init() (a listener
+          // registration) before it paints — ensureAll runs in the background —
+          // so this should land in well under a second. Kept tight on purpose:
+          // the whole run shares one 90s budget, and a generous wait here would
+          // spend it on the one path where nothing is going to arrive anyway.
+          15_000,
+          "the editor to re-mount",
+        );
+        assert(
+          !document.contains(firstInner),
+          "the editor is up but the old Settings DOM is still in the document — nothing below would be testing a re-render",
+        );
+        // Asserted here rather than only at the end: if the theme is dropped by
+        // the navigation INTO the editor, the report should say so happened on
+        // the way in and not leave it looking like a re-render fault.
+        assert(
+          root.dataset.customTheme === "1" && same(tok("--bg-app"), TRIP.background),
+          `the custom theme was lost on the way into the editor: --bg-app is ${tok("--bg-app")}, data-custom-theme ${String(root.dataset.customTheme)}`,
+        );
+        const edGear = await waitFor(
+          () => document.querySelector<HTMLElement>("#ed-settings"),
+          10_000,
+          "the editor's Settings gear",
+        );
+        assert(
+          edGear.offsetParent !== null && edGear.getClientRects().length > 0,
+          "the editor's Settings gear is in the DOM but not rendered",
+        );
+        edGear.click();
+        await waitFor(
+          () => {
+            const el = document.querySelector<HTMLElement>("#settings-inner");
+            return el && el !== firstInner ? el : null;
+          },
+          15_000,
+          "Settings to re-mount after the editor",
+        );
+
+        const afterTrip = checkRows(
+          TRIP,
+          settingsStore.get().customTheme,
+          "after editor → Settings",
+        );
+        const seg = checkSelectedSegment("after editor → Settings");
+        const disk = await checkOnDisk(TRIP);
+
+        return `Settings → editor → Settings via the editor's own gear (the heaviest teardown in the app): ${afterTrip} (unchanged from ${beforeTrip}); ${seg}; persisted ${disk}`;
+      } finally {
+        try {
+          await updateSettings({ theme: before.theme, customTheme: before.customTheme });
+        } catch {
+          // As above: a failed disk write must not mask a real failure.
         }
         navigate({ view: "home" });
       }

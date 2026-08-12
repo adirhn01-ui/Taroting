@@ -14,6 +14,7 @@ import type {
   AnimProp,
   Clip,
   ClipAudio,
+  ClipCrop,
   ClipKeyframes,
   ClipTransform,
   Generator,
@@ -22,6 +23,7 @@ import type {
   MediaInfo,
   MediaRef,
   ProjectFile,
+  Rational,
   Track,
 } from "./types";
 import { DEFAULT_EXPORT_PRESET } from "./types";
@@ -258,7 +260,24 @@ export function insertClip(p: ProjectFile, trackId: string, clip: Clip): Project
   });
 }
 
-/** Move a clip within its track (or to another track of the same kind). */
+/** Move a clip within its track (or to another track of the same kind).
+ *
+ *  Returns `p` UNCHANGED when the clip already sits on the destination track at
+ *  the resolved start — the same no-change signal `insertClip`, `trimClip` and
+ *  `setClipSpeed` use, and the one `session.commit` reads to decide whether to
+ *  push an undo step. Without it a drag that moved nothing still produced a
+ *  fresh reference and therefore a history entry, and with snapping on that is
+ *  the NORMAL outcome of nudging a clip against its neighbour: the first Ctrl+Z
+ *  then appeared to do nothing.
+ *
+ *  RESOLVED, not requested. The two differ whenever the requested span is
+ *  occupied, which is the entire reason this function goes through
+ *  `resolvePosition` — comparing against `requestedStart` would both miss real
+ *  no-ops (a drag into an occupied span that lands back where it started) and
+ *  claim false ones. The comparison is exact rather than epsilon-based: the
+ *  resolved start of a genuine no-op is computed from the same operands as the
+ *  clip's current start, so it comes back bit-identical, and an epsilon would
+ *  let this report "nothing changed" about a move it did not actually make. */
 export function moveClip(
   p: ProjectFile,
   clipId: string,
@@ -272,16 +291,23 @@ export function moveClip(
   const dest = findTrack(p, destId);
   if (!dest || dest.kind !== track.kind) return p;
 
+  // Resolved against the destination WITHOUT this clip — a clip never blocks
+  // its own move. (For a cross-track move the filter is a no-op; for a
+  // same-track one it is exactly what the removal below would have left.)
+  const others = dest.clips.filter((c) => c.id !== clipId);
+  const start = resolvePosition(others, clipDuration(clip), requestedStart);
+  if (destId === track.id && start === clip.timelineStart) return p;
+
   // Remove from source track…
   let next = withTrack(p, track.id, (t) => ({
     ...t,
     clips: t.clips.filter((c) => c.id !== clipId),
   }));
-  // …then place on destination near the requested start.
-  next = withTrack(next, destId, (t) => {
-    const start = resolvePosition(t.clips, clipDuration(clip), requestedStart);
-    return { ...t, clips: sortClips([...t.clips, { ...clip, timelineStart: start }]) };
-  });
+  // …then place on destination at the start already resolved above.
+  next = withTrack(next, destId, (t) => ({
+    ...t,
+    clips: sortClips([...t.clips, { ...clip, timelineStart: start }]),
+  }));
   return next;
 }
 
@@ -797,6 +823,351 @@ export function addGeneratedMedia(
     generator,
   };
   return { project: { ...p, media: [...p.media, media] }, media };
+}
+
+/* ------------------------------------------------------------------ */
+/* Loading a .trt: numeric sanitation                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * WHY THIS EXISTS, AND WHY IT IS ON THIS SIDE OF THE WIRE.
+ *
+ * `load_project` hands the frontend the RAW json (`store.rs` types it `Value`
+ * and returns `migrated`); the typed Rust struct it deserializes on the way
+ * past is used only for the missing-media scan and the recents stamp. So a
+ * `deserialize_with` on the Rust schema — `de_speed`, which normalises a zero,
+ * negative or non-finite `speed` — protects the EXPORT path (which does read
+ * the typed struct) and nothing else. `editor.ts` feeds the raw value straight
+ * into `ProjectSession`, and `save_project` writes the raw value back, so
+ * before this a `"speed": 0` file gave the editor `clipDuration() = Infinity`
+ * while the exporter computed something else entirely: a silent preview/export
+ * disagreement about how long a clip is, repaired nowhere and on nothing.
+ *
+ * `checkInvariants` below is TEST-ONLY — it never runs at runtime — so it is
+ * not the guard, and cannot be made into one cheaply (it reports, it does not
+ * repair). This function is the runtime one, and it follows the convention
+ * `sanitizeSettings` already set for settings.json: coerce field by field on
+ * READ, because a hand-edited or corrupt file must never crash a mount.
+ *
+ * WHAT IT DOES AND DOES NOT TOUCH. Only values with NO honest meaning are
+ * repaired — non-finite results, a divisor that is zero, a negative where
+ * negative is not a thing. Legal-but-unusual values are left exactly as
+ * authored: a speed of 8 (outside the editor's [0.25, 4]) still works and stays
+ * in step with the video chain, so clamping it would change a working project.
+ * That line matters because Rust repairs only `speed`: any repair here is a
+ * DIVERGENCE from the raw file until the session's next write puts the repaired
+ * value on disk. Confining repairs to values whose alternative is `inf`/`nan`
+ * reaching ffmpeg means the thing being diverged from was never going to
+ * render anyway.
+ *
+ * STRUCTURE IS NOT CHECKED. `load_project` has already deserialized the file
+ * into the typed struct, so shapes and JSON types are guaranteed by the time
+ * this runs — every clip has every field, `tracks` is an array of tracks. Only
+ * the VALUES are unconstrained (plus what `u32` already rejects: `width`,
+ * `height`, `rotate` and the fps pair cannot arrive negative or fractional,
+ * but they CAN arrive as zero). Structural invariants — track order, clip
+ * overlap, x/y keyframe pairing — are deliberately left to `checkInvariants`:
+ * repairing them means reordering or deleting a user's work, which is a much
+ * larger decision than replacing a value that cannot be rendered.
+ *
+ * Everything returns the SAME reference when nothing needed repair, so the
+ * overwhelmingly common case (a healthy project) allocates nothing and keeps
+ * object identity for `ProjectSession`'s reference comparisons.
+ */
+
+/** Finite, or `fallback`. */
+function fin(v: number, fallback: number): number {
+  return Number.isFinite(v) ? v : fallback;
+}
+
+/** Finite and >= `lo`, or `fallback`. */
+function finMin(v: number, lo: number, fallback: number): number {
+  return Number.isFinite(v) && v >= lo ? v : fallback;
+}
+
+/** A crop whose numbers cannot describe a rectangle is dropped rather than
+ *  guessed at: no crop is the identity, and it is the one repair that cannot
+ *  invent a region the user never asked for. */
+function sanitizeCrop(c: ClipCrop | undefined): ClipCrop | undefined {
+  if (!c) return c;
+  const ok =
+    Number.isFinite(c.x) &&
+    Number.isFinite(c.y) &&
+    c.x >= 0 &&
+    c.y >= 0 &&
+    Number.isFinite(c.w) &&
+    Number.isFinite(c.h) &&
+    c.w > 0 &&
+    c.h > 0;
+  return ok ? c : undefined;
+}
+
+/** `rotate` is `u32` in the schema but `0 | 90 | 180 | 270` in the type, and
+ *  every consumer switches on those four; `scale`, `x`, `y` and `opacity` reach
+ *  both the canvas matrix and the exporter's filter expressions, where a
+ *  non-finite value is printed literally as `nan`/`inf` and ffmpeg refuses the
+ *  graph. A scale of zero is the same kind of dead end (`scale=0:0`). */
+function sanitizeTransform(t: ClipTransform): ClipTransform {
+  const rotate: ClipTransform["rotate"] =
+    t.rotate === 90 || t.rotate === 180 || t.rotate === 270 ? t.rotate : 0;
+  const scale = Number.isFinite(t.scale) && t.scale > 0 ? t.scale : 1;
+  const x = fin(t.x, 0);
+  const y = fin(t.y, 0);
+  const opacity = fin(t.opacity, 1);
+  const crop = sanitizeCrop(t.crop);
+  if (
+    rotate === t.rotate &&
+    scale === t.scale &&
+    x === t.x &&
+    y === t.y &&
+    opacity === t.opacity &&
+    crop === t.crop
+  ) {
+    return t;
+  }
+  const out: ClipTransform = { ...t, rotate, scale, x, y, opacity };
+  if (crop) out.crop = crop;
+  else delete out.crop;
+  return out;
+}
+
+/** Both audio sinks multiply `volume` by `10 ** (gainOffsetDb / 20)`: the
+ *  preview's GainNode, which THROWS on a non-finite assignment and so takes the
+ *  whole playback graph down, and the exporter's `volume=` filter, which prints
+ *  `NaN`/`inf` and makes ffmpeg reject the chain. A pair whose product is not
+ *  representable is reset whole, since either one alone could be the culprit.
+ *
+ *  A NEGATIVE volume is its own preview/export disagreement, live today: the
+ *  preview graph applies `Math.max(0, volume)` (silence) while the exporter
+ *  passes the negative straight into `volume=`. Zero is the honest reading of
+ *  "less than none". */
+function sanitizeAudio(a: ClipAudio): ClipAudio {
+  let volume = Number.isFinite(a.volume) ? Math.max(0, a.volume) : 1;
+  let gainOffsetDb = fin(a.gainOffsetDb, 0);
+  if (!Number.isFinite(volume * 10 ** (gainOffsetDb / 20))) {
+    volume = 1;
+    gainOffsetDb = 0;
+  }
+  const fadeInSec = finMin(a.fadeInSec, 0, 0);
+  const fadeOutSec = finMin(a.fadeOutSec, 0, 0);
+  if (
+    volume === a.volume &&
+    gainOffsetDb === a.gainOffsetDb &&
+    fadeInSec === a.fadeInSec &&
+    fadeOutSec === a.fadeOutSec
+  ) {
+    return a;
+  }
+  return { ...a, volume, gainOffsetDb, fadeInSec, fadeOutSec };
+}
+
+/** One prop's track. `evalKfs` and `KfCursor` both assume finite values and a
+ *  STRICTLY ascending `t` — a descending pair is binary-searched wrongly and
+ *  `clampedBreakpoints` emits it as decreasing timestamps into the export
+ *  expression. Entries that cannot be placed (non-finite `t`) or cannot be
+ *  interpolated (non-finite `v`) are dropped; the survivors are sorted and
+ *  de-duplicated, which preserves more of the user's work than dropping the
+ *  array. An empty result becomes `undefined`, matching `writeKeyframes`'s
+ *  rule that an empty array is a violation rather than an absence. */
+function sanitizeKfs(arr: Keyframe[]): Keyframe[] | undefined {
+  let clean = arr.length > 0;
+  let prevT = -Infinity;
+  for (const k of arr) {
+    if (!Number.isFinite(k.t) || !Number.isFinite(k.v) || !(k.t > prevT)) {
+      clean = false;
+      break;
+    }
+    prevT = k.t;
+  }
+  if (clean) return arr;
+  const kept = arr
+    .filter((k) => Number.isFinite(k.t) && Number.isFinite(k.v))
+    .sort((a, b) => a.t - b.t);
+  const out: Keyframe[] = [];
+  for (const k of kept) {
+    if (out.length === 0 || k.t > out[out.length - 1]!.t) out.push(k);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function sanitizeKeyframes(kfs: ClipKeyframes): ClipKeyframes | undefined {
+  let changed = false;
+  const out: ClipKeyframes = {};
+  for (const prop of ["x", "y", "scale", "opacity"] as const) {
+    const arr = kfs[prop];
+    if (arr === undefined) continue;
+    const next = sanitizeKfs(arr);
+    if (next !== arr) changed = true;
+    if (next) out[prop] = next;
+  }
+  if (!changed) return kfs;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * POSTCONDITION: `clipDuration()` and `clipEnd()` of the returned clip are
+ * finite, and the duration is > 0.
+ *
+ * `speed` mirrors `de_speed` in `schema.rs` EXACTLY — non-finite or <= 0
+ * becomes 1.0, and nothing else moves — so the two sides of the wire agree
+ * rather than trading one silent disagreement for another. The extra step is
+ * the one case that survives both: a finite, positive speed small enough that
+ * `(srcOut - srcIn) / speed` overflows. Rust would compute `inf` there too, so
+ * the sides still AGREE about the file being unusable; the difference is that
+ * an infinite `timelineDuration` serialises to JSON `null`, and the export
+ * dialog's estimate input types it `f64`, so the estimate errors out. Making a
+ * finite duration a postcondition here is what closes that.
+ */
+function sanitizeClip(c: Clip): Clip {
+  const timelineStart = finMin(c.timelineStart, 0, 0);
+  let srcIn = finMin(c.srcIn, 0, 0);
+  let srcOut = c.srcOut;
+  if (!(Number.isFinite(srcOut) && srcOut > srcIn)) {
+    srcOut = srcIn + MIN_CLIP_DUR;
+    // …and if srcIn is so large that adding a frame does not move it, there is
+    // no in-point near it that can hold a clip at all.
+    if (!(srcOut > srcIn)) {
+      srcIn = 0;
+      srcOut = MIN_CLIP_DUR;
+    }
+  }
+  let speed = Number.isFinite(c.speed) && c.speed > 0 ? c.speed : 1;
+  if (!Number.isFinite((srcOut - srcIn) / speed)) speed = 1;
+
+  const audio = sanitizeAudio(c.audio);
+  const transform = c.transform ? sanitizeTransform(c.transform) : c.transform;
+  const keyframes = c.keyframes ? sanitizeKeyframes(c.keyframes) : c.keyframes;
+  if (
+    timelineStart === c.timelineStart &&
+    srcIn === c.srcIn &&
+    srcOut === c.srcOut &&
+    speed === c.speed &&
+    audio === c.audio &&
+    transform === c.transform &&
+    keyframes === c.keyframes
+  ) {
+    return c;
+  }
+  const out: Clip = { ...c, timelineStart, srcIn, srcOut, speed, audio };
+  if (transform) out.transform = transform;
+  else delete out.transform;
+  if (keyframes) out.keyframes = keyframes;
+  else delete out.keyframes;
+  return out;
+}
+
+/** `fpsValue` is `num / den` and every time helper divides by it, so a zero
+ *  `den` (which `u32` happily accepts) is `speed: 0` wearing a different hat:
+ *  `frameOf` returns ±Infinity and `snapToFrame` returns NaN, which is the
+ *  playhead, the ruler and the exporter's `-r` all at once. */
+function sanitizeFps(fps: Rational): Rational {
+  const rate = fps.num / fps.den;
+  const ok =
+    Number.isFinite(fps.num) &&
+    fps.num > 0 &&
+    Number.isFinite(fps.den) &&
+    fps.den > 0 &&
+    Number.isFinite(rate) &&
+    rate > 0;
+  return ok ? fps : { num: 30, den: 1 };
+}
+
+/** Media metadata is re-derived by `probe_media` on relink, but `duration`
+ *  reaches ffmpeg directly as the `duration` argument of the waveform and
+ *  filmstrip jobs, where a non-finite value serialises to JSON `null` and the
+ *  `f64` parameter rejects it. */
+function sanitizeMediaRef(m: MediaRef): MediaRef {
+  const duration = finMin(m.duration, 0, 0);
+  return duration === m.duration ? m : { ...m, duration };
+}
+
+/**
+ * Repair the numeric fields of a freshly loaded project. Total: never throws,
+ * and returns `p` itself when nothing needed repair.
+ *
+ * Called from `ipc.loadProject`, which is the single point at which a `.trt`
+ * becomes app state — putting it there rather than in the editor means every
+ * consumer (the session, the preview, the export spec the dialog builds from
+ * the in-memory project) sees the same repaired numbers, so preview and export
+ * cannot disagree, and the session's next write puts them on disk.
+ */
+export function sanitizeProject(p: ProjectFile): ProjectFile {
+  const t = p.timeline;
+
+  const fps = sanitizeFps(t.fps);
+  // clampCanvas is the app's own rule for this pair (even integers in
+  // [16, 8192], enforced by setProjectCanvas), but it is arithmetic: NaN in,
+  // NaN out. A canvas of 0 is what `u32` lets through and what `scale=0:0`
+  // chokes on.
+  const width = Number.isFinite(t.width) ? clampCanvas(t.width) : 1920;
+  const height = Number.isFinite(t.height) ? clampCanvas(t.height) : 1080;
+
+  // THE ONE STRUCTURAL REPAIR, and the reason it is the only one.
+  //
+  // Everything else here repairs a VALUE that has no honest meaning and leaves
+  // structure alone, because reordering or dropping tracks would be discarding
+  // the user's work. A timeline with no video track is the exception: there is
+  // no work to preserve, and `topVideoTrack` is `tracks[0]!` — so an empty array
+  // makes it `undefined` and the first `.id` throws. That is a hard crash on
+  // import from a hand-edited or truncated `.trt`, and the crafted `.trt` is
+  // this app's main threat surface.
+  //
+  // An audio-only `tracks` array is the subtler half of the same bug: `tracks[0]`
+  // would be an AUDIO track and `topVideoTrack` would hand it back silently, so
+  // an imported clip lands on a lane that cannot show it. The invariant the rest
+  // of the tree relies on (addVideoTrack unshifts, addAudioTrack appends) is
+  // "video tracks first, at least one of them" — restore exactly that, keeping
+  // every existing track and its clips.
+  const hasVideoFirst = t.tracks[0]?.kind === "video";
+  const baseTracks: Track[] = hasVideoFirst
+    ? t.tracks
+    : [{ id: uid(), kind: "video", name: "Video 1", muted: false, clips: [] }, ...t.tracks];
+
+  let tracksChanged = baseTracks !== t.tracks;
+  const tracks = baseTracks.map((track) => {
+    let clipsChanged = false;
+    const clips = track.clips.map((c) => {
+      const next = sanitizeClip(c);
+      if (next !== c) clipsChanged = true;
+      return next;
+    });
+    if (!clipsChanged) return track;
+    tracksChanged = true;
+    return { ...track, clips };
+  });
+
+  // A marker whose time is not a number cannot be drawn anywhere on the ruler,
+  // so there is nothing to repair it TO — it is dropped. Order is left alone:
+  // an out-of-order marker still draws in the right place.
+  let markers = t.markers;
+  if (markers) {
+    const kept = markers.filter((m) => Number.isFinite(m.t));
+    if (kept.length !== markers.length) markers = kept;
+  }
+
+  let mediaChanged = false;
+  const media = p.media.map((m) => {
+    const next = sanitizeMediaRef(m);
+    if (next !== m) mediaChanged = true;
+    return next;
+  });
+
+  const timelineChanged =
+    fps !== t.fps ||
+    width !== t.width ||
+    height !== t.height ||
+    tracksChanged ||
+    markers !== t.markers;
+  if (!timelineChanged && !mediaChanged) return p;
+
+  let timeline = t;
+  if (timelineChanged) {
+    // Spread first so an ABSENT `markers` key stays absent (rather than becoming
+    // an explicit `undefined`), then overwrite only if something was dropped.
+    timeline = { ...t, fps, width, height, tracks };
+    if (markers !== t.markers) timeline.markers = markers;
+  }
+  return { ...p, media, timeline };
 }
 
 /* ------------------------------------------------------------------ */

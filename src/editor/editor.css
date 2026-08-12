@@ -245,6 +245,40 @@ html[data-rescue-chrome] #ed-settings:focus-visible {
   touch-action: none;
 }
 
+/* ---------- timeline vertical scrollbar ----------
+ * The panel is a fixed height while the lane stack is not (layers and detached
+ * audio both append lanes), so the stack scrolls inside the host. This is the
+ * visible affordance for that: a thin overlay track pinned below the ruler,
+ * shown by timeline.ts ONLY while the lanes actually overflow — a project whose
+ * lanes all fit never renders any of this chrome.
+ *
+ * Above .tl-drop-guide (z 5) so it stays grabbable during an external drag. */
+.tl-vscroll {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 11px;
+  z-index: 6;
+  display: none;
+  touch-action: none;
+  background: transparent;
+}
+.tl-vscroll__thumb {
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  border-radius: var(--radius-full);
+  background: var(--text-3);
+  opacity: 0.4;
+  transition: opacity var(--dur) var(--ease);
+}
+.tl-vscroll:hover .tl-vscroll__thumb {
+  opacity: 0.7;
+}
+.tl-vscroll__thumb--active {
+  opacity: 0.9;
+}
+
 /* ---------- media panel ---------- */
 
 .media-panel {

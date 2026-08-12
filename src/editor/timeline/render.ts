@@ -112,35 +112,101 @@ export interface LaneRect {
   h: number;
 }
 
-/** Cached on the tracks array identity. Every project mutator in core/project.ts
- *  rebuilds that array (map/filter/spread) and nothing mutates it in place, so
- *  an identity hit means the geometry is unchanged. Callers treat the result as
- *  read-only. Without this, a plain hover over the timeline allocated a fresh
- *  array plus one LaneRect per track on every pointermove. */
-let laneLayoutCache: { tracks: Track[]; lanes: LaneRect[] } | null = null;
+/**
+ * Vertical scroll offset of the lane stack, in px, >= 0.
+ *
+ * This is module state ON PURPOSE, and it is the whole reason the "lanes below
+ * the third one are unreachable" bug cannot come back in a new disguise.
+ *
+ * The bug was that `draw` and `hitTest` disagreed about where a lane is: draw
+ * was handed an inflated canvas height and painted lanes into pixels the host
+ * never showed, while hitTest's y was bounded by the host. The fix is not to
+ * teach both sides the same offset — that is the version that rots, because
+ * there are three call sites (render.draw, interactions.hitTest, and the
+ * external-drop resolver in editor.ts) and any one of them can forget.
+ *
+ * Instead the offset is folded into `laneLayout`, which is the ONLY way to get
+ * lane geometry. There is no `laneLayout(project, scrollY)` overload and no
+ * default-zero parameter, so a caller cannot ask for unscrolled lanes even by
+ * accident: whatever `laneLayout` says is what is on screen, for everyone.
+ * `laneLayout` is a shared dependency of every one of those three call sites,
+ * so they move together by construction.
+ */
+let laneScrollY = 0;
 
-export function laneLayout(project: ProjectFile): LaneRect[] {
-  const tracks = project.timeline.tracks;
-  if (laneLayoutCache && laneLayoutCache.tracks === tracks) return laneLayoutCache.lanes;
-  const lanes: LaneRect[] = [];
-  let y = RULER_H + LANE_GAP;
-  for (const track of tracks) {
-    const h = track.kind === "video" ? VIDEO_LANE_H : AUDIO_LANE_H;
-    lanes.push({ track, y, h });
-    y += h + LANE_GAP;
-  }
-  laneLayoutCache = { tracks, lanes };
-  return lanes;
+/** Current lane scroll offset in px. */
+export function laneScroll(): number {
+  return laneScrollY;
 }
 
-/** The running `y` after laneLayout's loop, computed without building the
- *  array — this runs once per rendered frame and only needs the scalar. */
+/** Set the lane scroll offset (already clamped — see `clampLaneScroll`).
+ *  Returns true when the value actually changed, so the caller can skip a
+ *  render request for a no-op scroll. */
+export function setLaneScroll(px: number): boolean {
+  if (px === laneScrollY) return false;
+  laneScrollY = px;
+  return true;
+}
+
+/** Total height of the lane stack: the ruler, the leading gap, every lane, and
+ *  a trailing gap after the last one (which doubles as bottom padding). */
 export function totalLanesHeight(project: ProjectFile): number {
   let y = RULER_H + LANE_GAP;
   for (const track of project.timeline.tracks) {
     y += (track.kind === "video" ? VIDEO_LANE_H : AUDIO_LANE_H) + LANE_GAP;
   }
   return y;
+}
+
+/** How far the lane stack can scroll inside a viewport `viewportH` px tall.
+ *  Zero when everything already fits — which is what suppresses the scrollbar
+ *  and leaves the wheel gestures untouched on a one-lane project. */
+export function maxLaneScroll(project: ProjectFile, viewportH: number): number {
+  return Math.max(0, totalLanesHeight(project) - viewportH);
+}
+
+/** Clamp a proposed scroll offset into the legal range and snap it to whole
+ *  pixels (integers keep lane rects on device pixels and keep the layout free
+ *  of accumulated float drift). */
+export function clampLaneScroll(project: ProjectFile, px: number, viewportH: number): number {
+  return Math.max(0, Math.min(maxLaneScroll(project, viewportH), Math.round(px)));
+}
+
+/** Cached on the tracks array identity. Every project mutator in core/project.ts
+ *  rebuilds that array (map/filter/spread) and nothing mutates it in place, so
+ *  an identity hit means the geometry is unchanged. Callers treat the result as
+ *  read-only. Without this, a plain hover over the timeline allocated a fresh
+ *  array plus one LaneRect per track on every pointermove.
+ *
+ *  The scroll offset is part of the key too, but a scroll-only change refills
+ *  the existing rects instead of rebuilding the array: same array identity, no
+ *  allocation, and `y` is recomputed from the offset rather than accumulated,
+ *  so repeated scrolling cannot drift. */
+let laneLayoutCache: { tracks: Track[]; scrollY: number; lanes: LaneRect[] } | null = null;
+
+export function laneLayout(project: ProjectFile): LaneRect[] {
+  const tracks = project.timeline.tracks;
+  const cache = laneLayoutCache;
+  if (cache && cache.tracks === tracks) {
+    if (cache.scrollY !== laneScrollY) {
+      let y = RULER_H + LANE_GAP - laneScrollY;
+      for (const lane of cache.lanes) {
+        lane.y = y;
+        y += lane.h + LANE_GAP;
+      }
+      cache.scrollY = laneScrollY;
+    }
+    return cache.lanes;
+  }
+  const lanes: LaneRect[] = [];
+  let y = RULER_H + LANE_GAP - laneScrollY;
+  for (const track of tracks) {
+    const h = track.kind === "video" ? VIDEO_LANE_H : AUDIO_LANE_H;
+    lanes.push({ track, y, h });
+    y += h + LANE_GAP;
+  }
+  laneLayoutCache = { tracks, scrollY: laneScrollY, lanes };
+  return lanes;
 }
 
 export interface TimelineColors {
@@ -353,9 +419,25 @@ export function draw(ctx: CanvasRenderingContext2D, input: RenderInput): void {
   // pointer-up). Zero cost unless a move drag is active.
   const cross = crossLaneMove(input.drag, lanes);
 
+  // Lanes are scrolled (see laneScrollY), so the top one can be partly above the
+  // ruler and the bottom one partly past the canvas. One clip region confines
+  // every lane, clip, label and ghost to the band below the ruler — the ruler is
+  // drawn first and must stay pinned and legible while the stack slides under
+  // it. Lanes fully outside the band are skipped, so the drawing work stays
+  // proportional to what is visible however many lanes the project has.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, RULER_H, width, Math.max(0, height - RULER_H));
+  ctx.clip();
+
   for (let li = 0; li < lanes.length; li++) {
     const lane = lanes[li]!;
-    if (lane.y > height) break;
+    // Bounds are exclusive on both ends: a lane whose top sits exactly on the
+    // canvas bottom, or whose bottom sits exactly on the ruler, has no visible
+    // row at all. The clip region would swallow it either way — this just keeps
+    // the drawn set exactly equal to the visible set.
+    if (lane.y >= height) break;
+    if (lane.y + lane.h <= RULER_H) continue;
     ctx.fillStyle = colors.laneBg;
     ctx.fillRect(0, lane.y, width, lane.h);
 
@@ -386,6 +468,8 @@ export function draw(ctx: CanvasRenderingContext2D, input: RenderInput): void {
     ctx.textBaseline = "top";
     ctx.fillText(labels[li]!, 4, lane.y + 4);
   }
+
+  ctx.restore();
 
   /* ---------------- snap guide ---------------- */
   if (input.guideT !== null) {

@@ -1,6 +1,8 @@
 // Framework-less context menu. One reused host div on document.body; a single
 // menu is open at a time. No editor imports — usable from anywhere.
 
+import { blockShortcuts } from "../core/shortcuts";
+
 export interface MenuItem {
   label: string;
   danger?: boolean;
@@ -89,6 +91,22 @@ function onDismiss(): void {
   closeMenu();
 }
 
+/**
+ * Released when the menu closes. An open menu is modal in intent — it is the
+ * only thing the keyboard is talking to — but it has no `.modal-backdrop`, so
+ * the editor's dialog guard did not see it and every global chord still fired
+ * behind it. Worst case measured: right-clicking a lane does not change the
+ * selection, so Delete removed the previously selected clip on a DIFFERENT lane,
+ * invisibly, and the menu's own "Delete layer" then applied as well — two
+ * destructive edits and two undos for one intent.
+ *
+ * A token rather than a class the editor pattern-matches on: this file is the
+ * one that knows when a menu is open, so it is the one that should say so.
+ * Only the four keys `onKeyDown` handles stay live, which is the point — Escape
+ * still closes, the arrows still move the highlight, Enter still selects.
+ */
+let releaseShortcuts: (() => void) | null = null;
+
 function addListeners(): void {
   // capture phase so an outside pointerdown closes before other handlers run
   document.addEventListener("pointerdown", onOutsidePointerDown, true);
@@ -96,6 +114,7 @@ function addListeners(): void {
   window.addEventListener("wheel", onDismiss, true);
   window.addEventListener("resize", onDismiss);
   window.addEventListener("blur", onDismiss);
+  releaseShortcuts = blockShortcuts();
 }
 
 function removeListeners(): void {
@@ -104,6 +123,10 @@ function removeListeners(): void {
   window.removeEventListener("wheel", onDismiss, true);
   window.removeEventListener("resize", onDismiss);
   window.removeEventListener("blur", onDismiss);
+  // Paired with addListeners, which showMenu only calls when nothing was open,
+  // so the count cannot drift on a menu that replaces another menu.
+  releaseShortcuts?.();
+  releaseShortcuts = null;
 }
 
 export function showMenu(x: number, y: number, menuItems: MenuItem[]): void {

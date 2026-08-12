@@ -5,6 +5,11 @@
 // capture and while a colour picker is open — both of those mutate the single
 // row they own in place instead, because a rebuild would drop the element the
 // interaction is anchored to.
+//
+// NOTHING HERE PAINTS FROM AN INLINE `style` ATTRIBUTE. The packaged app's CSP
+// refuses them — read the block comment above `colorRow` before adding one, in
+// this file or in any other screen. It is not a style preference; the attribute
+// does not arrive.
 
 import "./settings.css";
 import { escapeHtml, formatBytes } from "../core/format";
@@ -114,6 +119,95 @@ const ROLE_PRESETS: Record<ColorRole, readonly string[] | undefined> = {
     "#1b1b20", "#000000", "#2a2118", "#16202c", "#2c1c24", "#55555f",
   ],
 };
+
+/* ---------------- why no `style="…"` anywhere on this screen ----------------
+ *
+ * READ THIS BEFORE PUTTING A COLOUR BACK INTO THE MARKUP.
+ *
+ * An inline `style` ATTRIBUTE does not survive into the packaged app. It is
+ * dropped, silently, with the element left exactly as its stylesheet rules
+ * leave it — which for the colour swatch is an empty 16x16 box.
+ *
+ * The chain, all of it Tauri's, none of it visible from this repo:
+ *
+ *   1. `index.html` carries a `<style>` block (the critical dark first paint).
+ *   2. At build time tauri-codegen's `inject_nonce_token` stamps every `<style>`
+ *      in the bundled HTML with `nonce="__TAURI_STYLE_NONCE__"`.
+ *   3. At serve time `replace_csp_nonce` swaps that token for a random value AND
+ *      APPENDS `'nonce-<random>'` to the `style-src` directive of the CSP we
+ *      configured in `src-tauri/tauri.conf.json`.
+ *   4. CSP Level 3: once a directive names a nonce-source or a hash-source,
+ *      `'unsafe-inline'` in that same directive IS IGNORED. So the shipped
+ *      `style-src 'self' 'unsafe-inline' 'nonce-…'` is strictly a nonce policy.
+ *   5. A `style` attribute cannot carry a nonce, and matching one by hash needs
+ *      `'unsafe-hashes'`, which is not (and should not be) in the policy.
+ *      Result: every inline style attribute in the app is refused.
+ *
+ * The CSSOM is NOT gated by any of that. `el.style.background = value` and
+ * `el.style.setProperty(…)` always apply. That is why the app is themed
+ * correctly (`applyTheme` writes twenty-one custom properties this way), why the
+ * colour picker's own swatch and presets are right, and why `paintColorButton`
+ * below works — while the same colour written into the markup does not.
+ *
+ * THAT ASYMMETRY IS WHAT MADE THIS BUG SO CONFUSING. The swatch and its hex
+ * caption were interpolated from one value in one template, so an empty swatch
+ * beside a correct caption looked impossible — a paint bug, or a save bug, but
+ * surely not a data bug. And it hid: pick a colour and `paintColorButton`
+ * repainted the swatch through the CSSOM, so the screen looked right for as long
+ * as you stayed on it. Leave and come back and the row was rebuilt from the
+ * markup, with nothing to paint it, and the fill was gone.
+ *
+ * It also cannot be caught by running the app. `npm run dev` loads the frontend
+ * from Vite's dev server, which Tauri never rewrites — no `<style>` nonce, no
+ * neutralised `'unsafe-inline'`, inline styles all fine. The in-app E2E runs
+ * there too. This exists only in a packaged build.
+ *
+ * SO: nothing on this screen paints from a `style` attribute. A colour reaches a
+ * swatch through `paintColorButton`, which `render` calls for all three rows
+ * right after the markup lands.
+ *
+ * AND NOT VIA `var(--accent)` / `var(--text-1)` IN settings.css, which is the
+ * obvious CSS-only alternative — those tokens ARE the user's literal picks, but
+ * `html[data-rescue-appearance] .settings__card--appearance` re-points both of
+ * them at the fixed `--safe-*` palette INSIDE this card. The swatches would then
+ * show the escape hatch's colours instead of the user's, which is precisely the
+ * one thing the escape hatch is documented never to do. Per-element, from the
+ * store, is the only source that stays true.
+ */
+
+/**
+ * One colour row: a label, a hint, and a button whose swatch and caption are the
+ * current colour.
+ *
+ * The swatch span is emitted EMPTY and UNSTYLED on purpose — see the block
+ * above. Its fill is applied by `paintColorButton` immediately after this
+ * markup is written, in the same synchronous turn, so there is never a frame in
+ * which an unfilled swatch is on screen.
+ *
+ * `hex` still lands in the caption and the accessible name, where it is text
+ * rather than CSS and nothing can refuse it. It is interpolated directly because
+ * `normalizeHexColor` has already proven it is exactly `#rrggbb` — see the note
+ * on that function in core/session.ts.
+ *
+ * Module scope rather than a closure inside `mountSettings`, and exported, for
+ * the reason `deriveCustomTheme` is: it is pure, and the one invariant that
+ * broke here — no colour in the markup — is then assertable without a DOM.
+ */
+export function colorRow(role: ColorRole, hex: string): string {
+  const label = ROLE_LABELS[role];
+  return `
+      <div class="settings__row">
+        <div class="settings__row-text">
+          <div class="settings__row-label">${escapeHtml(label)}</div>
+          <div class="settings__hint">${escapeHtml(ROLE_HINTS[role])}</div>
+        </div>
+        <button class="btn btn--sm settings__color-btn" id="settings-color-${role}"
+                aria-label="${escapeHtml(label)}, ${hex}" aria-haspopup="dialog">
+          <span class="settings__color-swatch"></span>
+          <span class="mono">${hex}</span>
+        </button>
+      </div>`;
+}
 
 const AUTOSAVE_OPTIONS = [1, 3, 5, 10, 30];
 const CACHE_LIMIT_OPTIONS_MB = [1024, 2048, 5120, 10240, 20480];
@@ -253,26 +347,6 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
           ${hint ? `<div class="settings__hint">${escapeHtml(hint)}</div>` : ""}
         </div>
         <input type="checkbox" class="switch" id="${id}" ${on ? "checked" : ""} />
-      </div>`;
-  }
-
-  /** One colour row: a label, a hint, and a button whose swatch and caption are
-   *  the current colour. The hex is interpolated directly because
-   *  `normalizeHexColor` has already proven it is exactly `#rrggbb` — see the
-   *  note on that function in core/session.ts. */
-  function colorRow(role: ColorRole, hex: string): string {
-    const label = ROLE_LABELS[role];
-    return `
-      <div class="settings__row">
-        <div class="settings__row-text">
-          <div class="settings__row-label">${escapeHtml(label)}</div>
-          <div class="settings__hint">${escapeHtml(ROLE_HINTS[role])}</div>
-        </div>
-        <button class="btn btn--sm settings__color-btn" id="settings-color-${role}"
-                aria-label="${escapeHtml(label)}, ${hex}" aria-haspopup="dialog">
-          <span class="settings__color-swatch" style="background:${hex}"></span>
-          <span class="mono">${hex}</span>
-        </button>
       </div>`;
   }
 
@@ -534,6 +608,11 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       aboutSection(),
       dangerSection(),
     ].join("");
+    // The one thing on this screen the markup cannot carry: three colours the
+    // packaged app's CSP refuses as `style` attributes. Painted here, in the
+    // same synchronous turn as the markup that needs them, so nothing is ever
+    // laid out with an empty swatch. See the block comment above colorRow.
+    paintColorSwatches(s);
     wire();
   }
 
@@ -683,10 +762,23 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     return { ...c, text: value };
   }
 
-  /** Update one colour button in place rather than re-rendering the screen:
-   *  the button is the picker's anchor, and rebuilding it mid-gesture would
-   *  pull the popover's positioning reference out from under it. Same reason
-   *  shortcut capture mutates a single row. */
+  /**
+   * Put one colour onto one colour button. THE ONLY WAY A COLOUR EVER REACHES
+   * THE DOM ON THIS SCREEN — the markup deliberately carries none (see the
+   * block comment above `colorRow`), so this runs on every render as well as on
+   * every picker frame.
+   *
+   * That it works mid-gesture is the second reason it exists: the button is the
+   * picker's anchor, and re-rendering the screen to show a new colour would pull
+   * the popover's positioning reference out from under it.
+   *
+   * NOTE THE ASYMMETRY IF `value` IS EVER NOT A COLOUR. `textContent` takes
+   * anything; `style.background` silently REJECTS an unparseable value and
+   * leaves whatever was there before. A bad value would therefore show up in the
+   * caption while the swatch kept a stale fill — the opposite of the failure
+   * this function was rewritten to fix, and just as confusing. Every caller
+   * passes a `normalizeHexColor` result; keep it that way.
+   */
   function paintColorButton(role: ColorRole, value: string): void {
     const btn = inner.querySelector<HTMLElement>(`#settings-color-${role}`);
     if (!btn) return;
@@ -695,6 +787,17 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     if (swatch) swatch.style.background = value;
     if (caption) caption.textContent = value;
     btn.setAttribute("aria-label", `${ROLE_LABELS[role]}, ${value}`);
+  }
+
+  /** Fill all three swatches from the store, after a render has replaced them.
+   *  A no-op for every other theme, which renders no colour rows at all — so a
+   *  Dark/Light/System Settings screen costs exactly one comparison for this. */
+  function paintColorSwatches(s: Settings): void {
+    if (s.theme !== "custom") return;
+    const c = validCustomTheme(s.customTheme);
+    paintColorButton("background", c.background);
+    paintColorButton("accent", c.accent);
+    paintColorButton("text", c.text);
   }
 
   function openColor(role: ColorRole, anchor: HTMLElement): void {

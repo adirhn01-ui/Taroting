@@ -5,7 +5,8 @@
 // parameters for a synthetic media item and, on confirm, registers it in the
 // project bin via addGeneratedMedia — never on the timeline. The measureText
 // helper (offscreen-canvas text metrics) is shared with the inspector's
-// generated-media editor so both compute identical intrinsic sizes.
+// generated-media editor so both compute identical intrinsic sizes, and so is
+// fitText, which keeps those sizes inside the range the export can synthesize.
 
 import "./generators.css";
 import { addGeneratedMedia } from "../../core/project";
@@ -33,8 +34,15 @@ export const TEXT_FONTS: FontFamily[] = [
 const MIN_SIZE = 8;
 const MAX_SIZE = 512;
 const MIN_DIM = 16;
-const MAX_DIM = 8192;
+/** Upper bound on either dimension of a generated element. Shared with the
+ *  solid dialog (evenDim), the inspector's solid editor and the project canvas
+ *  (setProjectCanvas in core/project.ts) — exported so the text path's tests
+ *  pin the same number rather than a copy of it. */
+export const MAX_DIM = 8192;
 const LINE_HEIGHT = 1.25;
+/** Re-measurements fitText may spend before it gives up. The first estimate is
+ *  exact for a linear font, so this is only slack for glyph hinting. */
+const FIT_STEPS = 8;
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(Math.max(v, lo), hi);
 /** Round UP to the next even integer, min 2. */
@@ -53,6 +61,10 @@ export function fontString(g: Extract<Generator, { type: "text" }>): string {
 let measureCtx: CanvasRenderingContext2D | null = null;
 function ctx2d(): CanvasRenderingContext2D | null {
   if (measureCtx) return measureCtx;
+  // `typeof document` rather than a bare reference: the fit logic below is
+  // exercised from vitest, whose environment is "node" and has no DOM at all,
+  // and the estimate in measureText is the documented answer to "no context".
+  if (typeof document === "undefined") return null;
   const c = document.createElement("canvas");
   measureCtx = c.getContext("2d");
   return measureCtx;
@@ -75,6 +87,123 @@ export function measureText(g: Extract<Generator, { type: "text" }>): { width: n
   const width = evenUp(maxW);
   const height = evenUp(lines.length * g.sizePx * LINE_HEIGHT);
   return { width, height };
+}
+
+/* ------------------------------------------------------------------ */
+/* Fitting text into a box the export can synthesize                   */
+/* ------------------------------------------------------------------ */
+//
+// A text element's media box IS its measured box, and both renderers depend on
+// that equality. The preview puts the glyphs in a `media.width × media.height`
+// div (`.stage-layer__gen`, `overflow: hidden`), where block flow starts them at
+// the TOP; the export synthesizes a `w×h` frame and hands drawtext
+// `boxw=w:boxh=h:text_align=L+M`, where `M` CENTRES them. Those two agree only
+// while the box equals the natural text extent — the moment the box is smaller,
+// the preview shows the first lines and the export shows the middle ones.
+//
+// So the 16..8192 clamp its solid siblings apply (evenDim, and setProjectCanvas
+// in core/project.ts) cannot simply be pointed at the measured box: clamping
+// alone trades an export that aborts for one that quietly renders different
+// lines than the preview, which is the same bug wearing a different face. Both
+// ends of the clamp break the equality, which is also why nothing here applies
+// MIN_DIM — evenUp already only ever rounds UP, so the box is never smaller
+// than its text.
+//
+// What CAN move without breaking the equality is the font size: the preview
+// (`styleGen` in playback/scheduler.ts) and the export (`drawtext fontsize=`)
+// both read it from the same generator. Oversized text therefore shrinks to
+// fit, the way "shrink text on overflow" does elsewhere — every character
+// survives, nothing is cropped, and the box still equals the text. When even
+// MIN_SIZE overflows there is no honest box left, and the edit is refused
+// rather than committed as a silent crop.
+
+/** The largest integer font size at or below `sizePx` whose text box fits
+ *  MAX_DIM on both axes, given `natural` measured AT `sizePx`. Both axes are
+ *  linear in the size — advance widths scale with the em, and the height is
+ *  literally lines × sizePx × LINE_HEIGHT — so one multiply lands on it or just
+ *  under. `fits` is false when the size that would be needed is below MIN_SIZE,
+ *  i.e. no allowed size fits. Pure: no canvas, no DOM. */
+export function fitTextSize(
+  natural: { width: number; height: number },
+  sizePx: number,
+): { sizePx: number; fits: boolean } {
+  const longest = Math.max(natural.width, natural.height, 1);
+  if (longest <= MAX_DIM) return { sizePx, fits: true };
+  // floor, never round: undershooting the limit costs a pixel, overshooting it
+  // is the bug.
+  const next = Math.floor(sizePx * (MAX_DIM / longest));
+  return { sizePx: Math.max(MIN_SIZE, next), fits: next >= MIN_SIZE };
+}
+
+export interface TextFit {
+  /** The generator to store: the input, with `sizePx` lowered iff it had to be.
+   *  Never commit the caller's original generator next to these dims. */
+  gen: Extract<Generator, { type: "text" }>;
+  /** A true `measureText(gen)`, ≤ MAX_DIM on both axes unless `tooLarge`. */
+  width: number;
+  height: number;
+  /** The authored size, when it was lowered to fit; null when it fit as-is. */
+  shrunkFrom: number | null;
+  /** No allowed font size fits. NOTHING here may be committed; `width`/`height`
+   *  are the box at MIN_SIZE — the smallest this text can be — so the caller
+   *  can say by how much it misses. */
+  tooLarge: boolean;
+}
+
+/** Measure a text generator and, while its box exceeds MAX_DIM, lower the font
+ *  size until it does not. The returned dims are always a true measurement of
+ *  the returned generator — that identity is what keeps the preview and the
+ *  export describing the same frame. */
+export function fitText(g: Extract<Generator, { type: "text" }>): TextFit {
+  let gen = g;
+  let box = measureText(gen);
+  for (let step = 0; step <= FIT_STEPS; step++) {
+    if (box.width <= MAX_DIM && box.height <= MAX_DIM) {
+      return {
+        gen,
+        ...box,
+        shrunkFrom: gen.sizePx === g.sizePx ? null : g.sizePx,
+        tooLarge: false,
+      };
+    }
+    const fit = fitTextSize(box, gen.sizePx);
+    if (!fit.fits) break;
+    gen = { ...gen, sizePx: fit.sizePx };
+    box = measureText(gen);
+  }
+  // Either no allowed size fits, or the estimate failed to converge within
+  // FIT_STEPS. MIN_SIZE is the last thing worth trying; if even that overflows,
+  // there is no box that holds this text and the caller must refuse.
+  const min = { ...gen, sizePx: MIN_SIZE };
+  const minBox = measureText(min);
+  const fits = minBox.width <= MAX_DIM && minBox.height <= MAX_DIM;
+  return {
+    gen: min,
+    ...minBox,
+    shrunkFrom: fits && min.sizePx !== g.sizePx ? g.sizePx : null,
+    tooLarge: !fits,
+  };
+}
+
+/** The clause both call sites append when a text element's size was lowered. */
+export function textShrunkNote(fit: TextFit): string {
+  return `size reduced ${fit.shrunkFrom} → ${fit.gen.sizePx} px so all of it fits`;
+}
+
+/** The refusal, shown identically wherever the user hits it. */
+export function showTextTooLarge(fit: TextFit): void {
+  toast.error("That text is too large to draw — shorten it or break the long line up.", {
+    op: "Text",
+    title: "Text too large",
+    detail:
+      `A text element can be at most ${MAX_DIM}×${MAX_DIM} px — the same limit ` +
+      `a solid element and the project canvas have.\n\n` +
+      `Even at the smallest font size (${MIN_SIZE} px) this text measures ` +
+      `${fit.width}×${fit.height} px, so it could only be drawn by cutting ` +
+      `part of it off. Nothing was changed.\n\n` +
+      `Shorten the text, or split the long line into several shorter ones — ` +
+      `a single very long line is the usual cause.`,
+  });
 }
 
 /** First ~24 chars of the text, single line, ellipsised — used as the bin label. */
@@ -283,12 +412,24 @@ function openTextDialog(ctx: GeneratorDialogCtx): void {
   let submitted = false;
   confirm.addEventListener("click", () => {
     if (submitted) return;
+    const fit = fitText(currentGen());
+    if (fit.tooLarge) {
+      // Nothing is added and the dialog stays open with the text intact, so the
+      // fix is one edit away rather than a re-type.
+      showTextTooLarge(fit);
+      return;
+    }
     submitted = true;
-    const g = currentGen();
-    const { width, height } = measureText(g);
-    ctx.session.commit((p) => addGeneratedMedia(p, g, width, height, textLabel(g.text)).project);
+    const { gen, width, height } = fit;
+    ctx.session.commit(
+      (p) => addGeneratedMedia(p, gen, width, height, textLabel(gen.text)).project,
+    );
     ctx.media.ensureAll(ctx.session.project);
-    toast.info(`Added text — ${width}×${height}`);
+    toast.info(
+      fit.shrunkFrom === null
+        ? `Added text — ${width}×${height}`
+        : `Added text — ${width}×${height} · ${textShrunkNote(fit)}`,
+    );
     m.close();
   });
   m.footer.append(cancel, confirm);

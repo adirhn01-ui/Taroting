@@ -125,9 +125,29 @@ html[data-rescue-nav] #home-settings:focus-visible {
   display: none;
 }
 
+/* The gap for both of these lived in a `style` attribute in home.ts until it was
+   found that the packaged build refuses every inline style: Tauri stamps a nonce
+   onto index.html's <style> block and appends it to `style-src`, which under CSP
+   Level 3 makes our own `'unsafe-inline'` inert, and a style ATTRIBUTE cannot
+   carry a nonce. It only ever showed up in a packaged build — `npm run dev` and
+   the in-app E2E serve HTML Tauri never rewrites — so the buttons sat flush
+   together in the shipped app and nowhere else. See the long note above
+   `colorRow` in src/settings/settings.ts. Static values belong here regardless;
+   only genuinely dynamic ones go through the CSSOM. */
+.home__actions,
+.home__select-bar {
+  gap: var(--sp-2);
+}
+
 /* Select-mode toolbar swaps in for the New/Open/Select row (same slot). */
 .home__select-bar {
   align-items: center;
+}
+
+/* The empty state is a child of the recents grid, so it has to span every
+   column or it sits in the first one. Same inline-style story as the gap above. */
+.recents-grid > .empty-state {
+  grid-column: 1 / -1;
 }
 .home__select-count {
   font-size: var(--fs-13);

@@ -97,10 +97,22 @@ interface ParityCase {
     y: number;
   };
   out: {
-    /** even-rounded display size, OUTPUT px — ffmpeg `scale=dw:dh` */
+    /** Even-rounded display size of the preview's crop BOX, OUTPUT px.
+     *
+     *  NOT, for a rotated row, what ffmpeg is handed. The preview sizes
+     *  `layer.crop` to this and then TURNS it with `rotate(r)` on the parent, so
+     *  for rotate 90/270 what the viewer sees is `dh` wide and `dw` tall. The
+     *  export has no such nesting: `transpose` mutates the frame, and the
+     *  `scale=` that follows it therefore gets `dh:dw`. Saying "ffmpeg
+     *  `scale=dw:dh`" here — as this comment used to — is exactly the belief
+     *  that shipped every rotated non-square clip at a transposed aspect.
+     *  `describe("the rotated rows state what ffmpeg must receive")` below spells
+     *  the real arguments out. */
     dw: number;
     dh: number;
-    /** integer overlay position, OUTPUT px — ffmpeg `overlay=ox:oy` */
+    /** Integer overlay position for a `dw x dh` box, OUTPUT px. Same caveat: for
+     *  rotate 90/270 the frame being positioned is `dh x dw`, so ffmpeg receives
+     *  a position centred on THAT, and these two are off by (dw-dh)/2 per axis. */
     ox: number;
     oy: number;
     /** the preview's exact, un-rounded display extent in project px */
@@ -272,6 +284,105 @@ describe("preview/export placement parity (shared golden table)", () => {
           expect([c.out.postCropW, c.out.postCropH, cropX, cropY]).toEqual(
             c.out.cropFilter,
           );
+        }
+      });
+    });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* The rotated rows: what ffmpeg must actually receive                 */
+/* ------------------------------------------------------------------ */
+//
+// The table stopped one step short. Its four integers are the preview's
+// UN-ROTATED crop box and where that box would sit, and both implementations
+// agreed on them perfectly — while the export still put every rotated
+// non-square clip on screen at a transposed aspect, off centre, sides clipped.
+// Nothing was wrong with the numbers; the graph consumed them on the far side
+// of a `transpose` that had already swapped the frame's axes.
+//
+// So this block says, from the preview's own model, what the two filters have
+// to be given. `applyTransform` is the whole argument: it writes cropW/cropH
+// onto `layer.crop` and `rotate(r)` onto `layer.rot`, the PARENT — so the box
+// the viewer measures is the swapped one, and the export has to arrive at the
+// same rectangle with no box to nest inside.
+
+/** The preview's on-screen extent: the crop box after `layer.rot` turns it.
+ *  This is what `scale=` must produce, because `scale=` runs post-transpose. */
+const drawnExtent = (c: ParityCase): [number, number] =>
+  c.in.rotate === 90 || c.in.rotate === 270 ? [c.out.dh, c.out.dw] : [c.out.dw, c.out.dh];
+
+describe("the rotated rows state what ffmpeg must receive", () => {
+  const rotated = TABLE.cases.filter((c) => c.in.rotate === 90 || c.in.rotate === 270);
+
+  it("has rotated rows whose display box is not square", () => {
+    // A square box makes `scale=dw:dh` and `scale=dh:dw` the same string and
+    // `ox` and `oy` centre a frame and its transpose alike — the exact shape of
+    // the fixture that let builder.rs's rotation test pass through the whole
+    // life of the bug. At least one rotated row must be able to see the swap,
+    // and at least one of those must also be off-Original.
+    expect(rotated.length).toBeGreaterThanOrEqual(3);
+    const nonSquare = rotated.filter((c) => c.out.dw !== c.out.dh);
+    expect(nonSquare.length).toBeGreaterThanOrEqual(3);
+    expect(
+      nonSquare.some((c) => c.in.exportW !== c.in.canvasW || c.in.exportH !== c.in.canvasH),
+    ).toBe(true);
+    // ...and one carrying offsets, so the re-centring is not measured only from
+    // the middle of the canvas where every formula agrees.
+    expect(nonSquare.some((c) => c.in.x !== 0 || c.in.y !== 0)).toBe(true);
+  });
+
+  for (const c of rotated) {
+    describe(c.name, () => {
+      it("the drawn extent is the crop box turned, not the crop box", () => {
+        const p = run(c);
+        const [w, h] = drawnExtent(c);
+        // The preview's continuous box, rotated, rounded the export's way.
+        expect(roundEven(runAtExportRes(c).cropH)).toBe(w);
+        expect(roundEven(runAtExportRes(c).cropW)).toBe(h);
+        // and it is genuinely a swap of the table's own pair
+        expect([w, h]).toEqual([c.out.dh, c.out.dw]);
+        expect(p.rotate === 90 || p.rotate === 270).toBe(true);
+      });
+
+      it("it is the ROTATED extent that `fit` was measured against", () => {
+        // The property the whole swap exists to preserve. `fit` is
+        // min(exportW/cropH, exportH/cropW) for a rotated clip, so the TURNED
+        // box is the one that fits the export frame and touches one of its
+        // bounds — while `dw` may legitimately overshoot it (the
+        // rotate90-nonsquare row's 1428 against an 802-wide canvas). An export
+        // that emitted `dw` as a width therefore built a frame the canvas
+        // clipped, which is precisely what shipped.
+        //
+        // Divided by userScale, which is a deliberate overflow: `k = fit *
+        // scale`, and a scale above 1 is the user zooming past the frame edge.
+        const q = runAtExportRes(c);
+        const w = q.cropH / c.in.scale;
+        const h = q.cropW / c.in.scale;
+        expect(w).toBeLessThanOrEqual(c.in.exportW + 1e-9);
+        expect(h).toBeLessThanOrEqual(c.in.exportH + 1e-9);
+        // exactly one axis is the constraining one, and it touches its bound
+        expect(
+          Math.abs(w - c.in.exportW) < 1e-9 || Math.abs(h - c.in.exportH) < 1e-9,
+          `${c.name}: turned box ${w}x${h} touches neither bound of ${c.in.exportW}x${c.in.exportH}`,
+        ).toBe(true);
+      });
+
+      it("the overlay position centres the turned box, not the crop box", () => {
+        const p = run(c);
+        const { sx, sy } = ratio(c);
+        const [w, h] = drawnExtent(c);
+        const x = roundAway((c.in.exportW - w) / 2 + p.posX * sx);
+        const y = roundAway((c.in.exportH - h) / 2 + p.posY * sy);
+        // The preview draws the clip centred on (canvas centre + x, + y) at the
+        // TURNED extent, so this is where the export's overlay has to land.
+        expect(Math.abs(x - ((c.in.exportW - w) / 2 + p.posX * sx))).toBeLessThan(1.25);
+        expect(Math.abs(y - ((c.in.exportH - h) / 2 + p.posY * sy))).toBeLessThan(1.25);
+        // ...and on a non-square box that is a different place from ox/oy. If
+        // these ever coincide the row has stopped testing anything.
+        if (c.out.dw !== c.out.dh) {
+          expect(x).not.toBe(c.out.ox);
+          expect(y).not.toBe(c.out.oy);
         }
       });
     });

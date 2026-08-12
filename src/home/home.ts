@@ -76,12 +76,12 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
         <div class="home__inner">
           <div class="home__hero">
             <div class="home__title">Projects</div>
-            <div class="row home__actions" id="home-actions" style="gap:var(--sp-2)">
+            <div class="row home__actions" id="home-actions">
               <button class="btn btn--primary" id="btn-new">${icon("plus")}New project</button>
               <button class="btn" id="btn-open">${icon("folder")}Open</button>
               <button class="btn btn--ghost" id="btn-select" title="Select projects" hidden>Select</button>
             </div>
-            <div class="row home__select-bar" id="home-select-bar" hidden style="gap:var(--sp-2)">
+            <div class="row home__select-bar" id="home-select-bar" hidden>
               <span class="home__select-count" id="home-select-count">0 selected</span>
               <button class="btn btn--danger" id="btn-select-delete" title="Delete selected projects" disabled>${icon("trash")}Delete</button>
               <button class="btn btn--ghost" id="btn-select-all" title="Select all projects matching the current search">Select all</button>
@@ -172,7 +172,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     if (items.length === 0) {
       const searching = search.value.trim().length > 0;
       grid.innerHTML = `
-        <div class="empty-state" style="grid-column: 1 / -1">
+        <div class="empty-state">
           ${icon("film", 32)}
           <div>${searching ? "No projects match your search." : "No projects yet."}</div>
           ${searching ? "" : `<div class="faint">Create one, or drop a video anywhere in this window.</div>`}

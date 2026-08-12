@@ -4,6 +4,7 @@
 
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { EncoderSummary, FfmpegFailure } from "./diagnostics";
+import { sanitizeProject } from "./project";
 import type { MediaInfo, MediaRef, ProjectFile, RecentsIndex, Settings } from "./types";
 
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -48,6 +49,68 @@ export interface LoadedProject {
   project: ProjectFile;
   missing: string[];
   recovered: boolean;
+}
+
+/* ---------------- reading settings.json ---------------- */
+
+/**
+ * How `get_settings` found settings.json — a mirror of `SettingsRead` /
+ * `SettingsStatus` in `src-tauri/src/settings.rs`, field for field and string
+ * for string. Deliberately NOT renamed into local vocabulary: these three
+ * discriminants are the contract, and a type that spells them the way the wire
+ * does is a rename either side cannot make quietly.
+ *
+ *     { "status": "ok",         "settings": { … }, "recovered": false }
+ *     { "status": "absent",     "settings": null,  "recovered": false }
+ *     { "status": "unreadable", "settings": null,  "recovered": false }
+ *
+ * The distinction that earns its keep is `absent` vs `unreadable`, and it is the
+ * same one `JsonRead` draws on the Rust side. "There is nothing stored" is a
+ * legitimate empty state a caller may freely write over; "something is stored
+ * but we could not read it" is NOT, because writing defaults over it rotates the
+ * last good copy into `.bak` and then hides it forever. Collapsing the two into
+ * a single `null` is precisely why the settings-clobber guard in `session.ts`
+ * never fired: `get_settings` RESOLVED with `null` instead of rejecting, so boot
+ * reported a clean "defaults" run, no toast appeared, and the first
+ * `updateSettings` of the session put `{ ...DEFAULTS, ...patch }` over a
+ * perfectly intact file that had merely been locked by a scanner for a moment.
+ *
+ * `recovered` says the settings ARE intact but the file they came from was not:
+ * the primary was corrupt and the `.bak` supplied them. Carried through so boot
+ * can say so rather than let the user wonder.
+ */
+export type SettingsRead =
+  | { status: "ok"; settings: unknown; recovered: boolean }
+  | { status: "absent" }
+  | { status: "unreadable" };
+
+/**
+ * The ONE place that knows the wire shape of `get_settings`.
+ *
+ * FAIL SAFE, NOT LENIENT. Anything this function does not positively recognise —
+ * an unknown status, a missing or null `settings` under `"ok"`, a bare value, a
+ * shape from a build that does not match this one — becomes `unreadable`, the
+ * state that REFUSES to write. The tempting fallback is the opposite (treat an
+ * unrecognised object as the settings themselves), and it is exactly how this
+ * bug would come back: the real `unreadable` payload would be mistaken for
+ * settings, `sanitizeSettings` would turn `{status, settings, recovered}` into
+ * pure defaults, boot would report a successful read, and the guard would never
+ * fire again — under a fix that looks correct. There is no legacy shape to be
+ * lenient toward: the backend and this file ship together, so an answer we do
+ * not understand means something is wrong, and the safe reading of "something is
+ * wrong" is "do not overwrite the user's file".
+ */
+export function normalizeSettingsRead(raw: unknown): SettingsRead {
+  if (raw !== null && typeof raw === "object") {
+    const o = raw as Record<string, unknown>;
+    // `settings` is non-null EXACTLY when the status is "ok" (the Rust type
+    // guarantees it); an "ok" without one is a contradiction, not a read.
+    if (o.status === "ok" && o.settings !== null && o.settings !== undefined) {
+      return { status: "ok", settings: o.settings, recovered: o.recovered === true };
+    }
+    if (o.status === "absent") return { status: "absent" };
+  }
+  return { status: "unreadable" };
 }
 
 export interface MediaKey {
@@ -99,11 +162,31 @@ export interface JobFailed {
   logTail: string[];
 }
 
+/** Standalone (rather than an arrow inside `ipc`) so `ipc.getSettings` can be
+ *  expressed in terms of it without the object literal referencing itself. */
+async function readSettings(): Promise<SettingsRead> {
+  // Outside the desktop app the fallback must be an EXPLICIT `absent`: a UI
+  // preview has no settings.json and nothing to protect, and the fail-safe
+  // default of `unreadable` would leave every previewed screen unable to save.
+  const fallback = (): unknown => ({ status: "absent", settings: null, recovered: false });
+  return normalizeSettingsRead(await call<unknown>("get_settings", undefined, fallback));
+}
+
 export const ipc = {
   listRecents: () =>
     call<RecentsIndex>("list_recents", undefined, () => ({ schema: 1, items: [] })),
   removeRecent: (path: string) => call<void>("remove_recent", { path }),
-  loadProject: (path: string) => call<LoadedProject>("load_project", { path }),
+  /** The one point at which a `.trt` becomes app state, and therefore where its
+   *  numbers are repaired — see `sanitizeProject`. `load_project` returns the
+   *  RAW json (the typed Rust struct it deserializes on the way past is used
+   *  only for the missing-media scan and the recents stamp), so a `speed: 0`
+   *  file reached `ProjectSession` unexamined and gave the editor an infinite
+   *  clip duration while the export path, which DOES read the typed struct,
+   *  computed a different one. */
+  loadProject: async (path: string): Promise<LoadedProject> => {
+    const loaded = await call<LoadedProject>("load_project", { path });
+    return { ...loaded, project: sanitizeProject(loaded.project) };
+  },
   saveProject: (path: string, project: ProjectFile) =>
     call<{ modifiedAt: string }>("save_project", { path, project }),
   refreshRecentThumb: (path: string) =>
@@ -125,7 +208,17 @@ export const ipc = {
   duplicateProject: (path: string, newName: string, newId: string) =>
     call<string>("duplicate_project", { path, newName, newId }),
   deleteProject: (path: string) => call<void>("delete_project", { path }),
-  getSettings: () => call<Settings | null>("get_settings", undefined, () => null),
+  /** Read settings.json, keeping "there is nothing there" and "there is
+   *  something there we could not read" apart. Anything that goes on to WRITE
+   *  settings must use this rather than `getSettings` — see `SettingsRead`. */
+  readSettings: readSettings,
+  /** Lossy convenience over `readSettings`: the stored value, or `null` for
+   *  BOTH empty states. Only safe for a caller that just wants to look — the
+   *  in-app E2E harness reading settings.json back to prove a write landed. */
+  getSettings: async (): Promise<Settings | null> => {
+    const read = await readSettings();
+    return read.status === "ok" ? (read.settings as Settings) : null;
+  },
   saveSettings: (settings: Settings) => call<void>("save_settings", { settings }),
 
   planPlayback: (media: MediaRef, hints: CodecHints, forceProxyLarge: boolean) =>

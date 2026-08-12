@@ -60,6 +60,29 @@ fn round_even(v: f64) -> i64 {
     n - (n % 2)
 }
 
+/// Largest side an exportable GENERATED media may declare.
+///
+/// Not an ffmpeg limit — measured, the bundled build makes a `color=s=40000x120`
+/// source without complaint. It is a resource bound on a frame we synthesize
+/// ourselves, and it has to sit above the editor's own generator cap (8192) so
+/// that anything authorable stays exportable. 16384 is the number the old
+/// silent clamp used, so nothing that exports today stops exporting.
+///
+/// IT IS A REFUSAL, NOT A CLAMP, and that distinction is the whole point:
+///   * clamping only the synthesis leaves the fit math, `dw`/`dh` and the
+///     opacity alpha mask still derived from the unclamped dims — two opinions
+///     of one dimension, which is the `blend` size mismatch this replaced;
+///   * clamping BOTH sides would export different CONTENT than the preview
+///     shows. `generator_source` pins drawtext's layout box to the media size
+///     and centres the lines in it (`text_align=L+M`), so a shrunk box does not
+///     drop the tail of the text, it drops both ends: 137 lines clamped to 68
+///     loses ~34 off the top and ~34 off the bottom, while the preview's block
+///     flow shows lines 1..68. An export that quietly renders the middle of the
+///     user's text is worse than one that says why it stopped.
+/// The editor no longer lets a generator exceed this; a project that does was
+/// either saved before that gate or hand-edited.
+const MAX_GENERATED_DIM: u32 = 16384;
+
 /* ------------------------------------------------------------------ */
 /* Font mapping + filter-path escaping                                 */
 /* ------------------------------------------------------------------ */
@@ -247,10 +270,28 @@ struct Placement {
     rotate: u32,
     flip_h: bool,
     flip_v: bool,
+    /// Display size of the preview's crop BOX — i.e. BEFORE `rot` turns it.
+    /// This mirrors `transforms.ts`, which sizes `layer.crop` to
+    /// `cropW*k x cropH*k` and only then applies `rotate(r)` to the parent.
+    ///
+    /// READ THE ROTATION NOTE BEFORE USING THESE. The export has no nesting: by
+    /// the time `scale=` runs, `transpose` has already swapped the frame's axes,
+    /// so for rotate 90/270 `scale=dw:dh` sizes the WRONG axes and the result is
+    /// a frame of swapped aspect. Everything downstream of the transpose must go
+    /// through `Placement::transposed` (or, for the overlay position, use
+    /// `ovl_x`/`ovl_y`). Emitting these raw exported a 90-rotated 1278x718 clip
+    /// as an 802x802 square instead of the preview's 802x1428.
     dw: i64,
     dh: i64,
+    /// Overlay position that centres a `dw x dh` box — so, like `dw`/`dh`, the
+    /// PRE-rotation one. Never emit it directly: use `Placement::overlay_pos`.
     ox: i64,
     oy: i64,
+    /// Overlay position that centres the TRANSPOSED frame (`dh x dw` for rotate
+    /// 90/270), which is the one `overlay` is actually handed. Identical to
+    /// `ox`/`oy` for 0/180.
+    ovl_x: i64,
+    ovl_y: i64,
     opacity: f64,
     /// Post-crop source dims (before rotate), used to size the alphamerge mask.
     post_crop_w: i64,
@@ -272,6 +313,61 @@ struct Placement {
     /// needs these to convert them too.
     sx: f64,
     sy: f64,
+}
+
+impl Placement {
+    /// Does the graph transpose this clip's frames?
+    fn rotated(&self) -> bool {
+        self.rotate == 90 || self.rotate == 270
+    }
+
+    /// Re-express a PRE-rotation `(w, h)` pair in the axes the frame actually
+    /// has once `transpose` has run.
+    ///
+    /// THE WHOLE FILE'S ROTATION HAZARD LIVES HERE. `placement` computes every
+    /// size against the preview's crop box, which is un-rotated (`transforms.ts`
+    /// sizes `layer.crop` first and rotates the parent afterwards). ffmpeg has no
+    /// such nesting — `transpose` mutates the frame in place — so any size handed
+    /// to a filter DOWNSTREAM of the transpose is in swapped axes and has to come
+    /// through here. `scale=` is the only such filter today, in three variants
+    /// (static, single-keyframe, ramped); all three must use it or a rotated clip
+    /// exports at its aspect transposed.
+    ///
+    /// Why not simply scale BEFORE transposing, which would need no swap at all:
+    /// `scale=...:eval=frame` re-negotiates its output size every frame, and
+    /// `transpose` latches its link dimensions at config time. Put the ramped
+    /// scale ahead of the transpose and an animated-scale clip freezes at its
+    /// t=0 size for the whole export (measured — the frame simply stops growing).
+    /// The swap is the cost of keeping animated scale alive.
+    fn transposed<T>(&self, w: T, h: T) -> (T, T) {
+        if self.rotated() { (h, w) } else { (w, h) }
+    }
+
+    /// Where `overlay` must put the frame it actually receives — the transposed
+    /// one, `dh x dw` for rotate 90/270. `ox`/`oy` centre the un-rotated box, so
+    /// emitting them shoved every rotated clip (dw-dh)/2 off centre on BOTH axes
+    /// on top of the aspect error.
+    ///
+    /// The rotated pair is RECOMPUTED by `placement` rather than derived from
+    /// `ox`/`oy`, and that is not fussiness. The shift between them looks like a
+    /// whole number — `(dw-dh)/2`, integral because `round_even` makes both dims
+    /// even — which suggests `ovl_x = ox + (dw-dh)/2`. It is wrong: `f64::round`
+    /// breaks ties AWAY FROM ZERO, so it is not translation-invariant across the
+    /// origin (`round(-0.5) = -1` but `round(-0.5 + 1) = 1`, not 0). The shared
+    /// parity table's `export-halved-with-a-rotated-cropped-clip-and-offsets` row
+    /// lands on exactly that tie and comes out one pixel off. Same formula, fresh
+    /// inputs, no shortcut.
+    ///
+    /// The unrotated arm reads `ox`/`oy` (equal to `ovl_x`/`ovl_y` there) so the
+    /// parity table's `ox`/`oy` rows keep guarding a number the export really
+    /// emits instead of a field only the tests look at.
+    fn overlay_pos(&self) -> (i64, i64) {
+        if self.rotated() {
+            (self.ovl_x, self.ovl_y)
+        } else {
+            (self.ox, self.oy)
+        }
+    }
 }
 
 /// Compute per-clip crop rect + scaled display size + overlay position, using
@@ -339,8 +435,16 @@ fn placement(clip: &Clip, media: &MediaRef, canvas: (u32, u32), out: (u32, u32))
     // x/y are CANVAS px; cw/ch (and therefore dw/dh) are OUTPUT px. The offsets
     // have to be converted before they can be added to an output-space centring
     // term — see the header of this function.
+    // These centre the un-rotated dw x dh box.
     let ox = ((cw - dw as f64) / 2.0 + x * sx).round() as i64;
     let oy = ((ch - dh as f64) / 2.0 + y * sy).round() as i64;
+    // And these centre the frame `overlay` is really handed: `transpose` has
+    // already run, so for 90/270 it is dh wide and dw tall. The SAME formula
+    // over the swapped extent — see `Placement::overlay_pos` for why shifting
+    // `ox`/`oy` by (dw-dh)/2 instead is off by a pixel on some rows.
+    let (ovl_w, ovl_h) = if rotated { (dh, dw) } else { (dw, dh) };
+    let ovl_x = ((cw - ovl_w as f64) / 2.0 + x * sx).round() as i64;
+    let ovl_y = ((ch - ovl_h as f64) / 2.0 + y * sy).round() as i64;
 
     // Only emit a crop filter when it actually narrows the frame.
     let crop = if crop_x > 0.0
@@ -367,11 +471,29 @@ fn placement(clip: &Clip, media: &MediaRef, canvas: (u32, u32), out: (u32, u32))
         dh,
         ox,
         oy,
+        ovl_x,
+        ovl_y,
         opacity,
         post_crop_w: crop_w.round() as i64,
         post_crop_h: crop_h.round() as i64,
-        src_w: src_w.round().clamp(1.0, 16384.0) as i64,
-        src_h: src_h.round().clamp(1.0, 16384.0) as i64,
+        // ONE derivation of the source size, deliberately unbounded here.
+        //
+        // These two used to carry `.clamp(1.0, 16384.0)` while `crop_w`/`crop_h`
+        // above — and therefore `post_crop_*`, `fit`, `dw`, `dh` — were computed
+        // from the same floats UNCLAMPED. For a generated media over the limit
+        // the graph then contained two different opinions of one dimension: the
+        // frame was synthesized at 16384 and the opacity alpha mask sized at,
+        // say, 25000, and `blend` will not pair them —
+        //   "First input link top parameters (size 16384x120) do not match the
+        //    corresponding second input link bottom parameters (size 25000x120)"
+        // — so graph configuration failed and the export died before its first
+        // frame, surfacing to the user as bare "ffmpeg exited with exit code: 1".
+        //
+        // The bound now lives in `build`, as a REFUSAL, before any of this runs;
+        // see `MAX_GENERATED_DIM` for why it cannot be a clamp. `src_w`/`src_h`
+        // are already `.max(1)` at their definition, so nothing is needed here.
+        src_w: src_w.round() as i64,
+        src_h: src_h.round() as i64,
         fit_w: crop_w * fit,
         fit_h: crop_h * fit,
         x: x * sx,
@@ -539,9 +661,26 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
         ));
     }
 
-    // Pre-check every text generator maps to an existing font file before we
-    // spawn ffmpeg, so failures surface as a clear BadInput.
+    // Pre-check generated media before we spawn ffmpeg, so failures surface as a
+    // clear BadInput instead of an ffmpeg exit code: the declared size must be
+    // one we can actually synthesize, and a text generator's font must exist.
     for m in &spec.media {
+        if m.generator.is_none() {
+            continue;
+        }
+        // A generated frame is BUILT at these dims, and the same dims feed the
+        // fit math and the opacity alpha mask. Anything we cannot build at, we
+        // must refuse here rather than emit a graph ffmpeg rejects — see
+        // MAX_GENERATED_DIM for why this is not a clamp.
+        let (gw, gh) = (m.width.unwrap_or(0), m.height.unwrap_or(0));
+        if gw > MAX_GENERATED_DIM || gh > MAX_GENERATED_DIM {
+            return Err(AppError::BadInput(format!(
+                "generated media '{}' is {gw}x{gh}, over the {MAX_GENERATED_DIM} px \
+                 limit for a generated frame — re-create the layer at a smaller \
+                 size (projects saved by older versions could store boxes this big)",
+                m.id
+            )));
+        }
         if let Some(Generator::Text { font_family, bold, italic, .. }) = &m.generator {
             match font_path(font_family, *bold, *italic) {
                 Some(p) => {
@@ -976,6 +1115,11 @@ enable='gte(t,{start:.6})*lt(t,{end:.6})'{out};"
     /// flips → transpose → scale (animated or static) → setsar=1 → fps →
     /// [static opacity colorchannelmixer] → [setpts timeline shift].
     ///
+    /// `scale` sits AFTER the transpose, so every size it is given is in
+    /// post-rotation axes while `Placement` speaks pre-rotation ones — hence the
+    /// `p.transposed(..)` calls. See `Placement::transposed` for why the filters
+    /// are not simply reordered instead.
+    ///
     /// Animated scale/geq always use the clip-local time var ("t"/"T") since
     /// those filters run before the final setpts shift. `shift_start` =
     /// Some(start) for overlay stages (appends the trailing
@@ -1064,24 +1208,31 @@ scale={cw}:{ch}[al{a}];[cx{a}][al{a}]blend=all_mode=multiply[am{a}];\
         // transform scale (mirrors preview's evalKfs). A single keyframe is a
         // constant scale factor: emit fixed display dims (fit * v). Multi-kf
         // uses the per-frame ramp expression (eval=frame).
+        //
+        // EVERY branch scales the TRANSPOSED frame, so every branch feeds its
+        // (w, h) through `p.transposed` — `dw`/`dh` and `fit_w`/`fit_h` alike
+        // describe the preview's un-rotated crop box. See `Placement::transposed`.
         let scale_kfs = clip.keyframes.as_ref().and_then(|k| k.scale.as_ref());
         match scale_kfs.filter(|k| !k.is_empty()) {
             Some(kfs) if kfs.len() == 1 => {
-                let sw = round_even(p.fit_w * kfs[0].v);
-                let sh = round_even(p.fit_h * kfs[0].v);
+                let (sw, sh) = p.transposed(
+                    round_even(p.fit_w * kfs[0].v),
+                    round_even(p.fit_h * kfs[0].v),
+                );
                 chain.push_str(&format!(",scale={sw}:{sh}"));
             }
             Some(kfs) => {
                 let bps = clamped_breakpoints(kfs, clip.src_in, clip.src_out, clip.speed);
                 // scale runs before the setpts shift → time var is clip-local "t".
                 let s = ramp_expr(&bps, "t");
+                let (fw, fh) = p.transposed(p.fit_w, p.fit_h);
                 chain.push_str(&format!(
-                    ",scale=w='trunc({:.4}*({s})/2)*2':h='trunc({:.4}*({s})/2)*2':eval=frame",
-                    p.fit_w, p.fit_h
+                    ",scale=w='trunc({fw:.4}*({s})/2)*2':h='trunc({fh:.4}*({s})/2)*2':eval=frame"
                 ));
             }
             None => {
-                chain.push_str(&format!(",scale={}:{}", p.dw, p.dh));
+                let (sw, sh) = p.transposed(p.dw, p.dh);
+                chain.push_str(&format!(",scale={sw}:{sh}"));
             }
         }
         chain.push_str(&format!(",setsar=1,fps={fps}"));
@@ -1124,8 +1275,14 @@ scale={cw}:{ch}[al{a}];[cx{a}][al{a}]blend=all_mode=multiply[am{a}];\
 
         // Centered expressions are needed whenever position OR scale has any
         // keyframe (scale changes overlay_w/h, so a fixed ox no longer centers).
+        // `overlay_pos()`, NOT the raw `ox`/`oy`: the frame reaching `overlay`
+        // has been transposed, so a rotated clip must be centred against its
+        // swapped extent. The animated branch below is immune —
+        // `(main_w-overlay_w)/2` reads the real, already-transposed width at
+        // runtime, which is why only this static path ever went wrong.
         if x_kf.is_none() && y_kf.is_none() && scale_kf.is_none() {
-            return (format!("{}", p.ox), format!("{}", p.oy));
+            let (ox, oy) = p.overlay_pos();
+            return (format!("{ox}"), format!("{oy}"));
         }
 
         // Per axis: single kf → constant value; multi-kf → ramp; absent → static.
@@ -1469,13 +1626,26 @@ mod tests {
         assert!(b.filter_complex.contains("concat=n=3:v=1:a=0"), "{}", b.filter_complex);
     }
 
+    /// EVERY DIMENSION HERE IS DELIBERATELY UNEQUAL TO EVERY OTHER.
+    ///
+    /// This test used to run a 50x50 crop on a 100x100 canvas exported at
+    /// Original. That makes `dw == dh == 100`, so `scale=dw:dh` and
+    /// `scale=dh:dw` are the same string and `ox == oy` centres both a frame and
+    /// its transpose — the whole rotation-axis question is invisible by
+    /// construction. It passed for the entire life of the bug where `transpose`
+    /// ran before `scale=dw:dh` and exported every rotated non-square clip at a
+    /// swapped aspect, off centre.
+    ///
+    /// So: crop w != crop h, media w != media h, canvas w != canvas h, export !=
+    /// canvas, and crop x != crop y. If any pair here is ever equalised for
+    /// convenience, this test stops testing rotation.
     #[test]
     fn speed_crop_rotate_flip_opacity_chain() {
-        let m = media("m1", r"C:\v.mp4", 100, 100, false);
+        let m = media("m1", r"C:\v.mp4", 1200, 800, false);
         let mut c = clip("c1", "m1", 0.0, 0.0, 4.0);
         c.speed = 2.0;
         c.transform = Some(ClipTransform {
-            crop: Some(ClipCrop { x: 10.0, y: 10.0, w: 50.0, h: 50.0 }),
+            crop: Some(ClipCrop { x: 60.0, y: 40.0, w: 900.0, h: 500.0 }),
             rotate: 90,
             flip_h: true,
             flip_v: false,
@@ -1484,11 +1654,15 @@ mod tests {
             y: 0.0,
             opacity: 0.5,
         });
-        let tl = timeline(100, 100, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
-        let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+        let b = build(
+            &spec(vec![m], tl, preset_at("mp4", "h264", "720p"), r"C:\o.mp4"),
+            &enc(),
+        )
+        .unwrap();
         let fc = &b.filter_complex;
         assert!(fc.contains("setpts=(PTS-STARTPTS)/2.000000"), "{fc}");
-        assert!(fc.contains("crop=50:50:10:10"), "{fc}");
+        assert!(fc.contains("crop=900:500:60:40"), "{fc}");
         assert!(fc.contains("transpose=1"), "{fc}");
         assert!(fc.contains("hflip"), "{fc}");
         assert!(!fc.contains("vflip"), "{fc}");
@@ -1498,12 +1672,19 @@ mod tests {
         let transpose_at = fc.find("transpose=1").expect("transpose present");
         assert!(hflip_at < transpose_at, "hflip must precede transpose: {fc}");
         assert!(
-            fc.contains("crop=50:50:10:10,hflip,transpose=1"),
+            fc.contains("crop=900:500:60:40,hflip,transpose=1"),
             "chain must be crop,hflip,transpose: {fc}"
         );
-        assert!(fc.contains("scale=100:100"), "{fc}");
+        // rotated fit: fitW=cropH=500, fitH=cropW=900 -> fit = min(1280/500,
+        // 720/900) = 0.8. The preview's crop BOX is 900*0.8 x 500*0.8 = 720x400;
+        // rotating it gives the 400x720 the frame must end up as. `scale=` runs
+        // after the transpose, so it is handed the swapped pair.
+        assert!(fc.contains(",scale=400:720,"), "scale must use post-transpose axes: {fc}");
+        assert!(!fc.contains(",scale=720:400,"), "pre-rotation axes reached scale=: {fc}");
+        // and the transposed frame is centred against ITS extent:
+        // x = (1280-400)/2 = 440, y = (720-720)/2 = 0.
+        assert!(fc.contains("overlay=440:0:shortest=1"), "{fc}");
         assert!(fc.contains("colorchannelmixer=aa=0.5000"), "{fc}");
-        assert!(fc.contains("overlay=0:0:shortest=1"), "{fc}");
     }
 
     /// `preset` with a named resolution instead of "original".
@@ -1631,6 +1812,489 @@ mod tests {
             fc.contains("overlay='(main_w-overlay_w)/2+-400.0000+(800.0000)*clip((t-0.0000)/4.0000,0,1)':'(main_h-overlay_h)/2+100.0000'"),
             "{fc}"
         );
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Rotation: what the CHAIN produces, not what `placement` computes     */
+    /* ------------------------------------------------------------------ */
+    //
+    // `placement`'s dw/dh/ox/oy were never wrong — the shared parity table pins
+    // them from both implementations and always passed. The export was still
+    // broken, because the GRAPH consumed them on the far side of a `transpose`
+    // that had already swapped the frame's axes. Nothing in the suite looked at
+    // that seam: the parity test stops at the four integers, and the one
+    // rotation chain test used a square box so the swap was a no-op.
+    //
+    // Everything below therefore asserts the emitted `scale=`/`overlay=` (and,
+    // at the end, real encoded pixels) rather than `Placement` fields.
+
+    /// The `scale=W:H` applied to the frame that reaches `overlay`: the one
+    /// immediately before `setsar=1`. Not the same as the first `,scale=` in the
+    /// graph — an opacity-keyframed clip has an earlier `scale=` sizing its alpha
+    /// mask, and `overlay_and_scale` would return that one.
+    fn display_scale(fc: &str) -> String {
+        let end = fc.find(",setsar=1").unwrap_or_else(|| panic!("no setsar=1 in {fc}"));
+        let head = fc[..end]
+            .rfind(",scale=")
+            .unwrap_or_else(|| panic!("no display scale in {fc}"))
+            + ",scale=".len();
+        fc[head..end].to_string()
+    }
+
+    /// The `overlay=X:Y` position, for either the concat (`:shortest=1`) or the
+    /// overlay-stage (`:enable=`) form.
+    fn display_overlay(fc: &str) -> String {
+        let i = fc.find("overlay=").unwrap_or_else(|| panic!("no overlay in {fc}")) + "overlay=".len();
+        let rest = &fc[i..];
+        let j = rest
+            .find(":shortest=1")
+            .or_else(|| rest.find(":enable="))
+            .unwrap_or_else(|| panic!("no overlay tail in {fc}"));
+        rest[..j].to_string()
+    }
+
+    /// Independent statement of the geometry the preview draws, written from
+    /// `transforms.ts`'s MODEL rather than from `placement`'s code: size the crop
+    /// box to cropW*k x cropH*k, then TURN it, then centre what that leaves.
+    /// Returns (scale_w, scale_h, overlay_x, overlay_y) as the graph must emit
+    /// them — i.e. already in post-transpose axes.
+    fn expected_chain_geometry(
+        src: (f64, f64),
+        crop: (f64, f64),
+        rotate: u32,
+        scale: f64,
+        xy: (f64, f64),
+        canvas: (u32, u32),
+        out: (u32, u32),
+    ) -> (i64, i64, i64, i64) {
+        let _ = src;
+        let (out_w, out_h) = (out.0 as f64, out.1 as f64);
+        let rotated = rotate == 90 || rotate == 270;
+        let (fit_w, fit_h) = if rotated { (crop.1, crop.0) } else { (crop.0, crop.1) };
+        let fit = (out_w / fit_w).min(out_h / fit_h);
+        let k = fit * scale;
+        // the preview's crop BOX, un-rotated
+        let box_w = round_even(crop.0 * k);
+        let box_h = round_even(crop.1 * k);
+        // ...as it appears once `rot` has turned it
+        let (disp_w, disp_h) = if rotated { (box_h, box_w) } else { (box_w, box_h) };
+        let sx = out_w / canvas.0 as f64;
+        let sy = out_h / canvas.1 as f64;
+        let ox = ((out_w - disp_w as f64) / 2.0 + xy.0 * sx).round() as i64;
+        let oy = ((out_h - disp_h as f64) / 2.0 + xy.1 * sy).round() as i64;
+        (disp_w, disp_h, ox, oy)
+    }
+
+    #[test]
+    fn the_chain_scales_and_centres_the_transposed_frame() {
+        // Rotation x flips x crop x export resolution. Only the rows with a
+        // non-square display box and a 90/270 angle can see the bug, but the
+        // 0/180 and square rows have to keep passing — a "fix" that swapped
+        // unconditionally, or that swapped for 180 too, breaks them.
+        struct Row {
+            name: &'static str,
+            media: (u32, u32),
+            crop: Option<(f64, f64, f64, f64)>, // x, y, w, h
+            rotate: u32,
+            flips: (bool, bool),
+            scale: f64,
+            xy: (f64, f64),
+            canvas: (u32, u32),
+            resolution: &'static str,
+        }
+        let rows = [
+            Row { name: "90, non-square media, non-square canvas, Original",
+                  media: (1278, 718), crop: None, rotate: 90, flips: (false, false),
+                  scale: 1.0, xy: (0.0, 0.0), canvas: (802, 1442), resolution: "original" },
+            Row { name: "270, non-square media, non-square canvas, Original",
+                  media: (903, 1607), crop: None, rotate: 270, flips: (false, false),
+                  scale: 1.0, xy: (0.0, 0.0), canvas: (1276, 718), resolution: "original" },
+            Row { name: "180 must NOT swap",
+                  media: (1278, 718), crop: None, rotate: 180, flips: (false, false),
+                  scale: 1.0, xy: (0.0, 0.0), canvas: (802, 1442), resolution: "original" },
+            Row { name: "0 must NOT swap",
+                  media: (1278, 718), crop: None, rotate: 0, flips: (false, false),
+                  scale: 1.0, xy: (0.0, 0.0), canvas: (802, 1442), resolution: "original" },
+            Row { name: "90 + crop + both flips + off-centre, 720p from 1080p",
+                  media: (1200, 800), crop: Some((60.0, 40.0, 900.0, 500.0)), rotate: 90,
+                  flips: (true, true), scale: 1.0, xy: (140.0, -90.0),
+                  canvas: (1920, 1080), resolution: "720p" },
+            Row { name: "270 + crop + userScale, 2160p from 1080p",
+                  media: (1200, 800), crop: Some((0.0, 0.0, 640.0, 360.0)), rotate: 270,
+                  flips: (false, true), scale: 1.37, xy: (-88.0, 33.0),
+                  canvas: (1920, 1080), resolution: "2160p" },
+            Row { name: "90 on a SQUARE crop — the shape the old test used",
+                  media: (100, 100), crop: Some((10.0, 10.0, 50.0, 50.0)), rotate: 90,
+                  flips: (true, false), scale: 1.0, xy: (0.0, 0.0),
+                  canvas: (100, 100), resolution: "original" },
+        ];
+
+        for r in rows {
+            let m = media("m1", r"C:\v.mp4", r.media.0, r.media.1, false);
+            let mut c = clip("c1", "m1", 0.0, 0.0, 2.0);
+            c.transform = Some(ClipTransform {
+                crop: r.crop.map(|(x, y, w, h)| ClipCrop { x, y, w, h }),
+                rotate: r.rotate,
+                flip_h: r.flips.0,
+                flip_v: r.flips.1,
+                scale: r.scale,
+                x: r.xy.0,
+                y: r.xy.1,
+                opacity: 1.0,
+            });
+            let tl = timeline(r.canvas.0, r.canvas.1, Rational { num: 30, den: 1 },
+                              vec![vtrack(vec![c])]);
+            let out = preset_at("mp4", "h264", r.resolution)
+                .output_dims(r.canvas.0, r.canvas.1);
+            let b = build(
+                &spec(vec![m], tl, preset_at("mp4", "h264", r.resolution), r"C:\o.mp4"),
+                &enc(),
+            )
+            .unwrap();
+
+            let crop = r.crop.map_or((r.media.0 as f64, r.media.1 as f64), |c| (c.2, c.3));
+            let (dw, dh, ox, oy) = expected_chain_geometry(
+                (r.media.0 as f64, r.media.1 as f64), crop, r.rotate, r.scale, r.xy,
+                r.canvas, out,
+            );
+            let fc = &b.filter_complex;
+            assert_eq!(display_scale(fc), format!("{dw}:{dh}"), "{}: scale", r.name);
+            assert_eq!(display_overlay(fc), format!("{ox}:{oy}"), "{}: overlay", r.name);
+        }
+    }
+
+    #[test]
+    fn the_rotated_display_box_stays_inside_the_output_frame() {
+        // The property the swap exists to preserve, stated without reference to
+        // either implementation: `fit` is measured against the ROTATED extent, so
+        // the frame the graph builds must fit the output box on both axes. The
+        // shipped chain emitted a frame 1428 px wide into an 802 px canvas.
+        for (mw, mh, rot, cw, ch) in [
+            (1278u32, 718u32, 90u32, 802u32, 1442u32),
+            (1278, 718, 270, 802, 1442),
+            (903, 1607, 90, 1276, 718),
+            (1200, 800, 90, 1920, 1080),
+            (800, 1200, 270, 1920, 1080),
+        ] {
+            for res in ["original", "720p", "2160p"] {
+                let m = media("m1", r"C:\v.mp4", mw, mh, false);
+                let mut c = clip("c1", "m1", 0.0, 0.0, 2.0);
+                c.transform = Some(ClipTransform {
+                    crop: None, rotate: rot, flip_h: false, flip_v: false,
+                    scale: 1.0, x: 0.0, y: 0.0, opacity: 1.0,
+                });
+                let tl = timeline(cw, ch, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+                let (ow, oh) = preset_at("mp4", "h264", res).output_dims(cw, ch);
+                let b = build(
+                    &spec(vec![m], tl, preset_at("mp4", "h264", res), r"C:\o.mp4"),
+                    &enc(),
+                )
+                .unwrap();
+                let sz = display_scale(&b.filter_complex);
+                let (w, h) = sz.split_once(':').expect("W:H");
+                let (w, h) = (w.parse::<i64>().unwrap(), h.parse::<i64>().unwrap());
+                let tag = format!("{mw}x{mh} rot{rot} canvas {cw}x{ch} @{res}");
+                // <= 1 slack: round_even can only ever round the extent DOWN to
+                // the even below, never up past the box.
+                assert!(w <= ow as i64 + 1, "{tag}: frame {w} wide in a {ow} box");
+                assert!(h <= oh as i64 + 1, "{tag}: frame {h} tall in a {oh} box");
+                // and it must actually TOUCH one of the two bounds, or the fit
+                // was computed against the un-rotated axes and came out small.
+                assert!(
+                    (w - ow as i64).abs() <= 2 || (h - oh as i64).abs() <= 2,
+                    "{tag}: frame {w}x{h} touches neither bound of {ow}x{oh}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_animated_scale_ramps_the_transposed_axes_too() {
+        // The keyframed `scale=` branches are the two the static-only fix would
+        // have missed. A single keyframe emits fixed dims; a ramp emits
+        // expressions — both are built from `fit_w`/`fit_h`, which describe the
+        // UN-rotated box, and both land downstream of the transpose.
+        let build_with = |kfs: Vec<Keyframe>| {
+            let m = media("m1", r"C:\v.mp4", 1200, 800, false);
+            let mut c = clip("c1", "m1", 0.0, 0.0, 4.0);
+            c.transform = Some(ClipTransform {
+                crop: Some(ClipCrop { x: 0.0, y: 0.0, w: 900.0, h: 500.0 }),
+                rotate: 90, flip_h: false, flip_v: false,
+                scale: 1.0, x: 0.0, y: 0.0, opacity: 1.0,
+            });
+            c.keyframes = Some(ClipKeyframes { x: None, y: None, scale: Some(kfs), opacity: None });
+            let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+            build(
+                &spec(vec![m], tl, preset_at("mp4", "h264", "720p"), r"C:\o.mp4"),
+                &enc(),
+            )
+            .unwrap()
+            .filter_complex
+        };
+
+        // fit = min(1280/500, 720/900) = 0.8 -> fitW = 900*0.8 = 720,
+        // fitH = 500*0.8 = 400. At v=0.5 the box is 360x200, so the TRANSPOSED
+        // frame is 200x360.
+        let fc = build_with(vec![Keyframe { t: 0.0, v: 0.5 }]);
+        assert_eq!(display_scale(&fc), "200:360", "single-kf scale: {fc}");
+
+        // Ramped: the w= expression must carry fitH (400) and h= fitW (720).
+        let fc = build_with(vec![
+            Keyframe { t: 0.0, v: 0.5 },
+            Keyframe { t: 4.0, v: 1.0 },
+        ]);
+        assert!(
+            fc.contains(",scale=w='trunc(400.0000*(") && fc.contains(":h='trunc(720.0000*("),
+            "ramped scale must swap fitW/fitH: {fc}"
+        );
+        assert!(fc.contains("eval=frame"), "{fc}");
+        // The ramp must stay DOWNSTREAM of the transpose: `transpose` latches its
+        // link dimensions at configure time, so a per-frame `scale` placed ahead
+        // of it freezes the frame at its t=0 size for the whole export (measured
+        // with the bundled ffmpeg — the box simply stops growing).
+        let t_at = fc.find("transpose=1").expect("transpose present");
+        let s_at = fc.find(",scale=w='trunc").expect("ramped scale present");
+        assert!(t_at < s_at, "animated scale must follow the transpose: {fc}");
+    }
+
+    #[test]
+    fn overlay_position_survives_the_transpose() {
+        // `Placement::overlay_pos` shifts `ox`/`oy` onto the rotated extent by an
+        // integer identity rather than recomputing them. Re-derive the position
+        // FROM SCRATCH for every row of the shared parity table and demand the
+        // same answer — this is what keeps the table's `ox`/`oy` assertions
+        // load-bearing instead of decorative now that the graph no longer emits
+        // those two numbers directly for rotated clips.
+        let table: ParityTable =
+            serde_json::from_str(PARITY_TABLE).expect("parity table must parse");
+        let mut rotated_rows = 0;
+
+        for case in &table.cases {
+            let n = &case.name;
+            let i = &case.input;
+            let mut m = media("pm", r"C:\parity.mp4", 1, 1, false);
+            m.width = i.media_w;
+            m.height = i.media_h;
+            let mut c = clip("pc", "pm", 0.0, 0.0, 1.0);
+            c.transform = Some(ClipTransform {
+                crop: i.crop.as_ref().map(|k| ClipCrop { x: k.x, y: k.y, w: k.w, h: k.h }),
+                rotate: i.rotate, flip_h: i.flip_h, flip_v: i.flip_v,
+                scale: i.scale, x: i.x, y: i.y, opacity: 1.0,
+            });
+            let p = placement(&c, &m, (i.canvas_w, i.canvas_h), (i.export_w, i.export_h));
+
+            let (fw, fh) = p.transposed(p.dw, p.dh);
+            let sx = i.export_w as f64 / i.canvas_w as f64;
+            let sy = i.export_h as f64 / i.canvas_h as f64;
+            let want = (
+                ((i.export_w as f64 - fw as f64) / 2.0 + i.x * sx).round() as i64,
+                ((i.export_h as f64 - fh as f64) / 2.0 + i.y * sy).round() as i64,
+            );
+            assert_eq!(p.overlay_pos(), want, "{n}: overlay position");
+
+            if p.rotated() {
+                rotated_rows += 1;
+                // and it must genuinely DIFFER from the un-rotated centring
+                // whenever the box is non-square, or the row cannot see the bug.
+                if p.dw != p.dh {
+                    assert_ne!(
+                        p.overlay_pos(), (p.ox, p.oy),
+                        "{n}: rotated non-square row must move off ox/oy"
+                    );
+                }
+            } else {
+                assert_eq!(p.overlay_pos(), (p.ox, p.oy), "{n}: unrotated must not move");
+            }
+        }
+        assert!(rotated_rows >= 3, "only {rotated_rows} rotated rows in the table");
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Rotation: REAL PIXELS from the bundled ffmpeg                        */
+    /* ------------------------------------------------------------------ */
+    //
+    // Everything above still only reads the filtergraph STRING, and reading the
+    // string is how this bug survived a rewrite of the very function that
+    // computes its numbers: `,transpose=1,scale=1428:802` looks correct until
+    // you notice `transpose` already swapped the frame. So these encode a frame
+    // with the real sidecar and measure where the content landed.
+    //
+    // White clip on the export's black base, so `bbox` reads back exactly the
+    // rectangle the clip occupies.
+
+    /// A private fixture dir. The shared `taroting export e2e` dir is written by
+    /// another suite in the same `cargo test` run, and racing on a half-written
+    /// fixture there shows up as a spurious `moov atom not found`.
+    fn geom_dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join("taroting rotate geometry");
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A solid-white `w x h` H.264 fixture, created once and reused.
+    fn white_source(w: u32, h: u32) -> std::path::PathBuf {
+        // the space is deliberate: argv quoting is part of what is under test
+        let p = geom_dir().join(format!("white {w}x{h}.mp4"));
+        if !p.exists() {
+            let tmp = geom_dir().join(format!("white {w}x{h}.part.mp4"));
+            let out = crate::jobs::ffmpeg::command("ffmpeg")
+                .unwrap()
+                .args([
+                    "-y", "-hide_banner", "-f", "lavfi",
+                    "-i", &format!("color=white:s={w}x{h}:r=30:d=1"),
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                ])
+                .arg(&tmp)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "fixture: {}", String::from_utf8_lossy(&out.stderr));
+            // rename last so a concurrent reader never sees a partial file
+            let _ = std::fs::rename(&tmp, &p);
+        }
+        p
+    }
+
+    /// Run a `BuiltExport` through the real sidecar. `finalize_args` lives in the
+    /// parent module and also materialises drawtext textfiles; these cases have
+    /// no text payloads and a graph far under the script-mode limit, so swapping
+    /// the placeholder for the inline filter is the whole of it.
+    fn encode_built(b: &BuiltExport, out: &std::path::Path) {
+        let mut args = b.args.clone();
+        let pos = args
+            .iter()
+            .position(|a| a == FILTER_PLACEHOLDER)
+            .expect("filter placeholder");
+        args[pos] = OsString::from(&b.filter_complex);
+        let last = args.len() - 1;
+        args[last] = OsString::from(out);
+        assert!(b.text_payloads.is_empty(), "this helper does not materialise textfiles");
+        let res = crate::jobs::ffmpeg::command("ffmpeg").unwrap().args(&args).output().unwrap();
+        assert!(res.status.success(), "export failed: {}", String::from_utf8_lossy(&res.stderr));
+    }
+
+    /// Bounding box (x, y, w, h) of the non-black content in the first frame.
+    ///
+    /// `min_val=96` and not something near black: H.264 deblocking spills luma
+    /// out of the white rectangle across the whole macroblock that contains its
+    /// edge, so a threshold of 16 reads this fixture's box 10 px too tall and
+    /// pinned to y=0. Anything from ~64 up to white (235) returns the same
+    /// rectangle, and it is the same one a lossless PNG of the graph gives.
+    fn content_bbox(path: &std::path::Path) -> (i64, i64, i64, i64) {
+        let out = crate::jobs::ffmpeg::command("ffmpeg")
+            .unwrap()
+            .args(["-hide_banner", "-nostats", "-i"])
+            .arg(path)
+            .args(["-frames:v", "1", "-vf", "bbox=min_val=96", "-f", "null", "-"])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        let line = err
+            .lines()
+            .find(|l| l.contains(" x1:") && l.contains(" y1:"))
+            .unwrap_or_else(|| panic!("no bbox line in:\n{err}"));
+        let field = |k: &str| -> i64 {
+            let i = line.find(k).unwrap_or_else(|| panic!("no {k} in {line}")) + k.len();
+            line[i..]
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("bad {k} in {line}"))
+        };
+        (field(" x1:"), field(" y1:"), field(" w:"), field(" h:"))
+    }
+
+    #[test]
+    fn real_ffmpeg_lands_a_rotated_clip_where_the_preview_draws_it() {
+        struct Case {
+            name: &'static str,
+            media: (u32, u32),
+            crop: Option<(f64, f64, f64, f64)>,
+            rotate: u32,
+            opacity_ramp: bool,
+            canvas: (u32, u32),
+            resolution: &'static str,
+            /// x, y, w, h of the content, as the preview positions it
+            want: (i64, i64, i64, i64),
+        }
+        let cases = [
+            // The shared parity table's own rotate-90 row. As shipped this
+            // encoded an 802x802 square at y=320: the 1428x802 frame was 626 px
+            // too wide for the canvas and got clipped to a square, then hung off
+            // centre because ox/oy centred the un-rotated box.
+            Case { name: "parity row rotate90-nonsquare-media-on-a-nonsquare-canvas",
+                   media: (1278, 718), crop: None, rotate: 90, opacity_ramp: false,
+                   canvas: (802, 1442), resolution: "original",
+                   want: (0, 7, 802, 1428) },
+            // The full intersection: rotate + crop + an opacity keyframe, at a
+            // resolution that is not the canvas. Shipped as 720x400 at (280,160)
+            // — aspect out by 3.24x, sides clipped, box off centre.
+            Case { name: "rotate90 + crop 900x500 + opacity ramp, 720p from 1080p",
+                   media: (1200, 800), crop: Some((0.0, 0.0, 900.0, 500.0)), rotate: 90,
+                   opacity_ramp: true, canvas: (1920, 1080), resolution: "720p",
+                   want: (440, 0, 400, 720) },
+            // Controls. Same inputs, no rotation — these were already right and
+            // must stay so, and they prove the harness can tell the two apart:
+            // if the measurement were blind, case 2 and case 3 would agree.
+            Case { name: "rotate0 control",
+                   media: (1200, 800), crop: Some((0.0, 0.0, 900.0, 500.0)), rotate: 0,
+                   opacity_ramp: true, canvas: (1920, 1080), resolution: "720p",
+                   want: (0, 5, 1280, 710) },
+            Case { name: "rotate180 control (must not swap)",
+                   media: (1200, 800), crop: Some((0.0, 0.0, 900.0, 500.0)), rotate: 180,
+                   opacity_ramp: true, canvas: (1920, 1080), resolution: "720p",
+                   want: (0, 5, 1280, 710) },
+        ];
+
+        for (n, case) in cases.iter().enumerate() {
+            let src = white_source(case.media.0, case.media.1);
+            let mut m = media("m1", &src.to_string_lossy(), case.media.0, case.media.1, false);
+            m.duration = 1.0;
+            let mut c = clip("c1", "m1", 0.0, 0.0, 0.5);
+            c.transform = Some(ClipTransform {
+                crop: case.crop.map(|(x, y, w, h)| ClipCrop { x, y, w, h }),
+                rotate: case.rotate,
+                flip_h: false,
+                flip_v: false,
+                scale: 1.0,
+                x: 0.0,
+                y: 0.0,
+                opacity: 1.0,
+            });
+            if case.opacity_ramp {
+                // starts at 1.0, so the measured first frame is fully opaque
+                // while the alphamerge block is still in the graph
+                c.keyframes = Some(ClipKeyframes {
+                    x: None, y: None, scale: None,
+                    opacity: Some(vec![
+                        Keyframe { t: 0.0, v: 1.0 },
+                        Keyframe { t: 0.5, v: 0.2 },
+                    ]),
+                });
+            }
+            let tl = timeline(case.canvas.0, case.canvas.1, Rational { num: 30, den: 1 },
+                              vec![vtrack(vec![c])]);
+            let out = geom_dir().join(format!("rot geometry {n}.mp4"));
+            let b = build(
+                &spec(vec![m], tl, preset_at("mp4", "h264", case.resolution),
+                      &out.to_string_lossy()),
+                &enc(),
+            )
+            .unwrap();
+            encode_built(&b, &out);
+
+            let got = content_bbox(&out);
+            let (wx, wy, ww, wh) = case.want;
+            let (gx, gy, gw, gh) = got;
+            // +-3 px: yuv420 chroma siting and H.264 ringing smear a hard white
+            // edge by a pixel or two. The error being caught here is 300+ px.
+            let close = |a: i64, b: i64| (a - b).abs() <= 3;
+            assert!(
+                close(gx, wx) && close(gy, wy) && close(gw, ww) && close(gh, wh),
+                "{}: encoded content {gw}x{gh} at ({gx},{gy}), preview draws \
+                 {ww}x{wh} at ({wx},{wy})  [graph: {}]",
+                case.name, b.filter_complex
+            );
+        }
     }
 
     #[test]
@@ -2317,6 +2981,117 @@ mod tests {
         // legitimately canvas-sized. The bug lives in the GENERATOR source, so
         // that is what this pins.)
         assert!(!fc.contains("color=c=0xff0000:s=398x934"), "{fc}");
+    }
+
+    /// The size a generated frame is SYNTHESIZED at (`color=...:s=WxH`).
+    fn generator_source_size(fc: &str) -> String {
+        let i = fc.find(":s=").unwrap_or_else(|| panic!("no generator source in {fc}")) + 3;
+        let rest = &fc[i..];
+        rest[..rest.find(':').expect("size tail")].to_string()
+    }
+
+    /// The size the opacity ALPHA MASK is scaled to — the other derivation of
+    /// the same dimension, and the one `blend` compares against the frame.
+    fn alpha_mask_size(fc: &str) -> String {
+        let i = fc.find("geq=lum=").unwrap_or_else(|| panic!("no alpha mask in {fc}"));
+        let j = fc[i..].find(",scale=").expect("mask scale") + i + ",scale=".len();
+        let rest = &fc[j..];
+        rest[..rest.find('[').expect("mask label")].to_string()
+    }
+
+    #[test]
+    fn an_oversized_generated_media_is_refused_before_ffmpeg_sees_it() {
+        // A generated frame was synthesized at a size CLAMPED to 16384 while the
+        // fit math and the opacity alpha mask kept using the unclamped dims, so
+        // an oversized media built a graph containing two different numbers for
+        // one dimension. ffmpeg then refused to configure it —
+        //   "First input link top parameters (size 16384x120) do not match the
+        //    corresponding second input link bottom parameters (size 25000x120)"
+        // — and the export died before its first frame, reaching the user as a
+        // bare "ffmpeg exited with exit code: 1". `build` used to return Ok here.
+        //
+        // The editor now caps a generator at 8192, so this only arrives from a
+        // project saved before that gate or hand-edited — both of which land in
+        // `build` exactly like any other spec.
+        let over = |w: u32, h: u32| {
+            let gm = gen_media("g1", Generator::Solid { color: "#ff0000".into() }, w, h);
+            let mut c = clip("c1", "g1", 0.0, 0.0, 2.0);
+            // the opacity keyframe is what turns the disagreement fatal
+            c.keyframes = Some(ClipKeyframes {
+                x: None, y: None, scale: None,
+                opacity: Some(vec![Keyframe { t: 0.0, v: 1.0 }, Keyframe { t: 2.0, v: 0.0 }]),
+            });
+            let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+            build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc())
+        };
+
+        // over on width, over on height, over on both
+        for (w, h) in [(25000, 120), (120, 25000), (20000, 20000)] {
+            // `BuiltExport` is not Debug, so no `expect_err`
+            let msg = match over(w, h) {
+                Err(e) => format!("{e}"),
+                Ok(_) => panic!("{w}x{h} built a graph instead of being refused"),
+            };
+            assert!(msg.contains("generated media 'g1'"), "{msg}");
+            assert!(msg.contains(&format!("{w}x{h}")), "message must state the size: {msg}");
+            assert!(msg.contains("16384"), "message must state the limit: {msg}");
+        }
+
+        // ...and the boundary is inclusive: exactly at the limit still exports,
+        // so the refusal cannot creep down over anything that works today.
+        let b = over(MAX_GENERATED_DIM, 120).expect("the limit itself must build");
+        assert_eq!(generator_source_size(&b.filter_complex), "16384x120");
+    }
+
+    #[test]
+    fn the_generated_frame_and_its_alpha_mask_are_the_same_size() {
+        // The invariant the clamp broke, stated directly: the frame we
+        // synthesize and the mask `blend` pairs it with are two derivations of
+        // ONE dimension and must never disagree. Re-clamping either side — the
+        // tempting "fix", and the one that would silently export the MIDDLE of a
+        // long text block because drawtext centres lines in its box — breaks
+        // this at the sizes below without breaking anything else.
+        for (w, h) in [(400u32, 200u32), (1920, 1080), (8192, 240), (MAX_GENERATED_DIM, 120)] {
+            let gm = gen_media("g1", Generator::Solid { color: "#00ff00".into() }, w, h);
+            let mut c = clip("c1", "g1", 0.0, 0.0, 2.0);
+            c.keyframes = Some(ClipKeyframes {
+                x: None, y: None, scale: None,
+                opacity: Some(vec![Keyframe { t: 0.0, v: 1.0 }, Keyframe { t: 2.0, v: 0.0 }]),
+            });
+            let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+            let b = build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+            let fc = &b.filter_complex;
+            assert_eq!(generator_source_size(fc), format!("{w}x{h}"), "synthesis size");
+            assert_eq!(alpha_mask_size(fc), format!("{w}:{h}"), "alpha mask size");
+        }
+    }
+
+    #[test]
+    fn a_generator_at_the_limit_really_configures_in_ffmpeg() {
+        // The refusal threshold is only honest if everything below it works.
+        // Build the widest allowed generator WITH an opacity keyframe — the exact
+        // shape that used to abort during graph configuration — and run the real
+        // sidecar over it. A string test cannot tell "the two numbers match" from
+        // "ffmpeg accepts them".
+        let gm = gen_media("g1", Generator::Solid { color: "#ffffff".into() },
+                           MAX_GENERATED_DIM, 120);
+        let mut c = clip("c1", "g1", 0.0, 0.0, 0.2);
+        c.keyframes = Some(ClipKeyframes {
+            x: None, y: None, scale: None,
+            opacity: Some(vec![Keyframe { t: 0.0, v: 1.0 }, Keyframe { t: 0.2, v: 0.2 }]),
+        });
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+        let out = geom_dir().join("generator at limit.mp4");
+        let b = build(
+            &spec(vec![gm], tl, preset("mp4", "h264"), &out.to_string_lossy()),
+            &enc(),
+        )
+        .unwrap();
+        // panics with ffmpeg's own stderr, so a regression names its own cause
+        encode_built(&b, &out);
+        // the clip is white on a black base, so SOMETHING must have been drawn
+        let (_, _, w, h) = content_bbox(&out);
+        assert!(w > 0 && h > 0, "the generated frame reached the output: {w}x{h}");
     }
 
     #[test]

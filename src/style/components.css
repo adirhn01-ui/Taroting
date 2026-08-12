@@ -251,6 +251,17 @@
   padding: var(--sp-5);
   overflow-y: auto;
 }
+/* Body copy inside a modal. A class and not a `style` attribute on the div:
+   the packaged build's style-src names a nonce, which under CSP3 neutralises
+   'unsafe-inline' in that directive, and an attribute cannot carry a nonce — so
+   inline styles simply do not arrive (see the block above `colorRow` in
+   settings/settings.ts). These three declarations are static, so they belong
+   here rather than in the CSSOM. Same values as .home-modal__body-text. */
+.modal__text {
+  font-size: var(--fs-13);
+  color: var(--text-2);
+  line-height: 1.5;
+}
 .modal__footer {
   display: flex;
   justify-content: flex-end;
