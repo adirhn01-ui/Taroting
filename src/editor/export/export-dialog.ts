@@ -8,6 +8,7 @@ import { escapeHtml, fileExt, formatBytes } from "../../core/format";
 import { appVersion, describeError, errorDetail, ipc, onJobEvents } from "../../core/ipc";
 import type { JobDone, JobFailed, JobProgress } from "../../core/ipc";
 import { ProjectSession, settingsStore, updateSettings } from "../../core/session";
+import { timelineDuration } from "../../core/time";
 import type { ExportPreset, ResolutionPreset } from "../../core/types";
 import { detailPane, recentErrors, recordError } from "../../ui/errors";
 import { trapTab } from "../../ui/focus";
@@ -593,14 +594,19 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     // Read the project live: an edit made while the dialog is open must be the
     // one we estimate (and export).
     const live = session.project;
-    const spec: ExportSpec = {
-      media: live.media,
-      timeline: live.timeline,
-      preset: buildPreset(),
-      outPath: outPath(),
-    };
+    // Only the four scalars the estimate reads — never the media list or the
+    // clips. See EstimateInput for the measured reason (16.9 ms of UI-thread
+    // JSON.stringify on a 1600-clip project, on a 300 ms debounce, per control
+    // change). The derivation here is the one the backend used to do itself.
+    const tl = live.timeline;
     try {
-      const est = await estimateExport(spec);
+      const est = await estimateExport({
+        durationSec: timelineDuration(tl),
+        width: tl.width,
+        height: tl.height,
+        fps: tl.fps.num / Math.max(1, tl.fps.den),
+        preset: buildPreset(),
+      });
       if (!el.isConnected) return;
       const prefix = est.exact ? "" : "≈ ";
       el.innerHTML = `Estimated size: <strong>${prefix}${escapeHtml(formatBytes(est.bytes))}</strong>`;
@@ -675,7 +681,17 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     // persist the preset into the project + remember the folder
     const preset = buildPreset();
     session.replace({ ...session.project, export: preset });
-    void updateSettings({ lastExportDir: folder });
+    // SAY SO if the write fails. Nothing else here reports it: the export runs
+    // regardless, so a bare `void` meant a rejected write silently cost the user
+    // their remembered destination — the next export opened somewhere else with
+    // no explanation. Same shape as settings.ts persist().
+    void updateSettings({ lastExportDir: folder }).catch((e: unknown) => {
+      toast.error("Couldn't save your settings.", {
+        detail: describeError(e),
+        op: "Settings",
+        title: "Export folder",
+      });
+    });
 
     const target = outPath();
     if (await pathExists(target)) {

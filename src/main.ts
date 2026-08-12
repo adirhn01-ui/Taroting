@@ -156,7 +156,21 @@ function enqueueOpen(path: string): void {
 }
 
 void (async () => {
-  await initSettings();
+  // A failed READ is not the same as a first run, and the difference matters:
+  // the store falls back to defaults either way, so without this the app opens
+  // looking factory-fresh — every preference, the export folder and every
+  // rebound shortcut apparently gone — with nothing said. `updateSettings`
+  // now refuses to overwrite a file it could not read, so the real settings
+  // survive on disk; this is the half that tells the user why the screen looks
+  // wrong, instead of leaving them to conclude their settings were lost.
+  const load = await initSettings();
+  if (!load.ok) {
+    toast.error("Couldn't read your settings.", {
+      detail: load.error,
+      op: "Settings",
+      title: "Load",
+    });
+  }
   // Atomically drain the server-side open-path queue and route each path. Safe
   // to call repeatedly: the drain returns every queued path to exactly one
   // caller, so the wake-up handler and the startup drain never double-open.

@@ -2,7 +2,7 @@
 // open project with autosave + undo/redo orchestration.
 
 import { History } from "./history";
-import { ipc } from "./ipc";
+import { describeError, ipc } from "./ipc";
 import { touchModified } from "./project";
 import { Store } from "./store";
 import type { ActionId, CustomTheme, ProjectFile, Settings } from "./types";
@@ -871,12 +871,95 @@ export function sanitizeSettings(raw: unknown): Settings {
   };
 }
 
-export async function initSettings(): Promise<void> {
+/* ---------------- loading settings, and not destroying them ----------------
+ *
+ * THE BUG THIS SHAPE EXISTS TO PREVENT. `initSettings` used to swallow a
+ * rejecting `get_settings` with a bare `catch {}` and leave the store at
+ * DEFAULT_SETTINGS. Nothing was surfaced, so the app simply came up looking
+ * like a fresh install — and then the FIRST `updateSettings` wrote
+ * `{ ...DEFAULTS, ...patch }` straight over the user's real settings.json. One
+ * switch toggle was enough to replace a configured export folder with `null`
+ * and every rebound shortcut with its stock chord. The write after that rotated
+ * the last good `.bak` away too, so the recovery copy the Rust side keeps for
+ * exactly this case was gone as well.
+ *
+ * `get_settings` returning `null` is the same trap wearing a friendlier face.
+ * `read_json_with_bak` maps BOTH "there is no file yet" and "neither the file
+ * nor its .bak could be read" to `Ok(None)`, and a Windows file lock — an
+ * antivirus scanner, a backup agent, a roaming profile still syncing — makes
+ * `std::fs::read` fail on a settings.json that is perfectly intact. Boot then
+ * concludes "first run" about a file full of the user's preferences.
+ *
+ * So the store carries an explicit answer to "is what I hold actually what is
+ * on disk?", and a write is only allowed to be a blind overwrite when it is.
+ * When it is not, the first write of the session RE-READS first:
+ *
+ *   read succeeds with settings → they were there all along. Adopt them (which
+ *       repairs the UI too) and merge the patch onto THEM, not onto defaults.
+ *   read succeeds with null     → the backend is sure there is nothing to
+ *       restore, so there is nothing to lose. Write.
+ *   read fails again            → we still do not know what is on disk. REFUSE,
+ *       and let the caller say so, rather than overwrite it to find out.
+ *
+ * That costs one extra IPC round trip, once, and only in a session whose boot
+ * read came back empty or failed. Every session that read real settings — which
+ * is every session of every user who has ever changed a setting — pays nothing:
+ * `settingsVerified` is true from boot and never consulted again.
+ */
+
+/** Whether `settingsStore` is known to match settings.json. False until a read
+ *  (or a write) has proven it, which is what gates the re-read above. */
+let settingsVerified = false;
+
+/** The boot read's failure, kept so a screen mounted later can still report
+ *  what start-up saw, and so a second failure can be told apart from a first. */
+let settingsReadFailure: string | null = null;
+
+/** How the one-time boot read of settings.json went.
+ *
+ *  `source` distinguishes the two SUCCESSFUL outcomes that used to be
+ *  indistinguishable from a failure: "disk" means stored settings were read and
+ *  applied, "defaults" means the backend reported nothing to restore. */
+export type SettingsLoad =
+  | { ok: true; source: "disk" | "defaults" }
+  | { ok: false; error: string };
+
+/** The boot read's failure, or null when it went fine. For a caller that was
+ *  not around when `initSettings` resolved (the Settings screen is mounted
+ *  later, and this is precisely the screen a user visits when their
+ *  preferences look wrong). */
+export function settingsLoadFailure(): string | null {
+  return settingsReadFailure;
+}
+
+/**
+ * Read settings, paint the theme, and REPORT what happened.
+ *
+ * The result is returned rather than toasted here on purpose: this module is
+ * core and has no business importing the toast UI. The caller (main.ts) owns
+ * the reporting. The `console.error` is a floor, not the mechanism — a data
+ * loss risk this quiet must not depend on a caller remembering to look.
+ */
+export async function initSettings(): Promise<SettingsLoad> {
+  let result: SettingsLoad;
+  settingsVerified = false;
+  settingsReadFailure = null;
   try {
     const loaded = await ipc.getSettings();
-    if (loaded) settingsStore.set(sanitizeSettings(loaded));
-  } catch {
-    // defaults are fine; settings UI reports persistence problems later
+    if (loaded) {
+      settingsStore.set(sanitizeSettings(loaded));
+      settingsVerified = true;
+      result = { ok: true, source: "disk" };
+    } else {
+      // Probably a first run — but possibly a settings.json that could not be
+      // opened, which the backend cannot tell apart. Left unverified so the
+      // first write re-reads before it overwrites anything.
+      result = { ok: true, source: "defaults" };
+    }
+  } catch (e) {
+    settingsReadFailure = describeError(e);
+    console.error("Could not read settings; running on defaults", e);
+    result = { ok: false, error: settingsReadFailure };
   }
   const s = settingsStore.get();
   applyTheme(s.theme, s.customTheme);
@@ -887,15 +970,59 @@ export async function initSettings(): Promise<void> {
     const cur = settingsStore.get();
     if (cur.theme === "system") applyTheme("system");
   });
+  return result;
+}
+
+/**
+ * Re-read settings.json before the first write of a session that never
+ * confirmed one. Returns true when real settings were found and adopted.
+ *
+ * Throws only in the case where writing would be destructive AND we have no
+ * idea what we would be destroying: the boot read failed and this one failed
+ * too. A boot that merely found nothing is left permissive — two independent
+ * "there is nothing here" answers must not lock a genuine first run out of
+ * saving its preferences forever.
+ */
+async function reconcileSettings(): Promise<boolean> {
+  let loaded: Settings | null;
+  try {
+    loaded = await ipc.getSettings();
+  } catch (e) {
+    if (settingsReadFailure !== null) {
+      throw new Error(
+        "Your settings file could not be read when the app started, and still can't be. " +
+          "Saving now would replace it with defaults, so nothing was written. " +
+          `The reason given was: ${describeError(e)}`,
+      );
+    }
+    // Start-up already established there is nothing on disk to protect.
+    settingsVerified = true;
+    return false;
+  }
+  settingsVerified = true;
+  settingsReadFailure = null;
+  if (!loaded) return false;
+  settingsStore.set(sanitizeSettings(loaded));
+  return true;
 }
 
 export async function updateSettings(patch: Partial<Settings>): Promise<void> {
+  // Only ever true after a boot read that came back empty or failed, and only
+  // for the first write of that session — see the block comment above. It is
+  // also the one path on which the store is read AFTER an await rather than
+  // synchronously, which is the price of not painting over the truth.
+  const adopted = settingsVerified ? false : await reconcileSettings();
   const next = { ...settingsStore.get(), ...patch };
   settingsStore.set(next);
   // Either key can change the painted theme: switching TO custom, or editing
-  // the colours while already on it.
-  if (patch.theme || patch.customTheme) applyTheme(next.theme, next.customTheme);
+  // the colours while already on it. `adopted` forces a repaint as well — the
+  // app has been showing the default theme since boot, and the settings we just
+  // recovered may name a different one.
+  if (adopted || patch.theme || patch.customTheme) applyTheme(next.theme, next.customTheme);
   await ipc.saveSettings(next);
+  // The file is now ours: whatever was unreadable at boot has been replaced by
+  // something we wrote, so later writes can go straight through.
+  settingsVerified = true;
 }
 
 /* ---------------- project session ---------------- */
@@ -909,6 +1036,26 @@ export type SaveState = "saved" | "dirty" | "saving" | "error";
 export type LeaveGuard = () => Promise<boolean>;
 
 const AUTOSAVE_DEBOUNCE_MS = 500;
+
+/**
+ * How many autosave ticks to wait before retrying after a failed write. Doubles
+ * per consecutive failure and stops here.
+ *
+ * A failed write leaves `saveState` at "error", never at "dirty", so the
+ * interval's dirty check alone meant NOTHING ever tried again: the project sat
+ * unsaved, showing "Save failed", until the user made another edit or left the
+ * editor. A cause that would have cleared on its own — an antivirus scan
+ * holding the file, a network drive spinning up, a lock from a sync client —
+ * never healed.
+ *
+ * Backed off rather than retried every tick because a retry is not free. Each
+ * attempt re-stamps `modifiedAt` and pushes a new project object through the
+ * store, which notifies every editor subscriber; against a destination that is
+ * permanently gone (the folder was deleted, the drive was unplugged) an
+ * every-tick retry is a re-render loop for as long as the editor stays open.
+ * At the 3 s default this settles at roughly one attempt a minute.
+ */
+const SAVE_RETRY_MAX_TICKS = 16;
 
 /** The open project: a reactive store, an undo history, and an autosaver. */
 export class ProjectSession {
@@ -924,16 +1071,31 @@ export class ProjectSession {
 
   private debounceTimer: number | undefined;
   private intervalTimer: number | undefined;
-  private saving = false;
+  /** The write currently draining, or null when idle. A PROMISE rather than the
+   *  old boolean, because a call that coalesces into it has to be able to WAIT
+   *  for it — see `save()`. */
+  private inFlight: Promise<void> | null = null;
   private pendingSave = false;
   private disposed = false;
+  /** Consecutive failed writes, and the interval ticks left before the next
+   *  retry. Both reset by any successful write. See SAVE_RETRY_MAX_TICKS. */
+  private failedSaves = 0;
+  private retryTicks = 0;
 
   constructor(path: string, initial: ProjectFile) {
     this.path = path;
     this.store = new Store(initial);
     const seconds = Math.max(1, settingsStore.get().autosaveSeconds);
     this.intervalTimer = window.setInterval(() => {
-      if (this.saveState.get() === "dirty") void this.save();
+      const state = this.saveState.get();
+      if (state === "dirty") {
+        void this.save();
+      } else if (state === "error" && this.retryTicks > 0 && --this.retryTicks === 0) {
+        // The retry path. Gated on `retryTicks > 0` rather than on the countdown
+        // alone so that "error" without a scheduled retry can never fall through
+        // to an every-tick attempt.
+        void this.save();
+      }
     }, seconds * 1000);
   }
 
@@ -991,35 +1153,82 @@ export class ProjectSession {
     this.debounceTimer = window.setTimeout(() => void this.save(), AUTOSAVE_DEBOUNCE_MS);
   }
 
-  /** Serialize + write. Coalesces concurrent calls. */
+  /**
+   * Serialize + write, coalescing concurrent calls.
+   *
+   * THE PROMISE MEANS "THE STATE AS OF THIS CALL IS ON DISK". That is why a
+   * coalesced call returns the in-flight promise instead of resolving straight
+   * away, and it is the whole fix for a real data loss:
+   *
+   *   edit → autosave starts → edit again while that write is in flight →
+   *   leave the editor (Back, Ctrl+W, the Settings gear, an OS open-path)
+   *
+   * `dispose()` awaits `save()` and then sets `disposed`. When `save()`
+   * resolved early — merely having recorded `pendingSave` — dispose marked the
+   * session disposed BEFORE the follow-up write ran, and the follow-up then
+   * short-circuited on `disposed` and never wrote. The second edit was silently
+   * gone, and every exit from the editor goes through `dispose()`.
+   */
   async save(): Promise<void> {
     if (this.disposed) return;
-    if (this.saving) {
+    if (this.inFlight) {
+      // Don't start a second concurrent write to the same path: ask the running
+      // drain for one more pass. That pass serializes whatever the store holds
+      // by then, which includes this caller's edits — so waiting on it is
+      // exactly waiting for them to land.
       this.pendingSave = true;
-      return;
+      return this.inFlight;
     }
-    this.saving = true;
-    this.saveState.set("saving");
+    // Published BEFORE `drain()` is invoked, so a `save()` arriving during the
+    // drain's first synchronous stretch coalesces instead of racing it. (Today
+    // nothing in that stretch can re-enter — store notifications are
+    // microtask-batched — but the ordering is free and the alternative is a
+    // second writer to the same file if that ever stops being true.)
+    let settle!: () => void;
+    this.inFlight = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
     try {
-      const stamped = touchModified(this.store.get());
-      this.store.set(stamped);
-      await ipc.saveProject(this.path, stamped);
-      if (this.saveState.get() === "saving") this.saveState.set("saved");
-    } catch {
-      this.saveState.set("error");
+      await this.drain();
     } finally {
-      this.saving = false;
-      if (this.pendingSave) {
-        this.pendingSave = false;
-        void this.save();
-      }
+      this.inFlight = null;
+      settle();
     }
+  }
+
+  /** One write, then another for as long as edits kept arriving while the last
+   *  was in flight. Never throws: a failure is reported through `saveState` and
+   *  retried by the autosave interval. */
+  private async drain(): Promise<void> {
+    do {
+      this.pendingSave = false;
+      this.saveState.set("saving");
+      try {
+        const stamped = touchModified(this.store.get());
+        this.store.set(stamped);
+        await ipc.saveProject(this.path, stamped);
+        this.failedSaves = 0;
+        this.retryTicks = 0;
+        // An edit made DURING the write already set "dirty"; don't paint over it.
+        if (this.saveState.get() === "saving") this.saveState.set("saved");
+      } catch {
+        this.failedSaves++;
+        this.retryTicks = Math.min(2 ** (this.failedSaves - 1), SAVE_RETRY_MAX_TICKS);
+        this.saveState.set("error");
+      }
+      // `discard()` can land mid-write — the quick-view "Discard" gesture
+      // deletes the temp file immediately afterwards — so stop rather than
+      // resurrect it with a follow-up.
+    } while (this.pendingSave && !this.disposed);
   }
 
   /** Flush and stop timers (called when leaving the editor). */
   async dispose(): Promise<void> {
     window.clearTimeout(this.debounceTimer);
     window.clearInterval(this.intervalTimer);
+    // `save()` now resolves only once the state at the time of this call has
+    // actually been written, coalesced follow-up included, so `disposed` is set
+    // after the last byte is out rather than while a write is still owed.
     if (!this.disposed && this.saveState.get() !== "saved") {
       await this.save();
     }

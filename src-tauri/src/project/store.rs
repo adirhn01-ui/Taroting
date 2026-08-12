@@ -41,7 +41,11 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
     let bak = bak_path(path);
     let rotated = if path.exists() {
-        let _ = std::fs::remove_file(&bak);
+        // Rename straight ONTO any existing backup — rename replaces it
+        // atomically. Deleting the old `.bak` first meant that a rotation which
+        // then failed (a scanner holding the name, a full volume) left no backup
+        // at all, and the one moment a backup matters most is the moment a write
+        // is going wrong.
         std::fs::rename(path, &bak)?;
         true
     } else {
@@ -59,26 +63,69 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The outcome of reading a JSON file that has a `.bak` sibling.
+///
+/// The distinction that earns its keep is `Absent` vs `Unreadable`. "Nothing is
+/// stored" is a legitimate empty state that a caller may freely write over;
+/// "something is stored but we could not read it" is NOT, because writing the
+/// empty value over it rotates the last good copy into `.bak` and then hides it
+/// forever — the fresh primary parses fine, so `read_json_with_bak` never
+/// consults the backup again. That is the exact sequence that wiped a user's
+/// whole recents list.
+pub enum JsonRead<T> {
+    /// Parsed. `recovered` is true when the `.bak` supplied it.
+    Parsed { value: T, recovered: bool },
+    /// Neither copy is on disk — a clean first run.
+    Absent,
+    /// At least one copy exists but nothing could be parsed out of it.
+    Unreadable,
+}
+
+/// `(parsed value, whether the file is there at all)`.
+///
+/// A file we cannot even open for a reason OTHER than "it isn't there" — a
+/// permission error, an exclusive lock, a bad sector — counts as PRESENT: the
+/// data may well still exist, so the caller must not overwrite it.
+fn read_json_one<T: serde::de::DeserializeOwned>(path: &Path) -> (Option<T>, bool) {
+    match std::fs::read(path) {
+        Ok(bytes) => (serde_json::from_slice::<T>(&bytes).ok(), true),
+        Err(e) => (None, e.kind() != std::io::ErrorKind::NotFound),
+    }
+}
+
 /// Read a JSON file, falling back to the `<path>.bak` that `atomic_write`
-/// rotates aside when the primary is missing or unparseable. Returns the parsed
-/// value (when either copy could be read) plus whether the backup supplied it.
+/// rotates aside, and report which of the three outcomes occurred.
 ///
 /// Those `.bak` files existed from the start but nothing ever read them, so a
 /// corrupt primary silently became "no data": for settings that meant every
 /// preference reset to defaults, and for recents it meant every project card
 /// disappearing from home. Both then re-saved over the last good backup.
-pub fn read_json_with_bak<T: serde::de::DeserializeOwned>(path: &Path) -> (Option<T>, bool) {
-    let primary = std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<T>(&b).ok());
-    if primary.is_some() {
-        return (primary, false);
+pub fn read_json_status<T: serde::de::DeserializeOwned>(path: &Path) -> JsonRead<T> {
+    let (primary, primary_present) = read_json_one::<T>(path);
+    if let Some(value) = primary {
+        return JsonRead::Parsed { value, recovered: false };
     }
-    let backup = std::fs::read(bak_path(path))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<T>(&b).ok());
-    let recovered = backup.is_some();
-    (backup, recovered)
+    let (backup, bak_present) = read_json_one::<T>(&bak_path(path));
+    if let Some(value) = backup {
+        return JsonRead::Parsed { value, recovered: true };
+    }
+    if primary_present || bak_present {
+        JsonRead::Unreadable
+    } else {
+        JsonRead::Absent
+    }
+}
+
+/// `read_json_status` for callers that only need the value: the parsed value
+/// (when either copy could be read) plus whether the backup supplied it.
+///
+/// Collapsing `Absent` and `Unreadable` into the same `None` is exactly what a
+/// caller that goes on to WRITE must not do — see `JsonRead`.
+pub fn read_json_with_bak<T: serde::de::DeserializeOwned>(path: &Path) -> (Option<T>, bool) {
+    match read_json_status(path) {
+        JsonRead::Parsed { value, recovered } => (Some(value), recovered),
+        JsonRead::Absent | JsonRead::Unreadable => (None, false),
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -174,22 +221,61 @@ fn recents_path() -> Result<PathBuf> {
     Ok(paths::data_dir()?.join("recents.json"))
 }
 
+/// The recents index plus whether it is safe to write back over it.
+struct Recents {
+    index: RecentsIndex,
+    /// False when an index EXISTS on disk that we could not read. Persisting the
+    /// empty default we fall back to would destroy it: `atomic_write` rotates
+    /// the last good copy into `.bak`, and the fresh empty primary then parses
+    /// fine, so the recovery path never looks at that backup again. One
+    /// unreadable file plus one ordinary save is all it took to lose the entire
+    /// list. Absence is different and stays writable — that is a first run.
+    writable: bool,
+}
+
+fn read_recents_checked() -> Recents {
+    let empty = |writable| Recents {
+        index: RecentsIndex::default(),
+        writable,
+    };
+    // No data dir means we could not even look; refuse to write blind.
+    let Ok(path) = recents_path() else {
+        return empty(false);
+    };
+    match read_json_status::<RecentsIndex>(&path) {
+        JsonRead::Parsed { value, .. } => Recents { index: value, writable: true },
+        JsonRead::Absent => empty(true),
+        JsonRead::Unreadable => empty(false),
+    }
+}
+
 fn read_recents() -> RecentsIndex {
-    recents_path()
-        .ok()
-        .and_then(|p| read_json_with_bak::<RecentsIndex>(&p).0)
-        .unwrap_or_default()
+    read_recents_checked().index
 }
 
 fn write_recents(index: &RecentsIndex) -> Result<()> {
     atomic_write(&recents_path()?, serde_json::to_vec(index)?.as_slice())
 }
 
+/// Persist an index that came from `read_recents_checked`, unless the read
+/// failed — see `Recents::writable`.
+///
+/// Skipping is reported as success on purpose: recents is a convenience, and a
+/// corrupt index must not be able to fail the project save that triggered the
+/// update. The user keeps their work and their (unreadable) index; nothing is
+/// destroyed, so a later repair is still possible.
+fn write_recents_checked(recents: &Recents) -> Result<()> {
+    if !recents.writable {
+        return Ok(());
+    }
+    write_recents(&recents.index)
+}
+
 fn upsert_recent(mut item: RecentItem) -> Result<()> {
-    let mut index = read_recents();
+    let mut recents = read_recents_checked();
     // Preserve a prior openedAt when the caller doesn't supply one, and refresh
     // the on-disk size so callers don't all have to stat.
-    if let Some(prev) = index.items.iter().find(|r| r.path == item.path) {
+    if let Some(prev) = recents.index.items.iter().find(|r| r.path == item.path) {
         if item.opened_at.is_none() {
             item.opened_at = prev.opened_at.clone();
         }
@@ -197,10 +283,10 @@ fn upsert_recent(mut item: RecentItem) -> Result<()> {
     if let Ok(meta) = std::fs::metadata(&item.path) {
         item.size_bytes = meta.len();
     }
-    index.items.retain(|r| r.path != item.path);
-    index.items.insert(0, item);
-    index.items.truncate(MAX_RECENTS);
-    write_recents(&index)
+    recents.index.items.retain(|r| r.path != item.path);
+    recents.index.items.insert(0, item);
+    recents.index.items.truncate(MAX_RECENTS);
+    write_recents_checked(&recents)
 }
 
 #[tauri::command]
@@ -225,9 +311,9 @@ pub fn list_recents() -> Result<RecentsIndex> {
 
 #[tauri::command]
 pub fn remove_recent(path: String) -> Result<()> {
-    let mut index = read_recents();
-    index.items.retain(|r| r.path != path);
-    write_recents(&index)
+    let mut recents = read_recents_checked();
+    recents.index.items.retain(|r| r.path != path);
+    write_recents_checked(&recents)
 }
 
 /* ------------------------------------------------------------------ */
@@ -334,12 +420,12 @@ pub fn load_project(path: String) -> Result<LoadedProject> {
 /// `opened_at`, or inserts a fresh entry built from the loaded project.
 fn stamp_opened(path: &str, typed: &ProjectFile) {
     let now = now_iso8601();
-    let mut index = read_recents();
-    if let Some(entry) = index.items.iter_mut().find(|r| r.path == path) {
+    let mut recents = read_recents_checked();
+    if let Some(entry) = recents.index.items.iter_mut().find(|r| r.path == path) {
         entry.opened_at = Some(now);
     } else {
         let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        index.items.insert(
+        recents.index.items.insert(
             0,
             RecentItem {
                 path: path.to_string(),
@@ -351,9 +437,9 @@ fn stamp_opened(path: &str, typed: &ProjectFile) {
                 opened_at: Some(now),
             },
         );
-        index.items.truncate(MAX_RECENTS);
+        recents.index.items.truncate(MAX_RECENTS);
     }
-    let _ = write_recents(&index);
+    let _ = write_recents_checked(&recents);
 }
 
 #[derive(Debug, Serialize)]
@@ -560,10 +646,10 @@ fn refresh_thumbs_for(
     // Persist so future mounts skip generation. Best-effort: a write failure
     // just means we regenerate next time.
     if !resolved.is_empty() {
-        let mut index = read_recents();
+        let mut recents = read_recents_checked();
         let mut changed = false;
         for (path, thumb) in &resolved {
-            if let Some(entry) = index.items.iter_mut().find(|r| r.path == *path) {
+            if let Some(entry) = recents.index.items.iter_mut().find(|r| r.path == *path) {
                 if entry.thumb.as_deref() != Some(thumb.as_str()) {
                     entry.thumb = Some(thumb.clone());
                     changed = true;
@@ -571,7 +657,7 @@ fn refresh_thumbs_for(
             }
         }
         if changed {
-            let _ = write_recents(&index);
+            let _ = write_recents_checked(&recents);
         }
     }
 
@@ -705,6 +791,32 @@ pub fn cleanup_temp_projects() {
     }
 }
 
+/// Do two paths name the same file?
+///
+/// This has to agree with `Path::exists`, and on Windows `exists` asks a
+/// filesystem that compares names case-INSENSITIVELY. A plain `==` did not, so
+/// renaming "My Film" to "my film" found the candidate taken (by the original)
+/// but not excluded (byte-unequal), deduped to "my film (2).trt", and then
+/// deleted "My Film.trt" — a case-only rename silently renumbered the project.
+#[cfg(windows)]
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.to_str(), b.to_str()) {
+        // Unicode-aware where possible, so "Ünsteady" → "ünsteady" is also
+        // recognised as the same file rather than deduping.
+        (Some(a), Some(b)) => a == b || a.to_lowercase() == b.to_lowercase(),
+        // A non-UTF8 name is legal on Windows and cannot be folded without a
+        // lossy conversion that could make two DIFFERENT names compare equal.
+        // The cost of that mistake is overwriting somebody else's file, so fall
+        // back to exact equality.
+        _ => a == b,
+    }
+}
+
+#[cfg(not(windows))]
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
+}
+
 /// Pick a free `<base>.trt` path in `dir`, deduping to `<base> (2).trt` etc.
 /// when the plain name is taken. `base` must already be sanitized. `exclude`
 /// (the caller's own current file, if any) is treated as free so renaming a
@@ -716,7 +828,7 @@ fn free_path_in(dir: &Path, base: &str, exclude: Option<&Path>) -> Result<PathBu
         } else {
             dir.join(format!("{base} ({}).trt", n + 1))
         };
-        if !candidate.exists() || exclude == Some(candidate.as_path()) {
+        if !candidate.exists() || exclude.is_some_and(|e| same_path(e, &candidate)) {
             return Ok(candidate);
         }
     }
@@ -749,7 +861,10 @@ pub fn rename_project(path: String, new_name: String) -> Result<String> {
     value["name"] = Value::String(new_name);
     atomic_write(&new_path, serde_json::to_vec_pretty(&value)?.as_slice())?;
 
-    if new_path != old {
+    // Clean up the old location only when it is genuinely a DIFFERENT file. A
+    // case-only rename lands on the same file on Windows, so deleting "the old
+    // one" here would delete the project we just wrote.
+    if !same_path(&new_path, old) {
         let _ = std::fs::remove_file(old);
         let mut bak = old.as_os_str().to_owned();
         bak.push(".bak");
@@ -758,13 +873,13 @@ pub fn rename_project(path: String, new_name: String) -> Result<String> {
 
     // Replace the recents entry's path + name, preserving the rest.
     let new_path_str = new_path.to_string_lossy().into_owned();
-    let mut index = read_recents();
+    let mut recents = read_recents_checked();
     let name_field = value["name"].as_str().unwrap_or_default().to_string();
-    if let Some(entry) = index.items.iter_mut().find(|r| r.path == path) {
+    if let Some(entry) = recents.index.items.iter_mut().find(|r| r.path == path) {
         entry.path = new_path_str.clone();
         entry.name = name_field;
     }
-    let _ = write_recents(&index);
+    let _ = write_recents_checked(&recents);
 
     Ok(new_path_str)
 }
@@ -818,9 +933,9 @@ pub fn delete_project(path: String) -> Result<()> {
     bak.push(".bak");
     let _ = std::fs::remove_file(PathBuf::from(bak));
 
-    let mut index = read_recents();
-    index.items.retain(|r| r.path != path);
-    write_recents(&index)
+    let mut recents = read_recents_checked();
+    recents.index.items.retain(|r| r.path != path);
+    write_recents_checked(&recents)
 }
 
 pub fn sanitize_filename(name: &str) -> String {
@@ -1448,6 +1563,63 @@ mod tests {
         });
     }
 
+    /// Every `.trt` sitting directly in `dir`, by on-disk name.
+    fn trt_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".trt"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A case-only rename must produce ONE file with the new casing. `exists()`
+    /// is case-insensitive on Windows while the old `exclude == Some(..)` test
+    /// was byte-exact, so the candidate looked taken but not excluded: the
+    /// rename deduped to "my film (2).trt" and then deleted the original.
+    #[test]
+    fn rename_changing_only_case_keeps_a_single_file() {
+        with_isolated("rename-case", |dir| {
+            let old = dir.join("My Film.trt");
+            write_json(&old, &serde_json::json!({ "name": "My Film", "id": "1" }));
+
+            let new_path =
+                rename_project(old.to_string_lossy().into_owned(), "my film".into()).unwrap();
+
+            assert!(new_path.ends_with("my film.trt"), "got {new_path}");
+            assert!(!new_path.contains("(2)"), "case-only rename must not dedupe: {new_path}");
+            assert_eq!(
+                trt_names(dir),
+                vec!["my film.trt".to_string()],
+                "exactly one project file, under the new casing"
+            );
+            // ...and it is the renamed project, not an emptied leftover.
+            let written: Value = read_raw_value(Path::new(&new_path)).unwrap();
+            assert_eq!(written["name"], "my film");
+            assert_eq!(written["id"], "1");
+        });
+    }
+
+    /// The dedupe itself must still work: a DIFFERENT project already holding
+    /// the target name (case-insensitively) still pushes the rename to " (2)".
+    #[test]
+    fn rename_still_dedupes_against_another_project_differing_only_in_case() {
+        with_isolated("rename-case-other", |dir| {
+            let old = dir.join("Draft.trt");
+            write_json(&old, &serde_json::json!({ "name": "Draft", "id": "1" }));
+            write_json(&dir.join("Taken.trt"), &serde_json::json!({ "name": "Taken", "id": "2" }));
+
+            let new_path =
+                rename_project(old.to_string_lossy().into_owned(), "taken".into()).unwrap();
+            assert!(new_path.ends_with("taken (2).trt"), "got {new_path}");
+            // the other project is untouched
+            let other: Value = read_raw_value(&dir.join("Taken.trt")).unwrap();
+            assert_eq!(other["id"], "2");
+        });
+    }
+
     #[test]
     fn duplicate_gives_fresh_id_and_leaves_original() {
         with_isolated("dup", |dir| {
@@ -1559,7 +1731,7 @@ mod tests {
     /* -------------------- corruption / data-loss guards ---------------- */
 
     #[test]
-    fn nonfinite_duration_does_not_wipe_recents() {
+    fn a_zero_speed_clip_is_normalised_and_keeps_recents_intact() {
         with_isolated("nonfinite-duration", |dir| {
             // A healthy project already sitting in recents.
             let healthy = dir.join("Healthy.trt");
@@ -1575,10 +1747,18 @@ mod tests {
             })
             .unwrap();
 
-            // `speed: 0` makes Clip::duration() infinite and Timeline::duration()
-            // propagates it. serde_json writes a non-finite f64 as `null`, which
-            // used to make the WHOLE index unparseable — 2 entries in, 0 out,
-            // i.e. every project card gone from home.
+            // `speed: 0` USED to make Clip::duration() infinite, and
+            // Timeline::duration() propagated it. serde_json writes a non-finite
+            // f64 as `null`, which made the WHOLE index unparseable — 2 entries
+            // in, 0 out, i.e. every project card gone from home.
+            //
+            // `de_speed` in schema.rs now normalises a zero/negative/non-finite
+            // speed to 1.0 at the deserialize boundary, so the hazard no longer
+            // starts. This case is kept, and still loaded end to end, because it
+            // is the regression guard for that: if the normalisation is ever
+            // dropped the duration goes non-finite again right here. The index's
+            // own tolerance for a `null` duration is guarded separately by
+            // `null_duration_in_a_stored_index_does_not_wipe_it`.
             let mut v = minimal_project("Poisoned");
             v["media"] = serde_json::json!([video_media("m1")]);
             v["timeline"]["tracks"] = serde_json::json!([{
@@ -1593,10 +1773,14 @@ mod tests {
             let poisoned = dir.join("Poisoned.trt");
             write_json(&poisoned, &v);
 
-            // The hazard is real: this project's duration IS non-finite, and it
-            // passes deserialization unchallenged.
+            // The speed is normalised on the way in, so the duration is finite:
+            // 2.0 s of source at 1.0x. A revert of `de_speed` fails here first.
             let typed = typed_project(v);
-            assert!(!typed.timeline.duration().is_finite());
+            assert!(
+                typed.timeline.duration().is_finite(),
+                "a zero speed must be normalised at deserialize, not propagated"
+            );
+            assert_eq!(typed.timeline.tracks[0].clips[0].speed, 1.0);
 
             // load_project → stamp_opened persists it into the index.
             load_project(poisoned.to_string_lossy().into_owned()).unwrap();
@@ -1604,7 +1788,10 @@ mod tests {
             let listed = list_recents().unwrap();
             assert_eq!(listed.items.len(), 2, "index was wiped: {listed:?}");
             let bad = listed.items.iter().find(|r| r.name == "Poisoned").unwrap();
-            assert_eq!(bad.duration_sec, 0.0, "non-finite must be stored as 0");
+            assert_eq!(
+                bad.duration_sec, 2.0,
+                "the normalised 1.0x speed must yield the real 2 s duration"
+            );
             let ok = listed.items.iter().find(|r| r.name == "Healthy").unwrap();
             assert_eq!(ok.duration_sec, 12.5, "the other entry must be intact");
         });
@@ -1746,6 +1933,116 @@ mod tests {
             std::fs::remove_file(&settings).unwrap();
             std::fs::remove_file(data.join("settings.json.bak")).unwrap();
             assert!(crate::settings::get_settings().unwrap().is_none());
+        });
+    }
+
+    /// An index that exists but cannot be read is NOT an empty index. Writing
+    /// the empty default over it rotated the last good copy into `.bak`, and
+    /// because the fresh primary then parsed fine `read_json_with_bak` never
+    /// looked at that backup again — one unreadable file plus one ordinary save
+    /// lost the user's entire recents list.
+    #[test]
+    fn an_unreadable_recents_index_is_never_overwritten() {
+        with_isolated("recents-unreadable", |dir| {
+            let data = paths::data_dir().unwrap();
+            paths::ensure_dir(&data).unwrap();
+            let recents = data.join("recents.json");
+            let bak = data.join("recents.json.bak");
+
+            // Both copies truncated: unreadable, not absent.
+            std::fs::write(&recents, b"{\"schema\":1,\"items\":[{\"pa").unwrap();
+            std::fs::write(&bak, b"{\"schema\":1,\"items\":[{\"na").unwrap();
+            let before = std::fs::read(&recents).unwrap();
+            let before_bak = std::fs::read(&bak).unwrap();
+
+            let card = |path: &Path, name: &str| RecentItem {
+                path: path.to_string_lossy().into_owned(),
+                name: name.into(),
+                modified_at: "m".into(),
+                duration_sec: 1.0,
+                thumb: None,
+                size_bytes: 0,
+                opened_at: None,
+            };
+
+            let proj = dir.join("Saved.trt");
+            write_json(&proj, &minimal_project("Saved"));
+
+            // A save must still succeed — recents is a convenience, and a
+            // corrupt index must not be able to fail the user's actual work.
+            upsert_recent(card(&proj, "Saved")).unwrap();
+            assert_eq!(
+                std::fs::read(&recents).unwrap(),
+                before,
+                "an unreadable index must be left exactly as found"
+            );
+            assert_eq!(
+                std::fs::read(&bak).unwrap(),
+                before_bak,
+                "the backup must not be rotated away either"
+            );
+
+            // The other mutation paths hold the same line.
+            load_project(proj.to_string_lossy().into_owned()).unwrap(); // stamp_opened
+            remove_recent(proj.to_string_lossy().into_owned()).unwrap();
+            delete_project(proj.to_string_lossy().into_owned()).unwrap();
+            assert_eq!(std::fs::read(&recents).unwrap(), before);
+            assert_eq!(std::fs::read(&bak).unwrap(), before_bak);
+
+            // Genuine ABSENCE is a different thing and stays writable — that is
+            // just a first run.
+            std::fs::remove_file(&recents).unwrap();
+            std::fs::remove_file(&bak).unwrap();
+            let fresh = dir.join("Fresh.trt");
+            write_json(&fresh, &minimal_project("Fresh"));
+            upsert_recent(card(&fresh, "Fresh")).unwrap();
+            assert_eq!(
+                read_recents().items.len(),
+                1,
+                "an absent index must accept writes"
+            );
+        });
+    }
+
+    /// A rotation that fails must leave the previous backup where it was.
+    /// Deleting the old `.bak` first meant a write going wrong took the backup
+    /// down with it — no primary update, and no fallback either.
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_rotation_leaves_the_previous_backup_intact() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        with_isolated("bak-rotation", |dir| {
+            let target = dir.join("Project.trt");
+            atomic_write(&target, b"first").unwrap();
+            atomic_write(&target, b"second").unwrap(); // rotates "first" into .bak
+            let bak = dir.join("Project.trt.bak");
+            assert_eq!(std::fs::read(&bak).unwrap(), b"first");
+
+            // Hold the PRIMARY with no sharing (FILE_SHARE_NONE) so it cannot be
+            // moved: the rotation rename fails, while the `.bak` — a different
+            // file — stays perfectly deletable. That asymmetry is exactly what
+            // made the old pre-delete destructive.
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&target)
+                .unwrap();
+
+            let err = atomic_write(&target, b"third");
+            assert!(err.is_err(), "the rotation should have failed");
+            assert_eq!(
+                std::fs::read(&bak).unwrap(),
+                b"first",
+                "the last good backup must survive a failed write"
+            );
+
+            drop(lock);
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                b"second",
+                "and the primary must be untouched"
+            );
         });
     }
 

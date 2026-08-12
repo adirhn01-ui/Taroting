@@ -27,12 +27,42 @@ export interface ExportEstimate {
   exact: boolean;
 }
 
-/** The payload passed to estimate_export / start_export. */
+/** The payload passed to start_export. */
 export interface ExportSpec {
   media: MediaRef[];
   timeline: Timeline;
   preset: ExportPreset;
   outPath: string;
+}
+
+/**
+ * The payload passed to estimate_export: everything the size estimate reads,
+ * and nothing else.
+ *
+ * This used to be a whole ExportSpec — the entire media list plus every clip on
+ * every track — for a backend command that touches four scalars and the preset.
+ * The dialog re-estimates on a 300 ms debounce after every control change, and
+ * the serialization is on the UI thread. Measured payload / JSON.stringify:
+ *
+ *      60 clips    29.5 KB   0.049 ms   →   213 B   0.0003 ms
+ *     240 clips   117.2 KB   0.190 ms   →   213 B   0.0003 ms
+ *    1600 clips   783.3 KB   1.497 ms   →   213 B   0.0003 ms
+ *
+ * The payload is now constant, so the backend's parse of it is constant too.
+ *
+ * `durationSec` and `fps` are derived by exactly the arithmetic the backend
+ * used to do itself (timelineDuration = latest clip end across tracks; fps =
+ * num / max(1, den)), so the estimate is byte-identical either way. A Rust test
+ * runs both entry points over the same project and asserts they agree.
+ */
+export interface EstimateInput {
+  durationSec: number;
+  /** Project canvas size — the resolution preset scales against it. */
+  width: number;
+  height: number;
+  /** Timeline frame rate as a plain number. */
+  fps: number;
+  preset: ExportPreset;
 }
 
 /** Detect (or re-detect, when force) available ffmpeg encoders. */
@@ -43,10 +73,10 @@ export function detectEncoders(force: boolean): Promise<EncoderReport> {
   return invoke<EncoderReport>("detect_encoders", { force });
 }
 
-/** Estimate the output size for a spec. */
-export function estimateExport(spec: ExportSpec): Promise<ExportEstimate> {
+/** Estimate the output size. */
+export function estimateExport(input: EstimateInput): Promise<ExportEstimate> {
   if (!inTauri) return Promise.resolve({ bytes: 0, exact: false });
-  return invoke<ExportEstimate>("estimate_export", { spec });
+  return invoke<ExportEstimate>("estimate_export", { input });
 }
 
 /** Kick off an export; resolves to the job id. */

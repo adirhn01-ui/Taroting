@@ -94,8 +94,25 @@ export interface ErrorDialogOptions {
  * handler binds on `window` in the capture phase — which runs BEFORE the
  * document-level capture handlers the dialogs underneath use — then stops the
  * event, so Escape closes only the topmost dialog.
+ *
+ * RETURNS ITS CLOSER, and the caller is expected to hold it.
+ *
+ * The backdrop has to live on `document.body` to sit above everything, but the
+ * router tears a screen down with `dispose()` and then clears `#app` — neither
+ * of which touches the body. Without a closer the dialog outlives the screen
+ * that opened it: still painted, still holding the `trapTab` focus trap, still
+ * holding the `window` keydown capture. Concretely: open Settings → Diagnostics
+ * → Recent errors → View, then let an OS "open with" arrive (a double-clicked
+ * `.trt` or media file), and the router navigates to the editor underneath a
+ * dialog you cannot tab out of. Nothing destructive is reachable — it is a
+ * read-only text pane — but it is a keyboard dead end.
+ *
+ * Screens with a teardown registry should register the returned closer; see
+ * `openOverlays` in `src/settings/settings.ts` and `src/home/home.ts`. `close`
+ * is idempotent, so registering it and also letting the user dismiss the dialog
+ * normally is safe.
  */
-export function openErrorDialog(opts: ErrorDialogOptions): void {
+export function openErrorDialog(opts: ErrorDialogOptions): () => void {
   const backdrop = document.createElement("div");
   backdrop.className = "modal-backdrop";
   backdrop.innerHTML = `
@@ -116,7 +133,12 @@ export function openErrorDialog(opts: ErrorDialogOptions): void {
   backdrop.querySelector("[data-pane-slot]")!.replaceWith(detailPane(opts.report));
 
   const releaseTrap = trapTab(backdrop);
+  // Idempotent: a screen's teardown may close a dialog the user has already
+  // dismissed, and `trapTab`'s release must not run twice.
+  let closed = false;
   const close = (): void => {
+    if (closed) return;
+    closed = true;
     window.removeEventListener("keydown", onKey, true);
     releaseTrap();
     backdrop.remove();
@@ -141,6 +163,7 @@ export function openErrorDialog(opts: ErrorDialogOptions): void {
   const ok = backdrop.querySelector<HTMLButtonElement>("[data-ok]")!;
   ok.addEventListener("click", close);
   ok.focus();
+  return close;
 }
 
 /* ---------------- recent-errors ring ---------------- */

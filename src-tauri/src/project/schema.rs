@@ -132,12 +132,40 @@ pub struct Clip {
     pub timeline_start: f64,
     pub src_in: f64,
     pub src_out: f64,
+    #[serde(deserialize_with = "de_speed")]
     pub speed: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transform: Option<ClipTransform>,
     pub audio: ClipAudio,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyframes: Option<ClipKeyframes>,
+}
+
+/// Speed is a DIVISOR everywhere it is used — `duration()` below, the video
+/// chain's `setpts=(PTS-STARTPTS)/speed`, and the `atempo` decomposition — so a
+/// zero, negative or non-finite value is not merely odd, it is unusable. It is
+/// normalised here, at the deserialize boundary, rather than defended against at
+/// each of those three sites.
+///
+/// Why this is not paranoia: `speed` is a bare `f64` in the schema with no
+/// frontend runtime validation (`checkInvariants` in `src/core/project.ts` is
+/// test-only), and this crate's own test suite writes and successfully loads a
+/// `"speed": 0.0` project — so such a file opens in the editor today. Left
+/// alone, `duration()` returns a non-finite value that reaches ffmpeg as a
+/// literal `inf` in `-t`/`d=` strings, and `atempo_factors` looped until the
+/// allocator failed, which under `panic = "abort"` takes the whole app down
+/// mid-export along with any unsaved work.
+///
+/// 1.0 rather than a clamp into the editor's [0.25, 4.0]: a clamp would have to
+/// reel in finite out-of-range speeds like 8.0 to be coherent, and those already
+/// work and stay in step with the video chain. Normalising only the values that
+/// have no honest meaning leaves every legal speed exactly as authored.
+fn de_speed<'de, D>(d: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = f64::deserialize(d)?;
+    Ok(if v.is_finite() && v > 0.0 { v } else { 1.0 })
 }
 
 impl Clip {

@@ -48,6 +48,15 @@ import type { ClipCrop, ClipTransform } from "../../core/types";
 // follow the EXPORT's rounding conventions, reproduced below. They are not a
 // second opinion — they are the documented, checkable consequence of the
 // preview's floats, and both suites re-derive them independently.
+//
+// TWO BOXES, NOT ONE. A row carries a project canvas (`canvasW/H`) AND an
+// export resolution (`exportW/H`); they coincide only for the "Original"
+// preset. The table conflated them until an export at any other resolution was
+// found to mis-place every off-centre clip: x/y are authored in canvas px and
+// were being added straight to an output-px centring term, so a clip at x=307
+// on a 1080p canvas landed 102 px off at 720p and 307 px off at 2160p — while a
+// centred clip stayed exact at every resolution, which is why a table with one
+// box per row could not see it.
 
 /** ffmpeg/Rust `f64::round()`: ties go AWAY from zero. JS `Math.round()` breaks
  *  ties toward +Infinity, so `Math.round(-0.5)` is -0 where Rust gives -1. The
@@ -73,8 +82,12 @@ interface ParityCase {
   in: {
     mediaW: number | null;
     mediaH: number | null;
+    /** the PROJECT canvas: the px space x/y and the crop rect are authored in */
     canvasW: number;
     canvasH: number;
+    /** the EXPORT resolution: the px space ffmpeg is spoken to in */
+    exportW: number;
+    exportH: number;
     rotate: 0 | 90 | 180 | 270;
     flipH: boolean;
     flipV: boolean;
@@ -84,15 +97,19 @@ interface ParityCase {
     y: number;
   };
   out: {
-    /** even-rounded display size — ffmpeg `scale=dw:dh` */
+    /** even-rounded display size, OUTPUT px — ffmpeg `scale=dw:dh` */
     dw: number;
     dh: number;
-    /** integer overlay position — ffmpeg `overlay=ox:oy` */
+    /** integer overlay position, OUTPUT px — ffmpeg `overlay=ox:oy` */
     ox: number;
     oy: number;
     /** the preview's exact, un-rounded display extent in project px */
     dwExact: number;
     dhExact: number;
+    /** the same extent with the fit measured against the EXPORT box, which is
+     *  what the export scales to. Equal to dwExact/dhExact at "Original". */
+    dwExactOut: number;
+    dhExactOut: number;
     /** the preview's media shift that exposes the crop window */
     offXExact: number;
     offYExact: number;
@@ -114,23 +131,50 @@ const TABLE: { cases: ParityCase[] } = JSON.parse(
   readFileSync(resolve(here, "preview-export-parity.json"), "utf8"),
 );
 
+const transformOf = (i: ParityCase["in"]): ClipTransform => ({
+  rotate: i.rotate,
+  flipH: i.flipH,
+  flipV: i.flipV,
+  scale: i.scale,
+  x: i.x,
+  y: i.y,
+  opacity: 1,
+  ...(i.crop ? { crop: i.crop } : {}),
+});
+
+/** The PREVIEW: the reference math with the project canvas as its box. Media
+ *  dims are left absent when the row omits them, so the `?? project.width`
+ *  fallback is genuinely exercised. */
 const run = (c: ParityCase) => {
   const i = c.in;
-  const t: ClipTransform = {
-    rotate: i.rotate,
-    flipH: i.flipH,
-    flipV: i.flipV,
-    scale: i.scale,
-    x: i.x,
-    y: i.y,
-    opacity: 1,
-    ...(i.crop ? { crop: i.crop } : {}),
-  };
   const media: { width?: number; height?: number } = {};
   if (i.mediaW !== null) media.width = i.mediaW;
   if (i.mediaH !== null) media.height = i.mediaH;
-  return computeTransform(t, media, { width: i.canvasW, height: i.canvasH });
+  return computeTransform(transformOf(i), media, { width: i.canvasW, height: i.canvasH });
 };
+
+/** The SAME reference math evaluated in the export box, which is what
+ *  builder.rs `placement` does: it measures `fit` against the output
+ *  resolution, so the media scales with the resolution by itself.
+ *
+ *  The media dims are pinned rather than left absent: srcW/srcH fall back to
+ *  the PROJECT canvas in both implementations (an unknown-size media is
+ *  canvas-sized to the preview), and letting this call's box supply them would
+ *  silently move that fallback into the export space. */
+const runAtExportRes = (c: ParityCase) => {
+  const i = c.in;
+  return computeTransform(
+    transformOf(i),
+    { width: i.mediaW ?? i.canvasW, height: i.mediaH ?? i.canvasH },
+    { width: i.exportW, height: i.exportH },
+  );
+};
+
+/** Project-canvas px -> output px, per axis. */
+const ratio = (c: ParityCase) => ({
+  sx: c.in.exportW / c.in.canvasW,
+  sy: c.in.exportH / c.in.canvasH,
+});
 
 describe("preview/export placement parity (shared golden table)", () => {
   for (const c of TABLE.cases) {
@@ -158,29 +202,47 @@ describe("preview/export placement parity (shared golden table)", () => {
         expect(p.posY).toBe(c.in.y);
       });
 
+      it("the export box scales the media by itself", () => {
+        // `fit` is measured against the OUTPUT resolution, so the displayed
+        // extent needs no ratio applied to it — it comes out of the same
+        // reference function, just evaluated in the other box. At "Original"
+        // this is the preview's own extent.
+        const q = runAtExportRes(c);
+        expect(q.cropW).toBe(c.out.dwExactOut);
+        expect(q.cropH).toBe(c.out.dhExactOut);
+      });
+
       it("discretises to the integers the export emits", () => {
         const p = run(c);
-        expect(roundEven(p.cropW)).toBe(c.out.dw);
-        expect(roundEven(p.cropH)).toBe(c.out.dh);
+        const q = runAtExportRes(c);
+        const { sx, sy } = ratio(c);
+        expect(roundEven(q.cropW)).toBe(c.out.dw);
+        expect(roundEven(q.cropH)).toBe(c.out.dh);
         // The export centres the EVEN-rounded box, exactly as builder.rs does:
-        //   ox = round((canvasW - dw) / 2 + x)
-        expect(roundAway((c.in.canvasW - c.out.dw) / 2 + p.posX)).toBe(c.out.ox);
-        expect(roundAway((c.in.canvasH - c.out.dh) / 2 + p.posY)).toBe(c.out.oy);
+        //   ox = round((exportW - dw) / 2 + x * exportW/canvasW)
+        // The centring term is output px and posX is CANVAS px: the ratio is
+        // what converts between them, and dropping it is the bug this axis
+        // exists to catch.
+        expect(roundAway((c.in.exportW - c.out.dw) / 2 + p.posX * sx)).toBe(c.out.ox);
+        expect(roundAway((c.in.exportH - c.out.dh) / 2 + p.posY * sy)).toBe(c.out.oy);
       });
 
       it("the integer export position stays within a pixel and a quarter of the preview", () => {
         const p = run(c);
+        const q = runAtExportRes(c);
+        const { sx, sy } = ratio(c);
         // The preview positions the crop box continuously (CSS translate
         // -50%,-50%); the export must land on integers with even extents. The
         // worst case is bounded, and this pins the bound rather than trusting
         // it: round_even moves the extent by < 1.5 px, halved by the centring
-        // (< 0.75), plus the final round (<= 0.5) → < 1.25 px.
-        const previewLeft = (c.in.canvasW - p.cropW) / 2 + p.posX;
-        const previewTop = (c.in.canvasH - p.cropH) / 2 + p.posY;
+        // (< 0.75), plus the final round (<= 0.5) → < 1.25 px. Measured in
+        // OUTPUT px — the tolerance is about rounding, not about resolution.
+        const previewLeft = (c.in.exportW - q.cropW) / 2 + p.posX * sx;
+        const previewTop = (c.in.exportH - q.cropH) / 2 + p.posY * sy;
         expect(Math.abs(c.out.ox - previewLeft)).toBeLessThan(1.25);
         expect(Math.abs(c.out.oy - previewTop)).toBeLessThan(1.25);
-        expect(Math.abs(c.out.dw - p.cropW)).toBeLessThan(1.5);
-        expect(Math.abs(c.out.dh - p.cropH)).toBeLessThan(1.5);
+        expect(Math.abs(c.out.dw - q.cropW)).toBeLessThan(1.5);
+        expect(Math.abs(c.out.dh - q.cropH)).toBeLessThan(1.5);
       });
 
       it("source and crop-window sizes match the ones the export chain uses", () => {
@@ -188,6 +250,8 @@ describe("preview/export placement parity (shared golden table)", () => {
         // Issue #1 lived here: `srcW/srcH` is what a generator is synthesized
         // at and `postCropW/H` is what sizes the opacity alpha mask. If those
         // two disagree with the preview, alphamerge aborts the export.
+        // The fallback box is the PROJECT CANVAS, never the export resolution:
+        // source px are source px, and the crop rect is clamped against them.
         expect(c.out.srcW).toBe(c.in.mediaW ?? c.in.canvasW);
         expect(c.out.srcH).toBe(c.in.mediaH ?? c.in.canvasH);
         // The preview expresses the crop window as a display box; dividing out
@@ -262,12 +326,114 @@ describe("the parity table cannot coincide its way into passing", () => {
 
   it("never lets a media dimension coincide with a canvas dimension", () => {
     for (const c of rows) {
-      if (c.in.mediaW === null) continue; // the deliberate "fall back" row
-      expect(c.in.mediaW, `${c.name}: mediaW must differ from canvasW`).not.toBe(c.in.canvasW);
-      expect(c.in.mediaH, `${c.name}: mediaH must differ from canvasH`).not.toBe(c.in.canvasH);
-      // ...and not cross-match either, which would hide a swapped-axis bug
-      expect(c.in.mediaW, `${c.name}: mediaW must differ from canvasH`).not.toBe(c.in.canvasH);
-      expect(c.in.mediaH, `${c.name}: mediaH must differ from canvasW`).not.toBe(c.in.canvasW);
+      if (c.in.mediaW === null) continue; // the deliberate "fall back" rows
+      for (const [label, w, h] of [
+        ["canvas", c.in.canvasW, c.in.canvasH],
+        ["export", c.in.exportW, c.in.exportH],
+      ] as const) {
+        expect(c.in.mediaW, `${c.name}: mediaW must differ from ${label}W`).not.toBe(w);
+        expect(c.in.mediaH, `${c.name}: mediaH must differ from ${label}H`).not.toBe(h);
+        // ...and not cross-match either, which would hide a swapped-axis bug
+        expect(c.in.mediaW, `${c.name}: mediaW must differ from ${label}H`).not.toBe(h);
+        expect(c.in.mediaH, `${c.name}: mediaH must differ from ${label}W`).not.toBe(w);
+      }
+    }
+  });
+
+  /* ---- the export-resolution axis ---- */
+  //
+  // Same lesson as the media-vs-canvas guard above, one level out: a row whose
+  // export resolution equals its project canvas cannot tell the two px spaces
+  // apart, and for years every row was such a row. These keep at least a few
+  // rows genuinely off-Original, and — crucially — assert that on those rows
+  // the WRONG formula would produce a visibly different answer.
+
+  /** What a builder that added canvas-px x/y straight onto an output-px
+   *  centring term would emit. This is the shipped bug, kept here so the rows
+   *  below have to actually diverge from it. */
+  const unscaledOffsetOx = (c: ParityCase) => roundAway((c.in.exportW - c.out.dw) / 2 + c.in.x);
+  const unscaledOffsetOy = (c: ParityCase) => roundAway((c.in.exportH - c.out.dh) / 2 + c.in.y);
+
+  it("exports several rows at a resolution the canvas does not share", () => {
+    const offOriginal = rows.filter(
+      (c) => c.in.exportW !== c.in.canvasW || c.in.exportH !== c.in.canvasH,
+    );
+    expect(offOriginal.length).toBeGreaterThanOrEqual(4);
+    // both directions, so an error that only shows when scaling one way cannot
+    // hide in the other
+    expect(offOriginal.some((c) => c.in.exportW > c.in.canvasW)).toBe(true);
+    expect(offOriginal.some((c) => c.in.exportW < c.in.canvasW)).toBe(true);
+    // a non-aspect-preserving export, where the two axes scale by different
+    // factors: the only shape that can catch one ratio used for both, or the
+    // two swapped
+    expect(
+      offOriginal.some(
+        (c) => c.in.exportW / c.in.canvasW !== c.in.exportH / c.in.canvasH,
+      ),
+    ).toBe(true);
+    // every off-Original row must carry offsets, or it says nothing about them
+    expect(offOriginal.every((c) => c.in.x !== 0 || c.in.y !== 0)).toBe(true);
+  });
+
+  it("keeps rows where the export resolution genuinely moves the clip", () => {
+    // On both axes at once, by a margin no rounding could account for.
+    const moved = rows.filter(
+      (c) =>
+        Math.abs(unscaledOffsetOx(c) - c.out.ox) >= 2 &&
+        Math.abs(unscaledOffsetOy(c) - c.out.oy) >= 2,
+    );
+    expect(moved.length).toBeGreaterThanOrEqual(2);
+    // ...and one where only x moves, because the export squashes a single axis
+    expect(
+      rows.some(
+        (c) =>
+          Math.abs(unscaledOffsetOx(c) - c.out.ox) >= 2 &&
+          unscaledOffsetOy(c) === c.out.oy &&
+          c.in.y !== 0,
+      ),
+    ).toBe(true);
+    // At Original the two formulas MUST agree — if they ever diverge there,
+    // the ratio is being applied where there is nothing to convert.
+    for (const c of rows) {
+      if (c.in.exportW !== c.in.canvasW || c.in.exportH !== c.in.canvasH) continue;
+      expect(unscaledOffsetOx(c), `${c.name}: ox at Original`).toBe(c.out.ox);
+      expect(unscaledOffsetOy(c), `${c.name}: oy at Original`).toBe(c.out.oy);
+      expect(c.out.dwExactOut, `${c.name}: extent at Original`).toBe(c.out.dwExact);
+      expect(c.out.dhExactOut, `${c.name}: extent at Original`).toBe(c.out.dhExact);
+    }
+    // ...and on an off-Original row that scales both axes equally, the export
+    // extent must actually differ from the preview's — a row whose media
+    // happened to land the same size proves nothing about the scaling. (A
+    // squashed export is excluded: it can leave the constraining axis, and so
+    // the fit, exactly where it was.)
+    for (const c of rows) {
+      const { sx, sy } = ratio(c);
+      if (sx === 1 || sx !== sy) continue;
+      expect(c.out.dwExactOut, `${c.name}: extent must scale`).not.toBe(c.out.dwExact);
+      expect(c.out.dhExactOut, `${c.name}: extent must scale`).not.toBe(c.out.dhExact);
+    }
+  });
+
+  it("pairs an off-Original row with an otherwise identical Original one", () => {
+    // The strongest form of the guard: two rows that differ in NOTHING but the
+    // export resolution. Whatever their ox/oy disagreement is, the resolution
+    // is the only thing that can have caused it.
+    const same = (a: ParityCase, b: ParityCase) =>
+      a.in.mediaW === b.in.mediaW && a.in.mediaH === b.in.mediaH &&
+      a.in.canvasW === b.in.canvasW && a.in.canvasH === b.in.canvasH &&
+      a.in.rotate === b.in.rotate && a.in.scale === b.in.scale &&
+      a.in.x === b.in.x && a.in.y === b.in.y;
+    const pairs = rows.flatMap((a) =>
+      rows.filter(
+        (b) =>
+          same(a, b) &&
+          a.in.exportW === a.in.canvasW &&
+          b.in.exportW !== b.in.canvasW,
+      ).map((b) => [a, b] as const),
+    );
+    expect(pairs.length).toBeGreaterThanOrEqual(2);
+    for (const [orig, scaled] of pairs) {
+      expect(scaled.out.ox, `${scaled.name} vs ${orig.name}`).not.toBe(orig.out.ox);
     }
   });
 

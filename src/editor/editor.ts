@@ -198,7 +198,17 @@ export async function mountEditor(
     window.clearTimeout(volSaveTimer);
     if (!volSavePending) return;
     volSavePending = false;
-    void updateSettings({ monitorVolume: volState.level });
+    // SAY SO if the write fails. The slider already shows the new level (the
+    // graph is updated before the IPC is even issued), so a bare `void` here
+    // left a rejected write looking exactly like a successful one — silent
+    // until the next launch reverted it. Same shape as settings.ts persist().
+    void updateSettings({ monitorVolume: volState.level }).catch((e: unknown) => {
+      toast.error("Couldn't save your settings.", {
+        detail: describeError(e),
+        op: "Settings",
+        title: "Monitor volume",
+      });
+    });
   };
   const applyVolume = (next: MonitorVolumeState): void => {
     volState = next;
@@ -828,13 +838,23 @@ export async function mountEditor(
       ghost = g;
     };
 
-    const resolveTarget = (clientX: number, clientY: number): void => {
+    /* The two drop-zone rects, measured ONCE when the drag actually starts.
+       Nothing a drag does can move them: the ghost is position:fixed, the
+       timeline drop guide is an absolutely-positioned overlay inside the host,
+       and --droptarget is an inset outline. They used to be re-read inside
+       resolveTarget, i.e. on EVERY pointermove — two forced synchronous layouts
+       of the whole editor tree per move, and each read came right after a
+       classList write that had just dirtied layout, which is the worst possible
+       ordering. A 400-move drag went from 800 forced layouts to 2. */
+    let previewRect: DOMRect | null = null;
+    let hostRect: DOMRect | null = null;
+
+    const resolveTarget = (clientX: number, clientY: number, pr: DOMRect, tr: DOMRect): void => {
       dropTarget = null;
       stageCanvas.classList.remove("preview__canvas--droptarget");
       ghost?.classList.remove("media-drag-ghost--no");
 
       // preview canvas first (small, precise)
-      const pr = stageCanvas.getBoundingClientRect();
       if (clientX >= pr.left && clientX <= pr.right && clientY >= pr.top && clientY <= pr.bottom) {
         dropTarget = { kind: "preview" };
         stageCanvas.classList.add("preview__canvas--droptarget");
@@ -843,7 +863,6 @@ export async function mountEditor(
       }
 
       // timeline host
-      const tr = timeline.hostRect();
       if (clientX >= tr.left && clientX <= tr.right && clientY >= tr.top && clientY <= tr.bottom) {
         const localY = clientY - tr.top;
         const localX = clientX - tr.left;
@@ -878,13 +897,18 @@ export async function mountEditor(
       if (!dragging) {
         if (Math.abs(e.clientX - downX) < 4 && Math.abs(e.clientY - downY) < 4) return;
         dragging = true;
+        // Measure BEFORE the ghost enters the DOM, so drag start costs one
+        // layout rather than one plus a re-layout for the appended ghost. Not
+        // measured on pointerdown: a plain click on a bin row must stay free.
+        previewRect = stageCanvas.getBoundingClientRect();
+        hostRect = timeline.hostRect();
         buildGhost();
       }
       if (ghost) {
         ghost.style.left = `${e.clientX + 12}px`;
         ghost.style.top = `${e.clientY + 12}px`;
       }
-      resolveTarget(e.clientX, e.clientY);
+      if (previewRect && hostRect) resolveTarget(e.clientX, e.clientY, previewRect, hostRect);
     };
 
     const finish = (commitDrop: boolean): void => {

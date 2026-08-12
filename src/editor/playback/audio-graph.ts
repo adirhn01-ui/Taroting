@@ -31,11 +31,63 @@ const NUDGE_SEC = 0.04;
 // i.e. zero extra work on healthy continuous playback.
 const SEEK_REARM_SEC = 0.15;
 
+/** What a currently-scheduled gain envelope assumes about the thing it is
+ *  riding: which clip it was built for, and the (timeline time, AudioContext
+ *  time) pair its breakpoints were baked from. Held per video element AND per
+ *  audio voice — see envelopeStale. */
+interface EnvAnchor {
+  clipId: string;
+  t0: number;
+  ctx0: number;
+}
+
+/**
+ * Has the playhead moved off the trajectory this envelope was scheduled for?
+ *
+ * `scheduleEnvelope` bakes its breakpoints into ABSOLUTE AudioContext times
+ * from an anchor, so the schedule is only still valid while the thing it drives
+ * is where continuous playback from `(t0, ctx0)` would put it. Any manual seek
+ * or ruler scrub repositions it off that trajectory and the fade/hold/zero
+ * breakpoints then fire at the wrong ctx time — audio that must stay at full
+ * gain gets zeroed early and, because nothing re-anchors, stays that way for
+ * the rest of the clip. That is the user-reported "scrub the playhead and it
+ * goes mute" bug.
+ *
+ * `pos` is the observed timeline position of whatever the envelope rides: for a
+ * video element that is its own currentTime mapped back to the timeline (the
+ * element IS the master clock, so it is the truth); for an audio-track voice it
+ * is the engine time `t` (the voice is drift-slaved to the engine, so the
+ * engine clock is the truth, and reading it avoids catching a mid-nudge
+ * element).
+ *
+ * This ALSO covers a preview-speed change, which the 0.3 s discontinuity test
+ * cannot see: `at()` maps timeline seconds to ctx seconds through `speed`, so
+ * every future breakpoint of an envelope scheduled at the old speed is at the
+ * wrong ctx time, and the divergence this measures grows from the anchor at the
+ * rate of the speed delta until it trips.
+ *
+ * Kept as one exported pure function precisely because the guard was previously
+ * inlined at one of its two call sites and simply missing at the other.
+ */
+export function envelopeStale(
+  env: { t0: number; ctx0: number },
+  pos: number,
+  ctxNow: number,
+  previewSpeed: number,
+): boolean {
+  const speed = Math.max(0.25, previewSpeed);
+  const expected = env.t0 + (ctxNow - env.ctx0) * speed;
+  return Math.abs(pos - expected) > SEEK_REARM_SEC;
+}
+
 interface Voice {
   el: HTMLAudioElement;
   gain: GainNode;
   clipId: string | null;
   url: string | null;
+  /** What this voice's scheduled envelope assumes; null when it has none (a
+   *  parked voice is zeroed outright). Same role as `videoEnv` below. */
+  env: EnvAnchor | null;
 }
 
 /** One clip the mixer wants a voice for on this tick. `active` = it is audible
@@ -174,11 +226,8 @@ export class AudioGraph {
   //    (its fade/hold/zero breakpoints fire at the wrong ctx time, muting audio
   //    that must stay full). syncVideoGain re-arms when that divergence exceeds
   //    SEEK_REARM_SEC, catching every seek size the discontinuity heuristic and
-  //    the drop-out/re-enter dance miss. See syncVideoGain.
-  private videoEnv = new WeakMap<
-    HTMLVideoElement,
-    { clipId: string; t0: number; ctx0: number }
-  >();
+  //    the drop-out/re-enter dance miss. See syncVideoGain and envelopeStale.
+  private videoEnv = new WeakMap<HTMLVideoElement, EnvAnchor>();
   private lastT = -1;
   private lastPlaying = false;
   private lastProject: ProjectFile | null = null;
@@ -222,7 +271,7 @@ export class AudioGraph {
       gain.gain.value = 0;
       this.ctx.createMediaElementSource(el).connect(gain);
       gain.connect(this.master);
-      this.voices.push({ el, gain, clipId: null, url: null });
+      this.voices.push({ el, gain, clipId: null, url: null, env: null });
     }
   }
 
@@ -324,12 +373,10 @@ export class AudioGraph {
       const env = this.videoEnv.get(info.el);
       let rearm = discontinuity || !env || env.clipId !== info.clip.id;
       if (!rearm && env) {
-        // where continuous playback from the schedule anchor would put the
-        // element now, vs. where it actually is (derived from currentTime).
-        const speed = Math.max(0.25, previewSpeed);
-        const expected = env.t0 + (this.ctx.currentTime - env.ctx0) * speed;
+        // where the element actually is (derived from currentTime) vs. where
+        // continuous playback from the schedule anchor would put it.
         const actual = timelineTime(info.clip, info.el.currentTime);
-        if (Math.abs(actual - expected) > SEEK_REARM_SEC) rearm = true;
+        if (envelopeStale(env, actual, this.ctx.currentTime, previewSpeed)) rearm = true;
       }
       if (rearm) {
         this.scheduleEnvelope(gain, info.clip, info.track, t, previewSpeed);
@@ -428,8 +475,31 @@ export class AudioGraph {
           }
         }
 
-        if (fresh || discontinuity) {
+        // Re-arm on exactly the conditions the video path uses — this is the
+        // SAME guard, and it was missing here. `fresh || discontinuity` alone
+        // leaves a band wide open: a ruler scrub during playback (timeline.seek
+        // → engine.seek, which does not pause) steps 0.12-0.3 s at a time,
+        // which is past HARD_RESYNC_SEC above — so the element jumps — but
+        // under the 0.3 s discontinuity bar, so the time-absolute envelope
+        // stayed anchored to the pre-scrub trajectory and fired its zero/fade
+        // breakpoints early. Scrubbing backwards therefore silenced the clip
+        // for the rest of its run, and nothing self-corrected until a >0.3 s
+        // jump, a pause or a project edit. The divergence accumulates across
+        // ticks (the anchor is only moved by a re-arm), so even a run of steps
+        // individually under the bar trips it within a few frames.
+        const env = voice.env;
+        let rearm = fresh || discontinuity || env === null || env.clipId !== clip.id;
+        // Only worth asking while the transport runs: paused, the element is
+        // paused and inaudible whatever its gain says, and the resume is a
+        // playing-flag discontinuity that re-arms everything anyway. Skipping
+        // it keeps a paused refresh (media.status fires ~10x/s during a job)
+        // from rescheduling six envelopes for nothing.
+        if (!rearm && playing && env !== null) {
+          rearm = envelopeStale(env, t, this.ctx.currentTime, previewSpeed);
+        }
+        if (rearm) {
           this.scheduleEnvelope(voice.gain, clip, track, t, previewSpeed);
+          voice.env = { clipId: clip.id, t0: t, ctx0: this.ctx.currentTime };
         }
       }
     }
@@ -439,6 +509,9 @@ export class AudioGraph {
   private parkVoice(voice: Voice): void {
     voice.el.pause();
     voice.clipId = null;
+    // The envelope is gone with it, so the voice's next claim always re-arms —
+    // mirroring `videoEnv.delete(el)` when an element goes inactive.
+    voice.env = null;
     voice.gain.gain.cancelScheduledValues(this.ctx.currentTime);
     voice.gain.gain.setValueAtTime(0, this.ctx.currentTime);
   }

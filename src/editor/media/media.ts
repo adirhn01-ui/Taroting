@@ -55,6 +55,23 @@ type JobTarget =
   | { type: "playback"; mediaId: string; output: string }
   | { type: "waveform"; mediaId: string; output: string };
 
+/**
+ * How long a cache-enforcement request waits for company.
+ *
+ * Enforcement is a whole-cache walk on the backend: read_dir over five kind
+ * directories plus a metadata() syscall per file, all of it BEFORE the
+ * `total <= cap` early-out — so it is the same overhead whether or not anything
+ * gets evicted. Measured: 1.34 ms at 50 files, 12.3 ms at 500, 48.2 ms at 2000.
+ *
+ * It used to run once per finished job. Opening a project with 20 media means
+ * ~40 completions (a playback plan and a waveform each) landing within a second
+ * or two of each other, i.e. ~40 full walks — 50 ms to 2 s of disk work on the
+ * project-open path, all of it redundant because the 40th walk sees what the
+ * 39th did. One second collapses any such burst into a single walk while still
+ * trimming promptly after the last job of the batch settles.
+ */
+const CACHE_ENFORCE_COALESCE_MS = 1000;
+
 export class MediaManager {
   /** mediaId → preview readiness */
   readonly status = new Store<Record<string, MediaState>>({});
@@ -67,6 +84,8 @@ export class MediaManager {
   private tracked = new Set<string>();
   private unlisten: (() => void) | null = null;
   private disposed = false;
+  /** Pending coalesced cache enforcement (see CACHE_ENFORCE_COALESCE_MS). */
+  private cacheTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private getProject: () => ProjectFile) {}
 
@@ -247,7 +266,27 @@ export class MediaManager {
     }
   }
 
+  /**
+   * Ask for a cache trim, at most once per CACHE_ENFORCE_COALESCE_MS.
+   *
+   * Deliberately NOT a resetting debounce: the first request in a burst arms
+   * the timer and later ones ride along, so a steady stream of job completions
+   * can never starve enforcement — it always runs within a second of the first
+   * request, and any request that arrives after the timer fires arms a fresh
+   * one. The `keep` list is built when the timer fires rather than when the
+   * request came in, so it reflects the project as it is at trim time.
+   */
   private enforceCache(): void {
+    if (this.cacheTimer !== null) return;
+    this.cacheTimer = setTimeout(() => {
+      this.cacheTimer = null;
+      this.runEnforceCache();
+    }, CACHE_ENFORCE_COALESCE_MS);
+  }
+
+  /** Issue the trim. The `keep` list is built here, not when the request came
+   *  in, so it reflects the project as it is at trim time. */
+  private runEnforceCache(): void {
     const keep = this.getProject().media.map(keyOf);
     void ipc.enforceCacheLimit(settingsStore.get().cacheLimitMB, keep).catch(() => {});
   }
@@ -256,6 +295,15 @@ export class MediaManager {
     this.disposed = true;
     this.unlisten?.();
     this.unlisten = null;
+    // A coalesced trim must not be lost just because the editor closed inside
+    // the collection window — that is how a cache quietly grows past its cap.
+    // getProject() is still valid here: the editor disposes this manager before
+    // it tears the session down.
+    if (this.cacheTimer !== null) {
+      clearTimeout(this.cacheTimer);
+      this.cacheTimer = null;
+      this.runEnforceCache();
+    }
     this.jobs.clear();
   }
 }

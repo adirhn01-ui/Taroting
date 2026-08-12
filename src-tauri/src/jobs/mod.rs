@@ -58,6 +58,16 @@ impl JobHandle {
     pub fn set_output(&self, path: PathBuf) {
         *self.output.lock().unwrap() = Some(path);
     }
+    /// Stop treating the output as disposable.
+    ///
+    /// `fail_job` deletes whatever `set_output` last named, which is right while
+    /// ffmpeg is still writing a partial file and catastrophic the moment it
+    /// isn't: an export whose encode SUCCEEDED owns a complete video at that
+    /// path, and a failure to publish it must not take the finished encode down
+    /// with it. Call this as soon as the file stops being partial.
+    pub fn clear_output(&self) {
+        *self.output.lock().unwrap() = None;
+    }
     fn attach_child(&self, child: Child) {
         *self.child.lock().unwrap() = Some(child);
     }
@@ -396,4 +406,49 @@ pub fn run_blocking_on_lane<T: Send + 'static>(
 #[tauri::command]
 pub fn cancel_job(jobs: tauri::State<'_, Arc<Jobs>>, id: JobId) -> bool {
     jobs.cancel(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `cleanup_output` is the failure path's eraser, and `clear_output` is the
+    /// only thing standing between it and a finished export. Both halves are
+    /// pinned here: a genuinely partial file still gets cleaned up, and a file
+    /// that has been released no longer does.
+    #[test]
+    fn clearing_the_output_target_spares_a_finished_file() {
+        let jobs = Jobs::default();
+        let dir = std::env::temp_dir().join(format!(
+            "taroting-jobs-cleanup-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // ffmpeg died mid-write: the partial output is garbage and must go.
+        let partial = dir.join("aborted.mp4.part");
+        std::fs::write(&partial, b"half an encode").unwrap();
+        let handle = jobs.allocate(JobKind::Export);
+        handle.set_output(partial.clone());
+        handle.cleanup_output();
+        assert!(!partial.exists(), "a partial output must still be cleaned up");
+
+        // ffmpeg finished and only the publish failed: the file is the user's
+        // completed video, so the same failure path must leave it alone.
+        let finished = dir.join("finished.mp4.part");
+        std::fs::write(&finished, b"a complete encode").unwrap();
+        let handle = jobs.allocate(JobKind::Export);
+        handle.set_output(finished.clone());
+        handle.clear_output();
+        handle.cleanup_output();
+        assert!(
+            finished.exists(),
+            "a completed encode must survive the failure path"
+        );
+        assert_eq!(std::fs::read(&finished).unwrap(), b"a complete encode");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

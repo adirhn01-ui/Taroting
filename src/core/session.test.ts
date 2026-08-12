@@ -1,21 +1,29 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ipc } from "./ipc";
+import { createProject } from "./project";
 import {
   CARD_RESCUE_RATIO,
   contrastRatioHex,
   CUSTOM_THEME_VARS,
   deriveCustomTheme,
+  initSettings,
   NAV_RESCUE_RATIO,
   needsAppearanceRescue,
   needsChromeRescue,
   needsNavRescue,
   normalizeHexColor,
+  ProjectSession,
   SAFE_APPEARANCE,
   SAFE_THEME_VARS,
   sanitizeSettings,
+  settingsLoadFailure,
+  settingsStore,
+  updateSettings,
 } from "./session";
 import { normalizeChord } from "./shortcuts";
+import { Store } from "./store";
 import { DEFAULT_CUSTOM_THEME, DEFAULT_SETTINGS, DEFAULT_SHORTCUTS } from "./types";
-import type { ActionId, CustomTheme } from "./types";
+import type { ActionId, CustomTheme, Settings } from "./types";
 
 /** Settings are persisted opaquely by the Rust side (serde_json::Value), so the
  *  frontend is the ONLY sanitizer between a hand-edited or corrupted
@@ -1638,5 +1646,382 @@ describe("the nav rescue", () => {
       expect(channelDistance(p["--safe-border-strong"], p["--safe-raised"]), dir).toBeGreaterThan(6);
       expect(channelDistance(p["--safe-hover"], p["--safe-raised"]), `${dir} hover`).toBeGreaterThan(3);
     }
+  });
+});
+
+/* ================================================================== */
+/* Session lifetime: the autosaver, and settings persistence          */
+/* ================================================================== */
+
+/**
+ * A stand-in for the two globals `session.ts` reaches for.
+ *
+ * `vite.config.ts` runs these in `environment: "node"`, so there is no DOM:
+ * `applyTheme` needs a root element to write dataset and style onto, and
+ * `ProjectSession` schedules its debounce and its autosave interval through
+ * `window`. The timer members DELEGATE at call time rather than capturing the
+ * function, so vitest's fake timers — installed per test below — are what
+ * actually runs.
+ */
+function installGlobalStubs(): void {
+  const root = {
+    dataset: {} as Record<string, string>,
+    style: { setProperty: () => {}, removeProperty: () => {} },
+  };
+  vi.stubGlobal("document", { documentElement: root });
+  vi.stubGlobal("window", {
+    matchMedia: () => ({ matches: false, addEventListener: () => {} }),
+    setTimeout: (fn: () => void, ms?: number) => globalThis.setTimeout(fn, ms),
+    clearTimeout: (id?: number) => globalThis.clearTimeout(id),
+    setInterval: (fn: () => void, ms?: number) => globalThis.setInterval(fn, ms),
+    clearInterval: (id?: number) => globalThis.clearInterval(id),
+  });
+}
+
+/** Only the timers, so the microtask queue (and therefore `Store`'s batched
+ *  notifications) keeps running normally, and `touchModified`'s `Date` stays
+ *  real. */
+function fakeTimerOptions(): Parameters<typeof vi.useFakeTimers>[0] {
+  return { toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] };
+}
+
+const PROJECT_PATH = "C:\\Users\\adirh\\Videos\\Taroting\\cut.trt";
+
+/** One full autosave period at the shipped default. */
+const TICK_MS = DEFAULT_SETTINGS.autosaveSeconds * 1000;
+
+/**
+ * The data loss this block exists for: an edit made while an autosave was
+ * already writing, on a session that is then torn down before that write
+ * returns. Every exit from the editor — Back, Ctrl+W, the Settings gear, an OS
+ * open-path — goes through `dispose()`, so this is not an exotic path.
+ *
+ * `save()` used to return the moment it saw a write in flight, having only
+ * recorded that a follow-up was owed. `dispose()` awaited that instant
+ * resolution and set `disposed`, and the follow-up then short-circuited on
+ * `disposed` and never wrote. The suite could not see it because nothing else
+ * in the app depends on what `save()`'s promise MEANS.
+ */
+describe("autosave while a write is already in flight", () => {
+  beforeEach(() => {
+    installGlobalStubs();
+    settingsStore.set(DEFAULT_SETTINGS);
+    vi.useFakeTimers(fakeTimerOptions());
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /** A writer whose FIRST call blocks until released, recording the project
+   *  name of everything that actually reaches disk. */
+  function blockingWriter(): { written: string[]; release: () => void } {
+    const written: string[] = [];
+    let release!: () => void;
+    const firstReturns = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let first = true;
+    vi.spyOn(ipc, "saveProject").mockImplementation(async (_path, project) => {
+      written.push(project.name);
+      if (first) {
+        first = false;
+        await firstReturns;
+      }
+      return { modifiedAt: project.modifiedAt };
+    });
+    return { written, release };
+  }
+
+  it("writes an edit made mid-write even when the editor is left immediately after", async () => {
+    const { written, release } = blockingWriter();
+    const session = new ProjectSession(PROJECT_PATH, createProject("start"));
+
+    session.commit((p) => ({ ...p, name: "first edit" }));
+    const autosave = session.save(); // the write that is now in flight
+    session.commit((p) => ({ ...p, name: "second edit" }));
+
+    const leaving = session.dispose(); // Back / Ctrl+W / the Settings gear
+    release();
+    await leaving;
+    await autosave;
+
+    expect(written).toEqual(["first edit", "second edit"]);
+    expect(session.saveState.get()).toBe("saved");
+  });
+
+  it("resolves a coalesced save only once the edits it carries are on disk", async () => {
+    const { written, release } = blockingWriter();
+    const session = new ProjectSession(PROJECT_PATH, createProject("start"));
+
+    session.commit((p) => ({ ...p, name: "first edit" }));
+    const autosave = session.save();
+    session.commit((p) => ({ ...p, name: "second edit" }));
+
+    // The contract dispose() leans on: this promise is "my state is on disk",
+    // not "somebody noted that it should be".
+    let settled = false;
+    const coalesced = session.save().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(written).toEqual(["first edit"]);
+
+    release();
+    await coalesced;
+    expect(written).toEqual(["first edit", "second edit"]);
+
+    await autosave;
+    session.discard();
+  });
+});
+
+/**
+ * A failed write leaves `saveState` at "error", never at "dirty" — so the
+ * interval's dirty check alone meant nothing ever tried again while the editor
+ * sat idle. The "Save failed" badge showed, so this was never silent, but a
+ * transient cause could not clear itself: only a fresh edit or leaving the
+ * editor would attempt another write.
+ */
+describe("autosave after a failed write", () => {
+  beforeEach(() => {
+    installGlobalStubs();
+    settingsStore.set(DEFAULT_SETTINGS);
+    vi.useFakeTimers(fakeTimerOptions());
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("retries on its own, with no edit and no navigation", async () => {
+    let attempts = 0;
+    vi.spyOn(ipc, "saveProject").mockImplementation(async (_path, project) => {
+      attempts++;
+      if (attempts === 1) throw new Error("the file was locked");
+      return { modifiedAt: project.modifiedAt };
+    });
+
+    const session = new ProjectSession(PROJECT_PATH, createProject("cut"));
+    await session.save();
+    expect(session.saveState.get()).toBe("error");
+    expect(attempts).toBe(1);
+
+    // One autosave period passes. The user does nothing at all.
+    await vi.advanceTimersByTimeAsync(TICK_MS);
+
+    expect(attempts).toBe(2);
+    expect(session.saveState.get()).toBe("saved");
+    session.discard();
+  });
+
+  it("backs off instead of retrying every tick while the cause persists", async () => {
+    const saveProject = vi
+      .spyOn(ipc, "saveProject")
+      .mockRejectedValue(new Error("the drive is gone"));
+
+    const session = new ProjectSession(PROJECT_PATH, createProject("cut"));
+    await session.save(); // attempt 1
+    await vi.advanceTimersByTimeAsync(TICK_MS * 20);
+
+    // Retries land on ticks 1, 3, 7 and 15 — the doubling backoff — never on
+    // all twenty. Each attempt re-stamps modifiedAt and notifies every project
+    // subscriber, so an every-tick retry against a dead destination would be a
+    // re-render loop for as long as the editor stays open.
+    expect(saveProject).toHaveBeenCalledTimes(5);
+    expect(session.saveState.get()).toBe("error");
+    session.discard();
+  });
+});
+
+/**
+ * The other data loss: a settings.json that could not be READ at boot, silently
+ * replaced by defaults on the very next write. Both halves are covered — a
+ * rejecting `get_settings`, and the `null` it returns when a Windows file lock
+ * (an antivirus scanner, a sync client) defeats both the file and its `.bak`,
+ * which the backend cannot tell apart from a first run.
+ */
+describe("settings that could not be read at start-up", () => {
+  beforeEach(() => {
+    installGlobalStubs();
+    // The store is module state shared with every other block in this file.
+    settingsStore.set(DEFAULT_SETTINGS);
+    // initSettings reports a failed read here too; keep it out of the output.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("reports a failed read instead of coming up as a fresh install", async () => {
+    vi.spyOn(ipc, "getSettings").mockRejectedValue(new Error("the file is in use"));
+
+    expect(await initSettings()).toEqual({ ok: false, error: "the file is in use" });
+    // …and still reachable from a screen mounted later, which is exactly the
+    // screen a user opens when their preferences look wrong.
+    expect(settingsLoadFailure()).toBe("the file is in use");
+  });
+
+  it("refuses to overwrite a settings file it never managed to read", async () => {
+    vi.spyOn(ipc, "getSettings").mockRejectedValue(new Error("the file is in use"));
+    const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
+
+    await initSettings();
+    await expect(updateSettings({ defaultExportDir: "D:\\Exports" })).rejects.toThrow(
+      /could not be read/,
+    );
+
+    expect(saveSettings).not.toHaveBeenCalled();
+    // Nothing was painted either: the optimistic store write is skipped on the
+    // one path where the optimism would be a lie.
+    expect(settingsStore.get().defaultExportDir).toBeNull();
+  });
+
+  it("merges the next change onto the real file once a read finally succeeds", async () => {
+    const stored: Settings = {
+      ...DEFAULT_SETTINGS,
+      defaultExportDir: "D:\\Exports",
+      shortcuts: { ...DEFAULT_SHORTCUTS, split: "Q" },
+    };
+    vi.spyOn(ipc, "getSettings")
+      .mockRejectedValueOnce(new Error("the file is in use"))
+      .mockResolvedValueOnce(stored);
+    const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
+
+    expect((await initSettings()).ok).toBe(false);
+    await updateSettings({ hardwareAccel: false });
+
+    const written = saveSettings.mock.calls[0]![0];
+    expect(written.hardwareAccel).toBe(false);
+    // The two values the old code destroyed: a configured export folder became
+    // null, and a rebound shortcut went back to its stock chord.
+    expect(written.defaultExportDir).toBe("D:\\Exports");
+    expect(written.shortcuts.split).toBe("Q");
+  });
+
+  it("re-reads before the first write when start-up found nothing at all", async () => {
+    const stored: Settings = { ...DEFAULT_SETTINGS, monitorVolume: 0.25 };
+    const getSettings = vi
+      .spyOn(ipc, "getSettings")
+      .mockResolvedValueOnce(null) // locked at boot, so the backend saw nothing
+      .mockResolvedValueOnce(stored); // …and perfectly readable a moment later
+    const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
+
+    expect(await initSettings()).toEqual({ ok: true, source: "defaults" });
+    await updateSettings({ proxyMedia: false });
+
+    expect(getSettings).toHaveBeenCalledTimes(2);
+    const written = saveSettings.mock.calls[0]![0];
+    expect(written.monitorVolume).toBe(0.25);
+    expect(written.proxyMedia).toBe(false);
+  });
+
+  it("still saves on a genuine first run, and re-reads only once", async () => {
+    const getSettings = vi.spyOn(ipc, "getSettings").mockResolvedValue(null);
+    const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
+
+    await initSettings();
+    await updateSettings({ proxyMedia: false });
+    await updateSettings({ hardwareAccel: false });
+
+    expect(saveSettings).toHaveBeenCalledTimes(2);
+    // Boot plus one reconcile — the gate must not turn every preference change
+    // into a disk round trip.
+    expect(getSettings).toHaveBeenCalledTimes(2);
+    expect(saveSettings.mock.calls[1]![0].proxyMedia).toBe(false);
+  });
+
+  it("costs nothing extra when start-up read the file", async () => {
+    const getSettings = vi
+      .spyOn(ipc, "getSettings")
+      .mockResolvedValue({ ...DEFAULT_SETTINGS, cacheLimitMB: 4096 });
+    const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
+
+    expect(await initSettings()).toEqual({ ok: true, source: "disk" });
+    expect(settingsLoadFailure()).toBeNull();
+    await updateSettings({ proxyMedia: false });
+
+    expect(getSettings).toHaveBeenCalledTimes(1);
+    expect(saveSettings.mock.calls[0]![0].cacheLimitMB).toBe(4096);
+  });
+});
+
+/**
+ * `Store` is the shared primitive under every screen, so one subscriber's bug
+ * used to become every later subscriber's bug: the notify loop had no
+ * per-listener guard, and `prevNotified` is advanced before it runs, so a throw
+ * both aborted the delivery and made that value unreachable for good. A throw
+ * in the Settings re-render stopped the editor re-binding its shortcuts, with
+ * nothing anywhere to say so.
+ */
+describe("Store notifications when a subscriber throws", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("still notifies every other subscriber, and reports the failure", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const store = new Store(0);
+    const seen: string[] = [];
+
+    store.subscribe((n) => seen.push(`first:${n}`));
+    store.subscribe(() => {
+      throw new Error("the Settings re-render blew up");
+    });
+    store.subscribe((n) => seen.push(`third:${n}`));
+
+    store.set(1);
+    await Promise.resolve();
+
+    expect(seen).toEqual(["first:1", "third:1"]);
+    expect(errors).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not silence a later subscriber permanently", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const store = new Store(0);
+    const seen: number[] = [];
+
+    store.subscribe(() => {
+      throw new Error("the Settings re-render blew up");
+    });
+    store.subscribe((n) => seen.push(n));
+
+    store.set(1);
+    await Promise.resolve();
+    store.set(2);
+    await Promise.resolve();
+
+    // Under the old loop this subscriber saw neither value, and never would.
+    expect(seen).toEqual([1, 2]);
+  });
+
+  it("keeps going when several subscribers throw", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const store = new Store("a");
+    const seen: string[] = [];
+
+    store.subscribe(() => {
+      throw new Error("first failure");
+    });
+    store.subscribe((s) => seen.push(`middle:${s}`));
+    store.subscribe(() => {
+      throw new Error("second failure");
+    });
+    store.subscribe((s) => seen.push(`last:${s}`));
+
+    store.set("b");
+    await Promise.resolve();
+
+    expect(seen).toEqual(["middle:b", "last:b"]);
+    expect(errors).toHaveBeenCalledTimes(2);
   });
 });

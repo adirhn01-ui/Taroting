@@ -263,16 +263,44 @@ struct Placement {
     /// display size that the scale expression multiplies by S(t).
     fit_w: f64,
     fit_h: f64,
-    /// x/y offsets (before centering) — carried for animated overlay exprs.
+    /// x/y offsets (before centering), ALREADY CONVERTED TO OUTPUT px — carried
+    /// for animated overlay exprs. See `placement` for the two pixel spaces.
     x: f64,
     y: f64,
+    /// Project-canvas px -> output px, per axis. Keyframed x/y values are
+    /// authored in canvas px exactly like the static offsets, so `overlay_xy`
+    /// needs these to convert them too.
+    sx: f64,
+    sy: f64,
 }
 
 /// Compute per-clip crop rect + scaled display size + overlay position, using
 /// the identical fit math as the preview transform.
-fn placement(clip: &Clip, media: &MediaRef, canvas_w: u32, canvas_h: u32) -> Placement {
-    let cw = canvas_w as f64;
-    let ch = canvas_h as f64;
+///
+/// TWO PIXEL SPACES MEET HERE and mixing them is precisely the bug this
+/// signature exists to make hard:
+///   * `canvas` is the PROJECT canvas (`timeline.width/height`). `t.x`/`t.y`,
+///     the x/y keyframe values and the crop rect are all authored against it —
+///     the preview positions a layer with `translate(posX * stageScale)`, i.e.
+///     canvas px times the on-screen zoom.
+///   * `out` is the EXPORT resolution (`ExportPreset::output_dims`). Every
+///     number ffmpeg receives — `scale=`, `overlay=`, the black bases — is in
+///     it.
+/// The two are equal only for the "Original" preset. `fit` is measured against
+/// `out`, so the MEDIA scales with the resolution on its own; the offsets do
+/// not, and must be multiplied by out/canvas. Adding raw canvas-px x/y to an
+/// output-px centring term shifted every off-centre clip: at 720p from a 1080p
+/// canvas, an x of 307 landed 102 px off, at 2160p it landed 307 px off, while
+/// a centred clip (x = y = 0) stayed exact at every resolution — which is why
+/// nothing caught it.
+fn placement(clip: &Clip, media: &MediaRef, canvas: (u32, u32), out: (u32, u32)) -> Placement {
+    let (canvas_w, canvas_h) = canvas;
+    let cw = out.0 as f64;
+    let ch = out.1 as f64;
+    // canvas px -> output px, per axis. A Custom resolution need not preserve
+    // the timeline's aspect, so the two factors are not always equal.
+    let sx = cw / canvas_w.max(1) as f64;
+    let sy = ch / canvas_h.max(1) as f64;
 
     let (rotate, flip_h, flip_v, scale, x, y, opacity, crop_rect) = match &clip.transform {
         Some(t) => (
@@ -288,6 +316,9 @@ fn placement(clip: &Clip, media: &MediaRef, canvas_w: u32, canvas_h: u32) -> Pla
         None => (0, false, false, 1.0, 0.0, 0.0, 1.0, None),
     };
 
+    // A media with no recorded size falls back to the PROJECT canvas, never to
+    // the output: the preview treats it as canvas-sized (`media.width ??
+    // project.width`) and the crop rect is clamped against that same space.
     let src_w = media.width.unwrap_or(canvas_w).max(1) as f64;
     let src_h = media.height.unwrap_or(canvas_h).max(1) as f64;
 
@@ -305,8 +336,11 @@ fn placement(clip: &Clip, media: &MediaRef, canvas_w: u32, canvas_h: u32) -> Pla
 
     let dw = round_even(crop_w * k);
     let dh = round_even(crop_h * k);
-    let ox = ((cw - dw as f64) / 2.0 + x).round() as i64;
-    let oy = ((ch - dh as f64) / 2.0 + y).round() as i64;
+    // x/y are CANVAS px; cw/ch (and therefore dw/dh) are OUTPUT px. The offsets
+    // have to be converted before they can be added to an output-space centring
+    // term — see the header of this function.
+    let ox = ((cw - dw as f64) / 2.0 + x * sx).round() as i64;
+    let oy = ((ch - dh as f64) / 2.0 + y * sy).round() as i64;
 
     // Only emit a crop filter when it actually narrows the frame.
     let crop = if crop_x > 0.0
@@ -340,8 +374,10 @@ fn placement(clip: &Clip, media: &MediaRef, canvas_w: u32, canvas_h: u32) -> Pla
         src_h: src_h.round().clamp(1.0, 16384.0) as i64,
         fit_w: crop_w * fit,
         fit_h: crop_h * fit,
-        x,
-        y,
+        x: x * sx,
+        y: y * sy,
+        sx,
+        sy,
     }
 }
 
@@ -412,8 +448,17 @@ fn register_clip_input(
     if media.kind == "image" {
         flags.push("-loop".into());
         flags.push("1".into());
+        // SOURCE seconds, not timeline seconds. `emit_clip_chain` puts a
+        // `setpts=(PTS-STARTPTS)/speed` on every clip, so a stream cut to
+        // `clip.duration()` here — which is ALREADY the timeline length,
+        // (src_out-src_in)/speed — comes out `duration/speed` long: a 2 s image
+        // at speed 2 exported 1 s of frames and every later segment slid 1 s
+        // ahead of its (correctly delayed) audio. The video branch below feeds
+        // the same source span through -ss/-to, and the generator path
+        // synthesizes `clip_dur * speed`; `src_out - src_in` is that quantity,
+        // written as the source window so a zero speed cannot make it NaN.
         flags.push("-t".into());
-        flags.push(format!("{:.6}", clip.duration()).into());
+        flags.push(format!("{:.6}", clip.src_out - clip.src_in).into());
     } else {
         flags.push("-ss".into());
         flags.push(format!("{:.6}", clip.src_in).into());
@@ -433,8 +478,29 @@ fn register_clip_input(
 /* ------------------------------------------------------------------ */
 
 /// Decompose a speed factor into atempo stages each within [0.5, 2.0].
+///
+/// `speed` is a bare `f64` in `project::schema` with no deserialize-time
+/// validation, and `.trt` files are shareable and hand-editable — the store's
+/// own test loads a project carrying `"speed": 0.0`. The halve/double loop
+/// below only terminates for a FINITE POSITIVE speed: `0.0 / 0.5` stays `0.0`,
+/// a negative diverges to -inf, and `inf / 2.0` stays inf. Each pass pushes
+/// another factor, so the Vec grows without bound (measured: 20M entries,
+/// 256 MiB and still climbing) until the allocator fails, and with
+/// `panic = "abort"` that kills the app mid-export along with unsaved work.
+///
+/// Such a speed has no honest tempo — the video chain's
+/// `setpts=(PTS-STARTPTS)/speed` is just as meaningless for it, and a NaN has
+/// no nearest legal value — so the audio is left at its natural tempo, exactly
+/// as for speed 1.0. Clamping into the editor's [MIN_SPEED, MAX_SPEED] =
+/// [0.25, 4.0] (src/core/project.ts) was the alternative and is rejected here:
+/// it would also have to reel in finite out-of-range speeds like 8.0, which
+/// terminate today and stay in step with the video chain, and slowing only the
+/// audio would invent an A/V desync where there is none.
 fn atempo_factors(speed: f64) -> Vec<f64> {
     let mut factors = Vec::new();
+    if !speed.is_finite() || speed <= 0.0 {
+        return factors;
+    }
     let mut remaining = speed;
     if (remaining - 1.0).abs() < 1e-9 {
         return factors;
@@ -494,7 +560,11 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
         }
     }
 
-    let (canvas_w, canvas_h) = preset.output_dims(spec.timeline.width, spec.timeline.height);
+    // The EXPORT resolution, which equals the project canvas only for the
+    // "Original" preset. Both spaces travel from here into `placement`, which
+    // is where mixing them up used to mis-place off-centre clips.
+    let (out_w, out_h) = preset.output_dims(spec.timeline.width, spec.timeline.height);
+    let canvas = (spec.timeline.width, spec.timeline.height);
     let fps_str = preset.output_fps(&spec.timeline);
     let duration_sec = spec.timeline.duration();
 
@@ -603,8 +673,9 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     /* ---- build filtergraph ---- */
     let mut fc = String::new();
     let mut gen = GraphGen {
-        w: canvas_w,
-        h: canvas_h,
+        w: out_w,
+        h: out_h,
+        canvas,
         fps: &fps_str,
         text_payloads: &mut text_payloads,
         stage_n: 0,
@@ -702,8 +773,12 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
 /* ------------------------------------------------------------------ */
 
 struct GraphGen<'a> {
+    /// OUTPUT dims: the exported frame size and the size of every black base.
     w: u32,
     h: u32,
+    /// PROJECT-CANVAS dims: the px space clip offsets and keyframe values are
+    /// authored in. Equal to `w`/`h` only when exporting at "Original".
+    canvas: (u32, u32),
     fps: &'a str,
     text_payloads: &'a mut Vec<(String, String)>,
     /// monotonically increasing suffix for unique stage labels
@@ -804,7 +879,7 @@ x=0:y=0:boxw={w}:boxh={h}:text_align=L+M:line_spacing={line_spacing}:expansion=n
                             .iter()
                             .find(|m| m.id == clip.media_id)
                             .expect("media exists (validated in build)");
-                        let p = placement(clip, m, w, h);
+                        let p = placement(clip, m, self.canvas, (w, h));
                         let clip_dur = clip.duration();
                         let n = self.next_n();
 
@@ -866,7 +941,7 @@ x=0:y=0:boxw={w}:boxh={h}:text_align=L+M:line_spacing={line_spacing}:expansion=n
         media: &MediaRef,
         final_label: Option<&str>,
     ) -> String {
-        let p = placement(clip, media, self.w, self.h);
+        let p = placement(clip, media, self.canvas, (self.w, self.h));
         let clip_dur = clip.duration();
         let n = self.next_n();
         let start = clip.timeline_start;
@@ -1054,18 +1129,29 @@ scale={cw}:{ch}[al{a}];[cx{a}][al{a}]blend=all_mode=multiply[am{a}];\
         }
 
         // Per axis: single kf → constant value; multi-kf → ramp; absent → static.
-        let offset = |kf: Option<&&Vec<Keyframe>>, stat: f64| -> String {
+        //
+        // `s` is the canvas->output factor. Keyframed x/y values are authored in
+        // PROJECT-CANVAS px exactly like the static transform offsets, while
+        // `(main_w-overlay_w)/2` below is OUTPUT px — the same units mix-up that
+        // `placement` documents, and it has to be undone on this path too.
+        // Scaling the breakpoint VALUES rather than wrapping the emitted
+        // expression in a multiply keeps the per-frame expression as cheap as
+        // before. `p.x`/`p.y` arrive already converted.
+        let offset = |kf: Option<&&Vec<Keyframe>>, stat: f64, s: f64| -> String {
             match kf {
-                Some(kfs) if kfs.len() == 1 => format!("{:.4}", kfs[0].v),
+                Some(kfs) if kfs.len() == 1 => format!("{:.4}", kfs[0].v * s),
                 Some(kfs) => {
-                    let bps = clamped_breakpoints(kfs, clip.src_in, clip.src_out, clip.speed);
+                    let mut bps = clamped_breakpoints(kfs, clip.src_in, clip.src_out, clip.speed);
+                    for b in &mut bps {
+                        b.v *= s;
+                    }
                     ramp_expr(&bps, tbase)
                 }
                 None => format!("{stat:.4}"),
             }
         };
-        let x_off = offset(x_kf.as_ref(), p.x);
-        let y_off = offset(y_kf.as_ref(), p.y);
+        let x_off = offset(x_kf.as_ref(), p.x, p.sx);
+        let y_off = offset(y_kf.as_ref(), p.y, p.sy);
         (
             format!("'(main_w-overlay_w)/2+{x_off}'"),
             format!("'(main_h-overlay_h)/2+{y_off}'"),
@@ -1420,6 +1506,133 @@ mod tests {
         assert!(fc.contains("overlay=0:0:shortest=1"), "{fc}");
     }
 
+    /// `preset` with a named resolution instead of "original".
+    fn preset_at(format: &str, vcodec: &str, resolution: &str) -> ExportPreset {
+        let mut p = preset(format, vcodec);
+        p.resolution = ResolutionPreset::Named(resolution.into());
+        p
+    }
+
+    /// The `ox:oy` and `dw:dh` ffmpeg is handed for a single-clip export.
+    fn overlay_and_scale(b: &BuiltExport) -> (String, String) {
+        let fc = &b.filter_complex;
+        let grab = |head: &str, tail: &str| {
+            let i = fc.find(head).unwrap_or_else(|| panic!("no {head} in {fc}")) + head.len();
+            let j = fc[i..].find(tail).unwrap_or_else(|| panic!("no {tail} after {head}")) + i;
+            fc[i..j].to_string()
+        };
+        (grab("overlay=", ":shortest=1"), grab(",scale=", ","))
+    }
+
+    #[test]
+    fn an_off_centre_clip_keeps_its_place_at_every_export_resolution() {
+        // The units bug: t.x/t.y are PROJECT-CANVAS px, `overlay=` is OUTPUT px.
+        // The media already scaled correctly (fit is measured against the output
+        // box) so only off-centre clips moved — 102 px at 720p, 307 px at 2160p
+        // for this x — and a centred clip was right everywhere, which is how it
+        // shipped. Expected values come from the shared parity table's
+        // export-720p / export-2160p rows.
+        let build_at = |resolution: &str| {
+            let m = media("m1", r"C:\v.mp4", 854, 482, false);
+            let mut c = clip("c1", "m1", 0.0, 0.0, 2.0);
+            c.transform = Some(ClipTransform {
+                crop: None, rotate: 0, flip_h: false, flip_v: false,
+                scale: 1.13, x: 307.0, y: -151.0, opacity: 1.0,
+            });
+            let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+            build(
+                &spec(vec![m], tl, preset_at("mp4", "h264", resolution), r"C:\o.mp4"),
+                &enc(),
+            )
+            .unwrap()
+        };
+
+        // 1920x1080 canvas at Original: the preview's own numbers.
+        let (xy, sz) = overlay_and_scale(&build_at("original"));
+        assert_eq!((xy.as_str(), sz.as_str()), ("186:-221", "2162:1220"));
+
+        // 1280x720: everything shrinks by 2/3, offsets included. Adding the raw
+        // 307/-151 would have emitted 226:-198.
+        let (xy, sz) = overlay_and_scale(&build_at("720p"));
+        assert_eq!((xy.as_str(), sz.as_str()), ("124:-148", "1442:814"));
+
+        // 3840x2160: everything doubles. The raw offsets would have given 65:-291.
+        let (xy, sz) = overlay_and_scale(&build_at("2160p"));
+        assert_eq!((xy.as_str(), sz.as_str()), ("372:-442", "4324:2440"));
+    }
+
+    #[test]
+    fn a_centred_clip_is_the_one_case_the_resolution_cannot_break() {
+        // The control that explains the silence: with x = y = 0 the offsets
+        // contribute nothing, so the centring term alone is right at every
+        // resolution. A test written with a centred fixture proves nothing
+        // about the conversion.
+        let build_at = |resolution: &str| {
+            let m = media("m1", r"C:\v.mp4", 854, 482, false);
+            let c = clip("c1", "m1", 0.0, 0.0, 2.0);
+            let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+            build(
+                &spec(vec![m], tl, preset_at("mp4", "h264", resolution), r"C:\o.mp4"),
+                &enc(),
+            )
+            .unwrap()
+        };
+        let num = |s: &str| s.parse::<i64>().unwrap_or_else(|_| panic!("not a number: {s}"));
+        for (r, out_w, out_h) in [("original", 1920, 1080), ("720p", 1280, 720), ("2160p", 3840, 2160)] {
+            let (xy, sz) = overlay_and_scale(&build_at(r));
+            let (ox, oy) = xy.split_once(':').expect("ox:oy");
+            let (dw, dh) = sz.split_once(':').expect("dw:dh");
+            // The display box sits dead centre on both axes — within the one
+            // pixel the even-rounding of the extent can cost.
+            assert!((2 * num(ox) + num(dw) - out_w).abs() <= 1, "{r}: {xy} / {sz}");
+            assert!((2 * num(oy) + num(dh) - out_h).abs() <= 1, "{r}: {xy} / {sz}");
+        }
+    }
+
+    #[test]
+    fn a_keyframed_offset_is_converted_to_output_px_as_well() {
+        // Any x/y/scale keyframe switches the overlay to the centred-expression
+        // form, which builds its own offset term out of the RAW keyframe values.
+        // Those are authored in canvas px exactly like the static transform, so
+        // they need the identical conversion — fixing only `placement` would
+        // leave every animated clip mis-placed.
+        let build_at = |resolution: &str| {
+            let m = media("m1", r"C:\v.mp4", 854, 482, false);
+            let mut c = clip("c1", "m1", 0.0, 0.0, 4.0);
+            c.keyframes = Some(ClipKeyframes {
+                x: Some(vec![
+                    Keyframe { t: 0.0, v: -200.0 },
+                    Keyframe { t: 4.0, v: 200.0 },
+                ]),
+                y: Some(vec![Keyframe { t: 0.0, v: 50.0 }]),
+                scale: None,
+                opacity: None,
+            });
+            let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+            build(
+                &spec(vec![m], tl, preset_at("mp4", "h264", resolution), r"C:\o.mp4"),
+                &enc(),
+            )
+            .unwrap()
+            .filter_complex
+        };
+
+        // Original: the authored values, unconverted.
+        let fc = build_at("original");
+        assert!(
+            fc.contains("overlay='(main_w-overlay_w)/2+-200.0000+(400.0000)*clip((t-0.0000)/4.0000,0,1)':'(main_h-overlay_h)/2+50.0000'"),
+            "{fc}"
+        );
+        // 2160p doubles the canvas, so every breakpoint doubles with it. The
+        // ramp is scaled through its VALUES, not by wrapping the expression in
+        // a multiply, so the per-frame cost is unchanged.
+        let fc = build_at("2160p");
+        assert!(
+            fc.contains("overlay='(main_w-overlay_w)/2+-400.0000+(800.0000)*clip((t-0.0000)/4.0000,0,1)':'(main_h-overlay_h)/2+100.0000'"),
+            "{fc}"
+        );
+    }
+
     #[test]
     fn audio_volume_gain_fade_delay_amix() {
         let m = media("m1", r"C:\v.mp4", 1920, 1080, true);
@@ -1452,6 +1665,133 @@ mod tests {
         assert!((f[0] - 2.0).abs() < 1e-9);
         assert!((f[1] - 1.5).abs() < 1e-9);
         assert!(atempo_factors(1.0).is_empty());
+    }
+
+    #[test]
+    fn atempo_terminates_on_a_speed_that_cannot_be_factored() {
+        // The halve/double loop only converges for a finite POSITIVE speed:
+        // 0.0/0.5 is still 0.0, a negative diverges to -inf, inf/2.0 is still
+        // inf. Each pass pushed another factor, so this used to grow a Vec
+        // until the allocator failed and `panic = "abort"` took the app down
+        // mid-export. `speed` is unvalidated in the schema and `.trt` files are
+        // hand-editable, so these are reachable, not hypothetical.
+        for bad in [0.0, -0.0, -1.0, -0.5, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let f = atempo_factors(bad);
+            assert!(f.is_empty(), "speed {bad} produced {} stage(s)", f.len());
+        }
+
+        // Everything finite and positive keeps its old decomposition, including
+        // the extremes: the guard must not have narrowed the working range.
+        assert_eq!(atempo_factors(0.25).len(), 2);
+        assert_eq!(atempo_factors(4.0).len(), 2);
+        assert!(atempo_factors(4.0).iter().all(|&x| (x - 2.0).abs() < 1e-9));
+        // Out-of-editor-range speeds are honoured rather than clamped, so the
+        // audio keeps step with the video chain's `setpts=(PTS-STARTPTS)/speed`.
+        let f = atempo_factors(8.0);
+        assert_eq!(f.len(), 3);
+        assert!(f.iter().all(|&x| (x - 2.0).abs() < 1e-9));
+        // f64::MAX = (2 - 2^-52) * 2^1023, so 1023 halvings land just under 2
+        // and the loop ends. Absurd, but bounded — it terminated before the
+        // guard and still does.
+        assert_eq!(atempo_factors(f64::MAX).len(), 1024);
+        assert_eq!(atempo_factors(f64::MIN_POSITIVE).len(), 1022);
+
+        // The product must still reconstruct the requested speed.
+        for s in [0.25, 0.4, 1.5, 3.0, 4.0, 8.0] {
+            let p: f64 = atempo_factors(s).iter().product();
+            assert!((p - s).abs() < 1e-9, "speed {s} decomposed to {p}");
+        }
+    }
+
+    #[test]
+    fn a_speed_zero_project_still_builds_instead_of_eating_the_heap() {
+        // `project::store`'s own test loads a `.trt` carrying `"speed": 0.0`, so
+        // this reaches the builder. It cannot produce a sane export — the clip
+        // has no finite duration — but it must come back rather than allocate
+        // until the process dies with the user's unsaved work.
+        let m = media("m1", r"C:\v.mp4", 854, 482, true);
+        let mut c = clip("c1", "m1", 0.0, 0.0, 2.0);
+        c.speed = 0.0;
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+        let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        assert!(!b.filter_complex.contains("atempo"), "{}", b.filter_complex);
+    }
+
+    /// A still image: the only input kind that gets `-loop 1 -t <len>` instead
+    /// of an `-ss`/`-to` source window. Dims differ from every canvas used here.
+    fn image_media(id: &str, path: &str) -> MediaRef {
+        let mut m = media(id, path, 854, 482, false);
+        m.kind = "image".into();
+        m
+    }
+
+    #[test]
+    fn an_image_at_speed_still_covers_its_whole_timeline_slot() {
+        // `-t` feeds the input SOURCE seconds; `emit_clip_chain` then divides
+        // PTS by speed. Handing it `clip.duration()` — already the timeline
+        // length — divided the length a second time: a 2 s slot at speed 2
+        // exported 1 s of frames, and because `adelay` on the audio stayed
+        // right, everything after it drifted by the difference.
+        let m = image_media("m1", r"C:\still.png");
+        let mut c = clip("c1", "m1", 0.0, 0.0, 4.0);
+        c.speed = 2.0; // 4 source seconds at 2x → a 2 s slot on the timeline
+        assert!((c.duration() - 2.0).abs() < 1e-9);
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+        let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+
+        let a = argstr(&b);
+        assert!(a.windows(2).any(|w| w[0] == "-loop" && w[1] == "1"), "{a:?}");
+        // 4 source seconds in, halved by the setpts → a 2 s segment out.
+        assert!(a.windows(2).any(|w| w[0] == "-t" && w[1] == "4.000000"), "{a:?}");
+        assert!(b.filter_complex.contains("setpts=(PTS-STARTPTS)/2.000000"), "{}", b.filter_complex);
+        // …and the black base it is overlaid onto is the TIMELINE length, so a
+        // short input would leave the tail of the segment empty.
+        assert!(b.filter_complex.contains("d=2.000000"), "{}", b.filter_complex);
+        assert!((b.duration_sec - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_image_a_generator_and_a_video_agree_on_length_at_the_same_speed() {
+        // The generator path always got this right (it synthesizes
+        // `clip_dur * speed` and then divides), and the video path gets it from
+        // its -ss/-to window. The image path was the odd one out; pin all three
+        // against each other so it cannot drift off again alone.
+        let build_one = |m: MediaRef, speed: f64| {
+            let mut c = clip("c1", "m1", 0.0, 0.0, 4.0);
+            c.speed = speed;
+            let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+            build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap()
+        };
+
+        for speed in [0.5, 1.0, 2.0] {
+            let slot = 4.0 / speed;
+            let img = build_one(image_media("m1", r"C:\still.png"), speed);
+            let vid = build_one(media("m1", r"C:\v.mp4", 854, 482, false), speed);
+            let gen = build_one(
+                gen_media("m1", Generator::Solid { color: "#00ff00".into() }, 854, 482),
+                speed,
+            );
+            for (what, b) in [("image", &img), ("video", &vid), ("generator", &gen)] {
+                assert!(
+                    (b.duration_sec - slot).abs() < 1e-9,
+                    "{what} at speed {speed}: {} != {slot}", b.duration_sec
+                );
+                assert!(
+                    b.filter_complex.contains(&format!("d={slot:.6}")),
+                    "{what} at speed {speed} must cover a {slot:.6}s slot: {}",
+                    b.filter_complex
+                );
+            }
+            // The image input and the generator source are handed the SAME
+            // number of source seconds — the quantity the setpts then divides.
+            let t = argstr(&img);
+            let i = t.iter().position(|s| s == "-t").expect("-t on the image input");
+            assert_eq!(t[i + 1], "4.000000", "image source span at speed {speed}");
+            assert!(
+                gen.filter_complex.contains("d=4.000000") || (speed - 1.0).abs() < 1e-9,
+                "generator source span at speed {speed}: {}", gen.filter_complex
+            );
+        }
     }
 
     #[test]
@@ -2154,8 +2494,13 @@ mod tests {
     struct ParityIn {
         media_w: Option<u32>,
         media_h: Option<u32>,
+        /// PROJECT canvas — the px space x/y and the crop rect are authored in.
         canvas_w: u32,
         canvas_h: u32,
+        /// EXPORT resolution — the px space ffmpeg is spoken to in. Equal to
+        /// the canvas only for the "Original" preset.
+        export_w: u32,
+        export_h: u32,
         rotate: u32,
         flip_h: bool,
         flip_v: bool,
@@ -2177,6 +2522,10 @@ mod tests {
         /// the preview's exact, un-rounded extent and media shift, project px
         dw_exact: f64,
         dh_exact: f64,
+        /// the same extent with the fit measured against the EXPORT box — what
+        /// the export actually scales to. Equals dw_exact/dh_exact at Original.
+        dw_exact_out: f64,
+        dh_exact_out: f64,
         off_x_exact: f64,
         off_y_exact: f64,
         /// fit * userScale, project px per source px
@@ -2243,7 +2592,10 @@ mod tests {
                 opacity: 1.0,
             });
 
-            let p = placement(&c, &m, i.canvas_w, i.canvas_h);
+            let p = placement(&c, &m, (i.canvas_w, i.canvas_h), (i.export_w, i.export_h));
+            // canvas px -> output px, the conversion the offsets need.
+            let sx = i.export_w as f64 / i.canvas_w as f64;
+            let sy = i.export_h as f64 / i.canvas_h as f64;
 
             // --- the four values ffmpeg actually receives -------------------
             assert_eq!(p.dw, o.dw, "{n}: scale width");
@@ -2254,28 +2606,36 @@ mod tests {
             // --- the discretisation, re-derived from the PREVIEW's floats ---
             // This is the actual cross-implementation check: this crate's own
             // `round_even` applied to the number the preview produced must land
-            // on the number `placement` emitted.
-            assert_eq!(round_even(o.dw_exact), p.dw, "{n}: round_even(preview dw)");
-            assert_eq!(round_even(o.dh_exact), p.dh, "{n}: round_even(preview dh)");
+            // on the number `placement` emitted. The extent comes from the
+            // preview math evaluated in the EXPORT box, because that is what
+            // `placement` fits against; the OFFSETS come from the preview's own
+            // box and are converted, because that is the space they are
+            // authored in.
+            assert_eq!(round_even(o.dw_exact_out), p.dw, "{n}: round_even(preview dw)");
+            assert_eq!(round_even(o.dh_exact_out), p.dh, "{n}: round_even(preview dh)");
 
             // --- how far the integer export may sit from the preview --------
             // The preview positions its crop box continuously; the export must
             // land on integers with even extents. Pin the bound rather than
             // trusting it: round_even moves the extent by < 1.5 px, halved by
             // the centring (< 0.75), plus the final round (<= 0.5) → < 1.25.
-            let preview_left = (i.canvas_w as f64 - o.dw_exact) / 2.0 + i.x;
-            let preview_top = (i.canvas_h as f64 - o.dh_exact) / 2.0 + i.y;
+            let preview_left = (i.export_w as f64 - o.dw_exact_out) / 2.0 + i.x * sx;
+            let preview_top = (i.export_h as f64 - o.dh_exact_out) / 2.0 + i.y * sy;
             assert!((p.ox as f64 - preview_left).abs() < 1.25, "{n}: ox drift");
             assert!((p.oy as f64 - preview_top).abs() < 1.25, "{n}: oy drift");
-            assert!((p.dw as f64 - o.dw_exact).abs() < 1.5, "{n}: dw drift");
-            assert!((p.dh as f64 - o.dh_exact).abs() < 1.5, "{n}: dh drift");
+            assert!((p.dw as f64 - o.dw_exact_out).abs() < 1.5, "{n}: dw drift");
+            assert!((p.dh as f64 - o.dh_exact_out).abs() < 1.5, "{n}: dh drift");
 
             // --- pass-through fields ---------------------------------------
             assert_eq!(p.rotate, i.rotate, "{n}: rotate");
             assert_eq!(p.flip_h, i.flip_h, "{n}: flipH");
             assert_eq!(p.flip_v, i.flip_v, "{n}: flipV");
-            assert_eq!(p.x, i.x, "{n}: x");
-            assert_eq!(p.y, i.y, "{n}: y");
+            // x/y leave `placement` in OUTPUT px (the keyframed overlay path
+            // adds them to `(main_w-overlay_w)/2`, which is output px too).
+            assert_eq!(p.x, i.x * sx, "{n}: x");
+            assert_eq!(p.y, i.y * sy, "{n}: y");
+            assert_eq!(p.sx, sx, "{n}: canvas->output x factor");
+            assert_eq!(p.sy, sy, "{n}: canvas->output y factor");
             assert_eq!(p.opacity, 1.0, "{n}: opacity");
 
             // --- the sizes issue #1 got wrong -------------------------------
@@ -2300,21 +2660,82 @@ mod tests {
             // evaluates crop_w * (fit * scale): IEEE multiplication is not
             // associative, so the two differ by a few ULP and nothing more.
             assert!(
-                rel_close(p.fit_w * i.scale, o.dw_exact, 1e-9),
-                "{n}: fit_w*scale {} vs preview {}", p.fit_w * i.scale, o.dw_exact
+                rel_close(p.fit_w * i.scale, o.dw_exact_out, 1e-9),
+                "{n}: fit_w*scale {} vs preview {}", p.fit_w * i.scale, o.dw_exact_out
             );
             assert!(
-                rel_close(p.fit_h * i.scale, o.dh_exact, 1e-9),
-                "{n}: fit_h*scale {} vs preview {}", p.fit_h * i.scale, o.dh_exact
+                rel_close(p.fit_h * i.scale, o.dh_exact_out, 1e-9),
+                "{n}: fit_h*scale {} vs preview {}", p.fit_h * i.scale, o.dh_exact_out
             );
 
             // --- the table's own derived columns stay self-consistent -------
+            // k, dwExact and the offsets are all CANVAS px, so they check
+            // against each other and never against the output columns.
             assert!(rel_close(o.post_crop_w as f64 * o.k, o.dw_exact, 1e-9), "{n}: k vs dwExact");
             assert!(rel_close(o.post_crop_h as f64 * o.k, o.dh_exact, 1e-9), "{n}: k vs dhExact");
             let crop_x = o.crop_filter.map_or(0.0, |a| a[2] as f64);
             let crop_y = o.crop_filter.map_or(0.0, |a| a[3] as f64);
             assert!(rel_close(-o.off_x_exact, crop_x * o.k, 1e-9), "{n}: offX vs crop x");
             assert!(rel_close(-o.off_y_exact, crop_y * o.k, 1e-9), "{n}: offY vs crop y");
+        }
+    }
+
+    /// The table must keep rows that can SEE the canvas-vs-output distinction.
+    /// A row exported at "Original" has one box wearing two hats and cannot
+    /// tell the spaces apart — every row was such a row while the offsets were
+    /// being added in the wrong units. Mirrors the vitest guard of the same
+    /// name; both suites have to agree the fixture is still load-bearing.
+    #[test]
+    fn the_parity_table_keeps_rows_the_export_resolution_actually_moves() {
+        let table: ParityTable =
+            serde_json::from_str(PARITY_TABLE).expect("parity table must parse");
+
+        // What a builder that added canvas-px x/y onto an output-px centring
+        // term emits — the shipped bug, kept here so rows must diverge from it.
+        let unscaled = |i: &ParityIn, o: &ParityOut| -> (i64, i64) {
+            (
+                ((i.export_w as f64 - o.dw as f64) / 2.0 + i.x).round() as i64,
+                ((i.export_h as f64 - o.dh as f64) / 2.0 + i.y).round() as i64,
+            )
+        };
+        let off_original = |c: &&ParityCase| {
+            c.input.export_w != c.input.canvas_w || c.input.export_h != c.input.canvas_h
+        };
+
+        let rows: Vec<&ParityCase> = table.cases.iter().filter(off_original).collect();
+        assert!(rows.len() >= 4, "only {} off-Original rows", rows.len());
+        assert!(
+            rows.iter().any(|c| c.input.export_w > c.input.canvas_w)
+                && rows.iter().any(|c| c.input.export_w < c.input.canvas_w),
+            "both an upscale and a downscale must appear"
+        );
+        // A non-aspect-preserving export: the only shape that catches one ratio
+        // used for both axes, or the two swapped.
+        assert!(
+            rows.iter().any(|c| {
+                let i = &c.input;
+                i.export_w as f64 / i.canvas_w as f64 != i.export_h as f64 / i.canvas_h as f64
+            }),
+            "no row scales the two axes differently"
+        );
+
+        let moved = table
+            .cases
+            .iter()
+            .filter(|c| {
+                let (bx, by) = unscaled(&c.input, &c.out);
+                (bx - c.out.ox).abs() >= 2 && (by - c.out.oy).abs() >= 2
+            })
+            .count();
+        assert!(moved >= 2, "only {moved} rows move on both axes");
+
+        // At Original the two formulas MUST agree: applying a ratio there would
+        // mean converting between a space and itself.
+        for c in table.cases.iter().filter(|c| !off_original(c)) {
+            let (bx, by) = unscaled(&c.input, &c.out);
+            assert_eq!((bx, by), (c.out.ox, c.out.oy), "{}: Original must not shift", c.name);
+            assert_eq!(c.out.dw_exact_out, c.out.dw_exact, "{}: extent at Original", c.name);
+            assert_eq!(c.out.dh_exact_out, c.out.dh_exact, "{}: extent at Original", c.name);
         }
     }
 

@@ -16,7 +16,7 @@ import { MEDIA_FILE_EXTENSIONS } from "../core/types";
 import type { RecentItem } from "../core/types";
 import { trapTab } from "../ui/focus";
 import { icon } from "../ui/icons";
-import { showMenu } from "../ui/menu";
+import { closeMenu, showMenu } from "../ui/menu";
 import { toast } from "../ui/toast";
 
 /* ---------------- sorting ---------------- */
@@ -339,6 +339,12 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   }
 
   async function refresh(): Promise<void> {
+    // Every caller is an async continuation of something the user started —
+    // delete, duplicate, rename, remove-from-list, the not-found path in
+    // openPath — so any of them can land after the screen is gone. One guard
+    // here covers all of them instead of one per call site: no recents read for
+    // a screen nobody is looking at, and no paint into detached DOM.
+    if (disposed) return;
     try {
       const index = await ipc.listRecents();
       recents = index.items;
@@ -357,6 +363,31 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
 
   /* ---------------- modal helper ---------------- */
 
+  /* Closers for everything this screen has parked on document.body.
+   *
+   * A modal backdrop is appended to document.body, NOT to the screen's own
+   * subtree — it has to be, to sit above everything. But the router tears a
+   * screen down by calling dispose() and then clearing #app, and neither of
+   * those touches document.body. An open dialog therefore outlives the screen
+   * that opened it: still visible, still holding the focus trap, still wired to
+   * this screen's callbacks. On the "Delete 'X'?" dialog that means a Delete
+   * button floating over the editor that really does delete the file.
+   *
+   * The way this happens without anyone doing anything odd: open the delete
+   * confirm on home, then let an OS "open with" arrive (double-click a .trt or
+   * a media file in Explorer, or a second launch forwarding a path).
+   * routeOpenPath navigates straight to the editor without closing anything.
+   *
+   * So: everything appended to document.body registers its closer here, and
+   * teardown closes the lot. */
+  const openOverlays = new Set<() => void>();
+
+  function closeOverlays(): void {
+    // Each close() removes itself from the set, so iterate a copy.
+    for (const close of [...openOverlays]) close();
+    openOverlays.clear();
+  }
+
   interface ModalOpts {
     title: string;
     bodyHtml: string;
@@ -368,6 +399,9 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   }
 
   function openModal(opts: ModalOpts): void {
+    // Nothing new goes onto document.body once the screen is gone: teardown has
+    // already run, so there would be no owner left to close it.
+    if (disposed) return;
     const backdrop = document.createElement("div");
     backdrop.className = "modal-backdrop";
     backdrop.innerHTML = `
@@ -394,13 +428,18 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
 
     const releaseTrap = trapTab(backdrop);
     let closed = false;
+    // Every exit — Cancel, confirm, Escape, a click on the backdrop, and
+    // teardown — funnels through here, which is what keeps the focus trap from
+    // being released on some paths and not others.
     const close = (): void => {
       if (closed) return;
       closed = true;
+      openOverlays.delete(close);
       releaseTrap();
       backdrop.remove();
       document.removeEventListener("keydown", onKey, true);
     };
+    openOverlays.add(close);
     const confirm = async (): Promise<void> => {
       const value = input ? input.value.trim() : "";
       if (input && value.length === 0) {
@@ -457,6 +496,13 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
         toast.info("Created an empty project.");
       }
       await ipc.saveProject(projectPath, project);
+      // Probing and importing take real time, and an OS "open with" can land a
+      // whole navigation inside that window. A screen that has been torn down
+      // must not steer the app afterwards: whatever replaced it is the newer
+      // intent, and jumping to this project instead would silently override it.
+      // Nothing is lost either way — save_project has already written the file
+      // and upserted it into recents, so it is one click away on the next visit.
+      if (disposed) return;
       navigate({ view: "editor", projectPath });
     } catch (e) {
       toast.error(describeError(e));
@@ -473,6 +519,9 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
         await refresh();
         return;
       }
+      // The existence check is a disk round-trip; see createNew for why a
+      // disposed screen must not navigate once it resolves.
+      if (disposed) return;
       navigate({ view: "editor", projectPath: path });
     } finally {
       busy = false;
@@ -495,6 +544,11 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       input: `${item.name} copy`,
       confirmLabel: "Duplicate",
       onConfirm: async (value) => {
+        // Same guard the bulk delete carries: a confirm must not act on behalf
+        // of a screen that no longer exists. Teardown closes the dialog now, so
+        // this should be unreachable — but it is the second lock on the door
+        // that made the first one's absence destructive.
+        if (disposed) return;
         try {
           await ipc.duplicateProject(item.path, value, crypto.randomUUID());
           await refresh();
@@ -513,6 +567,10 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       confirmLabel: "Delete",
       danger: true,
       onConfirm: async () => {
+        // Never delete a file for a screen the user has already left — see the
+        // note on promptDuplicate. This is the one where the missing guard cost
+        // real data.
+        if (disposed) return;
         try {
           await ipc.deleteProject(item.path);
           await refresh();
@@ -720,6 +778,12 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       unlistenDrop?.();
       unlistenDrop = null;
       document.removeEventListener("keydown", onEscape, true);
+      // The context menu and any open dialog live on document.body, outside the
+      // subtree the router clears — and both hold callbacks (promptDelete,
+      // startRename, the confirm handler) that reach back into this screen.
+      // Closing them is teardown's job; nothing else will ever do it.
+      closeMenu();
+      closeOverlays();
     },
   };
 }

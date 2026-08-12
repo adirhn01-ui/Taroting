@@ -10,7 +10,68 @@ import { Scheduler } from "./scheduler";
 
 const BOUNDARY_EPS = 1 / 240;
 
+/**
+ * How far the master video may sit from the engine's own extrapolated clock and
+ * still count as "nothing has happened here except time passing" — the test
+ * `catchUpTime` uses to tell a stale refresh from a real edit.
+ *
+ * The floor: the divergence a healthy refresh has to absorb is exactly the age
+ * of the last rAF tick, ~17 ms at 60 Hz and a multiple of that through a hitch,
+ * plus whatever jitter the element's clock carries. The ceiling: anything the
+ * bound absorbs is a mapping change that moves the PLAYHEAD by that much
+ * instead of re-seeking the element, and 50 ms is well under what a user could
+ * spot in a preview while still covering three dropped frames.
+ */
+const REFRESH_SLEW_SEC = 0.05;
+
 export type TickListener = (time: number, playing: boolean) => void;
+
+/**
+ * Should `refresh()` adopt the master video's position as the playhead instead
+ * of re-activating at the last tick's (stale) time? Returns the time to adopt,
+ * or null to keep the current one. Pure, so the whole decision is testable.
+ *
+ * WHY THIS EXISTS. `refresh()` re-runs `scheduler.activate(t, playing)`, and
+ * activate's master branch re-seeks the element whenever `|el.currentTime -
+ * srcT| > 0.01`. During playback `t` is a snapshot from the last rAF tick, so
+ * a refresh landing 12 ms later is ALREADY over that bar: it backward-seeks the
+ * very element that is acting as the master clock — a dropped frame plus an
+ * audio glitch. That is not a rare event either. editor.ts subscribes refresh()
+ * to `media.status` (a running proxy/remux job republishes that object ~10x/s,
+ * so 3-4 seeks a second while media prepares) and to the stage's
+ * ResizeObserver (every frame of a window drag). Neither has anything to say
+ * about where the playhead is.
+ *
+ * The guards are what keep a LEGITIMATE re-seek working, and each rules out one
+ * way the element's position can differ from the clock for a reason other than
+ * elapsed time:
+ *
+ *  - `masterTime === null`: no master video, so activate() seeks nothing that
+ *    a stale `t` could hurt (stills and gaps do not seek).
+ *  - `<= lastTick`: never rewind the playhead. In steady state the element only
+ *    moves forward from the value the last tick already read off it.
+ *  - past the boundary: crossing a cut is the ticker's job (advanceBoundary +
+ *    the A/B slot swap). Adopting a time past the segment end would make
+ *    activate() load the NEXT clip's URL over the still-showing slot and throw
+ *    away the preloaded buffer.
+ *  - beyond REFRESH_SLEW_SEC of the extrapolated clock: the clip↔source mapping
+ *    changed under the playhead (a clip moved, trimmed or re-sped — which is
+ *    exactly what refresh() is FOR), or the element stalled. Keep the old `t`
+ *    and let activate() hard-seek the element back onto it, precisely as before
+ *    this guard existed.
+ */
+export function catchUpTime(
+  masterTime: number | null,
+  lastTick: number,
+  extrapolated: number,
+  boundary: number,
+): number | null {
+  if (masterTime === null) return null;
+  if (masterTime <= lastTick) return null;
+  if (masterTime >= boundary - BOUNDARY_EPS) return null;
+  if (Math.abs(masterTime - extrapolated) > REFRESH_SLEW_SEC) return null;
+  return masterTime;
+}
 
 export class PlaybackEngine {
   loop = false;
@@ -139,6 +200,24 @@ export class PlaybackEngine {
   /** Re-resolve after project edits (clips moved/trimmed under the playhead). */
   refresh(): void {
     this.steppedFrame = null;
+    // Catch the playhead up to the running transport FIRST, so the activate()
+    // below computes a source time the master element already has and nothing
+    // seeks. Paused, `t` is exactly where the user put it and must not move.
+    // See catchUpTime for why each guard is there.
+    if (this.playing_) {
+      const adopt = catchUpTime(
+        this.scheduler.masterClockTime(),
+        this.t,
+        this.virtualNow(),
+        this.boundary,
+      );
+      if (adopt !== null) {
+        this.t = adopt;
+        // re-anchor exactly as the ticker does on a master-clock reading, so
+        // the virtual clock stays a seamless continuation at the next handoff
+        this.anchor(adopt);
+      }
+    }
     this.boundary = this.scheduler.activate(this.t, this.playing_).boundary;
     this.scheduler.animate(this.t);
     this.emit();
@@ -190,7 +269,8 @@ export class PlaybackEngine {
           this.t = 0;
           this.anchor(0);
           this.boundary = this.scheduler.activate(0, true).boundary;
-          this.scheduler.animate(0);
+          // no animate(0) here: this branch falls through to the shared
+          // animate(this.t) below, with this.t already 0.
         } else {
           this.t = dur;
           this.playing_ = false;

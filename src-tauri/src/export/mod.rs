@@ -141,6 +141,31 @@ fn finalize_args(built: &BuiltExport, out_path: &str) -> Result<(Vec<OsString>, 
     }
 }
 
+/// Publish a finished encode: move `<out>.part` onto `<out>`.
+///
+/// Renames STRAIGHT onto the destination — it never deletes what is already
+/// there first. `rename` replaces atomically on Windows, so a failure leaves the
+/// user's previous export at that path completely untouched; the old
+/// remove-then-rename destroyed that previous export whenever the rename then
+/// failed, which needs nothing more exotic than a media player, an AV scanner or
+/// a sync client holding the file (Windows opens without `FILE_SHARE_DELETE`,
+/// so the rename fails while the delete had already gone through).
+///
+/// On failure the `.part` file is deliberately left on disk and NAMED in the
+/// error. The encode is complete at that point: it is the user's finished video,
+/// and making them re-run a long export to get it back would be absurd.
+fn publish_export(part: &std::path::Path, final_path: &std::path::Path) -> std::result::Result<(), String> {
+    std::fs::rename(part, final_path).map_err(|e| {
+        format!(
+            "the export finished but could not be saved to {}: {e}. \
+             The finished video is at {} — close anything using the destination \
+             file, then rename that file to remove the .part suffix.",
+            final_path.display(),
+            part.display()
+        )
+    })
+}
+
 /* ------------------------------------------------------------------ */
 /* Failure detail + redaction                                          */
 /* ------------------------------------------------------------------ */
@@ -440,12 +465,15 @@ pub fn start_export(
 
             match result {
                 Ok(()) => {
-                    // publish: remove any existing output, then rename .part → out
+                    // The encode is COMPLETE, so the .part file is no longer a
+                    // partial: it is the finished video. Drop the job's cleanup
+                    // target before anything can fail, because fail_job() runs
+                    // cleanup_output() and would otherwise delete the very file
+                    // the user is waiting for.
+                    handle.clear_output();
+
                     let final_pb = std::path::PathBuf::from(&out_final);
-                    if final_pb.exists() {
-                        let _ = std::fs::remove_file(&final_pb);
-                    }
-                    match std::fs::rename(&part_path, &final_pb) {
+                    match publish_export(&part_path, &final_pb) {
                         Ok(()) => {
                             if let Some(state) = app_clone.try_state::<LastExportFailure>() {
                                 state.clear();
@@ -457,8 +485,7 @@ pub fn start_export(
                                 serde_json::json!({ "path": out_final }),
                             );
                         }
-                        Err(e) => {
-                            let message = format!("failed to finalize output: {e}");
+                        Err(message) => {
                             remember(&message, &[]);
                             jobs::fail_job(
                                 &app_clone,
@@ -703,6 +730,83 @@ mod unit {
         assert!(v["argv"].is_array());
         assert!(v["logTail"].is_array());
         assert!(v["filterComplex"].is_string());
+    }
+
+    /* -------- (2b) publishing a finished encode -------- */
+
+    fn publish_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "taroting-publish-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn publish_replaces_an_existing_export_at_the_same_path() {
+        let dir = publish_dir("ok");
+        let part = dir.join("Reel.mp4.part");
+        let out = dir.join("Reel.mp4");
+        std::fs::write(&part, b"new encode").unwrap();
+        std::fs::write(&out, b"previous export").unwrap();
+
+        publish_export(&part, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"new encode");
+        assert!(!part.exists(), "the .part must be consumed by a successful publish");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The lost-work bug, reproduced through the file the publish actually
+    /// moves. An AV scanner or search indexer grabbing the file ffmpeg has just
+    /// closed is the everyday Windows way for a rename to fail, and it is what
+    /// made the old delete-then-rename destructive: the `remove_file` succeeded
+    /// (the destination was never the locked file), the rename then failed, and
+    /// the user's previous export was simply gone.
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_publish_destroys_neither_the_new_encode_nor_the_old_export() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = publish_dir("locked");
+        let part = dir.join("Holiday Reel.mp4.part");
+        let out = dir.join("Holiday Reel.mp4");
+        std::fs::write(&part, b"the finished encode").unwrap();
+        std::fs::write(&out, b"last week's export").unwrap();
+
+        // share_mode 0 = FILE_SHARE_NONE: nothing may move this file while the
+        // handle is open, so the rename fails with "used by another process".
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&part)
+            .unwrap();
+
+        let message = publish_export(&part, &out).expect_err("rename must fail while locked");
+
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"last week's export",
+            "the previous export must not be destroyed by a failed publish"
+        );
+        assert!(
+            part.exists(),
+            "the completed encode must survive a publish failure"
+        );
+        // The user has to be told WHERE the finished video is, or it may as
+        // well have been deleted.
+        assert!(
+            message.contains("Holiday Reel.mp4.part"),
+            "message must name the kept file: {message}"
+        );
+
+        drop(lock);
+        assert_eq!(std::fs::read(&part).unwrap(), b"the finished encode");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /* -------- (3) the managed state -------- */

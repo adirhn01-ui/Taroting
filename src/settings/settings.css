@@ -110,6 +110,29 @@
 .settings__segmented .btn:hover {
   background: var(--bg-hover);
 }
+/* The SELECTED option's fill, CUSTOM THEMES ONLY.
+
+   components.css declares this on `.btn--on`, but `.settings__segmented .btn`
+   above is a two-class selector and outranks that one-class rule, so at rest the
+   selected option gets no fill and is distinguished ONLY by its --accent-strong
+   ink. Under the shipped palettes that is fine — the accent is a saturated blue
+   against near-white text, so it reads as selected by hue.
+
+   It stops working the moment a custom accent is DULLER than the text: a grey
+   accent (#6e6e6e) with white text draws the live theme's label at 4.05:1 beside
+   unselected labels at 14.35:1, so the option you are on looks like the one you
+   cannot pick. The fill carries "selected" independently of how bright the
+   accent happens to be, which is exactly what an arbitrary accent needs.
+
+   Scoped to html[data-custom-theme] on purpose: Dark and Light are Taroting's
+   own look and are not to be changed, so they keep the ink-only treatment they
+   ship with today. (`src/editor/export/export.css` re-declares the unscoped rule
+   for its own segmented control — that one is not part of the shipped theme
+   surface in the same way.) */
+html[data-custom-theme] .settings__segmented .btn--on {
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+}
 .settings__segmented .btn--on:hover {
   background: var(--accent-dim);
 }

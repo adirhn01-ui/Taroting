@@ -121,6 +121,30 @@ const CACHE_KIND_ORDER = ["remux", "proxy", "waveform", "thumbs", "filmstrip"];
 
 type CacheStats = { totalBytes: number; byKind: Record<string, number> };
 
+/**
+ * Write a settings change, and SAY SO if the write fails.
+ *
+ * Every one of these used to be a bare `void updateSettings(...)`. That paints
+ * the new value immediately (the store and `applyTheme` are updated before the
+ * IPC is awaited), so a rejected write left the app looking exactly as though it
+ * had saved — until the next launch, when everything silently reverted. There
+ * was no toast, no console error, nothing: `void` on a rejecting promise is an
+ * unhandled rejection and nothing in this app listens for those.
+ *
+ * The optimistic paint is deliberate and stays — the alternative is a settings
+ * screen that lags every toggle by a disk round trip. What was missing is the
+ * failure being visible when the optimism turns out to be wrong.
+ */
+function persist(patch: Partial<Settings>): void {
+  void updateSettings(patch).catch((e: unknown) => {
+    toast.error("Couldn't save your settings.", {
+      detail: describeError(e),
+      op: "Settings",
+      title: "Save",
+    });
+  });
+}
+
 export function mountSettings(root: HTMLElement): { dispose(): void } {
   root.innerHTML = `
     <div class="settings">
@@ -157,6 +181,39 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   let pickerLoading = false;
   // Set by dispose(): in-flight async work must not rebuild a detached DOM.
   let disposed = false;
+  /* Closers for everything this screen has parked on document.body.
+   *
+   * A modal backdrop has to be appended to the body to sit above everything,
+   * but the router tears a screen down by calling dispose() and then clearing
+   * the app root — neither of which touches the body. An open dialog therefore
+   * outlives the screen that opened it: still visible, still holding the focus
+   * trap, still wired to this screen's handlers. Here that is the Uninstall
+   * confirm, left floating over the editor after an OS "open with" navigates
+   * away underneath it. Teardown closes whatever is registered. */
+  const openOverlays = new Set<() => void>();
+
+  function closeOverlays(): void {
+    // Each close() removes itself from the set, so iterate a copy.
+    for (const close of [...openOverlays]) close();
+    openOverlays.clear();
+  }
+
+  /** `openErrorDialog`, tied to this screen's lifetime.
+   *
+   *  The dialog parks its backdrop on `document.body`, which the router never
+   *  clears, so an unregistered one survives teardown holding the focus trap —
+   *  the same shape as the confirm modals above, and reachable from all three
+   *  of this screen's error panes. `openErrorDialog`'s `close` is idempotent, so
+   *  a dialog the user already dismissed simply no-ops at teardown; that is why
+   *  the closer can stay registered rather than needing a dismissal callback.
+   *
+   *  The `disposed` check matters for the async caller: `copySystemReport`
+   *  awaits an ffmpeg probe before falling back to a dialog, and that can land
+   *  after the screen is gone. */
+  function showError(opts: Parameters<typeof openErrorDialog>[0]): void {
+    if (disposed) return;
+    openOverlays.add(openErrorDialog(opts));
+  }
   /** Resolved once on mount; empty until then so the first paint isn't blocked. */
   let appVer = "";
 
@@ -486,7 +543,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     // Theme segmented buttons
     inner.querySelectorAll<HTMLButtonElement>("[data-theme-opt]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        void updateSettings({ theme: btn.dataset.themeOpt as Settings["theme"] });
+        persist({ theme: btn.dataset.themeOpt as Settings["theme"] });
       });
     });
 
@@ -503,7 +560,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       .querySelector<HTMLSelectElement>("#settings-autosave")
       ?.addEventListener("change", (e) => {
         const v = Number((e.target as HTMLSelectElement).value);
-        void updateSettings({ autosaveSeconds: v });
+        persist({ autosaveSeconds: v });
       });
 
     // Export folder
@@ -512,28 +569,28 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       ?.addEventListener("click", () => void chooseExportDir());
     inner
       .querySelector<HTMLButtonElement>("#settings-clear-dir")
-      ?.addEventListener("click", () => void updateSettings({ defaultExportDir: null }));
+      ?.addEventListener("click", () => persist({ defaultExportDir: null }));
 
     // Performance switches
     inner
       .querySelector<HTMLInputElement>("#settings-hwaccel")
       ?.addEventListener("change", (e) => {
-        void updateSettings({ hardwareAccel: (e.target as HTMLInputElement).checked });
+        persist({ hardwareAccel: (e.target as HTMLInputElement).checked });
       });
     inner
       .querySelector<HTMLInputElement>("#settings-proxy")
       ?.addEventListener("change", (e) => {
-        void updateSettings({ proxyMedia: (e.target as HTMLInputElement).checked });
+        persist({ proxyMedia: (e.target as HTMLInputElement).checked });
       });
     inner
       .querySelector<HTMLInputElement>("#settings-snap-center")
       ?.addEventListener("change", (e) => {
-        void updateSettings({ snapCenterGuides: (e.target as HTMLInputElement).checked });
+        persist({ snapCenterGuides: (e.target as HTMLInputElement).checked });
       });
     inner
       .querySelector<HTMLInputElement>("#settings-temp-open")
       ?.addEventListener("change", (e) => {
-        void updateSettings({ tempOpenWith: (e.target as HTMLInputElement).checked });
+        persist({ tempOpenWith: (e.target as HTMLInputElement).checked });
       });
 
     // Cache limit
@@ -541,7 +598,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       .querySelector<HTMLSelectElement>("#settings-cache-limit")
       ?.addEventListener("change", (e) => {
         const v = Number((e.target as HTMLSelectElement).value);
-        void updateSettings({ cacheLimitMB: v });
+        persist({ cacheLimitMB: v });
       });
 
     // Clear cache (two-step confirm)
@@ -553,14 +610,14 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     inner
       .querySelector<HTMLButtonElement>("#settings-reset-shortcuts")
       ?.addEventListener("click", () => {
-        void updateSettings({ shortcuts: { ...DEFAULT_SHORTCUTS } });
+        persist({ shortcuts: { ...DEFAULT_SHORTCUTS } });
       });
 
     // Cache read failure → let the user actually read the reason
     inner
       .querySelector<HTMLButtonElement>("#settings-cache-error")
       ?.addEventListener("click", () => {
-        openErrorDialog({
+        showError({
           title: "Cache usage",
           message: "Couldn't read cache usage.",
           report: cacheStatsError ?? "",
@@ -572,7 +629,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       .querySelector<HTMLButtonElement>("#settings-view-errors")
       ?.addEventListener("click", () => {
         const list = recentErrors();
-        openErrorDialog({
+        showError({
           title: "Recent errors",
           message: `${list.length} error${list.length === 1 ? "" : "s"} this session. This list lives in memory only and is never written to disk.`,
           report: formatRecentErrors(list),
@@ -666,7 +723,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
           },
           onCommit: (value) => {
             paintColorButton(role, value);
-            void updateSettings({ customTheme: withRole(customTheme(), role, value) });
+            persist({ customTheme: withRole(customTheme(), role, value) });
           },
           onClose: () => {
             // Cleared on a microtask, deliberately: the closing commit has
@@ -700,9 +757,12 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
       const result = await open({ directory: true, multiple: false });
-      if (typeof result === "string") {
-        await updateSettings({ defaultExportDir: result });
-      }
+      // Through persist(), like every other write on this screen. It used to be
+      // a bare awaited updateSettings inside this try, which folded a failed
+      // SAVE into the catch below and reported it as "Couldn't pick a folder" —
+      // the folder had been picked fine; it was the write that was lost. The
+      // catch now covers only the dialog, which is all it ever understood.
+      if (typeof result === "string") persist({ defaultExportDir: result });
     } catch (e) {
       toast.error("Couldn't pick a folder.", {
         detail: describeError(e),
@@ -744,7 +804,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     // the click's transient activation — if the write is refused, hand the text
     // over in a pane the user can copy from directly.
     if (await copyText(report)) return;
-    openErrorDialog({
+    showError({
       title: "System report",
       message: "Select the text below and copy it.",
       report,
@@ -823,6 +883,9 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   /* ---------------- uninstall ---------------- */
 
   function confirmUninstall(): void {
+    // Nothing new goes onto document.body once the screen is gone: teardown has
+    // already run, so there would be no owner left to close it.
+    if (disposed) return;
     const backdrop = document.createElement("div");
     backdrop.className = "modal-backdrop";
     backdrop.innerHTML = `
@@ -840,11 +903,20 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     document.body.appendChild(backdrop);
 
     const releaseTrap = trapTab(backdrop);
+    let closed = false;
+    // Every exit — Cancel, Escape, a click on the backdrop, a failed uninstall,
+    // and teardown — funnels through here, which is what keeps the focus trap
+    // from being released on some paths and not others. Idempotent: the failure
+    // path can fire after teardown has already closed the dialog.
     const close = (): void => {
+      if (closed) return;
+      closed = true;
+      openOverlays.delete(close);
       document.removeEventListener("keydown", onKey, true);
       releaseTrap();
       backdrop.remove();
     };
+    openOverlays.add(close);
     function onKey(e: KeyboardEvent): void {
       if (e.key === "Escape") {
         e.preventDefault();
@@ -858,6 +930,11 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     });
     backdrop.querySelector("[data-cancel]")!.addEventListener("click", close);
     backdrop.querySelector("[data-confirm]")!.addEventListener("click", () => {
+      // The second lock, matching the delete confirms on home: a torn-down
+      // screen never acts. Teardown now closes this dialog, so a click here
+      // should be impossible afterwards — but the listener outlives the node,
+      // and this particular button uninstalls the application.
+      if (disposed) return;
       // On success the app process exits before this promise resolves; on
       // failure (e.g. a dev build with no registry entry) surface the error.
       void ipc.uninstallApp().catch((e: unknown) => {
@@ -894,7 +971,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       captureCleanup?.();
       captureCleanup = null;
       // updateSettings triggers a store change → subscribe re-renders.
-      void updateSettings({ shortcuts: { ...current, [action]: chord } });
+      persist({ shortcuts: { ...current, [action]: chord } });
     };
 
     window.addEventListener("keydown", onKey, true);
@@ -938,6 +1015,10 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       // never strand a previewed colour that was never persisted.
       picker?.close();
       picker = null;
+      // The Uninstall confirm lives on document.body, outside the subtree the
+      // router clears, and its buttons are wired to this screen. Closing it is
+      // teardown's job; nothing else will ever do it.
+      closeOverlays();
     },
   };
 }

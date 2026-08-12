@@ -17,6 +17,35 @@ pub struct ExportSpec {
     pub out_path: String,
 }
 
+/// The input to `estimate_export` — everything the size estimate reads, and
+/// nothing else.
+///
+/// This used to be a whole `ExportSpec`: the entire media list plus every clip
+/// on every track, for a command that touches four scalars and the preset. The
+/// dialog re-estimates on a 300 ms debounce after every control change, so a
+/// 1600-clip project was serializing 783 KB of JSON on the UI thread (1.5 ms of
+/// `JSON.stringify`) and parsing all of it here, to compute a number that
+/// depends on none of it. The payload is now a fixed 213 bytes whatever the
+/// project holds, so this command's parse is constant too.
+///
+/// `durationSec` is the timeline duration (latest clip end across all tracks)
+/// and `fps` is the timeline's frame rate as a plain number — both derived on
+/// the frontend by the same arithmetic `Timeline::duration()` and
+/// `Rational` do here, so the answer is byte-identical either way. The
+/// `#[cfg(test)]` adapter in `estimate.rs` keeps the full-spec path exercised
+/// so that equivalence stays proven.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EstimateInput {
+    pub duration_sec: f64,
+    /// Project canvas width/height (the `output_dims` inputs).
+    pub width: u32,
+    pub height: u32,
+    /// Timeline frame rate, already reduced to `num / den`.
+    pub fps: f64,
+    pub preset: ExportPreset,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportPreset {
@@ -134,10 +163,12 @@ impl ExportPreset {
         }
     }
 
-    /// Numeric fps used by the size estimator.
-    pub fn fps_value(&self, timeline: &Timeline) -> f64 {
+    /// Numeric output fps used by the size estimator, given the timeline's own
+    /// frame rate as a number. Takes the scalar rather than a `&Timeline` so the
+    /// estimator can answer from `EstimateInput` without a project attached.
+    pub fn fps_value(&self, timeline_fps: f64) -> f64 {
         match &self.fps {
-            FpsPreset::Original(_) => timeline.fps.num as f64 / timeline.fps.den.max(1) as f64,
+            FpsPreset::Original(_) => timeline_fps,
             FpsPreset::Custom(f) => *f,
         }
     }

@@ -143,11 +143,28 @@ export function showMenu(x: number, y: number, menuItems: MenuItem[]): void {
   if (!wasOpen) addListeners();
 }
 
+/**
+ * Close the menu and release everything it holds: the buttons, the
+ * document-level listeners, and `items` — whose `onSelect` closures capture the
+ * screen that opened them.
+ *
+ * This is also the teardown a screen must call from its own dispose(). The host
+ * div lives on document.body, which a route change never touches: clearing the
+ * app root leaves an open menu on screen, still listening, its items still
+ * pointing at callbacks on the screen the user just left. The next pointerdown
+ * anywhere dismisses it, so it is a nuisance rather than a hazard — but it is
+ * the same shape as an orphaned dialog and has the same one-line fix.
+ *
+ * Safe to call when nothing is open, and safe to call twice: removeEventListener
+ * on an unregistered handler is a no-op.
+ */
 export function closeMenu(): void {
-  if (!host) return;
-  host.style.display = "none";
-  host.textContent = "";
+  // Ahead of the host check so a call before the first showMenu() still clears
+  // state — the guard must never be the reason something stays referenced.
   items = [];
   activeIndex = -1;
   removeListeners();
+  if (!host) return;
+  host.style.display = "none";
+  host.textContent = "";
 }

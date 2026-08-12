@@ -162,6 +162,13 @@ export function mountInspector(
   function clearBuild(): void {
     for (const c of cleanup) c();
     cleanup = [];
+    // The controls that could have set `dragging` are about to be (or have just
+    // been) thrown away, so nothing can still be mid-gesture. This is not
+    // belt-and-braces: removing a FOCUSED element fires no blur/focusout, so a
+    // selection change while a slider had focus — selection.subscribe rebuilds
+    // unconditionally — used to strand the flag at true with no control left
+    // that could ever clear it.
+    dragging = false;
   }
 
   const playhead = (): number => ctx.engine.time;
@@ -277,6 +284,11 @@ export function mountInspector(
       dragging = false;
     };
     const onSlider = (): void => {
+      // begin() here, not only on focusin/pointerdown: a range input fires
+      // input+change on EVERY arrow key, so the second and later keyboard
+      // nudges arrive after commit() already cleared `before` — without this
+      // they edit the project through replace() and land no history entry.
+      begin();
       const v = clampRange(Number(input.value));
       num.value = fmtNum(v);
       readout.textContent = opts.format(v);
@@ -285,6 +297,7 @@ export function mountInspector(
     const onNum = (): void => {
       const raw = Number(num.value);
       if (!Number.isFinite(raw)) return;
+      begin(); // same reason as onSlider
       const v = clampRange(raw);
       input.value = String(v);
       readout.textContent = opts.format(v);
@@ -295,6 +308,12 @@ export function mountInspector(
     input.addEventListener("input", onSlider);
     input.addEventListener("change", commit);
     input.addEventListener("pointerup", commit);
+    // Focus can leave the slider without a change event — Tab on, Tab off, no
+    // value touched — and `dragging` gated every rebuild in the panel, so the
+    // stranded flag froze the inspector against undo/redo, trims, deletion and
+    // playhead scrubs until a plain click happened to heal it. `num` already
+    // had its blur; the range input had nothing.
+    input.addEventListener("focusout", commit);
     num.addEventListener("focusin", begin);
     num.addEventListener("input", onNum);
     num.addEventListener("change", commit);
@@ -305,6 +324,7 @@ export function mountInspector(
       input.removeEventListener("input", onSlider);
       input.removeEventListener("change", commit);
       input.removeEventListener("pointerup", commit);
+      input.removeEventListener("focusout", commit);
       num.removeEventListener("focusin", begin);
       num.removeEventListener("input", onNum);
       num.removeEventListener("change", commit);
@@ -342,6 +362,7 @@ export function mountInspector(
     const onInput = (): void => {
       const raw = Number(input.value);
       if (!Number.isFinite(raw)) return;
+      begin(); // re-capture the baseline if a commit already consumed it
       const v = opts.clamp(raw);
       applyLive(clipId, v, opts);
     };

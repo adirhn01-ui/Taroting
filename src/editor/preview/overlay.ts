@@ -681,6 +681,9 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
 
   function exitCrop(): void {
     if (mode !== "crop") return;
+    // A crop drag can still be in flight — Escape is delivered by keydown, not
+    // by pointerup (see cancelCropGesture for what that used to leave behind).
+    cancelCropGesture();
     mode = "idle";
     cropClipId = null;
     lastCropSig = "";
@@ -777,8 +780,48 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
      *  gesture's keySrcTime: every position upsert during the gesture edits ONE
      *  keyframe instead of scattering a new one per pointermove. */
     keySrcTime: number;
+    /** The pointer that owns the gesture. Kept so an exit that is NOT a
+     *  pointerup (Escape) can still release the capture the pointerdown took. */
+    pointerId: number;
   }
   let cropGesture: CropGesture | null = null;
+
+  /**
+   * End a crop drag that is not ending in a pointerup — today that is Escape,
+   * either pressed on the focused overlay or synthesized at `.stage-overlay` by
+   * theater.ts when it leaves crop mode on entry.
+   *
+   * REVERT, rather than commit. Escape mid-gesture means "cancel" everywhere
+   * else in the app, and it is the only reading that stays honest when the same
+   * key ALSO leaves crop mode: the user cannot aim Escape at one and not the
+   * other, so it has to mean the same thing either way. Reverting is also the
+   * only option that leaves history in a consistent state without inventing an
+   * entry — the drag's live edits went through session.replace(), which writes
+   * no history at all, so keeping them would park a change in the project (and
+   * in the next autosave) that Ctrl+Z cannot reach. replace() back to `before`
+   * is likewise history-free, so history comes out exactly as it was before the
+   * pointer went down.
+   *
+   * Clearing `cropGesture` is the other half, and the more damaging one when it
+   * is missed: a surviving gesture leaked into the NEXT crop session, where a
+   * bare pointermove (no button held) resumed the dead drag from its stale
+   * startClient — the crop jumped, then collapsed to the clamp — and the
+   * eventual pointerup committed against its stale baseline, undoing everything
+   * done in between.
+   */
+  function cancelCropGesture(): void {
+    const g = cropGesture;
+    if (!g) return;
+    cropGesture = null;
+    try { overlay.releasePointerCapture(g.pointerId); } catch { /* not captured */ }
+    // Revert only while the crop target is still there. renderCrop() also calls
+    // exitCrop() when the clip (or its media) has vanished from the project
+    // underneath crop mode; rolling the whole project back to `before` in that
+    // case would resurrect what was just deleted.
+    if (!cropClipId || !findClip(session.project, cropClipId)) return;
+    session.replace(g.before);
+    ctx.refresh();
+  }
 
   function cropContext(): {
     pose: PoseState; axis: Axis; srcW: number; srcH: number; k: number;
@@ -823,6 +866,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
         k: cc.k, axis: cc.axis, srcW: cc.srcW, srcH: cc.srcH,
         startScaleKfs: cc.startScaleKfs, startEffScale: cc.startEffScale,
         keySrcTime: cc.keySrcTime,
+        pointerId: e.pointerId,
       };
       capture(overlay, e.pointerId);
       e.preventDefault();
@@ -859,6 +903,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
         ghostCenterClient: { x: gcx, y: gcy },
         startScaleKfs: cc.startScaleKfs, startEffScale: cc.startEffScale,
         keySrcTime: cc.keySrcTime,
+        pointerId: e.pointerId,
       };
       capture(overlay, e.pointerId);
       e.preventDefault();
