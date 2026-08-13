@@ -173,14 +173,26 @@ html[data-custom-theme] .settings__segmented .btn--on {
      * an inline `style` attribute in the markup is refused outright by the
        packaged app's CSP (see the long note above colorRow in settings.ts).
    A swatch with no JS behind it is therefore an EMPTY BOX, which is exactly the
-   bug this replaced. The --border-strong outline is what keeps it findable when
-   the fill matches the card. */
+   bug this replaced.
+
+   WHY THE RING IS OUTSIDE THE BOX (measured in the packaged build, 2026-08-12).
+   This chip used to be 16x16 with a 1px --border-strong border. box-sizing is
+   border-box, so the ring painted INSIDE the face the user reads as "their
+   colour": with corner AA and fractional layout offsets, 28-31% of the chip's
+   pixels were ring, not pick, and the chip's spatial mean landed EXACTLY on
+   --bg-panel (#202020 pick -> mean #262626; #2a1420 -> mean #331827). At a
+   glance the swatch read as one more piece of card chrome, whatever the pick —
+   the owner's report. The fix: a bigger face, and the ring moved OUT of it via
+   box-shadow spread, so 100% of the box is the pick. The hairline itself is
+   --swatch-ring, a fixed translucent overlay keyed to the surface direction
+   (tokens.css), NOT a palette shade — it keeps a chip findable when the fill
+   melts into the button face, under every palette including --safe-*. */
 .settings__color-swatch {
-  width: 16px;
-  height: 16px;
+  width: 20px;
+  height: 20px;
   flex: none;
   border-radius: 4px;
-  border: 1px solid var(--border-strong);
+  box-shadow: 0 0 0 1px var(--swatch-ring);
 }
 
 /* ---------- The escape hatch ----------
@@ -216,9 +228,10 @@ html[data-custom-theme] .settings__segmented .btn--on {
    unreadable "Reset to default" is the same dead end as an unreadable card.
 
    Two things are deliberately NOT overridden:
-     * the colour swatches, which must show the literal picks — they carry a
-       --border-strong outline from this palette so a swatch that matches the
-       card exactly is still findable;
+     * the colour swatches, which must show the literal picks — their
+       --swatch-ring hairline is a fixed translucent overlay from tokens.css,
+       not a palette token, so a swatch that matches the card exactly stays
+       findable under the safe palette and the user's alike;
      * every other card on this screen, and the whole rest of the app, which
        stay fully in the user's colours.
 
@@ -346,12 +359,14 @@ html[data-rescue-appearance] .settings__card--appearance {
   align-items: center;
   gap: var(--sp-2);
 }
+/* Same ring-outside-the-face treatment as .settings__color-swatch above: every
+   pixel of the box is the colour under judgment, the hairline sits beyond it. */
 .cp__swatch {
   width: 26px;
   height: 26px;
   flex: none;
   border-radius: var(--radius-s);
-  border: 1px solid var(--border-strong);
+  box-shadow: 0 0 0 1px var(--swatch-ring);
 }
 .cp .cp__hex {
   flex: 1;
@@ -377,7 +392,8 @@ html[data-rescue-appearance] .settings__card--appearance {
 .cp__preset {
   height: 20px;
   padding: 0;
-  border: 1px solid var(--border-strong);
+  border: none;
+  box-shadow: 0 0 0 1px var(--swatch-ring);
   border-radius: 4px;
   cursor: pointer;
   transition: transform var(--dur) var(--ease);

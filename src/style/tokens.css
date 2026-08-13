@@ -122,6 +122,13 @@ html[data-theme="dark"] {
   --border: #26262c;
   --border-strong: #35353d;
 
+  /* Colour-swatch hairline. A translucent overlay rather than a palette shade
+     so it reads against ANY surface it lands on, and deliberately absent from
+     CUSTOM_THEME_VARS: a custom theme keeps whichever variant its derived
+     surface direction selects, and the appearance-rescue block cannot re-point
+     it. Measured rationale in settings.css above .settings__color-swatch. */
+  --swatch-ring: rgba(255, 255, 255, 0.28);
+
   --text-1: #ececf1;
   --text-2: #a4a4af;
   --text-3: #6e6e79;
@@ -162,6 +169,8 @@ html[data-theme="light"] {
 
   --border: #e4e4e9;
   --border-strong: #cfcfd8;
+
+  --swatch-ring: rgba(0, 0, 0, 0.28);
 
   --text-1: #1b1b20;
   --text-2: #5b5b66;

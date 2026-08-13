@@ -427,6 +427,11 @@ describe("deriveCustomTheme", () => {
     const { vars } = deriveCustomTheme(stock);
     expect(Object.keys(vars).sort()).toEqual([...CUSTOM_THEME_VARS].sort());
     expect(CUSTOM_THEME_VARS).toHaveLength(21);
+    // The swatch hairline is deliberately NOT themable: it is the one thing
+    // that keeps a colour chip findable when the pick melts into the card, so
+    // it must survive every palette — custom, rescue and safe alike. Making it
+    // derived would hand the user's picks the power to erase it.
+    expect(CUSTOM_THEME_VARS).not.toContain("--swatch-ring");
   });
 
   it("only ever emits colour literals it built itself, even from hostile input", () => {

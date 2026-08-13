@@ -2848,6 +2848,29 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
           swatch!.offsetParent !== null && box.width > 0 && box.height > 0,
           `${where}: the ${role} swatch has no box — there is nothing to paint`,
         );
+        // THE WAVE-2 GEOMETRY, pinned from the rendered style, not the
+        // stylesheet text. Measured in the packaged build (2026-08-12): a 16px
+        // chip with a 1px --border-strong border inside its border-box was
+        // 28-31% ring by area and its spatial mean landed exactly on
+        // --bg-panel, so every pick read as card chrome. The fix is a 20px
+        // face with ZERO border and the hairline OUTSIDE the box via
+        // box-shadow spread. Each assertion here fails for exactly one way of
+        // undoing that.
+        const chip = getComputedStyle(swatch!);
+        assert(
+          Math.round(box.width) === 20 && Math.round(box.height) === 20,
+          `${where}: the ${role} swatch face is ${box.width}x${box.height}, not 20x20`,
+        );
+        assert(
+          chip.borderTopWidth === "0px",
+          `${where}: the ${role} swatch has a ${chip.borderTopWidth} border back INSIDE its face — that ring was measured at 28-31% of the chip's pixels`,
+        );
+        assert(
+          /rgba\(\d+, \d+, \d+, 0\.\d+\).* 0px 0px 0px 1px|0px 0px 0px 1px.*rgba\(\d+, \d+, \d+, 0\.\d+\)/.test(
+            chip.boxShadow,
+          ),
+          `${where}: the ${role} swatch's outside hairline is gone or opaque — computed box-shadow is "${chip.boxShadow}", expected a 1px translucent spread ring (--swatch-ring)`,
+        );
         const painted = getComputedStyle(swatch!).backgroundColor;
         const alpha = parse(painted).a;
         // THE REPORTED SYMPTOM, called by its name so the report says it.
@@ -3188,6 +3211,20 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
           },
           recheck,
         );
+        // 4d. The wave-2 regression: the ring moves back INSIDE the chip's
+        //     face (measured at 28-31% of its pixels, mean == --bg-panel).
+        mustFail(
+          "the border-strong ring is put back inside the swatch face",
+          () => {
+            const el = need<HTMLElement>("#settings-color-background .settings__color-swatch");
+            const had = el.style.border;
+            el.style.border = "1px solid var(--border-strong)";
+            return () => {
+              el.style.border = had;
+            };
+          },
+          recheck,
+        );
 
         /* ---- 5. the theme control still says which theme is live ---- */
 
@@ -3197,7 +3234,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
 
         const disk = await checkOnDisk(TRIP);
 
-        return `Settings → home → Settings via the real Back and gear: ${afterTrip} (unchanged from ${beforeTrip}); ${seg}; persisted ${disk}; and the guard was proven red on a blanked swatch, a swatch painted from the wrong role, and a rewritten caption`;
+        return `Settings → home → Settings via the real Back and gear: ${afterTrip} (unchanged from ${beforeTrip}); ${seg}; persisted ${disk}; and the guard was proven red on a blanked swatch, a swatch painted from the wrong role, a rewritten caption, and a ring put back inside the chip face`;
       } finally {
         // Never leave the owner's real theme changed by a test run. Nothing
         // clamps any more, so a leaked theme is a genuinely unusable app. The
