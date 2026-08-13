@@ -391,6 +391,9 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       const stageOverlay = document.querySelector<HTMLElement>(".stage-overlay")!;
       const selbox = stageOverlay.querySelector<HTMLElement>(".stage-overlay__selbox")!;
       const stageCanvas = stageOverlay.parentElement as HTMLElement; // .preview__canvas
+      /** How long the re-entered theater took to auto-hide (section 7), reported
+       *  in the detail line so a regression toward "never" is visible. */
+      let hidMs = 0;
 
       // Teardown runs in a finally so a mid-test assertion failure can NEVER leak
       // theater state (fixed inset-0, overlay display:none, a live selection) into
@@ -506,13 +509,16 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
 
       // 4) auto-hide: while PLAYING, no pointer movement for > the hide delay hides
       // the chrome; a pointermove reveals it instantly. (Never hides while paused.)
+      //
+      // There is deliberately NO pointermove after play() here. One used to sit
+      // on this line "to arm the idle countdown", and that is exactly what made
+      // the assertion hollow: reveal() arms the timer by itself, so the block
+      // stayed green with the tick's play↔pause flip detector deleted outright.
+      // Starting playback is now the ONLY thing that can arm the timer below.
       engine.seek(5);
       engine.play();
       await sleep(60);
-      // a fresh pointermove reveals + arms the idle countdown
-      preview!.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: 10, clientY: 10 }));
-      await sleep(50);
-      assert(!preview!.classList.contains("theater--hidden"), "chrome should be visible right after pointermove");
+      assert(!preview!.classList.contains("theater--hidden"), "chrome should be visible when playback starts");
       await sleep(2700); // > AUTO_HIDE_MS (2500) with NO movement while playing
       assert(preview!.classList.contains("theater--hidden"), "chrome did not auto-hide after idle while playing");
       preview!.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: 40, clientY: 40 }));
@@ -569,6 +575,63 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         `after exit ArrowRight stepped ${stepped.toFixed(4)}s, expected ~1 frame (${frameSec.toFixed(4)}s), not ±5s`,
       );
 
+      // 7) RE-ENTER AFTER EXITING WHILE PLAYING. The tick early-returns while
+      // theater is closed, so its `wasPlaying` cache keeps whatever the LAST
+      // open session saw. Exit mid-playback, pause outside, come back: the next
+      // Space is a genuine play↔pause flip only if enter() re-seeded that cache
+      // from the engine. Without that one line the flip never fires, the hide
+      // countdown is never armed, and the bar sits on screen for the rest of the
+      // session. Nothing here moves a pointer, so reveal() cannot arm it either
+      // — the detector is the only path to a hidden bar.
+      assert(!preview!.classList.contains("theater"), "re-enter: precondition — must be out of theater");
+      fsBtn!.click();
+      await sleep(60);
+      assert(preview!.classList.contains("theater"), "re-enter: first enter failed");
+      engine.seek(6);
+      engine.play();
+      await sleep(140);
+      assert(engine.playing, "re-enter: playback did not start inside theater");
+      // leave WHILE PLAYING — this is what strands the cached flag at `true`
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      await sleep(60);
+      assert(!preview!.classList.contains("theater"), "re-enter: Escape did not exit while playing");
+      engine.pause();
+      await sleep(60);
+      assert(!engine.playing, "re-enter: engine did not pause outside theater");
+
+      // NOTHING may be awaited between re-entering and the Space. The engine
+      // emits a tick on seeks and refits too, not just on the transport, and ANY
+      // tick that lands while theater is open and the engine is still paused
+      // repairs the stale cache for free — `playing false !== wasPlaying true`
+      // is itself a flip. An earlier draft of this block slept 60ms here and
+      // PASSED with the fix reverted for exactly that reason. The bug is about
+      // the FIRST tick after re-entering being the one that starts playback,
+      // which is precisely what a user pressing Space on the new view produces,
+      // so everything from the click to the dispatch stays synchronous.
+      fsBtn!.click();
+      assert(preview!.classList.contains("theater"), "re-enter: second enter failed");
+      assert(!preview!.classList.contains("theater--hidden"), "re-enter: chrome must be visible on enter");
+      // Space through the app's own path: the theater's document-capture handler
+      // sees it first (and reveals, which CANNOT arm the countdown while the
+      // engine is still paused), then it bubbles to the window shortcut, which
+      // toggles playback — and engine.play() emits its tick synchronously, so
+      // the flip detector is the only thing that can have armed the countdown.
+      const hideT0 = performance.now();
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true }));
+      await sleep(120);
+      assert(engine.playing, "re-enter: Space did not start playback in theater");
+      await waitFor(
+        () => preview!.classList.contains("theater--hidden"),
+        5000, // comfortably past AUTO_HIDE_MS (2500)
+        "the bar to auto-hide after re-entering theater (enter() must re-seed wasPlaying)",
+      );
+      hidMs = performance.now() - hideT0;
+      assert(hidMs > 2000, `bar hid after only ${hidMs.toFixed(0)}ms — it was not the idle countdown`);
+      // the same detector in the other direction: pausing reveals immediately
+      engine.pause();
+      await sleep(140);
+      assert(!preview!.classList.contains("theater--hidden"), "pausing did not reveal the chrome");
+
       } finally {
         // clean up: fully out of theater, drop the selection (Escape on the
         // focused overlay), paused, back near the start — leave no state for later
@@ -584,7 +647,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         engine.seek(0);
         await sleep(40);
       }
-      return "enter→.theater+bar; overlay display:none+selbox gone+radius 0; bar/play hit-topmost; canvas refit to fullscreen box; ±5s+clamp; seek 50%; auto-hide↔pointermove; arrows ±5s→frame-step after exit; Escape restores transport+overlay+selection";
+      return `enter→.theater+bar; overlay display:none+selbox gone+radius 0; bar/play hit-topmost; canvas refit to fullscreen box; ±5s+clamp; seek 50%; auto-hide armed by the tick's flip alone (no pointermove)↔pointermove reveals; arrows ±5s→frame-step after exit; Escape restores transport+overlay+selection; exit-while-playing→pause→re-enter→Space auto-hid after ${hidMs.toFixed(0)}ms, pause revealed`;
     });
 
     await test("delete-layer", async () => {
@@ -1023,8 +1086,13 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       const { addVideoTrack, makeClip, insertClip } = await import("../core/project");
       const scheduler = (dev as unknown as { scheduler: import("../editor/playback/scheduler").Scheduler }).scheduler;
       const counter = session.project.media[0]!; // the counter fixture (imported first)
+      const stageEl = document.querySelector<HTMLElement>(".preview__canvas");
+      assert(stageEl !== null, "no .preview__canvas stage");
 
       let topId = "";
+      let zTop = 0;
+      let zBot = 0;
+      let scrimZ = "";
       session.commit((p) => { const r = addVideoTrack(p); topId = r.trackId; return r.project; });
       session.commit((p) => {
         const clip = makeClip(counter, 1);
@@ -1033,16 +1101,59 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       });
       engine.refresh();
 
+      // Both commits are unconditional, so the two undos below are too — but they
+      // now live in a finally. A throw between here and them (the scrim probe
+      // added below can throw) would otherwise leak an extra video track and a
+      // clip into every block that follows.
+      try {
       engine.seek(2);
       await sleep(200);
       const infos = scheduler.activeVideoInfos();
       assert(infos.length === 2, `expected 2 active video layers at t=2, got ${infos.length}`);
       const setOf = (el: HTMLVideoElement): HTMLElement =>
         el.closest(".stage-layer-set") as HTMLElement;
-      const zTop = Number(setOf(infos[0]!.el).style.zIndex);
-      const zBot = Number(setOf(infos[1]!.el).style.zIndex);
+      zTop = Number(setOf(infos[0]!.el).style.zIndex);
+      zBot = Number(setOf(infos[1]!.el).style.zIndex);
       assert(zTop > zBot, `topmost layer must have higher z-index (${zTop} vs ${zBot})`);
       assert(infos[0]!.track.id === topId, "topmost active info must be the new top track");
+
+      // STATUS SCRIM STACKS ABOVE THE MEDIA. ".preview__overlay" carries the
+      // "Preview unavailable" / "Missing media" message and is appended to
+      // .preview__canvas AFTER the layer sets — but DOM order loses to a
+      // positive z-index, and every mounted set carries one (1..n here, plus the
+      // manipulation .stage-overlay at 200). With TWO sets live this is the
+      // exact configuration in which a lower track's picture used to cover the
+      // message completely. Probe the PAINT order with elementFromPoint, not the
+      // class list: `active` was always set correctly, the pixels were the bug.
+      const scrim = stageEl!.querySelector<HTMLElement>(".preview__overlay");
+      assert(scrim !== null, "no .preview__overlay status scrim in the stage");
+      const scrimText = scrim!.textContent;
+      try {
+        // exactly what setOverlay() does — text, then the class that displays it
+        scrim!.textContent = "Preview unavailable";
+        scrim!.classList.add("active");
+        await sleep(40);
+        const sb = stageEl!.getBoundingClientRect();
+        assert(sb.width > 8 && sb.height > 8, `stage canvas has no area to probe (${sb.width}x${sb.height})`);
+        const hit = document.elementFromPoint(sb.left + sb.width / 2, sb.top + sb.height / 2);
+        assert(hit !== null, "elementFromPoint at the stage centre returned null");
+        const hitEl = hit as HTMLElement;
+        assert(
+          hitEl.closest(".stage-layer-set") === null,
+          `a media layer set wins the hit-test over the status scrim (hit=${hitEl.className})`,
+        );
+        assert(
+          hitEl === scrim || scrim!.contains(hitEl),
+          `status scrim is painted UNDER the stage: elementFromPoint=${hitEl.className || hitEl.tagName}`,
+        );
+        scrimZ = getComputedStyle(scrim!).zIndex;
+        assert(scrimZ === "250", `scrim z-index is "${scrimZ}", expected "250" (--z-stage-status)`);
+      } finally {
+        // setOverlay(stage, null) early-returns when the text is unchanged, so
+        // the app would never clear a class we set behind its back.
+        scrim!.classList.remove("active");
+        scrim!.textContent = scrimText;
+      }
 
       engine.seek(4);
       await sleep(150);
@@ -1058,10 +1169,11 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       for (let i = 1; i < samples.length; i++) if (samples[i]! < samples[i - 1]! - 0.02) monotone = false;
       assert(monotone, `engine.time not monotone: ${samples.map((s) => s.toFixed(2)).join(",")}`);
       assert(engine.time > 3, `expected to cross the top-layer 3s boundary, reached ${engine.time.toFixed(3)}`);
-
-      session.undo(); session.undo();
-      engine.refresh();
-      return `2-layer composite ok; z ${zTop}>${zBot}; crossed 3s, reached ${engine.time.toFixed(2)}s`;
+      } finally {
+        session.undo(); session.undo();
+        engine.refresh();
+      }
+      return `2-layer composite ok; z ${zTop}>${zBot}; status scrim hit-topmost over both layer sets at z ${scrimZ}; crossed 3s, reached ${engine.time.toFixed(2)}s`;
     });
 
     await test("frame-step-rapid", async () => {
@@ -1778,6 +1890,395 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       }
       assert(diff > 500, `canvas looks blank (diff=${diff})`);
       return `canvas has content (diff=${diff})`;
+    });
+
+    await test("timeline-panel-resize", async () => {
+      // The timeline panel's height is the user's: dragged from the 6px divider
+      // straddling its top border, clamped, and persisted ONCE on release.
+      //
+      // Everything below is measured off the RENDERED box, the canvas's own
+      // backing store and the settings store — never off the inline style the
+      // drag wrote. The failures this guards against are all "declared but never
+      // landed": a height flex quietly caps, a canvas that keeps its old DPR
+      // store behind a resized host, a persist that rides a promise nobody
+      // awaited, and an abandoned drag that reverts the pixels but still writes.
+      const { TIMELINE_HEIGHT_MAX, TIMELINE_HEIGHT_MIN } = await import("../core/types");
+      const { PREVIEW_MIN_H } = await import("../editor/timeline/panel-size");
+      const { settingsStore, updateSettings } = await import("../core/session");
+
+      const panel = document.querySelector<HTMLElement>(".timeline-panel");
+      assert(panel !== null, "no .timeline-panel");
+      const handle = document.querySelector<HTMLElement>("#ed-tl-resize");
+      assert(handle !== null, "no #ed-tl-resize divider");
+      const main = document.querySelector<HTMLElement>(".editor__main");
+      assert(main !== null, "no .editor__main");
+      const host = document.querySelector<HTMLElement>("#ed-timeline");
+      assert(host !== null, "no #ed-timeline lane host");
+      const cvs = host!.querySelector<HTMLCanvasElement>(".timeline-canvas");
+      assert(cvs !== null, "no .timeline-canvas");
+
+      const styleBefore = panel!.style.height;
+      const storedBefore = settingsStore.get().timelineHeight;
+
+      // The rule, restated from the two exported CONSTANTS rather than from
+      // panel-size.ts's own maxPanelHeight — otherwise this would assert the
+      // implementation against itself. Read from the LIVE .editor__main box so
+      // the block is honest on any window size.
+      const mainH = main!.getBoundingClientRect().height;
+      const maxH = Math.max(TIMELINE_HEIGHT_MIN, Math.min(TIMELINE_HEIGHT_MAX, mainH - PREVIEW_MIN_H));
+      const maxExpect = Math.round(maxH);
+      // The panel's bottom edge is the drag's anchor and is pinned to the bottom
+      // of .editor__main, so it does not move while the panel grows.
+      const bottom0 = panel!.getBoundingClientRect().bottom;
+
+      // Two targets that coincide with NOTHING in this system: not the 280px
+      // default/stylesheet height, not either bound, not the window-derived cap.
+      const TARGET = 431;
+      const MID_DRAG = 517;
+      assert(
+        TARGET > TIMELINE_HEIGHT_MIN && TARGET < maxExpect && MID_DRAG > TIMELINE_HEIGHT_MIN && MID_DRAG < maxExpect,
+        `fixture heights ${TARGET}/${MID_DRAG} are not strictly inside (${TIMELINE_HEIGHT_MIN}, ${maxExpect}) — a clamp would hide a broken drag`,
+      );
+
+      const renderedH = (): number => panel!.getBoundingClientRect().height;
+      const centreX = (): number => {
+        const b = panel!.getBoundingClientRect();
+        return b.left + b.width / 2;
+      };
+      // Pointer capture throws for a synthetic pointer, so the app catches it
+      // and relies on move/up/cancel being registered ON THE HANDLE for the life
+      // of the gesture. Dispatch every one of them there, exactly as it expects.
+      const pev = (type: string, clientY: number): void => {
+        handle!.dispatchEvent(
+          new PointerEvent(type, {
+            button: 0, pointerId: 7, clientX: centreX(), clientY, bubbles: true, cancelable: true,
+          }),
+        );
+      };
+      const dragTo = async (h: number, end: "up" | "escape"): Promise<void> => {
+        pev("pointerdown", panel!.getBoundingClientRect().top);
+        pev("pointermove", bottom0 - h);
+        await sleep(80); // the apply is coalesced into a rAF
+        if (end === "up") pev("pointerup", bottom0 - h);
+        else window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+        await sleep(80);
+      };
+      const storeExpect = (): number =>
+        Math.round(Math.max(50, host!.getBoundingClientRect().height) * (window.devicePixelRatio || 1));
+      const ctx2 = cvs!.getContext("2d")!;
+      const paintedDiff = (): number => {
+        const { data } = ctx2.getImageData(0, 0, cvs!.width, Math.min(cvs!.height, 300));
+        const first = [data[0], data[1], data[2]];
+        let d = 0;
+        for (let i = 0; i < data.length; i += 16) {
+          if (
+            Math.abs(data[i]! - first[0]!) > 12 ||
+            Math.abs(data[i + 1]! - first[1]!) > 12 ||
+            Math.abs(data[i + 2]! - first[2]!) > 12
+          ) {
+            d++;
+          }
+        }
+        return d;
+      };
+
+      try {
+        // (a) REACHABLE. The divider is a 6px band centred on a border the stage
+        // above and the transport below both touch, and it carries no z-index —
+        // being positioned is the whole of its claim to the pixels. Ask the
+        // renderer who is actually on top there, not whether it is displayed.
+        {
+          const b = panel!.getBoundingClientRect();
+          const hit = document.elementFromPoint(b.left + b.width / 2, b.top);
+          assert(hit !== null, "elementFromPoint at the panel's top edge returned null");
+          assert(
+            hit === handle,
+            `divider is not the topmost element at the panel's top edge: elementFromPoint=${(hit as HTMLElement).id || (hit as HTMLElement).className}`,
+          );
+        }
+
+        // (b) THE DRAG LANDS — in the box, in the backing store, and in pixels.
+        await dragTo(TARGET, "up");
+        const h1 = renderedH();
+        assert(Math.abs(h1 - TARGET) < 1.5, `panel rendered ${h1.toFixed(2)}px after dragging to ${TARGET}`);
+        await waitFor(
+          () => cvs!.height === storeExpect(),
+          3000,
+          `the canvas backing store to follow the host (have ${cvs!.height}, want ${storeExpect()})`,
+        );
+        const diffAfter = await waitFor(
+          () => { const d = paintedDiff(); return d > 500 ? d : null; },
+          3000,
+          "the timeline canvas to repaint into its new backing store",
+        );
+
+        // (c) PERSISTED, ONCE, ON RELEASE — and to the height that is on screen.
+        await waitFor(
+          () => settingsStore.get().timelineHeight === TARGET,
+          3000,
+          `timelineHeight to persist as ${TARGET} (have ${settingsStore.get().timelineHeight})`,
+        );
+        assert(
+          Math.abs(settingsStore.get().timelineHeight - h1) < 1.5,
+          `stored ${settingsStore.get().timelineHeight} disagrees with the rendered ${h1.toFixed(2)}`,
+        );
+
+        // (d) BOTH CLAMPS, against the live window.
+        await dragTo(70, "up"); // far past the floor
+        const hMin = renderedH();
+        assert(
+          Math.abs(hMin - TIMELINE_HEIGHT_MIN) < 1.5,
+          `dragging past the floor rendered ${hMin.toFixed(2)}, expected exactly ${TIMELINE_HEIGHT_MIN}`,
+        );
+        await dragTo(maxExpect + 300, "up"); // far past the ceiling
+        const hMax = renderedH();
+        assert(
+          Math.abs(hMax - maxExpect) < 1.5,
+          `dragging past the ceiling rendered ${hMax.toFixed(2)}, expected exactly ${maxExpect} = min(${TIMELINE_HEIGHT_MAX}, ${mainH.toFixed(1)} − ${PREVIEW_MIN_H})`,
+        );
+        await waitFor(
+          () => settingsStore.get().timelineHeight === maxExpect,
+          3000,
+          `the clamped ceiling to persist as ${maxExpect}`,
+        );
+
+        // (e) ESCAPE MID-DRAG reverts the pixels and writes nothing.
+        const beforeEsc = renderedH();
+        const storedEsc = settingsStore.get().timelineHeight;
+        pev("pointerdown", panel!.getBoundingClientRect().top);
+        pev("pointermove", bottom0 - MID_DRAG);
+        await sleep(80);
+        const midH = renderedH();
+        assert(
+          Math.abs(midH - MID_DRAG) < 1.5,
+          `mid-drag height ${midH.toFixed(2)} did not track the pointer to ${MID_DRAG}`,
+        );
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+        await sleep(120);
+        assert(
+          Math.abs(renderedH() - beforeEsc) < 1.5,
+          `Escape left the panel at ${renderedH().toFixed(2)}, expected the pre-drag ${beforeEsc.toFixed(2)}`,
+        );
+        // Long enough that a write issued on the abandoned drag would have landed.
+        await sleep(250);
+        assert(
+          settingsStore.get().timelineHeight === storedEsc,
+          `Escape persisted ${settingsStore.get().timelineHeight}; settings must still read ${storedEsc}`,
+        );
+
+        return `divider hit-topmost; drag→${h1.toFixed(0)}px rendered, canvas store ${cvs!.height}px @dpr ${window.devicePixelRatio}, repainted (diff=${diffAfter}), stored ${TARGET}; clamps ${TIMELINE_HEIGHT_MIN}/${maxExpect}; Escape at ${MID_DRAG}→${beforeEsc.toFixed(0)}px, settings untouched`;
+      } finally {
+        // Put the panel and the owner's settings back exactly as they were —
+        // the inline declaration verbatim, not the height it happened to render.
+        panel!.style.height = styleBefore;
+        try {
+          await updateSettings({ timelineHeight: storedBefore });
+        } catch {
+          // A failed disk write must not mask a real failure above.
+        }
+      }
+    });
+
+    await test("bin-drop-autoscroll", async () => {
+      // Dragging a bin row onto the timeline is a POINTER drag (pointerdown on
+      // the row, then window-level move/up), not HTML5 dnd — and it used to
+      // resolve its drop lane without ever scrolling, so a lane below the fold
+      // was a lane a bin item could not reach, while an identical-looking drag
+      // of a clip already on the timeline reached it fine.
+      //
+      // The fix drives createLaneAutoScroll from that gesture. What makes this
+      // block a real test of it: the pointer PARKS. After the move that enters
+      // the edge zone, nothing else is dispatched — the rAF loop and real frames
+      // are the only thing that can carry the lanes up to it.
+      const { addVideoTrack, findTrack } = await import("../core/project");
+      const { RULER_H, laneLayout, laneScroll, maxLaneScroll, totalLanesHeight } =
+        await import("../editor/timeline/render");
+      const tl = (dev as unknown as {
+        timeline: import("../editor/timeline/timeline").TimelineController;
+      }).timeline;
+
+      const host = document.querySelector<HTMLElement>("#ed-timeline");
+      assert(host !== null, "no #ed-timeline lane host");
+      const mediaList = document.querySelector<HTMLElement>("#media-list");
+      assert(mediaList !== null, "no #media-list bin");
+
+      const tracks0 = session.project.timeline.tracks;
+      const lastTrack0 = tracks0[tracks0.length - 1]!;
+      const targetId = lastTrack0.id;
+      // A drop is refused on a lane of the wrong kind, so pick a bin item that
+      // belongs on whatever the LAST lane is (addVideoTrack PREPENDS, so the
+      // layers added below push this lane further down, never past it).
+      const wantAudio = lastTrack0.kind === "audio";
+      const dragMedia = session.project.media.find((mm) => (mm.kind === "audio") === wantAudio);
+      assert(dragMedia !== undefined, `no ${wantAudio ? "audio" : "visual"} media in the bin for the last lane`);
+
+      const added: string[] = [];
+      let dropped = false;
+      let scrolledTo = 0;
+      let landedOn: string | null = null;
+      let detail = "";
+      try {
+        tl.scrollLanesTo(0);
+        const viewH = tl.view.height;
+        // Enough layers that the last lane starts BELOW the viewport entirely:
+        // one lane plus its gap is 64px at most, so 110px of overflow guarantees
+        // it — "partly clipped" would not prove the drag can reach it.
+        for (let i = 0; i < 24 && maxLaneScroll(session.project, viewH) < 110; i++) {
+          session.commit((p) => {
+            const r = addVideoTrack(p);
+            added.push(r.trackId);
+            return r.project;
+          });
+        }
+        engine.refresh();
+        tl.requestRender();
+        await sleep(60);
+
+        const maxScroll = maxLaneScroll(session.project, viewH);
+        assert(maxScroll > 0, `lane stack does not overflow (total ${totalLanesHeight(session.project)} in ${viewH}) — nothing to auto-scroll`);
+        assert(laneScroll() === 0, `precondition: lane scroll must start at 0, got ${laneScroll()}`);
+        const lanes0 = laneLayout(session.project);
+        const last0 = lanes0[lanes0.length - 1]!;
+        assert(last0.track.id === targetId, "the last lane is not the track we targeted");
+        // Copied out as a number, not held as a reference: laneLayout hands back
+        // a CACHED array whose rects are refilled in place on every scroll, so
+        // `last0.y` is a moving value, not a snapshot.
+        const startY = last0.y;
+        assert(
+          startY >= viewH,
+          `precondition: the target lane is already reachable at scroll 0 (y=${startY}, viewport ${viewH.toFixed(1)}) — the drag would pass without scrolling`,
+        );
+
+        // ---- the gesture ----
+        // Queried HERE, not before the commits: the editor subscribes the bin to
+        // the project store and rebuilds it with innerHTML, so every layer added
+        // above detached whatever row we had looked up. A detached row still
+        // answers closest(".media-row"), so the pointerdown would simply never
+        // reach the delegated listener and the drag would silently not happen.
+        const row = mediaList!.querySelector<HTMLElement>(`.media-row[data-id="${dragMedia!.id}"]`);
+        assert(row !== null, `no bin row for media ${dragMedia!.id}`);
+        assert(row!.isConnected, "the bin row is detached — pointerdown would not reach the bin's delegate");
+        const rb = row!.getBoundingClientRect();
+        const downX = rb.left + rb.width / 2;
+        const downY = rb.top + rb.height / 2;
+        row!.dispatchEvent(
+          new PointerEvent("pointerdown", {
+            button: 0, pointerId: 11, clientX: downX, clientY: downY, bubbles: true, cancelable: true,
+          }),
+        );
+        const hb = host!.getBoundingClientRect();
+        const parkX = hb.left + Math.min(220, hb.width / 2);
+        // 8px above the host's bottom edge: 18px deep into the 26px auto-scroll
+        // zone, and — once the stack is fully scrolled — inside the last lane's
+        // band rather than the trailing 4px LANE_GAP below it.
+        const parkY = hb.bottom - 8;
+        const wmove = (x: number, y: number): void => {
+          window.dispatchEvent(
+            new PointerEvent("pointermove", { pointerId: 11, clientX: x, clientY: y, bubbles: true }),
+          );
+        };
+        wmove(downX + 30, downY + 30); // cross the 4px drag threshold
+        wmove(parkX, parkY); // enter the edge zone — and PARK. Nothing after this.
+
+        // The guide must settle on the LAST lane, UNCLAMPED: setDropPreview
+        // clips its tint to [RULER_H, viewport], so demanding top === lane.y and
+        // height === lane.h is demanding the lane be wholly on screen — which it
+        // can only be if the parked pointer really did drag the stack to it.
+        let seen = "the guide never appeared at all";
+        try {
+          await waitFor(
+            () => {
+              const g = host!.querySelector<HTMLElement>(".tl-drop-guide");
+              if (!g || g.style.display !== "block") {
+                seen = g ? "guide hidden (wrong lane kind, or between lanes)" : "no guide element";
+                return null;
+              }
+              const lanes = laneLayout(session.project);
+              const last = lanes[lanes.length - 1]!;
+              const el = g.firstElementChild as HTMLElement;
+              const top = parseFloat(el.style.top);
+              const h = parseFloat(el.style.height);
+              seen = `guide top=${top} h=${h}; last lane y=${last.y} h=${last.h}`;
+              return Math.abs(top - last.y) < 0.6 && Math.abs(h - last.h) < 0.6 ? el : null;
+            },
+            8000,
+            "the drop guide to settle, unclipped, on the last lane",
+          );
+        } catch (e) {
+          throw new Error(
+            `${String(e)} — last seen: ${seen}; laneScroll=${laneScroll()} of max ${maxScroll}; ghost=${document.querySelector(".media-drag-ghost") !== null}`,
+          );
+        }
+
+        scrolledTo = laneScroll();
+        assert(scrolledTo > 0, "the lanes never scrolled — a parked pointer did not drive the loop");
+        const lanes1 = laneLayout(session.project);
+        const last1 = lanes1[lanes1.length - 1]!;
+        assert(
+          last1.y >= RULER_H - 0.5 && last1.y + last1.h <= viewH + 0.5,
+          `the target lane is still not wholly in view (y=${last1.y}, h=${last1.h}, viewport ${viewH.toFixed(1)})`,
+        );
+
+        // ---- the drop ----
+        const idsBefore = new Set<string>();
+        for (const t of session.project.timeline.tracks) for (const c of t.clips) idsBefore.add(c.id);
+        window.dispatchEvent(
+          new PointerEvent("pointerup", { pointerId: 11, clientX: parkX, clientY: parkY, bubbles: true }),
+        );
+        await sleep(80);
+        let newClipId = "";
+        for (const t of session.project.timeline.tracks) {
+          for (const c of t.clips) {
+            if (!idsBefore.has(c.id)) {
+              newClipId = c.id;
+              landedOn = t.id;
+            }
+          }
+        }
+        // Set BEFORE asserting: a clip that landed on the wrong lane still has
+        // to be undone, or the failure leaks into every block after this one.
+        if (newClipId !== "") dropped = true;
+        assert(newClipId !== "", "the drop committed no clip at all");
+        assert(
+          landedOn === targetId,
+          `clip landed on track ${landedOn}, expected the last (auto-scrolled-to) track ${targetId}`,
+        );
+        assert(
+          findTrack(session.project, targetId)!.clips.some((c) => c.id === newClipId),
+          "the new clip is not on the target track",
+        );
+
+        detail = `${added.length} layers → ${totalLanesHeight(session.project)}px of lanes in a ${viewH.toFixed(0)}px viewport; last lane started at y=${startY} (offscreen), parked pointer auto-scrolled ${scrolledTo.toFixed(0)}/${maxScroll.toFixed(0)}px to y=${last1.y}; drop landed on the last track`;
+      } finally {
+        // The drag owns window listeners and a rAF loop; Escape is its cancel
+        // path. Only reached when the block threw before pointerup.
+        if (document.querySelector(".media-drag-ghost")) {
+          window.dispatchEvent(
+            new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+          );
+          await sleep(60);
+        }
+        // Undo exactly what THIS block committed, and only if it committed it.
+        // An unconditional undo pops another block's history entry — that is not
+        // hypothetical here, it is how a deleted marker once came back.
+        if (dropped) session.undo();
+        for (let i = 0; i < added.length; i++) session.undo();
+        // the drop selected the new clip; drop that selection with the overlay's
+        // own Escape so nothing downstream holds a dead clip id
+        document.querySelector(".stage-overlay")?.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+        );
+        tl.scrollLanesTo(0);
+        engine.refresh();
+        tl.requestRender();
+      }
+      // Asserted AFTER the finally, never inside it: a throw from teardown would
+      // replace whichever real failure sent us there.
+      assert(
+        session.project.timeline.tracks.length === tracks0.length,
+        `teardown left ${session.project.timeline.tracks.length} tracks, started with ${tracks0.length}`,
+      );
+      return detail;
     });
 
     // Full-stack export: spec → Rust builder → ffmpeg → probe the output.

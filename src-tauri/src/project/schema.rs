@@ -222,10 +222,25 @@ pub struct Timeline {
 }
 
 impl Timeline {
+    /// The timeline length: the latest end across EVERY clip on every track.
+    ///
+    /// Reads all of them rather than each track's last, because nothing on this
+    /// side of the wire sorts or checks the order. The editor happens to keep
+    /// `clips` in `timelineStart` order, but a `.trt` is plain JSON that is
+    /// shared and hand-edited, and serde stores whatever order the file lists —
+    /// so `clips.last()` is a trust, not a fact. Trusting it truncated the
+    /// export to the last-LISTED clip's end: the longest clip written first
+    /// simply vanished off the end of the rendered video, silently, since a
+    /// short duration is a legal export.
+    ///
+    /// Even in file order `last()` is only right when the clips do not overlap;
+    /// a clip that starts later but is shorter also ends earlier. O(n) over the
+    /// clips is nothing next to the export it feeds.
     pub fn duration(&self) -> f64 {
         self.tracks
             .iter()
-            .filter_map(|t| t.clips.last().map(|c| c.end()))
+            .flat_map(|t| t.clips.iter())
+            .map(Clip::end)
             .fold(0.0, f64::max)
     }
 }
@@ -390,6 +405,89 @@ mod tests {
         assert_eq!(gen["fontFamily"], "Georgia");
         assert_eq!(gen["sizePx"], 96.0);
         assert_eq!(gen["bold"], true);
+    }
+
+    fn clip_at(id: &str, start: f64, src_in: f64, src_out: f64, speed: f64) -> Clip {
+        Clip {
+            id: id.into(),
+            media_id: "m1".into(),
+            timeline_start: start,
+            src_in,
+            src_out,
+            speed,
+            transform: None,
+            audio: ClipAudio {
+                volume: 1.0,
+                muted: false,
+                fade_in_sec: 0.0,
+                fade_out_sec: 0.0,
+                gain_offset_db: 0.0,
+                detached: false,
+            },
+            keyframes: None,
+        }
+    }
+
+    fn track_of(id: &str, clips: Vec<Clip>) -> Track {
+        Track {
+            id: id.into(),
+            kind: "video".into(),
+            name: "V".into(),
+            muted: false,
+            clips,
+        }
+    }
+
+    /// A hand-edited `.trt` may list a track's clips in ANY order — nothing on
+    /// this side sorts them — so the length must come from the latest end across
+    /// all of them, not from whichever clip happens to be written last.
+    ///
+    /// Every number here is distinct across the whole fixture (starts 10 / 0.25 /
+    /// 4 / 1.5, durations 8 / 2 / 3 / 1, ends 18 / 2.25 / 7 / 2.5) so a
+    /// duration read as a start, an end read as a duration, or a speed divisor
+    /// dropped all produce a value this assertion rejects.
+    #[test]
+    fn duration_spans_every_clip_however_the_file_orders_them() {
+        let longest = clip_at("longest", 10.0, 1.0, 5.0, 0.5); // dur 8.0 → end 18.0
+        let shortest = clip_at("early", 0.25, 0.5, 2.5, 1.0); // dur 2.0 → end 2.25
+        let middle = clip_at("middle", 4.0, 3.0, 9.0, 2.0); // dur 3.0 → end 7.0
+
+        // The clip that reaches furthest is written FIRST, which is exactly the
+        // shape `clips.last()` could not see.
+        let out_of_order = track_of("t1", vec![longest, shortest, middle]);
+        assert_eq!(
+            out_of_order.clips.last().unwrap().end(),
+            7.0,
+            "fixture guard: the last-LISTED clip must not be the longest, or this proves nothing"
+        );
+
+        let tl = Timeline {
+            fps: Rational { num: 30, den: 1 },
+            width: 1920,
+            height: 1080,
+            tracks: vec![
+                out_of_order,
+                track_of("t2", vec![clip_at("other", 1.5, 0.0, 1.0, 1.0)]), // end 2.5
+                track_of("empty", vec![]),
+            ],
+            markers: vec![],
+        };
+        assert_eq!(
+            tl.duration(),
+            18.0,
+            "the export must span the furthest clip on any track"
+        );
+
+        // An empty timeline is still 0, and a single track still answers from its
+        // own clips — the fold's identity must not leak in as a floor.
+        let empty = Timeline {
+            fps: Rational { num: 30, den: 1 },
+            width: 640,
+            height: 360,
+            tracks: vec![track_of("only", vec![])],
+            markers: vec![],
+        };
+        assert_eq!(empty.duration(), 0.0);
     }
 
     #[test]

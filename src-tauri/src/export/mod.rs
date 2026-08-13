@@ -42,9 +42,13 @@ impl ExportTemps {
     }
 }
 
-/// Escape a materialized textfile path for drawtext (mirrors the builder's
-/// `escape_filter_path`): backslashes → forward slashes, ':' → '\:', wrapped in
-/// single quotes.
+/// Escape a materialized textfile path for drawtext.
+///
+/// The transformation itself is `builder::escape_filter_value` — the ONE copy,
+/// shared with the builder rather than mirrored here. This function is the
+/// %TEMP%-specific rejection around it: an escaper that drifts from the one that
+/// wrote the placeholder produces a graph ffmpeg parses differently from the one
+/// whose length chose inline-vs-script mode.
 ///
 /// A single quote is REJECTED for the same reason the builder rejects it:
 /// ffmpeg's filter-option syntax has no escape that survives inside a quoted
@@ -60,17 +64,7 @@ fn escape_text_path(path: &str) -> Result<String> {
              and restart Taroting (current temp path: {path})"
         )));
     }
-    let mut out = String::with_capacity(path.len() + 4);
-    out.push('\'');
-    for ch in path.chars() {
-        match ch {
-            '\\' => out.push('/'),
-            ':' => out.push_str("\\:"),
-            c => out.push(c),
-        }
-    }
-    out.push('\'');
-    Ok(out)
+    Ok(builder::escape_filter_value(path))
 }
 
 /// Splice the built filtergraph into the argv. Text payloads are materialized to
@@ -562,6 +556,32 @@ mod unit {
         assert!(msg.contains(r"C:\Temp"), "message must give a concrete path: {msg}");
     }
 
+    /// ONE escaper, two rejection messages.
+    ///
+    /// The builder embeds a PLACEHOLDER escaped by its own wrapper and this
+    /// module substitutes the real path escaped by that one; the graph whose
+    /// length picks inline-vs-script mode is measured between those two steps.
+    /// If the transformations ever drift apart, the string ffmpeg parses is not
+    /// the string that was measured — so they are the same function, and this is
+    /// what says so.
+    #[test]
+    fn the_textfile_escaper_is_the_builders_escaper() {
+        for p in [
+            r"C:\Users\adele\AppData\Local\Temp\taroting-text-ab-0.txt",
+            r"D:\a folder\with-dashes_and.dots.txt",
+            r"\\server\share\clip.txt",
+            "no-separators-at-all",
+        ] {
+            assert_eq!(
+                escape_text_path(p).unwrap(),
+                builder::escape_filter_value(p),
+                "escapers disagree on {p}"
+            );
+        }
+        // Both still refuse a quote — the rejection is what stayed per-caller.
+        assert!(escape_text_path("a'b").is_err());
+    }
+
     #[test]
     fn escape_text_path_leaves_a_normal_path_unchanged() {
         let esc = escape_text_path(r"C:\Users\adele\AppData\Local\Temp\taroting-text-ab-0.txt")
@@ -999,13 +1019,176 @@ mod e2e {
     }
 
     fn encode(spec: &ExportSpec, dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        encode_with(spec, dir, name, &enc())
+    }
+
+    /// `encode` against an explicit encoder report, so a test can drive the
+    /// hardware branch of `chosen_encoder` without touching real detection.
+    fn encode_with(
+        spec: &ExportSpec,
+        dir: &std::path::Path,
+        name: &str,
+        encoders: &crate::hw::EncoderReport,
+    ) -> std::path::PathBuf {
         let out = dir.join(name);
         let out_s = out.to_string_lossy().into_owned();
-        let built = builder::build(spec, &enc()).unwrap();
+        let built = builder::build(spec, encoders).unwrap();
         let part = dir.join(format!("{name}.part"));
         run_built(&built, &out_s, &part);
         std::fs::rename(&part, &out).unwrap();
         out
+    }
+
+    /// A PRIVATE fixture directory per test.
+    ///
+    /// The shared `fixtures_dir` is reused across tests that run in parallel, and
+    /// a fixture half-written by one of them reads back as a corrupt file in
+    /// another ("moov atom not found"). Anything built fresh by a single test
+    /// lives here instead, where nothing else can be mid-write in it.
+    fn case_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("taroting export case {tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Read one ffprobe field off a file's first video stream.
+    fn probe_field(path: &std::path::Path, entry: &str) -> String {
+        let out = ffmpeg::run(
+            "ffprobe",
+            &[
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", entry,
+                "-of", "default=nw=1:nk=1",
+                path.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Decode the whole file and fail on the first decoder complaint.
+    ///
+    /// A container can accept a stream, exit 0 and still produce something no
+    /// decoder can open — which is exactly the shape of the AVI defect below, so
+    /// "ffprobe named a codec" is not enough on its own.
+    fn decodes_cleanly(path: &std::path::Path) -> std::result::Result<(), String> {
+        let out = ffmpeg::command("ffmpeg")
+            .unwrap()
+            .args([
+                "-hide_banner", "-loglevel", "error",
+                "-i", path.to_str().unwrap(),
+                "-f", "null", "-",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if out.status.success() && stderr.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("exit={:?} stderr={stderr}", out.status.code()))
+        }
+    }
+
+    /* -------- reading rotation out of real pixels -------- */
+
+    /// A 640x360 source whose four quadrants are four different colours.
+    ///
+    /// ASYMMETRIC BY CONSTRUCTION, and that is the entire point. Every earlier
+    /// rotation test measured a bounding box, and a box cannot tell a correct
+    /// quarter turn from one the wrong way round — both come out 360x640. Four
+    /// distinct quadrants give each of the four orientations (none, 90, 180,
+    /// 270) a DIFFERENT corner layout, so the assertion names a direction.
+    fn quad_fixture(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let src = dir.join(name);
+        let quad = |c: &str| format!("color={c}:s=320x180:r=30:d=1");
+        ffmpeg_ok(&[
+            "-y",
+            "-f", "lavfi", "-i", &quad("red"),
+            "-f", "lavfi", "-i", &quad("lime"),
+            "-f", "lavfi", "-i", &quad("blue"),
+            "-f", "lavfi", "-i", &quad("white"),
+            "-filter_complex", "[0][1]hstack[t];[2][3]hstack[b];[t][b]vstack,format=yuv420p",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "5",
+            src.to_str().unwrap(),
+        ]);
+        src
+    }
+
+    /// Name the colour at the centre of each quadrant of a decoded frame, in
+    /// the order [top-left, top-right, bottom-left, bottom-right].
+    ///
+    /// Patches are averaged well inside each quadrant so neither the export's
+    /// rescale nor yuv420p's chroma subsampling at the seams can reach them,
+    /// and the four references are chosen to survive a lossy encode: which
+    /// channels are high is unambiguous for all of red/green/blue/white.
+    fn corner_colors(path: &std::path::Path, t: f64) -> [String; 4] {
+        let w: u32 = probe_field(path, "stream=width").parse().unwrap();
+        let h: u32 = probe_field(path, "stream=height").parse().unwrap();
+        let out = ffmpeg::command("ffmpeg")
+            .unwrap()
+            .args([
+                "-hide_banner", "-loglevel", "error",
+                "-ss", &format!("{t:.3}"),
+                "-i", path.to_str().unwrap(),
+                "-frames:v", "1",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+            ])
+            .output()
+            .unwrap();
+        let px = out.stdout;
+        assert_eq!(
+            px.len(),
+            (w as usize) * (h as usize) * 3,
+            "expected one {w}x{h} rgb24 frame from {}",
+            path.display()
+        );
+
+        let name_at = |cx: u32, cy: u32| -> String {
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for y in cy.saturating_sub(4)..(cy + 4).min(h) {
+                for x in cx.saturating_sub(4)..(cx + 4).min(w) {
+                    let i = ((y as usize) * (w as usize) + x as usize) * 3;
+                    r += px[i] as u32;
+                    g += px[i + 1] as u32;
+                    b += px[i + 2] as u32;
+                    n += 1;
+                }
+            }
+            let (r, g, b) = (r / n, g / n, b / n);
+            match (r >= 128, g >= 128, b >= 128) {
+                (true, true, true) => "white".into(),
+                (true, false, false) => "red".into(),
+                (false, true, false) => "green".into(),
+                (false, false, true) => "blue".into(),
+                _ => format!("rgb({r},{g},{b})"),
+            }
+        };
+        [
+            name_at(w / 4, h / 4),
+            name_at(3 * w / 4, h / 4),
+            name_at(w / 4, 3 * h / 4),
+            name_at(3 * w / 4, 3 * h / 4),
+        ]
+    }
+
+    /// Is this encoder usable on THIS machine? A real short encode, because
+    /// `-encoders` lists everything ffmpeg was built with, present hardware or
+    /// not.
+    fn encoder_available(enc_name: &str) -> bool {
+        ffmpeg::command("ffmpeg")
+            .unwrap()
+            .args([
+                "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=duration=0.2:size=320x180:rate=30",
+                "-frames:v", "5",
+                "-c:v", enc_name,
+                "-f", "null", "-",
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     /// A small solid-color generated media (kind image, generator=solid).
@@ -1285,6 +1468,407 @@ mod e2e {
         let info = probe::probe_sync(out.to_str().unwrap()).unwrap();
         assert_eq!(info.kind, "gif");
         assert!(!info.has_audio);
+    }
+
+    /* -------- (5) the opacity mask at an extreme source width -------- */
+
+    /// The alpha mask is seeded at 16x16 and enlarged to the clip's post-crop
+    /// size. swscale's graph builder refuses a single pass beyond ~6890x on an
+    /// axis, so from that seed anything past ~110,240 px wide aborted the whole
+    /// export with "Failed initializing scaling graph (Not yet implemented in
+    /// FFmpeg, patches welcome)" — no frames, no useful message.
+    ///
+    /// 131056x120 is an authorable source, not a contrivance: a text
+    /// generator's box is `measureText`'s natural width and nothing caps it, so
+    /// one long unbroken pasted line gets there. The opacity KEYFRAME is what
+    /// emits the mask at all — the identical project with static opacity takes
+    /// the `colorchannelmixer` path and exports fine, which is why this hid.
+    #[test]
+    fn e2e_animated_opacity_survives_a_source_wider_than_one_swscale_pass() {
+        let dir = case_dir("maskwidth");
+        let mut wide = solid_media("wide", "#2080ff");
+        wide.width = Some(131_056);
+        wide.height = Some(120);
+
+        let mut c = clip_at("c1", "wide", 0.0, 0.0, 0.2);
+        c.keyframes = Some(ClipKeyframes {
+            x: None, y: None, scale: None,
+            opacity: Some(vec![
+                Keyframe { t: 0.0, v: 1.0 },
+                Keyframe { t: 0.2, v: 0.25 },
+            ]),
+        });
+        // Canvas, source and output all differ on both axes.
+        let tl = Timeline {
+            fps: Rational { num: 30, den: 1 }, width: 1280, height: 720,
+            tracks: vec![vtrack("v", vec![c])], markers: vec![],
+        };
+        let preset = ExportPreset {
+            format: "mp4".into(), vcodec: "h264".into(),
+            resolution: ResolutionPreset::Custom { w: 1920, h: 1080 },
+            fps: FpsPreset::Custom(30.0),
+            video_bitrate: BitratePreset::Auto(AutoTag::Auto),
+            audio_bitrate: BitratePreset::Auto(AutoTag::Auto),
+            use_hardware: false,
+        };
+        let spec = ExportSpec {
+            media: vec![wide], timeline: tl, preset,
+            out_path: dir.join("widemask.mp4").to_string_lossy().into_owned(),
+        };
+        // `encode` asserts ffmpeg exited 0 — with a single-pass mask it does not.
+        let out = encode(&spec, &dir, "widemask.mp4");
+
+        let info = probe::probe_sync(out.to_str().unwrap()).unwrap();
+        assert_eq!(info.width, Some(1920));
+        assert_eq!(info.height, Some(1080));
+        // 131056:120 fits to a 1920x2 strip centred at y=539. It must actually
+        // carry the colour: `alphamerge` REPLACING the alpha instead of
+        // multiplying it would leave a black band here even though ffmpeg
+        // exited 0.
+        let strip = yavg(&out, 0.05, 0, 539, 1920, 2);
+        assert!(strip > 20.0, "the fitted strip should be lit, got YAVG {strip}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* -------- (6) AVI must not hand back an undecodable stream -------- */
+
+    /// Every codec the dialog still OFFERS for AVI must come back as the codec
+    /// that was asked for, and must decode.
+    ///
+    /// The defect this pins: AVI + HEVC exits 0 and writes a NULL fourcc, which
+    /// ffprobe reads back as `rawvideo` and no decoder can open. HEVC was
+    /// removed from the offered list (a frontend list a Rust test cannot see),
+    /// but nothing asserted the PROPERTY — so the next codec added to a
+    /// container would be exposed to exactly the same trap. This is that
+    /// assertion, and it is deliberately about the file, not the list.
+    #[test]
+    fn e2e_avi_writes_a_stream_that_decodes_back_as_the_codec_asked_for() {
+        let dir = case_dir("avi");
+        let (_src, media) = fixture_media(&dir);
+
+        for vcodec in ["h264", "av1"] {
+            let c = clip_at("c1", "m1", 0.0, 0.0, 1.0);
+            let tl = Timeline {
+                fps: Rational { num: 30, den: 1 }, width: 640, height: 360,
+                tracks: vec![vtrack("v", vec![c])], markers: vec![],
+            };
+            let preset = ExportPreset {
+                format: "avi".into(), vcodec: vcodec.into(),
+                resolution: ResolutionPreset::Custom { w: 320, h: 180 },
+                fps: FpsPreset::Custom(15.0),
+                video_bitrate: BitratePreset::Auto(AutoTag::Auto),
+                audio_bitrate: BitratePreset::Auto(AutoTag::Auto),
+                use_hardware: false,
+            };
+            let name = format!("avi-{vcodec}.avi");
+            let spec = ExportSpec {
+                media: vec![media.clone()], timeline: tl, preset,
+                out_path: dir.join(&name).to_string_lossy().into_owned(),
+            };
+            let out = encode(&spec, &dir, &name);
+
+            let info = probe::probe_sync(out.to_str().unwrap()).unwrap();
+            assert_eq!(
+                info.vcodec.as_deref(),
+                Some(vcodec),
+                "avi+{vcodec} came back as {:?}",
+                info.vcodec
+            );
+            assert_ne!(
+                info.vcodec.as_deref(),
+                Some("rawvideo"),
+                "avi+{vcodec}: a null fourcc reads back as rawvideo"
+            );
+            // The mechanism underneath: AVI identifies the stream by fourcc, and
+            // the failure mode was an empty one.
+            let tag = probe_field(&out, "stream=codec_tag_string");
+            assert_ne!(tag, "[0][0][0][0]", "avi+{vcodec} wrote a null fourcc");
+            assert!(!tag.is_empty(), "avi+{vcodec} wrote no fourcc at all");
+            // And the whole file must decode, not merely be labelled.
+            decodes_cleanly(&out)
+                .unwrap_or_else(|e| panic!("avi+{vcodec} does not decode: {e}"));
+            // AVI carries mp3 audio here — the container has to survive that too.
+            assert!(info.has_audio, "avi+{vcodec} lost its audio track");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* -------- (7) rotation DIRECTION, read from pixels -------- */
+
+    /// Each rotation must land each colour in a specific corner.
+    ///
+    /// A bounding box cannot distinguish these: 90 and 270 produce a frame of
+    /// identical extent, and so do 0 and 180. Only the corner layout separates
+    /// all four, which is why the fixture is four different colours and the
+    /// expectations below are corner NAMES.
+    ///
+    /// Read them as a quarter turn of the source [red, green / blue, white]:
+    /// clockwise (90) sends the top-left to the top-right; counter-clockwise
+    /// (270) sends it to the bottom-left.
+    #[test]
+    fn e2e_clip_rotation_lands_every_corner_in_the_right_place() {
+        let dir = case_dir("rotate");
+        let src = quad_fixture(&dir, "quad.mp4");
+        let info = probe::probe_sync(src.to_str().unwrap()).unwrap();
+        let media = MediaRef {
+            id: "m1".into(), path: src.to_string_lossy().into_owned(),
+            size: info.size, mtime_ms: info.mtime_ms, kind: "video".into(),
+            duration: info.duration, fps: Some(Rational { num: 30, den: 1 }),
+            width: Some(640), height: Some(360),
+            container: info.container.clone(), vcodec: info.vcodec.clone(),
+            acodec: None, pix_fmt: info.pix_fmt.clone(), bit_depth: Some(8),
+            has_audio: false, audio_rate: None, audio_channels: None, generator: None,
+        };
+
+        // [top-left, top-right, bottom-left, bottom-right]
+        let cases: [(u32, (u32, u32), [&str; 4]); 4] = [
+            (0, (480, 270), ["red", "green", "blue", "white"]),
+            (90, (270, 480), ["blue", "red", "white", "green"]),
+            (180, (480, 270), ["white", "blue", "green", "red"]),
+            (270, (270, 480), ["green", "white", "red", "blue"]),
+        ];
+        for (rotate, (ow, oh), want) in cases {
+            let mut c = clip_at("c1", "m1", 0.0, 0.0, 1.0);
+            c.transform = Some(ClipTransform {
+                crop: None, rotate, flip_h: false, flip_v: false,
+                scale: 1.0, x: 0.0, y: 0.0, opacity: 1.0,
+            });
+            // Canvas differs from the source AND from every output, so nothing
+            // here can coincide its way to a pass.
+            let tl = Timeline {
+                fps: Rational { num: 30, den: 1 }, width: 1600, height: 900,
+                tracks: vec![vtrack("v", vec![c])], markers: vec![],
+            };
+            let preset = ExportPreset {
+                format: "mp4".into(), vcodec: "h264".into(),
+                resolution: ResolutionPreset::Custom { w: ow, h: oh },
+                fps: FpsPreset::Custom(30.0),
+                video_bitrate: BitratePreset::Auto(AutoTag::Auto),
+                audio_bitrate: BitratePreset::Auto(AutoTag::Auto),
+                use_hardware: false,
+            };
+            let name = format!("rot{rotate}.mp4");
+            let spec = ExportSpec {
+                media: vec![media.clone()], timeline: tl, preset,
+                out_path: dir.join(&name).to_string_lossy().into_owned(),
+            };
+            let out = encode(&spec, &dir, &name);
+
+            let probed = probe::probe_sync(out.to_str().unwrap()).unwrap();
+            assert_eq!(
+                (probed.width, probed.height),
+                (Some(ow), Some(oh)),
+                "rotate {rotate}: exported extent"
+            );
+            let got = corner_colors(&out, 0.5);
+            assert_eq!(
+                got.iter().map(String::as_str).collect::<Vec<_>>(),
+                want.to_vec(),
+                "rotate {rotate}: corners are [TL, TR, BL, BR]"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other rotation a real recording carries: a Display Matrix in the
+    /// container, which is how every phone stores portrait footage.
+    ///
+    /// ffmpeg autorotates on decode, so the frames reaching the filtergraph are
+    /// already turned and `media.width/height` must be the DISPLAY size — the
+    /// pairing `project::schema::ROTATION_REPAIR_SCHEMA` exists to repair. This
+    /// asserts the turn actually reaches the exported pixels, and in which
+    /// direction: ffprobe reports this matrix as rotation=90 and the decoder
+    /// applies a quarter turn COUNTER-clockwise.
+    #[test]
+    fn e2e_container_rotation_metadata_reaches_the_exported_pixels() {
+        let dir = case_dir("rotmeta");
+        let flat = quad_fixture(&dir, "quad.mp4");
+        let rotated = dir.join("quad-r90.mp4");
+        ffmpeg_ok(&[
+            "-y",
+            "-display_rotation:v:0", "90",
+            "-i", flat.to_str().unwrap(),
+            "-c", "copy",
+            rotated.to_str().unwrap(),
+        ]);
+
+        // Fixture guards. Without these the assertion below could pass on a
+        // fixture that was simply PAINTED rotated.
+        assert_eq!(
+            probe_field(&rotated, "stream_side_data=rotation"),
+            "90",
+            "the fixture must carry a real Display Matrix"
+        );
+        assert_eq!(
+            (
+                probe_field(&rotated, "stream=width"),
+                probe_field(&rotated, "stream=height"),
+            ),
+            ("640".to_string(), "360".to_string()),
+            "the CODED frame must still be the landscape one"
+        );
+
+        // probe_sync is rotation-aware: this is the size a MediaRef records, and
+        // the size the preview's <video> element reports.
+        let info = probe::probe_sync(rotated.to_str().unwrap()).unwrap();
+        assert_eq!(
+            (info.width, info.height),
+            (Some(360), Some(640)),
+            "a quarter-turn recording must be recorded at its DISPLAY size"
+        );
+
+        let media = MediaRef {
+            id: "m1".into(), path: rotated.to_string_lossy().into_owned(),
+            size: info.size, mtime_ms: info.mtime_ms, kind: "video".into(),
+            duration: info.duration, fps: Some(Rational { num: 30, den: 1 }),
+            width: info.width, height: info.height,
+            container: info.container.clone(), vcodec: info.vcodec.clone(),
+            acodec: None, pix_fmt: info.pix_fmt.clone(), bit_depth: Some(8),
+            has_audio: false, audio_rate: None, audio_channels: None, generator: None,
+        };
+        // No clip transform at all: every degree of turn here comes from the file.
+        let c = clip_at("c1", "m1", 0.0, 0.0, 1.0);
+        let tl = Timeline {
+            fps: Rational { num: 30, den: 1 }, width: 1600, height: 900,
+            tracks: vec![vtrack("v", vec![c])], markers: vec![],
+        };
+        let preset = ExportPreset {
+            format: "mp4".into(), vcodec: "h264".into(),
+            resolution: ResolutionPreset::Custom { w: 270, h: 480 },
+            fps: FpsPreset::Custom(30.0),
+            video_bitrate: BitratePreset::Auto(AutoTag::Auto),
+            audio_bitrate: BitratePreset::Auto(AutoTag::Auto),
+            use_hardware: false,
+        };
+        let spec = ExportSpec {
+            media: vec![media], timeline: tl, preset,
+            out_path: dir.join("meta.mp4").to_string_lossy().into_owned(),
+        };
+        let out = encode(&spec, &dir, "meta.mp4");
+
+        let got = corner_colors(&out, 0.5);
+        assert_eq!(
+            got.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["green", "white", "red", "blue"],
+            "a rotation=90 Display Matrix is a quarter turn counter-clockwise"
+        );
+        // Named separately so a no-op autorotation reads as what it is rather
+        // than as some other mistake.
+        assert_ne!(
+            got[0], "red",
+            "top-left is still the CODED top-left: the rotation was dropped"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* -------- (8) hardware-encoder geometry -------- */
+
+    /// Every geometry number this project has ever measured came out of
+    /// libx264. NVENC/QSV/AMF share the whole filtergraph and differ only in
+    /// codec args, but "should be identical" is not a measurement — so each
+    /// encoder this machine can actually run is put through the same export and
+    /// its output size probed.
+    ///
+    /// libx264 is a row here too, deliberately: it makes the test assert
+    /// something real on a machine with no hardware encoder at all, instead of
+    /// skipping into a silent pass.
+    #[test]
+    fn e2e_available_encoders_all_honour_the_export_resolution() {
+        let dir = case_dir("hwgeom");
+        let (_src, media) = fixture_media(&dir);
+
+        // (encoder, preset vcodec, ffprobe codec_name, hardware?)
+        let candidates: [(&str, &str, &str, bool); 10] = [
+            ("libx264", "h264", "h264", false),
+            ("libx265", "hevc", "hevc", false),
+            ("h264_nvenc", "h264", "h264", true),
+            ("h264_qsv", "h264", "h264", true),
+            ("h264_amf", "h264", "h264", true),
+            ("hevc_nvenc", "hevc", "hevc", true),
+            ("hevc_qsv", "hevc", "hevc", true),
+            ("hevc_amf", "hevc", "hevc", true),
+            ("av1_nvenc", "av1", "av1", true),
+            ("av1_qsv", "av1", "av1", true),
+        ];
+
+        let mut ran: Vec<&str> = Vec::new();
+        let mut skipped: Vec<&str> = Vec::new();
+        for (enc_name, vcodec, want_codec, hardware) in candidates {
+            if !encoder_available(enc_name) {
+                skipped.push(enc_name);
+                continue;
+            }
+            let report = crate::hw::EncoderReport {
+                h264: enc_name.into(),
+                hevc: enc_name.into(),
+                av1: enc_name.into(),
+                detail: vec![],
+            };
+            let c = clip_at("c1", "m1", 0.0, 0.0, 1.0);
+            // Source 640x360, canvas 1280x720, output 480x270: three different
+            // sizes, so an encoder that quietly kept the source or the canvas
+            // size is visible rather than coincidentally right.
+            let tl = Timeline {
+                fps: Rational { num: 30, den: 1 }, width: 1280, height: 720,
+                tracks: vec![vtrack("v", vec![c])], markers: vec![],
+            };
+            let preset = ExportPreset {
+                format: "mp4".into(), vcodec: vcodec.into(),
+                resolution: ResolutionPreset::Custom { w: 480, h: 270 },
+                fps: FpsPreset::Custom(30.0),
+                video_bitrate: BitratePreset::Auto(AutoTag::Auto),
+                audio_bitrate: BitratePreset::Auto(AutoTag::Auto),
+                use_hardware: hardware,
+            };
+            let name = format!("{enc_name}.mp4");
+            let spec = ExportSpec {
+                media: vec![media.clone()], timeline: tl, preset,
+                out_path: dir.join(&name).to_string_lossy().into_owned(),
+            };
+            // Without this the whole row could quietly run on libx264 — ffprobe
+            // reports "h264" for every h264 encoder alive, so the file cannot
+            // tell us which one made it.
+            let argv: Vec<String> = builder::build(&spec, &report)
+                .unwrap()
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                argv.windows(2).any(|w| w[0] == "-c:v" && w[1] == enc_name),
+                "{enc_name} was not the encoder actually selected: {argv:?}"
+            );
+            let out = encode_with(&spec, &dir, &name, &report);
+
+            let info = probe::probe_sync(out.to_str().unwrap()).unwrap();
+            assert_eq!(
+                (info.width, info.height),
+                (Some(480), Some(270)),
+                "{enc_name}: exported at the wrong size"
+            );
+            assert_eq!(
+                info.vcodec.as_deref(),
+                Some(want_codec),
+                "{enc_name}: wrong codec in the file"
+            );
+            assert!((info.duration - 1.0).abs() < 0.25, "{enc_name}: duration {}", info.duration);
+            decodes_cleanly(&out)
+                .unwrap_or_else(|e| panic!("{enc_name} output does not decode: {e}"));
+            let _ = std::fs::remove_file(&out);
+            ran.push(enc_name);
+        }
+
+        println!("encoder geometry — ran {ran:?}; unavailable on this machine {skipped:?}");
+        assert!(
+            ran.contains(&"libx264"),
+            "the software control row must always run; ran {ran:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

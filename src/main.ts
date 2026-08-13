@@ -8,6 +8,7 @@ import { createProject, importMediaAsClip } from "./core/project";
 import { confirmLeaveCurrentSession, initSettings, settingsStore } from "./core/session";
 import { MEDIA_FILE_EXTENSIONS } from "./core/types";
 import { mountHome } from "./home/home";
+import { closeErrorDialogs } from "./ui/errors";
 import { toast } from "./ui/toast";
 
 // Suppress WebView2's native context menu everywhere except editable text
@@ -56,6 +57,12 @@ async function go(route: Route): Promise<void> {
   dispose = null;
   if (prev) await prev();
   if (token !== navToken) return; // superseded while disposing
+  // Clearing #app cannot reach an error dialog: those live on document.body so
+  // they can sit above everything. A screen that owns one has just closed it in
+  // dispose(); this catches the ones nobody owns — a toast's "Details" dialog
+  // has no teardown moment of its own, so without this it stays painted over
+  // the next screen, still trapping Tab.
+  closeErrorDialogs();
   app.innerHTML = "";
 
   if (route.view === "home") {

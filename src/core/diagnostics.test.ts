@@ -204,6 +204,15 @@ describe("sweepUsernames", () => {
     const s = "C:\\Program Files\\Taroting\\ffmpeg.exe";
     expect(sweepUsernames(s)).toBe(s);
   });
+
+  // An apostrophe is LEGAL in a Windows account name. The old class stopped the
+  // match at it, so O'Brien redacted to `<user>'Brien…` — the account tail and
+  // everything after it survived into the "redacted" text.
+  it("redacts an account name containing an apostrophe", () => {
+    expect(sweepUsernames("save C:\\Users\\O'Brien\\Documents\\x.trt failed")).toBe(
+      "save C:\\Users\\<user>\\Documents\\x.trt failed",
+    );
+  });
 });
 
 describe("createRedactor", () => {
@@ -226,6 +235,30 @@ describe("createRedactor", () => {
     expect(scrubbed).not.toContain("holiday");
     expect(scrubbed).not.toContain("adirh");
     expect(scrubbed).toContain("<file 1.mp4>");
+  });
+
+  // The exposed channel: a path that was never registered (the project's own
+  // .trt is not in project.media), under an apostrophe account name, with a
+  // space in the file name. Asserted as the WHOLE string so every part of the
+  // behaviour is pinned: the free-text match ends at the space (so half of a
+  // spaced name survives — the documented residual, same as any spaced name),
+  // but the account tail that used to leak is gone with the rest of the path.
+  it("keeps an apostrophe account name out of a free-text path it never knew", () => {
+    const r = createRedactor();
+    const scrubbed = r.text(
+      "cannot save C:\\Users\\O'Brien\\Documents\\Taroting\\Wedding film.trt (locked)",
+    );
+    expect(scrubbed).toBe("cannot save <file 1> film.trt (locked)");
+  });
+
+  // PATH_LIKE no longer stops at apostrophes, so in a single-quoted ffmpeg
+  // filtergraph it swallows the closing quote — the trailing trim must give it
+  // back to the filtergraph rather than bake it into the token.
+  it("returns the closing quote of a single-quoted filtergraph path", () => {
+    const r = createRedactor();
+    expect(r.text("fontfile='C:/Users/adirh/AppData/seg.ttf' failed")).toBe(
+      "fontfile='<file 1.ttf>' failed",
+    );
   });
 
   it("tokenizes an unknown absolute path found in free text", () => {
@@ -433,6 +466,36 @@ describe("buildReport", () => {
       }),
     );
     expect(custom).toContain("Shortcuts       2 customised");
+  });
+
+  it("names the three custom colours — under a custom theme they are the repro", () => {
+    // Every hex differs from every other AND from DEFAULT_CUSTOM_THEME, so a
+    // swapped role, a dropped role or a fallback to the stock palette each
+    // changes the line. Legibility under a custom theme is measured from these
+    // exact values, so a report without them cannot reproduce a "can't read it"
+    // complaint.
+    const text = buildReport(
+      baseCtx({
+        settings: makeSettings({
+          theme: "custom",
+          customTheme: { background: "#241a3d", accent: "#c58e8e", text: "#453274" },
+        }),
+      }),
+    );
+    expect(text).toContain(
+      "Theme           custom  background #241a3d  accent #c58e8e  text #453274",
+    );
+  });
+
+  it("leaves a built-in theme's line as the bare name", () => {
+    for (const theme of ["dark", "light", "system"] as const) {
+      const text = buildReport(baseCtx({ settings: makeSettings({ theme }) }));
+      expect(text).toContain(`Theme           ${theme}\n`);
+      // makeSettings still carries DEFAULT_CUSTOM_THEME — an unconditional dump
+      // would emit it even though the user is not on a custom theme.
+      expect(text).not.toContain("#111113");
+      expect(text).not.toContain("background #");
+    }
   });
 
   it("lists the recent-errors ring", () => {

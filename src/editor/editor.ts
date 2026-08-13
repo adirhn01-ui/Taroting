@@ -29,7 +29,7 @@ import { ProjectSession, currentSession, settingsStore, updateSettings } from ".
 import { ShortcutManager } from "../core/shortcuts";
 import { Store } from "../core/store";
 import { clipEnd, locate } from "../core/time";
-import { MEDIA_FILE_EXTENSIONS } from "../core/types";
+import { MEDIA_FILE_EXTENSIONS, TIMELINE_HEIGHT_MAX } from "../core/types";
 import type { ActionId, Clip, MediaInfo, MediaRef, ProjectFile, Track } from "../core/types";
 import { icon } from "../ui/icons";
 import { closeMenu, showMenu } from "../ui/menu";
@@ -39,6 +39,7 @@ import { mountInspector } from "./inspector/inspector";
 import { openGeneratorDialog } from "./media/generators";
 import { MediaManager } from "./media/media";
 import { openRelinkDialog } from "./media/relink";
+import { statusChange } from "./media/status-diff";
 import {
   AudioGraph,
   makeMonitorVolume,
@@ -53,7 +54,9 @@ import { mountCanvasOverlay } from "./preview/overlay";
 import { mountTheater } from "./preview/theater";
 import { collectCandidates, snapTime } from "./timeline/snap";
 import { laneLabels, laneLayout } from "./timeline/render";
+import { createLaneAutoScroll, type LaneAutoScroller } from "./timeline/interactions";
 import { trapTab } from "../ui/focus";
+import { PREVIEW_MIN_H, clampPanelHeight, maxPanelHeight } from "./timeline/panel-size";
 import { TimelineController } from "./timeline/timeline";
 
 export async function mountEditor(
@@ -118,6 +121,7 @@ export async function mountEditor(
         <div class="editor__main">
           <div class="editor__preview" id="ed-stage"></div>
           <div class="timeline-panel">
+            <div class="timeline-resize" id="ed-tl-resize" role="separator" aria-orientation="horizontal" title="Resize timeline"></div>
             <div class="transport no-select">
               <button class="btn btn--ghost btn--icon btn--sm" id="tr-step-back" title="Previous frame (←)">${icon("stepBack", 14)}</button>
               <button class="btn btn--icon" id="tr-play" title="Play/Pause (Space)">${icon("play")}</button>
@@ -667,6 +671,123 @@ export async function mountEditor(
   });
   updateTime();
 
+  /* ---------------- timeline panel height ---------------- */
+
+  // The panel was a fixed 280px, which leaves ~231px of lanes once the transport
+  // row is subtracted — cramped as soon as a project has a few layers, on a
+  // maximised window that has hundreds of spare pixels above it. Its height is
+  // now the user's: dragged from the divider on its top edge, and kept.
+  //
+  // The height is written to ONE element and nothing else is notified. The stage
+  // and the timeline canvas each already refit from their own ResizeObserver, so
+  // the letterbox and the canvas's DPR backing store follow the new box on their
+  // own — there is no second refit path here to keep in step with theirs.
+  const tlPanel = $(".timeline-panel");
+  const tlMain = $(".editor__main");
+  const tlHandle = $("#ed-tl-resize");
+
+  // The stage floor, from the same constant the drag clamps against (see the
+  // note in editor.css). With it, a stored height too tall for THIS window
+  // renders capped by flex instead of pushing the transport off the bottom —
+  // and is left alone in settings, so the height comes back in full on the
+  // window it was chosen for.
+  $("#ed-stage").style.minHeight = `${PREVIEW_MIN_H}px`;
+  // Sanitised on read already; clamped again here because this is the value that
+  // reaches a style write, and "NaNpx" would silently leave the stylesheet's.
+  tlPanel.style.height = `${clampPanelHeight(settingsStore.get().timelineHeight, TIMELINE_HEIGHT_MAX)}px`;
+
+  // One pointerdown listener is the entire cost of this feature to someone who
+  // never touches the divider: no observers, no timers, nothing scheduled. Every
+  // listener below is created on the gesture and destroyed with it.
+  let tlResizeCleanup: (() => void) | null = null;
+  tlHandle.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || tlResizeCleanup) return;
+    e.preventDefault();
+
+    // Measured ONCE, like the media-row drag: the panel's bottom edge is the
+    // anchor the pointer sizes against and .editor__main fixes the ceiling.
+    // Neither can move while a pointer is captured here, so re-reading them per
+    // move would buy nothing and cost a forced layout of the editor tree.
+    const panelBottom = tlPanel.getBoundingClientRect().bottom;
+    const maxH = maxPanelHeight(tlMain.getBoundingClientRect().height);
+    // The exact pre-drag declaration, restored verbatim if the drag is
+    // abandoned — not the measured height, which differs from it whenever flex
+    // is capping a stored value.
+    const beforeH = tlPanel.style.height;
+    const pointerId = e.pointerId;
+
+    let next: number | null = null;
+    let applied: number | null = null;
+    let raf = 0;
+    // A pointer can report faster than the compositor paints, and every apply
+    // costs a stage refit plus a canvas resize. Coalesce to one per frame.
+    const flush = (): void => {
+      raf = 0;
+      if (next === null || next === applied) return;
+      applied = next;
+      tlPanel.style.height = `${next}px`;
+    };
+    const onMove = (ev: PointerEvent): void => {
+      const h = clampPanelHeight(panelBottom - ev.clientY, maxH);
+      if (h === next) return;
+      next = h;
+      if (!raf) raf = requestAnimationFrame(flush);
+    };
+    const end = (keep: boolean): void => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+      tlResizeCleanup = null;
+      tlHandle.classList.remove("timeline-resize--active");
+      tlHandle.removeEventListener("pointermove", onMove);
+      tlHandle.removeEventListener("pointerup", onUp);
+      tlHandle.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("keydown", onKey, true);
+      if (tlHandle.hasPointerCapture(pointerId)) tlHandle.releasePointerCapture(pointerId);
+      if (!keep || next === null) {
+        tlPanel.style.height = beforeH;
+        return;
+      }
+      // The last move may have been coalesced into the frame just cancelled.
+      if (next !== applied) tlPanel.style.height = `${next}px`;
+      if (next === settingsStore.get().timelineHeight) return;
+      // ONE write, on release: a write per move would be dozens of disk writes a
+      // second. And SAY SO if it fails — the panel is already at the new height,
+      // so a rejected write otherwise looks exactly like a saved one until the
+      // next launch puts it back (same reasoning as the monitor volume above).
+      void updateSettings({ timelineHeight: next }).catch((err: unknown) => {
+        toast.error("Couldn't save your settings.", {
+          detail: describeError(err),
+          op: "Settings",
+          title: "Timeline height",
+        });
+      });
+    };
+    const onUp = (): void => end(true);
+    const onCancel = (): void => end(false);
+    const onKey = (ev: KeyboardEvent): void => {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault();
+      end(false);
+    };
+
+    // Capture keeps the drag alive when the pointer leaves the 6px band, which
+    // it does immediately. It throws for a synthesized/inactive pointer (the
+    // autotest harness), and a throw here would leave the gesture half-armed
+    // with no way to end it — the drag still works without it because every
+    // listener below lives on the handle itself. Same guard as overlay.ts.
+    try {
+      tlHandle.setPointerCapture(pointerId);
+    } catch {
+      /* synthetic pointer */
+    }
+    tlHandle.classList.add("timeline-resize--active");
+    tlHandle.addEventListener("pointermove", onMove);
+    tlHandle.addEventListener("pointerup", onUp);
+    tlHandle.addEventListener("pointercancel", onCancel);
+    window.addEventListener("keydown", onKey, true);
+    tlResizeCleanup = () => end(false);
+  });
+
   /* ---------------- media panel (readiness list) ---------------- */
 
   const mediaList = $("#media-list");
@@ -769,12 +890,56 @@ export async function mountEditor(
     });
   }
 
+  /**
+   * The progress-only repaint: a running job's bar width and its "Preparing NN%"
+   * label, on rows that are already in the DOM.
+   *
+   * Why this exists rather than another `renderMedia`: a job republishes the
+   * status map ~10 times a second, and the rebuild answer to that throws away
+   * and re-creates every row in the bin — thumbnails included, which re-decodes
+   * each <img> — while the user is editing. `statusChange` decides when this is
+   * the whole of what is owed. The label is written here as well as in
+   * `statusHtml` because it carries the percentage: leaving it to the markup
+   * alone would freeze the number at whatever the last rebuild happened to see
+   * while the bar underneath it kept filling.
+   *
+   * The bar element is also the proof that the row on screen is the Preparing
+   * row this media rendered as — no other status emits one. If it is missing,
+   * the DOM has not caught up with a project edit yet, and the rebuild that edit
+   * already scheduled owns the row.
+   */
+  function paintMediaProgress(items: MediaRef[]): void {
+    const status = media.status.get();
+    const rows = mediaList.children;
+    for (let i = 0; i < items.length; i++) {
+      const s = status[items[i]!.id];
+      if (s?.state !== "preparing") continue;
+      const row = rows[i];
+      if (!(row instanceof HTMLElement)) continue;
+      const fill = row.querySelector<HTMLElement>(".media-row__bar > div");
+      if (!fill) continue;
+      fill.style.width = `${Math.round((s.ratio ?? 0.05) * 100)}%`;
+      const label = row.querySelector<HTMLElement>(".media-row__status");
+      if (label) {
+        label.textContent =
+          s.ratio === null ? "Preparing" : `Preparing ${Math.round(s.ratio * 100)}%`;
+      }
+    }
+  }
+
   const unsubs = [
     session.store.subscribe(() => {
       renderMedia();
       updateTime();
     }),
-    media.status.subscribe(() => {
+    media.status.subscribe((next, prev) => {
+      const change = statusChange(prev, next);
+      if (change === "none") return;
+      if (change === "progress") {
+        // Same rows, same states — only the number moved.
+        paintMediaProgress(session.project.media);
+        return;
+      }
       renderMedia();
       engine.refresh(); // proxies finishing may make the current frame playable
     }),
@@ -901,6 +1066,22 @@ export async function mountEditor(
     let previewRect: DOMRect | null = null;
     let hostRect: DOMRect | null = null;
 
+    /* Where the pointer was on the last move, in client coordinates. The
+       auto-scroll tick re-resolves the target from these because scrolling
+       slides the lanes under a STATIONARY pointer: the lane under the cursor
+       changes with no pointer event to announce it. Same reason interactions.ts
+       keeps lastX/lastY for the canvas drag. */
+    let lastClientX = 0;
+    let lastClientY = 0;
+
+    /* Lane auto-scroll, so a bin item can reach a lane that is scrolled out of
+       view. Without it this gesture could only ever drop onto the three or four
+       lanes that happen to be on screen, while dragging a clip already on the
+       timeline reached all of them — the same drag, two different sets of
+       reachable lanes. Built on the first real move (a plain click on a bin row
+       must stay free) and torn down in `cleanup`, the drag's single exit. */
+    let autoScroll: LaneAutoScroller | null = null;
+
     const resolveTarget = (clientX: number, clientY: number, pr: DOMRect, tr: DOMRect): void => {
       dropTarget = null;
       stageCanvas.classList.remove("preview__canvas--droptarget");
@@ -910,6 +1091,7 @@ export async function mountEditor(
       if (clientX >= pr.left && clientX <= pr.right && clientY >= pr.top && clientY <= pr.bottom) {
         dropTarget = { kind: "preview" };
         stageCanvas.classList.add("preview__canvas--droptarget");
+        autoScroll?.aim(null);
         timeline.clearDropPreview();
         return;
       }
@@ -918,6 +1100,12 @@ export async function mountEditor(
       if (clientX >= tr.left && clientX <= tr.right && clientY >= tr.top && clientY <= tr.bottom) {
         const localY = clientY - tr.top;
         const localX = clientX - tr.left;
+        // Aimed BEFORE the lane lookup, deliberately: the pinned ruler is "above
+        // the lanes", so hovering it pulls the stack up at full speed rather
+        // than being a dead spot, and the edge band at the bottom pulls down
+        // even while no lane resolves there. The host is the canvas's own box,
+        // so this local y is the canvas-local y the zone maths expects.
+        autoScroll?.aim(localY);
         const lanes = laneLayout(session.project);
         const lane = lanes.find((l) => localY >= l.y && localY < l.y + l.h);
         const kindOk =
@@ -941,7 +1129,9 @@ export async function mountEditor(
         return;
       }
 
-      // nowhere droppable
+      // nowhere droppable — including outside the window entirely, which is why
+      // the scroll is parked here rather than left running off the last aim.
+      autoScroll?.aim(null);
       timeline.clearDropPreview();
     };
 
@@ -954,8 +1144,18 @@ export async function mountEditor(
         // measured on pointerdown: a plain click on a bin row must stay free.
         previewRect = stageCanvas.getBoundingClientRect();
         hostRect = timeline.hostRect();
+        autoScroll = createLaneAutoScroll(timeline, () => {
+          // The lanes moved under the pointer: re-resolve from where it actually
+          // is, so the target lane and the drop guide keep agreeing with the
+          // offset that is now on screen.
+          if (previewRect && hostRect) {
+            resolveTarget(lastClientX, lastClientY, previewRect, hostRect);
+          }
+        });
         buildGhost();
       }
+      lastClientX = e.clientX;
+      lastClientY = e.clientY;
       if (ghost) {
         ghost.style.left = `${e.clientX + 12}px`;
         ghost.style.top = `${e.clientY + 12}px`;
@@ -989,6 +1189,11 @@ export async function mountEditor(
     };
     const cleanup = (): void => {
       dragCleanup = null;
+      // First and unconditionally: a loop that outlives its drag would keep
+      // scrolling a timeline nobody is dragging on. Every exit — pointerup,
+      // Escape, and the editor's own dispose — reaches this one function.
+      autoScroll?.stop();
+      autoScroll = null;
       ghost?.remove();
       stageCanvas.classList.remove("preview__canvas--droptarget");
       timeline.clearDropPreview();
@@ -1048,6 +1253,10 @@ export async function mountEditor(
     }
     const doCascade = (): void => {
       commit((proj) => removeMediaCascade(proj, m.id));
+      // The manager keeps status/waveforms/thumbs for every id it has ever
+      // tracked; a removed media would otherwise sit in those maps (waveform
+      // peaks included) for the rest of the session.
+      media.untrack(m.id);
       // clear selection if it referenced a now-removed clip
       const sel = selectedClipId();
       if (sel && !findClip(session.project, sel)) select(null);
@@ -1428,6 +1637,9 @@ export async function mountEditor(
       flushVolumeSave();
       unRefit();
       unName();
+      // Teardown mid-drag: the divider's own listeners die with the element, but
+      // the window keydown and the pending frame do not.
+      tlResizeCleanup?.();
       if (dragCleanup) dragCleanup();
       for (const u of unsubs) u();
       unlistenDrop?.();

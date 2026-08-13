@@ -14,7 +14,7 @@ import { navigate } from "../core/nav";
 import { addMedia, createProject } from "../core/project";
 import { MEDIA_FILE_EXTENSIONS } from "../core/types";
 import type { RecentItem } from "../core/types";
-import { trapTab } from "../ui/focus";
+import { focusFirst, trapTab } from "../ui/focus";
 import { icon } from "../ui/icons";
 import { closeMenu, showMenu } from "../ui/menu";
 import { toast } from "../ui/toast";
@@ -424,6 +424,17 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       input.addEventListener("focus", () => input.select());
       // defer so the modal is laid out before selecting
       requestAnimationFrame(() => input.focus());
+    } else {
+      // Nothing to type into, so focus a BUTTON — the trap only exists while
+      // focus is inside the backdrop, and a confirm that opens with focus on
+      // <body> lets Tab walk the project grid behind it.
+      //
+      // Never the red one. A danger modal's confirm deletes a real file for
+      // good, and seating focus there turns "Tab escaped the dialog" into "Enter
+      // permanently deleted a project" — a worse bug than the one being fixed.
+      // Cancel is also what enterSelectMode focuses, so the screen stays
+      // consistent about where a destructive prompt starts.
+      focusFirst(backdrop, opts.danger ? '[data-act="cancel"]' : '[data-act="confirm"]');
     }
 
     const releaseTrap = trapTab(backdrop);

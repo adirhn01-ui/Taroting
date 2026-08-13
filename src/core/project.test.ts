@@ -84,6 +84,28 @@ describe("createProject / addMedia", () => {
     expect(p.timeline.tracks).toHaveLength(1);
   });
 
+  /**
+   * The version stamp is a claim about the MEDIA in the file: schema 2 means
+   * "these width/height values are display-oriented". A project created today
+   * records them from `probe_media`, which reads the display matrix, so the
+   * claim is true the moment the file exists — and stamping 1 would ask the
+   * Rust loader (gated on `ROTATION_REPAIR_SCHEMA`, project/schema.rs) to
+   * ffprobe every video in the project on its first open, then rewrite the
+   * file, only to find nothing to correct.
+   */
+  it("stamps a new project at the schema its media already satisfies", () => {
+    expect(createProject("New").schema).toBe(2);
+  });
+
+  it("never restamps a project it did not create", () => {
+    // `sanitizeProject` repairs VALUES. The version is the loader's business —
+    // `migrate` and the rotation re-probe are both keyed off it — so a file
+    // that arrives claiming 1 has to come out claiming 1, or the one pass that
+    // corrects a sideways phone recording is skipped for good.
+    const old: ProjectFile = { ...createProject("Old"), schema: 1 };
+    expect(sanitizeProject(old).schema).toBe(1);
+  });
+
   it("adopts resolution + fps from the first visual media", () => {
     let p = createProject("New");
     p = addMedia(p, videoInfo()).project;

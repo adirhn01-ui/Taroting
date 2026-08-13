@@ -80,6 +80,10 @@ html[data-rescue-chrome] #ed-settings:focus-visible {
 
 /* ---------- preview stage ---------- */
 
+/* min-height is overwritten at mount with PREVIEW_MIN_H (timeline/panel-size.ts)
+ * — the floor the divider drag clamps against, kept in ONE place by writing it
+ * through the CSSOM rather than restating it here. It is what stops a tall
+ * timeline from swallowing the stage on a short window. */
 .editor__preview {
   flex: 1;
   min-height: 0;
@@ -159,6 +163,10 @@ html[data-rescue-chrome] #ed-settings:focus-visible {
   font-size: var(--fs-13);
   text-align: center;
   padding: var(--sp-4);
+  /* Without this the scrim painted UNDER every positioned sibling: the media
+   * layer sets (z 1..n) and the stage overlay (200). On a multi-layer project
+   * a lower track's picture covered "Preview unavailable" entirely. */
+  z-index: var(--z-stage-status);
 }
 .preview__overlay.active {
   display: flex;
@@ -166,13 +174,56 @@ html[data-rescue-chrome] #ed-settings:focus-visible {
 
 /* ---------- timeline panel ---------- */
 
+/* The height here is only what the panel measures for the frame before mount
+ * writes Settings.timelineHeight onto the element (editor.ts) — the number a
+ * user actually sees is theirs, dragged from the divider below and persisted.
+ * Keep it equal to DEFAULT_SETTINGS.timelineHeight so the two never disagree.
+ *
+ * `0 1 auto` rather than `none`: on a window too short for the stored height the
+ * panel yields instead of pushing the transport off the bottom edge, and the
+ * stage's mounted min-height is what decides where that yielding stops. Nothing
+ * shrinks while the height fits, so the ordinary case is unchanged.
+ *
+ * position:relative so the divider can straddle the top border. */
 .timeline-panel {
+  position: relative;
   height: 280px;
-  flex: none;
+  flex: 0 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   border-top: 1px solid var(--border);
   background: var(--bg-app);
+}
+
+/* Resize divider: a 6px band centred on the panel's top border, invisible at
+ * rest so the default view keeps exactly the chrome it had, and an accent line
+ * under the pointer or during the drag. No z-index — being positioned already
+ * puts it over the in-flow stage and transport it overlaps, and it is the only
+ * positioned thing in that band. */
+.timeline-resize {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -3px;
+  height: 6px;
+  cursor: ns-resize;
+  touch-action: none;
+}
+.timeline-resize::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 2px;
+  height: 2px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease);
+}
+.timeline-resize:hover::after,
+.timeline-resize--active::after {
+  opacity: 1;
 }
 
 .transport {

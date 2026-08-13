@@ -72,7 +72,13 @@ export const defaultTransform = (): ClipTransform => ({
 export function createProject(name: string): ProjectFile {
   const now = new Date().toISOString();
   return {
-    schema: 1,
+    // 2, not 1: the stamp records that this project's media dimensions are
+    // already display-oriented, and everything recorded from here on is —
+    // `probe_media` reads the display matrix. Stamping 1 would ask the Rust
+    // loader (`ROTATION_REPAIR_SCHEMA` in project/schema.rs) to re-probe every
+    // video in the project on its first open, and then rewrite the file, to
+    // discover it had nothing to correct.
+    schema: 2,
     app: "taroting",
     id: uid(),
     name,

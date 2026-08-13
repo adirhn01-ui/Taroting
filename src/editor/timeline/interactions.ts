@@ -25,6 +25,22 @@ export type DragState =
   | { kind: "move"; clipId: string; start: number; toTrackId: string }
   | { kind: "trimIn"; clipId: string; t: number }
   | { kind: "trimOut"; clipId: string; t: number }
+  /**
+   * A marker being dragged, and the ONLY record of where the drag has put it.
+   *
+   * The marker drag used to live-write the shared project on every pointermove,
+   * which is why it is the one gesture the file header's promise was not true
+   * of. Any commit that landed mid-drag — a shortcut, a menu action, an
+   * autosave-adjacent edit — snapshotted the marker WHERE THE POINTER HAPPENED
+   * TO BE, so undoing that unrelated edit restored the marker to a position it
+   * had merely passed through. Nothing put it back afterwards, so the residue
+   * survived the whole history.
+   *
+   * Now the project keeps the marker at its pointerdown position for the whole
+   * gesture and render.ts draws it from `t`, so a foreign snapshot can only ever
+   * capture a position the marker actually had.
+   */
+  | { kind: "marker"; markerId: string; t: number }
   | null;
 
 /** "Is this the same position?" for gesture bookkeeping: far below one frame at
@@ -177,6 +193,142 @@ export function autoScrollSubStepCount(dy: number): number {
   return n > 1 ? n : 1;
 }
 
+/* ---------------- lane auto-scroll: for a gesture that is not ours ----------------
+ *
+ * The canvas drag above is not the only way a clip lands on a lane. Dragging a
+ * row out of the media bin resolves its target lane from `laneLayout`, exactly
+ * as `hitTest` does — so a lane scrolled out of view was a lane a bin item could
+ * not be dropped on, while an identical-looking drag of a clip already on the
+ * timeline reached it fine. That gesture lives in editor.ts (it is a pointer
+ * drag, not HTML5 drag-and-drop), so what it needs from here is the loop, driven
+ * from outside.
+ *
+ * A rAF loop rather than an event-driven tick, for the reason the gesture exists
+ * at all: the pointer PARKS at the edge and waits for the stack to come to it,
+ * and a stationary pointer emits no move events. Ticking off the events would
+ * stall at exactly the moment the feature is being used.
+ */
+
+export interface LaneAutoScroller {
+  /** Point the loop at a canvas-local y, or `null` when the pointer is not over
+   *  the lane area at all. Idempotent and cheap enough for every pointermove:
+   *  the zone test is pure arithmetic and answers "no" almost always, so the
+   *  common case never walks the tracks. */
+  aim(y: number | null): void;
+  /** Stop, unconditionally and idempotently. The caller's single exit — wire it
+   *  to whatever ends the drag, the way `endGesture` owns `stopAutoScroll`. */
+  stop(): void;
+}
+
+/**
+ * A lane auto-scroll loop for an outside gesture.
+ *
+ * Where it engages, how hard it pulls and how far one frame may carry it all
+ * come from the same pure functions the canvas loop uses, so the two gestures
+ * scroll identically — a drag from the bin and a drag of a clip feel the same
+ * because they ARE the same numbers.
+ *
+ * `onStep` runs after each frame that actually scrolled: the lanes have slid
+ * under a stationary pointer, so whatever the caller resolved from the old
+ * offset — its target lane, its drop guide — is stale. Skipping it is the same
+ * preview/commit divergence `updateMovePreview` exists to prevent.
+ *
+ * There is deliberately NO sub-stepping here (contrast the canvas loop, and see
+ * AUTOSCROLL_MAX_STEP_PX). Sub-steps exist for `laneTargetForMove`'s hysteresis,
+ * which only adopts a lane the pointer has been INSIDE, so a wide frame can step
+ * clean over one. A drop resolver has no hysteresis — it reads whichever lane is
+ * under the pointer at the current offset — so its answer depends only on where
+ * a frame ENDS, never on the path taken to get there. Sampling it more often
+ * would be per-frame work that cannot change the outcome.
+ *
+ * Zero cost until it is aimed into an edge zone, and nothing survives `stop`.
+ */
+export function createLaneAutoScroll(
+  tl: TimelineController,
+  onStep: () => void,
+): LaneAutoScroller {
+  /** rAF handle; 0 when the loop is not running. */
+  let raf = 0;
+  /** Previous tick's timestamp; -1 means "first tick, just start the clock". */
+  let prev = -1;
+  /** The scroll position carried as a float across ticks — see nextLaneScroll. */
+  let pos = 0;
+  let aimY: number | null = null;
+
+  /** The velocity this aim asks for, or 0 when there is nothing to do: not
+   *  aimed, not in an edge zone, no overflow to scroll, or already pinned
+   *  against the end it is pulling towards. */
+  const wanted = (): number => {
+    if (aimY === null) return 0;
+    const v = laneAutoScrollVelocity(aimY, tl.view.height);
+    if (v === 0) return 0;
+    const max = maxLaneScroll(tl.project(), tl.view.height);
+    if (max <= 0) return 0;
+    return v < 0 ? (laneScroll() > 0 ? v : 0) : laneScroll() < max ? v : 0;
+  };
+
+  const stop = (): void => {
+    if (raf === 0) return;
+    cancelAnimationFrame(raf);
+    raf = 0;
+  };
+
+  const tick = (now: number): void => {
+    raf = 0;
+    const v = wanted();
+    // Left the zone, or ran out of scroll: let the loop die rather than respin.
+    // A later `aim` re-arms it if the pointer asks again.
+    if (v === 0) return;
+
+    let moved = false;
+    if (prev < 0) {
+      prev = now;
+    } else {
+      const from = pos;
+      const to = nextLaneScroll(
+        from,
+        v,
+        (now - prev) / 1000,
+        maxLaneScroll(tl.project(), tl.view.height),
+      );
+      prev = now;
+      if (to !== from) {
+        pos = to;
+        moved = true;
+      }
+    }
+
+    // Re-armed BEFORE the callback, not after. `onStep` re-resolves the drop
+    // target, and that calls back into `aim`; an `aim` that found the handle
+    // clear would arm a SECOND loop, whose handle the line below would then
+    // overwrite — two ticks a frame, and one rAF nothing could ever cancel.
+    // Armed first, `aim` sees a loop already running and does nothing, while a
+    // `stop()` from inside the callback still wins.
+    raf = requestAnimationFrame(tick);
+    if (moved) {
+      tl.scrollLanesTo(pos);
+      onStep();
+    }
+  };
+
+  return {
+    aim(y: number | null): void {
+      aimY = y;
+      if (wanted() === 0) {
+        stop();
+        return;
+      }
+      if (raf !== 0) return;
+      // Seeded from the STORED offset, which is pixel-snapped; the float is
+      // carried from here on so the slow end of the ramp is not rounded away.
+      pos = laneScroll();
+      prev = -1;
+      raf = requestAnimationFrame(tick);
+    },
+    stop,
+  };
+}
+
 type Hit =
   | { type: "marker"; marker: Marker }
   | { type: "ruler" }
@@ -208,10 +360,12 @@ type Mode =
       toTrackId: string;
     }
   | { name: "trim"; clip: Clip; edge: "in" | "out"; candidates: number[] }
-  /** The marker's own time at pointerdown — NOT a whole-project snapshot; see
-   *  the commit and cancel paths for why that distinction is the fix for a
-   *  marker drag swallowing unrelated edits into its undo entry. */
-  | { name: "marker-move"; markerId: string; startT: number };
+  /** `startT` is the marker's own time at pointerdown — NOT a whole-project
+   *  snapshot; see the commit path for why that distinction is the fix for a
+   *  marker drag swallowing unrelated edits into its undo entry. `t` is where
+   *  the drag has moved it to, which is a PREVIEW and not project state: it is
+   *  mirrored into the drag override and reaches the project once, on release. */
+  | { name: "marker-move"; markerId: string; startT: number; t: number };
 
 export function attachInteractions(tl: TimelineController): () => void {
   const canvas = tl.canvas;
@@ -240,7 +394,16 @@ export function attachInteractions(tl: TimelineController): () => void {
       return { type: "ruler" };
     }
     for (const lane of laneLayout(project)) {
-      if (y < lane.y || y > lane.y + lane.h) continue;
+      // Half-open, [lane.y, lane.y + lane.h), because that is exactly the band
+      // `fillRect(0, lane.y, width, lane.h)` paints: the row AT lane.y + lane.h
+      // is the first row of the gap below, drawn in the app background. An
+      // inclusive end claimed it for the lane, so one pixel row of every gap
+      // opened that lane's context menu while looking like empty space — and at
+      // the scroll where a lane's bottom lands exactly on RULER_H it claimed
+      // y === RULER_H too, a lane draw() had already skipped as having no
+      // visible row at all. The ruler owns y < RULER_H (above), lanes own
+      // whatever they paint, and nothing owns the gaps.
+      if (y < lane.y || y >= lane.y + lane.h) continue;
       for (const clip of lane.track.clips) {
         const cx = tl.xOf(clip.timelineStart);
         const cw = clipDuration(clip) * tl.view.pxPerSec;
@@ -444,7 +607,12 @@ export function attachInteractions(tl: TimelineController): () => void {
 
     if (hit.type === "marker") {
       tl.seek(hit.marker.t);
-      mode = { name: "marker-move", markerId: hit.marker.id, startT: hit.marker.t };
+      mode = {
+        name: "marker-move",
+        markerId: hit.marker.id,
+        startT: hit.marker.t,
+        t: hit.marker.t,
+      };
     } else if (hit.type === "kf") {
       // diamond: select the clip and seek to it; no drag.
       tl.select(hit.clip.id);
@@ -508,9 +676,14 @@ export function attachInteractions(tl: TimelineController): () => void {
     }
 
     if (mode.name === "marker-move") {
-      const id = mode.markerId;
+      // A PREVIEW, exactly like move and trim: the position goes into the drag
+      // override and render.ts draws the marker from it. The project is not
+      // touched until pointer-up, so a commit landing mid-drag cannot snapshot
+      // a position the marker was only passing through — and the drag no longer
+      // marks the project dirty on every pointermove either.
       const t = Math.max(0, tl.tOf(x));
-      tl.liveReplace((p) => moveMarkerTo(p, id, t));
+      mode.t = t;
+      tl.setDrag({ kind: "marker", markerId: mode.markerId, t }, null);
       tl.seek(t);
       return;
     }
@@ -559,7 +732,7 @@ export function attachInteractions(tl: TimelineController): () => void {
   };
 
   /** The marker's time right now, or null if it is no longer in the project
-   *  (deleted mid-gesture — see the commit and cancel paths). */
+   *  (deleted mid-gesture — see the commit path). */
   const markerTimeNow = (markerId: string): number | null => {
     const m = tl.project().timeline.markers?.find((x) => x.id === markerId);
     return m ? m.t : null;
@@ -593,30 +766,23 @@ export function attachInteractions(tl: TimelineController): () => void {
    * OS taking the pointer away mid-drag. It used to be wired straight to the
    * commit path, so an interrupted move landed the clip.
    *
-   * Move and trim need no rollback: they only ever wrote a drag override, and
-   * the project is untouched until pointerup. The marker drag DID write to the
-   * project, through the history-free `replace()`, so it is rolled back the same
-   * way — the marker goes back to `startT`, again history-free, so history comes
-   * out exactly as it was before pointerdown rather than gaining an entry for a
-   * gesture the user cancelled.
+   * NO gesture needs a project rollback any more, marker drags included: all
+   * three write nothing but a drag override, and `endGesture` drops that. The
+   * marker drag used to roll back through the history-free `replace()`, which
+   * worked but only because it was undoing its own live writes; not making them
+   * is strictly better, and it removes the one path on which a cancel had to
+   * reason about a commit that had landed underneath it.
    *
-   * The revert is scoped to the MARKER, not to a whole-project snapshot: a
-   * commit that landed mid-drag is not part of this gesture and must keep both
-   * its effect and its own undo entry (same reasoning as the commit path).
+   * What IS restored is the playhead. Both the scrub and the marker drag drive
+   * it (a marker drag seeks as it goes, so you can see the frame you are
+   * marking), and it is not project state, so nothing else puts it back.
    *
    * Selection is deliberately not restored. It is not project state, nothing in
    * the app makes it undoable, and the click that changed it is not the part
    * being cancelled.
    */
   const cancelGesture = (): void => {
-    if (mode.name === "marker-move") {
-      const { markerId, startT } = mode;
-      const now = markerTimeNow(markerId);
-      if (now !== null && Math.abs(now - startT) > POS_EPS) {
-        tl.liveReplace((p) => moveMarkerTo(p, markerId, startT));
-        tl.seek(startT);
-      }
-    } else if (mode.name === "scrub") {
+    if (mode.name === "marker-move" || mode.name === "scrub") {
       tl.seek(mode.startT);
     }
     endGesture();
@@ -626,22 +792,27 @@ export function attachInteractions(tl: TimelineController): () => void {
     const drag = tl.drag;
 
     if (mode.name === "marker-move") {
-      // ONE history entry for the marker move, and ONLY for the marker move.
-      // `before` used to be a snapshot taken on pointerdown, so any commit that
-      // landed during the drag — Delete, a shortcut, a context-menu action — was
-      // swallowed into the same undo step: one Ctrl+Z reverted both edits, the
-      // next Ctrl+Z was a visible no-op, and redo needed two presses.
+      // ONE history entry for the marker move, and ONLY for the marker move —
+      // the whole drag reaches the project right here, in a single ordinary
+      // commit, so it is bounded the same way a move or a trim is.
       //
-      // The entry is reconstructed from the CURRENT project instead: everything
-      // exactly as it stands now, with just this marker put back where the drag
-      // started. That is the state undo should land on, so the intervening
-      // commit keeps its own entry underneath and both edits stay individually
-      // undoable.
-      const { markerId, startT } = mode;
+      // Two earlier shapes were wrong for the same underlying reason. A `before`
+      // snapshot taken on pointerdown swallowed any commit that landed during
+      // the drag into this undo step. Reconstructing the entry from the current
+      // project fixed that, but the drag was still live-writing the project, so
+      // the FOREIGN commit's own snapshot captured the marker mid-flight and
+      // undoing it stranded the marker somewhere the user never dropped it. With
+      // the position held in the drag override there is nothing mid-flight to
+      // capture, and both edits stay individually undoable.
+      const { markerId, t } = mode;
       const now = markerTimeNow(markerId);
-      // Gone, or never actually moved: there is nothing to record.
-      if (now !== null && Math.abs(now - startT) > POS_EPS) {
-        tl.commitFrom(moveMarkerTo(tl.project(), markerId, startT));
+      // Gone (deleted mid-drag), or already exactly there: nothing to record.
+      // Compared against the marker's CURRENT time rather than `startT` because
+      // that is precisely the question "would this commit change anything" —
+      // `moveMarkerTo` always returns a fresh project, so an unguarded call
+      // would push a history entry for a marker that never moved.
+      if (now !== null && Math.abs(t - now) > POS_EPS) {
+        tl.commit((p: ProjectFile) => moveMarkerTo(p, markerId, t));
       }
     } else if (mode.name === "move" && drag?.kind === "move") {
       const { clipId, start, toTrackId } = drag;
@@ -698,9 +869,19 @@ export function attachInteractions(tl: TimelineController): () => void {
       tl.clipMenu(hit.clip, e.clientX, e.clientY);
     } else if (hit.type === "lane") {
       e.preventDefault();
+      // Empty lane: drop the selection first, the same way a LEFT click on the
+      // same pixel does. Right-click was the one way to open a menu over the
+      // timeline while a clip elsewhere stayed selected and outlined, and a menu
+      // whose items are scoped to the lane under the cursor sitting over a
+      // highlight somewhere else is an invitation to read one as the other.
+      // Selecting before showing the menu is also what the clip branch above
+      // does, so whatever a lane item comes to read, it reads the truth.
+      tl.select(null);
       tl.laneMenu(hit.track, e.clientX, e.clientY);
     }
-    // ruler / empty: leave the global suppression to swallow the default
+    // ruler / empty: no menu is opened, so there is nothing to disambiguate and
+    // the selection is left alone. The ruler deliberately keeps it on left click
+    // too — scrubbing is not a deselect gesture.
   };
 
   /* ---------------- wheel: zoom / pan ---------------- */

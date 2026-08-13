@@ -55,9 +55,53 @@ pub fn text_placeholder(i: usize) -> String {
     format!("\u{0}TAROTING_TEXT_{i}\u{0}")
 }
 
+/// The square the animated-opacity alpha mask is evaluated on, and the rung it
+/// is enlarged through on its way to the clip's post-crop size.
+///
+/// The mask is a CONSTANT field — `geq`'s expression reads only `T` — so it is
+/// evaluated as small as possible and blown up, which is why the seed is 16 px
+/// rather than the frame size: 256 expression evaluations per frame instead of
+/// millions.
+///
+/// The rung is what keeps that affordable AND correct. swscale's graph builder
+/// refuses a single pass beyond roughly 6890x on an axis, reporting only
+/// "Failed initializing scaling graph (Not yet implemented in FFmpeg, patches
+/// welcome)" and aborting the export. Measured against the bundled 8.1.1, from a
+/// 16 px seed: 110,240 px wide still configures, 110,384 px does not. That
+/// ceiling is reachable — a text generator's box is `measureText`'s natural
+/// width with no cap anywhere (see the `src_w`/`src_h` note in `placement`), so
+/// one long unbroken pasted line plus a single opacity keyframe was enough to
+/// kill the export. Verified at the real graph shape: a 131056x120 generator
+/// fails in one pass and succeeds through the rung.
+///
+/// Two passes multiply the reachable ratio instead of adding to it —
+/// 16 -> 128 is 8x, 128 -> target is up to ~6890x, so the mask now reaches
+/// ~881,920 px on an axis (measured: 878,000 configures, 900,000 does not). That
+/// is ~115x an 8K width, and past the point where a frame that wide can be
+/// allocated at any useful height anyway, so the frame itself becomes the
+/// binding limit rather than this. Enlarging the SEED instead would have bought
+/// the same headroom by multiplying geq's per-frame work by 64.
+const MASK_SEED: u32 = 16;
+const MASK_STEP: u32 = 128;
+
+/// Round a fitted display extent to an even number of pixels, never below 2.
+///
+/// The floor is load-bearing, not tidiness. `scale=` reads its arguments as
+/// SENTINELS at the low end: 0 means "keep the input size" and a negative value
+/// means "derive this axis from the other one, preserving aspect". The bare
+/// `n - (n % 2)` this replaced returned 0 for anything under 1.5 px — so a clip
+/// whose fitted height rounded away (`fit_h * k < 1.5`, which a source aspect
+/// beyond ~1280:1 reaches on a 1920-wide output: a 12800x8 media fits to
+/// 1920x1.2) emitted `scale=1920:0` and ffmpeg silently exported the source at
+/// its OWN height instead of the fitted one. No error, no warning, wrong
+/// geometry — and the same guard turns a crafted negative transform scale into a
+/// legal extent instead of an aspect-preserving sentinel.
+///
+/// 2 rather than 1 because yuv420p subsamples chroma: an odd extent is not
+/// encodable, which is the whole reason this function rounds to even at all.
 fn round_even(v: f64) -> i64 {
     let n = v.round() as i64;
-    n - (n % 2)
+    (n - (n % 2)).max(2)
 }
 
 /* ------------------------------------------------------------------ */
@@ -98,15 +142,22 @@ fn line_height_em(family: &str) -> f64 {
     }
 }
 
-/// Escape a filesystem path for use inside a drawtext filter option value:
-/// backslashes -> forward slashes, ':' -> '\:', then wrap in single quotes.
-/// A path containing a single quote cannot be represented and is rejected.
-fn escape_filter_path(path: &str) -> Result<String> {
-    if path.contains('\'') {
-        return Err(AppError::BadInput(format!(
-            "path contains a single quote which cannot be escaped for ffmpeg: {path}"
-        )));
-    }
+/// THE escaping rule for a path inside a filter option value: backslashes ->
+/// forward slashes, ':' -> '\:', wrapped in single quotes.
+///
+/// The single definition on purpose. Two call sites need it — this file, for the
+/// `fontfile=` and the textfile PLACEHOLDER, and `export::escape_text_path`, for
+/// the real `%TEMP%` textfile path substituted in later — and they must agree
+/// character for character or the graph the length check measures is not the
+/// graph ffmpeg parses. They carry different REJECTION messages (this one names
+/// a font path, that one names the TMP variable a user can actually change), so
+/// the quote check stays with each caller and only the transformation lives
+/// here.
+///
+/// Callers must reject a single quote BEFORE calling: ffmpeg's filter-option
+/// syntax has no escape for one that survives inside a quoted value, so a path
+/// containing one would silently truncate rather than fail loudly.
+pub fn escape_filter_value(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 4);
     out.push('\'');
     for ch in path.chars() {
@@ -117,7 +168,18 @@ fn escape_filter_path(path: &str) -> Result<String> {
         }
     }
     out.push('\'');
-    Ok(out)
+    out
+}
+
+/// Escape a filesystem path for use inside a drawtext filter option value.
+/// A path containing a single quote cannot be represented and is rejected.
+fn escape_filter_path(path: &str) -> Result<String> {
+    if path.contains('\'') {
+        return Err(AppError::BadInput(format!(
+            "path contains a single quote which cannot be escaped for ffmpeg: {path}"
+        )));
+    }
+    Ok(escape_filter_value(path))
 }
 
 /// Parse a "#RRGGBB" / "#RRGGBBAA" / "#RGB" color into ffmpeg `0xRRGGBB` plus an
@@ -1164,8 +1226,9 @@ enable='gte(t,{start:.6})*lt(t,{end:.6})'{out};"
             // extra passes are paid only by clips that have an opacity keyframe.
             chain.push_str(&format!(
                 ",format=rgba[chain{a}];[chain{a}]split[cm{a}][ca{a}];[ca{a}]alphaextract[cx{a}];\
-color=black:s=16x16:r={fps}:d={clip_dur:.6},format=gray,geq=lum='255*({expr})',\
-scale={cw}:{ch}[al{a}];[cx{a}][al{a}]blend=all_mode=multiply[am{a}];\
+color=black:s={MASK_SEED}x{MASK_SEED}:r={fps}:d={clip_dur:.6},format=gray,geq=lum='255*({expr})',\
+scale={MASK_STEP}:{MASK_STEP},scale={cw}:{ch}[al{a}];\
+[cx{a}][al{a}]blend=all_mode=multiply[am{a}];\
 [cm{a}][am{a}]alphamerge"
             ));
         }
@@ -2691,11 +2754,71 @@ mod tests {
         let fc = &b.filter_complex;
         assert!(fc.contains("s=16x16"), "{fc}");
         assert!(fc.contains("format=gray,geq=lum='255*("), "{fc}");
+        // The seed reaches the clip's post-crop size through the 128 rung, never
+        // in one pass: swscale refuses a single ratio past ~6890x, and the media
+        // whose box gets that large is a text generator, which is uncapped.
+        assert!(fc.contains("scale=128:128,scale=1920:1080"), "{fc}");
         assert!(fc.contains("alphamerge"), "{fc}");
         // geq uses capital T time var.
         assert!(fc.contains("clip((T-0.0000)"), "{fc}");
         // no static colorchannelmixer when opacity is animated.
         assert!(!fc.contains("colorchannelmixer"), "{fc}");
+    }
+
+    /// `scale=` treats 0 and negatives as SENTINELS, so a fitted extent that
+    /// rounds away stops being a size and becomes an instruction.
+    ///
+    /// The table names the defect by pinning the old expression's answer beside
+    /// the new one: `n - (n % 2)` on anything under 1.5 px is 0, which ffmpeg
+    /// reads as "keep the input size".
+    #[test]
+    fn round_even_never_emits_a_scale_sentinel() {
+        // The expression this replaced, kept verbatim so the rows below state
+        // what actually changed rather than asserting the new code twice.
+        let old = |v: f64| {
+            let n = v.round() as i64;
+            n - (n % 2)
+        };
+
+        // (input, old answer, new answer)
+        let rows: [(f64, i64, i64); 8] = [
+            (1.2, 0, 2),    // a 12800x8 media fitted into a 1920-wide output
+            (1.4999, 0, 2), // last value that rounds to 1
+            (0.4, 0, 2),    // rounds to 0 outright
+            (1.5, 2, 2),    // first value that rounds to 2 — unchanged
+            (9.216, 8, 8),  // the parity table's smallest real row — unchanged
+            (1920.0, 1920, 1920),
+            (1921.0, 1920, 1920), // odd extents still round DOWN to even
+            (-3.0, -2, 2),        // a crafted negative scale is not an aspect sentinel
+        ];
+        for (v, want_old, want_new) in rows {
+            assert_eq!(old(v), want_old, "fixture guard: old(v) for v={v}");
+            assert_eq!(round_even(v), want_new, "round_even({v})");
+        }
+        assert!(
+            rows.iter().any(|&(_, o, n)| o != n),
+            "a table where every row agrees would prove nothing changed"
+        );
+    }
+
+    /// The same defect through the graph ffmpeg is actually handed. A 12800x8
+    /// source on a 1920x1080 output fits to 1920x1.2 — the height rounds away,
+    /// and `scale=1920:0` exported the source at its own 8 px height instead.
+    #[test]
+    fn an_extreme_aspect_clip_scales_to_a_real_height_not_a_sentinel() {
+        let m = media("m1", r"C:\pano.mp4", 12800, 8, false);
+        let c = clip("c1", "m1", 0.0, 0.0, 3.0);
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+        let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        let fc = &b.filter_complex;
+        assert!(
+            !fc.contains("scale=1920:0"),
+            "0 is ffmpeg's keep-the-input-size sentinel: {fc}"
+        );
+        assert!(fc.contains("scale=1920:2"), "{fc}");
+        // And the overlay still centres the real 2 px extent, not the 0 the
+        // sentinel would have implied.
+        assert!(fc.contains("overlay=0:539:shortest=1"), "{fc}");
     }
 
     #[test]
@@ -2927,6 +3050,9 @@ mod tests {
         assert_eq!(e, r"'C\:/my media/a.ttf'");
         // embedded single quote is rejected.
         assert!(escape_filter_path("a'b").is_err());
+        // The wrapper adds only the rejection; the transformation is the shared
+        // one `export::escape_text_path` also calls.
+        assert_eq!(e, escape_filter_value(r"C:\my media\a.ttf"));
     }
 
     #[test]
@@ -2999,11 +3125,17 @@ mod tests {
 
     /// The size the opacity ALPHA MASK is scaled to — the other derivation of
     /// the same dimension, and the one `blend` compares against the frame.
+    /// The size the alpha mask ARRIVES at — the last `scale=` between the geq
+    /// and the mask's output label, which is the one that has to match the
+    /// frame. The pass before it is the fixed `MASK_STEP` rung that keeps any
+    /// single swscale ratio under its limit; that one is pinned by
+    /// `animated_opacity_uses_alphamerge_geq_16x16`, not here.
     fn alpha_mask_size(fc: &str) -> String {
         let i = fc.find("geq=lum=").unwrap_or_else(|| panic!("no alpha mask in {fc}"));
-        let j = fc[i..].find(",scale=").expect("mask scale") + i + ",scale=".len();
-        let rest = &fc[j..];
-        rest[..rest.find('[').expect("mask label")].to_string()
+        let rest = &fc[i..];
+        let seg = &rest[..rest.find('[').expect("mask label")];
+        let j = seg.rfind(",scale=").expect("mask scale") + ",scale=".len();
+        seg[j..].to_string()
     }
 
     #[test]

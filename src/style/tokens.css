@@ -100,6 +100,13 @@
    * layers (1..n) and the stage overlay (200) that live inside that container.
    * 300 clears both with headroom yet has no meaning outside .theater. */
   --z-stage-overlay: 200;
+  /* The "Preparing preview" / "Preview unavailable" scrim. Above the media
+   * layers (1..n) and the manipulation overlay (200) — a status message that a
+   * lower layer's picture can paint over is a failure the user never sees —
+   * yet below the editor chrome, and below the theater bar (300) inside the
+   * theater container's own context. DOM order cannot do this job: positive
+   * z-index siblings beat document order whatever the append sequence. */
+  --z-stage-status: 250;
   --z-editor-chrome: 300;
   --z-drag-ghost: 400;
   --z-theater: 500;

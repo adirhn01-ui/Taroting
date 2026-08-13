@@ -141,6 +141,21 @@ export function dropMediaTargets(jobs: Map<number, JobEntry>, mediaId: string): 
 }
 
 /**
+ * A copy of `map` without `key` — or `map` ITSELF when the key was not in it.
+ *
+ * The identity matters: `Store.set` early-outs on an identical reference, so
+ * forgetting a media entry that never got as far as publishing anything costs
+ * one `in` test and notifies nobody. Removing the last import of a project
+ * would otherwise re-render every subscriber three times over for nothing.
+ */
+function withoutKey<T>(map: Record<string, T>, key: string): Record<string, T> {
+  if (!(key in map)) return map;
+  const next = { ...map };
+  delete next[key];
+  return next;
+}
+
+/**
  * How long a cache-enforcement request waits for company.
  *
  * Enforcement is a whole-cache walk on the backend: read_dir over five kind
@@ -168,6 +183,25 @@ export class MediaManager {
   /** job id → the media entry (or entries) waiting on it; see `JobEntry`. */
   private jobs = new Map<number, JobEntry>();
   private tracked = new Set<string>();
+  /**
+   * mediaId → how many times that id's identity has been withdrawn.
+   *
+   * `ensure` awaits the backend, and a media entry can be relinked or removed
+   * from the bin while it is waiting. The answer that then arrives describes a
+   * file the project no longer points at, and publishing it stamps a stale job
+   * id and a stale status over the fresh ones — visibly, a relinked clip that
+   * drops back to "Preparing" on a job nobody will ever finish. So each
+   * `ensure` captures this number on entry and abandons everything it was about
+   * to publish if it has moved.
+   *
+   * ABSENT MEANS ZERO, so nothing is written here until something is actually
+   * withdrawn: a project that never relinks and never removes media pays one
+   * `Map.get` per media at mount and nothing at all afterwards. The entry then
+   * has to STAY — it is what makes the abandoned `ensure` recognise itself as
+   * stale — but ids are UUIDs, so the map is bounded by the number of media
+   * withdrawn in one session.
+   */
+  private generations = new Map<string, number>();
   private unlisten: (() => void) | null = null;
   private disposed = false;
   /** Pending coalesced cache enforcement (see CACHE_ENFORCE_COALESCE_MS). */
@@ -252,6 +286,22 @@ export class MediaManager {
     for (const media of project.media) void this.ensure(media);
   }
 
+  /** The current generation of `mediaId`; absent is zero. See `generations`. */
+  private generationOf(mediaId: string): number {
+    return this.generations.get(mediaId) ?? 0;
+  }
+
+  /** Withdraw this id's identity: every `ensure` already in flight for it will
+   *  drop whatever the backend eventually tells it. */
+  private bumpGeneration(mediaId: string): void {
+    this.generations.set(mediaId, this.generationOf(mediaId) + 1);
+  }
+
+  /** Has the `ensure` that captured `gen` been overtaken? */
+  private overtaken(mediaId: string, gen: number): boolean {
+    return this.generationOf(mediaId) !== gen;
+  }
+
   /** Forget a media item's tracking and re-ensure it against the current
    *  project (e.g. after a relink changed its path/size/mtime → new cache
    *  keys). Safe no-op if the media no longer exists. */
@@ -262,13 +312,44 @@ export class MediaManager {
     // a file the project no longer references, over a fresh preparing/ready
     // state. Co-waiters on those jobs are untouched. See `dropMediaTargets`.
     dropMediaTargets(this.jobs, mediaId);
+    // Dropping the TARGETS closes the window for a job that has already been
+    // registered; this closes the one before that. An `ensure` still waiting on
+    // `plan_playback` for the old file has not registered anything yet, so
+    // there is nothing to drop — it would register the old job AFTER this ran,
+    // and the fresh state would be overwritten by a job the old file started.
+    this.bumpGeneration(mediaId);
     const m = this.getProject().media.find((x) => x.id === mediaId);
     if (m) void this.ensure(m);
+  }
+
+  /**
+   * Forget a media item completely: it has left the project.
+   *
+   * `retrack`'s sibling, and the half that was missing. Removing media from the
+   * bin dropped it from the project but not from here, so its id stayed in
+   * `tracked` and in the three published maps for the rest of the session —
+   * every status notification carrying a state for a media nothing can render,
+   * and a waveform's peak arrays (the largest thing this class holds) pinned
+   * behind an id no clip references. Unlike `retrack` there is nothing to
+   * re-ensure afterwards, and the generation bump is what stops a `plan_playback`
+   * still in flight from publishing a status for the departed entry.
+   */
+  untrack(mediaId: string): void {
+    this.tracked.delete(mediaId);
+    dropMediaTargets(this.jobs, mediaId);
+    this.bumpGeneration(mediaId);
+    this.status.update((s) => withoutKey(s, mediaId));
+    this.waveforms.update((w) => withoutKey(w, mediaId));
+    this.thumbs.update((t) => withoutKey(t, mediaId));
   }
 
   async ensure(media: MediaRef): Promise<void> {
     if (this.disposed || this.tracked.has(media.id)) return;
     this.tracked.add(media.id);
+    // Captured BEFORE the first await, and re-checked in every continuation
+    // below: each one publishes something derived from the file this media
+    // pointed at when the work started. See `generations`.
+    const gen = this.generationOf(media.id);
 
     // Generated media (solid / text) has no file on disk: no probe, no
     // playback plan, no thumbnail, no waveform. The preview renders it
@@ -286,7 +367,7 @@ export class MediaManager {
       void ipc
         .getThumbnail(keyOf(media), at)
         .then((path) => {
-          if (this.disposed) return;
+          if (this.disposed || this.overtaken(media.id, gen)) return;
           this.thumbs.update((t) => ({ ...t, [media.id]: path }));
         })
         .catch((e: unknown) =>
@@ -303,7 +384,7 @@ export class MediaManager {
       void ipc
         .ensureWaveform(keyOf(media), media.duration, true)
         .then((wf) => {
-          if (this.disposed) return;
+          if (this.disposed || this.overtaken(media.id, gen)) return;
           if (wf.state === "ready") void this.loadWaveform(media.id, wf.path);
           else if (wf.state === "pending") {
             addJobTarget(this.jobs, wf.jobId, {
@@ -325,7 +406,12 @@ export class MediaManager {
     // Playback plan
     try {
       const plan = await ipc.planPlayback(media, codecHints(), settingsStore.get().proxyMedia);
-      if (this.disposed) return;
+      // The one that was actually reachable, if only just: a relink cuts the
+      // media loose from its old jobs, but a plan still in flight has not
+      // registered one yet, so without this it registers the OLD job after the
+      // cut and drags the relinked media back to "Preparing" on a job that will
+      // never report to it.
+      if (this.disposed || this.overtaken(media.id, gen)) return;
       if (plan.mode === "direct" || plan.mode === "ready") {
         this.patchStatus(media.id, {
           state: "ready",
@@ -341,6 +427,10 @@ export class MediaManager {
         this.patchStatus(media.id, { state: "preparing", ratio: null, jobId: plan.jobId });
       }
     } catch (e) {
+      // A failure belonging to the file this ensure started against, reported
+      // onto a media entry that has since been relinked or removed, is the same
+      // stale write wearing its most alarming face.
+      if (this.disposed || this.overtaken(media.id, gen)) return;
       this.patchStatus(media.id, { state: "failed", message: describeError(e) });
     }
   }

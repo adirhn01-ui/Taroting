@@ -336,12 +336,6 @@ export class TimelineController {
     this.deps.engine.refresh();
     this.requestRender();
   }
-  /** Live, history-free replace during a gesture (drag). */
-  liveReplace(mutate: (p: ProjectFile) => ProjectFile): void {
-    this.deps.session.replace(mutate(this.deps.session.project));
-    this.deps.engine.refresh();
-    this.requestRender();
-  }
   /** Close a gesture: push one history entry from the captured `before`. */
   commitFrom(before: ProjectFile): void {
     this.deps.session.commitFrom(before);

@@ -11,7 +11,7 @@ import { inTauri, ipc } from "../../core/ipc";
 import { findMedia, MIN_CLIP_DUR, updateClip, updateMedia } from "../../core/project";
 import type { ProjectSession } from "../../core/session";
 import type { Clip, MediaInfo, MediaRef, ProjectFile } from "../../core/types";
-import { trapTab } from "../../ui/focus";
+import { focusFirst, trapTab } from "../../ui/focus";
 import { icon } from "../../ui/icons";
 import { toast } from "../../ui/toast";
 import { clampCrop } from "../preview/canvas-math";
@@ -289,4 +289,17 @@ export function openRelinkDialog(ctx: RelinkCtx): void {
     row.querySelector("[data-locate]")!.addEventListener("click", () => void locate(m, row));
     listEl.appendChild(row);
   }
+
+  // Seated after the rows exist, or there is no Locate button to aim at. The
+  // first one is the whole point of the dialog, and this is also the only reason
+  // `trapTab` above does anything at all: the trap listens on the backdrop, so
+  // until focus is inside it, Tab walks the editor behind a "your files are
+  // missing" dialog and Enter lands on a timeline control. This file had no
+  // focus call of any kind, so the trap had never engaged.
+  //
+  // Close is named explicitly for the rowless case (which the early return
+  // above makes unreachable today) — the bare fallback would settle on the
+  // header X, and the footer button is the one the eye goes to.
+  const firstLocate = backdrop.querySelector("[data-locate]");
+  focusFirst(backdrop, firstLocate ? "[data-locate]" : "[data-close-btn]");
 }

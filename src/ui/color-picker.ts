@@ -293,6 +293,34 @@ export function openColorPicker(opts: ColorPickerOptions): ColorPickerHandle {
     track(e);
   });
 
+  /* ---------------- keyboard auto-repeat ----------------
+   *
+   * A HELD arrow key is one gesture, but the browser reports it as a keystroke
+   * every ~30 ms — and on a range input each of those also fires `change`. Every
+   * commit here is an IPC round-trip and a settings.json rewrite, so a two-second
+   * hold was persisting the file some sixty times to reach one colour.
+   *
+   * The repeats paint and preview exactly as before (the whole app recolours
+   * live); only the persist waits for the key to come up, which is the same
+   * once-per-gesture rule the pointer path already gets from pointerup and from
+   * change-on-release. Nothing can be lost by waiting: `dismiss` commits
+   * `current()` on every close path, so even a key released outside the picker
+   * ends up on disk.
+   *
+   * Cleared by any fresh keydown and by blur, so a stale flag can never swallow
+   * a later commit — including the `change` a mouse drag ends on.
+   */
+  let repeating = false;
+  function commitAfterRepeat(): void {
+    if (!repeating) return;
+    repeating = false;
+    commit();
+  }
+  for (const control of [sv, hue, bright]) {
+    control.addEventListener("keyup", commitAfterRepeat);
+    control.addEventListener("blur", commitAfterRepeat);
+  }
+
   sv.addEventListener("keydown", (e) => {
     const step = e.shiftKey ? 10 : 1;
     let ds = 0;
@@ -307,6 +335,11 @@ export function openColorPicker(opts: ColorPickerOptions): ColorPickerHandle {
     v = Math.min(100, Math.max(0, v + dv));
     paint(true);
     preview();
+    if (e.repeat) {
+      repeating = true;
+      return;
+    }
+    repeating = false;
     commit();
   });
 
@@ -322,9 +355,22 @@ export function openColorPicker(opts: ColorPickerOptions): ColorPickerHandle {
     paint(true);
     preview();
   });
-  // <input type="range"> fires change on release — one persist per gesture.
-  hue.addEventListener("change", commit);
-  bright.addEventListener("change", commit);
+  // A pointer drag ends in one `change`; a held arrow key fires one per repeat,
+  // so those are folded into the keyup above instead.
+  const onRangeKeyDown = (e: KeyboardEvent): void => {
+    // A fresh key FLUSHES rather than clears: if a hold ended somewhere this
+    // never saw a keyup (focus taken mid-hold), the pending value goes to disk
+    // now instead of being dropped on the floor.
+    if (e.repeat) repeating = true;
+    else commitAfterRepeat();
+  };
+  const onRangeChange = (): void => {
+    if (!repeating) commit();
+  };
+  for (const range of [hue, bright]) {
+    range.addEventListener("keydown", onRangeKeyDown);
+    range.addEventListener("change", onRangeChange);
+  }
 
   /* ---------------- hex field ---------------- */
 
@@ -364,6 +410,13 @@ export function openColorPicker(opts: ColorPickerOptions): ColorPickerHandle {
       void new EyeDropper()
         .open()
         .then((res) => {
+          // The pick can take as long as the user likes, and everything can
+          // change underneath it: Done, Escape, a click outside, a scroll, or
+          // another picker opening on a different colour. `handle` is this
+          // popover's own identity, so this covers both — a closed picker and a
+          // superseded one. Without it a dead popover still repaints the app's
+          // CSS variables and persists a colour for a screen that is gone.
+          if (active !== handle) return;
           const picked = normalizeHexColor(res.sRGBHex, "");
           if (picked === "") return; // never trust the value, even from the platform
           setHex(picked);

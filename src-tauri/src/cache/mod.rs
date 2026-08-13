@@ -23,9 +23,35 @@ pub struct MediaKey {
     pub mtime_ms: u64,
 }
 
+/// The version of the RECIPES that turn a source file into its derived files.
+///
+/// **Bump this whenever any recipe changes.** That means `prepare::proxy_args`,
+/// `remux_args`, `audio_remux_args`, `gif_proxy_args`, `thumbs`' `THUMB_WIDTH`
+/// or its scale/quality flags, `filmstrip_args`, and the waveform format
+/// (`SAMPLE_RATE`, `PAIRS_PER_SEC`, the `TPK1` layout) — anything whose output
+/// bytes would differ for an unchanged input file.
+///
+/// Without it the key covered only the SOURCE: `{path, size, mtime}` says
+/// nothing about how the derived file was produced, so a build that widened
+/// thumbnails or changed the proxy's CRF kept serving every previously cached
+/// output, forever, for any file the user had not touched. The bug reads as
+/// "the setting did nothing" on exactly the machines with the most cache.
+///
+/// Bumping it orphans the existing entries rather than deleting them — the new
+/// keys simply miss, and LRU eviction reclaims the old files against the user's
+/// cap in the normal way.
+pub const RECIPE_VERSION: u32 = 1;
+
 impl MediaKey {
     pub fn hash(&self) -> String {
-        let ident = format!("{}|{}|{}", self.path, self.size, self.mtime_ms);
+        self.hash_with(RECIPE_VERSION)
+    }
+
+    /// The identity actually hashed: source file identity AND the recipe version
+    /// that produced the derived file. Split out so a test can prove the version
+    /// participates without waiting for a real recipe change to prove it.
+    fn hash_with(&self, recipe: u32) -> String {
+        let ident = format!("{}|{}|{}|r{}", self.path, self.size, self.mtime_ms, recipe);
         format!("{:016x}", xxh3_64(ident.as_bytes()))
     }
 }
@@ -410,6 +436,37 @@ mod tests {
         let mut changed = key(1);
         changed.mtime_ms = 43;
         assert_ne!(a1, changed.hash());
+    }
+
+    /// The half of the key that is NOT the source file. Identical `{path, size,
+    /// mtime}` under two recipe versions must land on different entries, or a
+    /// build that changes how a proxy/thumb/waveform is produced keeps serving
+    /// the output of the old recipe until the user touches the file.
+    #[test]
+    fn the_recipe_version_participates_in_the_key() {
+        let k = key(7);
+
+        // Same file identity, different recipe → different entry.
+        assert_ne!(
+            k.hash_with(1),
+            k.hash_with(2),
+            "a recipe change must invalidate the derived files it produced"
+        );
+        // ...and it is not merely a distinct-inputs artefact: the version is
+        // stable, so an unchanged recipe keeps every existing cache hit.
+        assert_eq!(k.hash_with(3), k.hash_with(3));
+        assert_eq!(
+            k.hash(),
+            k.hash_with(RECIPE_VERSION),
+            "the shipped key must be the current recipe's"
+        );
+
+        // The recipe must not be confusable with the source fields it sits
+        // beside: bumping it is not the same edit as changing the file.
+        let mut bigger = key(7);
+        bigger.size += 1;
+        assert_ne!(k.hash_with(2), bigger.hash_with(1));
+        assert_ne!(k.hash_with(2), bigger.hash_with(2));
     }
 
     #[test]

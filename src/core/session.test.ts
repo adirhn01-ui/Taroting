@@ -22,7 +22,13 @@ import {
 } from "./session";
 import { normalizeChord } from "./shortcuts";
 import { Store } from "./store";
-import { DEFAULT_CUSTOM_THEME, DEFAULT_SETTINGS, DEFAULT_SHORTCUTS } from "./types";
+import {
+  DEFAULT_CUSTOM_THEME,
+  DEFAULT_SETTINGS,
+  DEFAULT_SHORTCUTS,
+  TIMELINE_HEIGHT_MAX,
+  TIMELINE_HEIGHT_MIN,
+} from "./types";
 import type { ActionId, CustomTheme, Settings } from "./types";
 
 /** Settings are persisted opaquely by the Rust side (serde_json::Value), so the
@@ -44,6 +50,7 @@ describe("sanitizeSettings", () => {
     snapCenterGuides: 0,
     tempOpenWith: "yes",
     monitorVolume: "loud",
+    timelineHeight: { px: 400 }, // a CSS length built from this is "[object Object]px"
     customTheme: { background: 0xff0000, accent: "javascript:alert(1)", text: ["#fff"] },
     shortcuts: {
       playPause: "Ctrl+Space", // legitimate rebind: must survive
@@ -66,6 +73,7 @@ describe("sanitizeSettings", () => {
     expect(typeof s.snapCenterGuides).toBe("boolean");
     expect(typeof s.tempOpenWith).toBe("boolean");
     expect(typeof s.monitorVolume).toBe("number");
+    expect(Number.isInteger(s.timelineHeight)).toBe(true);
     expect(s.customTheme).toEqual(DEFAULT_CUSTOM_THEME);
   });
 
@@ -120,6 +128,52 @@ describe("sanitizeSettings", () => {
     expect(sanitizeSettings({ cacheLimitMB: 5120 }).cacheLimitMB).toBe(5120);
   });
 
+  /**
+   * `timelineHeight` is written by dragging the timeline's top divider, and the
+   * bounds here are that handle's own — so a value the handle could never have
+   * produced is one the UI cannot undo. Below the floor there is no lane left
+   * to drop a clip on; above the ceiling there is no preview left to watch it
+   * in, and the divider that would fix either is off-screen.
+   *
+   * Every expected value below is distinct from every other and from the
+   * default, so no single wrong behaviour (ignore the input, floor instead of
+   * round, clamp to the wrong end, always fall back) can satisfy the table.
+   */
+  it("clamps timelineHeight to whole pixels inside the divider's own bounds", () => {
+    const table: [unknown, number][] = [
+      // Not a number at all: the shipped height, which is always usable.
+      ["tall", DEFAULT_SETTINGS.timelineHeight],
+      [NaN, DEFAULT_SETTINGS.timelineHeight],
+      [Infinity, DEFAULT_SETTINGS.timelineHeight],
+      [-Infinity, DEFAULT_SETTINGS.timelineHeight],
+      [null, DEFAULT_SETTINGS.timelineHeight],
+      [undefined, DEFAULT_SETTINGS.timelineHeight],
+      [{}, DEFAULT_SETTINGS.timelineHeight],
+      [[420], DEFAULT_SETTINGS.timelineHeight],
+      // A number, but not one the divider could have written.
+      [1e9, TIMELINE_HEIGHT_MAX],
+      [-5, TIMELINE_HEIGHT_MIN],
+      [0, TIMELINE_HEIGHT_MIN],
+      [TIMELINE_HEIGHT_MIN - 0.4, TIMELINE_HEIGHT_MIN],
+      // Fractional: rounded, not truncated — a half-pixel lane canvas is the
+      // one thing a stored layout size must never produce.
+      [300.7, 301],
+      [412.2, 412],
+      // Legal values, passed through: a real drag result, and a stringified one
+      // (a plausible hand-edit, accepted exactly as the neighbouring numbers
+      // accept it).
+      [412, 412],
+      ["351", 351],
+      [TIMELINE_HEIGHT_MIN, TIMELINE_HEIGHT_MIN],
+      [TIMELINE_HEIGHT_MAX, TIMELINE_HEIGHT_MAX],
+    ];
+    for (const [raw, expected] of table) {
+      expect(sanitizeSettings({ timelineHeight: raw }).timelineHeight, String(raw)).toBe(expected);
+    }
+    // The upgrade path: every settings.json written before this field existed.
+    expect(sanitizeSettings({}).timelineHeight).toBe(DEFAULT_SETTINGS.timelineHeight);
+  });
+
   it("passes a fully valid settings object through unchanged", () => {
     const valid = {
       ...DEFAULT_SETTINGS,
@@ -133,6 +187,10 @@ describe("sanitizeSettings", () => {
       snapCenterGuides: false,
       tempOpenWith: true,
       monitorVolume: 0.5,
+      // Deliberately NOT the default: a sanitizer that ignored the stored value
+      // and always wrote DEFAULT_SETTINGS.timelineHeight would pass this test
+      // otherwise, which is exactly the pass-by-construction shape.
+      timelineHeight: 412,
       customTheme: { background: "#101820", accent: "#ff8800", text: "#e8e8ff" },
       shortcuts: { ...DEFAULT_SHORTCUTS, split: "Ctrl+Alt+S" } as Record<ActionId, string>,
     };
@@ -1842,6 +1900,150 @@ describe("autosave after a failed write", () => {
     expect(saveProject).toHaveBeenCalledTimes(5);
     expect(session.saveState.get()).toBe("error");
     session.discard();
+  });
+});
+
+/**
+ * The third settings data loss, and the only one that needs no failure at all
+ * to happen: two preference changes landing in the same frame.
+ *
+ * `updateSettings` merges its patch onto the store and then AWAITS the write.
+ * Two calls therefore used to overlap — both merged, both handed the backend
+ * their own snapshot, and whichever `save_settings` finished LAST decided the
+ * file. The first call's snapshot was taken before the second patch existed, so
+ * a first write that happened to be the slower one silently un-saved the second
+ * preference. Nothing reports it: both promises resolve, both switches stay
+ * flipped on screen, and the loss only shows up on the next launch.
+ *
+ * Reachable from ordinary use — the Appearance card commits a colour and a
+ * theme together, and a switch toggled while a previous write is still out is a
+ * single unlucky double-click.
+ */
+describe("two settings writes landing in the same frame", () => {
+  beforeEach(() => {
+    installGlobalStubs();
+    // The store is module state shared with every other block in this file.
+    settingsStore.set(DEFAULT_SETTINGS);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /** Let every already-queued microtask run. A macrotask hop rather than a
+   *  counted number of `Promise.resolve()`s: the write chain is several `then`
+   *  hops deep and a counted flush is a fixture that rots the moment one is
+   *  added. */
+  const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /**
+   * A `save_settings` that blocks until released, recording what it was HANDED
+   * (call order) and, separately, what actually reached the file (completion
+   * order — the last entry is what a later launch would read back).
+   */
+  function gatedWriter(): {
+    started: Settings[];
+    landed: Settings[];
+    gates: Array<() => void>;
+    peakInFlight: () => number;
+  } {
+    const started: Settings[] = [];
+    const landed: Settings[] = [];
+    const gates: Array<() => void> = [];
+    let inFlight = 0;
+    let peak = 0;
+    vi.spyOn(ipc, "saveSettings").mockImplementation(async (s) => {
+      started.push(s);
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise<void>((resolve) => gates.push(resolve));
+      inFlight--;
+      landed.push(s);
+    });
+    return { started, landed, gates, peakInFlight: () => peak };
+  }
+
+  /** Boot from a real stored file, so `settingsVerified` is true and no write
+   *  takes the reconcile path — this block is about the writes themselves. */
+  async function bootVerified(): Promise<void> {
+    vi.spyOn(ipc, "readSettings").mockResolvedValue({
+      status: "ok",
+      settings: DEFAULT_SETTINGS,
+      recovered: false,
+    });
+    await initSettings();
+  }
+
+  it("never has two writes in flight at once", async () => {
+    const w = gatedWriter();
+    await bootVerified();
+
+    const first = updateSettings({ cacheLimitMB: 4096 });
+    const second = updateSettings({ autosaveSeconds: 17 });
+    await settle();
+
+    // The second call has already merged and painted — only its DISK write is
+    // waiting its turn, which is the whole point: queueing the store as well
+    // would stall the UI behind an IPC round trip.
+    expect(w.started).toHaveLength(1);
+    expect(settingsStore.get().autosaveSeconds).toBe(17);
+    expect(settingsStore.get().cacheLimitMB).toBe(4096);
+
+    w.gates[0]!();
+    await settle();
+    expect(w.started).toHaveLength(2);
+
+    w.gates[1]!();
+    await Promise.all([first, second]);
+    expect(w.peakInFlight()).toBe(1);
+  });
+
+  it("lands both patches on disk whatever order the backend finishes in", async () => {
+    const w = gatedWriter();
+    await bootVerified();
+
+    const first = updateSettings({ cacheLimitMB: 4096 });
+    const second = updateSettings({ autosaveSeconds: 17 });
+
+    // Released NEWEST FIRST, deliberately. A backend under load finishes writes
+    // in whatever order it likes, and that is exactly the case the old code lost
+    // a preference in: the slower first write, carrying a snapshot taken before
+    // the second patch existed, landed last and overwrote it.
+    for (;;) {
+      await settle();
+      const gate = w.gates.pop();
+      if (!gate) break;
+      gate();
+    }
+    await Promise.all([first, second]);
+
+    const onDisk = w.landed[w.landed.length - 1]!;
+    expect(onDisk.cacheLimitMB).toBe(4096);
+    expect(onDisk.autosaveSeconds).toBe(17);
+    // And every write in the burst carried the merged state, not just the last
+    // one — so a burst interrupted halfway still leaves a coherent file.
+    for (const s of w.landed) {
+      expect(s.cacheLimitMB).toBe(4096);
+      expect(s.autosaveSeconds).toBe(17);
+    }
+  });
+
+  it("reports a failed write to its own caller without blocking the next one", async () => {
+    const saveSettings = vi
+      .spyOn(ipc, "saveSettings")
+      .mockRejectedValueOnce(new Error("the file was locked"))
+      .mockResolvedValue(undefined);
+    await bootVerified();
+
+    // The queue must not become a way for one transient failure to swallow
+    // every preference change for the rest of the session.
+    await expect(updateSettings({ cacheLimitMB: 4096 })).rejects.toThrow(/locked/);
+    await updateSettings({ autosaveSeconds: 17 });
+
+    expect(saveSettings).toHaveBeenCalledTimes(2);
+    expect(saveSettings.mock.calls[1]![0].cacheLimitMB).toBe(4096);
+    expect(saveSettings.mock.calls[1]![0].autosaveSeconds).toBe(17);
   });
 });
 

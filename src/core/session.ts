@@ -11,6 +11,8 @@ import {
   DEFAULT_SETTINGS,
   DEFAULT_SHORTCUTS,
   LEGACY_BASE_COLORS,
+  TIMELINE_HEIGHT_MAX,
+  TIMELINE_HEIGHT_MIN,
 } from "./types";
 
 /* ---------------- settings ---------------- */
@@ -797,6 +799,14 @@ function asNum(v: unknown, fallback: number, lo: number, hi: number): number {
   return Math.min(Math.max(n, lo), hi);
 }
 
+/** `asNum` in whole pixels. A stored layout size is written back out as a CSS
+ *  length and compared against measured element heights, so a fractional value
+ *  buys nothing and lands the lane canvas on a half-pixel. Rounded AFTER the
+ *  clamp, which is safe because both bounds are integers. */
+function asInt(v: unknown, fallback: number, lo: number, hi: number): number {
+  return Math.round(asNum(v, fallback, lo, hi));
+}
+
 function asBool(v: unknown, fallback: boolean): boolean {
   return typeof v === "boolean" ? v : fallback;
 }
@@ -867,6 +877,16 @@ export function sanitizeSettings(raw: unknown): Settings {
     snapCenterGuides: asBool(o.snapCenterGuides, DEFAULT_SETTINGS.snapCenterGuides),
     tempOpenWith: asBool(o.tempOpenWith, DEFAULT_SETTINGS.tempOpenWith),
     monitorVolume: asNum(o.monitorVolume, DEFAULT_SETTINGS.monitorVolume, 0, 1),
+    // The same clamp the drag handle applies, so the two can never disagree
+    // about what a legal height is: a hand-edited 40 leaves no lane to drop a
+    // clip on, and a 4000 leaves no preview to watch it in — and neither is
+    // recoverable through the UI that wrote the value.
+    timelineHeight: asInt(
+      o.timelineHeight,
+      DEFAULT_SETTINGS.timelineHeight,
+      TIMELINE_HEIGHT_MIN,
+      TIMELINE_HEIGHT_MAX,
+    ),
     shortcuts,
   };
 }
@@ -1056,6 +1076,39 @@ async function reconcileSettings(): Promise<boolean> {
   return true;
 }
 
+/**
+ * The tail of the settings write chain — the one place `save_settings` is
+ * called from, and the reason two of them can never be in flight at once.
+ *
+ * THE INTERLEAVING THIS PREVENTS. Every switch, slider and colour commit in
+ * Settings calls `updateSettings`, and each one awaits its write. Two landing
+ * in the same frame used to overlap: both merged their patch onto the store,
+ * both handed the BACKEND their own snapshot, and whichever `save_settings`
+ * finished LAST decided the file. The first call's snapshot predates the second
+ * patch, so a slower first write silently un-saved the second preference — the
+ * loser of the race writing last, which is the worst possible ordering.
+ *
+ * Two things fix it, and neither is sufficient alone. Writes are CHAINED, so
+ * the last one to start is the last one to land. And each write serialises the
+ * STORE as it stands when it actually runs, not a snapshot captured at call
+ * time — so every write in a burst carries the merged state and the file is
+ * right even if one of them fails partway through.
+ *
+ * The tail deliberately absorbs rejections. A failed write is its own caller's
+ * problem and is re-thrown to them; it must not stop the next preference change
+ * from ever being saved.
+ */
+let settingsWriteTail: Promise<void> = Promise.resolve();
+
+function writeSettingsInOrder(): Promise<void> {
+  const write = settingsWriteTail.then(() => ipc.saveSettings(settingsStore.get()));
+  settingsWriteTail = write.then(
+    () => {},
+    () => {},
+  );
+  return write;
+}
+
 export async function updateSettings(patch: Partial<Settings>): Promise<void> {
   // Only ever true after a boot read that came back empty or failed, and only
   // for the first write of that session — see the block comment above. It is
@@ -1068,8 +1121,13 @@ export async function updateSettings(patch: Partial<Settings>): Promise<void> {
   // the colours while already on it. `adopted` forces a repaint as well — the
   // app has been showing the default theme since boot, and the settings we just
   // recovered may name a different one.
+  //
+  // Both of these stay SYNCHRONOUS with the call. Only the disk write queues:
+  // making the store wait its turn would mean a theme that repaints when the
+  // previous write's IPC round trip finishes, which is a visible stall for
+  // exactly the gesture (a colour commit) that produces the most writes.
   if (adopted || patch.theme || patch.customTheme) applyTheme(next.theme, next.customTheme);
-  await ipc.saveSettings(next);
+  await writeSettingsInOrder();
   // The file is now ours: whatever was unreadable at boot has been replaced by
   // something we wrote, so later writes can go straight through.
   settingsVerified = true;

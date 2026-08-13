@@ -11,7 +11,7 @@ import { ProjectSession, settingsStore, updateSettings } from "../../core/sessio
 import { timelineDuration } from "../../core/time";
 import type { ExportPreset, ResolutionPreset } from "../../core/types";
 import { detailPane, recentErrors, recordError } from "../../ui/errors";
-import { trapTab } from "../../ui/focus";
+import { focusFirst, trapTab } from "../../ui/focus";
 import { icon } from "../../ui/icons";
 import { toast } from "../../ui/toast";
 import {
@@ -421,6 +421,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   const releaseTrap = trapTab(backdrop);
 
   let exporting = false;
+  /** False until the form has been painted once — the difference between
+   *  opening the dialog and returning to the form from another view. */
+  let formPainted = false;
   /** Set by close() so an in-flight async listener registration can tell that
    *  the dialog is already gone (see beginExport). */
   let closed = false;
@@ -607,6 +610,28 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     updateHardwareRow();
     refreshOutPath();
     scheduleEstimate();
+    seatFormFocus();
+  }
+
+  /** Focus lives in the body this function just replaced. Every view swap here
+   *  destroys the focused node — the select the user changed, the Back button
+   *  they clicked, the Export button — and focus falls to <body>, where
+   *  `trapTab` (a listener on the backdrop) never sees a keydown again. So the
+   *  filename field, the form's natural entry point, takes it back.
+   *
+   *  Only when focus really did fall out: a control that survived the swap (the
+   *  header's Close) keeps it. */
+  function seatFormFocus(): void {
+    const first = !formPainted;
+    formPainted = true;
+    if (backdrop.contains(document.activeElement)) return;
+    const nameInput = $<HTMLInputElement>("#ex-name");
+    nameInput.focus();
+    // Pre-selected on the first paint only, so a name typed straight after
+    // opening replaces the suggestion. On a RE-render the user was reaching for
+    // a control, not the name, and a selected field would turn their next
+    // keystroke into a rename.
+    if (first) nameInput.select();
   }
 
   function wireForm(): void {
@@ -994,6 +1019,11 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     `;
     footerEl.innerHTML = `<button class="btn btn--danger" id="ex-cancel">Cancel</button>`;
     $("#ex-cancel").addEventListener("click", () => void onCancelExport());
+    // The Export button the user just pressed no longer exists. Cancel is the
+    // only thing this view offers, and it is the one control they may urgently
+    // want — reaching it must not depend on a Tab ring that has fallen out of
+    // the dialog.
+    focusFirst(backdrop, "#ex-cancel");
   }
 
   function handleProgress(e: JobProgress): void {
@@ -1081,6 +1111,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     `;
     $("#ex-reveal").addEventListener("click", () => void revealInExplorer(path));
     footerEl.querySelector("[data-close-btn]")!.addEventListener("click", close);
+    // Arrived here from the progress view, whose Cancel button is gone. Close is
+    // what the user wants next, and Enter should reach it without a Tab first.
+    focusFirst(backdrop, "[data-close-btn]");
   }
 
   /** Assemble the diagnostic report for a failed export. Everything here is
@@ -1150,10 +1183,10 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     saveBtn.textContent = "Save report";
     actions.appendChild(saveBtn);
 
-    const hint = document.createElement("div");
-    hint.className = "err-hint";
-    hint.textContent = "The saved file also includes the full filter graph.";
-    pane.appendChild(hint);
+    // The pane already states what it redacted; the filter graph is the one
+    // thing true only here, so it joins that line rather than stacking a second.
+    const hint = pane.querySelector<HTMLElement>(".err-hint");
+    if (hint) hint.textContent += " The saved file also includes the full filter graph.";
     bodyEl.querySelector(".export-result")!.appendChild(pane);
 
     // Swap the raw log for the full report as soon as it is assembled.
@@ -1197,16 +1230,18 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     `;
     $("#ex-back").addEventListener("click", () => renderForm());
     footerEl.querySelector("[data-close-btn]")!.addEventListener("click", close);
+    // The detail textarea, not a button: this is the view whose entire purpose
+    // is getting the text OUT, and a focused textarea makes Ctrl+A / Ctrl+C work
+    // on the first keystroke (the app's own Ctrl+C binding stands aside for a
+    // typing target). It also puts focus back inside the backdrop, which is what
+    // re-arms the Tab trap after the swap emptied it.
+    focusFirst(backdrop, ".err-detail");
   }
 
   /* -------- boot -------- */
+  // renderForm seats focus itself, on every paint — the Back path needs it just
+  // as much as the first one.
   renderForm();
-  // focus the filename input on open
-  const nameInput = backdrop.querySelector<HTMLInputElement>("#ex-name");
-  if (nameInput) {
-    nameInput.focus();
-    nameInput.select();
-  }
 
   // detect encoders in the background, then refresh the badge
   void detectEncoders(false)

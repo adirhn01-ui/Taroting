@@ -341,7 +341,14 @@ export function mountTheater(ctx: TheaterCtx): Theater {
   // the teardown so the two stages never desync. Either direction (gain OR lose
   // element fullscreen) resizes the container, so refit on every change.
   const onFsChange = (): void => {
-    if (active && !document.fullscreenElement) exit();
+    // Exact-element, not merely "any fullscreen": in the rejected-request
+    // fallback no fullscreenchange ever fires for US, so an event that arrives
+    // while we are active is either our own element changing state or another
+    // element taking the screen — and theater should stand down for both
+    // departures. Today no other element CAN enter fullscreen (the pooled
+    // videos carry no `controls` attribute), so the distinction is free
+    // future-proofing, not a behaviour change.
+    if (active && document.fullscreenElement !== container) exit();
     else scheduleRefit();
   };
 
@@ -367,6 +374,12 @@ export function mountTheater(ctx: TheaterCtx): Theater {
     playBtnShows = null;
     lastTimeText = "";
     lastPct = -1;
+    // The fourth cross-tick cache, and the one that gates BEHAVIOUR: the tick
+    // early-returns while theater is closed, so `wasPlaying` still holds the
+    // state from the previous session's last tick. Exiting while playing then
+    // re-entering paused made the next Space a non-flip — the hide timer never
+    // armed and the bar sat on screen for the whole run.
+    wasPlaying = engine.playing;
     updatePlayBtn();
     updateReadout();
 
@@ -377,7 +390,21 @@ export function mountTheater(ctx: TheaterCtx): Theater {
     // best-effort true fullscreen; rejects without a user gesture (tests) — the
     // in-window theater is already up, so we simply ignore the rejection.
     const rf = container.requestFullscreen?.();
-    if (rf) rf.catch(() => {});
+    if (rf) {
+      rf.then(
+        () => {
+          // Resolved after exit() already ran (a fast F→Esc): the fullscreen
+          // element is not populated until the OS transition completes, so
+          // exit()'s own check read null and could not undo a transition that
+          // had not landed — and it had already detached onFsChange, so nothing
+          // else will. The window is fullscreen with no theater over it; hand
+          // it back. `active` alone is the right predicate — if a NEW session
+          // has started meanwhile, fullscreen is wanted, whoever requested it.
+          if (!active) document.exitFullscreen?.().catch(() => {});
+        },
+        () => {},
+      );
+    }
 
     // the container jumped to fixed inset-0: refit the letterbox to the new box
     // so the video scales crisply (no stale windowed size / transient stretch).

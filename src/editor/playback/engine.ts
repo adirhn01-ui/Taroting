@@ -37,10 +37,13 @@ export type TickListener = (time: number, playing: boolean) => void;
  * a refresh landing 12 ms later is ALREADY over that bar: it backward-seeks the
  * very element that is acting as the master clock — a dropped frame plus an
  * audio glitch. That is not a rare event either. editor.ts subscribes refresh()
- * to `media.status` (a running proxy/remux job republishes that object ~10x/s,
- * so 3-4 seeks a second while media prepares) and to the stage's
- * ResizeObserver (every frame of a window drag). Neither has anything to say
- * about where the playhead is.
+ * to the stage's ResizeObserver (every frame of a window drag) and to
+ * `media.status`, which fires it whenever a media's readiness KIND changes — a
+ * proxy finishing under the playhead is precisely a refresh mid-playback.
+ * (Progress ticks used to come through here too, ~10x/s per running job;
+ * `statusChange` in src/editor/media/status-diff.ts now filters those out
+ * before they reach refresh().) Neither caller has anything to say about where
+ * the playhead is.
  *
  * The guards are what keep a LEGITIMATE re-seek working, and each rules out one
  * way the element's position can differ from the clock for a reason other than

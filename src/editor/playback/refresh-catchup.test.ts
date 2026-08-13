@@ -7,9 +7,11 @@
 // the last rAF tick, so a refresh landing 12 ms later is already over that bar
 // and backward-seeks the very element acting as the master clock — a dropped
 // frame plus an audio glitch. Two callers make that common rather than rare:
-// editor.ts subscribes refresh() to `media.status` (a running proxy/remux job
-// republishes that object ~10x/s) and to the stage's ResizeObserver (every
-// frame of a window drag). Neither says anything about where the playhead is.
+// editor.ts subscribes refresh() to the stage's ResizeObserver (every frame of
+// a window drag) and to `media.status` readiness-KIND changes (progress ticks
+// are filtered out by statusChange in media/status-diff.ts before they reach
+// refresh(), but a proxy finishing mid-playback still lands here). Neither
+// says anything about where the playhead is.
 //
 // The other half is what these tests mostly cover: suppressing the seek must
 // NOT suppress a LEGITIMATE one. refresh() exists for project edits — a clip

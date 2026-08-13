@@ -116,7 +116,11 @@ export function mountStage(
         canvas.appendChild(set.el);
         live.push(set);
       }
-      // keep the status overlay topmost
+      // Keep the overlay a child of the canvas after the re-attach churn.
+      // DOM order does NOT decide its paint order — the layer sets carry
+      // positive z-indexes, which beat document order among positioned
+      // siblings whatever the append sequence. What keeps the status scrim
+      // above every layer is --z-stage-status on .preview__overlay.
       canvas.appendChild(overlay);
       stage.layers = live;
     },

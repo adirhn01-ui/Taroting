@@ -25,3 +25,7 @@ CLAUDE.md
 
 # local process notes (manual QA regime)
 TESTING.md
+
+# E2E export output — rewritten by every autotest run, never source
+tests/autotest-export.mp4
+tests/autotest-export-v06.mp4

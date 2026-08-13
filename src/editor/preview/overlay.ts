@@ -443,6 +443,9 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     // upsert during the gesture so a moving playhead (engine playing) edits one
     // keyframe instead of scattering a new one per pointermove.
     keySrcTime: number;
+    /** The pointer that owns the gesture. Kept so an end that is NOT a pointerup
+     *  (Escape, dispose) can still release the capture the pointerdown took. */
+    pointerId: number;
     // scale
     downDist?: number;
     centerProj?: { x: number; y: number };
@@ -472,6 +475,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
         startProj: p,
         startPose: pose,
         keySrcTime: sourceTime(sel.clip, engine.time - sel.clip.timelineStart),
+        pointerId: e.pointerId,
         downDist: Math.hypot(p.x - center.x, p.y - center.y),
         centerProj: center,
       };
@@ -498,6 +502,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
       startProj: p,
       startPose: pose,
       keySrcTime: sourceTime(found.clip, engine.time - found.clip.timelineStart),
+      pointerId: e.pointerId,
     };
     capture(overlay, e.pointerId);
     // do NOT preventDefault: dblclick needs the native pointer sequence
@@ -552,6 +557,48 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     // Release inside the dead-zone: never armed, nothing mutated → pure select,
     // no history entry. Only commit when the gesture actually edited the project.
     if (g.armed && g.before) session.commitFrom(g.before);
+  }
+
+  /**
+   * End a move/scale drag that is NOT ending in a pointerup — today that is
+   * Escape on the focused overlay, or the overlay being torn down under a live
+   * gesture (the project closed, a navigation, an OS open-path arriving
+   * mid-drag).
+   *
+   * REVERT, rather than commit — the same reading cancelCropGesture takes, and
+   * the reason the two must agree: the user cannot aim Escape at one kind of
+   * canvas drag and not the other, so it has to mean the same thing on both.
+   * The drag's live edits went through session.replace(), which writes no
+   * history at all, so keeping them would park a change in the project (and in
+   * the next autosave) that Ctrl+Z cannot reach. replace() back to `before` is
+   * likewise history-free, so history comes out exactly as it was before the
+   * pointer went down.
+   *
+   * `gesture` is dropped FIRST, which is what makes this idempotent: a dispose
+   * that follows an Escape — or an Escape after the pointerup already committed
+   * — finds nothing and cannot revert a second time. Everything the gesture
+   * owns goes with it: the capture the pointerdown took, so a later pointermove
+   * cannot resume a dead drag from its stale startClient, and the center-snap
+   * guides, which would otherwise stay lit over a canvas nobody is dragging on.
+   */
+  function cancelGesture(): void {
+    const g = gesture;
+    if (!g) return;
+    gesture = null;
+    hideGuides();
+    try { overlay.releasePointerCapture(g.pointerId); } catch { /* not captured */ }
+    // Never armed: the pointer stayed inside the dead-zone, so nothing was
+    // written and no baseline was captured. That is a pure selection, and a
+    // selection is not what Escape is cancelling here.
+    if (!g.armed || !g.before) return;
+    // The guard cancelCropGesture carries, for the same reason: only roll back
+    // while the dragged clip is still there. Outside crop mode this handler
+    // swallows nothing but Escape and the arrows, so a global shortcut CAN
+    // delete the clip mid-drag — and restoring the whole snapshot would
+    // resurrect what that delete just removed.
+    if (!findClip(session.project, g.clipId)) return;
+    session.replace(g.before);
+    ctx.refresh();
   }
 
   /** Auto-key or static position write, then live-replace (no history). The
@@ -620,6 +667,14 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
       return;
     }
     if (e.key === "Escape") {
+      // A drag in flight is the innermost thing this key can cancel, so it takes
+      // the Escape — and the SELECTION SURVIVES it. That is what crop mode
+      // already does (exitCrop reverts the drag, leaves crop, and never touches
+      // selection.set) and what the timeline's own cancelGesture does; the clip
+      // stays selected because retrying the drag is the normal next move, and
+      // the pointer is usually still down when the key arrives. A second Escape,
+      // with no gesture left, is the one that clears the selection.
+      if (gesture) { e.preventDefault(); e.stopPropagation(); cancelGesture(); return; }
       if (selection.get()) { e.preventDefault(); e.stopPropagation(); selection.set(null); }
       return;
     }
@@ -1025,7 +1080,20 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
   overlay.addEventListener("pointerdown", onPointerDown);
   overlay.addEventListener("pointermove", onPointerMove);
   overlay.addEventListener("pointerup", onPointerUp);
-  overlay.addEventListener("pointercancel", onPointerUp);
+  // A cancelled pointer is the OS withdrawing the gesture, not the user
+  // finishing it — routing it to the commit path landed the clip wherever the
+  // interruption happened to leave it. Same ruling as the timeline's
+  // cancelGesture; the user re-does the drag they lost, they do not discover a
+  // half-drag committed behind an alt-tab.
+  // A cancelled pointer is the OS withdrawing the gesture, not the user
+  // finishing it — routing it to the commit path landed the clip wherever the
+  // interruption happened to leave it. Same ruling as the timeline's
+  // cancelGesture; the user re-does the drag they lost, they do not discover a
+  // half-drag committed behind an alt-tab.
+  overlay.addEventListener("pointercancel", () => {
+    if (mode === "crop") cancelCropGesture();
+    else cancelGesture();
+  });
   overlay.addEventListener("dblclick", onDblClick);
   overlay.addEventListener("keydown", onKeyDown);
   overlay.addEventListener("keyup", onKeyUp);
@@ -1049,6 +1117,24 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
 
   return {
     dispose(): void {
+      // A gesture can still be in flight when the overlay goes away — the
+      // project closed, a navigation, an OS open-path arriving mid-drag. Its
+      // live edits went through replace(), so they carry NO history entry:
+      // leaving them parks a half-finished drag in the project and in the save
+      // that editor.ts's own dispose is about to await, with nothing for Ctrl+Z
+      // to reach. Revert exactly as Escape does.
+      //
+      // Two calls, not one: the move/scale gesture and the crop gesture are
+      // separate state, and only one of them can be live at a time (crop mode
+      // routes every pointer event to its own handlers), so the other is always
+      // a no-op. Both drop their gesture before doing anything else, which is
+      // why a dispose that FOLLOWS an Escape cannot revert a second time.
+      //
+      // Before the unsubscribes, deliberately: the revert calls ctx.refresh(),
+      // and editor.ts disposes this overlay ahead of the engine and the
+      // timeline, so both are still alive to receive it.
+      cancelGesture();
+      cancelCropGesture();
       window.clearTimeout(nudgeIdle);
       unTick();
       unSel();

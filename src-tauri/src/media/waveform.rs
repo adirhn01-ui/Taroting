@@ -4,9 +4,11 @@
 //!
 //! Format: "TPK1" magic · u32le pairsPerSec · u32le pairCount · [i8 min, i8 max]×
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, State};
@@ -14,6 +16,7 @@ use tauri::{AppHandle, State};
 use crate::cache::{Cache, CacheKind, MediaKey};
 use crate::error::{AppError, Result};
 use crate::jobs::{self, JobId, JobKind, Jobs, Lane};
+use crate::media::playability::Inflight;
 
 pub const SAMPLE_RATE: u32 = 8000;
 pub const PAIRS_PER_SEC: u32 = 100;
@@ -151,11 +154,46 @@ pub enum WaveformResult {
     None,
 }
 
+/// Reserve the in-flight slot for `output`, or report the job already producing
+/// it.
+///
+/// `allocate` runs ONLY on a miss, and it runs while the lock is held. Both
+/// halves matter: allocating first and dropping the handle on a hit leaks a job
+/// the frontend never sees finish, and releasing the lock between the lookup and
+/// the insert re-opens the exact race this closes.
+///
+/// Poison-tolerant for the same reason the cache index is: with
+/// `panic = "abort"` a poisoned map would turn a waveform request into a dead
+/// process, and the map holds nothing worth protecting — a stale entry costs one
+/// redundant decode, never a wrong answer.
+fn claim_output<T>(
+    inflight: &Mutex<HashMap<PathBuf, JobId>>,
+    output: &Path,
+    allocate: impl FnOnce() -> (JobId, T),
+) -> std::result::Result<(JobId, T), JobId> {
+    let mut map = inflight.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&existing) = map.get(output) {
+        return Err(existing);
+    }
+    let claimed = allocate();
+    map.insert(output.to_path_buf(), claimed.0);
+    Ok(claimed)
+}
+
+/// Release the slot once the job that owns it has stopped writing.
+fn release_output(inflight: &Mutex<HashMap<PathBuf, JobId>>, output: &Path) {
+    inflight
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(output);
+}
+
 #[tauri::command]
 pub fn ensure_waveform(
     app: AppHandle,
     jobs: State<'_, Arc<Jobs>>,
     cache: State<'_, Arc<Cache>>,
+    inflight: State<'_, Inflight>,
     key: MediaKey,
     duration: f64,
     has_audio: bool,
@@ -173,11 +211,32 @@ pub fn ensure_waveform(
     let final_path = cache.file_path(CacheKind::Waveform, &hash, ".pk");
     let tmp_path = cache.file_path(CacheKind::Waveform, &hash, ".pk.tmp");
 
-    let handle = jobs.allocate(JobKind::Waveform);
-    let job_id = handle.id;
+    // Two clips on the same media — or one project opened while its previous
+    // mount is still tearing down — used to start two decodes of the SAME file
+    // writing the SAME `.pk`, then race each other's rename onto it. The
+    // timeline requests a waveform per audio clip as it draws, so duplicates are
+    // the normal case on the project-open path, not an edge one. `plan_playback`
+    // has guarded its own outputs this way since v0.6; this is the sibling call
+    // site that was missed, and it shares the same registry because the map is
+    // keyed by the absolute output path — a waveform's `.pk` can never collide
+    // with a remux's or proxy's `.mp4`.
+    let (job_id, handle) = match claim_output(&inflight.0, &final_path, || {
+        let h = jobs.allocate(JobKind::Waveform);
+        (h.id, h)
+    }) {
+        Ok(claimed) => claimed,
+        Err(existing) => {
+            return Ok(WaveformResult::Pending {
+                job_id: existing,
+                output: final_path.to_string_lossy().into_owned(),
+            })
+        }
+    };
+
     let app_clone = app.clone();
     let jobs_arc = Arc::clone(&jobs);
     let cache_arc = Arc::clone(&cache);
+    let inflight_arc = Arc::clone(&inflight.0);
     let src = key.path.clone();
     let final_clone = final_path.clone();
 
@@ -185,7 +244,13 @@ pub fn ensure_waveform(
         Lane::Background,
         Box::new(move || {
             handle.set_output(tmp_path.clone());
-            match extract(&app_clone, &handle, &src, duration, &tmp_path) {
+            let extracted = extract(&app_clone, &handle, &src, duration, &tmp_path);
+            // Released before the rename, exactly as `ensure_prepared` does: the
+            // decode is what must not be duplicated, and a request arriving
+            // during the rename either finds the finished file or starts a fresh
+            // job, both of which are correct.
+            release_output(&inflight_arc, &final_clone);
+            match extracted {
                 Ok(()) => {
                     if std::fs::rename(&tmp_path, &final_clone).is_ok() {
                         cache_arc.mark_used(&final_clone);
@@ -260,6 +325,63 @@ mod tests {
         // And the buffer that hint feeds is actually allocatable.
         let v: Vec<(i8, i8)> = Vec::with_capacity(pairs_capacity_hint(f64::MAX) + 16);
         assert!(v.capacity() >= MAX);
+    }
+
+    /// The de-duplication `plan_playback` had and this path did not.
+    ///
+    /// Every value differs on every axis it could be confused with: the two
+    /// outputs differ, the three job ids differ from each other and from the
+    /// allocation counts, and the payload the allocator returns is checked
+    /// separately from the id, so a helper that returned the wrong half of the
+    /// pair cannot pass.
+    #[test]
+    fn a_second_request_for_the_same_waveform_joins_the_running_job() {
+        let map: Mutex<HashMap<PathBuf, JobId>> = Mutex::new(HashMap::new());
+        let pk = PathBuf::from(r"C:\cache\waveform\1122334455667788.pk");
+        let other = PathBuf::from(r"C:\cache\waveform\99aabbccddeeff00.pk");
+
+        /// A stand-in for `jobs.allocate` that counts how often it actually runs.
+        fn allocator<'a>(
+            calls: &'a std::cell::Cell<u32>,
+            id: JobId,
+            tag: &'static str,
+        ) -> impl FnOnce() -> (JobId, &'static str) + 'a {
+            move || {
+                calls.set(calls.get() + 1);
+                (id, tag)
+            }
+        }
+        let allocations = std::cell::Cell::new(0u32);
+        let allocate = |id, tag| allocator(&allocations, id, tag);
+
+        // First request wins the slot and gets its own handle back.
+        let first = claim_output(&map, &pk, allocate(41, "handle-41")).expect("slot was free");
+        assert_eq!(first, (41, "handle-41"));
+        assert_eq!(allocations.get(), 1);
+
+        // The duplicate the timeline fires while drawing the second clip of the
+        // same media joins job 41 instead of starting a second decode onto the
+        // same file — and must NOT allocate a handle it would then drop.
+        let dup = claim_output(&map, &pk, allocate(77, "handle-77")).expect_err("must join");
+        assert_eq!(dup, 41, "the joiner must be told the RUNNING job's id");
+        assert_eq!(
+            allocations.get(),
+            1,
+            "a joined request must not allocate a job handle it then discards"
+        );
+
+        // A different media is a different output: it must still get its own job.
+        let second = claim_output(&map, &other, allocate(77, "handle-77")).expect("distinct output");
+        assert_eq!(second, (77, "handle-77"));
+        assert_eq!(allocations.get(), 2);
+
+        // Once the decode finishes the slot frees, so a later request (a cache
+        // miss after eviction, say) starts a fresh job rather than joining a
+        // dead one.
+        release_output(&map, &pk);
+        let again = claim_output(&map, &pk, allocate(93, "handle-93")).expect("slot released");
+        assert_eq!(again, (93, "handle-93"));
+        assert_eq!(allocations.get(), 3);
     }
 
     #[test]

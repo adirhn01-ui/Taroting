@@ -177,9 +177,15 @@ export interface ExportPreset {
   useHardware: boolean;
 }
 
-/** A `.trt` project file. */
+/** A `.trt` project file.
+ *
+ *  `schema` 2 = "media dimensions are display-oriented" (the rotation
+ *  migration): the Rust loader re-probes a schema-1 file's video media once,
+ *  corrects any transposed width/height, and persists it as 2. New projects
+ *  are stamped 2 directly — their media is recorded post-rotation-fix, so the
+ *  migration pass has nothing to do and skipping it is free. */
 export interface ProjectFile {
-  schema: 1;
+  schema: 1 | 2;
   app: "taroting";
   id: string;
   name: string;
@@ -270,8 +276,20 @@ export interface Settings {
   tempOpenWith: boolean;
   /** preview/monitor listening level 0..1 — NOT baked into clips or exports */
   monitorVolume: number;
+  /** Height of the timeline panel in px, written by dragging its top divider.
+   *  Clamped to [TIMELINE_HEIGHT_MIN, TIMELINE_HEIGHT_MAX] on read AND write —
+   *  settings.json is opaque to the backend, so a hand-edited value reaches the
+   *  frontend untyped and must never produce an unusable layout. */
+  timelineHeight: number;
   shortcuts: Record<ActionId, string>;
 }
+
+/** The one clamp for `timelineHeight`, shared by the sanitizer and the drag
+ *  handle so the two can never disagree about what a legal height is. The
+ *  minimum keeps the ruler plus one lane usable; the maximum keeps the preview
+ *  from collapsing on a 768-tall laptop. */
+export const TIMELINE_HEIGHT_MIN = 160;
+export const TIMELINE_HEIGHT_MAX = 640;
 
 export interface RecentItem {
   path: string;
@@ -346,6 +364,7 @@ export const DEFAULT_SETTINGS: Settings = {
   snapCenterGuides: true,
   tempOpenWith: false,
   monitorVolume: 1,
+  timelineHeight: 280,
   shortcuts: DEFAULT_SHORTCUTS,
 };
 

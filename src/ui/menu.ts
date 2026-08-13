@@ -15,6 +15,10 @@ export interface MenuItem {
 let host: HTMLDivElement | null = null;
 let items: MenuItem[] = [];
 let activeIndex = -1;
+/** Where focus was when the menu opened, so closing can put it back. Captured
+ *  only from OUTSIDE the host, so a menu that replaces another menu still
+ *  remembers the control the user actually came from. */
+let openerFocus: HTMLElement | null = null;
 
 function ensureHost(): HTMLDivElement {
   if (host) return host;
@@ -79,6 +83,14 @@ function onKeyDown(e: KeyboardEvent): void {
   } else if (e.key === "Enter") {
     e.preventDefault();
     if (activeIndex >= 0) select(activeIndex);
+  } else if (e.key === "Tab") {
+    // Tab dismisses rather than cycling. A context menu is not a dialog and has
+    // no business owning the Tab ring; the hole this closes is that Tab used to
+    // walk the SCREEN BEHIND an open menu — which is still shortcut-blocked and
+    // still swallowing Enter, so the next Enter would fire the menu item while
+    // the ring had moved somewhere else entirely.
+    e.preventDefault();
+    closeMenu();
   }
 }
 
@@ -131,6 +143,10 @@ function removeListeners(): void {
 
 export function showMenu(x: number, y: number, menuItems: MenuItem[]): void {
   const wasOpen = isOpen();
+  // Read before the host is rebuilt below: emptying it drops focus to <body>,
+  // so on a menu that replaces another menu there would be nothing left to read.
+  const opener = document.activeElement;
+  if (opener instanceof HTMLElement && !(host && host.contains(opener))) openerFocus = opener;
   const el = ensureHost();
   items = menuItems;
   activeIndex = -1;
@@ -187,7 +203,23 @@ export function closeMenu(): void {
   items = [];
   activeIndex = -1;
   removeListeners();
+  const opener = openerFocus;
+  openerFocus = null;
   if (!host) return;
+  // Asked BEFORE the host is emptied: removing the focused button is itself what
+  // drops focus to <body>, so afterwards this is false for every keyboard
+  // dismissal — the only case that wants the focus back.
+  const hadFocus = host.contains(document.activeElement);
   host.style.display = "none";
   host.textContent = "";
+  // Only when the menu was holding focus — which covers keyboard use and the
+  // hover highlight (setActive focuses), but leaves a menu that never took it
+  // alone. Without this the ring restarted at the top of the document on every
+  // dismissal, so Tab after a right-click landed nowhere near the clip.
+  //
+  // `isConnected` covers the screen having been torn down underneath us.
+  // Restored here rather than after `item.onSelect()` deliberately: an item that
+  // opens a dialog must be the LAST thing to touch focus, or the dialog's own
+  // opening focus is overwritten a moment later.
+  if (hadFocus && opener?.isConnected) opener.focus();
 }

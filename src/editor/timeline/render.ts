@@ -287,7 +287,9 @@ function labelFor(t: number, step: number): string {
 
 /** Effective clip geometry with drag overrides applied (pure). */
 export function effectiveClip(clip: Clip, drag: DragState): Clip {
-  if (!drag || drag.clipId !== clip.id) return clip;
+  // A marker drag carries no clip at all — it is the one DragState variant with
+  // no `clipId` — so it is ruled out before the id compare rather than after.
+  if (!drag || drag.kind === "marker" || drag.clipId !== clip.id) return clip;
   if (drag.kind === "move") {
     return { ...clip, timelineStart: drag.start };
   }
@@ -385,8 +387,18 @@ export function draw(ctx: CanvasRenderingContext2D, input: RenderInput): void {
   /* ---------------- markers (ruler flags) ---------------- */
   const markers = input.project.timeline.markers;
   if (markers && markers.length > 0) {
+    // A marker drag previews through the drag override instead of writing the
+    // project (see DragState in interactions.ts), so while one is in flight the
+    // position on screen comes from here and the project still holds where the
+    // drag started. Narrowed once, outside the loop: what this costs a frame
+    // with nothing being dragged is one null compare, and there is no per-marker
+    // allocation either way.
+    const drag = input.drag;
+    const markerDrag = drag !== null && drag.kind === "marker" ? drag : null;
     for (const marker of markers) {
-      const mx = xOf(marker.t);
+      const mt =
+        markerDrag !== null && markerDrag.markerId === marker.id ? markerDrag.t : marker.t;
+      const mx = xOf(mt);
       if (mx < -8 || mx > width + 8) continue;
       const x = Math.round(mx) + 0.5;
       const color = markerColor(marker.color, colors.accent);

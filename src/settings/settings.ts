@@ -996,7 +996,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
         <div class="modal__header"><span>Uninstall Taroting?</span></div>
         <div class="modal__body">
           <p>Your projects in <strong>Documents\\Taroting</strong> and exported files are kept.
-          Settings and caches are removed.</p>
+          The uninstaller that opens next asks whether to remove settings and caches.</p>
         </div>
         <div class="modal__footer">
           <button class="btn btn--sm" data-cancel>Cancel</button>
@@ -1039,7 +1039,8 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       // and this particular button uninstalls the application.
       if (disposed) return;
       // On success the app process exits before this promise resolves; on
-      // failure (e.g. a dev build with no registry entry) surface the error.
+      // failure (e.g. a dev or portable copy with no uninstall.exe beside the
+      // exe) surface the error.
       void ipc.uninstallApp().catch((e: unknown) => {
         close();
         toast.error("Couldn't uninstall Taroting.", {

@@ -6,7 +6,12 @@
 // (GitHub issue #1 — the reporter had to attach a screenshot that cut off
 // mid-line). Everything here renders detail into a readonly <textarea>, which
 // both of those guards already whitelist, and pairs it with an explicit copy.
+//
+// Anything built here to be COPIED OUT is redacted by `src/core/diagnostics.ts`
+// — imported, never re-implemented, because two copies of a privacy scrubber
+// drift and the quieter copy is the one that leaks.
 
+import { createRedactor } from "../core/diagnostics";
 import type { DiagnosticErrorEntry } from "../core/diagnostics";
 import { escapeHtml } from "../core/format";
 import { trapTab } from "./focus";
@@ -51,11 +56,38 @@ function execCommandCopy(text: string): boolean {
 
 /* ---------------- detail pane ---------------- */
 
+/** What the pane tells the user about what it has already done to the text.
+ *  Same sentence Settings → Diagnostics uses above "Recent errors", because it
+ *  is now the same guarantee in both places. */
+const REDACTION_HINT = "Paths are replaced with <file N> tokens.";
+
+/**
+ * One redaction pass over text on its way into a pane.
+ *
+ * A second pass over text a report already scrubbed is a no-op: `<file 1.mp4>`
+ * matches neither PATH_LIKE (no drive letter, no leading slash) nor either user
+ * sweep, so nothing is re-tokenised and the numbering cannot shift. That is what
+ * lets the pane redact unconditionally instead of asking every caller whether
+ * their string has been through it already.
+ *
+ * Exported as the seam the tests pin — the pane around it is DOM.
+ */
+export function redactDetail(text: string): string {
+  return createRedactor().text(text);
+}
+
 /**
  * A readonly <textarea> holding `text` plus a Copy button. A textarea (not a
  * <pre>) is the whole point: `isTypingTarget` returns true for it, so Ctrl+A /
  * Ctrl+C reach the browser untouched, the native context menu is allowed, and
  * `trapTab` reaches it for keyboard users.
+ *
+ * REDACTION HAPPENS HERE, not in the callers. The textarea exists so the native
+ * clipboard works on it, so scrubbing only what the Copy button reads leaves the
+ * leak wide open — select-all, Ctrl+C, paste into an issue, and the raw text
+ * goes with it. The case that made this real: the export dialog seeds this pane
+ * with the ffmpeg log tail, which carries absolute paths by construction, and it
+ * stays that text permanently whenever the report build fails.
  */
 export function detailPane(text: string): HTMLElement {
   const wrap = document.createElement("div");
@@ -65,7 +97,7 @@ export function detailPane(text: string): HTMLElement {
   ta.className = "err-detail";
   ta.readOnly = true;
   ta.spellcheck = false;
-  ta.value = text;
+  ta.value = redactDetail(text);
   ta.setAttribute("aria-label", "Details");
 
   const actions = document.createElement("div");
@@ -76,7 +108,13 @@ export function detailPane(text: string): HTMLElement {
   copy.addEventListener("click", () => void copyText(ta.value));
   actions.appendChild(copy);
 
-  wrap.append(ta, actions);
+  // Said once, next to the text it describes: a user about to paste this into a
+  // public issue should not have to take the redaction on trust.
+  const hint = document.createElement("div");
+  hint.className = "err-hint";
+  hint.textContent = REDACTION_HINT;
+
+  wrap.append(ta, actions, hint);
   return wrap;
 }
 
@@ -86,6 +124,29 @@ export interface ErrorDialogOptions {
   title: string;
   message: string;
   report: string;
+}
+
+/** Every error dialog currently on document.body. Each entry is that dialog's
+ *  own `close`, and each close removes itself. */
+const openDialogs = new Set<() => void>();
+
+/**
+ * Close every open error dialog. This is the router's to call on a route change
+ * — the FLOOR under the per-screen registries, not a replacement for them.
+ *
+ * A screen that owns its dialogs (Settings, Home) closes them in dispose() and
+ * this finds nothing left. But `toast.error(…, { detail })` opens one from
+ * anywhere, and a toast has no teardown moment to hang a closer on: nobody is
+ * holding that dialog when the screen underneath it goes away. Without this the
+ * dialog outlives the route — painted over the next screen, still holding the
+ * focus trap and the window keydown capture, with no owner left to dismiss it.
+ *
+ * Idempotent, like the closers it calls.
+ */
+export function closeErrorDialogs(): void {
+  // Each close() removes itself from the set, so iterate a copy.
+  for (const close of [...openDialogs]) close();
+  openDialogs.clear();
 }
 
 /**
@@ -110,7 +171,8 @@ export interface ErrorDialogOptions {
  * Screens with a teardown registry should register the returned closer; see
  * `openOverlays` in `src/settings/settings.ts` and `src/home/home.ts`. `close`
  * is idempotent, so registering it and also letting the user dismiss the dialog
- * normally is safe.
+ * normally is safe. `closeErrorDialogs` above is the floor for the callers that
+ * have nowhere to register one — a toast, most of all.
  */
 export function openErrorDialog(opts: ErrorDialogOptions): () => void {
   const backdrop = document.createElement("div");
@@ -139,10 +201,12 @@ export function openErrorDialog(opts: ErrorDialogOptions): () => void {
   const close = (): void => {
     if (closed) return;
     closed = true;
+    openDialogs.delete(close);
     window.removeEventListener("keydown", onKey, true);
     releaseTrap();
     backdrop.remove();
   };
+  openDialogs.add(close);
   function onKey(e: KeyboardEvent): void {
     if (e.key !== "Escape") return;
     // Only the topmost backdrop reacts, so a nested pane never closes the
@@ -185,15 +249,30 @@ export function recentErrors(): readonly DiagnosticErrorEntry[] {
   return ring;
 }
 
-/** Plain-text dump of the ring, oldest first. */
+/**
+ * Plain-text dump of the ring, oldest first.
+ *
+ * Scrubbed through the SAME redactor `buildReport` uses. This dump exists to be
+ * pasted into an issue, and a toast's detail is typically an ffmpeg log line or
+ * an fs error — precisely where an absolute path turns up. "Recent errors" and
+ * "Copy report" sit one row apart in Settings → Diagnostics, so the two must not
+ * disagree about what leaves the machine; only one of them used to redact.
+ *
+ * ONE redactor for the whole dump, matching a report's one-per-report rule: a
+ * file that fails twice then reads as the same `<file N>` in both entries
+ * instead of two unrelated ones, which is what makes the dump diagnosable at
+ * all after the names are gone.
+ */
 export function formatRecentErrors(entries: readonly DiagnosticErrorEntry[]): string {
   if (entries.length === 0) return "No errors this session.";
+  const redactor = createRedactor();
   return entries
     .map((e, i) => {
       const when = new Date(e.at).toISOString();
-      const headLine = `${String(i + 1).padStart(2)}. ${when}  ${e.op || "—"}\n    ${e.message}`;
+      const headLine = `${String(i + 1).padStart(2)}. ${when}  ${e.op || "—"}\n    ${redactor.text(e.message)}`;
       if (!e.detail) return headLine;
-      const detail = e.detail
+      const detail = redactor
+        .text(e.detail)
         .split("\n")
         .map((l) => `    ${l}`)
         .join("\n");

@@ -133,11 +133,19 @@ export const MAX_REPORT_CHARS = 48_000;
 
 /* ---------------- redaction primitives ---------------- */
 
-const WIN_USER = /([A-Za-z]:[\\/]+Users[\\/]+)[^\\/\r\n"']+/gi;
-const NIX_USER = /(\/(?:home|Users)\/)[^/\s"']+/g;
+/* The apostrophe is a LEGAL character in a Windows account name (O'Brien), so
+ * it must not end a match: excluding it left everything after the quote —
+ * account tail, folders, file name — verbatim in the "redacted" text, and
+ * sweepUsernames could not recover because the `X:\Users\` anchor had already
+ * been consumed. A name segment still ends at the path separator, so a
+ * single-quoted ffmpeg filtergraph (`fontfile='C:/Users/…'`) is unaffected;
+ * the closing quote a path-wide match CAN swallow is handled by the trailing
+ * trim in `text` below. `"` stays excluded — it is illegal in a filename. */
+const WIN_USER = /([A-Za-z]:[\\/]+Users[\\/]+)[^\\/\r\n"]+/gi;
+const NIX_USER = /(\/(?:home|Users)\/)[^/\s"]+/g;
 /** An absolute Windows path embedded in free text. Stops at whitespace, so a
  *  name containing spaces is only caught by the exact known-path pass. */
-const PATH_LIKE = /[A-Za-z]:[\\/][^\s"'<>|*?]*/g;
+const PATH_LIKE = /[A-Za-z]:[\\/][^\s"<>|*?]*/g;
 
 /** Replace the account name inside any user-profile path with `<user>`. */
 export function sweepUsernames(text: string): string {
@@ -193,7 +201,11 @@ export function createRedactor(knownPaths: readonly string[] = []): Redactor {
       if (out.includes(p)) out = out.split(p).join(seen.get(p)!);
     }
     out = out.replace(PATH_LIKE, (m) => {
-      const trimmed = m.replace(/[.,;:)\]}]+$/, "");
+      // The quote joins the punctuation trim because PATH_LIKE no longer stops
+      // at apostrophes (see WIN_USER above): in `fontfile='C:/…/f.ttf'` the
+      // match swallows the closing quote, which belongs to the filtergraph,
+      // not the path.
+      const trimmed = m.replace(/[.,;:)\]}']+$/, "");
       return path(trimmed) + m.slice(trimmed.length);
     });
     return sweepUsernames(out);
@@ -453,7 +465,20 @@ export function buildReport(ctx: ReportContext): string {
   if (s) {
     const custom = countCustomShortcuts(s);
     out.push(head("Settings"));
-    out.push(row("Theme", s.theme));
+    // A custom theme's three picks ARE the reproduction. Legibility under one is
+    // MEASURED, not structural — the nav rescue fires on a contrast ratio, so
+    // whether a control is rescued depends on the exact hexes — and "I can't
+    // read Settings" is unreproducible without them. They are colours the user
+    // chose, not facts about the user, so they go in verbatim; the built-in
+    // themes keep their bare name, having nothing to say beyond it.
+    out.push(
+      row(
+        "Theme",
+        s.theme === "custom"
+          ? `custom  background ${s.customTheme.background}  accent ${s.customTheme.accent}  text ${s.customTheme.text}`
+          : s.theme,
+      ),
+    );
     out.push(row("Autosave", `${s.autosaveSeconds}s`));
     out.push(row("Hardware accel", onOff(s.hardwareAccel)));
     out.push(row("Proxy media", onOff(s.proxyMedia)));
