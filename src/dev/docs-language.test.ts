@@ -25,6 +25,7 @@ const DOCS = [
   "docs/RELEASE-NOTES-v0.7.2.md",
   "docs/RELEASE-NOTES-v0.7.3.md",
   "docs/RELEASE-NOTES-v0.7.4.md",
+  "docs/RELEASE-NOTES-v0.8.0.md",
 ];
 
 // Case-insensitive. Word-boundaried so "accost"/"across" etc. can't false-match.
