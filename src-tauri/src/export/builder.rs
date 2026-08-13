@@ -60,29 +60,6 @@ fn round_even(v: f64) -> i64 {
     n - (n % 2)
 }
 
-/// Largest side an exportable GENERATED media may declare.
-///
-/// Not an ffmpeg limit — measured, the bundled build makes a `color=s=40000x120`
-/// source without complaint. It is a resource bound on a frame we synthesize
-/// ourselves, and it has to sit above the editor's own generator cap (8192) so
-/// that anything authorable stays exportable. 16384 is the number the old
-/// silent clamp used, so nothing that exports today stops exporting.
-///
-/// IT IS A REFUSAL, NOT A CLAMP, and that distinction is the whole point:
-///   * clamping only the synthesis leaves the fit math, `dw`/`dh` and the
-///     opacity alpha mask still derived from the unclamped dims — two opinions
-///     of one dimension, which is the `blend` size mismatch this replaced;
-///   * clamping BOTH sides would export different CONTENT than the preview
-///     shows. `generator_source` pins drawtext's layout box to the media size
-///     and centres the lines in it (`text_align=L+M`), so a shrunk box does not
-///     drop the tail of the text, it drops both ends: 137 lines clamped to 68
-///     loses ~34 off the top and ~34 off the bottom, while the preview's block
-///     flow shows lines 1..68. An export that quietly renders the middle of the
-///     user's text is worse than one that says why it stopped.
-/// The editor no longer lets a generator exceed this; a project that does was
-/// either saved before that gate or hand-edited.
-const MAX_GENERATED_DIM: u32 = 16384;
-
 /* ------------------------------------------------------------------ */
 /* Font mapping + filter-path escaping                                 */
 /* ------------------------------------------------------------------ */
@@ -476,7 +453,7 @@ fn placement(clip: &Clip, media: &MediaRef, canvas: (u32, u32), out: (u32, u32))
         opacity,
         post_crop_w: crop_w.round() as i64,
         post_crop_h: crop_h.round() as i64,
-        // ONE derivation of the source size, deliberately unbounded here.
+        // ONE derivation of the source size, deliberately unbounded.
         //
         // These two used to carry `.clamp(1.0, 16384.0)` while `crop_w`/`crop_h`
         // above — and therefore `post_crop_*`, `fit`, `dw`, `dh` — were computed
@@ -489,9 +466,19 @@ fn placement(clip: &Clip, media: &MediaRef, canvas: (u32, u32), out: (u32, u32))
         // — so graph configuration failed and the export died before its first
         // frame, surfacing to the user as bare "ffmpeg exited with exit code: 1".
         //
-        // The bound now lives in `build`, as a REFUSAL, before any of this runs;
-        // see `MAX_GENERATED_DIM` for why it cannot be a clamp. `src_w`/`src_h`
-        // are already `.max(1)` at their definition, so nothing is needed here.
+        // ONE derivation is the entire fix, and no bound may be reintroduced on
+        // either side. Bounding only the synthesis re-creates the mismatch above;
+        // bounding BOTH sides exports different CONTENT than the preview shows,
+        // because `generator_source` pins drawtext's layout box to the media
+        // size and centres the lines in it (`text_align=L+M`) — a shrunk box
+        // drops lines off BOTH ends, not the tail. And nothing needs bounding
+        // anyway: `placement` fits the source into the canvas with
+        // `fit = (cw/fit_w).min(ch/fit_h)`, so anything larger than the canvas is
+        // already scaled DOWN, in the export exactly as in the preview. A
+        // 25000-px-wide text box on a 1920 canvas renders complete, just small,
+        // and the clip's own transform scale then multiplies it — which is a
+        // legitimate effect, not an error state. `src_w`/`src_h` are already
+        // `.max(1)` at their definition, so nothing is needed here.
         src_w: src_w.round() as i64,
         src_h: src_h.round() as i64,
         fit_w: crop_w * fit,
@@ -662,24 +649,20 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     }
 
     // Pre-check generated media before we spawn ffmpeg, so failures surface as a
-    // clear BadInput instead of an ffmpeg exit code: the declared size must be
-    // one we can actually synthesize, and a text generator's font must exist.
+    // clear BadInput instead of an ffmpeg exit code: a text generator's font
+    // must exist.
+    //
+    // Deliberately NOT checked: the declared size. There is no cap on how large
+    // a generated media may be. A generated frame is synthesized at the media's
+    // own dims and the SAME dims feed the fit math and the opacity alpha mask,
+    // so any size builds a graph whose numbers agree throughout (see the
+    // `src_w`/`src_h` note in `placement`). Oversized is not an error state: the
+    // fit scales it down to the canvas in the export exactly as in the preview.
+    // A cap here refuses to export projects that are already saved on disk, and
+    // that is not a trade this makes.
     for m in &spec.media {
         if m.generator.is_none() {
             continue;
-        }
-        // A generated frame is BUILT at these dims, and the same dims feed the
-        // fit math and the opacity alpha mask. Anything we cannot build at, we
-        // must refuse here rather than emit a graph ffmpeg rejects — see
-        // MAX_GENERATED_DIM for why this is not a clamp.
-        let (gw, gh) = (m.width.unwrap_or(0), m.height.unwrap_or(0));
-        if gw > MAX_GENERATED_DIM || gh > MAX_GENERATED_DIM {
-            return Err(AppError::BadInput(format!(
-                "generated media '{}' is {gw}x{gh}, over the {MAX_GENERATED_DIM} px \
-                 limit for a generated frame — re-create the layer at a smaller \
-                 size (projects saved by older versions could store boxes this big)",
-                m.id
-            )));
         }
         if let Some(Generator::Text { font_family, bold, italic, .. }) = &m.generator {
             match font_path(font_family, *bold, *italic) {
@@ -1394,6 +1377,30 @@ fn push(args: &mut Vec<OsString>, items: &[&str]) {
 fn push_video_codec(args: &mut Vec<OsString>, spec: &ExportSpec, encoders: &EncoderReport) {
     let enc = chosen_encoder(spec, encoders);
     push(args, &["-c:v", &enc]);
+
+    // HEVC in an ISOBMFF container must be tagged `hvc1`, not the `hev1` both
+    // the mp4 and mov muxers pick by default (measured with the bundled 8.1.1:
+    // mp4+libx265 and mov+libx265 both come back `codec_tag_string=hev1`).
+    //
+    // The two differ in where the parameter sets live: `hev1` permits them
+    // in-band, `hvc1` requires them in the sample entry. QuickTime Player,
+    // Safari, iOS and macOS Photos decode HEVC only from `hvc1`, so an `hev1`
+    // file plays everywhere EXCEPT Apple — the worst shape of bug, because it
+    // looks fine on the machine that made it.
+    //
+    // Keyed on the LOGICAL codec, never the encoder name. `libx265` and
+    // `hevc_nvenc`/`_qsv`/`_amf` all emit the same AV_CODEC_ID_HEVC and the
+    // muxer's tag decision is identical for all four (hevc_nvenc verified on
+    // real hardware: hev1 without this, hvc1 with it), so matching on the four
+    // encoder strings would only be a list to forget to update.
+    //
+    // mp4/mov ONLY. `hvc1` is an ISOBMFF sample-entry type and means nothing to
+    // the other muxers; webm cannot carry hevc at all (rejected in `build`), gif
+    // never reaches this function, and avi wants a fourcc, not a sample entry.
+    let is_isobmff = matches!(spec.preset.format.as_str(), "mp4" | "mov");
+    if is_isobmff && spec.preset.vcodec == "hevc" {
+        push(args, &["-tag:v", "hvc1"]);
+    }
 
     let vb = spec.preset.video_bitrate;
     if let Some(k) = vb.kbps() {
@@ -3000,23 +3007,26 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_generated_media_is_refused_before_ffmpeg_sees_it() {
-        // A generated frame was synthesized at a size CLAMPED to 16384 while the
-        // fit math and the opacity alpha mask kept using the unclamped dims, so
-        // an oversized media built a graph containing two different numbers for
-        // one dimension. ffmpeg then refused to configure it —
+    fn an_oversized_generated_media_builds_instead_of_being_refused() {
+        // There is NO size cap. A build briefly carried one (16384, a refusal
+        // inherited from an older silent clamp) and it was withdrawn: a project
+        // already saved with a large text layer could not be exported at all
+        // until the user re-created the layer, and the premise was false anyway —
+        // oversized was never broken, only scaled down by the same fit math the
+        // preview uses. This is the test that keeps the cap from coming back.
+        //
+        // The real defect was two derivations of one dimension: the frame was
+        // synthesized at the clamped 16384 while the fit math and the opacity
+        // alpha mask kept the unclamped dims, so ffmpeg refused to configure —
         //   "First input link top parameters (size 16384x120) do not match the
         //    corresponding second input link bottom parameters (size 25000x120)"
-        // — and the export died before its first frame, reaching the user as a
-        // bare "ffmpeg exited with exit code: 1". `build` used to return Ok here.
-        //
-        // The editor now caps a generator at 8192, so this only arrives from a
-        // project saved before that gate or hand-edited — both of which land in
-        // `build` exactly like any other spec.
+        // That was fixed by making it ONE derivation, which is what the sizes
+        // asserted below prove.
         let over = |w: u32, h: u32| {
             let gm = gen_media("g1", Generator::Solid { color: "#ff0000".into() }, w, h);
             let mut c = clip("c1", "g1", 0.0, 0.0, 2.0);
-            // the opacity keyframe is what turns the disagreement fatal
+            // the opacity keyframe is the path that used to turn a disagreement
+            // fatal, so every case here carries one
             c.keyframes = Some(ClipKeyframes {
                 x: None, y: None, scale: None,
                 opacity: Some(vec![Keyframe { t: 0.0, v: 1.0 }, Keyframe { t: 2.0, v: 0.0 }]),
@@ -3025,33 +3035,28 @@ mod tests {
             build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc())
         };
 
-        // over on width, over on height, over on both
-        for (w, h) in [(25000, 120), (120, 25000), (20000, 20000)] {
-            // `BuiltExport` is not Debug, so no `expect_err`
-            let msg = match over(w, h) {
-                Err(e) => format!("{e}"),
-                Ok(_) => panic!("{w}x{h} built a graph instead of being refused"),
+        // over on width, over on height, over on both, and far past any of it
+        for (w, h) in [(25000u32, 120u32), (120, 25000), (20000, 20000), (40000, 120)] {
+            // `BuiltExport` is not Debug, so no `expect`
+            let fc = match over(w, h) {
+                Ok(b) => b.filter_complex,
+                Err(e) => panic!("{w}x{h} must build, got: {e}"),
             };
-            assert!(msg.contains("generated media 'g1'"), "{msg}");
-            assert!(msg.contains(&format!("{w}x{h}")), "message must state the size: {msg}");
-            assert!(msg.contains("16384"), "message must state the limit: {msg}");
+            assert_eq!(generator_source_size(&fc), format!("{w}x{h}"), "synthesis size");
+            assert_eq!(alpha_mask_size(&fc), format!("{w}:{h}"), "alpha mask size");
         }
-
-        // ...and the boundary is inclusive: exactly at the limit still exports,
-        // so the refusal cannot creep down over anything that works today.
-        let b = over(MAX_GENERATED_DIM, 120).expect("the limit itself must build");
-        assert_eq!(generator_source_size(&b.filter_complex), "16384x120");
     }
 
     #[test]
     fn the_generated_frame_and_its_alpha_mask_are_the_same_size() {
-        // The invariant the clamp broke, stated directly: the frame we
-        // synthesize and the mask `blend` pairs it with are two derivations of
-        // ONE dimension and must never disagree. Re-clamping either side — the
-        // tempting "fix", and the one that would silently export the MIDDLE of a
-        // long text block because drawtext centres lines in its box — breaks
-        // this at the sizes below without breaking anything else.
-        for (w, h) in [(400u32, 200u32), (1920, 1080), (8192, 240), (MAX_GENERATED_DIM, 120)] {
+        // The invariant the clamp broke, stated directly, and the one that
+        // actually mattered: the frame we synthesize and the mask `blend` pairs
+        // it with are two derivations of ONE dimension and must never disagree.
+        // Re-clamping either side — the tempting "fix", and the one that would
+        // silently export the MIDDLE of a long text block because drawtext
+        // centres lines in its box — breaks this at the oversized rows below
+        // without breaking anything else.
+        for (w, h) in [(400u32, 200u32), (1920, 1080), (8192, 240), (16384, 120), (25000, 120)] {
             let gm = gen_media("g1", Generator::Solid { color: "#00ff00".into() }, w, h);
             let mut c = clip("c1", "g1", 0.0, 0.0, 2.0);
             c.keyframes = Some(ClipKeyframes {
@@ -3067,21 +3072,21 @@ mod tests {
     }
 
     #[test]
-    fn a_generator_at_the_limit_really_configures_in_ffmpeg() {
-        // The refusal threshold is only honest if everything below it works.
-        // Build the widest allowed generator WITH an opacity keyframe — the exact
-        // shape that used to abort during graph configuration — and run the real
-        // sidecar over it. A string test cannot tell "the two numbers match" from
-        // "ffmpeg accepts them".
-        let gm = gen_media("g1", Generator::Solid { color: "#ffffff".into() },
-                           MAX_GENERATED_DIM, 120);
+    fn an_oversized_generator_really_encodes_in_ffmpeg() {
+        // "No cap" is only honest if the sizes a cap would have refused actually
+        // reach the file. 25000x120 is over the withdrawn 16384 threshold, and
+        // the opacity keyframe puts it down the alphamerge/blend path — that
+        // exact combination is what used to abort during graph configuration.
+        // Run the real sidecar: a string test cannot tell "the two numbers
+        // match" from "ffmpeg accepts them".
+        let gm = gen_media("g1", Generator::Solid { color: "#ffffff".into() }, 25000, 120);
         let mut c = clip("c1", "g1", 0.0, 0.0, 0.2);
         c.keyframes = Some(ClipKeyframes {
             x: None, y: None, scale: None,
             opacity: Some(vec![Keyframe { t: 0.0, v: 1.0 }, Keyframe { t: 0.2, v: 0.2 }]),
         });
         let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
-        let out = geom_dir().join("generator at limit.mp4");
+        let out = geom_dir().join("oversized generator.mp4");
         let b = build(
             &spec(vec![gm], tl, preset("mp4", "h264"), &out.to_string_lossy()),
             &enc(),
@@ -3089,9 +3094,14 @@ mod tests {
         .unwrap();
         // panics with ffmpeg's own stderr, so a regression names its own cause
         encode_built(&b, &out);
-        // the clip is white on a black base, so SOMETHING must have been drawn
+        // The clip is white on a black base, so SOMETHING must have been drawn —
+        // and it must be the whole box scaled DOWN, not a clipped one: fit =
+        // min(1920/25000, 1080/120) = 0.0768, so 25000x120 becomes 1920x8
+        // (round_even(9.216) = 8), centred at y=536. Measured, that is exactly
+        // what the file contains.
         let (_, _, w, h) = content_bbox(&out);
         assert!(w > 0 && h > 0, "the generated frame reached the output: {w}x{h}");
+        assert_eq!(w, 1920, "the oversized box is fit to the canvas width, not clipped");
     }
 
     #[test]
@@ -3576,7 +3586,8 @@ mod tests {
         );
         assert_vcodec_args(
             &built_with(hw_preset("mp4", "hevc"), &r),
-            &["-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "26", "-b:v", "0"],
+            // `-tag:v hvc1` rides along for every hevc-into-mp4/mov build
+            &["-c:v", "hevc_nvenc", "-tag:v", "hvc1", "-preset", "p5", "-rc", "vbr", "-cq", "26", "-b:v", "0"],
         );
         assert_vcodec_args(
             &built_with(hw_preset("mp4", "av1"), &r),
@@ -3593,7 +3604,7 @@ mod tests {
         );
         assert_vcodec_args(
             &built_with(hw_preset("mov", "hevc"), &r),
-            &["-c:v", "hevc_qsv", "-global_quality", "26"],
+            &["-c:v", "hevc_qsv", "-tag:v", "hvc1", "-global_quality", "26"],
         );
         assert_vcodec_args(
             &built_with(hw_preset("mp4", "av1"), &r),
@@ -3610,7 +3621,7 @@ mod tests {
         );
         assert_vcodec_args(
             &built_with(hw_preset("mp4", "hevc"), &r),
-            &["-c:v", "hevc_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "25", "-qp_p", "27"],
+            &["-c:v", "hevc_amf", "-tag:v", "hvc1", "-quality", "quality", "-rc", "cqp", "-qp_i", "25", "-qp_p", "27"],
         );
         assert_vcodec_args(
             &built_with(hw_preset("mp4", "av1"), &r),
@@ -3643,13 +3654,15 @@ mod tests {
         // SOFTWARE ones — never NVENC flags pinned onto libx264, which ffmpeg
         // rejects outright.
         let r = report("libx264", "libx265", "libsvtav1");
+        // slices, not fixed arrays: the hevc row is two entries longer than its
+        // siblings because mp4+hevc also carries `-tag:v hvc1`.
         for (codec, expect) in [
-            ("h264", ["-c:v", "libx264", "-preset", "medium", "-crf", "20"]),
-            ("hevc", ["-c:v", "libx265", "-preset", "medium", "-crf", "23"]),
-            ("av1", ["-c:v", "libsvtav1", "-preset", "8", "-crf", "32"]),
+            ("h264", &["-c:v", "libx264", "-preset", "medium", "-crf", "20"][..]),
+            ("hevc", &["-c:v", "libx265", "-tag:v", "hvc1", "-preset", "medium", "-crf", "23"][..]),
+            ("av1", &["-c:v", "libsvtav1", "-preset", "8", "-crf", "32"][..]),
         ] {
             let hw = built_with(hw_preset("mp4", codec), &r);
-            assert_vcodec_args(&hw, &expect);
+            assert_vcodec_args(&hw, expect);
             // …and byte-identical to what use_hardware:false would emit.
             assert_eq!(
                 vcodec_args(&hw),
@@ -3671,7 +3684,7 @@ mod tests {
         );
         assert_vcodec_args(
             &built_with(hw_preset("mp4", "hevc"), &r),
-            &["-c:v", "libx265", "-preset", "medium", "-crf", "23"],
+            &["-c:v", "libx265", "-tag:v", "hvc1", "-preset", "medium", "-crf", "23"],
         );
         assert_vcodec_args(
             &built_with(hw_preset("mp4", "av1"), &r),
@@ -3727,6 +3740,106 @@ mod tests {
         assert_vcodec_args(&b, &["-c:v", "av1_qsv", "-global_quality", "30"]);
         let a = argstr(&b);
         assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "webm"), "{a:?}");
+    }
+
+    /// Does the argv carry `-tag:v hvc1` as an adjacent pair?
+    fn has_hvc1_tag(b: &BuiltExport) -> bool {
+        argstr(b).windows(2).any(|w| w[0] == "-tag:v" && w[1] == "hvc1")
+    }
+
+    #[test]
+    fn hevc_into_mp4_and_mov_is_tagged_hvc1_and_nothing_else_is() {
+        // Both ISOBMFF muxers default the HEVC sample entry to `hev1`, which
+        // QuickTime, Safari, iOS and macOS Photos will not decode — the file
+        // plays everywhere except Apple. `-tag:v hvc1` is the fix, and it
+        // belongs to the CODEC not the encoder, so it must appear for the
+        // software and all three hardware HEVC encoders alike.
+        for (h264, hevc, av1) in [
+            ("libx264", "libx265", "libsvtav1"),
+            ("h264_nvenc", "hevc_nvenc", "av1_nvenc"),
+            ("h264_qsv", "hevc_qsv", "av1_qsv"),
+            ("h264_amf", "hevc_amf", "av1_amf"),
+        ] {
+            let r = report(h264, hevc, av1);
+            for hw in [false, true] {
+                let p = |f: &str, c: &str| if hw { hw_preset(f, c) } else { preset(f, c) };
+                let at = |f: &str, c: &str| has_hvc1_tag(&built_with(p(f, c), &r));
+
+                // carried: hevc into either ISOBMFF container
+                assert!(at("mp4", "hevc"), "{hevc} hw={hw}: mp4+hevc must be tagged");
+                assert!(at("mov", "hevc"), "{hevc} hw={hw}: mov+hevc must be tagged");
+
+                // not carried: same containers, other codecs. `hvc1` is an HEVC
+                // sample entry — on an h264 or av1 stream it would mislabel it.
+                for c in ["h264", "av1"] {
+                    // mov+av1 is rejected by the muxer and unreachable from the
+                    // dialog, but `build` still accepts it, so it is asserted.
+                    for f in ["mp4", "mov"] {
+                        assert!(!at(f, c), "{r:?} hw={hw}: {f}+{c} must NOT be tagged");
+                    }
+                }
+
+                // not carried: hevc into a non-ISOBMFF container. avi wants a
+                // fourcc, not a sample entry. (webm rejects hevc outright in
+                // `build`, and gif never reaches `push_video_codec` at all —
+                // see `gif_emits_no_video_codec_even_with_hardware_requested`,
+                // which pins that separately; asserting the tag's absence on a
+                // build that emits no `-c:v` would be vacuous.)
+                assert!(!at("avi", "hevc"), "{hevc} hw={hw}: avi+hevc must NOT be tagged");
+                assert!(!at("avi", "h264"), "{hevc} hw={hw}: avi+h264 must NOT be tagged");
+            }
+        }
+    }
+
+    /// `codec_name/codec_tag_string` of the first video stream, read back with
+    /// the bundled ffprobe.
+    fn probe_codec_and_tag(path: &std::path::Path) -> (String, String) {
+        let out = crate::jobs::ffmpeg::command("ffprobe")
+            .unwrap()
+            .args([
+                "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name,codec_tag_string",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "ffprobe: {}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+        let name = lines.next().unwrap_or_default().to_string();
+        let tag = lines.next().unwrap_or_default().to_string();
+        (name, tag)
+    }
+
+    #[test]
+    fn real_ffmpeg_writes_hvc1_into_mp4_and_mov_and_leaves_h264_alone() {
+        // The argv assertion above cannot tell "we passed -tag:v" from "the
+        // muxer honoured it". Encode for real and read the sample entry back:
+        // this is the only check that would have caught the original bug, since
+        // the shipped argv was perfectly well-formed and simply silent about the
+        // tag. Without `-tag:v hvc1` both rows below come back `hev1`.
+        for (fmt, codec, want_name, want_tag) in [
+            ("mp4", "hevc", "hevc", "hvc1"),
+            ("mov", "hevc", "hevc", "hvc1"),
+            // the control: h264 must keep the muxer's own `avc1`, never hvc1
+            ("mp4", "h264", "h264", "avc1"),
+        ] {
+            let r = report("libx264", "libx265", "libsvtav1");
+            let out = geom_dir().join(format!("codec tag {fmt} {codec}.{fmt}"));
+            let m = media("m1", &white_source(320, 240).to_string_lossy(), 320, 240, false);
+            let c = clip("c1", "m1", 0.0, 0.0, 0.2);
+            let tl = timeline(320, 240, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+            let b = build(
+                &spec(vec![m], tl, preset(fmt, codec), &out.to_string_lossy()),
+                &r,
+            )
+            .unwrap();
+            encode_built(&b, &out);
+            let (name, tag) = probe_codec_and_tag(&out);
+            assert_eq!(name, want_name, "{fmt}+{codec}: codec_name");
+            assert_eq!(tag, want_tag, "{fmt}+{codec}: codec_tag_string");
+        }
     }
 
     #[test]

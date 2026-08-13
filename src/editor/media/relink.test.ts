@@ -13,6 +13,7 @@ import {
 import { rat } from "../../core/time";
 import type { MediaInfo, ProjectFile } from "../../core/types";
 import { applyRelink, clampClipsToDuration, clampSrcWindow } from "./relink";
+import { addJobTarget, dropMediaTargets, type JobEntry, type JobTarget } from "./media";
 
 /** clampSrcWindow keeps the clip's source window inside a (possibly shorter)
  *  source, never collapsing it to zero length. Guards the relink-to-shorter-file
@@ -258,5 +259,173 @@ describe("applyRelink", () => {
     });
     const after = findClip(q, clipId)!.clip;
     expect(after.srcOut - after.srcIn).toBe(IMAGE_DEFAULT_DUR);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* job target mapping — one backend job, many media entries            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Preparation jobs are de-duplicated per output path on the backend
+ * (`src-tauri/src/media/playability.rs:163-172`) and the output path hashes
+ * `{path,size,mtimeMs}` — so two media entries pointing at ONE file get the
+ * SAME job id back. The map from job id to waiter therefore has to be
+ * one-to-many; when it was one-to-one the second registration silently
+ * overwrote the first, and that media never left "Preparing".
+ *
+ * `retrack` is the other half: it must be able to withdraw ONE media from the
+ * jobs the old file started without disturbing anything else waiting on them.
+ */
+const pb = (mediaId: string, output = `proxy/${mediaId}.mp4`): JobTarget => ({
+  type: "playback",
+  mediaId,
+  output,
+});
+const wf = (mediaId: string, output = `wave/${mediaId}.pk`): JobTarget => ({
+  type: "waveform",
+  mediaId,
+  output,
+});
+
+describe("addJobTarget", () => {
+  it("stores a lone waiter directly, so the common case allocates no array", () => {
+    const jobs = new Map<number, JobEntry>();
+    const a = pb("a");
+    addJobTarget(jobs, 7, a);
+    expect(jobs.get(7)).toBe(a); // the very same object, in the very same slot
+    expect(Array.isArray(jobs.get(7))).toBe(false);
+    expect(jobs.size).toBe(1);
+  });
+
+  it("KEEPS the first waiter when a second media lands on the same job", () => {
+    // The bug, at the level it lived: `jobs.set(id, b)` dropped `a` on the
+    // floor, and `a` was the entry already on the timeline.
+    const jobs = new Map<number, JobEntry>();
+    const a = pb("a");
+    const b = pb("b");
+    addJobTarget(jobs, 7, a);
+    addJobTarget(jobs, 7, b);
+    expect(jobs.get(7)).toEqual([a, b]); // registration order
+  });
+
+  it("grows past two waiters", () => {
+    const jobs = new Map<number, JobEntry>();
+    addJobTarget(jobs, 7, pb("a"));
+    addJobTarget(jobs, 7, pb("b"));
+    addJobTarget(jobs, 7, pb("c"));
+    expect((jobs.get(7) as JobTarget[]).map((t) => t.mediaId)).toEqual(["a", "b", "c"]);
+  });
+
+  it("replaces rather than queues when the same media+lane re-registers", () => {
+    // A repeated ensure() for one media must not make it a waiter twice over,
+    // and the newest target wins because it carries the newest output path.
+    const jobs = new Map<number, JobEntry>();
+    addJobTarget(jobs, 7, pb("a", "old.mp4"));
+    const fresh = pb("a", "new.mp4");
+    addJobTarget(jobs, 7, fresh);
+    expect(jobs.get(7)).toBe(fresh); // still the lone-target shape
+
+    addJobTarget(jobs, 7, pb("b"));
+    const newer = pb("a", "newer.mp4");
+    addJobTarget(jobs, 7, newer);
+    expect((jobs.get(7) as JobTarget[]).length).toBe(2);
+    expect((jobs.get(7) as JobTarget[])[0]).toBe(newer); // position preserved
+  });
+
+  it("treats the playback and waveform lanes of one media as separate waiters", () => {
+    const jobs = new Map<number, JobEntry>();
+    addJobTarget(jobs, 7, pb("a"));
+    addJobTarget(jobs, 7, wf("a"));
+    expect((jobs.get(7) as JobTarget[]).map((t) => t.type)).toEqual(["playback", "waveform"]);
+  });
+
+  it("never mixes waiters across job ids", () => {
+    const jobs = new Map<number, JobEntry>();
+    const a = pb("a");
+    const b = pb("b");
+    addJobTarget(jobs, 1, a);
+    addJobTarget(jobs, 2, b);
+    expect(jobs.get(1)).toBe(a);
+    expect(jobs.get(2)).toBe(b);
+  });
+});
+
+describe("dropMediaTargets", () => {
+  it("deletes the job entry when the relinked media was its only waiter", () => {
+    const jobs = new Map<number, JobEntry>();
+    addJobTarget(jobs, 7, pb("a"));
+    dropMediaTargets(jobs, "a");
+    expect(jobs.has(7)).toBe(false);
+  });
+
+  it("leaves a job belonging to someone else completely alone", () => {
+    const jobs = new Map<number, JobEntry>();
+    const other = pb("b");
+    addJobTarget(jobs, 7, other);
+    dropMediaTargets(jobs, "a");
+    expect(jobs.get(7)).toBe(other); // same reference: untouched
+  });
+
+  it("removes only the named media, keeping the order of the survivors", () => {
+    const jobs = new Map<number, JobEntry>();
+    for (const id of ["a", "b", "c"]) addJobTarget(jobs, 7, pb(id));
+    dropMediaTargets(jobs, "b");
+    expect((jobs.get(7) as JobTarget[]).map((t) => t.mediaId)).toEqual(["a", "c"]);
+  });
+
+  it("collapses back to the lone-target shape when one waiter is left", () => {
+    // Otherwise a job that once had company keeps paying the array's read cost
+    // for the rest of its life.
+    const jobs = new Map<number, JobEntry>();
+    const a = pb("a");
+    const b = pb("b");
+    addJobTarget(jobs, 7, a);
+    addJobTarget(jobs, 7, b);
+    dropMediaTargets(jobs, "a");
+    expect(jobs.get(7)).toBe(b);
+    expect(Array.isArray(jobs.get(7))).toBe(false);
+  });
+
+  it("deletes the entry when every waiter on it belonged to that media", () => {
+    const jobs = new Map<number, JobEntry>();
+    addJobTarget(jobs, 7, pb("a"));
+    addJobTarget(jobs, 7, wf("a"));
+    dropMediaTargets(jobs, "a");
+    expect(jobs.size).toBe(0);
+  });
+
+  it("withdraws the media from EVERY job it was waiting on", () => {
+    // A relink invalidates the media's whole cache identity, so its playback
+    // job, its waveform job and any job it shares are all stale for it.
+    const jobs = new Map<number, JobEntry>();
+    addJobTarget(jobs, 1, pb("a"));
+    addJobTarget(jobs, 2, wf("a"));
+    addJobTarget(jobs, 3, pb("b"));
+    addJobTarget(jobs, 3, pb("a"));
+    dropMediaTargets(jobs, "a");
+    expect(jobs.has(1)).toBe(false);
+    expect(jobs.has(2)).toBe(false);
+    expect((jobs.get(3) as JobTarget).mediaId).toBe("b");
+  });
+
+  it("is a no-op for a media that is waiting on nothing", () => {
+    const jobs = new Map<number, JobEntry>();
+    const a = pb("a");
+    const b = pb("b");
+    addJobTarget(jobs, 7, a);
+    addJobTarget(jobs, 7, b);
+    dropMediaTargets(jobs, "zzz");
+    expect(jobs.get(7)).toEqual([a, b]);
+  });
+
+  it("round-trips: a dropped media can register again and both waiters resolve", () => {
+    const jobs = new Map<number, JobEntry>();
+    addJobTarget(jobs, 1, pb("a"));
+    addJobTarget(jobs, 1, pb("b"));
+    dropMediaTargets(jobs, "a"); // relink
+    addJobTarget(jobs, 2, pb("a", "relinked.mp4")); // new file, new job
+    expect(jobs.get(1)).toEqual(pb("b"));
+    expect(jobs.get(2)).toEqual(pb("a", "relinked.mp4"));
   });
 });

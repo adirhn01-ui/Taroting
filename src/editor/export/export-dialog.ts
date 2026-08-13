@@ -59,21 +59,37 @@ export function splitPath(path: string): { dir: string; file: string } {
   return { dir: path.slice(0, i), file: path.slice(i + 1) };
 }
 
+/** How many " (n)" candidates a rename tries before it gives up. */
+export const RENAME_ATTEMPT_LIMIT = 1000;
+
 /**
  * Given a base file name (without extension), append " (2)", " (3)", … until
- * `taken(candidate)` returns false. If the name already ends in a suffix, the
- * numbering continues from there. Pure + synchronous for easy testing.
+ * `taken(candidate)` reports the name free. If the name already ends in a
+ * suffix, the numbering continues from there ("clip (3)" ⇒ "clip (4)").
+ *
+ * Returns `null` when `limit` candidates in a row are taken. That case used to
+ * be a **silent overwrite**: the shipped copy of this loop fell out of its
+ * guard still holding the last, taken candidate and exported straight over
+ * someone's file. There is no free name left to offer, so the caller has to say
+ * so — it must never write.
+ *
+ * `taken` may be sync or async, so production probes the filesystem through the
+ * very same numbering the tests drive with a plain predicate. This is the only
+ * implementation, and it is the one that ships.
  */
-export function renameWithSuffix(name: string, taken: (candidate: string) => boolean): string {
+export async function renameWithSuffix(
+  name: string,
+  taken: (candidate: string) => boolean | Promise<boolean>,
+  limit = RENAME_ATTEMPT_LIMIT,
+): Promise<string | null> {
   const match = /^(.*?)(?: \((\d+)\))?$/.exec(name);
   const stem = match?.[1] ?? name;
-  let n = match?.[2] ? parseInt(match[2], 10) + 1 : 2;
-  let candidate = `${stem} (${n})`;
-  while (taken(candidate)) {
-    n++;
-    candidate = `${stem} (${n})`;
+  const first = match?.[2] ? parseInt(match[2], 10) + 1 : 2;
+  for (let i = 0; i < limit; i++) {
+    const candidate = `${stem} (${first + i})`;
+    if (!(await taken(candidate))) return candidate;
   }
-  return candidate;
+  return null;
 }
 
 /** The export-preset fields this dialog owns. Anything else on a project's
@@ -125,10 +141,75 @@ const CODEC_LABELS: Record<Codec, string> = {
   av1: "AV1",
 };
 
-/** Which codecs a format offers (webm ⇒ AV1 only in v1). */
-function codecsForFormat(format: Format): Codec[] {
+const FORMAT_LABELS: Record<Format, string> = {
+  mp4: "MP4",
+  mov: "MOV",
+  webm: "WebM",
+  avi: "AVI",
+  gif: "GIF",
+};
+
+/**
+ * Which codecs a container can actually be handed.
+ *
+ * Only combinations verified against the bundled ffmpeg are on offer. The two
+ * exclusions are muxer limits, not preferences — the container refuses the
+ * stream at header-write time, so offering them is offering a guaranteed
+ * failure with a generic "exit code: 1" at the end of it:
+ *
+ *   webm + h264/hevc  →  "Only VP8 or VP9 or AV1 video … are supported for WebM"
+ *   mov  + av1        →  "av1 only supported in MP4 and AVIF."
+ *
+ * The MOV rule is about the codec ID, not the encoder: `-c copy` of an
+ * already-encoded AV1 stream into MOV fails identically, so the hardware
+ * encoders (av1_nvenc / av1_qsv / av1_amf) are just as impossible and must not
+ * be reachable either. mp4/avi mux all three; this was checked, not assumed.
+ *
+ * GIF keeps the full list on purpose. Its codec row is hidden (the palette
+ * pipeline owns the output), so returning a short list here would clobber the
+ * user's codec every time they passed through GIF on the way somewhere else.
+ */
+export function codecsForFormat(format: Format): Codec[] {
   if (format === "webm") return ["av1"];
+  if (format === "mov") return ["h264", "hevc"];
+  // AVI has no fourcc for HEVC. ffmpeg does NOT refuse it — it exits 0 and
+  // writes a stream with a null fourcc, which ffprobe then reads back as
+  // `rawvideo / [0][0][0][0]` and no decoder can open ("Invalid buffer size,
+  // packet size 6093 < expected frame_size 230400"). Measured with the bundled
+  // 8.1.1. That is worse than the mov+av1 case above, which at least fails
+  // loudly: here the user is told the export succeeded and is handed a file
+  // that will not play anywhere, including back in this app.
+  // avi+h264 (fourcc H264) and avi+av1 (AV01) are both fine.
+  if (format === "avi") return ["h264", "av1"];
   return ["h264", "hevc", "av1"];
+}
+
+/**
+ * Fallback order when a container cannot mux the codec that was asked for:
+ * nearest in intent first. Someone who picked AV1 picked it for efficiency, so
+ * dropping them onto HEVC honours that better than onto H.264, which is the
+ * largest-file option of the three.
+ */
+const CODEC_FALLBACK: Record<Codec, Codec[]> = {
+  av1: ["hevc", "h264"],
+  hevc: ["av1", "h264"],
+  h264: ["hevc", "av1"],
+};
+
+/**
+ * The codec `format` will actually be exported with, given the one that was
+ * asked for. Returns `wanted` untouched whenever the container can mux it.
+ *
+ * This has to run on the OPENING preset too, not just on a format switch: a
+ * project saved by an older build can carry MOV+AV1, and rendering a `<select>`
+ * whose options exclude the current value leaves the browser showing option one
+ * while the variable still says AV1 — the dialog would claim H.264 and export
+ * (fail at) AV1.
+ */
+export function resolveCodec(format: Format, wanted: Codec): Codec {
+  const allowed = codecsForFormat(format);
+  if (allowed.includes(wanted)) return wanted;
+  return CODEC_FALLBACK[wanted].find((c) => allowed.includes(c)) ?? allowed[0]!;
 }
 
 const RESOLUTIONS: { value: string; label: string }[] = [
@@ -178,6 +259,41 @@ function isSoftwareOnly(name: string): boolean {
   return encoderBadge(name) === "software";
 }
 
+/** Why hardware encoding is off the table for an export, or null if it isn't. */
+export type HardwareBlock = "setting" | "codec" | null;
+
+/**
+ * Whether something OUTSIDE the project forbids hardware for this export.
+ *
+ * Both reasons are about the machine and the session, never about what the
+ * project asked for — which is exactly why they get their own function. Pass
+ * `encoder: null` while the probe is still in flight (unknown ≠ software-only).
+ */
+export function hardwareBlockedBy(opts: {
+  globalEnabled: boolean;
+  encoder: string | null;
+}): HardwareBlock {
+  if (!opts.globalEnabled) return "setting";
+  if (opts.encoder !== null && isSoftwareOnly(opts.encoder)) return "codec";
+  return null;
+}
+
+/**
+ * The preset THIS export runs with: the project's preset, with `useHardware`
+ * forced off when something outside the project blocks it.
+ *
+ * The returned object is always a copy, and the input is never touched. That is
+ * the whole fix: the global "Hardware acceleration" switch used to be folded
+ * into the dialog's `useHardware` on open and then written back into the
+ * project on every export, so turning the global setting off once destroyed the
+ * project's own answer permanently — turning the setting back on did not bring
+ * it back. Gating the run and persisting the preference are now two different
+ * objects built from the same source.
+ */
+export function gateHardware(preset: ExportPreset, blocked: HardwareBlock): ExportPreset {
+  return blocked === null ? { ...preset } : { ...preset, useHardware: false };
+}
+
 /** Human ETA like "about 12s left" / "about 2m left". */
 function formatEta(sec: number): string {
   if (sec < 1) return "less than a second left";
@@ -202,7 +318,15 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   let fps: "original" | number = start.fps;
   let videoBitrate: "auto" | number = start.videoBitrate;
   let audioBitrate: "auto" | number = start.audioBitrate;
-  let useHardware = settingsStore.get().hardwareAccel && start.useHardware;
+  /* What the PROJECT asked for, and nothing else. The global "Hardware
+     acceleration" setting is applied where the export is built (see runPreset),
+     never folded in here — folding it in is what let a global toggle overwrite a
+     per-project choice for good. */
+  let useHardware = start.useHardware;
+
+  /** Set when the container could not mux the codec that was asked for, so the
+   *  form can say which one it moved to instead of changing under the user. */
+  let codecNote: string | null = null;
 
   const settings = settingsStore.get();
   let folder = settings.lastExportDir ?? settings.defaultExportDir ?? "";
@@ -210,8 +334,24 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
 
   let encoders: EncoderReport | null = null;
 
+  /** Move `codec` to something `next` can actually mux, remembering whether it
+   *  had to. Runs on open as well as on every format switch. */
+  function adoptFormat(next: Format): void {
+    const resolved = resolveCodec(next, codec);
+    codecNote =
+      resolved === codec
+        ? null
+        : `${CODEC_LABELS[codec]} can't be stored in a ${FORMAT_LABELS[next]} file — using ${CODEC_LABELS[resolved]}.`;
+    codec = resolved;
+    format = next;
+  }
+  // A project saved by an older build can carry an impossible pair (MOV+AV1).
+  adoptFormat(format);
+
   /* -------- build the current preset object -------- */
-  function buildPreset(): ExportPreset {
+
+  /** What gets PERSISTED into the project: the user's answers, verbatim. */
+  function projectPreset(): ExportPreset {
     // Read the persisted preset LIVE (same rule as everything else here), so a
     // field this dialog does not own survives even if it changed while the
     // dialog was open. See mergeExportPreset for why the spread order matters.
@@ -224,6 +364,31 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
       audioBitrate,
       useHardware,
     });
+  }
+
+  /** Which encoder the probe found for the codec on screen, or null if the
+   *  probe has not answered yet (GIF has no video codec at all). */
+  function currentEncoder(): string | null {
+    if (!encoders || format === "gif") return null;
+    return encoders[codec];
+  }
+
+  function hardwareBlock(): HardwareBlock {
+    // Read the setting live, like everything else in this dialog.
+    return hardwareBlockedBy({
+      globalEnabled: settingsStore.get().hardwareAccel,
+      encoder: currentEncoder(),
+    });
+  }
+
+  /** Whether THIS export actually runs on hardware. */
+  function effectiveHardware(): boolean {
+    return useHardware && hardwareBlock() === null;
+  }
+
+  /** What THIS export runs with: the project's preset, hardware gated. */
+  function runPreset(): ExportPreset {
+    return gateHardware(projectPreset(), hardwareBlock());
   }
 
   function currentExt(): string {
@@ -345,6 +510,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
             <span class="badge" id="ex-encoder-badge" hidden></span>
           </div>
         </div>
+        <div class="export-note" id="ex-codec-note" ${codecNote && showCodec ? "" : "hidden"}>${escapeHtml(codecNote ?? "")}</div>
 
         <div class="export-row">
           <label>Resolution</label>
@@ -404,9 +570,10 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
         <div class="export-row ${format === "gif" ? "export-row--hidden" : ""}" id="ex-hw-row">
           <label>Hardware acceleration</label>
           <div class="export-row__control">
-            <input class="switch" type="checkbox" id="ex-hw" ${useHardware ? "checked" : ""} />
+            <input class="switch" type="checkbox" id="ex-hw" />
           </div>
         </div>
+        <div class="export-note" id="ex-hw-note" hidden></div>
 
         <div class="export-row">
           <label>File name</label>
@@ -437,6 +604,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
 
     wireForm();
     updateEncoderBadge();
+    updateHardwareRow();
     refreshOutPath();
     scheduleEstimate();
   }
@@ -448,10 +616,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
       if (!btn) return;
       const next = btn.dataset.format as Format;
       if (next === format) return;
-      format = next;
-      // fix up codec if the new format doesn't offer the current one
-      const allowed = codecsForFormat(format);
-      if (!allowed.includes(codec)) codec = allowed[0]!;
+      // Sets `format` AND moves the codec to one this container can mux,
+      // leaving a note when it had to.
+      adoptFormat(next);
       // gif caps fps at 30
       if (format === "gif" && fps !== "original" && (fps as number) > 30) fps = 30;
       renderForm();
@@ -459,7 +626,12 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
 
     $<HTMLSelectElement>("#ex-codec").addEventListener("change", (e) => {
       codec = (e.target as HTMLSelectElement).value as Codec;
+      // The user has now made the call themselves; the note has served its turn.
+      codecNote = null;
+      const note = backdrop.querySelector<HTMLElement>("#ex-codec-note");
+      if (note) note.hidden = true;
       updateEncoderBadge();
+      updateHardwareRow();
       scheduleEstimate();
     });
 
@@ -523,6 +695,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     }
 
     $<HTMLInputElement>("#ex-hw")?.addEventListener("change", (e) => {
+      // Only reachable while the switch is enabled, i.e. while nothing outside
+      // the project is gating hardware — so this really is the project's own
+      // preference, and it is the only thing that ever writes it.
       useHardware = (e.target as HTMLInputElement).checked;
       scheduleEstimate();
     });
@@ -554,23 +729,43 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   function updateEncoderBadge(): void {
     const badge = backdrop.querySelector<HTMLElement>("#ex-encoder-badge");
     if (!badge) return;
-    if (!encoders || format === "gif") {
+    const name = currentEncoder();
+    if (name === null) {
       badge.hidden = true;
       return;
     }
-    const name = encoders[codec];
     badge.hidden = false;
     badge.textContent = encoderBadge(name);
-    // disable HW switch when only software is available for this codec
+  }
+
+  /**
+   * Point the hardware switch at what THIS export will do, and say why when
+   * that differs from what the project asked for.
+   *
+   * The switch shows `effectiveHardware()`, not `useHardware`: when the global
+   * setting is off, or the codec has no hardware encoder on this machine, the
+   * export genuinely runs in software and the switch should not claim
+   * otherwise. It is disabled in exactly those cases, which is what keeps
+   * `useHardware` — the project's own preference — from ever being written by
+   * anything but a real click on an enabled switch. Re-enable the setting and
+   * the project's choice is simply there again.
+   */
+  function updateHardwareRow(): void {
+    const blocked = hardwareBlock();
     const hw = backdrop.querySelector<HTMLInputElement>("#ex-hw");
     if (hw) {
-      if (isSoftwareOnly(name)) {
-        hw.checked = false;
-        hw.disabled = true;
-        useHardware = false;
-      } else {
-        hw.disabled = false;
-      }
+      hw.checked = effectiveHardware();
+      hw.disabled = blocked !== null;
+    }
+    const note = backdrop.querySelector<HTMLElement>("#ex-hw-note");
+    if (note) {
+      note.hidden = blocked === null || format === "gif";
+      note.textContent =
+        blocked === "setting"
+          ? "Hardware acceleration is off in Settings, so this export runs in software. Your project keeps its own preference."
+          : blocked === "codec"
+            ? "No hardware encoder for this codec on this machine — this export runs in software."
+            : "";
     }
   }
 
@@ -605,7 +800,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
         width: tl.width,
         height: tl.height,
         fps: tl.fps.num / Math.max(1, tl.fps.den),
-        preset: buildPreset(),
+        // The estimate has to describe the encode that will actually run, so
+        // it reads the gated preset — not the project's stored preference.
+        preset: runPreset(),
       });
       if (!el.isConnected) return;
       const prefix = est.exact ? "" : "≈ ";
@@ -678,9 +875,11 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
       return;
     }
 
-    // persist the preset into the project + remember the folder
-    const preset = buildPreset();
-    session.replace({ ...session.project, export: preset });
+    // Persist the preset into the project + remember the folder. This is the
+    // UNGATED preset on purpose: the project records what the user asked for,
+    // and a global setting (or a machine with no hardware encoder) must never
+    // get to rewrite that. runPreset() is what the export itself is handed.
+    session.replace({ ...session.project, export: projectPreset() });
     // SAY SO if the write fails. Nothing else here reports it: the export runs
     // regardless, so a bare `void` meant a rejected write silently cost the user
     // their remembered destination — the next export opened somewhere else with
@@ -698,8 +897,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
       showOverwriteWarning(
         () => void beginExport(target),
         () => {
-          // auto-suffix until free (best-effort: only checks against a cache of
-          // known-taken names, then re-verifies with pathExists on start)
+          // auto-suffix until the filesystem says the name is free
           void resolveRenameThenExport();
         },
       );
@@ -710,18 +908,27 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
 
   async function resolveRenameThenExport(): Promise<void> {
     const ext = currentExt();
-    // Probe candidates against the filesystem until we find a free one.
-    let n = 2;
-    const base = filename.replace(/ \(\d+\)$/, "");
-    let candidate = `${base} (${n})`;
-    // guard against pathological loops
-    for (let guard = 0; guard < 1000; guard++) {
-      const p = joinPath(folder, `${candidate}.${ext}`);
-      if (!(await pathExists(p))) break;
-      n++;
-      candidate = `${base} (${n})`;
+    const dir = folder;
+    // The numbering lives in renameWithSuffix — the same function the unit
+    // tests drive — and the filesystem is the predicate. There is no second
+    // copy of this loop to drift away from the tested one.
+    const free = await renameWithSuffix(filename, (candidate) =>
+      pathExists(joinPath(dir, `${candidate}.${ext}`)),
+    );
+    if (free === null) {
+      // Every candidate was taken. The old loop fell out of its guard holding
+      // the last one and exported over it; there is no free name to offer, so
+      // say so and write nothing.
+      toast.error("Couldn't find a free file name.", {
+        op: "Export",
+        title: "Rename",
+        detail:
+          `Tried ${RENAME_ATTEMPT_LIMIT} numbered variations of "${filename}.${ext}" in ${dir}` +
+          ` and every one already exists. Nothing was overwritten — choose a different name or folder.`,
+      });
+      return;
     }
-    filename = candidate;
+    filename = free;
     const nameInput = backdrop.querySelector<HTMLInputElement>("#ex-name");
     if (nameInput) nameInput.value = filename;
     refreshOutPath();
@@ -738,7 +945,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     const spec: ExportSpec = {
       media: live.media,
       timeline: live.timeline,
-      preset: buildPreset(),
+      preset: runPreset(),
       outPath: target,
     };
 
@@ -905,7 +1112,8 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
         logTail: failure?.logTail?.length ? failure.logTail : logTail,
         ffmpegVersion: failure?.ffmpegVersion ?? "",
       },
-      preset: buildPreset(),
+      // The preset ffmpeg was actually handed — that is the one being debugged.
+      preset: runPreset(),
       destinationSet: folder !== "",
       encoders,
       project: session.project,
@@ -1005,6 +1213,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     .then((report) => {
       encoders = report;
       updateEncoderBadge();
+      // The probe is what tells us whether this codec has a hardware encoder at
+      // all, so the switch can only settle once it lands.
+      updateHardwareRow();
     })
     .catch(() => {
       /* estimate + export still work; badge just stays hidden */

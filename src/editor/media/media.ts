@@ -3,7 +3,7 @@
 // jobs, loads waveform peaks and thumbnails, and exposes reactive maps the
 // editor UI renders from.
 
-import type { CodecHints, MediaKey } from "../../core/ipc";
+import type { CodecHints, JobDone, JobFailed, JobProgress, MediaKey } from "../../core/ipc";
 import { describeError, inTauri, ipc, mediaUrl, onJobEvents } from "../../core/ipc";
 import { settingsStore } from "../../core/session";
 import { Store } from "../../core/store";
@@ -51,9 +51,94 @@ function parsePk(buf: ArrayBuffer): WaveformData | null {
   return { pairsPerSec, mins, maxs };
 }
 
-type JobTarget =
+export type JobTarget =
   | { type: "playback"; mediaId: string; output: string }
   | { type: "waveform"; mediaId: string; output: string };
+
+/**
+ * What a single job id is preparing something FOR — one media entry, or several.
+ *
+ * ONE BACKEND JOB LEGITIMATELY SERVES MANY MEDIA ENTRIES. Preparation jobs are
+ * de-duplicated per output path (`src-tauri/src/media/playability.rs:163-172`),
+ * and the output path is hashed from `{path,size,mtimeMs}` — which is IDENTICAL
+ * for two media entries pointing at one file. Importing the same file twice (or
+ * relinking two entries onto one file) therefore gets the SAME job id back from
+ * two `plan_playback` calls, by design.
+ *
+ * This used to be a plain `Map<number, JobTarget>`, so the second registration
+ * overwrote the first: the shared job finished, resolved exactly one of its
+ * waiters, and the other sat on "Preparing 5%" for the rest of the session — no
+ * picture, no sound (audio-graph only voices clips whose media is ready), until
+ * the project was reopened against a warm cache. Only reachable when the cache
+ * entry is absent (first open after import, or after a trim) and only for media
+ * that needs a job at all — i.e. every .mov/.mkv/HEVC source.
+ *
+ * A LONE TARGET IS STORED DIRECTLY, NOT IN A ONE-ELEMENT ARRAY. The one-media,
+ * one-job case is the overwhelming majority and it must not pay for the rare
+ * one: it stores the very same object in the very same Map slot it always did,
+ * and reading it back costs one `Array.isArray` branch. The array is allocated
+ * only when a second waiter actually turns up, and `dropMediaTargets` collapses
+ * it back to a lone target when the count falls to one, so the fast shape is
+ * restored rather than left behind.
+ */
+export type JobEntry = JobTarget | JobTarget[];
+
+/** Two targets are the same waiter when they name the same media and lane. */
+function sameTarget(a: JobTarget, b: JobTarget): boolean {
+  return a.mediaId === b.mediaId && a.type === b.type;
+}
+
+/**
+ * Register `target` as a waiter on job `id`, keeping any waiters already there.
+ *
+ * Re-registering the same (media, lane) REPLACES rather than appends, so a
+ * repeated `ensure` can never queue a media entry twice against one job — the
+ * newest target wins, because it carries the newest `output`.
+ */
+export function addJobTarget(jobs: Map<number, JobEntry>, id: number, target: JobTarget): void {
+  const entry = jobs.get(id);
+  if (entry === undefined) {
+    jobs.set(id, target);
+    return;
+  }
+  if (!Array.isArray(entry)) {
+    jobs.set(id, sameTarget(entry, target) ? target : [entry, target]);
+    return;
+  }
+  const i = entry.findIndex((t) => sameTarget(t, target));
+  if (i >= 0) entry[i] = target;
+  else entry.push(target);
+}
+
+/**
+ * Forget every job target belonging to `mediaId`, leaving its co-waiters alone.
+ *
+ * This is what `retrack` owes the map. Dropping the id from `tracked` is not
+ * enough on its own: the media stays registered against the job the OLD file
+ * started, so when that job finishes or fails it writes over the relinked
+ * media's fresh status — a "failed" stamp from a file the project no longer
+ * references, on top of a perfectly healthy preparing/ready state.
+ *
+ * Siblings must survive. Two entries can share the job, and relinking one of
+ * them says nothing about the other, which is still legitimately waiting on it.
+ */
+export function dropMediaTargets(jobs: Map<number, JobEntry>, mediaId: string): void {
+  for (const [id, entry] of jobs) {
+    if (!Array.isArray(entry)) {
+      if (entry.mediaId === mediaId) jobs.delete(id);
+      continue;
+    }
+    // Compact in place; `kept` ends up as the number of survivors.
+    let kept = 0;
+    for (let i = 0; i < entry.length; i++) {
+      if (entry[i]!.mediaId !== mediaId) entry[kept++] = entry[i]!;
+    }
+    if (kept === entry.length) continue;
+    if (kept === 0) jobs.delete(id);
+    else if (kept === 1) jobs.set(id, entry[0]!); // back to the lone-target shape
+    else entry.length = kept;
+  }
+}
 
 /**
  * How long a cache-enforcement request waits for company.
@@ -80,7 +165,8 @@ export class MediaManager {
   /** mediaId → thumbnail file path */
   readonly thumbs = new Store<Record<string, string>>({});
 
-  private jobs = new Map<number, JobTarget>();
+  /** job id → the media entry (or entries) waiting on it; see `JobEntry`. */
+  private jobs = new Map<number, JobEntry>();
   private tracked = new Set<string>();
   private unlisten: (() => void) | null = null;
   private disposed = false;
@@ -91,37 +177,40 @@ export class MediaManager {
 
   async init(): Promise<void> {
     const unlisten = await onJobEvents({
+      // Each handler resolves EVERY waiter on the job, not just the last one
+      // registered. The `Array.isArray` branch is deliberately written out
+      // rather than hidden behind an iteration helper: a callback would mean a
+      // closure allocation on every job event, and the one-media-one-job path
+      // has to stay exactly as cheap as it was — one branch, one call, nothing
+      // allocated. See `JobEntry`.
       onProgress: (e) => {
-        const target = this.jobs.get(e.id);
-        if (!target || target.type !== "playback") return;
-        this.patchStatus(target.mediaId, {
-          state: "preparing",
-          ratio: e.ratio,
-          jobId: e.id,
-        });
+        const entry = this.jobs.get(e.id);
+        if (entry === undefined) return;
+        if (Array.isArray(entry)) {
+          for (let i = 0; i < entry.length; i++) this.targetProgress(entry[i]!, e);
+        } else {
+          this.targetProgress(entry, e);
+        }
       },
       onDone: (e) => {
-        const target = this.jobs.get(e.id);
-        if (!target) return;
+        const entry = this.jobs.get(e.id);
+        if (entry === undefined) return;
         this.jobs.delete(e.id);
-        if (target.type === "playback") {
-          const path = String(e.output.path ?? target.output);
-          this.patchStatus(target.mediaId, {
-            state: "ready",
-            url: mediaUrl(path),
-            sourcePath: path,
-          });
+        if (Array.isArray(entry)) {
+          for (let i = 0; i < entry.length; i++) this.targetDone(entry[i]!, e);
         } else {
-          void this.loadWaveform(target.mediaId, String(e.output.path ?? target.output));
+          this.targetDone(entry, e);
         }
         this.enforceCache();
       },
       onFailed: (e) => {
-        const target = this.jobs.get(e.id);
-        if (!target) return;
+        const entry = this.jobs.get(e.id);
+        if (entry === undefined) return;
         this.jobs.delete(e.id);
-        if (target.type === "playback" && !e.canceled) {
-          this.patchStatus(target.mediaId, { state: "failed", message: e.message });
+        if (Array.isArray(entry)) {
+          for (let i = 0; i < entry.length; i++) this.targetFailed(entry[i]!, e);
+        } else {
+          this.targetFailed(entry, e);
         }
       },
     });
@@ -131,6 +220,31 @@ export class MediaManager {
     // into a disposed manager.
     if (this.disposed) unlisten();
     else this.unlisten = unlisten;
+  }
+
+  /* --- what one job event means for ONE of its waiters ------------------ *
+   * Split out so the three handlers above can apply them to a lone target or
+   * to each of several without duplicating the body. Bodies are unchanged
+   * from when the mapping was one-to-one. */
+
+  private targetProgress(target: JobTarget, e: JobProgress): void {
+    if (target.type !== "playback") return;
+    this.patchStatus(target.mediaId, { state: "preparing", ratio: e.ratio, jobId: e.id });
+  }
+
+  private targetDone(target: JobTarget, e: JobDone): void {
+    const path = String(e.output.path ?? target.output);
+    if (target.type === "playback") {
+      this.patchStatus(target.mediaId, { state: "ready", url: mediaUrl(path), sourcePath: path });
+    } else {
+      void this.loadWaveform(target.mediaId, path);
+    }
+  }
+
+  private targetFailed(target: JobTarget, e: JobFailed): void {
+    if (target.type === "playback" && !e.canceled) {
+      this.patchStatus(target.mediaId, { state: "failed", message: e.message });
+    }
   }
 
   /** Track every media item in the project (idempotent). */
@@ -143,6 +257,11 @@ export class MediaManager {
    *  keys). Safe no-op if the media no longer exists. */
   retrack(mediaId: string): void {
     this.tracked.delete(mediaId);
+    // Cut it loose from the jobs the OLD file started, or their eventual
+    // outcome lands on the relinked media — most visibly a "failed" stamp from
+    // a file the project no longer references, over a fresh preparing/ready
+    // state. Co-waiters on those jobs are untouched. See `dropMediaTargets`.
+    dropMediaTargets(this.jobs, mediaId);
     const m = this.getProject().media.find((x) => x.id === mediaId);
     if (m) void this.ensure(m);
   }
@@ -187,7 +306,11 @@ export class MediaManager {
           if (this.disposed) return;
           if (wf.state === "ready") void this.loadWaveform(media.id, wf.path);
           else if (wf.state === "pending") {
-            this.jobs.set(wf.jobId, { type: "waveform", mediaId: media.id, output: wf.output });
+            addJobTarget(this.jobs, wf.jobId, {
+              type: "waveform",
+              mediaId: media.id,
+              output: wf.output,
+            });
           }
         })
         .catch((e: unknown) =>
@@ -210,7 +333,11 @@ export class MediaManager {
           sourcePath: plan.path,
         });
       } else {
-        this.jobs.set(plan.jobId, { type: "playback", mediaId: media.id, output: plan.output });
+        addJobTarget(this.jobs, plan.jobId, {
+          type: "playback",
+          mediaId: media.id,
+          output: plan.output,
+        });
         this.patchStatus(media.id, { state: "preparing", ratio: null, jobId: plan.jobId });
       }
     } catch (e) {

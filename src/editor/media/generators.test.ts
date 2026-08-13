@@ -1,38 +1,49 @@
-// Text generators must never produce a media box the export cannot synthesize.
+// A text element's media box is whatever the text actually measures — full
+// stop. No clamp, no shrink-to-fit, no refusal.
 //
-// THE BUG. `measureText` rounds the intrinsic box UP (evenUp) with no upper
-// bound, and both call sites — the creation dialog and the inspector's
-// generated-media editor — wrote that straight into `addGeneratedMedia`, which
-// does not clamp either. Its three siblings all clamp to 16..8192 (evenDim in
-// the solid dialog, evenDim in inspector/generated.ts, clampCanvas in
-// core/project.ts); the text path was the one that skipped it. A long enough
-// paste therefore produced a text element tens of thousands of pixels wide,
-// and the export either aborted in alphamerge ("First input link top
-// parameters (size 16384x120) do not match ... (size 25000x120)", because
-// builder.rs clamps the synthesized frame to 16384 while the fit math uses the
-// unclamped dims) or, without an opacity keyframe, silently rendered different
-// lines than the preview.
+// WHAT THESE TESTS REPLACED, AND WHY. An earlier revision decided an oversized
+// text box was a bug and added a fit layer: `fitTextSize`, `fitText`, a
+// shrink-the-font loop, and a toast that refused the edit outright when even
+// 8 px overflowed. The tests here asserted all of it. The owner ruled the whole
+// idea out — long text must not auto-adjust, because a box far larger than the
+// canvas is a thing people author on purpose: a title that starts enormous and
+// animates down into frame is exactly that, and shrinking it silently takes the
+// effect away. (Same ruling that removed contrast clamping from the theme
+// system. It is a do-not-reintroduce.)
 //
-// THE FIX IS NOT A CLAMP ON ITS OWN. The box has to EQUAL the natural text
-// extent, because the preview top-flows the lines in an overflow-hidden div
-// while drawtext CENTRES them in `boxh` — a box smaller than its text shows the
-// preview's first lines and the export's middle ones. So the font size is what
-// gives, and these tests pin both halves: the box lands inside the limit, AND
-// it stays a true measurement of the generator that is committed with it.
+// The premise was false too. `placement()` in src-tauri/src/export/builder.rs
+// computes `fit = (cw / fit_w).min(ch / fit_h)`, so media larger than the
+// canvas is already scaled DOWN, automatically, in the preview and the export
+// alike: a 16440-px-tall text box on a 1080-tall canvas draws the whole text,
+// small and complete. The clip's own transform scale then multiplies it. The
+// one genuine defect was two derivations of a single number disagreeing inside
+// builder.rs, and it was fixed there.
+//
+// So these tests pin the opposite of what they used to: the natural box comes
+// out of `measureText` untouched at the size the user asked for, and lands in
+// the project exactly as measured. The parity invariant is unchanged and is
+// still the point — the committed width/height must BE `measureText(gen)`,
+// because the preview sizes a div to media.width/height while the export pins
+// drawtext's layout box to the same pair. Those describe one picture only while
+// the numbers match.
 //
 // The environment is "node" (vite.config.ts), so `measureText` takes its
 // documented no-2D-context path and estimates advance widths. Every EXACT
-// number asserted below is on the height axis, which is `lines * sizePx * 1.25`
-// and involves no font metrics at all — identical in node and in the webview.
-// The width axis is asserted by property only, and each width case first
-// asserts that the natural box really does overflow, so a metric change makes
-// the test fail rather than pass vacuously.
+// number asserted below is therefore on the height axis, which is
+// `lines * sizePx * 1.25` and involves no font metrics at all — identical in
+// node and in the webview. Widths are asserted by parity and by inequality, so
+// a metric change makes a test fail rather than pass vacuously.
 
 import { describe, expect, it } from "vitest";
+import { addGeneratedMedia, createProject } from "../../core/project";
 import type { Generator } from "../../core/types";
-import { MAX_DIM, fitText, fitTextSize, measureText } from "./generators";
+import { measureText, textLabel } from "./generators";
 
-const MIN_SIZE = 8;
+/** The caps this path used to be subjected to, kept only so the cases below can
+ *  say "and this is comfortably past the number that used to trigger a shrink".
+ *  Nothing in src/ compares against them any more. */
+const FORMER_TEXT_CAP = 8192;
+const FORMER_SYNTH_CAP = 16384;
 
 const text = (
   body: string,
@@ -50,179 +61,134 @@ const text = (
 const lines = (n: number): string =>
   Array.from({ length: n }, (_, i) => `LINE ${i + 1}`).join("\n");
 
-describe("MAX_DIM", () => {
-  it("is the same 8192 its siblings clamp to", () => {
-    // A silent widening here would re-open the gap between the text path and
-    // evenDim / clampCanvas, which is the shape of the original bug.
-    expect(MAX_DIM).toBe(8192);
-  });
-});
+/** What both call sites do: measure, then hand the measurement straight to
+ *  addGeneratedMedia (the dialog) / updateMedia (the inspector) with no
+ *  inspection in between. Returns the MediaRef that ends up in the project. */
+const commit = (g: Extract<Generator, { type: "text" }>) => {
+  const { width, height } = measureText(g);
+  return addGeneratedMedia(createProject("t"), g, width, height, textLabel(g.text)).media;
+};
 
-describe("fitTextSize (pure)", () => {
-  it("leaves a box that already fits completely alone", () => {
-    expect(fitTextSize({ width: 1200, height: 240 }, 96)).toEqual({
-      sizePx: 96,
-      fits: true,
-    });
-    // exactly on the limit is still fitting
-    expect(fitTextSize({ width: MAX_DIM, height: MAX_DIM }, 96)).toEqual({
-      sizePx: 96,
-      fits: true,
-    });
-  });
-
-  it("scales the size down by the overflow ratio, on whichever axis binds", () => {
-    // The reported trigger, with the shipped Segoe UI metrics that produced it:
-    // 391 characters on one line at 96 px measures 42.0 px/char = 16422 px.
-    // 8192/16422 = 0.4988 -> 47 px.
-    expect(fitTextSize({ width: 16422, height: 120 }, 96)).toEqual({
-      sizePx: 47,
-      fits: true,
-    });
-    // the same ratio on the other axis must give the same answer
-    expect(fitTextSize({ width: 120, height: 16422 }, 96)).toEqual({
-      sizePx: 47,
-      fits: true,
-    });
-  });
-
-  it("floors rather than rounds, so the result is never still over", () => {
-    // 8192/8200 * 96 = 95.906: rounding would return 96 and change nothing.
-    expect(fitTextSize({ width: 8200, height: 120 }, 96).sizePx).toBe(95);
-  });
-
-  it("always makes progress while the box overflows", () => {
-    for (const w of [8194, 9000, 12345, 40000, 250000]) {
-      for (const size of [9, 16, 96, 512]) {
-        const r = fitTextSize({ width: w, height: 10 }, size);
-        if (r.fits) expect(r.sizePx).toBeLessThan(size);
-      }
-    }
-  });
-
-  it("reports fits=false when the size needed is below the minimum", () => {
-    // 96 * 8192/120000 = 6.55 -> below MIN_SIZE, so no allowed size fits.
-    const r = fitTextSize({ width: 120000, height: 120 }, 96);
-    expect(r.fits).toBe(false);
-    expect(r.sizePx).toBe(MIN_SIZE);
-  });
-});
-
-describe("fitText", () => {
-  it("does not touch text that already fits", () => {
+describe("measureText", () => {
+  it("returns the natural box, at the size asked for, for ordinary text", () => {
     const g = text("Title\nSecond line");
-    const fit = fitText(g);
-    expect(fit.tooLarge).toBe(false);
-    expect(fit.shrunkFrom).toBeNull();
-    expect(fit.gen).toBe(g); // the same object: no gratuitous rewrite of sizePx
-    expect(fit.height).toBe(240); // 2 lines * 96 * 1.25
+    expect(measureText(g).height).toBe(240); // 2 lines * 96 * 1.25
   });
 
-  /* ---- the two real triggers ---- */
-
-  it("shrinks a single line that is too wide, and keeps every character", () => {
+  it("does not shrink a 400-character single line", () => {
     const body = "A quote pasted as one long line. ".repeat(13).slice(0, 400);
     const g = text(body);
-    // the trigger is real: the natural box genuinely overflows
-    expect(measureText(g).width).toBeGreaterThan(MAX_DIM);
+    const box = measureText(g);
 
-    const fit = fitText(g);
-    expect(fit.tooLarge).toBe(false);
-    expect(fit.shrunkFrom).toBe(96);
-    expect(fit.gen.sizePx).toBeLessThan(96);
-    expect(fit.gen.sizePx).toBeGreaterThanOrEqual(MIN_SIZE);
-    expect(fit.width).toBeLessThanOrEqual(MAX_DIM);
-    expect(fit.height).toBeLessThanOrEqual(MAX_DIM);
-    // nothing is dropped or ellipsised — only the size moved
-    expect(fit.gen.text).toBe(body);
-    expect({ ...fit.gen, sizePx: 96 }).toEqual(g);
+    // The case is real: this is far past every cap this path used to have.
+    expect(box.width).toBeGreaterThan(FORMER_TEXT_CAP);
+    expect(box.width).toBeGreaterThan(FORMER_SYNTH_CAP);
+    // One line at 96 px is 120 px tall and stays 120 px tall — the old fit layer
+    // would have dropped the font to ~47 px and this to ~60.
+    expect(box.height).toBe(120);
   });
 
-  it("shrinks a line count that is too tall (137 lines at 96 px)", () => {
+  it("does not shrink a 137-line block (the owner's own example)", () => {
     const g = text(lines(137));
-    // 137 * 96 * 1.25 = 16440, over twice the limit
+    // 137 * 96 * 1.25 = 16440: over twice the old cap, committed as measured.
     expect(measureText(g).height).toBe(16440);
-
-    const fit = fitText(g);
-    expect(fit.tooLarge).toBe(false);
-    expect(fit.shrunkFrom).toBe(96);
-    // 96 * 8192/16440 = 47.83 -> 47; 137 * 47 * 1.25 = 8048.75 -> 8050 even.
-    expect(fit.gen.sizePx).toBe(47);
-    expect(fit.height).toBe(8050);
-    expect(fit.width).toBeLessThanOrEqual(MAX_DIM);
   });
 
-  /* ---- the floor, where shrinking runs out ---- */
-
-  it("still fits at the smallest size when it just barely can (819 lines)", () => {
-    const fit = fitText(text(lines(819)));
-    expect(fit.tooLarge).toBe(false);
-    expect(fit.gen.sizePx).toBe(MIN_SIZE);
-    expect(fit.height).toBe(8190); // 819 * 8 * 1.25, two px under the limit
-    expect(fit.shrunkFrom).toBe(96);
+  it("stays linear in sizePx, so nothing is silently capped", () => {
+    // If any bound were still being applied, doubling the font size would stop
+    // doubling the box at whatever that bound is.
+    const at96 = measureText(text(lines(137), 96));
+    const at192 = measureText(text(lines(137), 192));
+    expect(at96.height).toBe(16440);
+    expect(at192.height).toBe(32880);
+    expect(at192.width).toBeGreaterThan(at96.width);
   });
 
-  it("refuses one line further, instead of committing a crop (820 lines)", () => {
-    const fit = fitText(text(lines(820)));
-    expect(fit.tooLarge).toBe(true);
-    expect(fit.shrunkFrom).toBeNull();
-    // the reported box is the one at MIN_SIZE — the smallest this text can be —
-    // so the refusal can say by how much it misses
-    expect(fit.gen.sizePx).toBe(MIN_SIZE);
-    expect(fit.height).toBe(8200); // 820 * 8 * 1.25
-    expect(fit.height).toBeGreaterThan(MAX_DIM);
+  it("has no floor either — 8 px text keeps its own small box", () => {
+    expect(measureText(text("Title", 8)).height).toBe(10); // 1 * 8 * 1.25
+  });
+});
+
+describe("committing a text element", () => {
+  it("stores exactly the measured box, unmodified, for a 400-char line", () => {
+    const body = "A quote pasted as one long line. ".repeat(13).slice(0, 400);
+    const g = text(body);
+    const natural = measureText(g);
+    const media = commit(g);
+
+    expect({ width: media.width, height: media.height }).toEqual(natural);
+    expect(media.width).toBeGreaterThan(FORMER_SYNTH_CAP);
+    expect(media.height).toBe(120);
+    // and the generator stored beside it is the user's, at the size they typed:
+    // no rewritten sizePx, no defensive copy with a lowered font.
+    expect(media.generator).toBe(g);
+    expect((media.generator as Extract<Generator, { type: "text" }>).sizePx).toBe(96);
+    expect((media.generator as Extract<Generator, { type: "text" }>).text).toBe(body);
   });
 
-  /* ---- the invariant the bug actually broke ---- */
+  it("stores exactly the measured box, unmodified, for 137 lines", () => {
+    const g = text(lines(137));
+    const natural = measureText(g);
+    const media = commit(g);
 
-  it("returns dims that are a true measurement of the generator it returns", () => {
-    // This is the preview/export agreement in one line. The preview sizes a div
-    // to media.width/height and lets the glyphs flow from the top; the export
-    // synthesizes a w*h frame and centres the same glyphs in boxw/boxh. They
-    // describe the same picture only while the box equals the text — so the
-    // committed dims must be measureText(committed generator), exactly.
+    expect({ width: media.width, height: media.height }).toEqual(natural);
+    expect(media.height).toBe(16440);
+    expect(media.height).toBeGreaterThan(FORMER_TEXT_CAP);
+    expect((media.generator as Extract<Generator, { type: "text" }>).sizePx).toBe(96);
+  });
+
+  it("commits dims that are a true measurement of the generator beside them", () => {
+    // THE invariant, and the only one this path has. The preview sizes a div to
+    // media.width/height and lets the glyphs flow inside it; the export
+    // synthesizes a w*h frame and gives drawtext the same boxw/boxh. They
+    // describe the same picture exactly while the box equals the text — which
+    // it does by construction now that nothing adjusts either one.
     for (const g of [
       text("Title"),
       text(lines(3)),
       text(lines(137)),
       text(lines(819)),
+      text(lines(820)), // the old refusal boundary: now an ordinary element
       text("x".repeat(400)),
       text("x".repeat(400), 512),
       text("word ".repeat(200), 12),
       text("", 8),
     ]) {
-      const fit = fitText(g);
-      expect(measureText(fit.gen), `re-measure of ${fit.gen.sizePx}px`).toEqual({
-        width: fit.width,
-        height: fit.height,
-      });
-      if (!fit.tooLarge) {
-        expect(fit.width, "fitted width").toBeLessThanOrEqual(MAX_DIM);
-        expect(fit.height, "fitted height").toBeLessThanOrEqual(MAX_DIM);
-      }
+      const media = commit(g);
+      const label = `${g.text.split("\n").length} lines @ ${g.sizePx}px`;
+      expect({ width: media.width, height: media.height }, label).toEqual(measureText(g));
+      expect(media.generator, label).toBe(g);
     }
   });
 
-  it("never commits an over-size box across a sweep of shapes and sizes", () => {
+  it("never reduces a dimension, at any shape or size", () => {
     for (const size of [8, 12, 96, 200, 512]) {
       for (const chars of [1, 40, 400, 4000]) {
         for (const n of [1, 5, 200, 900]) {
           const body = Array.from({ length: n }, () => "x".repeat(chars)).join("\n");
           const g = text(body, size);
-          const fit = fitText(g);
+          const media = commit(g);
           const label = `${n} lines x ${chars} chars @ ${size}px`;
-          if (fit.tooLarge) {
-            // a refusal must be justified: the smallest allowed size overflows
-            expect(fit.gen.sizePx, label).toBe(MIN_SIZE);
-            expect(Math.max(fit.width, fit.height), label).toBeGreaterThan(MAX_DIM);
-          } else {
-            expect(fit.width, label).toBeLessThanOrEqual(MAX_DIM);
-            expect(fit.height, label).toBeLessThanOrEqual(MAX_DIM);
-            expect(fit.gen.sizePx, label).toBeLessThanOrEqual(size);
-            expect(fit.gen.sizePx, label).toBeGreaterThanOrEqual(MIN_SIZE);
-          }
+          // height is pure arithmetic, so it can be pinned outright
+          expect(media.height, label).toBe(Math.max(2, Math.ceil((n * size * 1.25) / 2) * 2));
+          // width is never below the em-based estimate of the widest line
+          expect(media.width, label).toBeGreaterThanOrEqual(chars * size * 0.6);
+          expect((media.generator as Extract<Generator, { type: "text" }>).sizePx, label).toBe(size);
         }
       }
+    }
+  });
+});
+
+describe("the fit layer stays deleted", () => {
+  it("exports no shrink-to-fit, no cap and no refusal for text", async () => {
+    const mod = await import("./generators");
+    const keys = Object.keys(mod);
+    // MAX_DIM is still a module-private constant for the SOLID path, where the
+    // box is a number the user types rather than one we measure. It must not
+    // become reachable from the text path again.
+    for (const gone of ["fitText", "fitTextSize", "textShrunkNote", "showTextTooLarge", "MAX_DIM"]) {
+      expect(keys, `${gone} must stay deleted`).not.toContain(gone);
     }
   });
 });

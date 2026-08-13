@@ -9,7 +9,23 @@ use serde_json::Value;
 
 use crate::error::{AppError, Result};
 
-pub const CURRENT_SCHEMA: u32 = 1;
+pub const CURRENT_SCHEMA: u32 = 2;
+
+/// The first schema version whose `media[].width`/`height` are rotation-aware.
+///
+/// A `.trt` written below this stored the CODED dimensions ffprobe reports, so
+/// a portrait phone recording — coded landscape plus a 90° Display Matrix —
+/// was recorded landscape, and `timeline.width`/`height`, adopted from the
+/// first visual media on an empty timeline, inherited the same mistake. The
+/// clip has been letterboxed into a sideways canvas ever since.
+///
+/// The correction cannot be made in `migrate`. Nothing in the file records the
+/// rotation, so a genuinely-landscape 1920x1080 clip and a portrait one stored
+/// pre-swap are the same bytes; only the file on disk can tell them apart.
+/// `store::load_project` therefore re-probes, gated on this constant, and the
+/// version stamp this migration writes is what records that it has done so —
+/// which is why the 1 → 2 step below changes nothing else.
+pub const ROTATION_REPAIR_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Rational {
@@ -228,19 +244,56 @@ pub struct ProjectFile {
     pub export: Value, // opaque to Rust until the export milestone
 }
 
+/// A project migrated to `CURRENT_SCHEMA`, plus the version it arrived as.
+///
+/// `from` is the load path's only way to tell a file that has already been
+/// through a version-gated repair from one that has not: `value` carries the
+/// current version either way. Returning it here, rather than leaving each
+/// caller to re-read `schema` off the raw JSON before calling, is what makes
+/// the gate impossible to forget.
+#[derive(Debug)]
+pub struct Migrated {
+    pub value: Value,
+    /// The version the file carried on disk, BEFORE migration.
+    pub from: u32,
+}
+
 /// Migrate a raw project JSON value to the current schema version.
-pub fn migrate(value: Value) -> Result<Value> {
+///
+/// Pure JSON, deliberately: it is called from paths that have no business
+/// touching the disk (`store::thumb_source_for` resolves a recents thumbnail
+/// this way). A migration step that needs more than the file's own bytes — the
+/// 1 → 2 dimension repair does, since the rotation exists only in the media
+/// file — belongs on the load path, keyed off the returned `from`.
+pub fn migrate(mut value: Value) -> Result<Migrated> {
+    // Compared as u64 BEFORE narrowing: `schema: 4294967297` truncates to 1 in
+    // a u32 cast, which would have run a v1 file's migrations over a document
+    // claiming to be from the future. A crafted `.trt` is this app's main
+    // threat surface, so the range check comes first and the cast happens only
+    // once the value is known to fit.
     let version = value
         .get("schema")
         .and_then(Value::as_u64)
         .ok_or_else(|| AppError::BadInput("not a Taroting project (missing schema)".into()))?;
-    match version as u32 {
-        CURRENT_SCHEMA => Ok(value),
-        v if v > CURRENT_SCHEMA => Err(AppError::BadInput(format!(
-            "project was created by a newer Taroting (schema {v}); please update the app"
-        ))),
-        v => Err(AppError::BadInput(format!("unknown project schema {v}"))),
+    if version > CURRENT_SCHEMA as u64 {
+        return Err(AppError::BadInput(format!(
+            "project was created by a newer Taroting (schema {version}); please update the app"
+        )));
     }
+    let from = version as u32;
+    match from {
+        CURRENT_SCHEMA => {}
+        // 1 → 2: nothing in the JSON changes, because nothing in the JSON CAN.
+        // The stamp is the entire migration — see `ROTATION_REPAIR_SCHEMA` for
+        // what it records and who acts on it.
+        1 => {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("schema".into(), Value::from(CURRENT_SCHEMA));
+            }
+        }
+        v => return Err(AppError::BadInput(format!("unknown project schema {v}"))),
+    }
+    Ok(Migrated { value, from })
 }
 
 #[cfg(test)]
@@ -309,7 +362,9 @@ mod tests {
             "unknownTopLevel": 42
         });
         let migrated = migrate(json).unwrap();
-        let parsed: ProjectFile = serde_json::from_value(migrated).unwrap();
+        assert_eq!(migrated.from, 1, "the file's ON-DISK version, not the current one");
+        assert_eq!(migrated.value["schema"], CURRENT_SCHEMA);
+        let parsed: ProjectFile = serde_json::from_value(migrated.value).unwrap();
         assert_eq!(parsed.name, "Test");
         assert_eq!(parsed.timeline.duration(), 60.0);
         // serialize back — unknown fields are dropped, knowns survive
@@ -341,5 +396,39 @@ mod tests {
     fn rejects_newer_schema() {
         let json = serde_json::json!({"schema": 999});
         assert!(migrate(json).is_err());
+
+        // A version that TRUNCATES to a known one must still be rejected. As a
+        // u32 cast this is 1, and a v1 file is migrated and re-probed; the
+        // check has to happen in u64.
+        let truncating = 1u64 + (1u64 << 32);
+        assert_eq!(truncating as u32, 1, "the cast this guards against");
+        assert!(migrate(serde_json::json!({"schema": truncating})).is_err());
+    }
+
+    /// The version gate the load-time repair hangs off. A file already at the
+    /// current version reports itself as such, so the repair does not re-run;
+    /// an older one reports the version it actually arrived as, whatever the
+    /// migration then stamps into the value.
+    #[test]
+    fn migrate_reports_the_version_the_file_arrived_as() {
+        let current = migrate(serde_json::json!({"schema": CURRENT_SCHEMA})).unwrap();
+        assert_eq!(current.from, CURRENT_SCHEMA);
+        assert!(
+            current.from >= ROTATION_REPAIR_SCHEMA,
+            "a current-schema file must not qualify for the rotation re-probe"
+        );
+
+        let old = migrate(serde_json::json!({"schema": 1, "name": "keep me"})).unwrap();
+        assert!(
+            old.from < ROTATION_REPAIR_SCHEMA,
+            "a pre-repair file must qualify: from={}",
+            old.from
+        );
+        // The stamp is the only edit: everything else survives untouched.
+        assert_eq!(old.value["schema"], CURRENT_SCHEMA);
+        assert_eq!(old.value["name"], "keep me");
+
+        assert!(migrate(serde_json::json!({"schema": 0})).is_err());
+        assert!(migrate(serde_json::json!({"name": "no schema"})).is_err());
     }
 }

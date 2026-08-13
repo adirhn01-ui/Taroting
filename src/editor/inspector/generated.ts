@@ -1,14 +1,14 @@
 // Inspector section for generated (solid / text) media. Edits the shared
 // MediaRef.generator via updateMedia — so changes apply to EVERY clip that
 // uses the element — and for text re-measures the intrinsic width/height with
-// the same offscreen-canvas helper the creation dialog uses, through the same
-// fitText that keeps the measured box inside the range the export can
-// synthesize (see the long note in ../media/generators.ts).
+// the same offscreen-canvas helper the creation dialog uses, so both call sites
+// compute identical boxes. That measurement is committed as-is: text is never
+// clamped, shrunk to fit or refused for being large (see the note at the top of
+// ../media/generators.ts).
 
 import { updateMedia } from "../../core/project";
 import type { Clip, FontFamily, Generator, MediaRef } from "../../core/types";
-import { TEXT_FONTS, fitText, showTextTooLarge, textShrunkNote } from "../media/generators";
-import { toast } from "../../ui/toast";
+import { TEXT_FONTS, measureText } from "../media/generators";
 import type { InspectorCtx } from "./inspector";
 
 const MIN_SIZE = 8;
@@ -58,10 +58,7 @@ export function buildGeneratedSection(
   if (gen.type === "solid") {
     buildSolid(s, gen, target.media, commitMedia);
   } else {
-    // The second callback rebuilds this section from the project WITHOUT
-    // committing: a refused edit has to put the fields back to what is actually
-    // stored, or they would advertise a generator the project does not have.
-    buildText(s, gen, commitMedia, () => ctx.refresh());
+    buildText(s, gen, commitMedia);
   }
 
   s.appendChild(
@@ -125,21 +122,14 @@ function buildText(
   s: HTMLElement,
   gen: Extract<Generator, { type: "text" }>,
   commitMedia: (patch: Partial<MediaRef>) => void,
-  revert: () => void,
 ): void {
-  // Commit the given text generator + its fitted intrinsic box. fitText lowers
-  // the font size when the natural box would exceed what the export can
-  // synthesize, so the committed dims are always a true measurement of the
-  // committed generator — commit `fit.gen`, never `g`.
+  // Commit the generator the user asked for, alongside its natural box. The
+  // dims are always a true measurement of the generator stored beside them —
+  // that identity is what keeps the preview and the export describing the same
+  // frame — and no size is too big to commit.
   const commitGen = (g: Extract<Generator, { type: "text" }>): void => {
-    const fit = fitText(g);
-    if (fit.tooLarge) {
-      showTextTooLarge(fit);
-      revert();
-      return;
-    }
-    if (fit.shrunkFrom !== null) toast.info(`Text ${textShrunkNote(fit)}`);
-    commitMedia({ generator: fit.gen, width: fit.width, height: fit.height });
+    const box = measureText(g);
+    commitMedia({ generator: g, width: box.width, height: box.height });
   };
 
   const textarea = el("textarea", "input gen-textarea");

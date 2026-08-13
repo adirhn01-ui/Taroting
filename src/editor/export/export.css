@@ -40,6 +40,19 @@
   display: none;
 }
 
+/* A one-line explanation under a row ("AV1 can't be stored in a MOV file…").
+   It is a sibling of .export-row, not a child, so the left pad reproduces the
+   row grid's 116px label column + gap and the text lines up under the control
+   it is talking about. Sits tight to its row rather than a full .export-form
+   gap away, so it reads as part of it. */
+.export-note {
+  margin-top: calc(var(--sp-3) - var(--sp-5));
+  padding-left: calc(116px + var(--sp-4));
+  font-size: var(--fs-12);
+  line-height: 1.45;
+  color: var(--text-3);
+}
+
 /* segmented row of buttons (format picker) */
 .export-seg {
   display: inline-flex;

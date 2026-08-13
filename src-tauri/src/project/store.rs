@@ -369,30 +369,248 @@ fn read_project_value(path: &Path) -> Result<(Value, bool)> {
     }
 }
 
+/// Whether the file behind `m` is on disk with exactly the size and mtime the
+/// project recorded.
+///
+/// The one identity rule, shared by the missing-media scan, the thumbnail
+/// resolver and the rotation repair below — it was spelled out separately at
+/// each of them. The repair in particular MUST agree with the scan: a file that
+/// fails this is the relink path's business, and re-probing it would write a
+/// REPLACED file's dimensions into a project the user has not relinked yet.
+///
+/// Compares both size and mtime. `mtime_ms_of` uses the exact derivation from
+/// `probe_sync` (modified() → ms since epoch, u64) so an unchanged file
+/// compares bit-identical; an exact match is correct (no tolerance).
+fn identity_intact(m: &schema::MediaRef) -> bool {
+    std::fs::metadata(&m.path)
+        .map(|meta| meta.len() == m.size && mtime_ms_of(&meta) == m.mtime_ms)
+        .unwrap_or(false)
+}
+
+/// A media entry whose stored dimensions a fresh probe contradicts by exactly a
+/// transposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DimFix {
+    /// Index into the project's `media` array.
+    index: usize,
+    /// What the project had stored — the pre-fix, coded pair.
+    from: (u32, u32),
+    /// What the file actually decodes to.
+    to: (u32, u32),
+}
+
+/// Is `probed` the transpose of `stored`, and does that transposition mean
+/// anything?
+///
+/// This is the whole discriminator between the two ways a fresh probe can
+/// disagree with a stored pair. A rotated recording stored its CODED size and
+/// the probe now reports the DECODED one, which is that pair swapped and
+/// nothing else. Any other disagreement — 1920x1080 stored, 1280x720 probed —
+/// is a DIFFERENT FILE, not a rotation, and quietly adopting its dimensions
+/// here would paper over exactly what the relink dialog exists to ask the user
+/// about. (The identity check in `rotation_fixes` is the first line of that
+/// defence and catches every ordinary replacement; this is what holds if a
+/// replacement ever slipped through with a colliding size and mtime.)
+///
+/// A square pair is excluded because its transpose is itself: there is no
+/// correction to make, and calling it one would hand `transposed_canvas` a
+/// "fix" with which to turn a canvas that was never wrong.
+fn is_transposition(stored: (u32, u32), probed: (u32, u32)) -> bool {
+    stored.0 != stored.1 && probed == (stored.1, stored.0)
+}
+
+/// Re-probe the media that could be carrying pre-rotation-fix dimensions and
+/// return the corrections. One ffprobe per candidate, which is why the caller
+/// runs this at most once per project.
+///
+/// Measured on this machine, warm: ~38 ms per candidate, all of it process
+/// startup — a 12-video project spends 490 ms in its one repairing load, a
+/// 40-video project 1.5 s. Serial, deliberately. The probes are independent and
+/// a bounded fan-out roughly halves the wall time (measured: 10 concurrent
+/// ffprobes in 203 ms against 452 ms serial), but this runs ONCE in a project's
+/// life, against a defect that is otherwise permanent, and the load it delays
+/// is one the user asked for. Concurrency on the load path would outlive its
+/// justification by years. If it ever needs bounding, bound it here — the
+/// candidate filter below is where the cheap wins already are.
+fn rotation_fixes(media: &[schema::MediaRef]) -> Vec<DimFix> {
+    let mut fixes = Vec::new();
+    for (index, m) in media.iter().enumerate() {
+        // Only a video stream can carry the Display Matrix that `probe_sync`
+        // transposes on. Measured with the bundled ffprobe: a JPEG exposes no
+        // side data at all, and the GIF muxer drops a rotation you ask it to
+        // write — so a still or a gif cannot have been stored wrong, and
+        // skipping them keeps a 200-photo slideshow from spawning 200
+        // processes. A generator has no file to probe.
+        if m.kind != "video" || m.generator.is_some() {
+            continue;
+        }
+        let (Some(w), Some(h)) = (m.width, m.height) else {
+            continue;
+        };
+        // A square frame transposes to itself — there is nothing to find, so
+        // do not pay a process to find it.
+        if w == h {
+            continue;
+        }
+        // Missing or changed on disk: already reported in `missing`, and the
+        // relink path re-probes and self-heals once the user points at the
+        // file. Unreadable (an exclusive lock, a codec ffprobe cannot open) is
+        // the same situation — leave the entry exactly as authored.
+        if !identity_intact(m) {
+            continue;
+        }
+        let Ok(info) = crate::media::probe::probe_sync(&m.path) else {
+            continue;
+        };
+        let (Some(pw), Some(ph)) = (info.width, info.height) else {
+            continue;
+        };
+        if is_transposition((w, h), (pw, ph)) {
+            fixes.push(DimFix { index, from: (w, h), to: (pw, ph) });
+        }
+    }
+    fixes
+}
+
+/// The canvas the timeline should be transposed to, or `None` to leave it be.
+///
+/// THE JUDGEMENT CALL. A canvas is adopted from the first visual media added to
+/// an EMPTY timeline (`addMedia`, src/core/project.ts), so a portrait clip
+/// stored pre-swap created a landscape canvas and has been letterboxed into it
+/// ever since. Transposing that back is the fix the user is actually asking
+/// for.
+///
+/// But the same shape — a canvas equal to a clip's stale dimensions — is also
+/// what a DELIBERATE choice looks like: a user framing a portrait clip inside a
+/// landscape canvas on purpose typed those very numbers. Nothing in the file
+/// separates the two, so the rule is drawn where the ambiguity disappears
+/// rather than where it is merely unlikely:
+///
+/// > transpose only when the corrected clip is the project's ONLY visual media
+/// > and the canvas is exactly that clip's stale dimensions.
+///
+/// A single visual media means there is nothing else the canvas could have been
+/// framed for, and no second clip that a transposition would silently reframe.
+/// Audio is not counted: it has no dimensions, could never have set the canvas,
+/// and its presence says nothing about framing — a portrait clip over a music
+/// bed is still a single-clip portrait project. Generators and stills ARE
+/// counted, even though `addMedia` never adopts a canvas from them, precisely
+/// because they are visual: a title card sized against the current canvas is
+/// evidence the canvas was already being composed against, and reframing under
+/// it would move the title.
+///
+/// Everything else is left alone — and "left alone" is a correct outcome, not a
+/// failure. The clip now carries its true dimensions, so it letterboxes
+/// properly inside whatever canvas it is in: visible, and one click to change.
+/// A wrong transposition is neither.
+///
+/// No clamping on the way out. Both numbers come from a canvas the app already
+/// accepted, and swapping a valid pair leaves each value inside the same range
+/// (`clampCanvas`: even, [16, 8192]) that the other one satisfied.
+fn transposed_canvas(typed: &ProjectFile, fixes: &[DimFix]) -> Option<(u32, u32)> {
+    let [fix] = fixes else {
+        return None;
+    };
+    let mut visual = typed.media.iter().enumerate().filter(|(_, m)| m.kind != "audio");
+    let (only, _) = visual.next()?;
+    if visual.next().is_some() || only != fix.index {
+        return None;
+    }
+    ((typed.timeline.width, typed.timeline.height) == fix.from).then_some(fix.to)
+}
+
+/// Write the corrections into the RAW project value.
+///
+/// The raw `Value` is what `load_project` hands back and what the editor's next
+/// save writes out, and it carries fields this build knows nothing about — a
+/// newer build's, or a hand-added one; tolerating them is a stated property of
+/// the format. Re-serializing the typed `ProjectFile` over it would silently
+/// drop every one of them, so the repair edits exactly the numbers it owns and
+/// leaves the rest of the document untouched.
+fn apply_dim_fixes(value: &mut Value, fixes: &[DimFix], canvas: Option<(u32, u32)>) {
+    for fix in fixes {
+        if let Some(entry) = value
+            .get_mut("media")
+            .and_then(|m| m.get_mut(fix.index))
+            .and_then(Value::as_object_mut)
+        {
+            entry.insert("width".into(), fix.to.0.into());
+            entry.insert("height".into(), fix.to.1.into());
+        }
+    }
+    if let Some((w, h)) = canvas {
+        if let Some(timeline) = value.get_mut("timeline").and_then(Value::as_object_mut) {
+            timeline.insert("width".into(), w.into());
+            timeline.insert("height".into(), h.into());
+        }
+    }
+}
+
+/// One-shot repair for projects saved before `probe_sync` learned to read the
+/// display matrix. Gated by the caller on `ROTATION_REPAIR_SCHEMA`, so this
+/// runs once in a project's life and never on a load that is already current.
+///
+/// KNOWN RESIDUE, and the reason it is accepted. Media that could not be read
+/// on the one load that repairs the project is stamped as repaired along with
+/// everything else, so a clip that happened to be on an unplugged drive that
+/// day keeps its stale dimensions afterwards. Relinking re-probes and fixes it
+/// — and that load reports it missing, so the user is asked. The alternative,
+/// withholding the stamp until every candidate has been read, buys that rare
+/// case by making a project with one permanently-deleted clip re-probe all its
+/// OTHER clips on every open, for good: a lasting per-load cost traded against
+/// a one-off that announces itself.
+fn repair_rotated_dimensions(path: &Path, value: &mut Value, typed: &ProjectFile, recovered: bool) {
+    let fixes = rotation_fixes(&typed.media);
+    apply_dim_fixes(value, &fixes, transposed_canvas(typed, &fixes));
+
+    // Persist even when nothing needed correcting. The version stamp is what
+    // records that this project has BEEN through the re-probe, and without
+    // writing it back every open pays for the probes again — which would make
+    // the schema gate, and with it the performance argument for gating at all,
+    // pointless.
+    //
+    // Except after a recovery. `atomic_write` rotates the current primary onto
+    // the `.bak`, and in a recovery the `.bak` IS the last good copy while the
+    // primary is the corrupt (or absent) one — so a write that then failed its
+    // second rename would restore the corrupt primary over the only good copy
+    // and leave nothing readable at all. A recovered project simply re-probes
+    // until the user's own next save stamps it: that costs one load and risks
+    // nothing.
+    if recovered {
+        return;
+    }
+    // Fail-soft otherwise: a read-only volume or a locked file must not fail
+    // the open. The repair is already in `value`, so the user gets a correct
+    // project this session and the next load tries again.
+    if let Ok(bytes) = serde_json::to_vec_pretty(value) {
+        let _ = atomic_write(path, &bytes);
+    }
+}
+
 #[tauri::command]
 pub fn load_project(path: String) -> Result<LoadedProject> {
     let p = Path::new(&path);
     let (raw, recovered) = read_project_value(p)?;
-    let migrated = schema::migrate(raw)?;
-    let typed: ProjectFile = ProjectFile::deserialize(&migrated)
+    let schema::Migrated { mut value, from } = schema::migrate(raw)?;
+    let typed: ProjectFile = ProjectFile::deserialize(&value)
         .map_err(|e| AppError::BadInput(format!("invalid project file: {e}")))?;
 
     // Verify media identity (path exists + size/mtime match). Generated media
     // (text/solid) has no file identity — its `path` is a display label.
     let mut missing = Vec::new();
     for m in &typed.media {
-        if m.generator.is_some() {
-            continue;
-        }
-        // Compare both size and mtime. mtime_ms uses the exact derivation from
-        // probe_sync (modified() → ms since epoch, u64) so an unchanged file
-        // compares bit-identical; an exact match is correct (no tolerance).
-        let ok = std::fs::metadata(&m.path)
-            .map(|meta| meta.len() == m.size && mtime_ms_of(&meta) == m.mtime_ms)
-            .unwrap_or(false);
-        if !ok {
+        if m.generator.is_none() && !identity_intact(m) {
             missing.push(m.id.clone());
         }
+    }
+
+    // Projects written before the display-matrix fix carry a rotated clip's
+    // CODED dimensions, and a canvas adopted from them. Nothing in the JSON can
+    // reveal that, so repair it against the files themselves — once, gated on
+    // the schema stamp, because doing it on every open is an ffprobe per clip
+    // on a path the user is waiting on.
+    if from < schema::ROTATION_REPAIR_SCHEMA {
+        repair_rotated_dimensions(p, &mut value, &typed, recovered);
     }
 
     // Stamp openedAt on this path's recents entry (create it if absent — a
@@ -403,7 +621,7 @@ pub fn load_project(path: String) -> Result<LoadedProject> {
     }
 
     Ok(LoadedProject {
-        project: migrated,
+        project: value,
         missing,
         recovered,
     })
@@ -528,8 +746,7 @@ pub fn save_project(
 /// unit-testable; `refresh_recent_thumb` layers cache lookup + generation on top.
 fn thumb_source_for(path: &str) -> Option<(crate::cache::MediaKey, f64)> {
     let (raw, _) = read_project_value(Path::new(path)).ok()?;
-    let migrated = schema::migrate(raw).ok()?;
-    let typed: ProjectFile = serde_json::from_value(migrated).ok()?;
+    let typed: ProjectFile = serde_json::from_value(schema::migrate(raw).ok()?.value).ok()?;
 
     // Generated media (text/solid) has no file; audio has no frame. Both are
     // skipped exactly as the editor's bin does — placeholder is acceptable.
@@ -539,11 +756,8 @@ fn thumb_source_for(path: &str) -> Option<(crate::cache::MediaKey, f64)> {
     }
     // The source must exist and match identity (size + mtime) before we hand a
     // path to ffmpeg — a stale/replaced file would otherwise yield a wrong or
-    // failed frame. Mirrors load_project's missing-media identity check.
-    let identity_ok = std::fs::metadata(&media.path)
-        .map(|meta| meta.len() == media.size && mtime_ms_of(&meta) == media.mtime_ms)
-        .unwrap_or(false);
-    if !identity_ok {
+    // failed frame. The same rule `load_project`'s missing-media scan applies.
+    if !identity_intact(media) {
         return None;
     }
 
@@ -1151,6 +1365,383 @@ mod tests {
         });
     }
 
+    /* -------------------------------------------------------------- */
+    /* Rotation repair (schema 1 → 2)                                  */
+    /* -------------------------------------------------------------- */
+
+    /// Encode a landscape 640x360 clip and stamp 90° of display rotation onto a
+    /// stream copy of it — the exact shape a portrait phone recording has:
+    /// coded landscape, plus a Display Matrix saying otherwise. Returns the
+    /// rotated file, which `probe_sync` reports as 360x640.
+    ///
+    /// No fixture in this repo carried rotation metadata, which is precisely
+    /// why this class of bug reached users past a green suite. The repair is
+    /// worth nothing tested against a synthetic disagreement.
+    fn rotated_video_fixture(dir: &Path) -> PathBuf {
+        let flat = dir.join("flat.mp4");
+        let out = crate::jobs::ffmpeg::run(
+            "ffmpeg",
+            &[
+                "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=1",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                flat.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let rotated = dir.join("portrait.mp4");
+        // `-display_rotation` on the INPUT + `-c copy` writes the matrix
+        // through without touching a pixel, so the coded size stays 640x360.
+        let out = crate::jobs::ffmpeg::run(
+            "ffmpeg",
+            &[
+                "-y",
+                "-display_rotation", "90",
+                "-i", flat.to_str().unwrap(),
+                "-c", "copy",
+                rotated.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        rotated
+    }
+
+    /// A media entry for `file` carrying the dimensions the OLD probe would
+    /// have stored — the coded pair, un-transposed — with a true identity so
+    /// the repair is allowed to look at it.
+    fn pre_swap_media(file: &Path, w: u32, h: u32) -> Value {
+        let meta = std::fs::metadata(file).unwrap();
+        serde_json::json!({
+            "id": "m1", "path": file.to_string_lossy(),
+            "size": meta.len(), "mtimeMs": mtime_ms_of(&meta),
+            "kind": "video", "duration": 1.0, "hasAudio": false,
+            "width": w, "height": h
+        })
+    }
+
+    /// Write a pre-repair (schema 1) project with the given media and canvas,
+    /// one clip on `m1`, and a field this build knows nothing about.
+    fn write_pre_repair_project(proj: &Path, media: Value, canvas: (u32, u32)) {
+        write_json(
+            proj,
+            &serde_json::json!({
+                "schema": 1, "app": "taroting", "id": "p1", "name": "Portrait",
+                "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+                "media": media,
+                "timeline": {
+                    "fps": {"num": 30, "den": 1},
+                    "width": canvas.0, "height": canvas.1,
+                    "tracks": [{ "id": "t1", "kind": "video", "name": "V1", "muted": false,
+                        "clips": [{
+                            "id": "c1", "mediaId": "m1",
+                            "timelineStart": 0.0, "srcIn": 0.0, "srcOut": 1.0, "speed": 1.0,
+                            "audio": {"volume": 1.0, "muted": false, "fadeInSec": 0.0,
+                                       "fadeOutSec": 0.0, "gainOffsetDb": 0.0, "detached": false}
+                        }] }]
+                },
+                "export": {},
+                "unknownFutureField": {"keep": "me"}
+            }),
+        );
+    }
+
+    /// The whole repair, against a real rotated file: a project saved with the
+    /// pre-swap dimensions loads corrected, the correction is on disk under the
+    /// bumped stamp, and the stamp then keeps it from ever running again.
+    #[test]
+    fn load_repairs_pre_swap_dimensions_once_and_persists_them() {
+        with_isolated("rot-repair", |dir| {
+            let file = rotated_video_fixture(dir);
+            let proj = dir.join("Portrait.trt");
+            write_pre_repair_project(
+                &proj,
+                serde_json::json!([pre_swap_media(&file, 640, 360)]),
+                (640, 360),
+            );
+
+            let loaded = load_project(proj.to_string_lossy().into_owned()).unwrap();
+            assert!(
+                loaded.missing.is_empty(),
+                "the file is right there, unchanged: {:?}",
+                loaded.missing
+            );
+            assert_eq!(loaded.project["media"][0]["width"], 360);
+            assert_eq!(loaded.project["media"][0]["height"], 640);
+            // A lone clip whose canvas was adopted from its stale dimensions:
+            // the canvas follows it round.
+            assert_eq!(loaded.project["timeline"]["width"], 360);
+            assert_eq!(loaded.project["timeline"]["height"], 640);
+
+            // The same numbers are on DISK, under the bumped stamp — without
+            // that, every open would pay for the probes again.
+            let on_disk: Value = serde_json::from_slice(&std::fs::read(&proj).unwrap()).unwrap();
+            assert_eq!(on_disk["schema"], schema::CURRENT_SCHEMA);
+            assert_eq!(on_disk["media"][0]["width"], 360);
+            assert_eq!(on_disk["media"][0]["height"], 640);
+            assert_eq!(on_disk["timeline"]["width"], 360);
+            assert_eq!(on_disk["timeline"]["height"], 640);
+            // ...written as a surgical edit, not a re-serialize of the typed
+            // struct, which would have dropped this.
+            assert_eq!(on_disk["unknownFutureField"]["keep"], "me");
+
+            // THE GATE. Put the STALE dimensions back — the precise pair this
+            // repair exists to correct — while leaving the bumped stamp alone.
+            // A second load must hand them straight back untouched, which it
+            // can only do by never probing the file. (Poisoning with arbitrary
+            // numbers would not test this: a re-probe finds no transposition
+            // in them and leaves them alone too, so the test would pass with
+            // the gate removed entirely.)
+            let mut poisoned = on_disk.clone();
+            poisoned["media"][0]["width"] = Value::from(640);
+            poisoned["media"][0]["height"] = Value::from(360);
+            write_json(&proj, &poisoned);
+
+            let again = load_project(proj.to_string_lossy().into_owned()).unwrap();
+            assert_eq!(
+                again.project["media"][0]["width"], 640,
+                "a second re-probe would have transposed this — the schema gate leaked"
+            );
+            assert_eq!(again.project["media"][0]["height"], 360);
+        });
+    }
+
+    /// A second VISUAL media means something else may have framed this project,
+    /// so the canvas is left where the user had it. The clip's own dimensions
+    /// are still repaired — it simply letterboxes correctly now instead of
+    /// being stretched.
+    #[test]
+    fn a_second_visual_media_keeps_the_canvas_out_of_it() {
+        with_isolated("rot-canvas", |dir| {
+            let file = rotated_video_fixture(dir);
+            let proj = dir.join("Titled.trt");
+            write_pre_repair_project(
+                &proj,
+                serde_json::json!([
+                    pre_swap_media(&file, 640, 360),
+                    {
+                        "id": "m2", "path": "Text: Title", "size": 0, "mtimeMs": 0,
+                        "kind": "image", "duration": 0.0, "hasAudio": false,
+                        "width": 640, "height": 360,
+                        "generator": { "type": "solid", "color": "#00ff00" }
+                    }
+                ]),
+                (640, 360),
+            );
+
+            let loaded = load_project(proj.to_string_lossy().into_owned()).unwrap();
+            assert_eq!(loaded.project["media"][0]["width"], 360, "the clip is still repaired");
+            assert_eq!(loaded.project["media"][0]["height"], 640);
+            assert_eq!(loaded.project["timeline"]["width"], 640, "the canvas is not");
+            assert_eq!(loaded.project["timeline"]["height"], 360);
+            // The title card is not a video and was never probed.
+            assert_eq!(loaded.project["media"][1]["width"], 640);
+        });
+    }
+
+    /// An audio bed is not a second visual media: a portrait clip over music is
+    /// still a single-clip portrait project, and its canvas follows.
+    #[test]
+    fn an_audio_companion_does_not_block_the_canvas() {
+        with_isolated("rot-scored", |dir| {
+            let file = rotated_video_fixture(dir);
+            let meta = std::fs::metadata(&file).unwrap();
+            let proj = dir.join("Scored.trt");
+            write_pre_repair_project(
+                &proj,
+                serde_json::json!([
+                    pre_swap_media(&file, 640, 360),
+                    {
+                        "id": "m2", "path": file.to_string_lossy(),
+                        "size": meta.len(), "mtimeMs": mtime_ms_of(&meta),
+                        "kind": "audio", "duration": 1.0, "hasAudio": true
+                    }
+                ]),
+                (640, 360),
+            );
+
+            let loaded = load_project(proj.to_string_lossy().into_owned()).unwrap();
+            assert_eq!(loaded.project["timeline"]["width"], 360);
+            assert_eq!(loaded.project["timeline"]["height"], 640);
+        });
+    }
+
+    /// A file that no longer matches what the project recorded is the relink
+    /// path's business. It is reported missing and left exactly as authored —
+    /// adopting a replacement's dimensions here would silently accept a file
+    /// the user has not agreed to.
+    #[test]
+    fn a_changed_file_is_left_to_the_relink_path() {
+        with_isolated("rot-relink", |dir| {
+            let file = rotated_video_fixture(dir);
+            let mut media = pre_swap_media(&file, 640, 360);
+            let stale = media["mtimeMs"].as_u64().unwrap().wrapping_sub(5_000);
+            media["mtimeMs"] = Value::from(stale);
+
+            let proj = dir.join("Changed.trt");
+            write_pre_repair_project(&proj, serde_json::json!([media]), (640, 360));
+
+            let loaded = load_project(proj.to_string_lossy().into_owned()).unwrap();
+            assert_eq!(loaded.missing, vec!["m1"]);
+            assert_eq!(loaded.project["media"][0]["width"], 640, "untouched");
+            assert_eq!(loaded.project["media"][0]["height"], 360);
+            assert_eq!(loaded.project["timeline"]["width"], 640);
+        });
+    }
+
+    /// A file with no rotation is the common case, and it must survive the
+    /// repair completely unchanged — including a project whose canvas the rule
+    /// would otherwise have been eligible to turn.
+    #[test]
+    fn an_unrotated_file_is_left_exactly_as_it_was() {
+        with_isolated("rot-none", |dir| {
+            rotated_video_fixture(dir); // also leaves the un-rotated `flat.mp4`
+            let flat = dir.join("flat.mp4");
+            let proj = dir.join("Flat.trt");
+            write_pre_repair_project(
+                &proj,
+                serde_json::json!([pre_swap_media(&flat, 640, 360)]),
+                (640, 360),
+            );
+
+            let loaded = load_project(proj.to_string_lossy().into_owned()).unwrap();
+            assert_eq!(loaded.project["media"][0]["width"], 640);
+            assert_eq!(loaded.project["media"][0]["height"], 360);
+            assert_eq!(loaded.project["timeline"]["width"], 640);
+            assert_eq!(loaded.project["timeline"]["height"], 360);
+            // Stamped all the same: a project that needed nothing must not be
+            // re-probed on every future open just because it needed nothing.
+            let on_disk: Value = serde_json::from_slice(&std::fs::read(&proj).unwrap()).unwrap();
+            assert_eq!(on_disk["schema"], schema::CURRENT_SCHEMA);
+        });
+    }
+
+    /// The candidate set is video-only, and that is a decision rather than an
+    /// oversight: measured with the bundled ffprobe, a still exposes no side
+    /// data at all and the gif muxer discards a rotation you ask it to write,
+    /// so neither can have been stored wrong — while probing them would cost a
+    /// process per photo in a slideshow. A still whose stored dimensions are
+    /// the exact transpose of its file's is therefore left alone, where the
+    /// identical disagreement on a video is corrected.
+    #[test]
+    fn only_video_media_is_ever_re_probed() {
+        with_isolated("rot-video-only", |dir| {
+            let still = dir.join("frame.png");
+            let out = crate::jobs::ffmpeg::run(
+                "ffmpeg",
+                &[
+                    "-y",
+                    "-f", "lavfi", "-i", "testsrc2=size=640x360",
+                    "-frames:v", "1",
+                    still.to_str().unwrap(),
+                ],
+            )
+            .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+            // Recorded transposed, and a lone visual media on a canvas that
+            // matches — every condition the repair looks for, except the kind.
+            let mut media = pre_swap_media(&still, 360, 640);
+            media["kind"] = Value::from("image");
+            let proj = dir.join("Still.trt");
+            write_pre_repair_project(&proj, serde_json::json!([media]), (360, 640));
+
+            let loaded = load_project(proj.to_string_lossy().into_owned()).unwrap();
+            assert_eq!(loaded.project["media"][0]["width"], 360, "a still is never re-probed");
+            assert_eq!(loaded.project["media"][0]["height"], 640);
+            assert_eq!(loaded.project["timeline"]["width"], 360, "so its canvas cannot move");
+            assert_eq!(loaded.project["timeline"]["height"], 640);
+        });
+    }
+
+    /// The discriminator between the two ways a fresh probe can disagree with
+    /// a stored pair.
+    #[test]
+    fn only_an_exact_transposition_counts_as_the_rotation_bug() {
+        // The bug: coded landscape stored, decoded portrait probed (and back).
+        assert!(is_transposition((1920, 1080), (1080, 1920)));
+        assert!(is_transposition((1080, 1920), (1920, 1080)));
+
+        // A different file, not a rotation — the relink dialog's business.
+        assert!(!is_transposition((1920, 1080), (1280, 720)));
+        assert!(!is_transposition((1920, 1080), (1080, 720)));
+        assert!(!is_transposition((1920, 1080), (720, 1080)));
+
+        // Agreement is not a correction.
+        assert!(!is_transposition((1920, 1080), (1920, 1080)));
+
+        // A square frame transposes to itself: nothing to correct, and calling
+        // it a correction would arm the canvas rule with a no-op.
+        assert!(!is_transposition((1080, 1080), (1080, 1080)));
+    }
+
+    /// `video_media` with an explicit kind and dimensions.
+    fn sized_media(id: &str, kind: &str, w: u32, h: u32) -> Value {
+        let mut m = video_media(id);
+        m["kind"] = Value::from(kind);
+        m["width"] = Value::from(w);
+        m["height"] = Value::from(h);
+        m
+    }
+
+    /// A typed project with the given media and canvas, and one empty track.
+    fn canvas_project(media: Value, canvas: (u32, u32)) -> ProjectFile {
+        let mut v = project_with_tracks(
+            media,
+            serde_json::json!([
+                { "id": "t1", "kind": "video", "name": "V1", "muted": false, "clips": [] }
+            ]),
+        );
+        v["timeline"]["width"] = Value::from(canvas.0);
+        v["timeline"]["height"] = Value::from(canvas.1);
+        typed_project(v)
+    }
+
+    /// The timeline rule, stated as cases. Pure — no files, no ffmpeg.
+    #[test]
+    fn the_canvas_only_follows_a_lone_visual_clip() {
+        let fix = DimFix { index: 0, from: (640, 360), to: (360, 640) };
+
+        // The case this exists for: one clip, canvas adopted from its stale
+        // dimensions, so the canvas was never anything but a mistake.
+        let solo = canvas_project(serde_json::json!([sized_media("m1", "video", 640, 360)]), (640, 360));
+        assert_eq!(transposed_canvas(&solo, &[fix]), Some((360, 640)));
+
+        // An audio bed has no dimensions and could never have set the canvas.
+        let mut audio = video_media("m2");
+        audio["kind"] = Value::from("audio");
+        let scored = canvas_project(
+            serde_json::json!([sized_media("m1", "video", 640, 360), audio]),
+            (640, 360),
+        );
+        assert_eq!(transposed_canvas(&scored, &[fix]), Some((360, 640)));
+
+        // A second visual media could have: a title card sized against this
+        // canvas would be moved by turning it.
+        let titled = canvas_project(
+            serde_json::json!([
+                sized_media("m1", "video", 640, 360),
+                sized_media("m2", "image", 640, 360)
+            ]),
+            (640, 360),
+        );
+        assert_eq!(transposed_canvas(&titled, &[fix]), None);
+
+        // A canvas that is not the clip's stale dimensions was not adopted from
+        // it — it is the user's own framing, and the clip letterboxes inside it.
+        let framed = canvas_project(serde_json::json!([sized_media("m1", "video", 640, 360)]), (1920, 1080));
+        assert_eq!(transposed_canvas(&framed, &[fix]), None);
+
+        // Nothing corrected → nothing for the canvas to follow.
+        assert_eq!(transposed_canvas(&solo, &[]), None);
+
+        // Two corrections is by definition not a lone clip.
+        let second = DimFix { index: 1, from: (640, 360), to: (360, 640) };
+        assert_eq!(transposed_canvas(&solo, &[fix, second]), None);
+    }
+
     #[test]
     fn now_iso8601_is_well_formed() {
         let s = now_iso8601();
@@ -1416,7 +2007,7 @@ mod tests {
     /// Parse a raw project JSON `Value` into a typed `ProjectFile` for testing
     /// `first_clip_media` directly (no files on disk, no identity checks).
     fn typed_project(v: Value) -> ProjectFile {
-        serde_json::from_value(schema::migrate(v).unwrap()).unwrap()
+        serde_json::from_value(schema::migrate(v).unwrap().value).unwrap()
     }
 
     /// A file-backed video `MediaRef` JSON with the given id, sized 10 bytes.
