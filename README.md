@@ -15,7 +15,9 @@ Taroting launches in a fraction of a second, stays out of your way, and does the
 **Editing**
 - Frame-accurate timeline: cut, trim, split, move, and ripple-delete clips
 - Snap-to-cut, frame stepping, and playhead seeking
+- Resizable timeline panel — drag the divider above the transport; the height persists
 - Unlimited undo/redo, autosave, and portable `.trt` project files (plain JSON — your original media is never modified)
+- Home screen project management: rename, duplicate, delete, multi-select, sort
 
 **Layers, keyframes, and markers**
 - Unlimited video layers with z-stacked compositing
@@ -26,8 +28,13 @@ Taroting launches in a fraction of a second, stays out of your way, and does the
 - Move, scale, and crop clips directly on the preview canvas: drag to move, corner handles to scale, double-click for Google-Slides-style crop mode
 - Fit / fill / center helpers and snap guides for alignment
 
+**Playback & appearance**
+- Fullscreen theater playback with auto-hiding controls
+- Monitor volume for preview listening — never baked into clips or exports
+- Three built-in looks plus fully custom theme colours (Settings → Appearance), used exactly as picked
+
 **Generators**
-- Text and solid-color generated media, placed like any other clip
+- Text (at any size) and solid-color generated media, placed like any other clip
 
 **Export**
 - MP4 / MOV / WebM / AVI / GIF containers
@@ -40,6 +47,7 @@ Taroting launches in a fraction of a second, stays out of your way, and does the
 
 **OS integration**
 - `.trt` files open on double-click; "Open with Taroting" on media files
+- Quick view (optional, in Settings): opening a media file from Explorer builds a temporary project you can keep or discard on exit
 - Single-instance: opening a file focuses the already-running app
 - Bin-first import — dropped media lands in the bin, then drag to the timeline or double-click to place at the playhead
 - Right-click menus on clips, media, and home-screen project cards
