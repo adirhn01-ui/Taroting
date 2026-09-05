@@ -21,9 +21,11 @@ second time. Free and open source, as always.
 
   What changed: Taroting now samples the screen itself. Clicking the eyedropper
   takes a snapshot of every monitor, then puts an invisible layer over the
-  screen with a crosshair cursor. As you move, **the whole app previews the
-  colour under the cursor live** — you see your theme in that colour before you
-  commit to it. Click to pick; Escape or right-click to cancel and put the
+  screen with a crosshair cursor and a **magnifier loupe** beside it — the
+  pixels around the cursor blown up into a grid, the exact pixel a click will
+  take outlined, and its hex value shown. As you move, **the whole app previews
+  the colour under the cursor live** — you see your theme in that colour before
+  you commit to it. Click to pick; Escape or right-click to cancel and put the
   previous colour back exactly. Multiple monitors and monitors positioned left
   of or above the main one are handled; the snapshot is taken before the layer
   appears, so the picker can never sample itself.
