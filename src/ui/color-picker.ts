@@ -25,8 +25,10 @@
 // src/settings/settings.ts.
 
 import { escapeHtml } from "../core/format";
+import { describeError, ipc, onScreenPickHover } from "../core/ipc";
 import { normalizeHexColor } from "../core/session";
 import { trapTab } from "./focus";
+import { toast } from "./toast";
 
 /* ---------------- colour maths (HSV — the picker's own model) ---------------- */
 
@@ -83,7 +85,41 @@ type EyeDropperCtor = new () => EyeDropperInstance;
 /** Feature detection, not a version guess: WebView2 ships the EyeDropper API,
  *  but the button is HIDDEN ENTIRELY where it does not exist rather than
  *  offered as a control that does nothing. */
+/** Proven, this session, that the platform cannot actually PRESENT the
+ *  eyedropper — the constructor exists and `open()` is permitted, and the pick
+ *  is then refused as a "cancel" before any human could have cancelled it. Held
+ *  in the module rather than in settings: it is a fact about the webview, not a
+ *  preference, and a webview update may make it false again, so the next launch
+ *  is free to try once more. */
+let eyeDropperUnusable = false;
+
+/** The native screen pick reported that this platform has no picker. Held in
+ *  the module: a fact about the build, not about any one popover, so the next
+ *  click takes the web fallback directly instead of paying an IPC round trip to
+ *  be told again. */
+let nativePickUnsupported = false;
+
+/** Shortest a REAL cancel can take. The overlay has to be presented, seen, and
+ *  dismissed; no one does that in a third of a second. A rejection faster than
+ *  this did not come from the user, whatever it calls itself. 300 rather than
+ *  200 because the same refusal, measured in the sibling app on a focused
+ *  visible window, has taken "a few hundred milliseconds" to arrive. */
+const EYEDROPPER_NO_SHOW_MS = 300;
+
+/**
+ * Did the platform REFUSE to run the eyedropper, or did the user cancel it?
+ *
+ * Both arrive as a rejection and, in this app's webview, both are literally
+ * named "AbortError :: The user canceled the selection" — so only the clock
+ * separates them. A refusal comes back before the overlay could have been
+ * drawn; a cancel needs a person to look at it first.
+ */
+export function eyeDropperRefused(errName: string, elapsedMs: number): boolean {
+  return errName !== "AbortError" || elapsedMs < EYEDROPPER_NO_SHOW_MS;
+}
+
 function eyeDropperCtor(): EyeDropperCtor | null {
+  if (eyeDropperUnusable) return null;
   return "EyeDropper" in window
     ? (window as unknown as { EyeDropper: EyeDropperCtor }).EyeDropper
     : null;
@@ -202,8 +238,10 @@ export function openColorPicker(opts: ColorPickerOptions): ColorPickerHandle {
 
   // A dead control is worse than a missing one — drop it from the DOM (and out
   // of the Tab ring) where the webview has no EyeDropper.
+  // Native pick first; the web API is only the fallback. The control is dropped
+  // only from a build that has neither.
   const EyeDropper = eyeDropperCtor();
-  if (!EyeDropper) eyedropper.remove();
+  if (nativePickUnsupported && !EyeDropper) eyedropper.remove();
 
   for (const raw of opts.presets ?? PRESETS) {
     // Normalized even though every caller passes a module-local literal: this is
@@ -401,35 +439,132 @@ export function openColorPicker(opts: ColorPickerOptions): ColorPickerHandle {
   hex.addEventListener("blur", () => paint(true));
 
   /* ---------------- screen eyedropper ---------------- */
+  //
+  // NATIVE FIRST. The app samples the screen itself (src-tauri/src/screen_pick.rs:
+  // a transparent topmost overlay over a frame captured before it appears, the
+  // pixel under the cursor). The web EyeDropper API is only the fallback for a
+  // platform where that native pick is not built.
+  //
+  // Why: WebView2 runtime 152 (Sept 2026) stopped presenting the web API's
+  // overlay — open() rejects in under a millisecond as "The user canceled the
+  // selection", no widget is ever created in the browser process, and no flag
+  // restores it. The runtime now updates every two weeks. A control that an
+  // engine update can silently take away is not one the app can offer, so the
+  // pick no longer depends on the engine at all.
+  //
+  // The popover stays open for the whole pick: the overlay takes the clicks, so
+  // the outside-pointerdown dismiss never fires, and the popover is deliberately
+  // not dismissed on window blur. Hover colours are PREVIEWED live — the whole
+  // app recolours under the cursor — and only the click commits.
+  let picking = false;
 
-  if (EyeDropper) {
-    eyedropper.addEventListener("click", () => {
-      // Requires transient user activation, hence a click. Escape rejects the
-      // promise — a cancelled pick is a normal outcome, not an error, and must
-      // not reach the console.
-      void new EyeDropper()
-        .open()
-        .then((res) => {
-          // The pick can take as long as the user likes, and everything can
-          // change underneath it: Done, Escape, a click outside, a scroll, or
-          // another picker opening on a different colour. `handle` is this
-          // popover's own identity, so this covers both — a closed picker and a
-          // superseded one. Without it a dead popover still repaints the app's
-          // CSS variables and persists a colour for a screen that is gone.
-          if (active !== handle) return;
-          const picked = normalizeHexColor(res.sRGBHex, "");
-          if (picked === "") return; // never trust the value, even from the platform
-          setHex(picked);
-          paint(true);
-          preview();
-          commit();
-        })
-        .catch(() => {
-          /* cancelled */
-        });
+  async function nativePick(): Promise<void> {
+    if (picking) return;
+    picking = true;
+    let unlisten: (() => void) | null = null;
+    try {
+      unlisten = await onScreenPickHover((hex) => {
+        if (active !== handle) return; // popover gone: nothing to preview into
+        opts.onPreview(hex);
+      });
+      const picked = await ipc.screenPickColor();
+      if (active !== handle) {
+        if (picked !== null) discarded(picked);
+        return;
+      }
+      // A cancel leaves the colour exactly as it was — but the hover previews
+      // have been repainting the app, so the current value must be re-asserted.
+      const norm = picked === null ? "" : normalizeHexColor(picked, "");
+      if (norm === "") {
+        preview();
+        return;
+      }
+      setHex(norm);
+      paint(true);
+      preview();
+      commit();
+    } catch (err) {
+      if (describeError(err).includes("not available on this platform")) {
+        nativePickUnsupported = true;
+        webPick();
+        return;
+      }
+      preview();
+      toast.error("Couldn't pick a color from the screen.", {
+        detail: describeError(err),
+        op: "Color picker",
+        title: "Screen color picker",
+      });
+    } finally {
+      unlisten?.();
+      picking = false;
+    }
+  }
+
+  /** The pick SUCCEEDED and there is nowhere to put it: this popover closed
+   *  while the pick was up (Escape, a resize, a scroll — all reachable while
+   *  the user is off choosing a colour). Dropping it without a word is how a
+   *  working eyedropper reads as a broken button, so say what was lost. */
+  function discarded(hex: string): void {
+    toast.error("The color you picked was discarded.", {
+      detail:
+        `The picker had already closed when the pick came back, so ${hex} was ` +
+        `not applied. Reopen the picker and try again, or paste the value into ` +
+        `the hex field.`,
+      op: "Color picker",
+      title: "Screen color picker",
     });
   }
 
+  /** Fallback: the web EyeDropper API, for a platform with no native pick.
+   *  Its rejection is genuinely ambiguous (a refusal and a cancel share a
+   *  name), so `eyeDropperRefused` reads the clock — see the note above it. */
+  function webPick(): void {
+    if (!EyeDropper) return;
+    const openedAt = performance.now();
+    void new EyeDropper()
+      .open()
+      .then((res) => {
+        if (active !== handle) {
+          discarded(res.sRGBHex);
+          return;
+        }
+        const picked = normalizeHexColor(res.sRGBHex, "");
+        if (picked === "") return; // never trust the value, even from the platform
+        setHex(picked);
+        paint(true);
+        preview();
+        commit();
+      })
+      .catch((err: unknown) => {
+        const elapsed = performance.now() - openedAt;
+        const name =
+          err !== null && typeof err === "object" && "name" in err
+            ? String((err as { name: unknown }).name)
+            : "";
+        if (!eyeDropperRefused(name, elapsed)) return; // the user's own choice
+        // It cannot run here either. Say so once, then take the control away
+        // rather than leave a button that does nothing.
+        eyeDropperUnusable = true;
+        eyedropper.remove();
+        toast.error("This build can't open the screen color picker.", {
+          detail:
+            `The webview refused to present the eyedropper after ` +
+            `${Math.round(elapsed)}ms: ${describeError(err)}\n\n` +
+            `Pick colors with the hex field or the presets instead.`,
+          op: "Color picker",
+          title: "Screen color picker",
+        });
+      });
+  }
+
+  eyedropper.addEventListener("click", () => {
+    if (nativePickUnsupported) {
+      webPick();
+      return;
+    }
+    void nativePick();
+  });
   /* ---------------- reset / done ---------------- */
 
   q<HTMLButtonElement>(".cp__reset").addEventListener("click", () => {

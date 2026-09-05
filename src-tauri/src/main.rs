@@ -11,6 +11,7 @@ mod media;
 mod os;
 mod paths;
 mod project;
+mod screen_pick;
 mod settings;
 
 use std::sync::Arc;
@@ -191,6 +192,7 @@ fn main() {
             debug::debug_write_report,
             os::take_pending_open_paths,
             os::uninstall_app,
+            screen_pick::screen_pick_color,
         ]);
 
     // Autotest only: the `window.__tarotingAutotest` init script. Not registered

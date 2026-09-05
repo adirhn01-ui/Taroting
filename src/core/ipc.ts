@@ -249,6 +249,12 @@ export const ipc = {
   takePendingOpenPaths: () =>
     call<string[]>("take_pending_open_paths", undefined, () => []),
   uninstallApp: () => call<void>("uninstall_app"),
+  /** Native screen colour pick (see src-tauri/src/screen_pick.rs). Resolves
+   *  to lowercase "#rrggbb" on a click, `null` when the user cancelled. Rejects
+   *  while a pick is already running, and on a platform with no native picker
+   *  ("not available on this platform" — the picker matches that phrase to
+   *  fall back to the web EyeDropper API). */
+  screenPickColor: () => call<string | null>("screen_pick_color"),
 
   /* diagnostics — all three are on-demand only; nothing is buffered, probed
    * or written unless the user asked for a report. */
@@ -327,6 +333,16 @@ export async function onOpenPath(cb: () => void): Promise<() => void> {
   if (!inTauri) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
   return listen("open-path", () => cb());
+}
+
+/** Subscribe to the colour under the cursor while a native screen pick is
+ *  running (`ipc.screenPickColor`). Throttled backend-side to ~60 Hz and only
+ *  on change, so previewing on every event is cheap. Returns an unlisten
+ *  function; the caller unsubscribes when the pick settles. */
+export async function onScreenPickHover(cb: (hex: string) => void): Promise<() => void> {
+  if (!inTauri) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ hex: string }>("screen-pick-hover", (e) => cb(e.payload.hex));
 }
 
 /** URL that the webview can load for a local media/cache file. */
