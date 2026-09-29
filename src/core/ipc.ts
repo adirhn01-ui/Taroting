@@ -460,16 +460,6 @@ export function mediaUrl(path: string): string {
 
 /* ---------------- dialogs ---------------- */
 
-export async function pickProjectFile(): Promise<string | null> {
-  if (!inTauri) return null;
-  const { open } = await import("@tauri-apps/plugin-dialog");
-  const result = await open({
-    multiple: false,
-    filters: [{ name: "Taroting project", extensions: ["trt"] }],
-  });
-  return typeof result === "string" ? result : null;
-}
-
 /** Home's Open picker: a project or a media file, one filter. */
 export async function pickOpenFile(): Promise<string | null> {
   if (!inTauri) return null;

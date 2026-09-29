@@ -46,13 +46,12 @@ Taroting launches in a fraction of a second, stays out of your way, and does the
 - Volume, mute, fade in/out, normalize, detach/restore, waveforms
 
 **OS integration**
-- `.trt` files open on double-click; "Open with Taroting" on media files
-- Quick view (optional, in Settings): opening a media file from Explorer builds a temporary project you can keep or discard on exit
+- `.trt` files open on double-click; media files opened from Explorer show in a lightweight viewer (the arrows move through the folder in name order) or, if you prefer, open straight into a temporary project — choose in Settings
 - Single-instance: opening a file focuses the already-running app
 - Bin-first import — dropped media lands in the bin, then drag to the timeline or double-click to place at the playhead
 - Right-click menus on clips, media, and home-screen project cards
 
-**Import formats:** MP4, MOV, MKV, AVI, WebM, GIF, MP3, WAV, FLAC, AAC, and PNG/JPEG. Drag and drop anywhere.
+**Import formats:** MP4, M4V, MOV, MKV, AVI, WebM, WMV, MTS/M2TS, 3GP, MPG/MPEG, GIF, MP3, WAV, FLAC, AAC, M4A, OGG, and PNG/JPEG/WebP/BMP. Drag and drop anywhere.
 
 ## Screenshots
 

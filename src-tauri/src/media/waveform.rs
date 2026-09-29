@@ -155,8 +155,9 @@ fn extract(
     write_pk(dst, &pairs)
 }
 
+/// Field names: see `PlaybackPlan` (media/playability.rs).
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase", tag = "state")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "state")]
 pub enum WaveformResult {
     Ready { path: String },
     Pending { job_id: JobId, output: String },

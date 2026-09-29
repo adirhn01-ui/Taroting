@@ -264,8 +264,12 @@ pub(crate) fn job_tmp_suffix(suffix: &str, id: JobId) -> String {
     format!("{suffix}.{id}.tmp")
 }
 
+/// `rename_all` on an enum renames only the VARIANT tags; the fields inside a
+/// struct variant need `rename_all_fields`, or `job_id` reaches the webview as
+/// `job_id` while it reads `jobId` — and every job it started was registered
+/// under `undefined`, so no progress/done/failed event ever matched it.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase", tag = "mode")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "mode")]
 pub enum PlaybackPlan {
     /// Play the original file directly.
     Direct { path: String },
@@ -422,6 +426,41 @@ pub fn plan_playback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The webview reads these by their camelCase names (src/core/ipc.ts
+    /// `PlaybackPlan`, `WaveformResult`, `FilmstripResult`). Pinned on the
+    /// WIRE: no Rust type check can see a field the JS side reads as
+    /// `undefined`, and that is exactly how every editor job went unheard.
+    #[test]
+    fn job_results_reach_the_webview_in_camel_case() {
+        use serde_json::json;
+        let wire = |v: serde_json::Result<serde_json::Value>| v.expect("serializes");
+        assert_eq!(
+            wire(serde_json::to_value(PlaybackPlan::Pending { job_id: 7, output: "o".into() })),
+            json!({ "mode": "pending", "jobId": 7, "output": "o" })
+        );
+        assert_eq!(
+            wire(serde_json::to_value(crate::media::waveform::WaveformResult::Pending {
+                job_id: 8,
+                output: "w".into()
+            })),
+            json!({ "state": "pending", "jobId": 8, "output": "w" })
+        );
+        assert_eq!(
+            wire(serde_json::to_value(crate::media::thumbs::FilmstripResult::Pending {
+                job_id: 9,
+                dir: "d".into()
+            })),
+            json!({ "state": "pending", "jobId": 9, "dir": "d" })
+        );
+        assert_eq!(
+            wire(serde_json::to_value(crate::media::thumbs::FilmstripResult::Ready {
+                dir: "d".into(),
+                frame_count: 3
+            })),
+            json!({ "state": "ready", "dir": "d", "frameCount": 3 })
+        );
+    }
 
     fn media(kind: &str, path: &str) -> MediaRef {
         MediaRef {

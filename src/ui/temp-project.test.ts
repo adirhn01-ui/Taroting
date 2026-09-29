@@ -3,6 +3,7 @@ import { ipc } from "../core/ipc";
 import { createProject } from "../core/project";
 import { ProjectSession } from "../core/session";
 import {
+  createTempExits,
   createTempLeaveGateWith,
   discardTempSession,
   keepTempSession,
@@ -32,7 +33,8 @@ vi.mock("./toast", () => ({ toast: { error: vi.fn(), info: vi.fn() } }));
  * kept path are in different folders under different names, and neither is
  * derived from the project name, so an assertion that one path was used can
  * never pass because the other happened to be spelled the same. */
-const TEMP_PATH = "C:\\Users\\adirh\\AppData\\Local\\Taroting\\tmp-projects\\holiday-in-crete.trt";
+const TEMP_DIR = "C:\\Users\\adirh\\AppData\\Local\\Taroting\\tmp-projects";
+const TEMP_PATH = `${TEMP_DIR}\\holiday-in-crete.trt`;
 const KEPT_PATH = "C:\\Users\\adirh\\Documents\\Taroting\\Ferry day 2.trt";
 const PROJECT_NAME = "Ferry day";
 
@@ -127,6 +129,9 @@ beforeEach(() => {
   vi.spyOn(ipc, "deleteProject").mockImplementation(async (path: string) => {
     order.push(`deleteProject:${path}`);
   });
+  // discardTempSession deletes only inside this dir (open-media caches the
+  // first answer for the run, so every test must give the same one).
+  vi.spyOn(ipc, "tempProjectsDir").mockResolvedValue(TEMP_DIR);
 });
 
 afterEach(() => {
@@ -381,6 +386,21 @@ describe("discardTempSession / keepTempSession", () => {
     expect(order).toEqual(["discard", `deleteProject:${TEMP_PATH}`]);
   });
 
+  it("discard after a Keep relocated the session into the library never deletes the kept file", async () => {
+    // A Keep (the badge's, or a gate's) racing a close-time discard: by the
+    // time the discard runs, session.path is the library file. Deleting it
+    // would undo the Keep and lose the project.
+    const s = tempSession();
+    fakeRelocate(s);
+    await keepTempSession(s);
+    expect(s.path).toBe(KEPT_PATH);
+    const discard = vi.spyOn(s, "discard");
+    order = [];
+    await discardTempSession(s);
+    expect(discard).toHaveBeenCalledTimes(1);
+    expect(order).toEqual([]);
+  });
+
   it("discard never throws when the delete fails (the startup sweep catches the file)", async () => {
     const s = tempSession();
     vi.mocked(ipc.deleteProject).mockRejectedValueOnce(new Error("sharing violation"));
@@ -411,5 +431,162 @@ describe("discardTempSession / keepTempSession", () => {
     vi.mocked(ipc.deleteProject).mockRejectedValueOnce(new Error("sharing violation"));
     await expect(keepTempSession(s)).resolves.toBe(KEPT_PATH);
     expect(s.temp.get()).toBe(false);
+  });
+});
+
+/**
+ * Keep WITHOUT leaving — the editor's Temporary badge — shares one latch with
+ * the leave gate. The failure it exists to prevent: Back (or an OS open, or the
+ * window close) landing while the badge's Keep is still relocating reaches an
+ * idle gate on a still-temp session, prompts again, and a second Keep then
+ * relocates from where the first already moved autosave — deleting the FIRST
+ * kept file as its "scratch" file.
+ */
+describe("createTempExits — in-place Keep behind the leave gate", () => {
+  beforeEach(() => {
+    vi.mocked(toast.info).mockClear();
+  });
+
+  /** relocate() that moves the path only when the test says so. */
+  function heldRelocate(s: ProjectSession, fail?: Error): () => void {
+    let release: () => void = () => {};
+    vi.spyOn(s, "relocate").mockImplementation(async (dest: string) => {
+      order.push(`relocate:${dest}`);
+      await new Promise<void>((r) => {
+        release = r;
+      });
+      if (fail) throw fail;
+      (s as unknown as { _path: string })._path = dest;
+    });
+    return () => release();
+  }
+
+  it("Back during a badge Keep waits for it, then leaves WITHOUT a prompt; one Keep, the kept file survives", async () => {
+    const s = tempSession();
+    const release = heldRelocate(s);
+    const d = deferredAsk();
+    const exits = createTempExits(s, createTempLeaveGateWith(s, d.ask));
+    const kept = exits.keep();
+    await settle();
+    // the Keep is mid-relocate: still temp, nothing deleted yet
+    expect(s.temp.get()).toBe(true);
+    const back = outcome();
+    exits.confirmLeave(back.dest, back.cancel);
+    await settle();
+    expect([back.dests, back.cancels]).toEqual([0, 0]);
+    expect(d.calls()).toBe(0);
+    release();
+    await expect(kept).resolves.toBe("kept");
+    await settle();
+    expect([back.dests, back.cancels]).toEqual([1, 0]);
+    expect(d.calls()).toBe(0);
+    expect(order).toEqual([
+      `newProjectPath:${PROJECT_NAME}`,
+      `relocate:${KEPT_PATH}`,
+      `deleteProject:${TEMP_PATH}`,
+    ]);
+    expect(s.path).toBe(KEPT_PATH);
+    expect(toast.info).toHaveBeenCalledWith("Kept in your library.");
+  });
+
+  it("an OS open / window close (confirm) during a badge Keep resolves true once it lands", async () => {
+    const s = tempSession();
+    const release = heldRelocate(s);
+    const d = deferredAsk();
+    const exits = createTempExits(s, createTempLeaveGateWith(s, d.ask));
+    void exits.keep();
+    await settle();
+    let answer: boolean | null = null;
+    void exits.confirm().then((v) => {
+      answer = v;
+    });
+    await settle();
+    expect(answer).toBeNull();
+    release();
+    await settle();
+    expect(answer).toBe(true);
+    expect(d.calls()).toBe(0);
+  });
+
+  it("a second click while a Keep runs is ignored: one path asked for, one relocate", async () => {
+    const s = tempSession();
+    const release = heldRelocate(s);
+    const exits = createTempExits(s, createTempLeaveGateWith(s, deferredAsk().ask));
+    const first = exits.keep();
+    await settle();
+    await expect(exits.keep()).resolves.toBe("ignored");
+    release();
+    await expect(first).resolves.toBe("kept");
+    expect(order.filter((e) => e.startsWith("relocate:"))).toHaveLength(1);
+    expect(order.filter((e) => e.startsWith("newProjectPath:"))).toHaveLength(1);
+  });
+
+  it("the badge does nothing while the leave prompt is open", async () => {
+    const s = tempSession();
+    const d = deferredAsk();
+    const exits = createTempExits(s, createTempLeaveGateWith(s, d.ask));
+    const back = outcome();
+    exits.confirmLeave(back.dest, back.cancel);
+    expect(d.calls()).toBe(1);
+    await expect(exits.keep()).resolves.toBe("ignored");
+    expect(order).toEqual([]);
+    d.answer("cancel");
+    await settle();
+    expect([back.dests, back.cancels]).toEqual([0, 1]);
+  });
+
+  it("a kept (permanent) project ignores the badge", async () => {
+    const s = new ProjectSession(KEPT_PATH, createProject(PROJECT_NAME));
+    sessions.push(s);
+    const exits = createTempExits(s, createTempLeaveGateWith(s, deferredAsk().ask));
+    await expect(exits.keep()).resolves.toBe("ignored");
+    expect(order).toEqual([]);
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  it("a failed Keep toasts its own wording, stays temp, and the next exit asks as usual", async () => {
+    const s = tempSession();
+    const release = heldRelocate(s, new Error("access denied"));
+    const d = deferredAsk();
+    const exits = createTempExits(s, createTempLeaveGateWith(s, d.ask));
+    const kept = exits.keep();
+    await settle();
+    const back = outcome();
+    exits.confirmLeave(back.dest, back.cancel);
+    release();
+    await expect(kept).resolves.toBe("failed");
+    await settle();
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    const msg = vi.mocked(toast.error).mock.calls[0]![0];
+    expect(msg.startsWith("Couldn't keep this project: ")).toBe(true);
+    expect(msg).toContain("access denied");
+    expect(toast.info).not.toHaveBeenCalled();
+    expect(s.temp.get()).toBe(true);
+    expect(s.path).toBe(TEMP_PATH);
+    expect(order.some((e) => e.startsWith("deleteProject:"))).toBe(false);
+    // the waiting Back now reaches the gate, which prompts (still temp)
+    expect(d.calls()).toBe(1);
+    expect([back.dests, back.cancels]).toEqual([0, 0]);
+    d.answer("cancel");
+    await settle();
+    expect([back.dests, back.cancels]).toEqual([0, 1]);
+    // and the badge works again
+    heldRelocate(s);
+    void exits.keep();
+    await settle();
+    expect(order.filter((e) => e.startsWith("relocate:"))).toHaveLength(2);
+  });
+
+  it("a toast that throws neither rejects the Keep nor strands the latch", async () => {
+    const s = tempSession();
+    fakeRelocate(s);
+    vi.mocked(toast.info).mockImplementationOnce(() => {
+      throw new Error("no DOM");
+    });
+    const exits = createTempExits(s, createTempLeaveGateWith(s, deferredAsk().ask));
+    await expect(exits.keep()).resolves.toBe("kept");
+    const back = outcome();
+    exits.confirmLeave(back.dest, back.cancel);
+    expect([back.dests, back.cancels]).toEqual([1, 0]);
   });
 });

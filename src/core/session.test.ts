@@ -203,6 +203,54 @@ describe("sanitizeSettings", () => {
   });
 });
 
+/* ---------------- openWith: the 0.8 → 0.9 migration ----------------
+ *
+ * 0.8 stored a boolean `tempOpenWith` ("Quick view from File Explorer"). 0.9
+ * replaces it with `openWith`, and the old key is read once as a hint: true
+ * meant "open as a temporary project", which is the editor; anything else —
+ * off, absent, garbage — lands in the viewer, the new default. A valid new key
+ * always wins, and the old key is never written back. */
+describe("sanitizeSettings openWith migration", () => {
+  it("defaults a fresh install to the viewer", () => {
+    expect(DEFAULT_SETTINGS.openWith).toBe("viewer");
+  });
+
+  it.each([
+    ["legacy on", { tempOpenWith: true }, "editor"],
+    ["legacy off", { tempOpenWith: false }, "viewer"],
+    ["nothing stored", {}, "viewer"],
+    // Both keys present and DISAGREEING, in both directions, so a sanitizer that
+    // preferred the legacy key over the new one fails one of these two rows.
+    ["new key wins over legacy off", { openWith: "editor", tempOpenWith: false }, "editor"],
+    ["new key wins over legacy on", { openWith: "viewer", tempOpenWith: true }, "viewer"],
+    // Strict `=== true`: a hand-edited string is not the boolean 0.8 wrote.
+    ["legacy string is not true", { tempOpenWith: "true" }, "viewer"],
+    ["legacy 1 is not true", { tempOpenWith: 1 }, "viewer"],
+  ])("%s", (_name, raw, expected) => {
+    expect(sanitizeSettings(raw).openWith).toBe(expected);
+  });
+
+  // Every junk value is run TWICE — once beside a legacy `true`, once alone.
+  // Only then is "falls back via the legacy rule" proven: a sanitizer that
+  // mapped junk straight to a hardcoded "viewer" would pass the lone half and
+  // fail the other, and one that mapped it to "editor" would fail the lone half.
+  const junk: unknown[] = ["Viewer", "EDITOR", 1, null, ["editor"], "quick", { editor: true }, ""];
+  it.each(junk.map((v) => [JSON.stringify(v), v]))(
+    "junk openWith %s falls back to the legacy rule",
+    (_name, value) => {
+      expect(sanitizeSettings({ openWith: value, tempOpenWith: true }).openWith).toBe("editor");
+      expect(sanitizeSettings({ openWith: value }).openWith).toBe("viewer");
+    },
+  );
+
+  it("reads the legacy key but never writes it back", () => {
+    const s = sanitizeSettings({ tempOpenWith: true });
+    expect(s.openWith).toBe("editor");
+    expect("tempOpenWith" in s).toBe(false);
+    expect(Object.keys(s).sort()).toEqual(Object.keys(DEFAULT_SETTINGS).sort());
+  });
+});
+
 /* ---------------- custom theme colours ---------------- */
 
 const HEX6 = /^#[0-9a-f]{6}$/;

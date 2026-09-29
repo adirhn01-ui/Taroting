@@ -322,4 +322,91 @@ if (big) {
   ]);
 }
 
+/* --- viewer folder: one folder the viewer steps through (src/dev/autotest-viewer.ts).
+   Every media file has its OWN pixel size, so a block that reads the rendered
+   element's natural size knows exactly which file is on screen — a stepper
+   that skipped or repeated one cannot land on a matching number. The names
+   pin natural order (clip2 < clip10), case-insensitivity (Clip11, IMG_7.JPG)
+   and a space in a name; the last five entries must NEVER be stepped onto.
+   Visual family in Explorer's order: clip2, clip10, Clip11, d, IMG_7, phone,
+   w, z still (8). Audio family: a1, a2 (2). All tiny (< 200 KB together). */
+const viewerDir = path.join(outDir, "viewer");
+fs.mkdirSync(viewerDir, { recursive: true });
+const vw = (name) => `viewer/${name}`;
+// H.264 + AAC in MP4: plays directly. The only viewer file with an audio track
+// in the visual family besides Clip11, so the autotest mute has something to mute.
+run(vw("clip2.mp4"), [
+  "-f", "lavfi", "-i", "testsrc2=size=96x54:rate=30:duration=1",
+  "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+  "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+  "-c:a", "aac", "-shortest",
+]);
+run(vw("clip10.mp4"), [
+  "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=30:duration=1",
+  "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+]);
+// The same codecs in a QuickTime container: classify says containerOnly, so
+// the viewer tries it directly first. Whether WebView2 plays it that way or
+// falls back to a remux is recorded by the viewer-natural-order block.
+run(vw("Clip11.mov"), [
+  "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30:duration=1",
+  "-f", "lavfi", "-i", "sine=frequency=523:duration=1",
+  "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+  "-c:a", "aac", "-shortest", "-f", "mov",
+]);
+run(vw("d.gif"), ["-f", "lavfi", "-i", "testsrc2=size=48x32:rate=12:duration=1"]);
+// Upper-case extension on purpose; the muxer and codec are named because
+// nothing should hang on ffmpeg matching ".JPG" by itself.
+run(vw("IMG_7.JPG"), [
+  "-f", "lavfi", "-i", "testsrc2=size=200x150", "-frames:v", "1",
+  "-f", "image2", "-c:v", "mjpeg",
+]);
+// A portrait phone clip in miniature: CODED 80x44, display matrix 90°. The
+// webview shows it upright, so its <video> natural size is portrait.
+const phone = path.join(viewerDir, "phone.mp4");
+if (!fs.existsSync(phone)) {
+  console.log("create viewer/phone.mp4");
+  // The intermediate lives OUTSIDE viewer/: a run that dies between the two
+  // calls would otherwise leave a ninth playable clip in the folder, and every
+  // counter the viewer blocks assert would be off by one.
+  const plain = path.join(outDir, "viewer-phone.plain.mp4");
+  execFileSync(ffmpeg, [
+    "-y", "-hide_banner", "-loglevel", "error",
+    "-f", "lavfi", "-i", "testsrc2=size=80x44:rate=30:duration=1",
+    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", plain,
+  ]);
+  execFileSync(ffmpeg, [
+    "-y", "-hide_banner", "-loglevel", "error",
+    "-display_rotation", "90", "-i", plain, "-c", "copy", phone,
+  ]);
+  fs.rmSync(plain);
+}
+// WMV2 has no web decoder: the proxy class, i.e. the "Prepare preview" button.
+run(vw("w.wmv"), [
+  "-f", "lavfi", "-i", "testsrc2=size=64x36:rate=30:duration=1",
+  "-c:v", "wmv2",
+]);
+// Smaller than any stage, so object-fit: scale-down leaves it at 30x20.
+run(vw("z still.png"), ["-f", "lavfi", "-i", "testsrc2=size=30x20", "-frames:v", "1"]);
+// Different durations, so a block can tell which of the two is loaded.
+run(vw("a1.mp3"), ["-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-c:a", "libmp3lame", "-q:a", "4"]);
+run(vw("a2.wav"), ["-f", "lavfi", "-i", "sine=frequency=349:duration=2", "-ar", "8000", "-c:a", "pcm_s16le"]);
+// Everything below must be skipped by the sibling listing.
+const notes = path.join(viewerDir, "notes.txt");
+if (!fs.existsSync(notes)) fs.writeFileSync(notes, "not media\n");
+const appleDouble = path.join(viewerDir, "._clip2.mp4");
+if (!fs.existsSync(appleDouble)) fs.writeFileSync(appleDouble, Buffer.alloc(16, 0x5a));
+fs.mkdirSync(path.join(viewerDir, "sub.mp4"), { recursive: true });
+// A real, playable clip that only the Hidden attribute keeps out of the list —
+// so a listing that ignored the attribute would step onto it and play it.
+const hidden = path.join(viewerDir, "hidden.mp4");
+if (!fs.existsSync(hidden)) {
+  console.log("create viewer/hidden.mp4 (+h)");
+  fs.copyFileSync(path.join(viewerDir, "clip2.mp4"), hidden);
+}
+// Every run, not only on creation: a copied or restored fixture folder can
+// lose the attribute, and then every viewer counter reads "/ 9". Setting it
+// on a file that already has it is a no-op.
+if (process.platform === "win32") execFileSync("attrib", ["+h", hidden]);
+
 console.log("fixtures ready at", outDir);

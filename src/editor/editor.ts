@@ -29,6 +29,7 @@ import {
   updateClip,
   videoTracks,
 } from "../core/project";
+import { registerCloseTask } from "../core/app-close";
 import { ProjectSession, currentSession, settingsStore, updateSettings } from "../core/session";
 import { ShortcutManager } from "../core/shortcuts";
 import { Store } from "../core/store";
@@ -54,9 +55,22 @@ import { collectCandidates, snapTime } from "./timeline/snap";
 import { laneLabels, laneLayout } from "./timeline/render";
 import { createLaneAutoScroll, type LaneAutoScroller } from "./timeline/interactions";
 import { trapTab } from "../ui/focus";
-import { createTempLeaveGate } from "../ui/temp-project";
+import { createTempExits, createTempLeaveGate } from "../ui/temp-project";
 import { PREVIEW_MIN_H, clampPanelHeight, maxPanelHeight } from "./timeline/panel-size";
 import { TimelineController } from "./timeline/timeline";
+
+/**
+ * Where every exit from this editor lands: Back/Ctrl+W, the keep/discard
+ * outcomes, and a failed load. An editor opened from the viewer ("Open as
+ * project") goes back to the viewer on the same file; everything else goes
+ * home. One function, so no exit can honour `returnTo` while another forgets it
+ * (the guard-applied-to-three-of-four-exits shape this repo keeps finding). The
+ * gear is deliberately NOT an exit here: it goes to Settings, whose Back goes
+ * home.
+ */
+export function exitDest(route: EditorRoute): Route {
+  return route.returnTo ? { view: "viewer", path: route.returnTo } : { view: "home" };
+}
 
 /**
  * Mount the editor for `route` into `root`.
@@ -77,10 +91,6 @@ export async function mountEditor(
   isStale: () => boolean,
 ): Promise<{ dispose(): Promise<void> }> {
   const noop = { dispose: async (): Promise<void> => {} };
-  // Where every exit from this editor lands: Back/Ctrl+W, the keep/discard
-  // outcomes, and a failed load. One place, so honouring `route.returnTo` (back
-  // to the viewer on the same file) is a one-line change once that route exists.
-  const exitDest = (): Route => ({ view: "home" });
 
   let loaded;
   try {
@@ -90,7 +100,9 @@ export async function mountEditor(
     // over the newer screen: the user has already moved on.
     if (isStale()) return noop;
     toast.error(describeError(e));
-    navigate(exitDest());
+    // A viewer-launched editor that cannot load goes back to the viewer on the
+    // same file, not home: the user came from there and never asked to leave.
+    navigate(exitDest(route));
     return noop;
   }
   if (isStale()) return noop;
@@ -98,13 +110,17 @@ export async function mountEditor(
   const session = new ProjectSession(route.projectPath, loaded.project, {
     temp: route.temp === true,
   });
-  // A quick-view session is a throwaway file that startup cleanup deletes, so
+  // A temporary session is a throwaway file that startup cleanup deletes, so
   // ANY route away from it must offer keep-or-discard first. Back/Ctrl+W/gear
-  // go through the gate directly; this guard covers the one path that does
-  // not — an OS "open with" request arriving from File Explorer, which used to
-  // navigate straight past the prompt and silently destroy the work.
-  const gate = createTempLeaveGate(session);
-  if (session.temp.get()) session.leaveGuard = () => gate.confirm();
+  // go through the gate directly; this guard covers the paths that do not —
+  // an OS "open with" request arriving from File Explorer (which used to
+  // navigate straight past the prompt and silently destroy the work) and the
+  // window close. Every exit goes through `exits`, never the bare gate: it
+  // holds them behind a Keep pressed on the Temporary badge (see paintKeep)
+  // until that settles, so no exit can prompt — and Keep a second time —
+  // mid-relocate. paintKeep clears the guard once the project is kept.
+  const exits = createTempExits(session, createTempLeaveGate(session));
+  if (session.temp.get()) session.leaveGuard = () => exits.confirm();
   const media = new MediaManager(() => session.project);
   await media.init();
   // The second await. Nothing shared has been touched yet, so a superseded
@@ -123,10 +139,11 @@ export async function mountEditor(
 
   /* ---------------- layout ---------------- */
 
+  const homeLabel = route.returnTo ? "Back to viewer" : "Back to projects";
   root.innerHTML = `
     <div class="editor">
       <div class="editor__topbar">
-        <button class="btn btn--ghost btn--icon" id="ed-home" title="Back to projects">${icon("chevronLeft")}</button>
+        <button class="btn btn--ghost btn--icon" id="ed-home" title="${homeLabel}" aria-label="${homeLabel}">${icon("chevronLeft")}</button>
         <div class="editor__name" id="ed-name" title="Rename project" tabindex="0">${escapeHtml(session.project.name)}</div>
         <div class="editor__savestate" id="ed-save">Saved</div>
         <div class="grow"></div>
@@ -225,6 +242,10 @@ export async function mountEditor(
         title: "Monitor volume",
       }),
   );
+  // The level is written 300 ms after the last change. Closing the window
+  // inside that window would drop it; dispose() is not reached on a close, so
+  // the close flow runs this instead.
+  const unregVolumeFlush = registerCloseTask(() => volume.flush());
 
   // Refit the stage when the project canvas w/h changes (resolution adoption,
   // canvas settings). Cheap: compares two numbers per project change.
@@ -939,6 +960,38 @@ export async function mountEditor(
           : s === "dirty"
             ? "Edited"
             : "Save failed";
+    paintKeep();
+  }
+
+  // Keep on the Temporary badge: make a temp project permanent without leaving
+  // it. The button exists only while the session is temp — added and removed
+  // here, from the same two subscriptions as the badge, so after a Keep (from
+  // here OR from the leave prompt) it goes away with no remount. Idempotent:
+  // painting twice in one state touches nothing.
+  function paintKeep(): void {
+    const existing = root.querySelector<HTMLButtonElement>("#ed-keep");
+    if (!session.temp.get()) {
+      existing?.remove();
+      // Nothing left to confirm: an OS open, the window close and Back all go
+      // through without a prompt now.
+      session.leaveGuard = null;
+      return;
+    }
+    if (existing) return;
+    const btn = document.createElement("button");
+    btn.className = "btn btn--ghost btn--sm editor__keep";
+    btn.id = "ed-keep";
+    btn.title = "Keep this project in your library";
+    btn.textContent = "Keep";
+    btn.addEventListener("click", () => {
+      // Blur first: a focused button would take the next Space as a click
+      // instead of play/pause (the transport buttons' rule).
+      btn.blur();
+      // Latched inside: a second click while one runs does nothing, and so
+      // does a click while the leave prompt is deciding. Toasts either way.
+      void exits.keep();
+    });
+    $("#ed-save").after(btn);
   }
   const unsubs = [
     session.store.subscribe(() => {
@@ -1297,12 +1350,13 @@ export async function mountEditor(
     media.ensureAll(session.project);
   }
 
-  // Back to home / Ctrl+W, and the Settings gear. A temp session is resolved
-  // (kept or discarded) by the gate first — otherwise the editor's dispose would
-  // flush edits only to the doomed temp path (silent loss). Cancel stays put.
-  // A permanent session passes straight through.
-  const goHome = (): void => gate.confirmLeave(() => navigate(exitDest()));
-  const goSettings = (): void => gate.confirmLeave(() => navigate({ view: "settings" }));
+  // Back (to home, or to the viewer it came from) / Ctrl+W, and the Settings
+  // gear. A temp session is resolved (kept or discarded) by the gate first —
+  // otherwise the editor's dispose would flush edits only to the doomed temp
+  // path (silent loss). Cancel stays put. A permanent session passes straight
+  // through. Both wait out a badge Keep in flight (see createTempExits).
+  const goHome = (): void => exits.confirmLeave(() => navigate(exitDest(route)));
+  const goSettings = (): void => exits.confirmLeave(() => navigate({ view: "settings" }));
 
   $("#ed-home").addEventListener("click", () => goHome());
   $("#ed-settings").addEventListener("click", () => goSettings());
@@ -1493,6 +1547,9 @@ export async function mountEditor(
       unTick();
       unGraphTick();
       unVolume();
+      // Unregister before the final flush: a close request landing after this
+      // screen is gone must not flush a disposed controller.
+      unregVolumeFlush();
       volume.dispose();
       unRefit();
       unName();

@@ -9,8 +9,9 @@ import {
   formatDuration,
   formatRelative,
 } from "../core/format";
-import { describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles, pickProjectFile } from "../core/ipc";
+import { describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles, pickOpenFile } from "../core/ipc";
 import { navigate } from "../core/nav";
+import { isTempProjectPath } from "../core/open-media";
 import { addMedia, createProject } from "../core/project";
 import { MEDIA_FILE_EXTENSIONS } from "../core/types";
 import type { RecentItem } from "../core/types";
@@ -525,22 +526,47 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   async function openPath(path: string): Promise<void> {
     if (guard()) return;
     try {
+      const ext = fileExt(path);
+      if (ext !== "trt") {
+        // Only Home's Open picker hands a media file here (drops and recents
+        // never do). The picker's filter can be typed around ("*.*"), so the
+        // allowlist is applied here too, as it is on every other way in.
+        if (!MEDIA_FILE_EXTENSIONS.has(ext)) {
+          toast.error("Unsupported file type.");
+          return;
+        }
+        // The dialog was open for as long as the user took; see createNew
+        // for why a disposed screen must not navigate once it resolves.
+        if (disposed) return;
+        // Always the viewer, whatever "Open files from File Explorer in" says:
+        // that setting is about Explorer. Opening a file from here is looking
+        // at it; making a project of it is one click away in the viewer, and
+        // "New project" stays the way to start one for keeps.
+        navigate({ view: "viewer", path });
+        return;
+      }
       if (!(await ipc.pathExists(path))) {
         toast.error("Project file not found");
         await refresh();
         return;
       }
-      // The existence check is a disk round-trip; see createNew for why a
-      // disposed screen must not navigate once it resolves.
+      // A .trt inside tmp-projects is a live temporary project (a drop, or the
+      // picker pointed at the scratch folder): it opens as temp, so it gets the
+      // Temporary badge and the keep gate instead of being edited in place
+      // until the next start's sweep deletes it — the same classification an
+      // Explorer open applies.
+      const temp = await isTempProjectPath(path);
+      // Both checks are disk round-trips; see createNew for why a disposed
+      // screen must not navigate once they resolve.
       if (disposed) return;
-      navigate({ view: "editor", projectPath: path });
+      navigate(temp ? { view: "editor", projectPath: path, temp: true } : { view: "editor", projectPath: path });
     } finally {
       busy = false;
     }
   }
 
   async function openViaDialog(): Promise<void> {
-    const path = await pickProjectFile();
+    const path = await pickOpenFile();
     if (path) await openPath(path);
   }
 

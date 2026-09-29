@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { ExportPreset } from "../../core/types";
 import { DEFAULT_EXPORT_PRESET } from "../../core/types";
 import {
+  createExportRunHold,
+  EXPORT_RUNNING_REASON,
   codecsForFormat,
   gateHardware,
   hardwareBlockedBy,
@@ -478,5 +480,107 @@ describe("overwriteOffer", () => {
     // Nothing there to overwrite; the backend decides it the same way.
     expect(overwriteOffer("D:\\Footage\\Brand new.mp4", false, media)).toBe("free");
     expect(overwriteOffer("D:\\Footage\\Holiday Clip.mp4", false, media)).toBe("free");
+  });
+});
+
+/**
+ * What a running export holds on the rest of the app: `session.blockLeave`
+ * (an OS open refuses instead of tearing the editor down under ffmpeg) and a
+ * close task (the window close cancels the job). Every terminal path releases
+ * both. A block left behind refuses every later open for the rest of the
+ * session; a task left behind cancels a job id that is no longer this run's.
+ */
+describe("createExportRunHold", () => {
+  function rig(): {
+    session: { blockLeave: string | null };
+    registered: Array<() => void | Promise<void>>;
+    unregisters: number;
+    cancel: () => void;
+    cancels: number;
+    register: (t: () => void | Promise<void>) => () => void;
+  } {
+    const r = {
+      session: { blockLeave: null as string | null },
+      registered: [] as Array<() => void | Promise<void>>,
+      unregisters: 0,
+      cancels: 0,
+      cancel: () => {
+        r.cancels++;
+      },
+      register: (t: () => void | Promise<void>) => {
+        r.registered.push(t);
+        return () => {
+          r.unregisters++;
+          r.registered.splice(r.registered.indexOf(t), 1);
+        };
+      },
+    };
+    return r;
+  }
+
+  it("hold blocks the session with the export's reason and registers the cancel as a close task", () => {
+    const r = rig();
+    const h = createExportRunHold(r.session, r.register, r.cancel);
+    h.hold();
+    expect(r.session.blockLeave).toBe("An export is running.");
+    expect(EXPORT_RUNNING_REASON).toBe("An export is running.");
+    expect(r.registered).toHaveLength(1);
+    // the registered task IS the cancel path, not a copy that forgot something
+    void r.registered[0]!();
+    expect(r.cancels).toBe(1);
+  });
+
+  it("release clears the block and unregisters the task", () => {
+    const r = rig();
+    const h = createExportRunHold(r.session, r.register, r.cancel);
+    h.hold();
+    h.release();
+    expect(r.session.blockLeave).toBeNull();
+    expect(r.registered).toHaveLength(0);
+    expect(r.unregisters).toBe(1);
+  });
+
+  it("a cancel releases twice (its own path + the canceled-failure event): the second is a no-op", () => {
+    const r = rig();
+    const h = createExportRunHold(r.session, r.register, r.cancel);
+    h.hold();
+    h.release();
+    h.release();
+    expect(r.unregisters).toBe(1);
+    expect(r.session.blockLeave).toBeNull();
+  });
+
+  it("release never clobbers a reason something else set", () => {
+    const r = rig();
+    const h = createExportRunHold(r.session, r.register, r.cancel);
+    h.hold();
+    r.session.blockLeave = "A preview is being prepared.";
+    h.release();
+    expect(r.session.blockLeave).toBe("A preview is being prepared.");
+    // ...but its own task still goes
+    expect(r.registered).toHaveLength(0);
+  });
+
+  it("holding twice registers once; a second run after a release registers afresh", () => {
+    const r = rig();
+    const h = createExportRunHold(r.session, r.register, r.cancel);
+    h.hold();
+    h.hold();
+    expect(r.registered).toHaveLength(1);
+    h.release();
+    h.hold();
+    expect(r.registered).toHaveLength(1);
+    expect(r.session.blockLeave).toBe(EXPORT_RUNNING_REASON);
+    h.release();
+    expect(r.unregisters).toBe(2);
+    expect(r.session.blockLeave).toBeNull();
+  });
+
+  it("a release with no run in progress touches nothing", () => {
+    const r = rig();
+    r.session.blockLeave = "Something else.";
+    createExportRunHold(r.session, r.register, r.cancel).release();
+    expect(r.session.blockLeave).toBe("Something else.");
+    expect(r.unregisters).toBe(0);
   });
 });

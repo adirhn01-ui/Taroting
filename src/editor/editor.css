@@ -64,6 +64,13 @@ html[data-rescue-chrome] #ed-settings:focus-visible {
   color: var(--danger);
   border-color: var(--danger);
 }
+/* The Temporary badge's own action. The topbar's gap already spaces it off the
+   badge; it only must never shrink or wrap its one word when a long project
+   name crowds the bar. */
+.editor__keep {
+  flex: none;
+  white-space: nowrap;
+}
 
 .editor__body {
   flex: 1;

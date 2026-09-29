@@ -468,6 +468,29 @@ describe("buildReport", () => {
     expect(custom).toContain("Shortcuts       2 customised");
   });
 
+  it("says where a file opened from File Explorer lands, as its own padded line", () => {
+    // "editor" first: it is NOT the default, so a row that ignored the setting
+    // and printed DEFAULT_SETTINGS.openWith fails here. The exact line (label,
+    // padding, value, newline) is asserted so a label longer than the column
+    // — which padEnd cannot shorten, gluing it onto the value — fails too.
+    const editor = buildReport(baseCtx({ settings: makeSettings({ openWith: "editor" }) }));
+    expect(editor).toContain("Explorer opens  editor\n");
+    expect(editor).not.toContain("Explorer opens  viewer");
+    const viewer = buildReport(baseCtx({ settings: makeSettings({ openWith: "viewer" }) }));
+    expect(viewer).toContain("Explorer opens  viewer\n");
+    expect(viewer).not.toContain("Explorer opens  editor");
+  });
+
+  it("never echoes a raw openWith string into the report", () => {
+    // Settings reach buildReport typed, but the row must not be the one place
+    // an unsanitized value is copied out verbatim. Anything but "viewer" is
+    // reported as the only other thing the app can do with it.
+    const junk = { ...makeSettings(), openWith: "C:\\Users\\adirh\\evil" } as unknown as Settings;
+    const text = buildReport(baseCtx({ settings: junk }));
+    expect(text).toContain("Explorer opens  editor\n");
+    expect(text).not.toContain("evil");
+  });
+
   it("names the three custom colours — under a custom theme they are the repro", () => {
     // Every hex differs from every other AND from DEFAULT_CUSTOM_THEME, so a
     // swapped role, a dropped role or a fallback to the stock palette each

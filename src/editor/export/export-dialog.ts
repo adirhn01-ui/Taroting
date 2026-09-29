@@ -3,6 +3,7 @@
 // cancel and a success / error result view.
 
 import "./export.css";
+import { registerCloseTask } from "../../core/app-close";
 import type { ReportContext } from "../../core/diagnostics";
 import { escapeHtml, fileExt, formatBytes } from "../../core/format";
 import { appVersion, describeError, errorDetail, ipc, onJobEvents } from "../../core/ipc";
@@ -367,6 +368,57 @@ function formatEta(sec: number): string {
   return `about ${m}m left`;
 }
 
+/** The reason a running export gives for refusing a navigation it did not
+ *  start (an OS open from File Explorer). Also the close gate's cue. */
+export const EXPORT_RUNNING_REASON = "An export is running.";
+
+export interface ExportRunHold {
+  /** An export run started: refuse outside navigations and make the window
+   *  close cancel it. Idempotent. */
+  hold(): void;
+  /** The run reached a terminal state (done, failed, canceled, dialog gone).
+   *  Idempotent: a cancel reaches both the cancel path and the canceled-failure
+   *  event, and both release. */
+  release(): void;
+}
+
+/**
+ * What a running export holds on the rest of the app, as one pair so every
+ * terminal path releases exactly what the start took.
+ *
+ * `session.blockLeave` makes an OS open refuse (with a toast) instead of
+ * tearing the editor — and this dialog, parked on document.body — down under a
+ * running ffmpeg. The close task makes a window close stop the export instead
+ * of leaving the encoder writing a `.part` nobody will ever publish. Either one
+ * left behind after the run is its own bug: a stale block refuses every later
+ * open for the rest of the session, a stale task cancels a job id that may by
+ * then belong to something else.
+ *
+ * Release clears the block only while it is still OURS: it never clobbers a
+ * reason something else set.
+ */
+export function createExportRunHold(
+  session: { blockLeave: string | null },
+  register: (task: () => void | Promise<void>) => () => void,
+  cancel: () => void | Promise<void>,
+): ExportRunHold {
+  let unregister: (() => void) | null = null;
+  return {
+    hold() {
+      session.blockLeave = EXPORT_RUNNING_REASON;
+      if (unregister === null) unregister = register(cancel);
+    },
+    release() {
+      if (session.blockLeave === EXPORT_RUNNING_REASON) session.blockLeave = null;
+      if (unregister !== null) {
+        const u = unregister;
+        unregister = null;
+        u();
+      }
+    },
+  };
+}
+
 /* ---------------- dialog ---------------- */
 
 export function openExportDialog(ctx: { session: ProjectSession }): void {
@@ -499,11 +551,28 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   let lastTaskbarPct = -1;
   let unlistenJobs: (() => void) | null = null;
   let estimateTimer: number | undefined;
+  /** The startExport call still awaiting its job id, if any. A window close in
+   *  that gap waits for it, so the job it is about to start gets canceled too
+   *  instead of running on after the window is gone. */
+  let starting: Promise<unknown> | null = null;
+  /** Set by the window close. A run still registering its job listener (before
+   *  startExport was even called) sees it and never starts the job at all. */
+  let closeCanceled = false;
+  const runHold = createExportRunHold(session, registerCloseTask, async () => {
+    closeCanceled = true;
+    if (jobId === null && starting) await starting.catch(() => {});
+    // The dialog's own Cancel path: kill the job, release the hold.
+    if (jobId !== null) await onCancelExport();
+  });
 
   /* -------- lifecycle -------- */
   function close(): void {
     if (exporting) return;
     closed = true;
+    // Belt and braces: every run path releases on its own, and close() is a
+    // no-op while one is running — but a dialog that is gone must never leave
+    // the session blocked.
+    runHold.release();
     document.removeEventListener("keydown", onKeydown, true);
     releaseTrap();
     window.clearTimeout(estimateTimer);
@@ -1056,6 +1125,10 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     };
 
     exporting = true;
+    // A close that ended in "stay" after all (the destroy failed) must not
+    // stop the NEXT run from starting.
+    closeCanceled = false;
+    runHold.hold();
     renderProgress();
 
     // Listen before starting so we don't miss the first progress event.
@@ -1075,15 +1148,34 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
       // event listener unavailable (non-tauri) — export will still reject below
     }
 
+    if (closeCanceled) {
+      // The window is closing; there is no job to cancel yet, so start none.
+      exporting = false;
+      runHold.release();
+      if (unlistenJobs) {
+        unlistenJobs();
+        unlistenJobs = null;
+      }
+      // Back to the form, not a progress view with nothing behind it, in case
+      // the window stays after all.
+      renderForm();
+      return;
+    }
+
     try {
-      jobId = await startExport(spec);
+      const pending = startExport(spec);
+      starting = pending;
+      jobId = await pending;
     } catch (e) {
       exporting = false;
+      runHold.release();
       if (unlistenJobs) {
         unlistenJobs();
         unlistenJobs = null;
       }
       renderError(errorDetail(e), []);
+    } finally {
+      starting = null;
     }
   }
 
@@ -1130,6 +1222,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   function handleDone(e: JobDone): void {
     if (e.kind !== "export" || (jobId !== null && e.id !== jobId)) return;
     exporting = false;
+    runHold.release();
     void clearTaskbarProgress();
     if (unlistenJobs) {
       unlistenJobs();
@@ -1142,6 +1235,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   function handleFailed(e: JobFailed): void {
     if (e.kind !== "export" || (jobId !== null && e.id !== jobId)) return;
     exporting = false;
+    runHold.release();
     void clearTaskbarProgress();
     if (unlistenJobs) {
       unlistenJobs();
@@ -1164,6 +1258,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     }
     exporting = false;
     jobId = null;
+    runHold.release();
     void clearTaskbarProgress();
     if (unlistenJobs) {
       unlistenJobs();

@@ -483,7 +483,10 @@ export function buildReport(ctx: ReportContext): string {
     out.push(row("Hardware accel", onOff(s.hardwareAccel)));
     out.push(row("Proxy media", onOff(s.proxyMedia)));
     out.push(row("Snap guides", onOff(s.snapCenterGuides)));
-    out.push(row("Open from Explorer", s.openWith));
+    // A fixed word either way: the report never echoes a raw settings string.
+    // The label stays inside LABEL_W — a longer one would glue straight onto
+    // the value, since padEnd cannot shorten.
+    out.push(row("Explorer opens", s.openWith === "viewer" ? "viewer" : "editor"));
     out.push(row("Cache limit", `${s.cacheLimitMB} MB`));
     out.push(row("Monitor volume", s.monitorVolume.toFixed(2)));
     out.push(row("Default export", s.defaultExportDir ? "set" : "not set"));

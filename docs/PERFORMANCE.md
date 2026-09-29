@@ -63,3 +63,52 @@ therefore **not** comparable to anything in this row, and the warm improvement
 from 0.17 s should be read as "well within baseline", not as a change earned by
 this release. To get a comparable cold number, time a freshly downloaded binary
 on a machine that has never seen it.
+
+## v0.9.0 — method additions
+
+v0.9.0 adds the folder viewer, which is the first screen a media file opened
+from Explorer lands on. The two measurements above cannot see it: "start →
+window" stops at the first non-empty title, before any route work, and "idle
+RAM" is taken on the home screen. These are added, on the same machine and the
+release exe, and the tables are filled by that run.
+
+- **Explorer launch → viewer on file**: `Start-Process <exe> -ArgumentList
+  '"<file>"'` and poll `MainWindowTitle` every 25 ms until it CONTAINS the
+  file's name. The viewer sets the title to `<name> — Taroting` as soon as it
+  mounts on that file, before the file is probed or decoded — so this times
+  the open route and the viewer's mount, not just the window; the first
+  decoded frame is NOT included. Cold (no instance running) and warm (the same
+  measurement against a running instance — the single-instance hand-off plus
+  the viewer's in-place swap).
+- **Warm swap**: with the viewer already showing a file, open a second file
+  from Explorer and time until the title names it.
+- **Viewer idle RAM**: the same sum as "Idle RAM" (the app plus its WebView2
+  processes), ~6 s after the viewer settles, in three states: a still shown; a
+  paused 1080p H.264 clip; and 10 s after flipping through 20 photos of
+  24–48 MP (the memory must come back, not accumulate).
+- **Viewer idle CPU**: total CPU time of the same processes across 30 s of
+  idle, once on a still and once on a paused video. The viewer runs no
+  animation loop, so both should be indistinguishable from the home screen.
+- **Home idle RAM** is re-measured unchanged — the viewer chunk is lazy and
+  must add nothing until a file is opened.
+- **Cache growth**: the preview cache size before and after the viewer run, so
+  clips that had to be remuxed or prepared show up as what they wrote.
+
+| Metric | v0.8.1 | v0.9.0 | Verdict |
+|---|---|---|---|
+| Start → window (warm) | | | |
+| Idle RAM, home screen (app + WebView2) | | | |
+| Explorer launch → viewer on file, cold (title names the file) | — | | — |
+| Explorer launch → viewer on file, warm | — | | — |
+| Warm swap (second open while viewing) | — | | — |
+
+| Viewer state | RAM (app + WebView2) | 30 s idle CPU |
+|---|---|---|
+| Still shown | | |
+| Paused 1080p H.264 | | |
+| After 20 photos of 24–48 MP, +10 s | | — |
+| Home screen, for comparison | | |
+
+| Cache | Before | After | Note |
+|---|---|---|---|
+| Preview cache size | | | |

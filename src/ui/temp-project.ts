@@ -5,11 +5,14 @@
 // A temp session lives in tmp-projects, which startup cleanup sweeps, so ANY
 // route away from it must offer keep-or-discard first — Back, Ctrl+W, the
 // Settings gear, an OS "open with" from File Explorer (through
-// `session.leaveGuard`), and later the window close. Every one of them goes
+// `session.leaveGuard`), and the window close when the project was edited.
+// Keep on the editor's Temporary badge is the one way to settle it without
+// leaving; it uses `keepTempSession` below directly. Every exit goes
 // through ONE gate, so the guard cannot be applied to three exits and forgotten
 // on the fourth (the v0.7.3 quick-view gap was exactly that).
 
 import { describeError, ipc } from "../core/ipc";
+import { isTempProjectPath } from "../core/open-media";
 import type { ProjectSession } from "../core/session";
 import { focusFirst, trapTab } from "./focus";
 import { icon } from "./icons";
@@ -28,7 +31,7 @@ export function askKeepTemp(): Promise<KeepChoice> {
       <div class="modal" role="dialog" aria-modal="true" aria-label="Keep temporary project?">
         <div class="modal__header"><span>Keep temporary project?</span><button class="btn btn--ghost btn--icon btn--sm" data-act="cancel" title="Cancel" aria-label="Cancel">${icon("x", 14)}</button></div>
         <div class="modal__body">
-          <div class="modal__text">This project was opened as a quick view and isn't in your library yet. Keep it, or discard it? Discarding removes only this temporary copy — your media file is untouched.</div>
+          <div class="modal__text">This is a temporary project and isn't in your library yet. Keep it, or discard it? Discarding removes only this temporary copy — your media file is untouched.</div>
         </div>
         <div class="modal__footer">
           <button class="btn" data-act="discard">Discard</button>
@@ -95,7 +98,8 @@ export async function keepTempSession(session: ProjectSession): Promise<string> 
 }
 
 /** session.discard() FIRST (so no flush resurrects the file), then best-effort
- *  ipc.deleteProject(session.path). Never throws. */
+ *  ipc.deleteProject(session.path) — ONLY when that path is inside the temp-projects dir.
+ *  Never throws. */
 export async function discardTempSession(session: ProjectSession): Promise<void> {
   // discard() runs FIRST so the editor's dispose flush (which targets this same
   // temp path) can't resurrect the file after we delete it. deleteProject
@@ -104,8 +108,17 @@ export async function discardTempSession(session: ProjectSession): Promise<void>
   // entry exists for a temp path, so deleteProject's recents-retain is a
   // harmless no-op.
   session.discard();
+  // The path is read once, right after the session stops, and only a path
+  // inside tmp-projects is ever deleted. A Keep that already relocated this
+  // session (a badge Keep, or a gate's Keep racing a close-time discard) has
+  // moved it into the library, and deleting THAT would undo the Keep and lose
+  // the user's project. The guard lives here, not in the callers, so every
+  // discard gets it. An unknown temp dir answers "not temp": the file is left
+  // for the startup sweep rather than risked.
+  const path = session.path;
   try {
-    await ipc.deleteProject(session.path);
+    if (!(await isTempProjectPath(path))) return;
+    await ipc.deleteProject(path);
   } catch {
     // Fail-soft: the temp file stays for the next startup's temp-dir sweep.
   }
@@ -223,6 +236,88 @@ export function createTempLeaveGateWith(
       ),
     get busy() {
       return busy;
+    },
+  };
+}
+
+export type KeepInPlaceResult = "kept" | "failed" | "ignored";
+
+/** The leave gate plus Keep WITHOUT leaving (the editor's Temporary badge). */
+export interface TempExits {
+  /** The gate's confirmLeave, run only once any in-place Keep has settled.
+   *  EXACTLY ONE of dest/onCancel fires, as with the gate itself. */
+  confirmLeave(dest: () => void, onCancel?: () => void): void;
+  /** Same as a promise (session.leaveGuard, the close gate): true = proceed. */
+  confirm(): Promise<boolean>;
+  /** keepTempSession + a toast either way. "ignored" (nothing done) while
+   *  another Keep runs, while the gate's prompt is open or resolving, or once
+   *  the session is no longer temp. Never rejects. */
+  keep(): Promise<KeepInPlaceResult>;
+}
+
+/**
+ * Put an in-place Keep and the leave gate behind ONE latch.
+ *
+ * Without it, an exit landing while a badge Keep is still relocating (Back, an
+ * OS open, the window close) reaches the gate with the gate idle and the
+ * session still temp — so it prompts AGAIN, and a second Keep relocates from
+ * where the first had already moved autosave and deletes the FIRST kept file
+ * as its "scratch" file. So every exit waits for the Keep: after a successful
+ * one the gate sees a permanent session and passes straight through; after a
+ * failed one it asks as usual. And the badge does nothing while the gate is
+ * deciding (its own Keep or Discard is settling this project's fate).
+ */
+export function createTempExits(session: ProjectSession, gate: TempLeaveGate): TempExits {
+  let keeping: Promise<KeepInPlaceResult> | null = null;
+
+  const confirmLeave = (dest: () => void, onCancel?: () => void): void => {
+    if (keeping) {
+      // Reported like the gate's own callback throws, never left unhandled.
+      void keeping
+        .then(() => gate.confirmLeave(dest, onCancel))
+        .catch((e: unknown) => console.error("A temporary-project exit callback threw", e));
+    } else gate.confirmLeave(dest, onCancel);
+  };
+
+  return {
+    confirmLeave,
+    confirm: () =>
+      new Promise<boolean>((resolve) =>
+        confirmLeave(
+          () => resolve(true),
+          () => resolve(false),
+        ),
+      ),
+    keep() {
+      if (keeping || gate.busy || !session.temp.get()) return Promise.resolve("ignored");
+      // A toast that throws must neither strand the latch nor turn a finished
+      // Keep into a rejection, hence the try around each.
+      const run = keepTempSession(session)
+        .then(
+          (): KeepInPlaceResult => {
+            try {
+              toast.info("Kept in your library.");
+            } catch {
+              // the Keep itself is done
+            }
+            return "kept";
+          },
+          (e: unknown): KeepInPlaceResult => {
+            // Still temp at its old path: the user can try again, or leave
+            // through the prompt.
+            try {
+              toast.error(`Couldn't keep this project: ${describeError(e)}`);
+            } catch {
+              // nothing more to report it with
+            }
+            return "failed";
+          },
+        )
+        .finally(() => {
+          keeping = null;
+        });
+      keeping = run;
+      return run;
     },
   };
 }

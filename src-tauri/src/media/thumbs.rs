@@ -124,8 +124,9 @@ pub fn get_thumbnail(
 /* Filmstrips                                                          */
 /* ------------------------------------------------------------------ */
 
+/// Field names: see `PlaybackPlan` (media/playability.rs).
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase", tag = "state")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "state")]
 pub enum FilmstripResult {
     Ready { dir: String, frame_count: u32 },
     Pending { job_id: JobId, dir: String },

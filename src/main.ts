@@ -1,8 +1,9 @@
 import "./style/tokens.css";
 import "./style/base.css";
 import "./style/components.css";
-import { fileExt, fileStem } from "./core/format";
-import { describeError, inTauri, ipc, onOpenPath } from "./core/ipc";
+import { installCloseGate, runCloseFlow, type CloseDeps } from "./core/app-close";
+import { fileExt, fileName } from "./core/format";
+import { describeError, destroyWindow, inTauri, ipc, onOpenPath } from "./core/ipc";
 import { navigate, setNavigator, type Route } from "./core/nav";
 import {
   TEARDOWN_WAIT_MS,
@@ -11,8 +12,13 @@ import {
   openMediaAsProject,
   runOnOpenChain,
 } from "./core/open-media";
-import { createProject, importMediaAsClip } from "./core/project";
-import { confirmLeaveCurrentSession, initSettings, settingsStore } from "./core/session";
+import {
+  confirmLeaveCurrentSession,
+  currentSession,
+  initSettings,
+  leaveBlockedReason,
+  settingsStore,
+} from "./core/session";
 import { MEDIA_FILE_EXTENSIONS } from "./core/types";
 import { mountHome } from "./home/home";
 import { closeErrorDialogs } from "./ui/errors";
@@ -51,6 +57,9 @@ if (!import.meta.env.DEV) {
 
 // Boot: paint the home screen immediately. The editor is a separate chunk,
 // prefetched on idle so opening a project is instant without slowing startup.
+// The viewer is a separate chunk too, and deliberately NOT prefetched: it is
+// only ever reached from File Explorer or Home's Open, and a user who never
+// goes there must not pay for it.
 
 const app = document.getElementById("app")!;
 
@@ -124,7 +133,9 @@ async function go(route: Route): Promise<void> {
       if (activeViewer === v) activeViewer = null;
       v.dispose();
     };
-  } else {
+  } else if (route.view === "editor") {
+    // The whole route goes through, `temp` and `returnTo` included: every
+    // editor exit reads `returnTo` to go back to the viewer's file.
     const { mountEditor } = await import("./editor/editor");
     if (token !== navToken) return;
     const view = await mountEditor(app, route, () => token !== navToken);
@@ -138,18 +149,24 @@ async function go(route: Route): Promise<void> {
       return;
     }
     dispose = () => view.dispose();
+  } else {
+    // A view added to Route without a branch here fails to compile instead of
+    // silently mounting nothing.
+    const unhandled: never = route;
+    void unhandled;
   }
 }
 
 setNavigator((route) => void go(route));
 void go({ view: "home" });
 
-// OS file-open routing: a ".trt" opens the project directly; a supported media
-// file starts a new project with that file placed on the timeline (an OS
-// "Open with" implies the user wants to work with it, not just stage it).
-// This differs from in-app import, which is bin-first (see home createNew).
-// Serialized on the open chain (core/open-media) so overlapping launches can't
-// interleave two project creations.
+// OS file-open routing (File Explorer "Open with", a second launch). A ".trt"
+// opens that project. A media file goes where Settings → Opening files says:
+// the viewer (no project at all), or a TEMPORARY one-clip project in the
+// editor. Neither creates anything permanent — the user keeps a temporary
+// project only by choosing Keep (owner decision; Home's "New project" is the
+// one permanent creation path). Serialized on the open chain (core/open-media)
+// so overlapping launches can't interleave two project creations.
 
 async function routeOpenPath(path: string): Promise<void> {
   const ext = fileExt(path);
@@ -164,8 +181,25 @@ async function routeOpenPath(path: string): Promise<void> {
   // the next launch's temp sweep deletes — and temp projects are excluded from
   // recents, so there is no way back. Resolves true (no gate installed, or the
   // user chose Keep/Discard); false cancels this open entirely, before any
-  // project file is created.
-  if (!(await confirmLeaveCurrentSession())) return;
+  // project file is created — and false is SAID: a running export refuses by
+  // name, and a Cancel on the Keep prompt (or a prompt already open) used to
+  // drop the open without a word, which reads as "Explorer did nothing".
+  //
+  // Sampled BEFORE the gate: a temporary session only gets through it by Keep
+  // (relocated to a permanent file) or Discard (disposed, its file deleted).
+  // Either way the user has agreed to leave that screen, and the editor left
+  // on it no longer edits what it shows — a Discarded one saves nothing, and a
+  // Kept one still carries the scratch route. See the catch below.
+  const leaving = currentSession.get();
+  // Only a temp editor whose gate actually asked: without a guard the leave
+  // went through unasked, and that editor is still live — never navigate over it.
+  const leavingTemp = leaving?.temp.get() === true && !!leaving.leaveGuard;
+  if (!(await confirmLeaveCurrentSession())) {
+    const why = leaveBlockedReason();
+    const name = fileName(path);
+    toast.info(why ? `${why} ${name} wasn't opened.` : `Still editing. ${name} wasn't opened.`);
+    return; // settles, so the chain moves on to the next open
+  }
 
   if (isProject) {
     // A .trt that physically lives in the temp-projects dir is a live quick-view
@@ -176,29 +210,45 @@ async function routeOpenPath(path: string): Promise<void> {
     navigate(temp ? { view: "editor", projectPath: path, temp: true } : { view: "editor", projectPath: path });
     return;
   }
-  // Quick-view: with the setting on, an open-with media file becomes a
-  // temporary project in the temp dir (never in recents) until the user chooses
-  // to keep it when leaving the editor. Off → the classic permanent flow,
-  // byte-identical.
-  // BRIDGE until the viewer lands (Wave 2): "editor" keeps 0.8's quick view;
-  // "viewer" still takes the old permanent-project path below.
-  const temp = settingsStore.get().openWith === "editor";
+
+  if (settingsStore.get().openWith === "viewer") {
+    // A viewer already on screen swaps the file in place: no remount, no
+    // reload of the chunk, and the folder is re-listed for the new file.
+    if (activeViewer) activeViewer.show(path);
+    else navigate({ view: "viewer", path });
+    return;
+  }
+
+  // "editor": a temporary project in tmp-projects (never in recents) until the
+  // user keeps it. Called directly, not through runOnOpenChain: this function
+  // already runs on the chain, and a task that awaits the chain awaits itself.
   try {
-    if (temp) {
-      const projectPath = await openMediaAsProject(path);
-      navigate({ view: "editor", projectPath, temp: true });
-      return;
-    }
-    const projectPath = await ipc.newProjectPath(fileStem(path));
-    let project = createProject(fileStem(projectPath));
-    const info = await ipc.probeMedia(path);
-    project = importMediaAsClip(project, info).project;
-    await ipc.saveProject(projectPath, project);
-    navigate({ view: "editor", projectPath });
+    const projectPath = await openMediaAsProject(path);
+    navigate({ view: "editor", projectPath, temp: true });
   } catch (e) {
     toast.error(describeError(e));
+    // The open the user agreed to leave for has failed. An editor whose temp
+    // session went through the gate (Kept or Discarded above) and is STILL the
+    // screen goes home rather than staying on a dead editor: with Discard its
+    // edits would be silently dropped, and its Keep button toasts "already
+    // closed". Home is where a finished Keep is visible, in the library. A
+    // permanent session (no gate to pass) keeps its editor — nothing happened
+    // to it. Only this branch needs the rule: a .trt has navigated already,
+    // and an editor that cannot load that file routes itself away (mountEditor);
+    // the viewer branches cannot fail here.
+    if (leavingTemp && currentSession.get() === leaving) navigate({ view: "home" });
   }
 }
+
+/** What the close gate needs from the shell. `settle` is the UNBOUNDED wait on
+ *  every screen teardown (an editor's final save included); runCloseFlow puts
+ *  its own cap on it, so a teardown hung on a dead disk can delay a close but
+ *  never block it. */
+const closeDeps: CloseDeps = {
+  session: () => currentSession.get(),
+  settle: () => teardowns.settled(),
+  destroy: destroyWindow,
+};
 
 function enqueueOpen(path: string): void {
   // routeOpenPath reports its own failures; the catch only keeps a rejection
@@ -228,6 +278,11 @@ void (async () => {
     // for a recovered project applies here.
     toast.info("Your settings were restored from their automatic backup.");
   }
+  // The window-close gate (core/app-close). Installed once the settings are
+  // in, so a close flow's settings wait covers real writes, not the boot read.
+  // Until then — the first moments of a launch — X closes natively, which is
+  // safe: nothing can be open yet that a close would lose.
+  installCloseGate(closeDeps);
   // Atomically drain the server-side open-path queue and route each path. Safe
   // to call repeatedly: the drain returns every queued path to exactly one
   // caller, so the wake-up handler and the startup drain never double-open.
@@ -247,6 +302,11 @@ void (async () => {
 
 // Dev-only in-app E2E harness (activated via TAROTING_AUTOTEST=1).
 if (import.meta.env.DEV) {
+  // The real close flow with an injected destroy, so the E2E can drive every
+  // branch without closing the window it runs in.
+  (window as unknown as { __tarotingCloseFlow?: unknown }).__tarotingCloseFlow = (
+    destroy: () => Promise<void>,
+  ) => runCloseFlow({ ...closeDeps, destroy });
   void (async () => {
     try {
       if (!inTauri) return;

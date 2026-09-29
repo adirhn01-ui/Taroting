@@ -147,34 +147,99 @@ fn run_uninstaller() -> Result<()> {
 /// A JS close listener makes Tauri swallow the native close, so a hung or
 /// crashed renderer would leave X doing nothing, forever. This remembers the
 /// first close request the webview has not acknowledged (`close_ack`).
+///
+/// One timestamp, not a counter: the only question is "has the webview been
+/// silent for 5 s since the user FIRST asked to close". A live webview acks
+/// every request within milliseconds (before it shows any Keep prompt), so a
+/// user clicking X again while that prompt is up is never force-closed.
+///
+/// The ack cannot overtake the record it answers. Tauri's `attach_window`
+/// (tauri 2.11.5 `manager/window.rs` L99-103) emits `tauri://close-requested`
+/// and then runs the app's `on_window_event` listeners synchronously inside the
+/// same event-loop callback. On Windows every webview→host message (IPC
+/// protocol request or postMessage) arrives as a WebView2 event on the UI
+/// thread, which is still inside this close callback when the stamp is
+/// written — so the ack cannot precede the stamp, whichever thread later runs
+/// the command.
 #[derive(Default)]
 pub struct CloseWatch {
     first_unacked: Mutex<Option<std::time::Instant>>,
+}
+
+impl CloseWatch {
+    /// Record a close request at `now`; `true` means "destroy the window".
+    /// A force clears the stamp; an empty slot takes `now`; a pending request
+    /// younger than [`FORCE_CLOSE_AFTER`] is LEFT ALONE — refreshing it would
+    /// let a user clicking X every second postpone the escape hatch forever.
+    ///
+    /// Poison-tolerant: a poisoned lock still holds a valid `Option<Instant>`,
+    /// and `unwrap()` here would abort the process from inside a window event.
+    fn note_request(&self, now: std::time::Instant) -> bool {
+        let mut slot = self.first_unacked.lock().unwrap_or_else(|e| e.into_inner());
+        if should_force_close(*slot, now) {
+            *slot = None;
+            return true;
+        }
+        if slot.is_none() {
+            *slot = Some(now);
+        }
+        false
+    }
+
+    /// The webview answered: nothing is pending any more.
+    fn ack(&self) {
+        *self.first_unacked.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// Force-destroy when a close request arrives this long after an earlier one
 /// the webview never acknowledged.
 pub const FORCE_CLOSE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Pure decision (SEAM STUB — Wave 2 fills it in).
+/// Pure decision: force-destroy when a close request arrives ≥
+/// [`FORCE_CLOSE_AFTER`] after an earlier one the webview never acknowledged.
+///
+/// `saturating_duration_since`, not `now - t`: `Instant` subtraction's
+/// non-panicking behaviour on a backwards pair is documented only as
+/// "currently", and release is `panic = "abort"`. A stamp from the future
+/// reads as zero elapsed — never a force.
 pub fn should_force_close(
     first_unacked: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> bool {
-    let _ = (first_unacked, now);
-    false
+    match first_unacked {
+        Some(t) => now.saturating_duration_since(t) >= FORCE_CLOSE_AFTER,
+        None => false,
+    }
 }
 
-/// Called from main.rs `.on_window_event` for `WindowEvent::CloseRequested`
-/// (SEAM STUB — Wave 2 fills it in).
+/// Pure decision for one close request on window `label` at `now`.
+///
+/// Only "main" is watched: the stamp is one window's state, and a close on any
+/// other window must neither start its clock nor be destroyed by it — so the
+/// label check short-circuits BEFORE `note_request` can write a stamp.
+fn should_destroy(label: &str, watch: &CloseWatch, now: std::time::Instant) -> bool {
+    label == "main" && watch.note_request(now)
+}
+
+/// Called from main.rs `.on_window_event` for `WindowEvent::CloseRequested`.
+///
+/// The decision lives in [`should_destroy`] so it is testable without a
+/// window; only the `destroy()` call itself is left to the manual check.
+/// `destroy()` posts `WindowMessage::Destroy` through the event-loop proxy
+/// (tauri-runtime-wry `destroy`), so calling it from inside this handler does
+/// not re-enter the loop. Its error is ignored: there is nothing further to try
+/// from here, and the next X starts a fresh 5 s clock.
 pub fn on_close_requested<R: tauri::Runtime>(window: &tauri::Window<R>, watch: &CloseWatch) {
-    let _ = (window, &watch.first_unacked);
+    if should_destroy(window.label(), watch, std::time::Instant::now()) {
+        let _ = window.destroy();
+    }
 }
 
-/// The webview answered: clear the pending timestamp (SEAM STUB).
+/// The webview answered: clear the pending timestamp.
 #[tauri::command]
 pub fn close_ack(watch: tauri::State<'_, CloseWatch>) {
-    let _ = &watch.first_unacked;
+    watch.ack();
 }
 
 #[cfg(test)]
@@ -242,5 +307,109 @@ mod tests {
             "an undecodable path must be dropped, never lossily rewritten"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ---- close escape hatch ---- */
+
+    use std::time::{Duration, Instant};
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// The boundary rows straddle 5 s by 100 ms so `>=` vs `>` and an off-by-
+    /// one-second constant each flip exactly one row. The future-stamp row pins
+    /// the saturating subtraction: a clock pair that runs backwards must read
+    /// as "not yet", never as a panic or a force.
+    #[test]
+    fn should_force_close_table() {
+        let t0 = Instant::now();
+        let rows: [(Option<Instant>, Instant, bool, &str); 5] = [
+            (None, t0 + ms(60_000), false, "nothing pending"),
+            (Some(t0), t0 + ms(4_900), false, "4.9 s is still patient"),
+            (Some(t0), t0 + ms(5_000), true, "exactly 5.0 s forces"),
+            (Some(t0), t0 + ms(60_000), true, "60 s forces"),
+            (Some(t0 + ms(1_000)), t0, false, "a stamp in the future"),
+        ];
+        for (first, now, want, why) in rows {
+            assert_eq!(should_force_close(first, now), want, "{why}");
+        }
+    }
+
+    /// Distinguishes "leave the pending stamp alone" from "overwrite it with
+    /// now": an overwrite would make the third request see 100 ms and wait.
+    #[test]
+    fn pending_request_is_not_refreshed_by_a_younger_one() {
+        let w = CloseWatch::default();
+        let t0 = Instant::now();
+        assert!(!w.note_request(t0), "the first request only starts the clock");
+        assert!(!w.note_request(t0 + ms(4_900)), "4.9 s after the first");
+        assert!(w.note_request(t0 + ms(5_000)), "5.0 s after the FIRST forces");
+    }
+
+    /// After a force the slot is empty again, so the very next request starts
+    /// a new clock instead of forcing on a stale stamp.
+    #[test]
+    fn force_clears_so_the_next_request_starts_fresh() {
+        let w = CloseWatch::default();
+        let t0 = Instant::now();
+        assert!(!w.note_request(t0));
+        assert!(w.note_request(t0 + ms(7_000)));
+        assert!(!w.note_request(t0 + ms(7_001)), "a fresh first request");
+        assert_eq!(*w.first_unacked.lock().unwrap(), Some(t0 + ms(7_001)));
+    }
+
+    /// The label gate, row by row on a fresh watch each: "main" starts the
+    /// clock and forces at 5 s; any other label never stamps (slot stays
+    /// `None`) and so never forces, however late the second request is.
+    #[test]
+    fn should_destroy_only_watches_main() {
+        let t0 = Instant::now();
+
+        let main = CloseWatch::default();
+        assert!(!should_destroy("main", &main, t0), "main: first request waits");
+        assert_eq!(*main.first_unacked.lock().unwrap(), Some(t0), "main stamps");
+        assert!(should_destroy("main", &main, t0 + ms(5_000)), "main forces at 5 s");
+
+        let other = CloseWatch::default();
+        assert!(!should_destroy("other", &other, t0), "other: no force");
+        assert_eq!(*other.first_unacked.lock().unwrap(), None, "other never stamps");
+        assert!(!should_destroy("other", &other, t0 + ms(60_000)), "other: never forces");
+        assert_eq!(*other.first_unacked.lock().unwrap(), None, "still no stamp");
+    }
+
+    /// A live webview acks every request, so a request long after an acked one
+    /// is a fresh first request, never a force.
+    #[test]
+    fn ack_clears_the_pending_request() {
+        let w = CloseWatch::default();
+        let t0 = Instant::now();
+        assert!(!w.note_request(t0));
+        w.ack();
+        assert_eq!(*w.first_unacked.lock().unwrap(), None);
+        assert!(!w.note_request(t0 + ms(60_000)), "acked, so 60 s later is new");
+    }
+
+    /// A panic while the lock was held must not turn the escape hatch itself
+    /// into a crash (release aborts on panic). The poisoned slot still carries
+    /// the stamp written before the panic, and the clock keeps working on it.
+    #[test]
+    fn poisoned_lock_does_not_panic() {
+        let w = std::sync::Arc::new(CloseWatch::default());
+        let t0 = Instant::now();
+        let w2 = w.clone();
+        let _ = std::thread::spawn(move || {
+            let mut slot = w2.first_unacked.lock().unwrap();
+            *slot = Some(t0);
+            panic!("poison the close watch");
+        })
+        .join();
+        assert!(w.first_unacked.is_poisoned(), "fixture must be poisoned");
+
+        assert!(!w.note_request(t0 + ms(3_000)), "stamp kept, 3 s is patient");
+        assert!(w.note_request(t0 + ms(5_500)), "and 5.5 s still forces");
+        assert!(!w.note_request(t0 + ms(5_600)));
+        w.ack();
+        assert!(!w.note_request(t0 + ms(20_000)), "ack worked through poison");
     }
 }

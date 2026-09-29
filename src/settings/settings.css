@@ -147,6 +147,22 @@ html[data-custom-theme] .settings__segmented .btn--on {
   row-gap: var(--sp-2);
 }
 
+/* ---------- Opening files ---------- */
+/* The same wrap as the Appearance card, with one difference that matters: this
+   row's text is a long hint, and a flex item's default basis is its max-content
+   width. A two-sentence hint alone is wider than the ~600 px row, so a bare
+   `flex-wrap: wrap` would drop the control under the label at EVERY window size,
+   the minimum included. A small explicit basis keeps the control on the right
+   and lets the hint wrap inside its column; the control only moves to its own
+   line once the row is genuinely too narrow for both. */
+.settings__card--opening .settings__row {
+  flex-wrap: wrap;
+  row-gap: var(--sp-2);
+}
+.settings__card--opening .settings__row-text {
+  flex: 1 1 240px;
+}
+
 .settings__custom {
   display: flex;
   flex-direction: column;

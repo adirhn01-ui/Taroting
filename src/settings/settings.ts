@@ -1,5 +1,6 @@
 // Settings screen: a full-window route (like home) for appearance, autosave,
-// export defaults, performance, cache, and rebindable keyboard shortcuts.
+// export defaults, where files opened from Explorer land, performance, cache,
+// and rebindable keyboard shortcuts.
 // Everything persists immediately via updateSettings and reflects settingsStore
 // live. The screen fully re-renders on store changes EXCEPT during shortcut
 // capture and while a colour picker is open — both of those mutate the single
@@ -24,7 +25,7 @@ import {
 } from "../core/session";
 import { chordOf, conflictingActions, findConflicts, normalizeChord } from "../core/shortcuts";
 import type { ShortcutConflict } from "../core/shortcuts";
-import type { ActionId, CustomTheme, Settings, ShortcutMode } from "../core/types";
+import type { ActionId, CustomTheme, OpenWith, Settings, ShortcutMode } from "../core/types";
 import { DEFAULT_CUSTOM_THEME, DEFAULT_SHORTCUTS } from "../core/types";
 import type { ColorPickerHandle } from "../ui/color-picker";
 import {
@@ -232,6 +233,16 @@ export function colorRow(role: ColorRole, hex: string): string {
         </button>
       </div>`;
 }
+
+/** What each "Opening files" choice does, shown under the control for the one
+ *  that is on. Both say plainly that nothing lands in the library on its own:
+ *  the viewer makes no project at all, and the editor's is temporary until the
+ *  user keeps it. */
+const OPEN_WITH_HINTS: Record<OpenWith, string> = {
+  viewer: "Shows the file on its own. Use the arrows to move through its folder.",
+  editor:
+    "Opens a temporary project with the file on the timeline. You choose whether to keep it when you leave.",
+};
 
 const AUTOSAVE_OPTIONS = [1, 3, 5, 10, 30];
 const CACHE_LIMIT_OPTIONS_MB = [1024, 2048, 5120, 10240, 20480];
@@ -454,6 +465,31 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       </section>`;
   }
 
+  // Its own card rather than a row under Performance: where a file lands is a
+  // choice about behaviour, not speed. The hint follows the selection, so the
+  // screen says what the current choice does rather than what one of them does.
+  function openingSection(s: Settings): string {
+    const seg = segmented(
+      s.openWith,
+      [
+        { value: "viewer", label: "Viewer" },
+        { value: "editor", label: "Editor" },
+      ],
+      "data-openwith-opt",
+    );
+    return `
+      <section class="card settings__card settings__card--opening">
+        <div class="settings__section-head">Opening files</div>
+        <div class="settings__row">
+          <div class="settings__row-text">
+            <div class="settings__row-label">Open files from File Explorer in</div>
+            <div class="settings__hint">${escapeHtml(OPEN_WITH_HINTS[s.openWith === "editor" ? "editor" : "viewer"])}</div>
+          </div>
+          ${seg}
+        </div>
+      </section>`;
+  }
+
   function performanceSection(s: Settings): string {
     return `
       <section class="card settings__card">
@@ -463,19 +499,15 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
           "settings-proxy",
           "Proxy media",
           s.proxyMedia,
-          "Use lighter preview copies for heavy or 4K files",
+          // "while editing": the viewer plays 4K directly and never proxies, so
+          // an unqualified hint would promise something this switch does not do.
+          "Use lighter preview copies for heavy or 4K files while editing",
         )}
         ${switchRow(
           "settings-snap-center",
           "Snap to center guides",
           s.snapCenterGuides,
           "Dragged clips snap to the canvas center",
-        )}
-        ${switchRow(
-          "settings-temp-open",
-          "Quick view from File Explorer",
-          s.openWith === "editor",
-          "Media opened from File Explorer becomes a temporary project. You choose whether to keep it when you leave",
         )}
       </section>`;
   }
@@ -635,6 +667,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       appearanceSection(s),
       autosaveSection(s),
       exportSection(s),
+      openingSection(s),
       performanceSection(s),
       cacheSection(s),
       shortcutsSection(s),
@@ -657,6 +690,13 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     inner.querySelectorAll<HTMLButtonElement>("[data-theme-opt]").forEach((btn) => {
       btn.addEventListener("click", () => {
         persist({ theme: btn.dataset.themeOpt as Settings["theme"] });
+      });
+    });
+
+    // Where a file opened from File Explorer lands
+    inner.querySelectorAll<HTMLButtonElement>("[data-openwith-opt]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        persist({ openWith: btn.dataset.openwithOpt as OpenWith });
       });
     });
 
@@ -699,11 +739,6 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       .querySelector<HTMLInputElement>("#settings-snap-center")
       ?.addEventListener("change", (e) => {
         persist({ snapCenterGuides: (e.target as HTMLInputElement).checked });
-      });
-    inner
-      .querySelector<HTMLInputElement>("#settings-temp-open")
-      ?.addEventListener("change", (e) => {
-        persist({ openWith: (e.target as HTMLInputElement).checked ? "editor" : "viewer" });
       });
 
     // Cache limit

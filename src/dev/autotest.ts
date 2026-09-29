@@ -111,7 +111,13 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       const detail = await fn();
       results[results.length - 1] = { name, pass: true, detail };
     } catch (e) {
-      results[results.length - 1] = { name, pass: false, detail: String(e) };
+      // An assert() (a plain Error) says everything; an unexpected throw (a
+      // TypeError from a null deref) says nothing about WHERE without its frames.
+      const where =
+        e instanceof Error && e.name !== "Error" && e.stack
+          ? ` @ ${e.stack.split(/\r?\n/).slice(1, 4).map((l) => l.trim()).join(" < ")}`
+          : "";
+      results[results.length - 1] = { name, pass: false, detail: String(e) + where };
     }
     await write(false);
   };
@@ -3895,6 +3901,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       }
     });
     await (await import("./autotest-wave1")).runWave1Blocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-viewer")).runViewerBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
   } catch (e) {
     results.push({ name: "setup", pass: false, detail: String(e) });
   }
