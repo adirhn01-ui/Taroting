@@ -21,6 +21,22 @@ fn dev_only() -> Result<()> {
     }
 }
 
+/// True when this process was launched to run the in-app E2E suite. Pinned to a
+/// debug build as well as the environment variable, so a shipped Taroting can
+/// never take any autotest path, whatever the environment says.
+pub fn autotest_mode() -> bool {
+    cfg!(debug_assertions) && std::env::var("TAROTING_AUTOTEST").is_ok_and(|v| v == "1")
+}
+
+/// Autotest only: the private scratch root that every OWNER-data location is
+/// redirected into (see `paths.rs`), so an E2E run can never write into the
+/// owner's settings, recents, projects or temporary projects — it used to leave
+/// an "Autotest N.trt" in their Documents\Taroting on every run. Wiped when an
+/// autotest primary instance starts, so each run begins from factory defaults.
+pub fn autotest_root() -> std::path::PathBuf {
+    std::env::temp_dir().join("taroting-autotest")
+}
+
 pub fn report_path() -> std::path::PathBuf {
     std::env::temp_dir().join("taroting-autotest-report.json")
 }

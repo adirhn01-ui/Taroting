@@ -1502,6 +1502,11 @@ mod tests {
         // quick-view tests never touch the real %LOCALAPPDATA%\Taroting.
         let prev_local = std::env::var_os("LOCALAPPDATA");
         std::env::set_var("LOCALAPPDATA", dir.join("localappdata"));
+        // New projects land in %USERPROFILE%\Documents\Taroting. Without this the
+        // keep/cleanup tests wrote "Keep.trt"/"Kept.trt" into the REAL Documents
+        // folder of whoever ran the suite, and left them there.
+        let prev_profile = std::env::var_os("USERPROFILE");
+        std::env::set_var("USERPROFILE", dir.join("userprofile"));
 
         body(&dir);
 
@@ -1512,6 +1517,10 @@ mod tests {
         match prev_local {
             Some(v) => std::env::set_var("LOCALAPPDATA", v),
             None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        match prev_profile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

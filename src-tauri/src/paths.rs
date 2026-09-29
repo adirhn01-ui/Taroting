@@ -29,8 +29,22 @@ fn dir_from_env(var: &str, value: Option<OsString>) -> Result<PathBuf> {
         .ok_or_else(|| AppError::BadInput(format!("environment variable {var} is not set")))
 }
 
+/// Under the in-app E2E harness (debug build + TAROTING_AUTOTEST=1) every
+/// location that holds the OWNER's data is redirected into a private scratch
+/// root, so a test run can never touch their settings, recents, projects or
+/// temporary projects. The cache is deliberately NOT redirected: it is
+/// regenerable, keyed by file identity, and re-deriving every proxy on every run
+/// would push the suite past its time cap. A normal or shipped run never takes
+/// this branch (`autotest_mode` is false in release builds).
+fn autotest_redirect(leaf: &str) -> Option<PathBuf> {
+    crate::debug::autotest_mode().then(|| crate::debug::autotest_root().join(leaf))
+}
+
 /// %APPDATA%\Taroting — settings.json, recents.json
 pub fn data_dir() -> Result<PathBuf> {
+    if let Some(dir) = autotest_redirect("appdata") {
+        return Ok(dir);
+    }
     Ok(env_dir("APPDATA")?.join("Taroting"))
 }
 
@@ -44,6 +58,9 @@ pub fn cache_dir() -> Result<PathBuf> {
 /// primary instance starts; choosing Keep in the editor's keep/discard prompt
 /// writes the project permanently to Documents.
 pub fn temp_projects_dir() -> Result<PathBuf> {
+    if let Some(dir) = autotest_redirect("tmp-projects") {
+        return Ok(dir);
+    }
     Ok(env_dir("LOCALAPPDATA")?
         .join("Taroting")
         .join("tmp-projects"))
@@ -51,6 +68,9 @@ pub fn temp_projects_dir() -> Result<PathBuf> {
 
 /// Default folder for new projects: Documents\Taroting
 pub fn default_projects_dir() -> Result<PathBuf> {
+    if let Some(dir) = autotest_redirect("documents") {
+        return Ok(dir);
+    }
     Ok(env_dir("USERPROFILE")?.join("Documents").join("Taroting"))
 }
 

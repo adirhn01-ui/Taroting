@@ -20,13 +20,10 @@ use tauri::{Emitter, Manager, PhysicalPosition};
 
 /* ---------------- in-app E2E harness (TAROTING_AUTOTEST=1) ---------------- */
 
-/// True when this process was launched to run the in-app E2E suite. The
-/// environment variable is read exactly the way `debug::debug_info` reads it,
-/// and is additionally pinned to a debug build — a shipped Taroting can never
-/// take any of the autotest paths below, whatever the environment says.
-fn autotest_mode() -> bool {
-    cfg!(debug_assertions) && std::env::var("TAROTING_AUTOTEST").is_ok_and(|v| v == "1")
-}
+/// True when this process was launched to run the in-app E2E suite (debug build
+/// + TAROTING_AUTOTEST=1). Lives in `debug.rs` because `paths.rs` needs it too:
+/// under autotest every owner-data location is redirected into a scratch root.
+use debug::autotest_mode;
 
 /// Autotest only: stamp a synchronous flag on `window` before ANY frontend
 /// script runs, so frontend code that must behave differently under test can
@@ -148,6 +145,12 @@ fn main() {
             // deleted the live instance's quick-view files. Only the primary
             // instance reaches setup, and it does so before its event loop
             // serves a single command, so no session of its own can exist yet.
+            if autotest_mode() {
+                // Each E2E run starts from factory defaults in its own scratch
+                // root (paths.rs redirects settings, recents, projects and temp
+                // projects there), and leaves nothing in the owner's folders.
+                let _ = std::fs::remove_dir_all(debug::autotest_root());
+            }
             project::store::cleanup_temp_projects();
             if autotest_mode() {
                 if let Some(win) = app.get_webview_window("main") {
