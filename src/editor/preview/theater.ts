@@ -13,6 +13,7 @@
 // no-op early-return and the bar is display:none.
 
 import { formatTimecode } from "../../core/format";
+import { isTypingTarget, shortcutsBlocked } from "../../core/shortcuts";
 import { icon } from "../../ui/icons";
 import type { MonitorVolumeState } from "../playback/audio-graph";
 import type { PlaybackEngine } from "../playback/engine";
@@ -296,9 +297,13 @@ export function mountTheater(ctx: TheaterCtx): Theater {
   // play/pause keeps working exactly as elsewhere.
   const onKeyDown = (e: KeyboardEvent): void => {
     if (!active) return;
+    // The same two gates the ShortcutManager honours. A dialog or menu owns the
+    // keyboard while it is up: without this, ArrowLeft/Right seeked and Esc
+    // tore theater down BEHIND an open modal (the capture phase runs before the
+    // dialog's own handler, and stopPropagation then starved it of the key).
+    if (shortcutsBlocked() || document.querySelector(".modal-backdrop")) return;
     // typing targets never reach us in this mode, but stay safe if one is focused
-    const t = e.target as HTMLElement | null;
-    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    if (isTypingTarget(e.target)) return;
     reveal();
     if (e.key === "ArrowLeft") {
       e.preventDefault();

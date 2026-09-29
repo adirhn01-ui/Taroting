@@ -114,6 +114,10 @@ const BLANK_OPTIONAL_MEDIA: Partial<MediaRef> = {
   audioRate: undefined,
   audioChannels: undefined,
   generator: undefined,
+  // A still's "this size already accounts for EXIF" stamp: a claim about the
+  // OLD file. Relinked to a video (or anything else the probe does not stamp),
+  // the record must not inherit it.
+  oriented: undefined,
 };
 
 /** Point `mediaId` at a freshly probed file and repair everything that derives

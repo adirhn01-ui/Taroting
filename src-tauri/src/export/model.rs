@@ -49,7 +49,7 @@ pub struct EstimateInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportPreset {
-    /// mp4 | mov | webm | avi | gif
+    /// mp4 | mov | webm | avi | gif — anything else is refused by `container()`.
     pub format: String,
     /// h264 | hevc | av1
     pub vcodec: String,
@@ -101,12 +101,67 @@ impl BitratePreset {
     }
 }
 
+/// The containers the exporter writes: the ONE whitelist every format decision
+/// in the builder is taken from.
+///
+/// `format` stays a plain `String` on the wire (the TypeScript union is the
+/// contract, and the project persists it), so nothing stops a crafted `.trt` —
+/// or a project saved by a newer build that knows a format this one does not —
+/// from carrying any string at all. The muxer choice used to end in
+/// `_ => -f mp4`, which quietly wrote MP4 bytes under whatever extension the user
+/// picked: a file named `.mkv` that is not one. Parsing into this enum up front
+/// makes an unknown format an error before anything is spawned, and every later
+/// `match` is exhaustive, so there is no fallback arm left to land in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Container {
+    Mp4,
+    Mov,
+    Webm,
+    Avi,
+    Gif,
+}
+
+impl Container {
+    /// Exact, case-sensitive: the frontend only ever sends these spellings, so
+    /// anything else ("MP4", "mp4 ") was not written by it.
+    pub fn from_format(format: &str) -> Option<Self> {
+        match format {
+            "mp4" => Some(Self::Mp4),
+            "mov" => Some(Self::Mov),
+            "webm" => Some(Self::Webm),
+            "avi" => Some(Self::Avi),
+            "gif" => Some(Self::Gif),
+            _ => None,
+        }
+    }
+
+    /// ISOBMFF (the mp4/mov family): the containers where `-movflags` and the
+    /// `hvc1` sample-entry tag mean anything.
+    pub fn is_isobmff(self) -> bool {
+        matches!(self, Self::Mp4 | Self::Mov)
+    }
+}
+
 fn round_down_even(v: f64) -> u32 {
     let n = v.floor().max(2.0) as u32;
     n - (n % 2)
 }
 
 impl ExportPreset {
+    /// The whitelisted container for `format`, or `None` for a format this
+    /// build does not write.
+    pub fn container(&self) -> Option<Container> {
+        Container::from_format(&self.format)
+    }
+
+    /// Whether `vcodec` is one of the codecs this build writes. Exact and
+    /// case-sensitive, like `Container::from_format`: the frontend only sends
+    /// these three spellings, and the encoder lookups downstream default an
+    /// unknown one to libx264, so it has to be stopped before them.
+    pub fn vcodec_is_known(&self) -> bool {
+        matches!(self.vcodec.as_str(), "h264" | "hevc" | "av1")
+    }
+
     /// Resolve the output video dimensions (already rounded DOWN to even).
     /// `timeline_w/h` are the project canvas size; named presets keep the
     /// project aspect ratio at the requested height.

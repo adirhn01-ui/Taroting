@@ -105,11 +105,6 @@ fn main() {
     };
     let jobs = Arc::new(jobs::Jobs::default());
 
-    // Wipe leftover quick-view (open-with) scratch projects from a prior run.
-    // Runs before the webview starts — no live session can race the wipe, and it
-    // only ever touches the app's own tmp-projects dir.
-    project::store::cleanup_temp_projects();
-
     let mut builder = tauri::Builder::default()
         // Single-instance MUST be registered first: a second launch is routed to
         // the running window (focus + push path + emit "open-path" as a wake-up)
@@ -146,6 +141,14 @@ fn main() {
         // windows are created before this hook runs, so "main" is always here.
         // A normal run never enters the branch and launches exactly as before.
         .setup(|app| {
+            // Wipe leftover quick-view scratch projects from a prior run. HERE,
+            // not at the top of main(): a second launch only exits inside
+            // plugin initialisation (single-instance), so anything main() does
+            // first also runs in that doomed process — and a sweep there
+            // deleted the live instance's quick-view files. Only the primary
+            // instance reaches setup, and it does so before its event loop
+            // serves a single command, so no session of its own can exist yet.
+            project::store::cleanup_temp_projects();
             if autotest_mode() {
                 if let Some(win) = app.get_webview_window("main") {
                     conceal_autotest_window(&win);

@@ -3850,6 +3850,50 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         navigate({ view: "home" });
       }
     });
+
+    await test("exif-orientation-still", async () => {
+      // A portrait phone photo in miniature: CODED 64x36 landscape, EXIF
+      // orientation 6 (make-fixtures splices the tag in). ffmpeg autorotates
+      // it on decode, so the only size that is right for the export is the
+      // PORTRAIT one — and the probe used to store the coded pair: a squashed
+      // preview and export, and an abort under any crop wider than 36 px or
+      // any opacity keyframe. The other half of the parity is the webview's:
+      // the preview's <img> is sized from these numbers and Chromium applies
+      // the EXIF itself, so its natural size must be the same pair. Nothing is
+      // added to the session's project — this is probe ↔ webview only.
+      const { mediaUrl } = await import("../core/ipc");
+      const path = `${fixturesDir}\\photo_o6.jpg`;
+      const info = await ipc.probeMedia(path);
+      assert(info.kind === "image", `photo_o6.jpg probed as ${info.kind}, not a still`);
+      assert(
+        info.width === 36 && info.height === 64,
+        `probe stored ${info.width}x${info.height}; the decoder hands the filtergraph 36x64 (coded 64x36, orientation 6)`,
+      );
+      assert(info.oriented === true, `probe did not stamp the still as oriented (got ${String(info.oriented)})`);
+
+      const img = new Image();
+      img.src = mediaUrl(path);
+      // decode() rejects if the src is cleared first, so it is given a handler
+      // up front: a timeout must not leave an unhandled rejection behind to
+      // fail the whole run from the errors list.
+      const decoding = img.decode();
+      decoding.catch(() => {});
+      let timer = 0;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = window.setTimeout(() => reject(new Error("timed out decoding photo_o6.jpg")), 5_000);
+      });
+      try {
+        await Promise.race([decoding, timeout]);
+        assert(
+          img.naturalWidth === info.width && img.naturalHeight === info.height,
+          `the webview decodes ${img.naturalWidth}x${img.naturalHeight} but the probe stored ${info.width}x${info.height} — preview and export disagree about this photo's shape`,
+        );
+        return `probe ${info.width}x${info.height} oriented=${String(info.oriented)} (coded 64x36, EXIF 6); webview <img> natural ${img.naturalWidth}x${img.naturalHeight} — WebView2 applies JPEG EXIF orientation, parity holds`;
+      } finally {
+        clearTimeout(timer);
+        img.removeAttribute("src");
+      }
+    });
   } catch (e) {
     results.push({ name: "setup", pass: false, detail: String(e) });
   }

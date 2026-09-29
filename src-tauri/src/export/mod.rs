@@ -14,6 +14,8 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::error::{AppError, Result};
 use crate::hw;
 use crate::jobs::{self, JobId, JobKind, Jobs, Lane};
+use crate::project::schema::MediaRef;
+use crate::project::store::PathIdentity;
 
 use self::builder::{BuiltExport, FILTER_PLACEHOLDER};
 use self::model::ExportSpec;
@@ -158,6 +160,74 @@ fn publish_export(part: &std::path::Path, final_path: &std::path::Path) -> std::
             part.display()
         )
     })
+}
+
+/// Refuse an export whose destination is one of the project's own source files.
+///
+/// Originals are never modified — and an export onto one would modify it
+/// twice over: ffmpeg reads the source while `publish_export` is about to
+/// rename the finished `.part` over it, and the dialog's overwrite strip had no
+/// way to know that the file it offered to "Replace" was one the project reads.
+/// `<out>.part` is checked as well, because ffmpeg runs with `-y` and would
+/// truncate a source that happened to carry that name before reading a frame.
+///
+/// Identity is asked of the filesystem (`canonicalize`, the same question
+/// `path_identity` asks), never of a folding rule, so "C:\Clips\A.mp4" and
+/// "c:\clips\a.MP4" are caught as one file on NTFS and two names a
+/// case-sensitive folder keeps apart are not confused. The destination is
+/// resolved ONCE per candidate rather than once per media item: the sources
+/// are the only thing that varies, and this runs on the main thread before the
+/// job starts, so a project with many clips must not pay two resolutions each.
+/// The mapping is `path_identity`'s: byte-equal is `Same` with no filesystem
+/// call, two resolved paths are `Same` or `Different`, and either side that
+/// will not resolve is `Unknown`.
+///
+/// `Unknown` refuses, except where the answer is already proven: a destination
+/// that does not exist cannot be any file the project reads (this is the normal
+/// export, and it resolves to `Unknown`, so refusing there would block every
+/// export), and neither can a source that is proven absent (it can't be the
+/// destination that does exist). `try_exists` rather than `exists`, because
+/// only `Ok(false)` is proof; a permission error is not. A refusal on
+/// `Unknown` says so ("couldn't check", e.g. an unreachable share) instead of
+/// claiming an overwrite nobody proved.
+fn refuse_overwriting_a_source(out_path: &str, media: &[MediaRef]) -> Result<()> {
+    let out = std::path::PathBuf::from(out_path);
+    let part = std::path::PathBuf::from(format!("{out_path}.part"));
+    for dest in [&out, &part] {
+        if matches!(dest.try_exists(), Ok(false)) {
+            continue;
+        }
+        let real_dest = std::fs::canonicalize(dest).ok();
+        for m in media.iter().filter(|m| m.generator.is_none()) {
+            let src = std::path::Path::new(&m.path);
+            let identity = if dest.as_path() == src {
+                PathIdentity::Same
+            } else {
+                match (&real_dest, std::fs::canonicalize(src).ok()) {
+                    (Some(d), Some(s)) if *d == s => PathIdentity::Same,
+                    (Some(_), Some(_)) => PathIdentity::Different,
+                    _ => PathIdentity::Unknown,
+                }
+            };
+            let name = builder::display_name(&m.path);
+            match identity {
+                PathIdentity::Same => {
+                    return Err(AppError::BadInput(format!(
+                        "This would overwrite {name}, which this project uses. Choose another name."
+                    )));
+                }
+                PathIdentity::Different => {}
+                PathIdentity::Unknown if matches!(src.try_exists(), Ok(false)) => {}
+                PathIdentity::Unknown => {
+                    return Err(AppError::BadInput(format!(
+                        "Couldn't check whether this would overwrite {name}, which this project uses. \
+                         Choose another name."
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /* ------------------------------------------------------------------ */
@@ -402,6 +472,9 @@ pub fn start_export(
     let (encoders, ffmpeg_version) = hw::detect(false);
     let built = builder::build(&spec, &encoders)?;
     let out_path = spec.out_path.clone();
+    // Before anything touches the disk (the text/script temps below, the
+    // `.part`, the publish rename).
+    refuse_overwriting_a_source(&out_path, &spec.media)?;
 
     let (mut final_args, temps) = finalize_args(&built, &out_path)?;
 
@@ -850,6 +923,176 @@ mod unit {
 
         state.clear();
         assert!(state.peek_redacted().is_none(), "a healthy export must clear it");
+    }
+
+    /* -------- (4) never export onto a source -------- */
+
+    /// A source media entry for the overwrite guard: only `path` and
+    /// `generator` are read, the rest is a plausible probe.
+    fn source(id: &str, path: &std::path::Path) -> MediaRef {
+        MediaRef {
+            id: id.into(),
+            path: path.to_string_lossy().into_owned(),
+            size: 17,
+            mtime_ms: 1,
+            kind: "video".into(),
+            duration: 3.0,
+            fps: None,
+            width: Some(640),
+            height: Some(360),
+            container: Some("mov,mp4,m4a,3gp,3g2,mj2".into()),
+            vcodec: Some("h264".into()),
+            acodec: None,
+            pix_fmt: Some("yuv420p".into()),
+            bit_depth: Some(8),
+            has_audio: false,
+            audio_rate: None,
+            audio_channels: None,
+            generator: None,
+        }
+    }
+
+    fn refused_naming(out: &std::path::Path, media: &[MediaRef], name: &str) {
+        let err = refuse_overwriting_a_source(&out.to_string_lossy(), media)
+            .expect_err("an export onto a source must be refused");
+        assert!(matches!(err, AppError::BadInput(_)), "wrong variant: {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("overwrite {name},")), "must name {name}: {msg}");
+        assert!(msg.contains("Choose another name"), "must say what to do: {msg}");
+    }
+
+    /// Real files throughout: the guard's whole point is to ask the filesystem,
+    /// so a test that only compared strings would prove nothing about it. The
+    /// source is listed SECOND behind an unrelated one, so a guard that only
+    /// looked at `media[0]` fails here.
+    #[test]
+    fn an_export_onto_one_of_the_projects_own_files_is_refused() {
+        let dir = publish_dir("guard-same");
+        let other = dir.join("Intro.mov");
+        let src = dir.join("Holiday Clip.mp4");
+        std::fs::write(&other, b"intro").unwrap();
+        std::fs::write(&src, b"the original footage").unwrap();
+        let media = [source("m1", &other), source("m2", &src)];
+
+        refused_naming(&src, &media, "Holiday Clip.mp4");
+        // The same file spelled through a `..` detour is still the same file.
+        let detour = dir.join("sub").join("..").join("Holiday Clip.mp4");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        refused_naming(&detour, &media, "Holiday Clip.mp4");
+
+        assert_eq!(std::fs::read(&src).unwrap(), b"the original footage");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NTFS folds case, so this spelling IS the source. A byte comparison would
+    /// have waved it through and the publish rename would have replaced it.
+    #[cfg(windows)]
+    #[test]
+    fn the_same_source_spelled_in_another_case_is_still_refused() {
+        let dir = publish_dir("guard-case");
+        let src = dir.join("Holiday Clip.mp4");
+        std::fs::write(&src, b"the original footage").unwrap();
+        let media = [source("m1", &src)];
+
+        for spelling in ["holiday clip.mp4", "HOLIDAY CLIP.MP4", "Holiday Clip.MP4"] {
+            refused_naming(&dir.join(spelling), &media, "Holiday Clip.mp4");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Replacing an earlier export, or any file the project does not read, is
+    /// an ordinary overwrite and stays the user's call in the dialog.
+    #[test]
+    fn replacing_a_file_the_project_does_not_use_is_allowed() {
+        let dir = publish_dir("guard-other");
+        let src = dir.join("Holiday Clip.mp4");
+        let previous = dir.join("Holiday Clip export.mp4");
+        std::fs::write(&src, b"the original footage").unwrap();
+        std::fs::write(&previous, b"last week's export").unwrap();
+
+        refuse_overwriting_a_source(&previous.to_string_lossy(), &[source("m1", &src)])
+            .expect("an unrelated existing file may be replaced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The normal export: nothing at the destination yet. `path_identity`
+    /// answers `Unknown` for a path that does not exist, and reading that as
+    /// "refuse" would block every export there is. A source that is missing
+    /// too (moved, offline drive) must not trip it either: it can't be a file
+    /// that does not exist.
+    #[test]
+    fn a_destination_that_does_not_exist_yet_is_never_refused() {
+        let dir = publish_dir("guard-new");
+        let src = dir.join("Holiday Clip.mp4");
+        std::fs::write(&src, b"the original footage").unwrap();
+        let missing = dir.join("Offline Drive Clip.mp4");
+        let media = [source("m1", &src), source("m2", &missing)];
+
+        let fresh = dir.join("Holiday Clip final.mp4");
+        refuse_overwriting_a_source(&fresh.to_string_lossy(), &media)
+            .expect("a new file cannot be a source");
+
+        // ...and an EXISTING destination next to a missing source is decided by
+        // the sources that exist, not refused on the missing one's `Unknown`.
+        let previous = dir.join("Holiday Clip export.mp4");
+        std::fs::write(&previous, b"last week's export").unwrap();
+        refuse_overwriting_a_source(&previous.to_string_lossy(), &media)
+            .expect("a proven-absent source is not the destination");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ffmpeg writes `<out>.part` with `-y`, so a source carrying that name
+    /// would be truncated before the first frame was read, even though the
+    /// destination itself is new.
+    #[test]
+    fn a_source_named_like_the_part_file_is_refused() {
+        let dir = publish_dir("guard-part");
+        let src = dir.join("Reel.mp4.part");
+        std::fs::write(&src, b"a source that happens to end in .part").unwrap();
+
+        refused_naming(&dir.join("Reel.mp4"), &[source("m1", &src)], "Reel.mp4.part");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A source the filesystem cannot be asked about at all (an unreachable
+    /// share behaves the same way; a NUL in the name is the portable way to
+    /// make `try_exists` fail rather than answer `false`) is not PROVEN to be
+    /// the destination, so the refusal must not claim an overwrite: it says the
+    /// check failed. A proven `Same` keeps the plain wording.
+    #[test]
+    fn an_unanswerable_source_is_refused_as_unchecked_not_as_an_overwrite() {
+        let dir = publish_dir("guard-unknown");
+        let previous = dir.join("Holiday Clip export.mp4");
+        std::fs::write(&previous, b"last week's export").unwrap();
+        let unreadable = dir.join("Rem\0ote Clip.mp4");
+        assert!(unreadable.try_exists().is_err(), "premise: the source cannot be checked");
+
+        let err = refuse_overwriting_a_source(&previous.to_string_lossy(), &[source("m1", &unreadable)])
+            .expect_err("an unprovable source must still refuse");
+        assert!(matches!(err, AppError::BadInput(_)), "wrong variant: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("Couldn't check whether this would overwrite Rem"),
+            "must say it could not check: {msg}"
+        );
+        assert!(!msg.contains("This would overwrite"), "must not claim an overwrite: {msg}");
+        assert!(msg.contains("Choose another name"), "must say what to do: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Generated media have no file; their `path` is a placeholder and never
+    /// names anything on disk, so it is not compared at all.
+    #[test]
+    fn generated_media_never_count_as_a_source() {
+        let dir = publish_dir("guard-gen");
+        let out = dir.join("Titles.mp4");
+        std::fs::write(&out, b"previous export").unwrap();
+        let mut gen = source("m1", &out);
+        gen.generator = Some(crate::project::schema::Generator::Solid { color: "#123456".into() });
+
+        refuse_overwriting_a_source(&out.to_string_lossy(), &[gen])
+            .expect("a generator is not a file the export could overwrite");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

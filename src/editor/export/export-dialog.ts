@@ -212,6 +212,71 @@ export function resolveCodec(format: Format, wanted: Codec): Codec {
   return CODEC_FALLBACK[wanted].find((c) => allowed.includes(c)) ?? allowed[0]!;
 }
 
+/**
+ * The opening format, taken from the project's persisted preset — which is a
+ * value out of a `.trt` file, not out of this dialog. The type says it is one of
+ * five strings; a crafted project, or one saved by a newer build with a format
+ * this one does not know, says otherwise. Left as-is it named the output file
+ * (`clip.mkv`), labelled the save filter, and reached the backend, which now
+ * refuses it. A format this build does not write opens as MP4 instead.
+ */
+export function whitelistFormat(value: unknown): Format {
+  return FORMATS.some((f) => f.value === value) ? (value as Format) : "mp4";
+}
+
+/**
+ * The opening codec, whitelisted the same way. It has to be settled BEFORE
+ * `resolveCodec` sees it: that indexes `CODEC_FALLBACK[wanted]`, and an unknown
+ * codec there is `undefined.find(...)`, a TypeError that takes the whole dialog
+ * down on open. An unknown one opens as the format's first choice rather than as
+ * a fixed H.264, so WebM does not arrive with a note about moving the user off
+ * an H.264 they never picked.
+ */
+export function whitelistCodec(value: unknown, format: Format): Codec {
+  const known = Object.keys(CODEC_LABELS) as Codec[];
+  return known.includes(value as Codec) ? (value as Codec) : codecsForFormat(format)[0]!;
+}
+
+/** A path compared the way Windows names files: separators unified, ASCII case
+ *  folded. ASCII only, on purpose: `toLowerCase` is full Unicode while NTFS
+ *  folds with a much narrower table, so "Straße" and "Straẞe" (or a Kelvin
+ *  sign and a K) are two files there and must not read as one. A UI hint only —
+ *  the backend asks the filesystem itself. */
+function comparablePath(path: string): string {
+  return path.replace(/\//g, "\\").replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
+/**
+ * Whether `target` is one of the files this project reads. Exporting onto one
+ * would replace an original, so the overwrite strip must not offer Replace for
+ * it. Generated media have no file (their `path` is a placeholder) and never
+ * match. The backend refuses the same export on its own; this only keeps the
+ * dialog from offering a button that is bound to fail.
+ */
+export function isProjectSource(
+  target: string,
+  media: readonly { path: string; generator?: unknown }[],
+): boolean {
+  const want = comparablePath(target);
+  return media.some((m) => !m.generator && comparablePath(m.path) === want);
+}
+
+/** What the Export button may do with the chosen path: write it (`free`),
+ *  offer to replace what is there (`replace`), or refuse it because it is one
+ *  of the project's own files (`ownFile`: no Replace, only another name). A
+ *  path that does not exist yet cannot be a source, exactly as the backend
+ *  decides it. */
+export type OverwriteOffer = "free" | "replace" | "ownFile";
+
+export function overwriteOffer(
+  target: string,
+  exists: boolean,
+  media: readonly { path: string; generator?: unknown }[],
+): OverwriteOffer {
+  if (!exists) return "free";
+  return isProjectSource(target, media) ? "ownFile" : "replace";
+}
+
 const RESOLUTIONS: { value: string; label: string }[] = [
   { value: "original", label: "Original" },
   { value: "4320p", label: "8K (4320p)" },
@@ -312,8 +377,10 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
      estimate or the export itself reads `session.project` live, so an edit made
      while this dialog is open is the one that gets exported. */
   const start = session.project.export;
-  let format: Format = start.format;
-  let codec: Codec = start.vcodec;
+  // Whitelisted first: everything below (the file extension, the codec list,
+  // the gif-only rows) is derived from these two.
+  let format: Format = whitelistFormat(start.format);
+  let codec: Codec = whitelistCodec(start.vcodec, format);
   let resolution: ResolutionPreset = start.resolution;
   let fps: "original" | number = start.fps;
   let videoBitrate: "auto" | number = start.videoBitrate;
@@ -861,15 +928,22 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
   }
 
   /* -------- overwrite warning strip -------- */
-  function showOverwriteWarning(onReplace: () => void, onRename: () => void): void {
+  /** `onReplace: null` is the strip for one of the project's own source files:
+   *  the name is refused outright, so there is no Replace to offer — only a
+   *  different name, or Cancel. */
+  function showOverwriteWarning(onReplace: (() => void) | null, onRename: () => void): void {
     const slot = backdrop.querySelector<HTMLElement>("#ex-warn-slot");
     if (!slot) return;
+    const msg =
+      onReplace === null
+        ? "This is one of this project's own files. Choose another name."
+        : "A file with this name already exists.";
     slot.innerHTML = `
       <div class="export-warn">
         ${icon("warning", 16)}
-        <div class="export-warn__msg">A file with this name already exists.</div>
+        <div class="export-warn__msg">${msg}</div>
         <div class="export-warn__actions">
-          <button class="btn btn--sm" data-w="replace">Replace</button>
+          ${onReplace === null ? "" : `<button class="btn btn--sm" data-w="replace">Replace</button>`}
           <button class="btn btn--sm" data-w="rename">Rename</button>
           <button class="btn btn--sm" data-w="cancel">Cancel</button>
         </div>
@@ -877,10 +951,12 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     const clear = (): void => {
       slot.innerHTML = "";
     };
-    slot.querySelector('[data-w="replace"]')!.addEventListener("click", () => {
-      clear();
-      onReplace();
-    });
+    if (onReplace !== null) {
+      slot.querySelector('[data-w="replace"]')!.addEventListener("click", () => {
+        clear();
+        onReplace();
+      });
+    }
     slot.querySelector('[data-w="rename"]')!.addEventListener("click", () => {
       clear();
       onRename();
@@ -918,9 +994,11 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     });
 
     const target = outPath();
-    if (await pathExists(target)) {
+    // Media read live, like everything else the export is built from.
+    const offer = overwriteOffer(target, await pathExists(target), session.project.media);
+    if (offer !== "free") {
       showOverwriteWarning(
-        () => void beginExport(target),
+        offer === "replace" ? () => void beginExport(target) : null,
         () => {
           // auto-suffix until the filesystem says the name is free
           void resolveRenameThenExport();

@@ -53,6 +53,13 @@ export interface MediaRef {
   audioChannels?: number;
   /** present → synthetic media (solid/text); no file is probed */
   generator?: Generator;
+  /** Stills only: `width`/`height` already account for the file's EXIF
+   *  orientation (they are what the decoder hands the filtergraph, the same
+   *  invariant schema 2 records for video). Stamped by `probe_media` on every
+   *  new still and by the load-time orientation repair; a still without it is
+   *  re-checked against its file header once. The repair is idempotent without
+   *  the flag — it only saves the re-check — so a copy that loses it is safe. */
+  oriented?: true;
 }
 
 /** What `probe_media` returns — a MediaRef without an assigned id. */
@@ -271,8 +278,9 @@ export interface Settings {
   proxyMedia: boolean;
   /** drag a clip on the canvas → snap its center to the project center */
   snapCenterGuides: boolean;
-  /** open-with a media file from Explorer → temporary project (kept only if the
-   *  user presses Back in the editor). Off = the classic permanent-project flow. */
+  /** open-with a media file from Explorer → temporary project; leaving the
+   *  editor asks Keep (→ Documents) or Discard. Off = the classic
+   *  permanent-project flow. */
   tempOpenWith: boolean;
   /** preview/monitor listening level 0..1 — NOT baked into clips or exports */
   monitorVolume: number;

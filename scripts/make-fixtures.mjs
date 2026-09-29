@@ -110,6 +110,58 @@ run("tone.aac", ["-f", "lavfi", "-i", "sine=frequency=392:duration=30", "-c:a", 
 
 /* --- stills + sequence --- */
 run("photo.png", ["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=1:duration=1", "-frames:v", "1"]);
+
+/* --- EXIF orientation: a portrait phone photo in miniature. CODED 64x36
+   landscape, tagged orientation 6 (turn 90° clockwise), which ffmpeg's
+   autorotate and the webview both show as 36x64 — pins probe ↔ decoder ↔ <img>
+   parity for turned stills. ffmpeg will not write the tag itself, so the frame
+   is encoded plain and an APP1 "Exif" segment is spliced in right after SOI,
+   dropping the JFIF APP0: the exact layout a camera writes. */
+function tiffOrientation(o) {
+  // Big-endian TIFF header + IFD0 holding one SHORT entry, 0x0112 = o.
+  const b = Buffer.alloc(26);
+  b.write("MM", 0, "ascii");
+  b.writeUInt16BE(42, 2);
+  b.writeUInt32BE(8, 4);
+  b.writeUInt16BE(1, 8);
+  b.writeUInt16BE(0x0112, 10);
+  b.writeUInt16BE(3, 12);
+  b.writeUInt32BE(1, 14);
+  b.writeUInt16BE(o, 18);
+  b.writeUInt32BE(0, 22);
+  return b;
+}
+function jpegWithOrientation(src, o) {
+  if (src[0] !== 0xff || src[1] !== 0xd8) throw new Error("not a JPEG");
+  const kept = [];
+  let i = 2;
+  while (i < src.length) {
+    if (src[i] !== 0xff) throw new Error(`bad JPEG marker at ${i}`);
+    const m = src[i + 1];
+    if (m === 0xda) {
+      kept.push(src.subarray(i)); // SOS: the rest verbatim
+      break;
+    }
+    const len = src.readUInt16BE(i + 2);
+    if (m !== 0xe0) kept.push(src.subarray(i, i + 2 + len));
+    i += 2 + len;
+  }
+  const payload = Buffer.concat([Buffer.from("Exif\0\0", "binary"), tiffOrientation(o)]);
+  const app1 = Buffer.from([0xff, 0xe1, 0, 0]);
+  app1.writeUInt16BE(payload.length + 2, 2);
+  return Buffer.concat([Buffer.from([0xff, 0xd8]), app1, payload, ...kept]);
+}
+const turned = path.join(outDir, "photo_o6.jpg");
+if (!fs.existsSync(turned)) {
+  console.log("create photo_o6.jpg");
+  const plain = path.join(outDir, "photo_o6.plain.jpg");
+  execFileSync(ffmpeg, [
+    "-y", "-hide_banner", "-loglevel", "error",
+    "-f", "lavfi", "-i", "testsrc2=size=64x36", "-frames:v", "1", plain,
+  ]);
+  fs.writeFileSync(turned, jpegWithOrientation(fs.readFileSync(plain), 6));
+  fs.rmSync(plain);
+}
 const seqDir = path.join(outDir, "png_sequence");
 if (!fs.existsSync(seqDir)) {
   console.log("create png_sequence/ (90 frames)");

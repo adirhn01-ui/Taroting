@@ -5,13 +5,17 @@ import {
   codecsForFormat,
   gateHardware,
   hardwareBlockedBy,
+  isProjectSource,
   joinPath,
   mergeExportPreset,
+  overwriteOffer,
   RENAME_ATTEMPT_LIMIT,
   renameWithSuffix,
   resolveCodec,
   sanitizeFileName,
   splitPath,
+  whitelistCodec,
+  whitelistFormat,
   type PresetEdits,
 } from "./export-dialog";
 
@@ -372,5 +376,107 @@ describe("splitPath", () => {
   });
   it("handles a bare file name", () => {
     expect(splitPath("out.mp4")).toEqual({ dir: "", file: "out.mp4" });
+  });
+});
+
+/* A `.trt` is hand-editable and shareable, and a newer build may know formats
+   this one does not: the persisted preset is data, not a promise that it matches
+   the ExportPreset type. */
+describe("whitelistFormat", () => {
+  it("keeps every format this build writes", () => {
+    for (const f of ["mp4", "mov", "webm", "avi", "gif"]) expect(whitelistFormat(f)).toBe(f);
+  });
+  it("opens anything else as MP4, near-misses included", () => {
+    for (const f of ["mkv", "MP4", "mp4 ", "", "__proto__", "toString", null, undefined, 4, {}]) {
+      expect(whitelistFormat(f)).toBe("mp4");
+    }
+  });
+});
+
+describe("whitelistCodec", () => {
+  it("keeps every codec this build knows, whatever the format", () => {
+    for (const c of ["h264", "hevc", "av1"] as const) {
+      expect(whitelistCodec(c, "mp4")).toBe(c);
+      expect(whitelistCodec(c, "webm")).toBe(c); // resolveCodec, not this, moves it
+    }
+  });
+  it("opens an unknown codec as the format's own first choice", () => {
+    // Every format with a different answer, so a fixed fallback cannot pass.
+    expect(whitelistCodec("vp9", "webm")).toBe("av1");
+    expect(whitelistCodec("vp9", "mp4")).toBe("h264");
+    expect(whitelistCodec("H264", "mov")).toBe("h264");
+    expect(whitelistCodec("__proto__", "avi")).toBe("h264");
+    expect(whitelistCodec(undefined, "webm")).toBe("av1");
+  });
+  it("hands resolveCodec only values it can index — an unknown one used to throw on open", () => {
+    for (const format of ["mp4", "mov", "webm", "avi", "gif"] as const) {
+      for (const raw of ["vp9", "", "constructor", null]) {
+        const codec = whitelistCodec(raw, format);
+        expect(() => resolveCodec(format, codec)).not.toThrow();
+        // WebM + garbage lands on a pair the backend accepts, with no move to
+        // report: the codec was never H.264 to begin with.
+        expect(resolveCodec(format, codec)).toBe(codec);
+      }
+    }
+  });
+});
+
+describe("isProjectSource", () => {
+  const media = [
+    { path: "C:\\Clips\\Intro.mov" },
+    { path: "D:\\Footage\\Holiday Clip.mp4" },
+    { path: "gen", generator: { type: "solid", color: "#123456" } },
+  ];
+  it("matches a source listed after an unrelated one", () => {
+    expect(isProjectSource("D:\\Footage\\Holiday Clip.mp4", media)).toBe(true);
+  });
+  it("matches across case and separator spelling, as Windows names files", () => {
+    expect(isProjectSource("d:\\footage\\HOLIDAY CLIP.MP4", media)).toBe(true);
+    expect(isProjectSource("D:/Footage/Holiday Clip.mp4", media)).toBe(true);
+  });
+  it("does not match a different file in the same folder, or the same name elsewhere", () => {
+    expect(isProjectSource("D:\\Footage\\Holiday Clip export.mp4", media)).toBe(false);
+    expect(isProjectSource("E:\\Footage\\Holiday Clip.mp4", media)).toBe(false);
+  });
+  it("never matches a generated media's placeholder path", () => {
+    expect(isProjectSource("gen", media)).toBe(false);
+  });
+  it("folds ASCII case only: pairs NTFS keeps as two files are not one source", () => {
+    // Full-Unicode lower-casing calls both pairs equal; NTFS's own table does
+    // not, so treating them as one would hide the Replace button for a file
+    // the project never reads.
+    for (const [source, other] of [
+      ["Stra\u00DFe.mp4", "Stra\u1E9Ee.mp4"],
+      ["Kelvin.mp4", "\u212Aelvin.mp4"],
+    ] as const) {
+      const at = (name: string) => "D:\\Footage\\" + name;
+      expect(isProjectSource(at(source), [{ path: at(source) }])).toBe(true);
+      expect(isProjectSource(at(other), [{ path: at(source) }])).toBe(false);
+    }
+  });
+});
+
+describe("overwriteOffer", () => {
+  const media = [{ path: "D:\\Footage\\Holiday Clip.mp4" }];
+  it("offers Replace for an existing file the project does not read", () => {
+    expect(overwriteOffer("D:\\Footage\\Holiday Clip export.mp4", true, media)).toBe("replace");
+  });
+  it("never offers Replace for one of the project's own files", () => {
+    expect(overwriteOffer("D:\\Footage\\Holiday Clip.mp4", true, media)).toBe("ownFile");
+    expect(overwriteOffer("d:/footage/holiday clip.MP4", true, media)).toBe("ownFile");
+  });
+  it("decides each path on its own — a source after a replaceable file, and back", () => {
+    // No confirmation carries over from one choice to the next.
+    const seq = [
+      ["D:\\Footage\\Holiday Clip export.mp4", "replace"],
+      ["D:\\Footage\\Holiday Clip.mp4", "ownFile"],
+      ["D:\\Footage\\Holiday Clip export.mp4", "replace"],
+    ] as const;
+    for (const [target, want] of seq) expect(overwriteOffer(target, true, media)).toBe(want);
+  });
+  it("writes a path that does not exist yet, even one spelled like a source", () => {
+    // Nothing there to overwrite; the backend decides it the same way.
+    expect(overwriteOffer("D:\\Footage\\Brand new.mp4", false, media)).toBe("free");
+    expect(overwriteOffer("D:\\Footage\\Holiday Clip.mp4", false, media)).toBe("free");
   });
 });

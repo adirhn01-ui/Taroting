@@ -249,6 +249,25 @@ describe("applyRelink", () => {
     expect(after.srcOut).toBeGreaterThan(after.srcIn);
   });
 
+  it("drops the old still's EXIF stamp unless the new probe stamps it too", () => {
+    // `oriented` vouches that the stored size already accounts for the OLD
+    // file's EXIF orientation. `updateMedia` merges, so a probe that does not
+    // report the field (a video, say) would inherit that claim — and the
+    // load-time orientation repair skips any stamped still unread.
+    const stamped: MediaInfo = { ...imageInfo, oriented: true };
+    const { p, mediaId } = projectWith(stamped);
+    expect(findMedia(p, mediaId)!.oriented).toBe(true);
+
+    const toVideo = findMedia(applyRelink(p, mediaId, originalInfo.path, originalInfo), mediaId)!;
+    expect(toVideo.oriented).toBeUndefined();
+    // ...and it is not written to the `.trt` either.
+    expect(JSON.parse(JSON.stringify(toVideo))).not.toHaveProperty("oriented");
+
+    // A fresh still is stamped by its own probe: that stamp must survive.
+    const other: MediaInfo = { ...stamped, path: "D:\\other.jpg", width: 3000, height: 4000 };
+    expect(findMedia(applyRelink(p, mediaId, other.path, other), mediaId)!.oriented).toBe(true);
+  });
+
   it("relinking an image to another image never collapses the clip", () => {
     const { p, mediaId, clipId } = projectWith(imageInfo);
     const q = applyRelink(p, mediaId, "D:\\other.jpg", {

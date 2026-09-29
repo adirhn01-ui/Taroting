@@ -19,7 +19,7 @@
 use std::ffi::OsString;
 
 use crate::error::{AppError, Result};
-use crate::export::model::{BitratePreset, ExportSpec};
+use crate::export::model::{BitratePreset, Container, ExportSpec};
 use crate::hw::EncoderReport;
 use crate::project::schema::{
     Clip, Generator, Keyframe, MediaRef, Track,
@@ -604,19 +604,63 @@ fn clip_audible(clip: &Clip, media: &MediaRef, track: &Track) -> bool {
     media.has_audio && !clip.audio.muted && !clip.audio.detached && !track.muted
 }
 
+/// Whether ffmpeg will open this still with a demuxer that takes `-loop`.
+///
+/// `-loop` is a private option of the image2 family ("image2" itself and the
+/// per-codec "*_pipe" demuxers: png_pipe, jpeg_pipe, webp_pipe, ...). Handed to
+/// any other demuxer it is not an ignored hint but a fatal "Option loop not
+/// found" before a single frame is read, and the stills that land there are
+/// exactly the ones an older probe called "image": AVIF/HEIC (demuxed by mov),
+/// ico, apng. `container` is ffprobe's `format_name` for the same file ffmpeg
+/// is about to open, so it names the demuxer that will receive the flag. The
+/// test itself is the probe's `is_image2_family`, the one that made the file a
+/// still in the first place, so there is a single rule and the probe can never
+/// hand this a still it refuses. This wrapper adds only the `MediaRef` plumbing:
+/// a project written before that rule (or crafted) is what reaches the `false`
+/// arm, and so is a missing `container`, which a real probe never leaves empty.
+fn loops_as_still(media: &MediaRef) -> bool {
+    media
+        .container
+        .as_deref()
+        .is_some_and(crate::media::probe::is_image2_family)
+}
+
+/// The file-name part of a media path, for messages the user reads. Never
+/// slices: `Path::file_name` does its own splitting on separators.
+pub(crate) fn display_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
 /// Register a video clip's frame source, pushing a File input entry when the
 /// media is a real file (generated media consume no slot).
+///
+/// A still ("image" kind) that ffmpeg would not open with an image2-family
+/// demuxer is REFUSED here, naming the file. There is no honest fallback: `-loop`
+/// on it is fatal (see `loops_as_still`), and feeding it through the `-ss/-to`
+/// window instead would hand one frame to an `overlay=...:shortest=1` whose
+/// black base is the full slot, so the segment would end after that frame and
+/// every later clip would slide earlier, silently, out of step with its audio.
 fn register_clip_input(
     inputs: &mut Vec<InputEntry>,
     clip: &Clip,
     media: &MediaRef,
-) -> ClipInput {
+) -> Result<ClipInput> {
     if let Some(gen) = &media.generator {
-        return ClipInput::Generated(gen.clone());
+        return Ok(ClipInput::Generated(gen.clone()));
     }
     let idx = inputs.len();
     let mut flags: Vec<OsString> = Vec::new();
     if media.kind == "image" {
+        if !loops_as_still(media) {
+            return Err(AppError::BadInput(format!(
+                "{} can't be exported as a still image. Remove it from the project \
+                 and add it again, then export.",
+                display_name(&media.path)
+            )));
+        }
         flags.push("-loop".into());
         flags.push("1".into());
         // SOURCE seconds, not timeline seconds. `emit_clip_chain` puts a
@@ -641,7 +685,7 @@ fn register_clip_input(
         flags,
         source: InputSource::File(OsString::from(&media.path)),
     });
-    ClipInput::File(idx)
+    Ok(ClipInput::File(idx))
 }
 
 /* ------------------------------------------------------------------ */
@@ -694,11 +738,33 @@ fn atempo_factors(speed: f64) -> Vec<f64> {
 
 pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport> {
     let preset = &spec.preset;
-    let format = preset.format.as_str();
-    let is_gif = format == "gif";
 
     // --- validation -------------------------------------------------
-    if format == "webm" && (preset.vcodec == "h264" || preset.vcodec == "hevc") {
+    // The format first: every later container decision (the gif palette
+    // pipeline, audio on/off, codec and muxer flags) is taken from `container`,
+    // so an unknown one must stop here rather than reach a default. The string
+    // itself is not echoed: it came out of a project file and may be anything.
+    let container = preset.container().ok_or_else(|| {
+        AppError::BadInput(
+            "This project asks for an export format Taroting doesn't write. \
+             Choose MP4, MOV, WebM, AVI or GIF."
+                .into(),
+        )
+    })?;
+    // The codec is a plain string on the wire too, and `software_lib` /
+    // `chosen_encoder` end in `_ => libx264`: an unknown one would be encoded
+    // as H.264 under a project that asked for something else. Stop it here, by
+    // the same exact whitelist as the format.
+    if !preset.vcodec_is_known() {
+        return Err(AppError::BadInput(
+            "This project asks for a video codec Taroting doesn't write. \
+             Choose H.264, H.265 or AV1."
+                .into(),
+        ));
+    }
+    let is_gif = container == Container::Gif;
+
+    if container == Container::Webm && (preset.vcodec == "h264" || preset.vcodec == "hevc") {
         return Err(AppError::BadInput(
             "webm only supports the av1 (or vp9) video codec, not h264/hevc".into(),
         ));
@@ -779,7 +845,7 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
             if gap > 0.0005 {
                 segments.push(Segment::Gap(gap));
             }
-            let input = register_clip_input(&mut inputs, clip, media);
+            let input = register_clip_input(&mut inputs, clip, media)?;
             segments.push(Segment::Clip(VideoSeg { input, clip: clip.clone() }));
             cursor = clip.end();
         }
@@ -813,7 +879,7 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
                         clip.media_id
                     ))
                 })?;
-                let input = register_clip_input(&mut inputs, clip, media);
+                let input = register_clip_input(&mut inputs, clip, media)?;
                 layer.push(OverlayClip { input, clip: clip.clone() });
             }
             overlay_layers.push(layer);
@@ -928,20 +994,20 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     if is_gif {
         // palette pipeline handles color
     } else {
-        push_video_codec(&mut args, spec, encoders);
+        push_video_codec(&mut args, spec, container, encoders);
     }
 
     if is_gif {
         // gif has no audio
     } else if want_audio {
-        push_audio_codec(&mut args, spec);
+        push_audio_codec(&mut args, spec, container);
         args.push("-ar".into());
         args.push("48000".into());
     } else {
         args.push("-an".into());
     }
 
-    push_container(&mut args, format);
+    push_container(&mut args, container);
     args.push(OsString::from(&spec.out_path));
 
     Ok(BuiltExport {
@@ -1437,7 +1503,12 @@ fn push(args: &mut Vec<OsString>, items: &[&str]) {
     args.extend(items.iter().map(OsString::from));
 }
 
-fn push_video_codec(args: &mut Vec<OsString>, spec: &ExportSpec, encoders: &EncoderReport) {
+fn push_video_codec(
+    args: &mut Vec<OsString>,
+    spec: &ExportSpec,
+    container: Container,
+    encoders: &EncoderReport,
+) {
     let enc = chosen_encoder(spec, encoders);
     push(args, &["-c:v", &enc]);
 
@@ -1460,8 +1531,7 @@ fn push_video_codec(args: &mut Vec<OsString>, spec: &ExportSpec, encoders: &Enco
     // mp4/mov ONLY. `hvc1` is an ISOBMFF sample-entry type and means nothing to
     // the other muxers; webm cannot carry hevc at all (rejected in `build`), gif
     // never reaches this function, and avi wants a fourcc, not a sample entry.
-    let is_isobmff = matches!(spec.preset.format.as_str(), "mp4" | "mov");
-    if is_isobmff && spec.preset.vcodec == "hevc" {
+    if container.is_isobmff() && spec.preset.vcodec == "hevc" {
         push(args, &["-tag:v", "hvc1"]);
     }
 
@@ -1512,12 +1582,14 @@ fn push_quality(args: &mut Vec<OsString>, enc: &str) {
     }
 }
 
-fn push_audio_codec(args: &mut Vec<OsString>, spec: &ExportSpec) {
-    let format = spec.preset.format.as_str();
-    let (codec, auto_kbps) = match format {
-        "webm" => ("libopus", 160u64),
-        "avi" => ("libmp3lame", 192u64),
-        _ => ("aac", 192u64),
+fn push_audio_codec(args: &mut Vec<OsString>, spec: &ExportSpec, container: Container) {
+    // Gif never gets here (it has no audio stream); it shares the aac arm only
+    // because the match is exhaustive, which is the point: a new container has
+    // to choose its audio codec rather than inherit one.
+    let (codec, auto_kbps) = match container {
+        Container::Webm => ("libopus", 160u64),
+        Container::Avi => ("libmp3lame", 192u64),
+        Container::Mp4 | Container::Mov | Container::Gif => ("aac", 192u64),
     };
     push(args, &["-c:a", codec]);
     match spec.preset.audio_bitrate {
@@ -1526,14 +1598,16 @@ fn push_audio_codec(args: &mut Vec<OsString>, spec: &ExportSpec) {
     }
 }
 
-fn push_container(args: &mut Vec<OsString>, format: &str) {
-    match format {
-        "mp4" => push(args, &["-movflags", "+faststart", "-f", "mp4"]),
-        "mov" => push(args, &["-movflags", "+faststart", "-f", "mov"]),
-        "webm" => push(args, &["-f", "webm"]),
-        "avi" => push(args, &["-f", "avi"]),
-        "gif" => push(args, &["-f", "gif"]),
-        _ => push(args, &["-f", "mp4"]),
+/// The muxer is always named (`-f`), never inferred from the extension: ffmpeg
+/// writes to `<out>.part`, which says nothing. Exhaustive on purpose, so there
+/// is no default muxer for an unknown format to land in (see `Container`).
+fn push_container(args: &mut Vec<OsString>, container: Container) {
+    match container {
+        Container::Mp4 => push(args, &["-movflags", "+faststart", "-f", "mp4"]),
+        Container::Mov => push(args, &["-movflags", "+faststart", "-f", "mov"]),
+        Container::Webm => push(args, &["-f", "webm"]),
+        Container::Avi => push(args, &["-f", "avi"]),
+        Container::Gif => push(args, &["-f", "gif"]),
     }
 }
 
@@ -2453,10 +2527,192 @@ mod tests {
 
     /// A still image: the only input kind that gets `-loop 1 -t <len>` instead
     /// of an `-ss`/`-to` source window. Dims differ from every canvas used here.
+    ///
+    /// Everything a probe reports for a real still, not a video fixture with its
+    /// kind swapped: this helper used to keep `media`'s `container: "mp4"`,
+    /// which is precisely the stale-probe shape `-loop` cannot open (and which
+    /// `build` now refuses), so every image test was exercising a project that
+    /// could not have exported.
     fn image_media(id: &str, path: &str) -> MediaRef {
         let mut m = media(id, path, 854, 482, false);
         m.kind = "image".into();
+        m.container = Some("image2".into());
+        m.vcodec = Some("png".into());
+        m.acodec = None;
+        m.pix_fmt = Some("rgba".into());
+        m.fps = None;
+        m.duration = 0.04;
+        m.audio_rate = None;
+        m.audio_channels = None;
         m
+    }
+
+    /// Every container ffprobe reports for a file that is NOT opened by an
+    /// image2-family demuxer, next to the stills that are. The stale-probe
+    /// cases are the real ones: AVIF/HEIC come back as the mov family, `.ico`
+    /// as "ico", an animated PNG as "apng".
+    const NOT_IMAGE2: &[Option<&str>] = &[
+        Some("mov,mp4,m4a,3gp,3g2,mj2"),
+        Some("ico"),
+        Some("apng"),
+        Some("mp4"),
+        None,
+    ];
+    const IMAGE2: &[&str] = &["image2", "png_pipe", "jpeg_pipe", "webp_pipe"];
+
+    #[test]
+    fn a_still_ffmpeg_cannot_loop_is_refused_by_name_in_either_layer() {
+        // Bottom track (the concat pipeline) and a higher track (an overlay
+        // stage) register their inputs through the same door; pin both, and
+        // pin that the refusal names the FILE, not the media id.
+        for container in NOT_IMAGE2 {
+            let mut bad = image_media("m1", r"C:\pics\Holiday photo.avif");
+            bad.container = container.map(|c| c.to_string());
+            let vid = media("m2", r"C:\v.mp4", 1918, 1078, true);
+
+            let bottom = timeline(
+                1280,
+                720,
+                Rational { num: 30, den: 1 },
+                vec![vtrack(vec![clip("c1", "m1", 0.0, 0.0, 3.0)])],
+            );
+            let top = timeline(
+                1280,
+                720,
+                Rational { num: 30, den: 1 },
+                vec![
+                    vtrack_id("top", vec![clip("c1", "m1", 1.0, 0.0, 3.0)]),
+                    vtrack_id("bot", vec![clip("c2", "m2", 0.0, 0.0, 5.0)]),
+                ],
+            );
+            for (where_, tl) in [("bottom", bottom), ("overlay", top)] {
+                let err = build(
+                    &spec(vec![bad.clone(), vid.clone()], tl, preset("mp4", "h264"), r"C:\o.mp4"),
+                    &enc(),
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{container:?} on the {where_} track must be refused"));
+                assert!(matches!(err, AppError::BadInput(_)), "{container:?}: {err:?}");
+                let msg = err.to_string();
+                assert!(msg.contains("Holiday photo.avif"), "{container:?} {where_}: {msg}");
+                assert!(!msg.contains(r"C:\pics"), "names the file, not the folder: {msg}");
+                assert!(msg.contains("still"), "{container:?} {where_}: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_still_from_an_image2_family_demuxer_still_loops() {
+        // The other side of the line: every real still keeps `-loop 1 -t`, and
+        // is never quietly turned into an `-ss/-to` window instead.
+        for container in IMAGE2 {
+            let mut m = image_media("m1", r"C:\pics\still.png");
+            m.container = Some(container.to_string());
+            let tl = timeline(
+                1280,
+                720,
+                Rational { num: 30, den: 1 },
+                vec![vtrack(vec![clip("c1", "m1", 0.0, 0.0, 3.0)])],
+            );
+            let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc())
+                .unwrap_or_else(|e| panic!("{container}: {e}"));
+            let a = argstr(&b);
+            let i = a.iter().position(|s| s == r"C:\pics\still.png").unwrap();
+            assert_eq!(
+                &a[i - 5..i],
+                ["-loop", "1", "-t", "3.000000", "-i"],
+                "{container}: {a:?}"
+            );
+            assert!(!a.contains(&"-ss".to_string()), "{container}: {a:?}");
+        }
+    }
+
+    #[test]
+    fn an_unloopable_still_that_no_clip_uses_does_not_block_the_export() {
+        // The check is on what ffmpeg will actually be asked to open. A stale
+        // still sitting unused in the bin must not hold the timeline hostage.
+        let mut unused = image_media("m9", r"C:\pics\icon.ico");
+        unused.container = Some("ico".into());
+        let vid = media("m1", r"C:\v.mp4", 1918, 1078, true);
+        let tl = timeline(
+            1280,
+            720,
+            Rational { num: 30, den: 1 },
+            vec![vtrack(vec![clip("c1", "m1", 0.0, 0.0, 2.0)])],
+        );
+        let b = build(&spec(vec![unused, vid], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc())
+            .unwrap();
+        assert!(!argstr(&b).contains(&r"C:\pics\icon.ico".to_string()));
+    }
+
+    #[test]
+    fn an_unknown_export_format_is_refused_instead_of_written_as_mp4() {
+        // A crafted .trt, or one saved by a build that knows more formats. Each
+        // of these used to fall through to `-f mp4` and write MP4 bytes under
+        // the user's chosen name. Near-misses of real spellings included: the
+        // whitelist is exact.
+        for format in ["mkv", "MP4", "mp4 ", " mp4", "", "gif\u{0}", "webm;", "m4v", "mpegts"] {
+            for vcodec in ["h264", "av1"] {
+                let tl = timeline(
+                    1280,
+                    720,
+                    Rational { num: 30, den: 1 },
+                    vec![vtrack(vec![clip("c1", "m1", 0.0, 0.0, 2.0)])],
+                );
+                let m = media("m1", r"C:\v.mp4", 1918, 1078, true);
+                let err = build(&spec(vec![m], tl, preset(format, vcodec), r"C:\o.mkv"), &enc())
+                    .err()
+                    .unwrap_or_else(|| panic!("format {format:?} must be refused"));
+                assert!(matches!(err, AppError::BadInput(_)), "{format:?}: {err:?}");
+                let msg = err.to_string();
+                assert!(
+                    msg.starts_with("This project asks for an export format")
+                        && msg.contains("MP4, MOV, WebM, AVI or GIF"),
+                    "{format:?}: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_whitelisted_format_names_its_own_muxer_and_audio_codec() {
+        // One row per container, every column different from its neighbours,
+        // so a swapped arm anywhere shows up as the wrong pair.
+        for (format, vcodec, muxer, movflags, acodec, akbps, gif) in [
+            ("mp4", "h264", "mp4", true, Some("aac"), "192k", false),
+            ("mov", "hevc", "mov", true, Some("aac"), "192k", false),
+            ("webm", "av1", "webm", false, Some("libopus"), "160k", false),
+            ("avi", "h264", "avi", false, Some("libmp3lame"), "192k", false),
+            ("gif", "h264", "gif", false, None, "", true),
+        ] {
+            let tl = timeline(
+                1280,
+                720,
+                Rational { num: 30, den: 1 },
+                vec![vtrack(vec![clip("c1", "m1", 0.0, 0.0, 2.0)])],
+            );
+            let m = media("m1", r"C:\v.mp4", 1918, 1078, true);
+            let out = format!(r"C:\o.{format}");
+            let b = build(&spec(vec![m], tl, preset(format, vcodec), &out), &enc()).unwrap();
+            let a = argstr(&b);
+            let n = a.len();
+            assert_eq!(&a[n - 3..], ["-f", muxer, out.as_str()], "{format}: {a:?}");
+            assert_eq!(a.contains(&"+faststart".to_string()), movflags, "{format}: {a:?}");
+            match acodec {
+                Some(ac) => {
+                    assert!(a.windows(2).any(|w| w[0] == "-c:a" && w[1] == ac), "{format}: {a:?}");
+                    assert!(a.windows(2).any(|w| w[0] == "-b:a" && w[1] == akbps), "{format}: {a:?}");
+                }
+                None => assert!(!a.contains(&"-c:a".to_string()), "{format}: {a:?}"),
+            }
+            assert_eq!(b.filter_complex.contains("palettegen"), gif, "{format}");
+            assert_eq!(a.contains(&"[gifout]".to_string()), gif, "{format}: {a:?}");
+            assert_eq!(
+                a.windows(2).any(|w| w[0] == "-tag:v" && w[1] == "hvc1"),
+                format == "mov",
+                "{format}: only the ISOBMFF+hevc row is tagged: {a:?}"
+            );
+        }
     }
 
     #[test]
@@ -3825,14 +4081,38 @@ mod tests {
     }
 
     #[test]
-    fn hardware_with_an_unknown_codec_falls_back_to_libx264() {
-        // `chosen_encoder`'s hardware arm has no entry for anything outside
-        // h264/hevc/av1, and a `.trt` carries the codec string verbatim.
+    fn an_unknown_video_codec_is_refused_instead_of_encoded_as_h264() {
+        // `chosen_encoder` and `software_lib` still end in `_ => libx264`, and a
+        // `.trt` carries the codec string verbatim, so a codec outside
+        // h264/hevc/av1 ("vp9", a near-miss spelling, "") used to be written as
+        // H.264 under a project that asked for something else. `build` now
+        // stops it first, hardware or software, in every container.
         let r = report("h264_nvenc", "hevc_nvenc", "av1_nvenc");
-        assert_vcodec_args(
-            &built_with(hw_preset("mp4", "vp9"), &r),
-            &["-c:v", "libx264", "-preset", "medium", "-crf", "20"],
-        );
+        for format in ["mp4", "mov", "webm", "avi", "gif"] {
+            for vcodec in ["vp9", "H264", "h264 ", "libx264", "h265", ""] {
+                for hardware in [true, false] {
+                    let mut p = preset(format, vcodec);
+                    p.use_hardware = hardware;
+                    let tl = timeline(
+                        1280,
+                        720,
+                        Rational { num: 30, den: 1 },
+                        vec![vtrack(vec![clip("c1", "m1", 0.0, 0.0, 2.0)])],
+                    );
+                    let m = media("m1", r"C:\v.mp4", 1918, 1078, true);
+                    let err = build(&spec(vec![m], tl, p, r"C:\o.out"), &r)
+                        .err()
+                        .unwrap_or_else(|| panic!("{format}/{vcodec:?} must be refused"));
+                    assert!(matches!(err, AppError::BadInput(_)), "{format}/{vcodec:?}: {err:?}");
+                    let msg = err.to_string();
+                    assert!(
+                        msg.starts_with("This project asks for a video codec")
+                            && msg.contains("H.264, H.265 or AV1"),
+                        "{format}/{vcodec:?}: {msg}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

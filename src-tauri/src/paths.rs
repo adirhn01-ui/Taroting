@@ -40,8 +40,9 @@ pub fn cache_dir() -> Result<PathBuf> {
 }
 
 /// %LOCALAPPDATA%\Taroting\tmp-projects — scratch projects for the quick-view
-/// (open-with) flow. Files here are never in recents and are wiped at startup;
-/// pressing Back in the editor re-saves the project permanently to Documents.
+/// (open-with) flow. Files here are never in recents and are wiped when the
+/// primary instance starts; choosing Keep in the editor's keep/discard prompt
+/// writes the project permanently to Documents.
 pub fn temp_projects_dir() -> Result<PathBuf> {
     Ok(env_dir("LOCALAPPDATA")?
         .join("Taroting")

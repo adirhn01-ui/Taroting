@@ -435,12 +435,14 @@ fn is_transposition(stored: (u32, u32), probed: (u32, u32)) -> bool {
 fn rotation_fixes(media: &[schema::MediaRef]) -> Vec<DimFix> {
     let mut fixes = Vec::new();
     for (index, m) in media.iter().enumerate() {
-        // Only a video stream can carry the Display Matrix that `probe_sync`
-        // transposes on. Measured with the bundled ffprobe: a JPEG exposes no
-        // side data at all, and the GIF muxer drops a rotation you ask it to
-        // write — so a still or a gif cannot have been stored wrong, and
-        // skipping them keeps a 200-photo slideshow from spawning 200
-        // processes. A generator has no file to probe.
+        // Only a video stream can carry the stream-level Display Matrix this
+        // repair is about. A still's turn lives elsewhere — EXIF orientation,
+        // applied per frame, invisible to `-show_streams` — and is repaired by
+        // `repair_still_orientation`, which reads the header first and spends
+        // a frame probe only on a still that header says was stored stale;
+        // re-probing every still here would make a 200-photo slideshow spawn
+        // 200 processes. The GIF muxer drops a rotation you ask it to write, so
+        // a gif cannot have been stored wrong. A generator has no file to probe.
         if m.kind != "video" || m.generator.is_some() {
             continue;
         }
@@ -568,22 +570,258 @@ fn repair_rotated_dimensions(path: &Path, value: &mut Value, typed: &ProjectFile
     // writing it back every open pays for the probes again — which would make
     // the schema gate, and with it the performance argument for gating at all,
     // pointless.
-    //
-    // Except after a recovery. `atomic_write` rotates the current primary onto
-    // the `.bak`, and in a recovery the `.bak` IS the last good copy while the
-    // primary is the corrupt (or absent) one — so a write that then failed its
-    // second rename would restore the corrupt primary over the only good copy
-    // and leave nothing readable at all. A recovered project simply re-probes
-    // until the user's own next save stamps it: that costs one load and risks
-    // nothing.
+    persist_repair(path, value, recovered);
+}
+
+/// Write a load-time repair back to the project file.
+///
+/// Except after a recovery. `atomic_write` rotates the current primary onto
+/// the `.bak`, and in a recovery the `.bak` IS the last good copy while the
+/// primary is the corrupt (or absent) one — so a write that then failed its
+/// second rename would restore the corrupt primary over the only good copy and
+/// leave nothing readable at all. A recovered project simply repairs again on
+/// the next load until the user's own next save carries it: that costs one
+/// load and risks nothing.
+///
+/// Fail-soft otherwise: a read-only volume or a locked file must not fail the
+/// open. The repair is already in `value`, so the user gets a correct project
+/// this session and the next load tries again.
+fn persist_repair(path: &Path, value: &Value, recovered: bool) {
     if recovered {
         return;
     }
-    // Fail-soft otherwise: a read-only volume or a locked file must not fail
-    // the open. The repair is already in `value`, so the user gets a correct
-    // project this session and the next load tries again.
     if let Ok(bytes) = serde_json::to_vec_pretty(value) {
         let _ = atomic_write(path, &bytes);
+    }
+}
+
+/// Windows attributes marking a cloud placeholder — a file whose bytes are not
+/// on this machine (OneDrive "online-only", and any sync provider built on the
+/// same Cloud Files API). Reading even a header from one downloads it.
+#[cfg_attr(not(windows), allow(dead_code))]
+const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
+#[cfg_attr(not(windows), allow(dead_code))]
+const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x4_0000;
+#[cfg_attr(not(windows), allow(dead_code))]
+const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
+
+/// Whether a file with these attributes is a cloud placeholder. Pure, so the
+/// three bits are pinned by a test rather than by a OneDrive account.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_placeholder_attributes(attributes: u32) -> bool {
+    attributes
+        & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+        != 0
+}
+
+/// Whether reading `path` would download it. Metadata alone never does, so
+/// this is asked BEFORE anything opens the file. Unreadable metadata counts as
+/// a placeholder: the repair is optional, a surprise download is not.
+#[cfg(windows)]
+fn is_cloud_placeholder(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::metadata(path).map_or(true, |m| is_placeholder_attributes(m.file_attributes()))
+}
+
+#[cfg(not(windows))]
+fn is_cloud_placeholder(_path: &Path) -> bool {
+    false
+}
+
+/// Correct the stored size of stills probed before `probe_sync` learned EXIF
+/// orientation, and mark every still checked. Returns whether `value` changed.
+///
+/// A photo shot in portrait is usually CODED landscape with orientation 6 or
+/// 8, and ffmpeg autorotates it on decode, so the old probe stored the coded
+/// pair while the filtergraph received its transpose: a squashed preview and
+/// export, and a hard abort as soon as the clip carried a crop wider than the
+/// decoded frame or an opacity keyframe. Nothing in the JSON reveals it; the
+/// file's header does.
+///
+/// Runs on EVERY load, not behind a schema gate (owner's decision: no schema
+/// bump for this). What keeps that cheap is the `oriented` flag — a flagged
+/// still is skipped without touching its file — and what keeps it CORRECT is
+/// that the repair is idempotent without the flag: it only fires while the
+/// stored pair equals the header's coded pair exactly, which a repaired entry
+/// never does again. So a copy that loses the flag costs one header read,
+/// never a second transposition. Only a flag that is literally `true` counts;
+/// any other value from a hand-edited file is simply checked and replaced.
+///
+/// The header decides who is a CANDIDATE; ffmpeg decides the turn. The sniff
+/// is knowingly more lenient than ffmpeg's EXIF parser — ffmpeg drops the
+/// whole block, orientation and all, over one out-of-line value past its end
+/// (`media/exif.rs`) — so trusting it alone would transpose a still that was
+/// stored RIGHT and write that down for good. So:
+/// - Sniff 1..=4, a stored pair that is not the coded pair, or a square:
+///   flagged, and no process spawned. Nothing here can be the stale case.
+/// - Sniff 5..=8 with the stored pair exactly the coded pair: the same
+///   frame-level ffprobe import uses (`probe::frame_transposes`). A quarter
+///   turn → transposed and flagged; no turn (ffmpeg rejected the block) →
+///   flagged, size untouched; the probe FAILED → nothing changes and nothing
+///   is flagged, so the next load asks again.
+/// - Sniff `None` (a header the sniff will not vouch for: unknown format, a
+///   capped walk, two Exif blocks, an orientation entry it cannot read): left
+///   alone and unflagged, with no process — the same as a file that fails
+///   identity. Import sends such a file to the frame probe; the load path does
+///   not pay a process per load for one, only the header re-read.
+///
+/// Cost: the frame probe (~120 ms on a 12 MP JPEG) only ever runs for a still
+/// stored by the pre-fix probe with a turned header, and once it answers the
+/// flag retires it. KNOWN RESIDUE: such a still whose frame never decodes
+/// (a corrupt body behind a good header) pays that probe on every load until
+/// it is relinked — rare, legacy-only (today's import stores the transpose,
+/// which never matches the coded pair again), and a bounded cost, where
+/// flagging it unconfirmed would vouch for a size nobody measured.
+///
+/// Order: identity, then placeholder, then header, then the frame probe.
+/// Nothing may open the file before the placeholder check has said it is
+/// local — the frame probe above all, which would download an online-only
+/// file whole. A file that fails the identity check is the relink path's
+/// business, exactly as for the video repair; a cloud placeholder is left
+/// unflagged, so it is looked at on a later load once it is local.
+///
+/// The canvas is never turned: `addMedia` does not adopt a canvas from a
+/// still, so no canvas was ever derived from these numbers. The CROPS of the
+/// transposed still's clips are clamped into the new box (`clamp_clip_crops`).
+fn repair_still_orientation(value: &mut Value, media: &[schema::MediaRef]) -> bool {
+    repair_still_orientation_with(value, media, crate::media::probe::frame_transposes)
+}
+
+/// `repair_still_orientation` with the frame probe injected, so the tests can
+/// pin exactly when it runs and what a failure does.
+fn repair_still_orientation_with(
+    value: &mut Value,
+    media: &[schema::MediaRef],
+    mut frame_transposes: impl FnMut(&str) -> Option<bool>,
+) -> bool {
+    let mut fixes = Vec::new();
+    let mut checked = Vec::new();
+    for (index, m) in media.iter().enumerate() {
+        if m.kind != "image" || m.generator.is_some() {
+            continue;
+        }
+        let flagged = value
+            .get("media")
+            .and_then(|a| a.get(index))
+            .and_then(|e| e.get("oriented"))
+            == Some(&Value::Bool(true));
+        if flagged {
+            continue;
+        }
+        // Identity, then placeholder, then the header — nothing may open the
+        // file before the placeholder check has said it is local.
+        if !identity_intact(m) || is_cloud_placeholder(Path::new(&m.path)) {
+            continue;
+        }
+        let Some(sniff) = crate::media::exif::sniff(Path::new(&m.path)) else {
+            continue;
+        };
+        if let (Some(w), Some(h)) = (m.width, m.height) {
+            // A square's transpose is itself: flagged below, never probed.
+            if sniff.transposes() && w != h && (w, h) == sniff.coded {
+                match frame_transposes(&m.path) {
+                    Some(true) => fixes.push(DimFix { index, from: (w, h), to: (h, w) }),
+                    Some(false) => {}
+                    None => continue,
+                }
+            }
+        }
+        checked.push(index);
+    }
+    apply_dim_fixes(value, &fixes, None);
+    for fix in &fixes {
+        if let Some(m) = media.get(fix.index) {
+            clamp_clip_crops(value, &m.id, fix.to);
+        }
+    }
+    for &index in &checked {
+        if let Some(entry) = value
+            .get_mut("media")
+            .and_then(|a| a.get_mut(index))
+            .and_then(Value::as_object_mut)
+        {
+            entry.insert("oriented".into(), Value::Bool(true));
+        }
+    }
+    !checked.is_empty()
+}
+
+/// `CROP_MIN` in `src/editor/preview/canvas-math.ts`: the smallest crop
+/// extent, in source px, the editor lets a crop shrink to.
+const CROP_MIN: f64 = 8.0;
+
+/// Clamp the crop of every clip of `media_id` (on any track) into a frame of
+/// `(w, h)` — `clampCrop` in `src/editor/preview/canvas-math.ts`, number for
+/// number, which is what relink runs after its own change of dimensions
+/// (`clampClipCrops`, src/editor/media/relink.ts).
+///
+/// Why here: a crop authored against the stale landscape box can hang off
+/// the new portrait one, and nothing on the load path clamps it against the
+/// media's size — `sanitizeProject` (src/core/project.ts) only drops crops
+/// that are not rectangles. The export builder then clamps w/h but not x/y,
+/// while the preview clamps all four, so the two would show different parts
+/// of the photo. Clamping once, here, makes the stored crop the one both see.
+///
+/// Only a crop `sanitizeCrop` would KEEP is touched — four finite numbers,
+/// x/y >= 0, w/h > 0. Anything else it drops, and clamping it first would
+/// resurrect it (`f64::max` quietly discards a NaN that `Math.max` spreads).
+/// A crop is rewritten only when a component moves, and whole values are
+/// written as integers, so an untouched crop stays byte-identical.
+fn clamp_clip_crops(value: &mut Value, media_id: &str, (w, h): (u32, u32)) {
+    let (sw, sh) = (f64::from(w), f64::from(h));
+    let Some(tracks) = value
+        .get_mut("timeline")
+        .and_then(|t| t.get_mut("tracks"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for track in tracks {
+        let Some(clips) = track.get_mut("clips").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for clip in clips {
+            if clip.get("mediaId").and_then(Value::as_str) != Some(media_id) {
+                continue;
+            }
+            let Some(crop) = clip
+                .get_mut("transform")
+                .and_then(|t| t.get_mut("crop"))
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            let num = |k: &str| crop.get(k).and_then(Value::as_f64).filter(|v| v.is_finite());
+            let (Some(x), Some(y), Some(cw), Some(ch)) = (num("x"), num("y"), num("w"), num("h")) else {
+                continue;
+            };
+            if x < 0.0 || y < 0.0 || cw <= 0.0 || ch <= 0.0 {
+                continue;
+            }
+            let clamp = |v: f64, lo: f64, hi: f64| v.max(lo).min(hi);
+            let nw = clamp(cw, CROP_MIN, sw);
+            let nh = clamp(ch, CROP_MIN, sh);
+            let nx = clamp(x, 0.0, sw - nw);
+            let ny = clamp(y, 0.0, sh - nh);
+            let nw = nw.min(sw - nx);
+            let nh = nh.min(sh - ny);
+            for (k, old, new) in [("x", x, nx), ("y", y, ny), ("w", cw, nw), ("h", ch, nh)] {
+                if new != old {
+                    crop.insert(k.into(), json_number(new));
+                }
+            }
+        }
+    }
+}
+
+/// A finite `f64` as JSON: an integer when it is a whole number (what every
+/// crop the editor writes is, and what `clampCrop` keeps whole numbers at),
+/// a float otherwise.
+fn json_number(v: f64) -> Value {
+    if v.fract() == 0.0 && v.abs() < 9.0e15 {
+        Value::from(v as i64)
+    } else {
+        serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number)
     }
 }
 
@@ -609,8 +847,16 @@ pub fn load_project(path: String) -> Result<LoadedProject> {
     // reveal that, so repair it against the files themselves — once, gated on
     // the schema stamp, because doing it on every open is an ffprobe per clip
     // on a path the user is waiting on.
+    //
+    // Stills first, and ungated (header reads, and only for unflagged stills;
+    // a frame probe only for one whose header says it was stored stale),
+    // so that when the video repair runs its one write carries both; otherwise
+    // the still repair writes on its own, and only when it changed something.
+    let stills_changed = repair_still_orientation(&mut value, &typed.media);
     if from < schema::ROTATION_REPAIR_SCHEMA {
         repair_rotated_dimensions(p, &mut value, &typed, recovered);
+    } else if stills_changed {
+        persist_repair(p, &value, recovered);
     }
 
     // Stamp openedAt on this path's recents entry (create it if absent — a
@@ -979,10 +1225,19 @@ pub fn temp_project_path(name: Option<String>) -> Result<String> {
     fresh_untitled_in(&dir, &base)
 }
 
-/// Best-effort wipe of stale files in the temp-projects dir. Called once at
-/// startup, before any project opens, so it never races a live quick-view
-/// session. ONLY touches the app's own tmp-projects dir; a missing dir or any
-/// per-file error is ignored (the next startup retries).
+/// Best-effort wipe of stale files in the temp-projects dir. ONLY touches the
+/// app's own tmp-projects dir; a missing dir or any per-file error is ignored
+/// (the next startup retries).
+///
+/// Must run from the Builder's `.setup()` hook, never from `main()` directly.
+/// A second launch (an Explorer double-click while the app is open) is a whole
+/// new process that only exits inside plugin initialisation, when the
+/// single-instance plugin forwards its argv to the running window. Anything
+/// `main()` does before `Builder::run` therefore also runs in that doomed second
+/// process — and a sweep there deleted the LIVE instance's quick-view files.
+/// `.setup()` runs after every plugin has initialised, so only the instance that
+/// owns the single-instance mutex ever gets here, and it gets here before its
+/// event loop serves any command, so no session of its own can exist yet.
 pub fn cleanup_temp_projects() {
     let Ok(dir) = paths::temp_projects_dir() else {
         return;
@@ -1006,7 +1261,7 @@ pub fn cleanup_temp_projects() {
 /// answer whose failure is cosmetic rather than destructive. Collapsing it into
 /// a bool would silently pick one of them for both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PathIdentity {
+pub(crate) enum PathIdentity {
     /// Provably one and the same file.
     Same,
     /// Provably two different files.
@@ -1049,7 +1304,7 @@ fn real_path(p: &Path) -> Option<PathBuf> {
 /// So ask the filesystem instead of imitating it. `canonicalize` resolves each
 /// name to the directory entry's real case, so equal canonical paths mean
 /// literally the same file — exactly what this volume folds, and nothing else.
-fn path_identity(a: &Path, b: &Path) -> PathIdentity {
+pub(crate) fn path_identity(a: &Path, b: &Path) -> PathIdentity {
     // Byte-identical needs no filesystem, and answers even for a path that
     // does not exist yet.
     if a == b {
@@ -1618,13 +1873,18 @@ mod tests {
         });
     }
 
-    /// The candidate set is video-only, and that is a decision rather than an
-    /// oversight: measured with the bundled ffprobe, a still exposes no side
-    /// data at all and the gif muxer discards a rotation you ask it to write,
-    /// so neither can have been stored wrong — while probing them would cost a
-    /// process per photo in a slideshow. A still whose stored dimensions are
-    /// the exact transpose of its file's is therefore left alone, where the
-    /// identical disagreement on a video is corrected.
+    /// The STREAM re-probe's candidate set is video-only, and that is a
+    /// decision rather than an oversight: measured with the bundled ffprobe, a
+    /// still exposes no stream-level side data and the gif muxer discards a
+    /// rotation you ask it to write, so neither can carry the Display Matrix
+    /// this repair is about — while probing them would cost a process per
+    /// photo in a slideshow. A still CAN be stored wrong, by EXIF orientation,
+    /// but that is `repair_still_orientation`'s business, and it only ever
+    /// turns a still whose header says it is turned AND whose stored pair is
+    /// exactly the coded one. This PNG carries no orientation, so a still whose
+    /// stored dimensions are the exact transpose of its file's is left alone
+    /// by both repairs, where the identical disagreement on a video is
+    /// corrected.
     #[test]
     fn only_video_media_is_ever_re_probed() {
         with_isolated("rot-video-only", |dir| {
@@ -3040,5 +3300,434 @@ mod tests {
             cleanup_temp_projects();
             assert!(keep.exists());
         });
+    }
+
+    /// A REAL JPEG coded (w, h) — one `testsrc2` frame from the bundled ffmpeg,
+    /// which the frame probe can decode — carrying `tiff` as its EXIF block.
+    /// For every still the repair confirms with ffprobe; a header-only
+    /// `still_file` would leave that answer to how leniently ffmpeg decodes
+    /// two bytes of scan data.
+    fn real_still_file(dir: &Path, name: &str, (w, h): (u16, u16), tiff: &[u8]) -> PathBuf {
+        use crate::media::exif::tests::jpeg_with_exif;
+        let base = dir.join(format!("{w}x{h} base.jpg"));
+        if !base.exists() {
+            let size = format!("testsrc2=size={w}x{h}");
+            let out = crate::jobs::ffmpeg::run(
+                "ffmpeg",
+                &["-y", "-f", "lavfi", "-i", &size, "-frames:v", "1", base.to_str().unwrap()],
+            )
+            .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        let file = dir.join(name);
+        std::fs::write(&file, jpeg_with_exif(&std::fs::read(&base).unwrap(), tiff)).unwrap();
+        file
+    }
+
+    /// A header-only JPEG coded (w, h) carrying EXIF orientation `o` (none at
+    /// all when `o` is 0). Enough for every still the repair settles from the
+    /// header alone — no ffmpeg, no shared `%TEMP%` fixture. A candidate the
+    /// frame probe must confirm needs `real_still_file` instead.
+    fn still_file(dir: &Path, name: &str, (w, h): (u16, u16), o: u16) -> PathBuf {
+        use crate::media::exif::tests::{jpeg_with_exif, tiff_orientation, tiny_jpeg};
+        let base = tiny_jpeg(w, h);
+        let bytes = if o == 0 { base } else { jpeg_with_exif(&base, &tiff_orientation(o, false)) };
+        let file = dir.join(name);
+        std::fs::write(&file, bytes).unwrap();
+        file
+    }
+
+    /// A still entry for `file` with the given stored size and a true identity.
+    fn still_media(id: &str, file: &Path, (w, h): (u32, u32)) -> Value {
+        let meta = std::fs::metadata(file).unwrap();
+        serde_json::json!({
+            "id": id, "path": file.to_string_lossy(),
+            "size": meta.len(), "mtimeMs": mtime_ms_of(&meta),
+            "kind": "image", "duration": 0.0, "hasAudio": false,
+            "width": w, "height": h, "container": "jpeg_pipe"
+        })
+    }
+
+    /// A CURRENT-schema project, so the video repair's unconditional write can
+    /// never stand in for the still repair's own, with a field this build
+    /// knows nothing about.
+    fn write_current_project(proj: &Path, media: Value, canvas: (u32, u32)) {
+        write_json(
+            proj,
+            &serde_json::json!({
+                "schema": schema::CURRENT_SCHEMA, "app": "taroting", "id": "p1", "name": "Stills",
+                "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+                "media": media,
+                "timeline": {
+                    "fps": {"num": 30, "den": 1}, "width": canvas.0, "height": canvas.1,
+                    "tracks": [{ "id": "t1", "kind": "video", "name": "V1", "muted": false, "clips": [] }]
+                },
+                "export": {},
+                "unknownFutureField": {"keep": "me"}
+            }),
+        );
+    }
+
+    fn read_disk(proj: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(proj).unwrap()).unwrap()
+    }
+
+    /// Load `proj` with its `.bak` cleared first, returning the result and
+    /// whether the load WROTE the file — `atomic_write` rotates the primary
+    /// onto `.bak`, so a `.bak` afterwards is a write, whatever bytes it wrote.
+    fn load_and_see_write(proj: &Path) -> (LoadedProject, bool) {
+        let _ = std::fs::remove_file(bak_path(proj));
+        let loaded = load_project(proj.to_string_lossy().into_owned()).unwrap();
+        (loaded, bak_path(proj).exists())
+    }
+
+    /// The case this exists for: a portrait photo (coded 64x36, orientation 6)
+    /// stored at its coded size by the old probe. One load confirms the turn
+    /// with the real frame probe, repairs and flags it and writes that down;
+    /// after that the flag keeps the file unread and the project unwritten.
+    /// The canvas equals the stale pair on purpose — the exact shape the VIDEO
+    /// repair would turn — and must not move.
+    #[test]
+    fn a_turned_still_is_repaired_once_and_flagged() {
+        with_isolated("still-turned", |dir| {
+            use crate::media::exif::tests::tiff_orientation;
+            let file = real_still_file(dir, "portrait.jpg", (64, 36), &tiff_orientation(6, false));
+            let proj = dir.join("Stills.trt");
+            write_current_project(&proj, serde_json::json!([still_media("m1", &file, (64, 36))]), (64, 36));
+
+            let (loaded, wrote) = load_and_see_write(&proj);
+            assert!(loaded.missing.is_empty(), "{:?}", loaded.missing);
+            assert_eq!(loaded.project["media"][0]["width"], 36);
+            assert_eq!(loaded.project["media"][0]["height"], 64);
+            assert_eq!(loaded.project["media"][0]["oriented"], true);
+            assert_eq!(loaded.project["timeline"]["width"], 64, "a still never turns the canvas");
+            assert_eq!(loaded.project["timeline"]["height"], 36);
+            assert!(wrote, "the repair must be persisted");
+            let disk = read_disk(&proj);
+            assert_eq!(disk["media"][0]["width"], 36);
+            assert_eq!(disk["media"][0]["height"], 64);
+            assert_eq!(disk["media"][0]["oriented"], true);
+            assert_eq!(disk["unknownFutureField"]["keep"], "me", "a surgical edit, not a re-serialize");
+
+            // Second load: nothing to do, so nothing is written.
+            let (again, wrote) = load_and_see_write(&proj);
+            assert!(!wrote, "an already-repaired project was rewritten");
+            assert_eq!(again.project["media"][0]["width"], 36);
+
+            // THE FLAG. Put the stale pair back with the flag still on: only
+            // the flag can keep the next load from transposing it again.
+            let mut poisoned = read_disk(&proj);
+            poisoned["media"][0]["width"] = Value::from(64);
+            poisoned["media"][0]["height"] = Value::from(36);
+            write_json(&proj, &poisoned);
+            let (flagged, wrote) = load_and_see_write(&proj);
+            assert_eq!(flagged.project["media"][0]["width"], 64, "a flagged still was re-read");
+            assert_eq!(flagged.project["media"][0]["height"], 36);
+            assert!(!wrote);
+
+            // CONSTRUCTION. Repaired dims with the flag lost (a copy that
+            // dropped it): re-checked, never turned a second time.
+            let mut unflagged = read_disk(&proj);
+            unflagged["media"][0]["width"] = Value::from(36);
+            unflagged["media"][0]["height"] = Value::from(64);
+            unflagged["media"][0].as_object_mut().unwrap().remove("oriented");
+            write_json(&proj, &unflagged);
+            let (rechecked, _) = load_and_see_write(&proj);
+            assert_eq!(rechecked.project["media"][0]["width"], 36, "turned twice");
+            assert_eq!(rechecked.project["media"][0]["height"], 64);
+            assert_eq!(rechecked.project["media"][0]["oriented"], true);
+        });
+    }
+
+    /// Everything that must NOT be transposed, each for its own reason, and
+    /// what each one gets instead.
+    #[test]
+    fn only_a_stale_quarter_turned_still_changes_size() {
+        with_isolated("still-others", |dir| {
+            let plain = still_file(dir, "plain.jpg", (80, 30), 0);
+            let upright = still_file(dir, "upright.jpg", (70, 20), 1);
+            let half = still_file(dir, "half.jpg", (66, 24), 3);
+            let right = still_file(dir, "right.jpg", (90, 50), 6);
+            let square = still_file(dir, "square.jpg", (48, 48), 8);
+            let other = still_file(dir, "other.jpg", (60, 44), 8);
+            // The one row the frame probe confirms, so the one real JPEG.
+            let bogus = real_still_file(
+                dir,
+                "bogus flag.jpg",
+                (58, 26),
+                &crate::media::exif::tests::tiff_orientation(5, false),
+            );
+            let changed = still_file(dir, "changed.jpg", (52, 28), 6);
+            let mut changed_media = still_media("m8", &changed, (52, 28));
+            changed_media["mtimeMs"] = Value::from(changed_media["mtimeMs"].as_u64().unwrap() - 5_000);
+            let mut bogus_media = still_media("m7", &bogus, (58, 26));
+            bogus_media["oriented"] = Value::from("yes");
+
+            let proj = dir.join("Mixed.trt");
+            write_current_project(
+                &proj,
+                serde_json::json!([
+                    still_media("m1", &plain, (80, 30)),   // no EXIF
+                    still_media("m2", &upright, (70, 20)), // orientation 1
+                    still_media("m3", &half, (66, 24)),    // a half turn keeps both axes
+                    still_media("m4", &right, (50, 90)),   // turned, but already stored right
+                    still_media("m5", &square, (48, 48)),  // its transpose is itself
+                    still_media("m6", &other, (1280, 720)), // not this file's coded pair
+                    bogus_media,                           // a flag that is not `true`
+                    changed_media                          // the relink path's business
+                ]),
+                (1920, 1080),
+            );
+
+            let (loaded, wrote) = load_and_see_write(&proj);
+            let m = &loaded.project["media"];
+            let dims = |i: usize| (m[i]["width"].as_u64().unwrap(), m[i]["height"].as_u64().unwrap());
+            assert_eq!(dims(0), (80, 30));
+            assert_eq!(dims(1), (70, 20));
+            assert_eq!(dims(2), (66, 24));
+            assert_eq!(dims(3), (50, 90));
+            assert_eq!(dims(4), (48, 48));
+            assert_eq!(dims(5), (1280, 720));
+            assert_eq!(dims(6), (26, 58), "only `true` is the flag; anything else is checked");
+            assert_eq!(dims(7), (52, 28));
+            for i in 0..7 {
+                assert_eq!(m[i]["oriented"], true, "media {i} was checked, so it is flagged");
+            }
+            assert!(m[7].get("oriented").is_none(), "an unverified file is not vouched for");
+            assert_eq!(loaded.missing, vec!["m8"]);
+            assert!(wrote, "the flags are worth writing down");
+        });
+    }
+
+    /// A full clip of `media_id` on the timeline, cropped to `crop` when given.
+    fn cropped_clip(id: &str, media_id: &str, crop: Option<[u32; 4]>) -> Value {
+        let mut transform = serde_json::json!({
+            "rotate": 0, "flipH": false, "flipV": false, "scale": 1.0, "x": 0.0, "y": 0.0, "opacity": 1.0
+        });
+        if let Some([x, y, w, h]) = crop {
+            transform["crop"] = serde_json::json!({ "x": x, "y": y, "w": w, "h": h });
+        }
+        serde_json::json!({
+            "id": id, "mediaId": media_id, "timelineStart": 0.0, "srcIn": 0.0, "srcOut": 5.0,
+            "speed": 1.0, "transform": transform,
+            "audio": { "volume": 1.0, "muted": false, "fadeInSec": 0.0, "fadeOutSec": 0.0,
+                       "gainOffsetDb": 0.0, "detached": false }
+        })
+    }
+
+    /// A current-schema project value holding `media` and `tracks`, for the
+    /// tests that drive the repair directly with an injected frame probe.
+    fn stills_value(media: Value, tracks: Value) -> (Value, Vec<schema::MediaRef>) {
+        let value = serde_json::json!({
+            "schema": schema::CURRENT_SCHEMA, "app": "taroting", "id": "p1", "name": "Stills",
+            "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+            "media": media,
+            "timeline": { "fps": {"num": 30, "den": 1}, "width": 1920, "height": 1080, "tracks": tracks },
+            "export": {}
+        });
+        let typed = ProjectFile::deserialize(&value).unwrap();
+        (value, typed.media)
+    }
+
+    /// The verifier's finding, end to end with the real frame probe: on every
+    /// layout ffmpeg drops the whole EXIF block for, the header still says 6
+    /// at the stored coded size — the exact shape of a stale still — but the
+    /// photo DECODES landscape. Flagged, never transposed, and its crop left
+    /// exactly as authored. Trusting the sniff alone turned every one of these
+    /// sideways and wrote it down.
+    #[test]
+    fn a_still_ffmpeg_does_not_turn_is_flagged_not_transposed() {
+        with_isolated("still-rejected-exif", |dir| {
+            use crate::media::exif::tests::ffmpeg_rejected_exif;
+            let mut media = Vec::new();
+            let mut clips = Vec::new();
+            for (i, (name, tiff)) in ffmpeg_rejected_exif().into_iter().enumerate() {
+                let file = real_still_file(dir, &format!("{name}.jpg"), (64, 36), &tiff);
+                let s = crate::media::exif::sniff(&file).unwrap();
+                assert_eq!((s.orientation, s.coded), (6, (64, 36)), "{name}: must look stale to the sniff");
+                let id = format!("m{i}");
+                media.push(still_media(&id, &file, (64, 36)));
+                clips.push(cropped_clip(&format!("c{i}"), &id, Some([40, 0, 24, 36])));
+            }
+            let proj = dir.join("Rejected.trt");
+            write_current_project(&proj, Value::from(media.clone()), (1920, 1080));
+            let mut doc = read_disk(&proj);
+            doc["timeline"]["tracks"][0]["clips"] = Value::from(clips);
+            write_json(&proj, &doc);
+
+            let (loaded, wrote) = load_and_see_write(&proj);
+            for i in 0..media.len() {
+                let m = &loaded.project["media"][i];
+                assert_eq!((m["width"].as_u64(), m["height"].as_u64()), (Some(64), Some(36)), "media {i} turned");
+                assert_eq!(m["oriented"], true, "media {i}: ffmpeg answered, so it is settled");
+                assert_eq!(
+                    loaded.project["timeline"]["tracks"][0]["clips"][i]["transform"]["crop"],
+                    serde_json::json!({ "x": 40, "y": 0, "w": 24, "h": 36 }),
+                    "clip {i}: a crop on an untouched still must not move"
+                );
+            }
+            assert!(wrote, "the flags are worth writing down");
+        });
+    }
+
+    /// A frame probe that FAILS vouches for nothing: the stale-looking still
+    /// keeps its size and stays unflagged, so the next load asks again —
+    /// while the rows that never needed asking are flagged as before.
+    #[test]
+    fn a_failed_frame_probe_changes_nothing_and_flags_nothing() {
+        with_isolated("still-probe-fails", |dir| {
+            let stale = still_file(dir, "stale.jpg", (64, 36), 6);
+            let upright = still_file(dir, "upright.jpg", (70, 20), 1);
+            let (mut value, media) = stills_value(
+                serde_json::json!([still_media("m1", &stale, (64, 36)), still_media("m2", &upright, (70, 20))]),
+                serde_json::json!([{ "id": "t1", "kind": "video", "name": "V1", "muted": false,
+                    "clips": [cropped_clip("c1", "m1", Some([40, 0, 24, 36]))] }]),
+            );
+            let before = value.clone();
+            let changed = repair_still_orientation_with(&mut value, &media, |_| None);
+            assert!(changed, "the upright still is still flagged");
+            assert_eq!(value["media"][0], before["media"][0], "an unconfirmed still was touched");
+            assert!(value["media"][0].get("oriented").is_none());
+            assert_eq!(value["media"][1]["oriented"], true);
+            assert_eq!(value["timeline"], before["timeline"], "an unconfirmed still's crop moved");
+
+            // Alone, a failing candidate is no change at all — nothing to write.
+            let (mut alone, media) = stills_value(
+                serde_json::json!([still_media("m1", &stale, (64, 36))]),
+                serde_json::json!([]),
+            );
+            let before = alone.clone();
+            assert!(!repair_still_orientation_with(&mut alone, &media, |_| None));
+            assert_eq!(alone, before);
+        });
+    }
+
+    /// The frame probe runs for exactly one shape — a header saying 5..=8 at
+    /// the stored, non-square coded pair — and never for a still settled by
+    /// the header (1..=4, already transposed, some other size, square), a
+    /// flagged one, one whose header is unreadable, or one that fails the
+    /// identity check. That is the whole of the load path's process cost.
+    #[test]
+    fn the_frame_probe_runs_only_for_a_stale_candidate() {
+        with_isolated("still-probe-count", |dir| {
+            let stale = still_file(dir, "stale.jpg", (64, 36), 8);
+            let half = still_file(dir, "half.jpg", (64, 36), 3);
+            let right = still_file(dir, "right.jpg", (90, 50), 6);
+            let other = still_file(dir, "other.jpg", (60, 44), 7);
+            let square = still_file(dir, "square.jpg", (48, 48), 6);
+            let flagged = still_file(dir, "flagged.jpg", (80, 30), 6);
+            let unreadable = dir.join("unreadable.jpg");
+            std::fs::write(&unreadable, b"not an image at all").unwrap();
+            let moved = still_file(dir, "moved.jpg", (52, 28), 6);
+            let mut flagged_media = still_media("m6", &flagged, (80, 30));
+            flagged_media["oriented"] = Value::Bool(true);
+            let mut moved_media = still_media("m8", &moved, (52, 28));
+            moved_media["size"] = Value::from(1);
+            let (mut value, media) = stills_value(
+                serde_json::json!([
+                    still_media("m1", &stale, (64, 36)),
+                    still_media("m2", &half, (64, 36)),
+                    still_media("m3", &right, (50, 90)),
+                    still_media("m4", &other, (1280, 720)),
+                    still_media("m5", &square, (48, 48)),
+                    flagged_media,
+                    still_media("m7", &unreadable, (64, 36)),
+                    moved_media
+                ]),
+                serde_json::json!([]),
+            );
+            let mut asked = Vec::new();
+            repair_still_orientation_with(&mut value, &media, |p| {
+                asked.push(p.to_owned());
+                Some(true)
+            });
+            assert_eq!(asked, vec![stale.to_string_lossy().into_owned()]);
+            let m = &value["media"];
+            assert_eq!((m[0]["width"].as_u64(), m[0]["height"].as_u64()), (Some(36), Some(64)));
+            for i in 0..6 {
+                assert_eq!(m[i]["oriented"], true, "media {i}");
+            }
+            assert!(m[6].get("oriented").is_none(), "an unreadable header is not vouched for");
+            assert!(m[7].get("oriented").is_none(), "the relink path's business");
+        });
+    }
+
+    /// Transposing a still's size must bring its clips' crops into the NEW
+    /// box — `clampCrop`'s exact rule, on every track — or the preview (which
+    /// clamps x/y) and the export (which does not) show different regions.
+    #[test]
+    fn a_transposed_still_s_crops_are_clamped_into_the_new_box() {
+        with_isolated("still-crop-clamp", |dir| {
+            let stale = still_file(dir, "stale.jpg", (64, 36), 6);
+            let plain = still_file(dir, "plain.jpg", (64, 36), 0);
+            let video_track = |clips: Value| {
+                serde_json::json!({ "id": "t1", "kind": "video", "name": "V1", "muted": false, "clips": clips })
+            };
+            let mut second = video_track(serde_json::json!([
+                cropped_clip("c2", "m1", Some([60, 0, 4, 36])), // off the new box entirely
+                cropped_clip("c3", "m2", Some([40, 0, 24, 36])), // another media's clip
+            ]));
+            second["id"] = Value::from("t2");
+            let mut odd = cropped_clip("c5", "m1", None);
+            odd["transform"]["crop"] = serde_json::json!({ "x": -1, "y": 0, "w": 24, "h": 36 });
+            let (mut value, media) = stills_value(
+                serde_json::json!([still_media("m1", &stale, (64, 36)), still_media("m2", &plain, (64, 36))]),
+                serde_json::json!([
+                    video_track(serde_json::json!([
+                        cropped_clip("c1", "m1", Some([40, 0, 24, 36])), // fits only the old box
+                        cropped_clip("c4", "m1", Some([4, 8, 20, 20])),  // fits both
+                        cropped_clip("c6", "m1", None),                  // no crop at all
+                        odd                                              // sanitizeCrop drops it
+                    ])),
+                    second
+                ]),
+            );
+            let before = value.clone();
+            assert!(repair_still_orientation_with(&mut value, &media, |_| Some(true)));
+            assert_eq!((value["media"][0]["width"].as_u64(), value["media"][0]["height"].as_u64()), (Some(36), Some(64)));
+            let clip = |t: usize, c: usize| &value["timeline"]["tracks"][t]["clips"][c];
+            let crop = |x: u32, y: u32, w: u32, h: u32| serde_json::json!({ "x": x, "y": y, "w": w, "h": h });
+            // w stays 24 (<= 36), x pulls back to 36 - 24.
+            assert_eq!(clip(0, 0)["transform"]["crop"], crop(12, 0, 24, 36));
+            // w grows to CROP_MIN, then x pulls back to 36 - 8.
+            assert_eq!(clip(1, 0)["transform"]["crop"], crop(28, 0, 8, 36));
+            assert_eq!(clip(0, 1), &before["timeline"]["tracks"][0]["clips"][1], "a fitting crop was rewritten");
+            assert_eq!(clip(0, 2), &before["timeline"]["tracks"][0]["clips"][2]);
+            assert_eq!(clip(0, 3), &before["timeline"]["tracks"][0]["clips"][3], "a crop TS drops was clamped");
+            assert_eq!(clip(1, 1), &before["timeline"]["tracks"][1]["clips"][1], "another media's clip moved");
+        });
+    }
+
+    /// A generator's `path` is a label; one that happens to name a real,
+    /// identity-matching, turned photo must still never be read or flagged —
+    /// and a project with nothing to repair is never written.
+    #[test]
+    fn a_generator_is_never_touched() {
+        with_isolated("still-generator", |dir| {
+            let file = still_file(dir, "looks like a photo.jpg", (64, 36), 6);
+            let mut gen = still_media("m1", &file, (64, 36));
+            gen["generator"] = serde_json::json!({ "type": "solid", "color": "#00ff00" });
+            let proj = dir.join("Gen.trt");
+            write_current_project(&proj, serde_json::json!([gen]), (1920, 1080));
+
+            let (loaded, wrote) = load_and_see_write(&proj);
+            assert_eq!(loaded.project["media"][0]["width"], 64);
+            assert_eq!(loaded.project["media"][0]["height"], 36);
+            assert!(loaded.project["media"][0].get("oriented").is_none());
+            assert!(!wrote);
+        });
+    }
+
+    /// The three bits that mean "the bytes are in the cloud", and neighbours
+    /// that do not: ARCHIVE and NORMAL are on every ordinary file, PINNED and
+    /// UNPINNED describe a sync policy, not where the bytes are.
+    #[test]
+    fn only_offline_and_recall_bits_mark_a_placeholder() {
+        for local in [0u32, 0x20, 0x80, 0x2000, 0x8_0000, 0x10_0000, 0x20 | 0x10_0000] {
+            assert!(!is_placeholder_attributes(local), "{local:#x}");
+        }
+        for cloud in [0x1000u32, 0x4_0000, 0x40_0000, 0x20 | 0x40_0000, 0x10_0000 | 0x40_0000 | 0x1000] {
+            assert!(is_placeholder_attributes(cloud), "{cloud:#x}");
+        }
     }
 }
