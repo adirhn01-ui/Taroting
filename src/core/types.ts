@@ -57,23 +57,26 @@ export interface MediaRef {
   generator?: Generator;
   /** Stills only: `width`/`height` are what THIS app's decoders present, the
    *  same size in the preview and in export (the invariant schema 2 records for
-   *  video). For a file the WebView turns by its EXIF orientation (JPEG, a PNG
-   *  with an early eXIf — measured) that is the oriented size and export
-   *  autorotates to match; for one it does not it is the coded size and the
-   *  file also carries `noAutorotate` — one per-file rule, `exif::read_still`
-   *  in the backend.
+   *  video). For a file the WebView turns by its EXIF orientation (a JPEG, a
+   *  PNG with an eXIf before its image data — measured) that is the oriented
+   *  size and export autorotates to match; for one it does not it is the coded
+   *  size and the file also carries `noAutorotate` — one per-file rule,
+   *  `exif::read_still` in the backend.
    *  Stamped by `probe_media` on every new still and by the load-time
    *  orientation repair; a still without it is re-checked against its file
-   *  header once. The repair is idempotent without the flag — it only saves the
-   *  re-check — so a copy that loses it is safe. */
+   *  header once, and so, once, is a PNG or WebP stamped without
+   *  `noAutorotate` by an earlier build of the rule. The repair is idempotent
+   *  without the flag — it only saves the re-check — so a copy that loses it
+   *  is safe. */
   oriented?: true;
-  /** Stills only: the WebView shows this file's pixels UNTURNED even though
-   *  it carries an orientation tag ffmpeg would honour — every WebP, a PNG
-   *  whose eXIf chunk sits after its image data (measured: WebView2 reads an
-   *  eXIf only before IDAT), bmp/tiff. Export and thumbnails must then decode
-   *  it with `-noautorotate` too, and `width`/`height` are the coded size.
-   *  Decided PER FILE from the header by the backend (probe + the load-time
-   *  repair), because a PNG's answer depends on where its eXIf sits. */
+  /** Stills only: the WebView draws this file's pixels UNTURNED whatever
+   *  orientation tag it may carry — every WebP and TIFF, and a PNG whose first
+   *  IDAT comes before any eXIf chunk (measured: WebView2 reads an eXIf only
+   *  before IDAT; ffmpeg reads one anywhere). Export and thumbnails then decode
+   *  it with `-noautorotate` too — a no-op on an untagged file — and
+   *  `width`/`height` are the coded size. Decided PER FILE from the chunk
+   *  headers by the backend (probe + the load-time repair), by where a tag
+   *  could sit, never by reading one. Never set on a JPEG or a BMP. */
   noAutorotate?: true;
 }
 

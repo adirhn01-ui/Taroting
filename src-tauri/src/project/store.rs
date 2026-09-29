@@ -640,12 +640,13 @@ fn is_cloud_placeholder(_path: &Path) -> bool {
 ///
 /// Runs on EVERY load, not behind a schema gate (owner's decision: no schema
 /// bump for this). What keeps that cheap is the `oriented` flag — a flagged
-/// still is skipped without touching its file — and what keeps it CORRECT is
-/// that the repair is idempotent without the flag: it only fires while the
-/// stored pair equals the header's coded pair exactly, which a repaired entry
-/// never does again. So a copy that loses the flag costs one header read,
-/// never a second transposition. Only a flag that is literally `true` counts;
-/// any other value from a hand-edited file is simply checked and replaced.
+/// still is skipped without touching its file, bar the one header-read
+/// recheck below — and what keeps it CORRECT is that the repair is idempotent
+/// without the flag: it only fires while the stored pair is exactly the one
+/// its header says is wrong, which a repaired entry never is again. So a copy
+/// that loses the flag costs one header read, never a second transposition.
+/// Only a flag that is literally `true` counts; any other value from a
+/// hand-edited file is simply checked and replaced.
 ///
 /// The header decides who is a CANDIDATE; ffmpeg decides the turn. The sniff
 /// is knowingly more lenient than ffmpeg's EXIF parser — ffmpeg drops the
@@ -675,20 +676,35 @@ fn is_cloud_placeholder(_path: &Path) -> bool {
 /// flagging it unconfirmed would vouch for a size nobody measured.
 ///
 /// Whose rule the still follows is decided per FILE from the same header read
-/// (`exif::read_still`, the function the probe asks). A still whose tag the
-/// WebView ignores — a WebP's EXIF, a PNG eXIf after the image data — keeps
-/// its CODED size by design: it is stamped `noAutorotate: true` (with
-/// `oriented`), never transposed and never sent to the frame probe. That is
-/// what brings a late-eXIf PNG imported by 0.8.1 — stored coded, exported
-/// autorotated, so turned in the export alone — into line: the stamp makes
-/// the export stop turning it. The one entry it is withheld from is one
-/// stored at the TRANSPOSE of its coded pair (a build that followed ffmpeg's
-/// turn stored it so): the stamp would make the export decode the coded
-/// frame against a turned size, the hard-abort shape. It is left exactly as
-/// it is, unflagged — a header read on each load, no process — until a
-/// relink re-probes it. Every still that follows ffmpeg and is checked loses
-/// any `noAutorotate` it carries, so the two flags always agree with one
-/// header read.
+/// (`exif::read_still`, the function the probe asks). A still the WebView
+/// draws unturned — any WebP or TIFF, a PNG whose image data comes before any
+/// eXIf — is right at its CODED size by design: it is stamped
+/// `noAutorotate: true` (with `oriented`) and never sent to the frame probe.
+/// Stored at the TRANSPOSE of that coded pair (not square), it is transposed
+/// BACK to it first and its clips' crops clamped into the coded box — the
+/// forward repair's mirror — because a stamp alone would make the export
+/// decode the coded frame against a turned size: the hard-abort shape. That
+/// brings a late-eXIf PNG imported by 0.8.1 (stored coded, exported
+/// autorotated, so turned in the export alone) into line — the stamp makes
+/// the export stop turning it — and equally a copy that lost `oriented`
+/// after a build that followed ffmpeg's turn had stored it turned. A flagged
+/// still whose header gives no size is left alone and unflagged: which way
+/// it is stored cannot be told. Every still that follows ffmpeg and is
+/// checked loses any `noAutorotate` it carries, so the two flags always agree
+/// with one header read.
+///
+/// The one flagged entry the `oriented` skip would hide: a PNG or WebP (by
+/// its recorded `vcodec` / `container`) stamped `oriented` WITHOUT
+/// `noAutorotate`. Earlier builds of this rule flagged fewer files — one
+/// followed ffmpeg's turn on every tagged PNG and WebP and stored them turned,
+/// the next flagged a PNG only when a tail search FOUND a late tag, missing
+/// one past its window — so their stamp can sit on a file today's rule flags.
+/// Such an entry is re-read with `exif::read_flag` (chunk headers only, never
+/// the tail search) behind the same identity and placeholder checks, and
+/// settled exactly as above, once: the stamp it gains ends the recheck. One
+/// the rule still follows — a PNG with an eXIf before its image data — is
+/// left as it was stamped, and so pays that one small header read on every
+/// load: rare files, whose settled answer no stamp records.
 ///
 /// Order: identity, then placeholder, then header, then the frame probe.
 /// Nothing may open the file before the placeholder check has said it is
@@ -698,9 +714,13 @@ fn is_cloud_placeholder(_path: &Path) -> bool {
 /// cloud placeholder is left unflagged, so it is looked at on a later load
 /// once it is local.
 ///
-/// The canvas is never turned: `addMedia` does not adopt a canvas from a
-/// still, so no canvas was ever derived from these numbers. The CROPS of the
-/// transposed still's clips are clamped into the new box (`clamp_clip_crops`).
+/// The canvas is never turned. `addMedia` does not adopt a canvas from a
+/// still, but `openMediaAsProject` (a quick-view / viewer temp project of a
+/// photo) does size the canvas from it — such a project repaired here keeps
+/// its old canvas and letterboxes the still, which is safe: nothing is
+/// cropped away and export matches the preview. Silently reshaping a canvas
+/// the user may have composed on would not be. The CROPS of the transposed
+/// still's clips are clamped into the new box (`clamp_clip_crops`).
 fn repair_still_orientation(value: &mut Value, media: &[schema::MediaRef]) -> bool {
     repair_still_orientation_with(value, media, crate::media::probe::frame_transposes)
 }
@@ -719,12 +739,14 @@ fn repair_still_orientation_with(
         if m.kind != "image" || m.generator.is_some() {
             continue;
         }
-        let flagged = value
+        let oriented = value
             .get("media")
             .and_then(|a| a.get(index))
             .and_then(|e| e.get("oriented"))
             == Some(&Value::Bool(true));
-        if flagged {
+        // Stamped by a build whose rule flagged fewer files (see above).
+        let recheck = oriented && m.no_autorotate != Some(true) && recorded_png_or_webp(m);
+        if oriented && !recheck {
             continue;
         }
         // Identity, then placeholder, then the header — nothing may open the
@@ -732,20 +754,18 @@ fn repair_still_orientation_with(
         if !identity_intact(m) || is_cloud_placeholder(Path::new(&m.path)) {
             continue;
         }
+        if recheck {
+            // Headers only: this runs on every load for a PNG the rule
+            // follows, so it must never reach the sniff's tail search.
+            let flag = crate::media::exif::read_flag(Path::new(&m.path));
+            if flag.no_autorotate {
+                settle_unturned(index, m, flag.coded, &mut fixes, &mut checked);
+            }
+            continue;
+        }
         let still = crate::media::exif::read_still(Path::new(&m.path));
         if still.no_autorotate {
-            // The WebView leaves this tag unturned, so its CODED size is the
-            // right one and the stamp is all it needs — never a transpose,
-            // never a frame probe. Unless it is stored at the transpose of
-            // that coded pair: then the stamp would set the export against
-            // the stored size, and it is left alone (see above).
-            let stored_turned = match (still.sniff, m.width, m.height) {
-                (Some(s), Some(w), Some(h)) => w != h && (h, w) == s.coded,
-                _ => false,
-            };
-            if !stored_turned {
-                checked.push((index, true));
-            }
+            settle_unturned(index, m, still.coded, &mut fixes, &mut checked);
             continue;
         }
         let Some(sniff) = still.sniff else {
@@ -784,6 +804,40 @@ fn repair_still_orientation_with(
         }
     }
     !checked.is_empty()
+}
+
+/// Settle a still every decoder in the app opens `-noautorotate`: its CODED
+/// size is the right one, so a stored pair that is exactly its transpose (not
+/// square — `is_transposition`) is turned back to it, and the still is
+/// stamped. Any other stored pair is stamped as it is — the relink path's
+/// business if it is a different file, as for every still. No `coded` at all
+/// (a header that gives no size) settles nothing: which way the entry is
+/// stored cannot be told, and a stamp against a turned size is the abort.
+fn settle_unturned(
+    index: usize,
+    m: &schema::MediaRef,
+    coded: Option<(u32, u32)>,
+    fixes: &mut Vec<DimFix>,
+    checked: &mut Vec<(usize, bool)>,
+) {
+    let Some(coded) = coded else {
+        return;
+    };
+    if let (Some(w), Some(h)) = (m.width, m.height) {
+        if is_transposition((w, h), coded) {
+            fixes.push(DimFix { index, from: (w, h), to: coded });
+        }
+    }
+    checked.push((index, true));
+}
+
+/// Whether a still's entry records a PNG or a WebP — by the codec or the
+/// demuxer the probe stored, either being enough. The two formats an earlier
+/// build of the per-file rule could stamp `oriented` while withholding the
+/// `noAutorotate` today's rule gives them (`repair_still_orientation`).
+fn recorded_png_or_webp(m: &schema::MediaRef) -> bool {
+    matches!(m.vcodec.as_deref(), Some("png" | "webp"))
+        || matches!(m.container.as_deref(), Some("png_pipe" | "webp_pipe"))
 }
 
 /// `CROP_MIN` in `src/editor/preview/canvas-math.ts`: the smallest crop
@@ -1928,16 +1982,19 @@ mod tests {
     /// rotation you ask it to write, so neither can carry the Display Matrix
     /// this repair is about — while probing them would cost a process per
     /// photo in a slideshow. A still CAN be stored wrong, by EXIF orientation,
-    /// but that is `repair_still_orientation`'s business, and it only ever
-    /// turns a still whose header says it is turned AND whose stored pair is
-    /// exactly the coded one. This PNG carries no orientation, so a still whose
-    /// stored dimensions are the exact transpose of its file's is left alone
-    /// by both repairs, where the identical disagreement on a video is
-    /// corrected.
+    /// but that is `repair_still_orientation`'s business, and for a still the
+    /// app follows ffmpeg on it only ever turns one whose header says it is
+    /// turned AND whose stored pair is exactly the coded one. This JPEG
+    /// carries no orientation, so a still whose stored dimensions are the
+    /// exact transpose of its file's is left alone by both repairs, where the
+    /// identical disagreement on a video is corrected. (A JPEG, not a PNG: an
+    /// untagged PNG is one every decoder opens `-noautorotate`, and the still
+    /// repair turns such a still stored at the transpose of its coded pair
+    /// back to it — its own business, pinned beside it.)
     #[test]
     fn only_video_media_is_ever_re_probed() {
         with_isolated("rot-video-only", |dir| {
-            let still = dir.join("frame.png");
+            let still = dir.join("frame.jpg");
             let out = crate::jobs::ffmpeg::run(
                 "ffmpeg",
                 &[
@@ -3712,19 +3769,20 @@ mod tests {
         file
     }
 
-    /// A still whose tag the WebView ignores, stored at its coded 64x36 with a
+    /// A still the WebView draws unturned, stored at its coded 64x36 with a
     /// header saying 6, is the EXACT shape of a stale JPEG, and the bundled
     /// ffmpeg's autorotate would turn it — but the WebView does not (measured
     /// for a WebP's EXIF and a PNG eXIf after the image data), so 64x36 is its
     /// right size and the export must decode it `-noautorotate`. The repair
     /// stamps `noAutorotate` (the late PNG is exactly what 0.8.1 stored, and
     /// exported turned): never asked of the frame probe, never transposed, its
-    /// crop unmoved. Beside them, each for one reason:
+    /// crop unmoved. So is an untagged PNG — the rule reads where a tag could
+    /// sit, not whether one does. Beside them, each for one reason:
     /// - the SAME PNG with its eXIf before the image data, and a JPEG: the
     ///   WebView turns both, so both are followed — asked, and transposed;
-    /// - a late PNG stored at the TRANSPOSE of its coded pair: the stamp would
-    ///   set the export against the stored size, so it is left exactly as it
-    ///   is, unflagged;
+    /// - a late PNG stored at the TRANSPOSE of its coded pair: a stamp alone
+    ///   would set the export against the stored size, so it is turned BACK
+    ///   to 64x36, its crop clamped into that box, and stamped;
     /// - an upright JPEG carrying a stale `noAutorotate`: checked, and the
     ///   flag it does not deserve is gone.
     ///
@@ -3734,7 +3792,7 @@ mod tests {
     #[test]
     fn a_still_whose_tag_the_webview_ignores_is_stamped_never_turned() {
         with_isolated("still-ignored-tag", |dir| {
-            use crate::media::exif::tests::{tiff_orientation, webp_with_exif};
+            use crate::media::exif::tests::{sniff_bytes, tiff_orientation, tiny_png, webp_with_exif};
             let t6 = tiff_orientation(6, false);
             let base = dir.join("64x36 base.webp");
             let out = crate::jobs::ffmpeg::run(
@@ -3750,8 +3808,10 @@ mod tests {
             let turned_file = png_still(dir, "late stored turned.png", (64, 36), &t6, true);
             let jpeg_file = still_file(dir, "stale.jpg", (64, 36), 6);
             let upright_file = still_file(dir, "upright.jpg", (70, 20), 1);
+            let plain_file = dir.join("plain.png");
+            std::fs::write(&plain_file, tiny_png(64, 36)).unwrap();
             for f in [&webp_file, &late_file, &early_file] {
-                let s = crate::media::exif::read_still(f).sniff.unwrap();
+                let s = sniff_bytes(&std::fs::read(f).unwrap()).unwrap();
                 assert_eq!((s.orientation, s.coded), (6, (64, 36)), "{f:?} must look stale to the sniff");
             }
             let as_png = |mut m: Value| {
@@ -3767,6 +3827,7 @@ mod tests {
             let turned = as_png(still_media("m5", &turned_file, (36, 64)));
             let mut stale_flag = still_media("m6", &upright_file, (70, 20));
             stale_flag["noAutorotate"] = Value::Bool(true);
+            let plain = as_png(still_media("m7", &plain_file, (64, 36)));
 
             let (mut value, media) = stills_value(
                 serde_json::json!([
@@ -3775,12 +3836,16 @@ mod tests {
                     early,
                     still_media("m4", &jpeg_file, (64, 36)),
                     turned,
-                    stale_flag
+                    stale_flag,
+                    plain
                 ]),
                 serde_json::json!([{ "id": "t1", "kind": "video", "name": "V1", "muted": false,
                     "clips": [
                         cropped_clip("c1", "m1", Some([40, 0, 24, 36])),
-                        cropped_clip("c2", "m2", Some([40, 0, 24, 36]))
+                        cropped_clip("c2", "m2", Some([40, 0, 24, 36])),
+                        // Authored against the turned 36x64 box: y hangs off
+                        // the coded 64x36 one.
+                        cropped_clip("c5", "m5", Some([0, 40, 36, 24]))
                     ] }]),
             );
             let before = value.clone();
@@ -3793,17 +3858,21 @@ mod tests {
             assert_eq!(asked, vec![path(&early_file), path(&jpeg_file)], "only the followed stills are asked");
             let m = &value["media"];
             let dims = |i: usize| (m[i]["width"].as_u64().unwrap(), m[i]["height"].as_u64().unwrap());
-            for i in [0, 1] {
-                assert_eq!(dims(i), (64, 36), "media {i} was turned");
+            for i in [0, 1, 4, 6] {
+                assert_eq!(dims(i), (64, 36), "media {i} is not at its coded size");
                 assert_eq!(m[i]["oriented"], true, "media {i}");
                 assert_eq!(m[i]["noAutorotate"], true, "media {i} was not stamped");
             }
-            assert_eq!(value["timeline"], before["timeline"], "an unturned still's crop moved");
+            let clip = |c: usize| &value["timeline"]["tracks"][0]["clips"][c]["transform"]["crop"];
+            for c in [0, 1] {
+                assert_eq!(clip(c), &before["timeline"]["tracks"][0]["clips"][c]["transform"]["crop"], "clip {c} moved");
+            }
+            // h 24 fits 36, so y pulls back to 36 - 24.
+            assert_eq!(clip(2), &serde_json::json!({ "x": 0, "y": 12, "w": 36, "h": 24 }), "the turned-back crop");
             for i in [2, 3] {
                 assert_eq!(dims(i), (36, 64), "media {i}: the followed control");
                 assert!(m[i].get("noAutorotate").is_none(), "media {i}");
             }
-            assert_eq!(m[4], before["media"][4], "a still stored turned was stamped against its size");
             assert_eq!(m[5]["oriented"], true);
             assert!(m[5].get("noAutorotate").is_none(), "a stale flag survived its check");
             assert_eq!(dims(5), (70, 20));
@@ -3832,6 +3901,125 @@ mod tests {
                 assert_eq!((e["width"].as_u64(), e["height"].as_u64()), (Some(64), Some(36)), "media {i} turned");
                 assert_eq!((&e["oriented"], &e["noAutorotate"]), (&Value::Bool(true), &Value::Bool(true)), "media {i}");
             }
+        });
+    }
+
+    /// The one-time recheck of a PNG or WebP stamped `oriented` WITHOUT
+    /// `noAutorotate` — what earlier builds of the rule wrote: one followed
+    /// ffmpeg's turn on every tagged PNG and WebP and stored them TURNED (so
+    /// the export, told nothing, turned them too, while the preview drew them
+    /// coded in a turned box); the next flagged only a late tag its tail
+    /// search found. Coded 64x36 throughout, so a turned 36x64 can never pass
+    /// for a right one:
+    /// - a late PNG and a WebP stored turned: turned BACK, stamped, and the
+    ///   late PNG's crop clamped into the coded box;
+    /// - an untagged PNG and the verifier's late-eXIf-behind-70-KB PNG, stored
+    ///   coded: stamped, sizes untouched — one recognised by its `vcodec`
+    ///   alone, one by its `container` alone;
+    /// - a PNG with its eXIf BEFORE the image data, stored turned: the rule
+    ///   still follows it, so it is left exactly as stamped;
+    /// - a late PNG that fails identity, a JPEG, and a PNG already carrying
+    ///   the flag: never rechecked at all.
+    /// The frame probe is never asked. A second pass — the next load — finds
+    /// nothing to do, and so does a second load end to end.
+    #[test]
+    fn a_stamped_png_or_webp_is_rechecked_once_under_the_current_rule() {
+        with_isolated("still-recheck", |dir| {
+            use crate::media::exif::tests::{
+                png_exif_past_the_tail, riff, tiff_orientation, tiny_png, vp8l, webp_with_exif,
+            };
+            let t6 = tiff_orientation(6, false);
+            let late_file = png_still(dir, "late.png", (64, 36), &t6, true);
+            let early_file = png_still(dir, "early.png", (64, 36), &t6, false);
+            let webp_file = dir.join("portrait.webp");
+            std::fs::write(&webp_file, webp_with_exif(&riff(&[vp8l(64, 36)]), 64, 36, &t6)).unwrap();
+            let plain_file = dir.join("plain.png");
+            std::fs::write(&plain_file, tiny_png(64, 36)).unwrap();
+            let past_file = dir.join("late behind 70 KB.png");
+            let (_, past_bytes) = png_exif_past_the_tail(&tiny_png(64, 36)).remove(0);
+            std::fs::write(&past_file, past_bytes).unwrap();
+            let moved_file = png_still(dir, "moved.png", (64, 36), &t6, true);
+            let jpeg_file = still_file(dir, "turned.jpg", (64, 36), 6);
+            let flagged_file = png_still(dir, "flagged.png", (64, 36), &t6, true);
+
+            let stamped = |id: &str, file: &Path, wh: (u32, u32), container: Option<&str>, vcodec: Option<&str>| {
+                let mut m = still_media(id, file, wh);
+                m["oriented"] = Value::Bool(true);
+                m.as_object_mut().unwrap().remove("container");
+                if let Some(c) = container {
+                    m["container"] = Value::from(c);
+                }
+                if let Some(v) = vcodec {
+                    m["vcodec"] = Value::from(v);
+                }
+                m
+            };
+            let png = (Some("png_pipe"), Some("png"));
+            let mut moved = stamped("m6", &moved_file, (36, 64), png.0, png.1);
+            moved["size"] = Value::from(1);
+            let mut flagged = stamped("m8", &flagged_file, (64, 36), png.0, png.1);
+            flagged["noAutorotate"] = Value::Bool(true);
+            let (mut value, media) = stills_value(
+                serde_json::json!([
+                    stamped("m1", &late_file, (36, 64), png.0, png.1),
+                    stamped("m2", &early_file, (36, 64), png.0, png.1),
+                    stamped("m3", &webp_file, (36, 64), Some("webp_pipe"), Some("webp")),
+                    stamped("m4", &plain_file, (64, 36), Some("image2"), Some("png")),
+                    stamped("m5", &past_file, (64, 36), Some("png_pipe"), None),
+                    moved,
+                    stamped("m7", &jpeg_file, (36, 64), Some("jpeg_pipe"), Some("mjpeg")),
+                    flagged
+                ]),
+                serde_json::json!([{ "id": "t1", "kind": "video", "name": "V1", "muted": false,
+                    "clips": [
+                        cropped_clip("c1", "m1", Some([0, 40, 36, 24])),
+                        cropped_clip("c2", "m2", Some([0, 40, 36, 24]))
+                    ] }]),
+            );
+            let before = value.clone();
+            let never = |p: &str| -> Option<bool> { panic!("the recheck asked the frame probe about {p}") };
+            assert!(repair_still_orientation_with(&mut value, &media, never));
+
+            let m = &value["media"];
+            let dims = |i: usize| (m[i]["width"].as_u64().unwrap(), m[i]["height"].as_u64().unwrap());
+            for i in [0, 2, 3, 4] {
+                assert_eq!(dims(i), (64, 36), "media {i} is not at its coded size");
+                assert_eq!(m[i]["noAutorotate"], true, "media {i} was not stamped");
+                assert_eq!(m[i]["oriented"], true, "media {i}");
+            }
+            let crop = |c: usize| &value["timeline"]["tracks"][0]["clips"][c]["transform"]["crop"];
+            assert_eq!(crop(0), &serde_json::json!({ "x": 0, "y": 12, "w": 36, "h": 24 }), "not clamped");
+            assert_eq!(crop(1), &before["timeline"]["tracks"][0]["clips"][1]["transform"]["crop"]);
+            for i in [1, 5, 6, 7] {
+                assert_eq!(m[i], before["media"][i], "media {i} was touched");
+            }
+
+            // The next load: settled, so nothing changes and nothing is written.
+            let settled = value.clone();
+            let media = ProjectFile::deserialize(&value).unwrap().media;
+            assert!(!repair_still_orientation_with(&mut value, &media, never), "a second pass changed something");
+            assert_eq!(value, settled);
+
+            // End to end: the first load repairs and writes, the second does not.
+            let proj = dir.join("Recheck.trt");
+            write_current_project(
+                &proj,
+                serde_json::json!([
+                    stamped("m1", &late_file, (36, 64), png.0, png.1),
+                    stamped("m2", &early_file, (36, 64), png.0, png.1)
+                ]),
+                (1920, 1080),
+            );
+            let (loaded, wrote) = load_and_see_write(&proj);
+            assert!(wrote, "the repair must be persisted");
+            let e = &loaded.project["media"];
+            assert_eq!((e[0]["width"].as_u64(), e[0]["height"].as_u64()), (Some(64), Some(36)));
+            assert_eq!(e[0]["noAutorotate"], true);
+            assert_eq!((e[1]["width"].as_u64(), e[1]["height"].as_u64()), (Some(36), Some(64)));
+            assert!(e[1].get("noAutorotate").is_none());
+            let (again, wrote) = load_and_see_write(&proj);
+            assert!(!wrote, "a rechecked project was rewritten");
+            assert_eq!(again.project["media"], loaded.project["media"]);
         });
     }
 

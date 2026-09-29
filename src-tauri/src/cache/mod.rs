@@ -44,14 +44,18 @@ pub struct MediaKey {
 /// The key is GLOBAL: a bump re-derives every proxy, remux and waveform too, so
 /// it is owed only when some input a SHIPPED build could have cached now comes
 /// out different. v0.9 added `-noautorotate` to thumbnails/filmstrips of stills
-/// the WebView does not orient (`exif::read_still`: WebP, TIFF, and a PNG whose
-/// eXIf sits after its image data) and deliberately did NOT bump. WebP/TIFF
-/// were not importable in any released build and JPEG / early-eXIf PNG recipes
-/// are byte-identical; the one stale shape a 0.8.1 cache can hold is the
-/// thumbnail of a late-eXIf PNG with an orientation tag, served turned where
-/// the preview is not. That is cosmetic and very rare, and it heals on Clear
-/// cache, on LRU eviction or when the file is re-saved — re-deriving every
-/// user's proxies and waveforms for it would not be proportionate.
+/// the WebView draws unturned (`exif::read_flag`: every WebP and TIFF, and a
+/// PNG whose first IDAT comes before any eXIf — tagged or not) and
+/// deliberately did NOT bump. WebP/TIFF were not importable in any released
+/// build; JPEG and early-eXIf PNG argv is unchanged; and on an UNTAGGED PNG —
+/// the one flagged input a 0.8.1 cache holds in bulk — the flag is a no-op:
+/// its thumbnail is byte-identical with and without it (measured on the
+/// bundled ffmpeg, pinned in `thumbs.rs`'s tests). The one stale shape left is
+/// the thumbnail of a PNG with an orientation tag after its image data, served
+/// turned where the preview is not. That is cosmetic and very rare, and it
+/// heals on Clear cache, on LRU eviction or when the file is re-saved —
+/// re-deriving every user's proxies and waveforms for it would not be
+/// proportionate.
 pub const RECIPE_VERSION: u32 = 1;
 
 impl MediaKey {

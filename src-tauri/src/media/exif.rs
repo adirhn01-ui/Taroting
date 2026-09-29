@@ -88,8 +88,9 @@
 //! per FILE by `read_still` below, because WebView2's answer depends on the
 //! file and not just its format: it turns a JPEG by its EXIF and a PNG by an
 //! eXIf before the image data, but not a PNG by an eXIf after it, nor a WebP
-//! (all measured). Where it does not, the app ignores the tag exactly as the
-//! WebView does, and the turn above is never asked about.
+//! (all measured). Where it does not, every decoder in the app opens the file
+//! `-noautorotate` exactly as the WebView draws it, and neither this sniff nor
+//! the frame probe behind it is ever asked about that file.
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -132,24 +133,44 @@ fn open_regular(path: &Path) -> Option<std::fs::File> {
 /* Whose orientation rule the app follows — decided per FILE           */
 /* ------------------------------------------------------------------ */
 
-/// A still's header, read once: the sniff, and the one answer every decoder
-/// in the app obeys about its orientation tag.
+/// A still's header, read once: the one answer every decoder in the app obeys
+/// about its orientation tag, and what the header says about the turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Still {
-    /// What the header says: `None` when the file cannot be opened, is not a
-    /// JPEG / PNG / WebP / TIFF, or its header is malformed, truncated, or
-    /// not this reader's to vouch for (module docs).
+    /// The sniff — read ONLY for a still the app follows ffmpeg on
+    /// (`no_autorotate` false), the one kind whose turn anything asks about.
+    /// `None` for a flagged still, whose tag no decoder in the app acts on (so
+    /// no PNG tail is searched for it), and for a file that cannot be opened,
+    /// is not a still format this knows, or whose header is malformed,
+    /// truncated, or not this reader's to vouch for (module docs).
     pub sniff: Option<Sniff>,
-    /// The file carries an orientation tag the bundled ffmpeg would turn it
-    /// by, and WebView2 draws the picture UNTURNED — so every decoder opens
-    /// it `-noautorotate` and its stored size is the CODED one. The probe
-    /// stores this as `MediaRef.noAutorotate` (`probe.rs`), the load-time
-    /// repair stamps it on older entries (`project/store.rs`), the export
-    /// builder reads that stored answer (`export/builder.rs`), and the
-    /// thumbnail and filmstrip jobs, which hold only a path, ask here
-    /// directly (`media/thumbs.rs`) — the same function on the same file.
+    /// Every decoder in the app opens this still `-noautorotate`, and its
+    /// stored size is the CODED one: the WebView draws it unturned whatever
+    /// its tag says, if it has one (`read_still`). The probe stores this as
+    /// `MediaRef.noAutorotate` (`probe.rs`), the load-time repair stamps it on
+    /// older entries (`project/store.rs`), the export builder reads that
+    /// stored answer (`export/builder.rs`), and the thumbnail and filmstrip
+    /// jobs, which hold only a path, ask `read_flag` (`media/thumbs.rs`) — the
+    /// same rule (`flag_of`) on the same file.
     pub no_autorotate: bool,
+    /// A flagged still's coded (width, height), from the header's own size
+    /// fields — IHDR, the VP8X / VP8 / VP8L header, IFD0 — however its
+    /// orientation block reads: what the load-time repair compares a stored
+    /// size with. `None` for a followed still (nothing needs it), and for a
+    /// flagged one whose header gives no size (a zero side included).
+    pub coded: Option<(u32, u32)>,
 }
+
+/// `read_flag`'s answer: a `Still` without the sniff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Flag {
+    /// `Still::no_autorotate`.
+    pub no_autorotate: bool,
+    /// `Still::coded`.
+    pub coded: Option<(u32, u32)>,
+}
+
+const NOT_A_STILL: Flag = Flag { no_autorotate: false, coded: None };
 
 /// Read the still at `path` and decide, per FILE, whether the app follows
 /// ffmpeg's EXIF turn or ignores the tag the way the WebView does.
@@ -164,25 +185,34 @@ pub(crate) struct Still {
 ///
 /// | file                                             | WebView turns it | `no_autorotate` |
 /// |--------------------------------------------------|------------------|-----------------|
-/// | any still the sniff vouches has orientation 1    | nothing to turn  | no              |
-/// | JPEG, EXIF 2..=8 or unvouched                    | yes (E2E `exif-orientation-still`) | no  |
-/// | PNG, an eXIf before IDAT                         | yes (`exif-orientation-png-early`) | no  |
-/// | PNG, eXIf only after IDAT, 2..=8 or unvouched    | no (`exif-orientation-png-late`)   | yes |
+/// | JPEG, any                                        | yes (E2E `exif-orientation-still`) | no  |
+/// | PNG, an eXIf before the first IDAT               | yes (`exif-orientation-png-early`) | no  |
+/// | PNG, the first IDAT before any eXIf — one after it, or none | no (`exif-orientation-png-late`) | yes |
 /// | PNG, a walk that never reaches IDAT              | cannot say       | no              |
-/// | WebP, EXIF 2..=8 or unvouched                    | no (`exif-orientation-webp`)       | yes |
-/// | TIFF, IFD0 2..=8 or unvouched                    | not drawn at all | yes             |
-/// | BMP, GIF, a video, unrecognised or unreadable    | no tag known here | no             |
+/// | WebP, any                                        | no (`exif-orientation-webp`)       | yes |
+/// | TIFF, any                                        | not drawn at all | yes             |
+/// | BMP                                              | no tag to turn   | no              |
+/// | GIF, a video, unrecognised or unreadable         | no tag known here | no             |
 ///
 /// "no" is ffmpeg's turn, followed: the probe stores the decoded size (a
 /// 5..=8 confirmed by the frame probe) and every decoder autorotates — which
-/// on an untagged file is no turn at all, so its argv is byte-for-byte what
-/// every earlier build used. "yes" where the header cannot be vouched for is
-/// deliberate: `-noautorotate` is a no-op where ffmpeg would not have turned
-/// the picture and right where it would, because the decode is then the
-/// coded pixels — exactly what the WebView draws. So a tag the WebView never
-/// reads can never make the export disagree with the preview, whatever it
-/// says. The one row that "cannot say" keeps the earlier builds' argv: either
-/// answer could be wrong there, and that one at least leaves caches alone.
+/// on an untagged file is no turn at all. "yes" is decided by where a tag
+/// COULD sit, never by reading one: `-noautorotate` on a file ffmpeg would
+/// not have turned changes nothing (an untagged PNG's and an untagged WebP's
+/// thumbnails come out byte-identical with and without it — measured), and
+/// on one it would have turned it is exactly the coded picture the WebView
+/// draws. So nothing that follows IDAT — a late eXIf of any size, one behind
+/// a large chunk, one with a bad CRC — can make the export disagree with the
+/// preview, and no tail read, no frame probe and no window can be fooled
+/// about it. (The rule this replaced flagged a PNG only when a tail search
+/// FOUND a late tag: an eXIf 6 followed by a 70 KB tEXt, or one whose block
+/// overran the 64 KB window, read as "no tag", was stored coded and unflagged,
+/// and ffmpeg turned it in the export — measured.) The one row that "cannot
+/// say" keeps the earlier builds' argv.
+///
+/// A BMP is known here only to say it has nothing to turn by: it carries no
+/// EXIF and ffmpeg attaches no display matrix to one, so its sniff is
+/// orientation 1 and import spends no frame probe on it.
 ///
 /// Known limits, both of files the formats themselves forbid or leave
 /// ffmpeg's to call: a PNG with two eXIf chunks (the spec allows one) is
@@ -191,30 +221,64 @@ pub(crate) struct Still {
 /// a JPEG with two Exif APP1s is ffmpeg's call (module docs), WebView2's
 /// parser unmeasured there.
 ///
-/// Cost: one regular-file guard and a 12-byte magic read ahead of the sniff;
-/// a PNG pays a second, header-only walk plus the tail read only when it
-/// carries an orientation at all. No process.
+/// Cost: one regular-file guard and a 12-byte magic read; a PNG's chunk
+/// headers up to its first IDAT; a WebP's or TIFF's own header walk; and the
+/// sniff — with it a followed PNG's one tail read — only for a still the app
+/// follows. No process.
 pub(crate) fn read_still(path: &Path) -> Still {
     match open_regular(path) {
         Some(mut file) => still_reader(&mut file),
-        None => Still { sniff: None, no_autorotate: false },
+        None => Still { sniff: None, no_autorotate: false, coded: None },
+    }
+}
+
+/// `read_still` without the sniff: the flag and a flagged still's coded size,
+/// from chunk and segment HEADERS alone — never the PNG tail search, which
+/// only a followed PNG's sniff reads. For the callers that need nothing more
+/// and may run often: the thumbnail and filmstrip jobs (once per cache miss)
+/// and the load-time recheck of stamped PNGs and WebPs (every load). Decided
+/// by the same `flag_of` as `read_still`, so the two never disagree.
+pub(crate) fn read_flag(path: &Path) -> Flag {
+    match open_regular(path) {
+        Some(mut file) => flag_reader(&mut file),
+        None => NOT_A_STILL,
+    }
+}
+
+fn flag_reader<R: Read + Seek>(r: &mut R) -> Flag {
+    match read_magic(r) {
+        Some((container, magic)) => flag_of(r, container, &magic),
+        None => NOT_A_STILL,
     }
 }
 
 fn still_reader<R: Read + Seek>(r: &mut R) -> Still {
     let Some((container, magic)) = read_magic(r) else {
-        return Still { sniff: None, no_autorotate: false };
+        return Still { sniff: None, no_autorotate: false, coded: None };
     };
-    let sniff = sniff_as(r, container, &magic);
-    // Vouched "no tag" settles it for every format: nothing to turn by.
-    let tagged = !sniff.is_some_and(|s| s.orientation == 1);
-    let no_autorotate = tagged
-        && match container {
-            Container::Jpeg => false,
-            Container::Png => png_exif_only_after_data(r),
-            Container::Webp | Container::Tiff => true,
-        };
-    Still { sniff, no_autorotate }
+    let Flag { no_autorotate, coded } = flag_of(r, container, &magic);
+    // The sniff answers one question — whether ffmpeg's turn needs a frame
+    // probe — and only a still the app follows ffmpeg on ever asks it.
+    let sniff = if no_autorotate { None } else { sniff_as(r, container, &magic) };
+    Still { sniff, no_autorotate, coded }
+}
+
+/// The rule itself (`read_still`'s table), by container: where an
+/// orientation tag COULD sit, never what one says.
+fn flag_of<R: Read + Seek>(r: &mut R, container: Container, magic: &[u8; 12]) -> Flag {
+    let sized = |coded: Option<(u32, u32)>| coded.filter(|&(w, h)| w > 0 && h > 0);
+    match container {
+        Container::Jpeg | Container::Bmp => NOT_A_STILL,
+        Container::Png => match png_unturned(r) {
+            Some(coded) => Flag { no_autorotate: true, coded: sized(Some(coded)) },
+            None => NOT_A_STILL,
+        },
+        Container::Webp => Flag {
+            no_autorotate: true,
+            coded: sized(u32_at(magic, 4, true).and_then(|size| webp(r, size)).map(|h| h.coded)),
+        },
+        Container::Tiff => Flag { no_autorotate: true, coded: sized(tiff(r).map(|h| h.coded)) },
+    }
 }
 
 /// The still formats this reader knows, by their magic bytes.
@@ -224,13 +288,14 @@ enum Container {
     Png,
     Webp,
     Tiff,
+    Bmp,
 }
 
 /// The first 12 bytes and what they say the file is. `None` for anything
-/// that is not a still format this knows — BMP (no EXIF to turn by), a GIF,
-/// a video, audio, a file too short to tell — so a video is never taken for
-/// a still: a rotated RECORDING keeps its autorotate, which the `<video>`
-/// element applies too. RIFF alone is not a WebP: an AVI is a RIFF file too.
+/// that is not a still format this knows — a GIF, a video, audio, a file too
+/// short to tell — so a video is never taken for a still: a rotated RECORDING
+/// keeps its autorotate, which the `<video>` element applies too. RIFF alone
+/// is not a WebP: an AVI is a RIFF file too.
 fn read_magic<R: Read + Seek>(r: &mut R) -> Option<(Container, [u8; 12])> {
     let mut magic = [0u8; 12];
     read_at(r, 0, &mut magic)?;
@@ -242,58 +307,50 @@ fn read_magic<R: Read + Seek>(r: &mut R) -> Option<(Container, [u8; 12])> {
         Container::Webp
     } else if magic.starts_with(b"II*\0") || magic.starts_with(b"MM\0*") {
         Container::Tiff
+    } else if magic.starts_with(b"BM") {
+        Container::Bmp
     } else {
         return None;
     };
     Some((container, magic))
 }
 
-/// Whether a PNG's orientation can only come from an eXIf AFTER the image
-/// data: WebView2 reads an eXIf only before the first IDAT (measured — E2E
-/// `exif-orientation-png-early` turns, `-late` does not), while ffmpeg reads
-/// one anywhere and keeps the last (measured). Asked only of a PNG whose
-/// sniff did not vouch for "no tag", so it is a walk of its own rather than a
-/// change to `png`'s early returns: the chunk HEADERS up to the first IDAT
-/// (capped like `png`'s), then the same tail search.
+/// The PNG half of the rule: the chunk HEADERS, walked from IHDR to the first
+/// eXIf, IDAT or IEND — never a chunk body, never the tail. WebView2 reads an
+/// eXIf only before the first IDAT (measured — E2E `exif-orientation-png-early`
+/// turns, `-late` does not), so:
 ///
-/// - An eXIf before IDAT, readable or not: `false` — the WebView turns by it,
-///   so the app follows ffmpeg's turn, as for a JPEG.
-/// - None before IDAT, and the tail holds one saying 2..=8, or one this
-///   reader cannot vouch for (a failing CRC, which ffmpeg ignores, or a block
-///   it cannot read): `true`. The WebView never reads past IDAT, so
-///   `-noautorotate` is right whatever that chunk says.
-/// - None anywhere, or a late one saying 1: `false`, nothing to turn by.
-/// - A walk that never reaches IDAT — truncated, a bad IHDR, an IEND first,
-///   an offset past `u64`, more than `MAX_CHUNKS` chunks: `false`, the table's
-///   "cannot say" row.
-fn png_exif_only_after_data<R: Read + Seek>(r: &mut R) -> bool {
-    let mut ihdr = [0u8; 8];
-    if read_at(r, 8, &mut ihdr).is_none() || ihdr != [0, 0, 0, 13, b'I', b'H', b'D', b'R'] {
-        return false;
+/// - IDAT first: `Some(IHDR's size)`. The WebView draws this PNG coded
+///   whatever follows its image data, so the app decodes it `-noautorotate`
+///   — right under any late eXIf ffmpeg would honour (it keeps the last one,
+///   measured), and a no-op without one.
+/// - An eXIf first, readable or not: `None` — the WebView turns by it, so the
+///   app follows ffmpeg's turn, as for a JPEG.
+/// - A walk that never reaches IDAT — a bad or truncated IHDR, an IEND first,
+///   a read past the end, an offset past `u64`, more than `MAX_CHUNKS` chunks
+///   (capped like `png`'s walk): `None`, the table's "cannot say" row.
+fn png_unturned<R: Read + Seek>(r: &mut R) -> Option<(u32, u32)> {
+    let mut ihdr = [0u8; 8 + 13];
+    read_at(r, 8, &mut ihdr)?;
+    if ihdr.get(..8)? != [0, 0, 0, 13, b'I', b'H', b'D', b'R'] {
+        return None;
     }
+    let coded = (u32_at(&ihdr, 8, false)?, u32_at(&ihdr, 12, false)?);
     // Past the signature, IHDR's framing, its 13 bytes and its CRC — where
     // `png` starts its walk, so the two walks share one cap.
     let mut pos: u64 = 8 + 8 + 13 + 4;
     for _ in 0..MAX_CHUNKS {
         let mut hdr = [0u8; 8];
-        if read_at(r, pos, &mut hdr).is_none() {
-            return false;
-        }
-        match hdr.get(4..8) {
-            Some(b"eXIf") | Some(b"IEND") => return false,
-            Some(b"IDAT") => {
-                return !matches!(png_tail_orientation(r, pos), Some(None | Some(1)));
-            }
+        read_at(r, pos, &mut hdr)?;
+        match hdr.get(4..8)? {
+            b"IDAT" => return Some(coded),
+            b"eXIf" | b"IEND" => return None,
             _ => {}
         }
-        let next = u32_at(&hdr, 0, false)
-            .and_then(|len| pos.checked_add(12)?.checked_add(u64::from(len)));
-        let Some(next) = next else {
-            return false;
-        };
-        pos = next;
+        let len = u64::from(u32_at(&hdr, 0, false)?);
+        pos = pos.checked_add(12)?.checked_add(len)?;
     }
-    false
+    None
 }
 
 /// JPEG marker segments walked, SOI to SOS, before giving up. A camera JPEG has
@@ -321,12 +378,28 @@ fn sniff_as<R: Read + Seek>(r: &mut R, container: Container, magic: &[u8; 12]) -
     let s = match container {
         Container::Jpeg => jpeg(r)?,
         Container::Png => png(r)?,
-        Container::Webp => webp(r, u32_at(magic, 4, true)?)?,
-        Container::Tiff => tiff(r)?,
+        Container::Webp => webp(r, u32_at(magic, 4, true)?)?.sniff()?,
+        Container::Tiff => tiff(r)?.sniff()?,
+        Container::Bmp => bmp(r)?,
     };
     // A zero side is not a size anything downstream can use (and a JPEG whose
     // height lives in a DNL marker reports 0 here): no answer beats that one.
     (s.coded.0 > 0 && s.coded.1 > 0).then_some(s)
+}
+
+/// A WebP or TIFF header as its walk read it: the coded size, which the rule
+/// needs of a flagged still (`Still::coded`) whatever its orientation block
+/// says, and the orientation it can vouch for — `None` where the sniff itself
+/// is `None` (an unreadable block, a walk past its cap).
+struct Head {
+    coded: (u32, u32),
+    orientation: Option<u8>,
+}
+
+impl Head {
+    fn sniff(self) -> Option<Sniff> {
+        Some(Sniff { orientation: self.orientation?, coded: self.coded })
+    }
 }
 
 /// Seek to `pos` and fill `buf` exactly. `None` on any short read, which is
@@ -567,10 +640,14 @@ fn jpeg<R: Read + Seek>(r: &mut R) -> Option<Sniff> {
 /// an early one is only the answer when no late one follows. Walking every IDAT
 /// to get there would touch the whole file, where the tail is one read.
 ///
-/// More than one eXIf is `None` (module docs). Cost against the old walk,
-/// which stopped at an early eXIf: a PNG carrying one now also reads the
-/// chunk headers up to IDAT and the tail — the same single ≤64 KB read every
-/// eXIf-less PNG already paid. No process.
+/// More than one eXIf is `None` (module docs). A pure mirror of ffmpeg for any
+/// PNG, but `read_still` only ever asks it of a PNG the app FOLLOWS — one with
+/// an eXIf before the image data (where the tail is what catches a second,
+/// later block: the two-eXIf `None`) or one whose walk never reaches IDAT. A
+/// PNG whose first IDAT comes first is flagged by `png_unturned` without it,
+/// so what a window-bound tail search can miss past IDAT decides nothing.
+/// Cost: the chunk headers up to IDAT, the eXIf's IFD0 and one ≤64 KB tail
+/// read. No process.
 fn png<R: Read + Seek>(r: &mut R) -> Option<Sniff> {
     let mut ihdr = [0u8; 8 + 13];
     read_at(r, 8, &mut ihdr)?;
@@ -690,11 +767,15 @@ fn crc32(bytes: &[u8]) -> u32 {
 /// PNG, the FIRST EXIF chunk decides, readable or not (measured: 1 then 6
 /// does not rotate; an unreadable block then 6 does not either), so a later
 /// one is not looked at and a first one this reader cannot vouch for is `None`.
-fn webp<R: Read + Seek>(r: &mut R, riff_size: u32) -> Option<Sniff> {
+/// The walk goes on past such a block all the same, so the coded size a WebP
+/// carries after it is still found (`Head`).
+fn webp<R: Read + Seek>(r: &mut R, riff_size: u32) -> Option<Head> {
     let end = 8u64.checked_add(u64::from(riff_size))?;
     let mut pos: u64 = 12;
     let mut coded: Option<(u32, u32)> = None;
-    let mut orientation = None;
+    // Set by the FIRST EXIF chunk: its vouched orientation, or `None` when
+    // this reader cannot vouch for it.
+    let mut exif: Option<Option<u8>> = None;
     let mut done = false;
     for _ in 0..MAX_CHUNKS {
         let mut hdr = [0u8; 8];
@@ -742,25 +823,48 @@ fn webp<R: Read + Seek>(r: &mut R, riff_size: u32) -> Option<Sniff> {
                 let bits = u32_at(&l, 1, true)?;
                 coded = Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1));
             }
-            b"EXIF" if orientation.is_none() => {
-                orientation = Some(vouched(ifd0(r, body, size).as_ref())?);
+            b"EXIF" if exif.is_none() => {
+                exif = Some(vouched(ifd0(r, body, size).as_ref()));
             }
             _ => {}
         }
         // RIFF chunks are padded to an even length.
         pos = body.checked_add(size)?.checked_add(size & 1)?;
     }
-    if !done {
-        return None;
-    }
-    Some(Sniff { orientation: orientation.unwrap_or(1), coded: coded? })
+    // A walk that hit its cap never saw every chunk: the size it read stands,
+    // but it has no business vouching that no EXIF followed.
+    let orientation = if done { exif.unwrap_or(Some(1)) } else { None };
+    Some(Head { coded: coded?, orientation })
 }
 
 /// TIFF: the file IS the TIFF structure, so IFD0 carries the size too.
-fn tiff<R: Read + Seek>(r: &mut R) -> Option<Sniff> {
+fn tiff<R: Read + Seek>(r: &mut R) -> Option<Head> {
     let len = r.seek(SeekFrom::End(0)).ok()?;
     let i = ifd0(r, 0, len)?;
-    Some(Sniff { orientation: vouched(Some(&i))?, coded: (i.width?, i.height?) })
+    Some(Head { coded: (i.width?, i.height?), orientation: vouched(Some(&i)) })
+}
+
+/// BMP: no orientation to speak of — no EXIF, and ffmpeg's decoder attaches
+/// no display matrix — so always 1, and the size from the DIB header: 16-bit
+/// at 18/20 in the 12-byte OS/2 core header, signed 32-bit at 18/22 in every
+/// later one, where a negative height is top-down row order, not a smaller
+/// picture. Answered rather than left `None` so a BMP never costs a frame
+/// probe (~120 ms on import, for a turn it cannot have) and the load-time
+/// repair settles it on first sight instead of re-reading it on every load.
+fn bmp<R: Read + Seek>(r: &mut R) -> Option<Sniff> {
+    let mut dib = [0u8; 12];
+    read_at(r, 14, &mut dib)?;
+    let coded = match u32_at(&dib, 0, true)? {
+        12 => (u32::from(u16_at(&dib, 4, true)?), u32::from(u16_at(&dib, 6, true)?)),
+        n if n >= 16 => {
+            // Reinterpreted, not converted: these two fields are signed.
+            let w = u32_at(&dib, 4, true)? as i32;
+            let h = u32_at(&dib, 8, true)? as i32;
+            (u32::try_from(w).ok()?, h.unsigned_abs())
+        }
+        _ => return None,
+    };
+    Some(Sniff { orientation: 1, coded })
 }
 
 #[cfg(test)]
@@ -1062,6 +1166,41 @@ pub(crate) mod tests {
         b
     }
 
+    /// A BMP header: the 14-byte file header and a 40-byte BITMAPINFOHEADER
+    /// of (w, h) — signed, as the format has them. No pixels; the sniffer
+    /// reads only the DIB header's size fields.
+    pub(crate) fn tiny_bmp(w: i32, h: i32) -> Vec<u8> {
+        let mut b = b"BM".to_vec();
+        b.extend_from_slice(&54u32.to_le_bytes()); // the file size, never read
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&54u32.to_le_bytes()); // where the pixels would start
+        b.extend_from_slice(&40u32.to_le_bytes());
+        b.extend_from_slice(&w.to_le_bytes());
+        b.extend_from_slice(&h.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&24u16.to_le_bytes());
+        b.extend_from_slice(&[0; 24]);
+        b
+    }
+
+    /// A late eXIf the old tail search could not see, in the two shapes a
+    /// verifier measured ffmpeg turning while that search said "no tag":
+    /// `(name, png)` on `base`, each eXIf saying 6.
+    /// - followed by a 70 KB tEXt, which pushes it out of the tail window;
+    /// - a block of 65,527 bytes (orientation 6 up front, zeros after), whose
+    ///   chunk no longer fits the window at all.
+    pub(crate) fn png_exif_past_the_tail(base: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+        let t6 = tiff_orientation(6, false);
+        let late = png_with_exif(base, &t6, true);
+        let iend = late.len() - 12;
+        let mut comment = b"Comment\0".to_vec();
+        comment.extend(std::iter::repeat_n(b'x', 70_000));
+        let then_text: Vec<u8> = [&late[..iend], &png_chunk(b"tEXt", &comment)[..], &late[iend..]].concat();
+        let mut big = t6.clone();
+        big.resize(65_527, 0);
+        vec![("png_late6_then_70k_text", then_text), ("png_late6_65527_block", png_with_exif(base, &big, true))]
+    }
+
     pub(crate) fn vp8l(w: u32, h: u32) -> Vec<u8> {
         let bits = (w - 1) | ((h - 1) << 14);
         let mut d = vec![0x2F];
@@ -1247,12 +1386,17 @@ pub(crate) mod tests {
         tiff_entries_in(true, &entries, &[])
     }
 
-    /// The per-FILE rule's table, row by row, on bytes whose sniff each row
-    /// also pins (a `read_still` sniff is the plain sniff, never a second
-    /// opinion). The rows that matter most differ ONLY in where a PNG's
-    /// eXIf sits, or only in whether a WebP carries a tag, so a rule that
-    /// decided by format — the one this replaced — fails here: it gave every
-    /// PNG one answer and every WebP the flag.
+    /// The per-FILE rule's table, row by row: `Some(coded)` is flagged with
+    /// that coded size, `None` followed. The rows that matter most differ ONLY
+    /// in where a PNG's eXIf sits, so a rule that decided by format fails
+    /// here; and the flagged PNG rows include every tail a search could get
+    /// wrong — none at all, a late 1, a late 6 past the window, a bad CRC — so
+    /// a rule that decided by READING the tag fails too (the one this
+    /// replaced left the verifier's two past-the-window files unflagged).
+    ///
+    /// A followed still's sniff is the plain sniff, never a second opinion; a
+    /// flagged one's is never read. `read_flag` gives the same answer on
+    /// every row, since the thumbnail jobs decide by it.
     #[test]
     fn the_per_file_rule_is_the_measured_table() {
         let (jpg, png, webp) = (tiny_jpeg(64, 36), tiny_png(50, 20), riff(&[vp8l(70, 40)]));
@@ -1272,106 +1416,184 @@ pub(crate) mod tests {
         };
         let late_rows = png_exif_left_to_ffmpeg(&png);
         let left = |name: &str| late_rows.iter().find(|r| r.0 == name).unwrap().1.clone();
+        let past = png_exif_past_the_tail(&png);
+        let past = |name: &str| past.iter().find(|r| r.0 == name).unwrap().1.clone();
+        let iend_first: Vec<u8> = [&png[..33], &png_chunk(b"IEND", &[])[..]].concat();
 
-        let rows: Vec<(&str, Vec<u8>, bool)> = vec![
+        let (p, w, tf) = (Some((50, 20)), Some((70, 40)), Some((120, 48)));
+        let rows: Vec<(&str, Vec<u8>, Option<(u32, u32)>)> = vec![
             // JPEG: the WebView turns it, so the app follows ffmpeg — tag or
             // no tag, readable or not.
-            ("jpeg o6", jpeg_with_exif(&jpg, &t(6)), false),
-            ("jpeg o3", jpeg_with_exif(&jpg, &t(3)), false),
-            ("jpeg none", jpg.clone(), false),
-            ("jpeg two blocks", jpeg_with_exif(&jpeg_with_exif(&jpg, &t(6)), &t(6)), false),
-            // PNG: where the eXIf sits is the whole question.
-            ("png early o6", png_with_exif(&png, &t(6), false), false),
-            ("png early o3", png_with_exif(&png, &t(3), false), false),
-            ("png early unreadable", png_with_exif(&png, &c3, false), false),
-            ("png early prefixed", png_with_exif(&png, &prefixed, false), false),
-            ("png late o6", png_with_exif(&png, &t(6), true), true),
-            ("png late o8 le", png_with_exif(&png, &tiff_orientation(8, true), true), true),
-            ("png late o3", png_with_exif(&png, &t(3), true), true),
-            ("png late o1", png_with_exif(&png, &t(1), true), false),
-            ("png late unreadable", png_with_exif(&png, &c3, true), true),
-            ("png late prefixed", png_with_exif(&png, &prefixed, true), true),
-            ("png late o6 bad crc", left("png_late6_badcrc"), true),
-            ("png early 1 late 6", left("png_1_then_late6"), false),
-            ("png two early", left("png_two_early_1_6"), false),
-            ("png none", png.clone(), false),
-            ("png late past the cap", far, false),
-            // WebP and TIFF: never turned by the WebView; flagged whenever
-            // there may be a tag, never when there is none.
-            ("webp o6", webp_with_exif(&webp, 70, 40, &t(6)), true),
-            ("webp o2", webp_with_exif(&webp, 70, 40, &t(2)), true),
-            ("webp o1", webp_with_exif(&webp, 70, 40, &t(1)), false),
-            ("webp unreadable", webp_with_exif(&webp, 70, 40, &c3), true),
-            ("webp none", webp.clone(), false),
-            ("tiff o7", tiny_tiff(120, 48, 7), true),
-            ("tiff none", tiny_tiff(120, 48, 0), false),
-            // Not stills this reader knows: never flagged. A video above all.
-            ("bmp", b"BM\x36\0\0\0\0\0\0\0\x36\0\0\0\x28\0".to_vec(), false),
-            ("gif", b"GIF89a\x40\0\x24\0\0\0\0\0".to_vec(), false),
-            ("avi", b"RIFF\x24\0\0\0AVI LIST\0\0\0\0".to_vec(), false),
-            ("mp4", b"\0\0\0\x18ftypmp42\0\0\0\0".to_vec(), false),
-            ("mkv", vec![0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0, 0, 0, 0, 0], false),
-            ("too short", vec![0xFF, 0xD8], false),
-            ("empty", vec![], false),
+            ("jpeg o6", jpeg_with_exif(&jpg, &t(6)), None),
+            ("jpeg o3", jpeg_with_exif(&jpg, &t(3)), None),
+            ("jpeg none", jpg.clone(), None),
+            ("jpeg two blocks", jpeg_with_exif(&jpeg_with_exif(&jpg, &t(6)), &t(6)), None),
+            // PNG: whether an eXIf comes before the first IDAT is the whole
+            // question — never what one says, nor whether a late one exists.
+            ("png early o6", png_with_exif(&png, &t(6), false), None),
+            ("png early o3", png_with_exif(&png, &t(3), false), None),
+            ("png early unreadable", png_with_exif(&png, &c3, false), None),
+            ("png early prefixed", png_with_exif(&png, &prefixed, false), None),
+            ("png early 1 late 6", left("png_1_then_late6"), None),
+            ("png two early", left("png_two_early_1_6"), None),
+            ("png late o6", png_with_exif(&png, &t(6), true), p),
+            ("png late o8 le", png_with_exif(&png, &tiff_orientation(8, true), true), p),
+            ("png late o3", png_with_exif(&png, &t(3), true), p),
+            ("png late o1", png_with_exif(&png, &t(1), true), p),
+            ("png late unreadable", png_with_exif(&png, &c3, true), p),
+            ("png late prefixed", png_with_exif(&png, &prefixed, true), p),
+            ("png late o6 bad crc", left("png_late6_badcrc"), p),
+            ("png late o6 then 70 KB", past("png_late6_then_70k_text"), p),
+            ("png late o6 65527-byte block", past("png_late6_65527_block"), p),
+            ("png none", png.clone(), p),
+            // A walk that never reaches IDAT cannot say.
+            ("png late past the cap", far, None),
+            ("png iend first", iend_first, None),
+            ("png ihdr only", png[..33].to_vec(), None),
+            // WebP and TIFF: never turned by the WebView, so always flagged —
+            // an unreadable block's size is read all the same.
+            ("webp o6", webp_with_exif(&webp, 70, 40, &t(6)), w),
+            ("webp o2", webp_with_exif(&webp, 70, 40, &t(2)), w),
+            ("webp o1", webp_with_exif(&webp, 70, 40, &t(1)), w),
+            ("webp unreadable", webp_with_exif(&webp, 70, 40, &c3), w),
+            ("webp none", webp.clone(), w),
+            ("tiff o7", tiny_tiff(120, 48, 7), tf),
+            ("tiff none", tiny_tiff(120, 48, 0), tf),
+            // Nothing to turn by, or not a still this reader knows: never
+            // flagged. A video above all.
+            ("bmp", tiny_bmp(90, -30), None),
+            ("gif", b"GIF89a\x40\0\x24\0\0\0\0\0".to_vec(), None),
+            ("avi", b"RIFF\x24\0\0\0AVI LIST\0\0\0\0".to_vec(), None),
+            ("mp4", b"\0\0\0\x18ftypmp42\0\0\0\0".to_vec(), None),
+            ("mkv", vec![0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0, 0, 0, 0, 0], None),
+            ("too short", vec![0xFF, 0xD8], None),
+            ("empty", vec![], None),
         ];
         for (name, bytes, want) in rows {
             let still = still_bytes(&bytes);
-            assert_eq!(still.no_autorotate, want, "{name}");
-            assert_eq!(still.sniff, sniff_bytes(&bytes), "{name}: the sniff is the sniff");
+            assert_eq!(still.no_autorotate, want.is_some(), "{name}");
+            assert_eq!(still.coded, want, "{name}: coded");
+            let sniff = if still.no_autorotate { None } else { sniff_bytes(&bytes) };
+            assert_eq!(still.sniff, sniff, "{name}: the sniff is the sniff, and only a followed still's");
+            let flag = flag_reader(&mut Cursor::new(&bytes));
+            assert_eq!(flag, Flag { no_autorotate: still.no_autorotate, coded: still.coded }, "{name}: read_flag");
         }
     }
 
-    /// The flag's two PNG rows at their edge: the same late eXIf 6 flagged
+    /// A BMP has no orientation to turn by, and says so with its own size —
+    /// so the probe's `Some(s) if !s.transposes()` spends no frame probe on
+    /// it. Both DIB header shapes; a negative height is row order, not size;
+    /// a negative or zero width, a header size it does not know and a
+    /// truncated header are no answer at all.
+    #[test]
+    fn a_bmp_sniffs_as_upright_at_its_own_size() {
+        assert_eq!(sniff_bytes(&tiny_bmp(90, 30)), Some(Sniff { orientation: 1, coded: (90, 30) }));
+        assert_eq!(sniff_bytes(&tiny_bmp(90, -30)), Some(Sniff { orientation: 1, coded: (90, 30) }));
+        let mut core = tiny_bmp(0, 0)[..14].to_vec();
+        core.extend_from_slice(&12u32.to_le_bytes());
+        core.extend_from_slice(&90u16.to_le_bytes());
+        core.extend_from_slice(&30u16.to_le_bytes());
+        core.extend_from_slice(&[1, 0, 24, 0]);
+        assert_eq!(sniff_bytes(&core), Some(Sniff { orientation: 1, coded: (90, 30) }));
+        // The one height with no positive i32: taken whole, never a panic.
+        assert_eq!(sniff_bytes(&tiny_bmp(90, i32::MIN)).map(|s| s.coded), Some((90, 1 << 31)));
+        let mut unknown = tiny_bmp(90, 30);
+        unknown[14] = 13;
+        for (name, bytes) in [
+            ("negative width", tiny_bmp(-90, 30)),
+            ("zero width", tiny_bmp(0, 30)),
+            ("zero height", tiny_bmp(90, 0)),
+            ("unknown header size", unknown),
+            ("truncated", tiny_bmp(90, 30)[..20].to_vec()),
+        ] {
+            assert_eq!(sniff_bytes(&bytes), None, "{name}");
+        }
+    }
+
+    /// `png_unturned` on its own, at its edges: the same late eXIf 6 flagged
     /// or not by nothing but a chunk before IDAT — an early eXIf of 1 (no
-    /// turn), which the WebView reads and ffmpeg overrides with the late one.
-    /// And `png_exif_only_after_data` on its own, where the sniff's gate
-    /// cannot hide it: a PNG whose eXIf says 1 late is not "only after the
-    /// data" in any way that matters, one saying 6 is.
+    /// turn), which the WebView reads and ffmpeg overrides with the late one —
+    /// and a PNG flagged with no tag at all, or a late 1, because the rule
+    /// never reads one. What follows IDAT is never looked at: the verifier's
+    /// two past-the-window files are flagged on the chunk headers alone.
     #[test]
     fn a_png_is_flagged_by_where_its_exif_sits() {
         let png = tiny_png(50, 20);
         let t6 = tiff_orientation(6, false);
         let late = png_with_exif(&png, &t6, true);
+        let unturned = |b: &[u8]| png_unturned(&mut Cursor::new(b));
         let early_1_then_late = png_with_exif(&png_with_exif(&png, &tiff_orientation(1, false), false), &t6, true);
-        assert!(png_exif_only_after_data(&mut Cursor::new(&late)));
-        assert!(!png_exif_only_after_data(&mut Cursor::new(&early_1_then_late)));
-        assert!(!png_exif_only_after_data(&mut Cursor::new(&png_with_exif(&png, &t6, false))));
-        assert!(!png_exif_only_after_data(&mut Cursor::new(&png_with_exif(&png, &tiff_orientation(1, false), true))));
-        assert!(!png_exif_only_after_data(&mut Cursor::new(&png)));
+        assert_eq!(unturned(&late), Some((50, 20)));
+        assert_eq!(unturned(&png_with_exif(&png, &tiff_orientation(1, false), true)), Some((50, 20)));
+        assert_eq!(unturned(&png), Some((50, 20)));
+        for (name, bytes) in png_exif_past_the_tail(&png) {
+            assert_eq!(unturned(&bytes), Some((50, 20)), "{name}");
+        }
+        assert_eq!(unturned(&early_1_then_late), None);
+        assert_eq!(unturned(&png_with_exif(&png, &t6, false)), None);
         // A bad IHDR or no IDAT at all: the walk cannot say, so it does not.
         let mut bad_ihdr = late.clone();
         bad_ihdr[11] = 14;
-        assert!(!png_exif_only_after_data(&mut Cursor::new(&bad_ihdr)));
+        assert_eq!(unturned(&bad_ihdr), None);
         let iend_first: Vec<u8> = [&late[..33], &png_chunk(b"IEND", &[])[..]].concat();
-        assert!(!png_exif_only_after_data(&mut Cursor::new(&iend_first)));
-        // Every prefix of a flagged file: no panic, and a truncation that cuts
-        // the walk short never invents the flag.
+        assert_eq!(unturned(&iend_first), None);
+        // Every prefix of a flagged file: no panic, never the flag before the
+        // walk has read IDAT's header, always the flag once it has — nothing
+        // past that header takes part.
         for n in 0..late.len() {
-            let still = still_bytes(&late[..n]);
-            if n < 33 + 12 {
-                assert!(!still.no_autorotate, "prefix {n}");
-            }
+            assert_eq!(still_bytes(&late[..n]).no_autorotate, n >= 33 + 8, "prefix {n}");
         }
     }
 
-    /// Through the file: behind the regular-file guard (`open_regular`). A
-    /// real late-eXIf PNG is flagged; a directory, a missing path and a file
-    /// too short to name a format are read as nothing at all.
+    /// Malformed PNGs the flag walk meets before any IDAT: IHDR and nothing
+    /// else, a chunk whose length runs to `u32::MAX` (the next header would
+    /// sit 4 GB past the end), and every IHDR field corrupted in turn. No
+    /// panic, and never the flag — a walk that never reaches IDAT cannot say.
+    #[test]
+    fn a_malformed_png_is_never_flagged_and_never_panics() {
+        let png = tiny_png(50, 20);
+        let ihdr_only = png[..33].to_vec();
+        let mut overflow: Vec<u8> = png[..33].to_vec();
+        overflow.extend(png_chunk(b"tEXt", b"k\0v"));
+        overflow[33..37].copy_from_slice(&[0xFF; 4]);
+        overflow.extend_from_slice(&png[33..]);
+        for (name, bytes) in [("ihdr only", ihdr_only), ("length overflow", overflow)] {
+            let still = still_bytes(&bytes);
+            assert!(!still.no_autorotate, "{name}");
+            assert_eq!(still.coded, None, "{name}");
+            assert_eq!(flag_reader(&mut Cursor::new(&bytes)), NOT_A_STILL, "{name}");
+        }
+        for i in 8..33 {
+            let mut bad = png.clone();
+            bad[i] ^= 0xA5;
+            let _ = still_bytes(&bad);
+            let _ = flag_reader(&mut Cursor::new(&bad));
+        }
+    }
+
+    /// Through the file: behind the regular-file guard (`open_regular`), both
+    /// entry points. A real late-eXIf PNG is flagged at its coded size, its
+    /// sniff never read; an early one is followed and sniffed; a directory, a
+    /// missing path and a file too short to name a format are nothing at all.
     #[test]
     fn read_still_is_behind_the_regular_file_guard() {
         let dir = std::env::temp_dir().join("taroting read still test");
         std::fs::create_dir_all(&dir).unwrap();
         let late = dir.join("late.png");
-        let bytes = png_with_exif(&tiny_png(50, 20), &tiff_orientation(6, false), true);
-        std::fs::write(&late, &bytes).unwrap();
-        let still = read_still(&late);
-        assert!(still.no_autorotate);
-        assert_eq!(still.sniff, Some(Sniff { orientation: 6, coded: (50, 20) }));
+        std::fs::write(&late, png_with_exif(&tiny_png(50, 20), &tiff_orientation(6, false), true)).unwrap();
+        assert_eq!(read_still(&late), Still { sniff: None, no_autorotate: true, coded: Some((50, 20)) });
+        assert_eq!(read_flag(&late), Flag { no_autorotate: true, coded: Some((50, 20)) });
+        let early = dir.join("early.png");
+        std::fs::write(&early, png_with_exif(&tiny_png(50, 20), &tiff_orientation(6, false), false)).unwrap();
+        let sniffed = Some(Sniff { orientation: 6, coded: (50, 20) });
+        assert_eq!(read_still(&early), Still { sniff: sniffed, no_autorotate: false, coded: None });
+        assert_eq!(read_flag(&early), NOT_A_STILL);
         let short = dir.join("short.jpg");
         std::fs::write(&short, [0xFF, 0xD8]).unwrap();
-        let nothing = Still { sniff: None, no_autorotate: false };
+        let nothing = Still { sniff: None, no_autorotate: false, coded: None };
         for path in [short, dir.join("absent.webp"), dir.clone()] {
             assert_eq!(read_still(&path), nothing, "{path:?}");
+            assert_eq!(read_flag(&path), NOT_A_STILL, "{path:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1574,23 +1796,29 @@ pub(crate) mod tests {
         let inputs = [
             jpeg_with_exif(&tiny_jpeg(64, 36), &t6),
             png_with_exif(&tiny_png(50, 20), &t6, true),
+            png_with_exif(&tiny_png(50, 20), &t6, false),
             webp_with_exif(&riff(&[vp8l(70, 40)]), 70, 40, &t6),
             riff(&[vp8(90, 24)]),
+            tiny_tiff(120, 48, 6),
+            tiny_bmp(90, -30),
         ];
         for full in &inputs {
             for n in 0..full.len() {
                 if let Some(s) = sniff_bytes(&full[..n]) {
                     assert!(s.coded.0 > 0 && s.coded.1 > 0);
                 }
-                let _ = still_bytes(&full[..n]);
+                let still = still_bytes(&full[..n]);
+                assert!(still.coded.is_none_or(|(w, h)| w > 0 && h > 0));
+                let _ = flag_reader(&mut Cursor::new(&full[..n]));
             }
             // Flip every byte in turn: whatever comes back, it must not panic
-            // — the sniff, nor the per-file rule's own PNG walk.
+            // — the sniff, nor the rule's own walks.
             for i in 0..full.len() {
                 let mut bad = full.clone();
                 bad[i] ^= 0xA5;
                 let _ = sniff_bytes(&bad);
                 let _ = still_bytes(&bad);
+                let _ = flag_reader(&mut Cursor::new(&bad));
             }
         }
 

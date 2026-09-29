@@ -662,9 +662,10 @@ fn register_clip_input(
             )));
         }
         // The bundled ffmpeg turns every still by its EXIF orientation on
-        // decode, but the preview's WebView leaves some unturned (a WebP's
-        // EXIF, a PNG eXIf after the image data — measured) — and the probe
-        // stored such a still at its CODED size for exactly that reason.
+        // decode, but the preview's WebView leaves some unturned (any WebP,
+        // a PNG whose image data comes before its eXIf — measured) — and the
+        // probe stored such a still at its CODED size for exactly that reason
+        // (flagging an untagged one too: there the flag changes nothing).
         // Autorotate here would hand the filtergraph the transpose of the
         // stored size: a squashed export, or a hard size-mismatch abort under
         // a crop or an opacity keyframe. So it is switched off exactly where
@@ -2703,10 +2704,14 @@ mod tests {
     /// portrait (the WebView turns both); the same eXIf AFTER the image data,
     /// and a WebP with that EXIF, decode at their coded landscape size (ffmpeg
     /// would turn them, the WebView does not, so `-noautorotate` must be
-    /// there). 96x40 so a transposed answer can never pass for a right one.
+    /// there). An untagged PNG and WebP are flagged too, and decode exactly as
+    /// they always did. 96x40 so a transposed answer can never pass for a
+    /// right one.
     #[test]
     fn a_real_still_decodes_to_its_stored_size_through_the_builders_own_input() {
-        use crate::media::exif::tests::{jpeg_with_exif, png_with_exif, tiff_orientation, webp_with_exif};
+        use crate::media::exif::tests::{
+            jpeg_with_exif, png_exif_past_the_tail, png_with_exif, tiff_orientation, webp_with_exif,
+        };
         let dir = std::env::temp_dir().join("taroting still input decode");
         std::fs::create_dir_all(&dir).unwrap();
         let base = |ext: &str| {
@@ -2721,17 +2726,21 @@ mod tests {
         };
         let (jpg, png, webp) = (base("jpg"), base("png"), base("webp"));
         let t6 = tiff_orientation(6, false);
-        // (name, bytes, stored portrait, flagged noAutorotate)
-        let rows: Vec<(&str, Vec<u8>, bool, bool)> = vec![
+        // (name, bytes, stored portrait, flagged noAutorotate). The two
+        // past-the-tail rows are the verifier's files: stored coded and
+        // UNflagged by the rule this replaced, so this decode came out turned.
+        let mut rows: Vec<(&str, Vec<u8>, bool, bool)> =
+            png_exif_past_the_tail(&png).into_iter().map(|(n, b)| (n, b, false, true)).collect();
+        rows.extend([
             ("o6.jpg", jpeg_with_exif(&jpg, &t6), true, false),
             ("o6.webp", webp_with_exif(&webp, 96, 40, &t6), false, true),
             ("o8 le.webp", webp_with_exif(&webp, 96, 40, &tiff_orientation(8, true)), false, true),
             ("o6 early.png", png_with_exif(&png, &t6, false), true, false),
             ("o6 late.png", png_with_exif(&png, &t6, true), false, true),
             ("o8 late le.png", png_with_exif(&png, &tiff_orientation(8, true), true), false, true),
-            ("o1.webp", webp.clone(), false, false),
-            ("o1.png", png.clone(), false, false),
-        ];
+            ("o1.webp", webp.clone(), false, true),
+            ("o1.png", png.clone(), false, true),
+        ]);
         for (name, bytes, portrait, flagged) in rows {
             let file = dir.join(name);
             std::fs::write(&file, bytes).unwrap();

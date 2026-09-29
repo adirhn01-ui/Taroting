@@ -14,20 +14,25 @@ use crate::jobs::{self, JobId, JobKind, Jobs, Lane};
 
 const THUMB_WIDTH: u32 = 320;
 
-/// Whether `src` is a still whose orientation tag the WebView ignores (a
-/// WebP's EXIF, a PNG eXIf after the image data — measured) — so a thumbnail
-/// or filmstrip of it must be decoded with `-noautorotate`, or it would show
-/// the photo turned while the preview and the export show it as coded.
+/// Whether `src` is a still the WebView draws unturned whatever orientation
+/// tag it may carry (a WebP, a TIFF, a PNG whose image data comes before any
+/// eXIf — measured) — so a thumbnail or filmstrip of it must be decoded with
+/// `-noautorotate`, or a tagged one would show the photo turned while the
+/// preview and the export show it as coded. On an untagged one the flag
+/// changes nothing: the thumbnail is byte-identical either way (measured).
 ///
-/// These jobs hold only a path, so they ask `exif::read_still` — the same
-/// per-file function the probe asked when it stored the export's answer
+/// These jobs hold only a path, so they ask `exif::read_flag` — the same
+/// per-file rule the probe applied when it stored the export's answer
 /// (`MediaRef.noAutorotate`) for the same file, so the thumbnail is turned
-/// exactly as the export is. A header read, and only ever inside the job,
-/// i.e. on a cache miss. A video, a GIF, an untagged still or anything
-/// unreadable keeps its autorotate — a rotated recording is turned by the
-/// `<video>` element too.
+/// exactly as the export is. Chunk and segment headers only, and only ever
+/// inside the job, i.e. on a cache miss. A video, a GIF, a JPEG, a BMP or
+/// anything unreadable keeps its autorotate — a rotated recording is turned
+/// by the `<video>` element too.
+///
+/// Known exotic mismatch: this decides by magic bytes, not media kind, so an
+/// APNG (probed as a video, exported autorotated) is thumbnailed `-noautorotate`.
 fn ignores_orientation(src: &Path) -> bool {
-    crate::media::exif::read_still(src).no_autorotate
+    crate::media::exif::read_flag(src).no_autorotate
 }
 
 /// The input: `-noautorotate` right before `-i` where `ignores_orientation`
@@ -232,15 +237,15 @@ mod tests {
     }
 
     /// Both jobs' argv, whole, decided per FILE: a WebP turned by its EXIF,
-    /// and a PNG with the same orientation in an eXIf AFTER its image data,
-    /// get `-noautorotate` right before their `-i`; the same PNG eXIf BEFORE
-    /// the image data, a JPEG with that EXIF, an untagged WebP, an MP4 and an
-    /// AVI (a RIFF file, like a WebP) get exactly the argv they always had.
-    /// The two PNGs differ in nothing but where the chunk sits, and the two
-    /// WebPs in nothing but the tag, so a decision by format fails here. Then
-    /// the real thumbnail of each photo: the late PNG and the tagged WebP
-    /// come out LANDSCAPE (coded, as the preview and the export show them),
-    /// the early PNG and the JPEG portrait.
+    /// an untagged WebP, a PNG with the same orientation in an eXIf AFTER its
+    /// image data and an untagged PNG get `-noautorotate` right before their
+    /// `-i`; the same PNG eXIf BEFORE the image data, a JPEG with that EXIF, a
+    /// BMP, an MP4 and an AVI (a RIFF file, like a WebP) get exactly the argv
+    /// they always had. The two tagged PNGs differ in nothing but where the
+    /// chunk sits, so a decision by format fails here. Then the real
+    /// thumbnail of each photo: the late PNG and the tagged WebP come out
+    /// LANDSCAPE (coded, as the preview and the export show them), the early
+    /// PNG and the JPEG portrait.
     #[test]
     fn a_still_the_webview_leaves_unturned_is_thumbnailed_as_coded() {
         let dir = std::env::temp_dir().join("taroting thumbs orientation");
@@ -268,6 +273,10 @@ mod tests {
         std::fs::write(&early, png_with_exif(&png, &t6, false)).unwrap();
         let late = dir.join("o6 late.png");
         std::fs::write(&late, png_with_exif(&png, &t6, true)).unwrap();
+        let plain_png = dir.join("o1.png");
+        std::fs::write(&plain_png, &png).unwrap();
+        let bmp = dir.join("plain.bmp");
+        std::fs::write(&bmp, base("bmp")).unwrap();
         // Never decoded: only their magic bytes are read.
         let mp4 = dir.join("clip.mp4");
         std::fs::write(&mp4, b"\0\0\0\x18ftypmp42\0\0\0\0").unwrap();
@@ -279,9 +288,11 @@ mod tests {
         let rows = [
             (&webp, true),
             (&late, true),
+            (&untagged, true),
+            (&plain_png, true),
             (&early, false),
             (&jpg, false),
-            (&untagged, false),
+            (&bmp, false),
             (&mp4, false),
             (&avi, false),
         ];
@@ -319,6 +330,22 @@ mod tests {
             let (w, h) = (info.width.unwrap(), info.height.unwrap());
             assert_eq!(w, THUMB_WIDTH, "{file:?}");
             assert_eq!(w > h, landscape, "{file:?}: thumbnail came out {w}x{h}");
+        }
+
+        // What lets `cache::RECIPE_VERSION` stay put: an untagged PNG or WebP
+        // is flagged now and was not before, and its thumbnail is the same
+        // bytes either way — so no cache a shipped build wrote goes stale.
+        for file in [&plain_png, &untagged] {
+            let thumb = |args: Vec<OsString>| {
+                let _ = std::fs::remove_file(&dst);
+                let out = crate::jobs::ffmpeg::command("ffmpeg").unwrap().args(args).output().unwrap();
+                assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+                std::fs::read(&dst).unwrap()
+            };
+            let flagged = thumbnail_args(file, &dst, 0.0);
+            let plain: Vec<OsString> = flagged.iter().filter(|a| *a != "-noautorotate").cloned().collect();
+            assert_eq!(flagged.len(), plain.len() + 1, "{file:?} is flagged");
+            assert!(thumb(flagged) == thumb(plain), "{file:?}: -noautorotate changed an untagged thumbnail");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
