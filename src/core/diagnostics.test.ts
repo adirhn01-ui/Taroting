@@ -7,7 +7,7 @@ import {
   sweepUsernames,
   type ReportContext,
 } from "./diagnostics";
-import type { Clip, ProjectFile, Settings } from "./types";
+import type { Clip, MediaRef, ProjectFile, Settings } from "./types";
 import { DEFAULT_EXPORT_PRESET, DEFAULT_SETTINGS } from "./types";
 
 /* ------------------------------------------------------------------ */
@@ -336,6 +336,49 @@ describe("redactProjectShape", () => {
     expect(redactProjectShape(makeProject()).media[3]!.generator).toEqual({ type: "solid" });
   });
 
+  it("reduces a drawing to two counts, never a colour or a coordinate", () => {
+    // A drawing can be a signature. `p` lengths 32 and 48 are 2 and 3 points; a
+    // shape carries none — so strokes (3) and points (5) can't stand in for
+    // each other, and a count of chunks (2) would be wrong on both.
+    const drawing: MediaRef = {
+      id: "d1",
+      path: "Drawing",
+      size: 0,
+      mtimeMs: 0,
+      kind: "image",
+      duration: 0,
+      hasAudio: false,
+      width: 641,
+      height: 361,
+      generator: {
+        type: "drawing",
+        chunks: [
+          [
+            { t: "pen", c: "#a1b2c3", w: 4, o: 1, p: "Q".repeat(32) },
+            { t: "erase", w: 16, p: "R".repeat(48) },
+          ],
+          [{ t: "arrow", c: "#d4e5f6", w: 3, a: [123.5, 45.25], b: [678.75, 90.5] }],
+        ],
+      },
+    };
+    const project: ProjectFile = { ...makeProject(), schema: 3, kind: "image", media: [drawing] };
+    const shape = redactProjectShape(project);
+    expect(shape.kind).toBe("image");
+    expect(shape.media[0]!.generator).toEqual({ type: "drawing", strokes: 3, points: 5 });
+
+    const text = buildReport(baseCtx({ project }));
+    expect(text).toContain("Project kind    image\n");
+    expect(text).toContain("generator:drawing strokes=3 points=5");
+    for (const leak of ["a1b2c3", "d4e5f6", "123.5", "45.25", "678.75", "QQQQ", "RRRR"]) {
+      expect(text, leak).not.toContain(leak);
+    }
+  });
+
+  it("calls a project without a kind a video project", () => {
+    expect(redactProjectShape(makeProject()).kind).toBe("video");
+    expect(buildReport(baseCtx({ project: makeProject() }))).toContain("Project kind    video\n");
+  });
+
   it("caps the media table and reports how many rows were dropped", () => {
     const project = makeProject();
     const many = { ...project, media: [] as ProjectFile["media"] };
@@ -466,6 +509,15 @@ describe("buildReport", () => {
       }),
     );
     expect(custom).toContain("Shortcuts       2 customised");
+  });
+
+  it("counts the recent ink colours and never prints one", () => {
+    const text = buildReport(
+      baseCtx({ settings: makeSettings({ inkColors: ["#a1b2c3", "#d4e5f6", "#0f1e2d"] }) }),
+    );
+    expect(text).toContain("Ink colours     3\n");
+    for (const c of ["a1b2c3", "d4e5f6", "0f1e2d"]) expect(text).not.toContain(c);
+    expect(buildReport(baseCtx({ settings: makeSettings() }))).toContain("Ink colours     0\n");
   });
 
   it("says where a file opened from File Explorer lands, as its own padded line", () => {

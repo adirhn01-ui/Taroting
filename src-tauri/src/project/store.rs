@@ -193,6 +193,16 @@ pub struct RecentItem {
     /// last time this project was opened (ISO 8601 UTC); stamped by `load_project`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened_at: Option<String>,
+    /// `Some("image")` for an image project; absent for a video project (TS
+    /// `RecentItem.kind`). Only the literal string "image" reads as the kind:
+    /// anything else in the index is treated as absent rather than failing the
+    /// parse, since one unparseable field would blank the whole home screen.
+    #[serde(
+        default,
+        deserialize_with = "schema::image_kind_or_none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -967,6 +977,12 @@ pub fn load_project(path: String) -> Result<LoadedProject> {
     })
 }
 
+/// The recents `kind` of a project: `Some("image")` for an image project, and
+/// `None` — no key written — for a video one, whatever else its `kind` holds.
+fn recent_kind(typed: &ProjectFile) -> Option<String> {
+    (typed.kind.as_deref() == Some("image")).then(|| "image".to_string())
+}
+
 /// Record that `path` was just opened. Updates the existing recents entry's
 /// `opened_at`, or inserts a fresh entry built from the loaded project.
 fn stamp_opened(path: &str, typed: &ProjectFile) {
@@ -986,6 +1002,7 @@ fn stamp_opened(path: &str, typed: &ProjectFile) {
                 thumb: None,
                 size_bytes,
                 opened_at: Some(now),
+                kind: recent_kind(typed),
             },
         );
         recents.index.items.truncate(MAX_RECENTS);
@@ -1071,6 +1088,7 @@ pub fn save_project(
             thumb,
             size_bytes: 0, // filled by upsert_recent via fs metadata
             opened_at: None, // preserved from any prior entry by upsert_recent
+            kind: recent_kind(&typed),
         })?;
     }
 
@@ -1524,6 +1542,10 @@ pub fn duplicate_project(path: String, new_name: String, new_id: String) -> Resu
         thumb: src_recent.and_then(|r| r.thumb),
         size_bytes,
         opened_at: None,
+        // From the copied file itself, not the source's recents entry: the
+        // file is what Home will open, and an entry can be missing or stale.
+        kind: (value.get("kind").and_then(Value::as_str) == Some("image"))
+            .then(|| "image".to_string()),
     })?;
 
     Ok(new_path_str)
@@ -2293,6 +2315,7 @@ mod tests {
             thumb: None,
             size_bytes: 0,
             opened_at: None,
+            kind: None,
         })
         .unwrap();
         path
@@ -2827,6 +2850,7 @@ mod tests {
                 thumb: None,
                 size_bytes: 0,
                 opened_at: Some("2020-01-01T00:00:00Z".into()),
+                kind: None,
             })
             .unwrap();
             assert_eq!(read_recents().items.len(), 1, "seed should persist");
@@ -2891,6 +2915,7 @@ mod tests {
                 thumb: None,
                 size_bytes: 0,
                 opened_at: None,
+                kind: None,
             })
             .unwrap();
 
@@ -3006,6 +3031,7 @@ mod tests {
                     thumb: None,
                     size_bytes: 0,
                     opened_at: None,
+                    kind: None,
                 })
                 .unwrap();
             }
@@ -3045,6 +3071,7 @@ mod tests {
                     thumb: None,
                     size_bytes: 0,
                     opened_at: None,
+                    kind: None,
                 }],
             };
             std::fs::write(
@@ -3201,6 +3228,7 @@ mod tests {
                 thumb: None,
                 size_bytes: 0,
                 opened_at: None,
+                kind: None,
             };
 
             let proj = dir.join("Saved.trt");
@@ -4100,5 +4128,41 @@ mod tests {
         for cloud in [0x1000u32, 0x4_0000, 0x40_0000, 0x20 | 0x40_0000, 0x10_0000 | 0x40_0000 | 0x1000] {
             assert!(is_placeholder_attributes(cloud), "{cloud:#x}");
         }
+    }
+
+    /// `RecentItem.kind` is "image" or absent, and nothing else a recents index
+    /// holds there may cost the index its parse (the whole home screen reads
+    /// from it). A video entry writes no `kind` key, so an index this build
+    /// writes for video projects is byte-for-byte what it was.
+    #[test]
+    fn recents_kind_is_image_or_absent_and_never_fails_the_index() {
+        let entry = |kind: Option<Value>| {
+            let mut v = serde_json::json!({
+                "path": "C:\\p\\Pic.trt", "name": "Pic",
+                "modifiedAt": "2026-09-01T00:00:00Z", "durationSec": 0.0, "thumb": null
+            });
+            if let Some(k) = kind {
+                v["kind"] = k;
+            }
+            v
+        };
+        let index: RecentsIndex = serde_json::from_value(serde_json::json!({
+            "schema": 1,
+            "items": [
+                entry(Some("image".into())),
+                entry(None),
+                entry(Some("video".into())),
+                entry(Some(7.into())),
+                entry(Some(Value::Null)),
+            ]
+        }))
+        .expect("an odd kind must not fail the index");
+        let kinds: Vec<Option<&str>> = index.items.iter().map(|i| i.kind.as_deref()).collect();
+        assert_eq!(kinds, [Some("image"), None, None, None, None]);
+
+        let out = serde_json::to_value(&index.items[0]).unwrap();
+        assert_eq!(out["kind"], "image");
+        let video = serde_json::to_value(&index.items[1]).unwrap();
+        assert!(video.get("kind").is_none(), "{video}");
     }
 }

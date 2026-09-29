@@ -11,6 +11,14 @@ use crate::error::{AppError, Result};
 
 pub const CURRENT_SCHEMA: u32 = 2;
 
+/// The schema an IMAGE project is stamped with, and only an image project.
+/// CURRENT_SCHEMA stays 2: bumping it would make `migrate()` reject every
+/// schema-2 file and stamp schema-1 VIDEO files as 3. A video project never
+/// carries `kind`, stays 2, and is byte-identical on disk.
+pub const IMAGE_SCHEMA: u32 = 3;
+/// Highest schema this build opens.
+pub const MAX_ACCEPTED_SCHEMA: u32 = 3;
+
 /// The first schema version whose `media[].width`/`height` are rotation-aware.
 ///
 /// A `.trt` written below this stored the CODED dimensions ffprobe reports, so
@@ -90,8 +98,59 @@ fn true_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<O
     Ok((Value::deserialize(d)? == Value::Bool(true)).then_some(true))
 }
 
-/// A synthetic media source (solid color or styled text). Mirrors the TS
-/// `Generator` union: a `type`-tagged, camelCase enum.
+/// `Some("image")` for a JSON `"image"`, `None` for anything else: the only
+/// kind a project (`ProjectFile.kind?: "image"`) or a recents entry
+/// (`RecentItem.kind?: "image"`) carries. Same reasoning as `true_or_none`:
+/// 0.8.1 ignored `kind` as unknown, so a value there it would have opened must
+/// not turn the file into "invalid project file" now — and `migrate()` reads
+/// the kind by exactly this rule, so the two can never disagree.
+pub(crate) fn image_kind_or_none<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    Ok((Value::deserialize(d)? == Value::from("image")).then(|| "image".to_string()))
+}
+
+/// The strokes of a drawing that have the typed shape, skipping any that do
+/// not — never failing. `load_project` parses a project only to CHECK it and
+/// hands the raw JSON on, so one damaged stroke must not make the whole image
+/// project "invalid project file" (graceful failure on a corrupt `.trt`): the
+/// image editor drops the strokes it cannot validate and says so. The strict
+/// shape check belongs to `save_project`, which validates the raw value, so the
+/// app can never WRITE a stroke this skips. A `chunks` that is not an array of
+/// arrays reads as no strokes.
+fn strokes_that_parse<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<Vec<Stroke>>, D::Error> {
+    let Value::Array(chunks) = Value::deserialize(d)? else {
+        return Ok(Vec::new());
+    };
+    Ok(chunks
+        .into_iter()
+        .filter_map(|chunk| match chunk {
+            Value::Array(strokes) => Some(
+                strokes
+                    .into_iter()
+                    .filter_map(|s| serde_json::from_value::<Stroke>(s).ok())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect())
+}
+
+/// A photo layer's adjustments, or `None` when the value is not an object of
+/// numbers. Rust only carries these (the image editor sanitizes and renders
+/// them), so a malformed one is no reason to refuse the file — least of all a
+/// video project, where 0.8.1 ignored the key.
+fn adjust_or_none<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<ClipAdjust>, D::Error> {
+    Ok(serde_json::from_value(Value::deserialize(d)?).ok())
+}
+
+/// A synthetic media source (solid color, styled text, or an image project's
+/// drawing layer). Mirrors the TS `Generator` union: a `type`-tagged,
+/// camelCase enum.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum Generator {
@@ -106,6 +165,68 @@ pub enum Generator {
         bold: bool,
         italic: bool,
     },
+    /// A freehand/markup layer of an IMAGE project, and never valid anywhere
+    /// else: `load_project` refuses one in a video project, `save_project`
+    /// refuses one unless `kind` is "image", and the video exporter's `build()`
+    /// pre-check refuses it before any input is registered. Strokes come in
+    /// chunks of at most 256 (`STROKE_CHUNK` in src/core/types.ts).
+    #[serde(rename = "drawing")]
+    Drawing {
+        #[serde(deserialize_with = "strokes_that_parse")]
+        chunks: Vec<Vec<Stroke>>,
+    },
+}
+
+/// One committed mark on a drawing layer (TS `Stroke`). Typed only so
+/// `save_project` can prove the shape; the raw JSON value is what is written,
+/// so nothing here is ever re-serialized onto disk.
+///
+/// Loose on purpose: which fields a stroke needs depends on `t` (ink and erase
+/// strokes carry `p`, shapes carry `a`/`b`, an erase has no `c`), and that rule
+/// — with the value checks — belongs to the save-time validation, not to
+/// serde. `p` is unpadded standard base64 of little-endian Float32
+/// `[x, y, pressure]` triples, 16 characters per point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stroke {
+    pub t: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c: Option<String>,
+    pub w: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub o: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub b: Option<[f64; 2]>,
+}
+
+/// An image project's colour/tone adjustments of one PHOTO layer (TS
+/// `ClipAdjust`): integers on the TS side, 0 = identity, a missing field = 0.
+/// Rust never acts on them — the image editor renders them — so they are
+/// carried, not interpreted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipAdjust {
+    #[serde(default)]
+    pub exposure: f64,
+    #[serde(default)]
+    pub brightness: f64,
+    #[serde(default)]
+    pub contrast: f64,
+    #[serde(default)]
+    pub highlights: f64,
+    #[serde(default)]
+    pub shadows: f64,
+    #[serde(default)]
+    pub saturation: f64,
+    #[serde(default)]
+    pub hue: f64,
+    #[serde(default)]
+    pub warmth: f64,
+    #[serde(default)]
+    pub tint: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +299,13 @@ pub struct Clip {
     pub audio: ClipAudio,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyframes: Option<ClipKeyframes>,
+    /// Image projects, photo layers only.
+    #[serde(
+        default,
+        deserialize_with = "adjust_or_none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub adjust: Option<ClipAdjust>,
 }
 
 /// Speed is a DIVISOR everywhere it is used — `duration()` below, the video
@@ -224,6 +352,15 @@ pub struct Track {
     pub name: String,
     pub muted: bool,
     pub clips: Vec<Clip>,
+    /// Image projects: the layer is hidden (the eye toggle). Absent = visible.
+    /// TS only ever writes `true` (anything else reads as visible, never as a
+    /// parse failure); the video exporter never reads it.
+    #[serde(
+        default,
+        deserialize_with = "true_or_none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hidden: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +417,19 @@ pub struct ProjectFile {
     pub media: Vec<MediaRef>,
     pub timeline: Timeline,
     pub export: Value, // opaque to Rust until the export milestone
+    /// `Some("image")` → an image project (schema `IMAGE_SCHEMA`). Absent → a
+    /// video project. `migrate()` refuses any other pairing of the two; any
+    /// other value here reads as absent (`image_kind_or_none`).
+    #[serde(
+        default,
+        deserialize_with = "image_kind_or_none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub kind: Option<String>,
+    /// Image projects only. Opaque to Rust: the image editor sanitizes
+    /// `background` and `export` on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<Value>,
 }
 
 /// A project migrated to `CURRENT_SCHEMA`, plus the version it arrived as.
@@ -313,18 +463,41 @@ pub fn migrate(mut value: Value) -> Result<Migrated> {
         .get("schema")
         .and_then(Value::as_u64)
         .ok_or_else(|| AppError::BadInput("not a Taroting project (missing schema)".into()))?;
-    if version > CURRENT_SCHEMA as u64 {
+    if version > MAX_ACCEPTED_SCHEMA as u64 {
         return Err(AppError::BadInput(format!(
             "project was created by a newer Taroting (schema {version}); please update the app"
         )));
     }
     let from = version as u32;
+    // Schema and kind must agree, both ways. A schema-3 file without the image
+    // kind would reach the VIDEO pipeline holding whatever an image project
+    // holds, and an image kind on a video schema would open a video project in
+    // the image editor. No build writes either shape, so either one is a
+    // crafted or damaged file: refused, never guessed at. Only the literal
+    // string "image" is the kind; any other string there reads as "not an
+    // image project" — refused at schema 3, a plain video project at 1 or 2.
+    let is_image = value.get("kind").and_then(Value::as_str) == Some("image");
     match from {
-        CURRENT_SCHEMA => {}
+        IMAGE_SCHEMA => {
+            if !is_image {
+                return Err(AppError::BadInput(
+                    "schema 3 is only valid for an image project".into(),
+                ));
+            }
+        }
+        CURRENT_SCHEMA => {
+            if is_image {
+                return Err(AppError::BadInput("an image project must be schema 3".into()));
+            }
+        }
         // 1 → 2: nothing in the JSON changes, because nothing in the JSON CAN.
         // The stamp is the entire migration — see `ROTATION_REPAIR_SCHEMA` for
-        // what it records and who acts on it.
+        // what it records and who acts on it. No image project was ever
+        // schema 1, so one claiming to be is refused rather than stamped.
         1 => {
+            if is_image {
+                return Err(AppError::BadInput("an image project must be schema 3".into()));
+            }
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("schema".into(), Value::from(CURRENT_SCHEMA));
             }
@@ -488,6 +661,7 @@ mod tests {
                 detached: false,
             },
             keyframes: None,
+            adjust: None,
         }
     }
 
@@ -498,6 +672,7 @@ mod tests {
             name: "V".into(),
             muted: false,
             clips,
+            hidden: None,
         }
     }
 
@@ -591,5 +766,177 @@ mod tests {
 
         assert!(migrate(serde_json::json!({"schema": 0})).is_err());
         assert!(migrate(serde_json::json!({"name": "no schema"})).is_err());
+    }
+
+    /// Schema 3 and `kind: "image"` come as a pair or not at all. Each refusal
+    /// is told apart by its message, so a check that fired for the wrong reason
+    /// (the "newer Taroting" range check, say) cannot pass for the right one.
+    /// A damaged stroke never makes an image project unopenable: the typed
+    /// check keeps the strokes that parse and skips the rest (the raw JSON the
+    /// editor receives still has them, and it drops them with a notice). Each
+    /// damaged shape differs from the good one on exactly one field.
+    #[test]
+    fn a_damaged_stroke_never_refuses_the_project() {
+        let project = serde_json::json!({
+            "schema": 3, "kind": "image", "name": "pic",
+            "timeline": { "width": 640, "height": 360, "fps": 30, "tracks": [], "markers": [] },
+            "media": [{
+                "id": "d1", "kind": "image", "path": "Drawing", "size": 0, "mtimeMs": 0,
+                "duration": 1, "width": 640, "height": 360, "hasAudio": false,
+                "generator": { "type": "drawing", "chunks": [
+                    [
+                        { "t": "pen", "c": "#1a2b3c", "w": 4, "o": 1, "p": "AAAAAAAAAAAAAAAA" },
+                        { "t": "pen", "c": "#1a2b3c", "o": 1, "p": "AAAAAAAAAAAAAAAA" },
+                        { "t": "pen", "c": "#1a2b3c", "w": "wide", "o": 1, "p": "AAAAAAAAAAAAAAAA" }
+                    ],
+                    "not a chunk",
+                    [ 7, { "t": "erase", "w": 9, "p": "AAAAAAAAAAAAAAAA" } ]
+                ]}
+            }],
+            "export": {}
+        });
+        let media = project["media"][0].clone();
+        let m: MediaRef = serde_json::from_value(media).expect("a damaged drawing still parses");
+        match m.generator {
+            Some(Generator::Drawing { chunks }) => {
+                let kept: Vec<(usize, Vec<&str>)> = chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (i, c.iter().map(|s| s.t.as_str()).collect()))
+                    .collect();
+                // chunk 0 keeps only the whole stroke; the string chunk is gone;
+                // chunk 2 keeps the erase and drops the bare number.
+                assert_eq!(kept, vec![(0, vec!["pen"]), (1, vec!["erase"])]);
+                assert_eq!(chunks[0][0].w, 4.0);
+                assert_eq!(chunks[1][0].w, 9.0);
+            }
+            other => panic!("expected a drawing, got {other:?}"),
+        }
+        // Not an array at all: no strokes, still no refusal.
+        let m: MediaRef = serde_json::from_value(serde_json::json!({
+            "id": "d2", "kind": "image", "path": "Drawing", "size": 0, "mtimeMs": 0,
+            "duration": 1, "width": 10, "height": 10, "hasAudio": false,
+            "generator": { "type": "drawing", "chunks": { "oops": true } }
+        }))
+        .expect("a non-array chunks still parses");
+        assert!(matches!(m.generator, Some(Generator::Drawing { chunks }) if chunks.is_empty()));
+    }
+
+    #[test]
+    fn schema_and_image_kind_must_agree() {
+        let msg = |v: Value| match migrate(v) {
+            Err(AppError::BadInput(m)) => m,
+            other => panic!("expected BadInput, got {other:?}"),
+        };
+
+        // The one valid image shape: accepted as-is, reporting schema 3, so the
+        // rotation re-probe (keyed on `from`) never runs on an image project.
+        let ok = migrate(serde_json::json!({"schema": 3, "kind": "image", "name": "pic"})).unwrap();
+        assert_eq!(ok.from, IMAGE_SCHEMA);
+        assert!(ok.from >= ROTATION_REPAIR_SCHEMA);
+        assert_eq!(ok.value["schema"], 3, "an image project is never re-stamped");
+        assert_eq!(ok.value["kind"], "image");
+
+        assert!(msg(serde_json::json!({"schema": 3})).contains("only valid for an image project"));
+        // A kind that is not the literal string "image" is not the image kind.
+        assert!(msg(serde_json::json!({"schema": 3, "kind": "Image"}))
+            .contains("only valid for an image project"));
+        assert!(msg(serde_json::json!({"schema": 3, "kind": true}))
+            .contains("only valid for an image project"));
+        assert!(msg(serde_json::json!({"schema": 2, "kind": "image"})).contains("must be schema 3"));
+        assert!(msg(serde_json::json!({"schema": 1, "kind": "image"})).contains("must be schema 3"));
+        assert!(msg(serde_json::json!({"schema": 4, "kind": "image"})).contains("newer Taroting"));
+
+        // Video files are exactly what they were: 2 passes, 1 is stamped 2.
+        let v2 = migrate(serde_json::json!({"schema": 2})).unwrap();
+        assert_eq!((v2.from, v2.value["schema"].as_u64()), (2, Some(2)));
+        let v1 = migrate(serde_json::json!({"schema": 1})).unwrap();
+        assert_eq!((v1.from, v1.value["schema"].as_u64()), (1, Some(2)));
+    }
+
+    /// The image-project fields are additive and optional: a video project
+    /// written by this build carries none of them, so its bytes are what they
+    /// were; a value in them that no build writes reads as absent rather than
+    /// refusing the file; and an image project's fields travel with their TS
+    /// names.
+    #[test]
+    fn image_fields_are_absent_from_video_projects_and_camel_case_in_image_ones() {
+        let video_shape = || serde_json::json!({
+            "schema": 2, "app": "taroting", "id": "p1", "name": "Cut",
+            "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-02T00:00:00Z",
+            "media": [],
+            "timeline": {
+                "fps": {"num": 25, "den": 1}, "width": 1280, "height": 720,
+                "tracks": [{"id": "t1", "kind": "video", "name": "Video", "muted": false, "clips": [{
+                    "id": "c1", "mediaId": "m1", "timelineStart": 0.5, "srcIn": 1.0,
+                    "srcOut": 3.0, "speed": 1.0,
+                    "audio": {"volume": 1.0, "muted": false, "fadeInSec": 0.0,
+                              "fadeOutSec": 0.0, "gainOffsetDb": 0.0, "detached": false}
+                }]}]
+            },
+            "export": {}
+        });
+        let video = video_shape();
+        let typed: ProjectFile = serde_json::from_value(video.clone()).unwrap();
+        assert!(typed.kind.is_none() && typed.image.is_none());
+        assert_eq!(serde_json::to_value(&typed).unwrap(), video, "no new key appears on a video project");
+
+        let mut image = video;
+        image["schema"] = 3.into();
+        image["kind"] = "image".into();
+        image["image"] = serde_json::json!({"background": "#fafafa"});
+        image["timeline"]["tracks"][0]["hidden"] = true.into();
+        image["timeline"]["tracks"][0]["clips"][0]["adjust"] =
+            serde_json::json!({"exposure": 12.0, "hue": -40.0});
+        image["media"] = serde_json::json!([{
+            "id": "d1", "path": "Drawing", "size": 0, "mtimeMs": 0, "kind": "image",
+            "duration": 0.0, "hasAudio": false, "width": 641, "height": 361,
+            "generator": {"type": "drawing", "chunks": [[
+                {"t": "pen", "c": "#1a2b3c", "w": 4.5, "o": 1.0, "p": "AAAAAAAAAAAAAAAA"},
+                {"t": "erase", "w": 16.0, "p": "AAAAAAAAAAAAAAAA"},
+                {"t": "arrow", "c": "#e5484d", "w": 3.0, "a": [10.0, 20.0], "b": [300.0, -5.0]}
+            ]]}
+        }]);
+        let typed: ProjectFile = serde_json::from_value(image.clone()).unwrap();
+        assert_eq!(typed.kind.as_deref(), Some("image"));
+        assert_eq!(typed.timeline.tracks[0].hidden, Some(true));
+        let adj = typed.timeline.tracks[0].clips[0].adjust.as_ref().unwrap();
+        assert_eq!((adj.exposure, adj.hue, adj.contrast), (12.0, -40.0, 0.0));
+        match &typed.media[0].generator {
+            Some(Generator::Drawing { chunks }) => {
+                assert_eq!(chunks.len(), 1);
+                assert_eq!(chunks[0].len(), 3);
+                assert_eq!(chunks[0][1].t, "erase");
+                assert!(chunks[0][1].c.is_none());
+                assert_eq!(chunks[0][2].b, Some([300.0, -5.0]));
+            }
+            other => panic!("expected a drawing, got {other:?}"),
+        }
+        // A value no build writes, in any of the new keys, reads as absent —
+        // never as a parse failure that would refuse a file 0.8.1 opened.
+        let mut odd = video_shape();
+        odd["kind"] = 5.into();
+        odd["timeline"]["tracks"][0]["hidden"] = "yes".into();
+        odd["timeline"]["tracks"][0]["clips"][0]["adjust"] = 5.into();
+        let parsed: ProjectFile = serde_json::from_value(odd).expect("odd values must not refuse the file");
+        assert!(parsed.kind.is_none());
+        assert!(parsed.timeline.tracks[0].hidden.is_none());
+        assert!(parsed.timeline.tracks[0].clips[0].adjust.is_none());
+        let mut named = video_shape();
+        named["kind"] = "video".into();
+        named["timeline"]["tracks"][0]["hidden"] = false.into();
+        named["timeline"]["tracks"][0]["clips"][0]["adjust"] = serde_json::json!({ "hue": "warm" });
+        let parsed: ProjectFile = serde_json::from_value(named).unwrap();
+        assert!(parsed.kind.is_none(), "only the literal \"image\" is the kind");
+        assert!(parsed.timeline.tracks[0].hidden.is_none());
+        assert!(parsed.timeline.tracks[0].clips[0].adjust.is_none());
+
+        // Written back (by anything that ever does) under the TS names.
+        let out = serde_json::to_value(&typed).unwrap();
+        assert_eq!(out["kind"], "image");
+        assert_eq!(out["image"], image["image"]);
+        assert_eq!(out["timeline"]["tracks"][0]["hidden"], true);
+        assert_eq!(out["timeline"]["tracks"][0]["clips"][0]["adjust"]["hue"], -40.0);
+        assert_eq!(out["media"][0]["generator"], image["media"][0]["generator"]);
     }
 }

@@ -6,6 +6,7 @@ mod diagnostics;
 mod error;
 mod export;
 mod hw;
+mod image_save;
 mod jobs;
 mod media;
 mod os;
@@ -164,6 +165,8 @@ fn main() {
         .manage(media::playability::Inflight::default())
         .manage(export::LastExportFailure::default())
         .manage(os::CloseWatch::default())
+        // An empty map until an image save begins: no thread, no timer.
+        .manage(Arc::new(image_save::ImageSaves::default()))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 os::on_close_requested(window, &window.state::<os::CloseWatch>());
@@ -209,6 +212,10 @@ fn main() {
             os::uninstall_app,
             os::close_ack,
             screen_pick::screen_pick_color,
+            image_save::image_save_begin,
+            image_save::image_save_chunk,
+            image_save::image_save_commit,
+            image_save::image_save_abort,
         ]);
 
     // Autotest only: the `window.__tarotingAutotest` init script. Not registered

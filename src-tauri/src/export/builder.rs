@@ -809,6 +809,16 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
         if m.generator.is_none() {
             continue;
         }
+        // A drawing belongs to an IMAGE project, which the image editor renders
+        // and ffmpeg never sees. `load_project` already refuses one in a video
+        // project; this is the export's own guard, so a crafted spec cannot
+        // reach `register_clip_input` (which would clone every stroke into the
+        // plan) or `generator_source`. Every media entry, used by a clip or not.
+        if matches!(m.generator, Some(Generator::Drawing { .. })) {
+            return Err(AppError::BadInput(
+                "image projects are exported from the image editor".into(),
+            ));
+        }
         if let Some(Generator::Text { font_family, bold, italic, .. }) = &m.generator {
             match font_path(font_family, *bold, *italic) {
                 Some(p) => {
@@ -1110,6 +1120,14 @@ drawtext=fontfile={font_esc}:textfile={text_ref}:fontsize={px}:fontcolor=0x{rgb}
 x=0:y=0:boxw={w}:boxh={h}:text_align=L+M:line_spacing={line_spacing}:expansion=none"
                 ))
             }
+            // Unreachable by construction, and it MUST stay so: `emit_clip_chain`
+            // `.expect`s this result (under `panic = "abort"`), which is sound
+            // only because `build()`'s media pre-check refuses a drawing before
+            // any input is registered. That pre-check is the guard; this arm
+            // exists because the match must be exhaustive, and it says why.
+            Generator::Drawing { .. } => Err(AppError::BadInput(
+                "drawing layers belong to image projects".into(),
+            )),
         }
     }
 
@@ -1722,6 +1740,7 @@ mod tests {
             transform: None,
             audio: default_audio(),
             keyframes: None,
+            adjust: None,
         }
     }
 
@@ -1730,7 +1749,14 @@ mod tests {
     }
 
     fn vtrack_id(id: &str, clips: Vec<Clip>) -> Track {
-        Track { id: id.into(), kind: "video".into(), name: "Video".into(), muted: false, clips }
+        Track {
+            id: id.into(),
+            kind: "video".into(),
+            name: "Video".into(),
+            muted: false,
+            clips,
+            hidden: None,
+        }
     }
 
     fn vtrack(clips: Vec<Clip>) -> Track {
@@ -3034,7 +3060,7 @@ mod tests {
         let ac = clip("a1", "m1", 0.0, 0.0, 3.0);
         let atrack = Track {
             id: "at".into(), kind: "audio".into(), name: "Audio".into(),
-            muted: false, clips: vec![ac],
+            muted: false, clips: vec![ac], hidden: None,
         };
         let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![]), atrack]);
         let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
@@ -3066,7 +3092,7 @@ mod tests {
         let ac = clip("a1", "m1", 0.0, 0.0, 5.0);
         let atrack = Track {
             id: "at".into(), kind: "audio".into(), name: "Audio".into(),
-            muted: false, clips: vec![ac],
+            muted: false, clips: vec![ac], hidden: None,
         };
         let tl = timeline(1920, 1080, Rational { num: 30, den: 1 },
             vec![vtrack(vec![vc]), atrack]);
@@ -3344,6 +3370,51 @@ mod tests {
         // generated media consume no -i input slot.
         let a = argstr(&b);
         assert_eq!(a.iter().filter(|s| s.as_str() == "-i").count(), 0);
+    }
+
+    /// A drawing (an image-project layer) is refused by the media pre-check with
+    /// a plain Err: never a panic, which `panic = "abort"` would turn into the
+    /// app dying mid-export, and never an ffmpeg run. Covered twice over — as a
+    /// clip on the timeline (the path that would otherwise reach
+    /// `generator_source` and its `.expect`) and as an entry no clip uses (the
+    /// pre-check reads every media entry, not just the used ones). The file
+    /// clip alongside is valid, so the drawing is the only thing to refuse.
+    #[test]
+    fn a_drawing_is_refused_before_anything_is_built() {
+        let drawing = || {
+            gen_media(
+                "d1",
+                Generator::Drawing {
+                    chunks: vec![vec![Stroke {
+                        t: "pen".into(),
+                        c: Some("#1a2b3c".into()),
+                        w: 4.0,
+                        o: Some(1.0),
+                        p: Some("AAAAAAAAAAAAAAAA".into()),
+                        a: None,
+                        b: None,
+                    }]],
+                },
+                641,
+                361,
+            )
+        };
+        let file = media("m1", r"C:\v.mp4", 1280, 720, false);
+        let expect_refusal = |media: Vec<MediaRef>, clips: Vec<Clip>| {
+            let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(clips)]);
+            match build(&spec(media, tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()) {
+                Err(AppError::BadInput(m)) => {
+                    assert!(m.contains("image editor"), "{m}")
+                }
+                Err(e) => panic!("expected BadInput, got {e:?}"),
+                Ok(_) => panic!("a drawing reached the ffmpeg plan"),
+            }
+        };
+        expect_refusal(
+            vec![file.clone(), drawing()],
+            vec![clip("c1", "m1", 0.0, 0.0, 2.0), clip("c2", "d1", 2.0, 0.0, 1.0)],
+        );
+        expect_refusal(vec![file, drawing()], vec![clip("c1", "m1", 0.0, 0.0, 2.0)]);
     }
 
     #[test]

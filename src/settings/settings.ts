@@ -69,12 +69,28 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   nextFile: "Next file (viewer)",
   seekBack: "Back 5s (viewer)",
   seekFwd: "Forward 5s (viewer)",
+  imgSelect: "Select / move (image)",
+  imgPen: "Pen (image)",
+  imgPencil: "Pencil (image)",
+  imgMarker: "Marker (image)",
+  imgEraser: "Eraser (image)",
+  imgShape: "Shapes (image)",
+  imgRuler: "Show or hide ruler (image)",
+  imgSizeDown: "Smaller brush (image)",
+  imgSizeUp: "Larger brush (image)",
+  imgZoomIn: "Zoom in (image)",
+  imgZoomOut: "Zoom out (image)",
+  imgZoomFit: "Fit to window (image)",
+  imgZoom100: "Actual size (image)",
+  imgPanHold: "Hold to pan (image)",
 };
 
 /** The screens that have a ShortcutManager TODAY. The conflict warning names a
- *  mode, and "Ctrl+Z (image)" would point at a screen the user cannot open —
- *  every image action is also an editor action, so its clash already shows as
- *  "(editor)". `"image"` joins this list in Phase 3, with the image editor. */
+ *  mode, and "Ctrl+Z (image)" would point at a screen the user cannot open.
+ *  The shared actions (undo, redo, save, copy, delete, …) are editor actions
+ *  too, so their clashes already show as "(editor)"; the image-only `img*`
+ *  actions show none until `"image"` joins this list — which it does together
+ *  with the image editor itself, not before. */
 export const LIVE_MODES: readonly ShortcutMode[] = ["editor", "viewer"];
 
 /** `findConflicts` restricted to LIVE_MODES — the one result the Shortcuts card
@@ -112,6 +128,20 @@ export const ACTION_ORDER: ActionId[] = [
   "nextFile",
   "seekBack",
   "seekFwd",
+  "imgSelect",
+  "imgPen",
+  "imgPencil",
+  "imgMarker",
+  "imgEraser",
+  "imgShape",
+  "imgRuler",
+  "imgSizeDown",
+  "imgSizeUp",
+  "imgZoomIn",
+  "imgZoomOut",
+  "imgZoomFit",
+  "imgZoom100",
+  "imgPanHold",
 ];
 
 /** The three user-settable colours of the custom theme, in the order they are

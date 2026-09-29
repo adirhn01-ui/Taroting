@@ -26,7 +26,7 @@ import type {
   Rational,
   Track,
 } from "./types";
-import { DEFAULT_EXPORT_PRESET } from "./types";
+import { DEFAULT_EXPORT_PRESET, IMAGE_CANVAS_MAX_SIDE } from "./types";
 import { EPS_KF, removeKfNear, upsertKf } from "./anim";
 import { clipDuration, clipEnd } from "./time";
 
@@ -628,6 +628,16 @@ export function removeMarker(p: ProjectFile, markerId: string): ProjectFile {
 function clampCanvas(n: number): number {
   const even = Math.round(n / 2) * 2;
   return Math.min(Math.max(even, MIN_CANVAS), MAX_CANVAS);
+}
+
+/** An IMAGE project's canvas side: any integer in [1, IMAGE_CANVAS_MAX_SIDE].
+ *  Never even-rounded and never capped at 8192 — those are video-encoder rules,
+ *  and a 641×361 photo must stay 641×361. The upper bound is a crafted-file
+ *  guard, not a user limit (the renderer degrades above Chromium's canvas
+ *  limits instead of refusing). Arithmetic: NaN in, NaN out — callers test
+ *  `Number.isFinite` first, as `sanitizeProject` does for `clampCanvas`. */
+export function clampImageCanvas(n: number): number {
+  return Math.min(Math.max(Math.round(n), 1), IMAGE_CANVAS_MAX_SIDE);
 }
 
 /** Set the project canvas size, clamped to even integers within [16, 8192].

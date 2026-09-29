@@ -765,9 +765,10 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
       el.style.width = `${media.width ?? 0}px`;
       el.style.height = `${media.height ?? 0}px`;
       el.style.transformOrigin = "0 0";
+      // A drawing (image projects only, never on this stage) leaves the box empty.
       if (media.generator.type === "solid") {
         el.style.background = media.generator.color;
-      } else {
+      } else if (media.generator.type === "text") {
         const g = media.generator;
         el.style.color = g.color;
         el.style.whiteSpace = "pre";

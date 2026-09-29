@@ -19,9 +19,17 @@ import type { MediaManager } from "./media";
 
 export interface RelinkCtx {
   session: ProjectSession;
-  media: MediaManager;
+  /** Only `retrack` is used, so that is all a caller has to supply: the image
+   *  editor has no MediaManager and passes its own cache invalidation. */
+  media: Pick<MediaManager, "retrack">;
   /** media ids whose file is missing or changed on disk */
   missing: string[];
+  /** Image projects: a photo layer may only ever be relinked to a still. A
+   *  pick that is anything else is refused outright ("This isn't a still
+   *  image."), with NO "Use anyway" — a video or GIF behind a photo layer is a
+   *  kind change the image renderer cannot draw. Absent/false: the video
+   *  editor's warn-but-allow flow, unchanged. */
+  stillsOnly?: boolean;
 }
 
 /**
@@ -49,6 +57,14 @@ export function clampSrcWindow(
   const srcOut = Math.min(clip.srcOut, dur);
   const srcIn = Math.max(0, Math.min(clip.srcIn, srcOut - minSrcLen));
   return { srcIn, srcOut };
+}
+
+/** A probe result an image project may relink a photo layer to: a still file.
+ *  `generator` is never set on a probe, and is tested anyway — the same rule
+ *  every other `kind === "image"` check in the tree follows. The `stillsOnly`
+ *  gate; exported for the tests. */
+export function isStillInfo(info: MediaInfo): boolean {
+  return info.kind === "image" && !info.generator;
 }
 
 /** Clamp every clip's source window for `mediaId` into the shorter source
@@ -265,6 +281,18 @@ export function openRelinkDialog(ctx: RelinkCtx): void {
         status.textContent = "Couldn't read that file.";
       }
       void e;
+      return;
+    }
+
+    // Refused, not warned: there is nothing to "use anyway" in an image
+    // project, whose renderer only draws stills. A warning left by an earlier
+    // pick in this row goes too, so its button cannot apply that older file.
+    if (ctx.stillsOnly && !isStillInfo(info)) {
+      row.querySelector(".relink-row__warn")?.remove();
+      if (status) {
+        status.className = "relink-row__status relink-row__status--bad";
+        status.textContent = "This isn't a still image.";
+      }
       return;
     }
 

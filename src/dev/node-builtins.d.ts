@@ -6,6 +6,8 @@
 declare module "node:fs" {
   export function readFileSync(path: string, encoding: string): string;
   export function existsSync(path: string): boolean;
+  /** Every entry under `path`, as paths relative to it (Node ≥ 20). */
+  export function readdirSync(path: string, options: { recursive: true }): string[];
 }
 
 declare module "node:url" {

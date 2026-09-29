@@ -1,0 +1,3 @@
+/* Image editor shell. Reuses the video editor's shell classes (and its route-out
+   control ids, so the nav rescue applies unchanged); only what is genuinely new
+   to image mode lives here, built from the tokens in style/tokens.css. */

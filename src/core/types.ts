@@ -19,8 +19,9 @@ export type FontFamily =
   | "Courier New"
   | "Impact";
 
-/** A synthetic media source (no file on disk): a solid color fill or styled text.
- *  Media carrying a generator has kind:"image"; its `path` is a display label. */
+/** A synthetic media source (no file on disk): a solid color fill, styled text,
+ *  or an image project's drawing layer. Media carrying a generator has
+ *  kind:"image"; its `path` is a display label. */
 export type Generator =
   | { type: "solid"; color: string }
   | {
@@ -31,7 +32,42 @@ export type Generator =
       color: string;
       bold: boolean;
       italic: boolean;
-    };
+    }
+  /** A freehand/markup layer of an IMAGE project. Never valid in a video project:
+   *  load_project refuses it there, save_project refuses it unless kind === "image",
+   *  and the video exporter's build() pre-check refuses it. */
+  | { type: "drawing"; chunks: Stroke[][] };
+
+export type InkKind = "pen" | "pencil" | "marker";
+export type ShapeKind = "line" | "rect" | "ellipse" | "arrow";
+
+/** One committed mark on a drawing layer, in LAYER-LOCAL source px (origin = the
+ *  layer media box's top-left — the same space as ClipCrop). Immutable once built:
+ *  history snapshots share stroke objects by reference.
+ *
+ *  `p` = standard-alphabet base64, NO padding, of little-endian Float32 triples
+ *  [x, y, pressure]*; length is a positive multiple of 16 chars (one point = 12 bytes).
+ *  `w` = nominal width in source px (> 0). `c` = lowercase #rrggbb.
+ *  `o` = per-stroke opacity 0..1 (pen 1, pencil 0.3+0.7·meanPressure, marker 0.4). */
+export type Stroke =
+  | { t: InkKind; c: string; w: number; o: number; p: string }
+  | { t: "erase"; w: number; p: string }
+  | { t: ShapeKind; c: string; w: number; a: [number, number]; b: [number, number] };
+
+/** Image-project colour/tone adjustments of one PHOTO layer. Every field is an
+ *  integer; 0 is identity. Ranges: hue -180..180 (degrees), all others -100..100.
+ *  Absent `Clip.adjust` === identity. */
+export interface ClipAdjust {
+  exposure: number;
+  brightness: number;
+  contrast: number;
+  highlights: number;
+  shadows: number;
+  saturation: number;
+  hue: number;
+  warmth: number;
+  tint: number;
+}
 
 /** A reference to an original media file on disk. Originals are never modified. */
 export interface MediaRef {
@@ -150,6 +186,8 @@ export interface Clip {
   audio: ClipAudio;
   /** present → this clip animates one or more transform props */
   keyframes?: ClipKeyframes;
+  /** image projects, photo layers only */
+  adjust?: ClipAdjust;
 }
 
 export interface Track {
@@ -159,6 +197,8 @@ export interface Track {
   muted: boolean;
   /** invariant: sorted by timelineStart, non-overlapping */
   clips: Clip[];
+  /** image projects: layer hidden (eye toggle). Absent = visible. */
+  hidden?: true;
 }
 
 /** A ruler flag at timeline time `t`. `color` is a palette index 0..5. */
@@ -208,9 +248,16 @@ export interface ExportPreset {
  *  migration): the Rust loader re-probes a schema-1 file's video media once,
  *  corrects any transposed width/height, and persists it as 2. New projects
  *  are stamped 2 directly — their media is recorded post-rotation-fix, so the
- *  migration pass has nothing to do and skipping it is free. */
+ *  migration pass has nothing to do and skipping it is free.
+ *
+ *  `schema` 3 is an IMAGE project and nothing else: the Rust `migrate()`
+ *  refuses 3 without `kind: "image"`, and `kind: "image"` below 3. A video
+ *  project never carries `kind`, stays 2, and is byte-identical on disk. */
 export interface ProjectFile {
-  schema: 1 | 2;
+  /** 3 = image project (requires kind === "image"). Video projects stay 2. */
+  schema: 1 | 2 | 3;
+  /** present → image project (schema 3). Absent → video project. */
+  kind?: "image";
   app: "taroting";
   id: string;
   name: string;
@@ -220,6 +267,23 @@ export interface ProjectFile {
   timeline: Timeline;
   /** last-used export preset, persisted per project */
   export: ExportPreset;
+  /** image projects only */
+  image?: ImageMeta;
+}
+
+export type ImageExportFormat = "png" | "jpeg" | "webp";
+export interface ImageExportPreset {
+  format: ImageExportFormat;
+  /** 1..100; JPEG/WebP only. WebP 100 = lossless (Chromium's own rule). */
+  quality: number;
+  /** percent of the canvas, or an explicit output size */
+  size: 100 | 50 | 25 | { w: number; h: number };
+}
+export interface ImageMeta {
+  /** "transparent" or a validated lowercase #rrggbb */
+  background: string;
+  /** last-used image export options, persisted per project */
+  export?: ImageExportPreset;
 }
 
 export type ActionId =
@@ -249,7 +313,21 @@ export type ActionId =
   | "prevFile"
   | "nextFile"
   | "seekBack"
-  | "seekFwd";
+  | "seekFwd"
+  | "imgSelect"
+  | "imgPen"
+  | "imgPencil"
+  | "imgMarker"
+  | "imgEraser"
+  | "imgShape"
+  | "imgRuler"
+  | "imgSizeDown"
+  | "imgSizeUp"
+  | "imgZoomIn"
+  | "imgZoomOut"
+  | "imgZoomFit"
+  | "imgZoom100"
+  | "imgPanHold";
 
 /** The three user-settable colours of the "custom" theme.
  *
@@ -317,6 +395,10 @@ export interface Settings {
    *  frontend untyped and must never produce an unusable layout. */
   timelineHeight: number;
   shortcuts: Record<ActionId, string>;
+  /** image editor: recently used ink colours, most recent first, ≤ 6, lowercase
+   *  #rrggbb. Sanitized on read like every field (`asInkColors` in
+   *  core/session.ts); diagnostics report only how many there are. */
+  inkColors: string[];
 }
 
 /** The one clamp for `timelineHeight`, shared by the sanitizer and the drag
@@ -336,6 +418,8 @@ export interface RecentItem {
   sizeBytes: number;
   /** ISO 8601; stamped when the project is opened (absent until first open) */
   openedAt?: string;
+  /** "image" for image projects; absent for video projects */
+  kind?: "image";
 }
 
 export interface RecentsIndex {
@@ -374,6 +458,26 @@ export const DEFAULT_SHORTCUTS: Record<ActionId, string> = {
   nextFile: "ArrowRight",
   seekBack: "Shift+ArrowLeft",
   seekFwd: "Shift+ArrowRight",
+  // The image editor's own actions, image mode only (ACTION_MODES). None shares
+  // a mode with an editor or viewer action, so these defaults cannot collide
+  // with a stock chord — only with a user's custom one, and sanitizeShortcuts
+  // then leaves that chord to the user and this action unbound.
+  imgSelect: "V",
+  imgPen: "P",
+  imgPencil: "B",
+  imgMarker: "H",
+  imgEraser: "E",
+  imgShape: "U",
+  imgRuler: "R",
+  imgSizeDown: "[",
+  imgSizeUp: "]",
+  imgZoomIn: "Ctrl+=",
+  imgZoomOut: "Ctrl+-",
+  imgZoomFit: "Ctrl+0",
+  imgZoom100: "Ctrl+1",
+  // Resolved by the image editor's own keydown/keyup pair through
+  // `resolveChord`, never by a ShortcutManager handler: holding needs keyup.
+  imgPanHold: "Space",
 };
 
 /** Which screens an action lives on. A chord conflicts only with an action that shares a
@@ -395,13 +499,17 @@ export const ACTION_MODES: Readonly<Record<ActionId, readonly ShortcutMode[]>> =
   goStart: ["editor", "viewer"],
   goEnd: ["editor", "viewer"],
   split: ["editor"],
-  delete: ["editor"],
+  // Delete / Copy mean "the selected layer" / "the whole image" in image mode.
+  delete: ["editor", "image"],
   rippleDelete: ["editor"],
   undo: ["editor", "image"],
   redo: ["editor", "image"],
   redoAlt: ["editor", "image"],
   save: ["editor", "image"],
-  copy: ["editor"],
+  copy: ["editor", "image"],
+  // Editor-only ON PURPOSE: a bound chord is preventDefault()ed by the
+  // ShortcutManager, which would kill the DOM `paste` event the image editor
+  // reads pasted pixels from.
   paste: ["editor"],
   toggleSnap: ["editor"],
   toggleLoop: ["editor"],
@@ -413,6 +521,20 @@ export const ACTION_MODES: Readonly<Record<ActionId, readonly ShortcutMode[]>> =
   nextFile: ["viewer"],
   seekBack: ["viewer"],
   seekFwd: ["viewer"],
+  imgSelect: ["image"],
+  imgPen: ["image"],
+  imgPencil: ["image"],
+  imgMarker: ["image"],
+  imgEraser: ["image"],
+  imgShape: ["image"],
+  imgRuler: ["image"],
+  imgSizeDown: ["image"],
+  imgSizeUp: ["image"],
+  imgZoomIn: ["image"],
+  imgZoomOut: ["image"],
+  imgZoomFit: ["image"],
+  imgZoom100: ["image"],
+  imgPanHold: ["image"],
 };
 
 /** The stock DARK palette's --bg-app, --accent and --text-1 — so switching to
@@ -448,6 +570,7 @@ export const DEFAULT_SETTINGS: Settings = {
   monitorVolume: 1,
   timelineHeight: 280,
   shortcuts: DEFAULT_SHORTCUTS,
+  inkColors: [],
 };
 
 /** Which family a media extension belongs to (see media-extensions.json). */
@@ -475,6 +598,18 @@ export function stepFamilyOf(ext: string): StepFamily | null {
   const f = mediaFamilyOf(ext);
   return f === null ? null : f === "audio" ? "audio" : "visual";
 }
+
+/** Crafted-.trt guard for image canvases (load-time only; never a user refusal). */
+export const IMAGE_CANVAS_MAX_SIDE = 65535;
+/** Chromium canvas limits (kMaxSkiaDim / kMaxCanvasArea): above these the app renders
+ *  at the largest size that fits and says so — it never refuses the photo. */
+export const RENDER_MAX_SIDE = 32767;
+export const RENDER_MAX_AREA = 268_435_456;
+/** libwebp bitstream limit per side */
+export const WEBP_MAX_SIDE = 16383;
+/** Strokes per drawing chunk. Appending a stroke copies only the chunk index and
+ *  the last chunk, so unlimited undo stays linear in memory. */
+export const STROKE_CHUNK = 256;
 
 export const DEFAULT_EXPORT_PRESET: ExportPreset = {
   format: "mp4",

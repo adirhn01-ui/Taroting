@@ -1267,12 +1267,12 @@ mod e2e {
         Clip {
             id: id.into(), media_id: media.into(), timeline_start: start,
             src_in: si, src_out: so, speed: 1.0, transform: None,
-            audio: default_audio(), keyframes: None,
+            audio: default_audio(), keyframes: None, adjust: None,
         }
     }
 
     fn vtrack(id: &str, clips: Vec<Clip>) -> Track {
-        Track { id: id.into(), kind: "video".into(), name: "V".into(), muted: false, clips }
+        Track { id: id.into(), kind: "video".into(), name: "V".into(), muted: false, clips, hidden: None }
     }
 
     fn preset_640(fps: f64) -> ExportPreset {
@@ -1656,16 +1656,16 @@ mod e2e {
         let a = Clip {
             id: "a".into(), media_id: "m1".into(), timeline_start: 0.0,
             src_in: 0.5, src_out: 1.5, speed: 1.0, transform: None, audio: default_audio(),
-            keyframes: None,
+            keyframes: None, adjust: None,
         };
         let b = Clip {
             id: "b".into(), media_id: "m1".into(), timeline_start: 1.5,
             src_in: 2.0, src_out: 3.0, speed: 1.0, transform: None, audio: default_audio(),
-            keyframes: None,
+            keyframes: None, adjust: None,
         };
         let track = Track {
             id: "vt".into(), kind: "video".into(), name: "Video".into(),
-            muted: false, clips: vec![a, b],
+            muted: false, clips: vec![a, b], hidden: None,
         };
         let tl = Timeline {
             fps: Rational { num: 30, den: 1 }, width: 640, height: 360, tracks: vec![track],
@@ -1709,11 +1709,11 @@ mod e2e {
         let c = Clip {
             id: "c".into(), media_id: "m1".into(), timeline_start: 0.0,
             src_in: 0.0, src_out: 1.0, speed: 1.0, transform: None, audio: default_audio(),
-            keyframes: None,
+            keyframes: None, adjust: None,
         };
         let track = Track {
             id: "vt".into(), kind: "video".into(), name: "Video".into(),
-            muted: false, clips: vec![c],
+            muted: false, clips: vec![c], hidden: None,
         };
         let tl = Timeline {
             fps: Rational { num: 30, den: 1 }, width: 640, height: 360, tracks: vec![track],
@@ -2150,11 +2150,11 @@ mod e2e {
         let c = Clip {
             id: "c".into(), media_id: "m1".into(), timeline_start: 0.0,
             src_in: 0.0, src_out: 10.0, speed: 1.0, transform: None, audio: default_audio(),
-            keyframes: None,
+            keyframes: None, adjust: None,
         };
         let track = Track {
             id: "vt".into(), kind: "video".into(), name: "Video".into(),
-            muted: false, clips: vec![c],
+            muted: false, clips: vec![c], hidden: None,
         };
         let tl = Timeline {
             fps: Rational { num: 30, den: 1 }, width: 640, height: 360, tracks: vec![track],

@@ -38,13 +38,20 @@ function field(label: string, control: HTMLElement): HTMLElement {
 }
 
 /** Build the generated-media editor for the selected clip, or null when the
- *  media has no generator. Commits (history entry) + refreshes on every edit. */
+ *  media has no generator (or is a drawing, which has nothing to edit here).
+ *  Commits (history entry) + refreshes on every edit.
+ *
+ *  Only `session` and `refresh` are read, so that is all the ctx asks for: the
+ *  image editor's inspector passes its own. `sharedNote: false` drops the
+ *  "every clip using this element" note, which is untrue where every layer
+ *  owns its media 1:1. */
 export function buildGeneratedSection(
-  ctx: InspectorCtx,
+  ctx: Pick<InspectorCtx, "session" | "refresh">,
   target: { clip: Clip; media: MediaRef },
+  opts?: { sharedNote?: boolean },
 ): HTMLElement | null {
   const gen = target.media.generator;
-  if (!gen) return null;
+  if (!gen || gen.type === "drawing") return null;
   const mediaId = target.media.id;
 
   const s = el("div", "insp-section");
@@ -61,13 +68,15 @@ export function buildGeneratedSection(
     buildText(s, gen, commitMedia);
   }
 
-  s.appendChild(
-    el(
-      "div",
-      "insp-note",
-      "Edits apply to every clip using this element.",
-    ),
-  );
+  if (opts?.sharedNote !== false) {
+    s.appendChild(
+      el(
+        "div",
+        "insp-note",
+        "Edits apply to every clip using this element.",
+      ),
+    );
+  }
   return s;
 }
 

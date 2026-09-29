@@ -843,6 +843,28 @@ function asCustomTheme(v: unknown): CustomTheme {
   };
 }
 
+/** The image editor's recent ink colours: at most this many, newest first. Six
+ *  recents plus six base colours fill the colour picker's twelve-swatch row. */
+export const INK_COLORS_MAX = 6;
+
+/** Always a FRESH array of at most INK_COLORS_MAX distinct, validated lowercase
+ *  `#rrggbb` strings, newest first. These reach a canvas `fillStyle` and a
+ *  swatch's CSSOM background, so each one goes through `normalizeHexColor`
+ *  like every other colour sink; an invalid entry is dropped rather than
+ *  replaced (a fallback colour here would be one the user never picked).
+ *  Dedupe runs AFTER normalizing, so "#ABC" and "#aabbcc" count once. Only the
+ *  first handful of entries is even looked at: the list is capped at six, and a
+ *  hand-edited megabyte array must not cost a megabyte of work at boot. */
+function asInkColors(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  for (let i = 0; i < v.length && i < 64 && out.length < INK_COLORS_MAX; i++) {
+    const c = normalizeHexColor(v[i], "");
+    if (c !== "" && !out.includes(c)) out.push(c);
+  }
+  return out;
+}
+
 /** Rebuild a stored shortcut map over every known action. A stored STRING wins. An action the
  *  stored map does not mention gets its DEFAULT chord UNLESS that chord (normalizeChord) is
  *  already bound, IN THE STORED MAP, to an action sharing a mode; then it is left unbound (""):
@@ -930,6 +952,7 @@ export function sanitizeSettings(raw: unknown): Settings {
       TIMELINE_HEIGHT_MAX,
     ),
     shortcuts,
+    inkColors: asInkColors(o.inkColors),
   };
 }
 
@@ -1193,6 +1216,20 @@ export type LeaveGuard = () => Promise<boolean>;
 
 const AUTOSAVE_DEBOUNCE_MS = 500;
 
+/** How a `ProjectSession` autosaves. The video editor passes only `temp`, and
+ *  its autosave is exactly what it always was. */
+export interface SessionOptions {
+  /** the project lives in tmp-projects until kept (see `ProjectSession.temp`) */
+  temp?: boolean;
+  /** Idle wait after the last edit before an autosave, ms. Default 500
+   *  (AUTOSAVE_DEBOUNCE_MS). SETTING it also makes it a true idle debounce:
+   *  the interval tick then skips a dirty state while an edit's debounce is
+   *  still pending, instead of saving a few ms after a pointer-up. The image
+   *  editor passes 2500 — serializing a large drawing is not free, and a write
+   *  mid-gesture would be felt. */
+  debounceMs?: number;
+}
+
 /**
  * How many autosave ticks to wait before retrying after a failed write. Doubles
  * per consecutive failure and stops here.
@@ -1253,22 +1290,40 @@ export class ProjectSession {
   /** Where the most recent SUCCESSFUL write landed. `relocate` succeeds exactly
    *  when this names the destination — see there for why not `saveState`. */
   private lastWrittenPath: string | null = null;
+  /** `SessionOptions.debounceMs` when given (validated), else null: null keeps
+   *  the video editor's autosave exactly as it was — the 500 ms debounce and an
+   *  interval that saves any dirty state. */
+  private readonly idleMs: number | null;
+  /** Outstanding `holdAutosave` tokens, and whether an autosave came due while
+   *  one was held (it runs, debounced, on the last release). */
+  private holds = 0;
+  private deferred = false;
 
-  constructor(path: string, initial: ProjectFile, opts?: { temp?: boolean }) {
+  constructor(path: string, initial: ProjectFile, opts?: SessionOptions) {
     this._path = path;
     this.temp = new Store<boolean>(opts?.temp ?? false);
     this.store = new Store(initial);
+    const idle = opts?.debounceMs;
+    this.idleMs = typeof idle === "number" && Number.isFinite(idle) && idle >= 0 ? idle : null;
     const seconds = Math.max(1, settingsStore.get().autosaveSeconds);
     this.intervalTimer = window.setInterval(() => {
       const state = this.saveState.get();
-      if (state === "dirty") {
-        void this.save();
-      } else if (state === "error" && this.retryTicks > 0 && --this.retryTicks === 0) {
-        // The retry path. Gated on `retryTicks > 0` rather than on the countdown
-        // alone so that "error" without a scheduled retry can never fall through
-        // to an every-tick attempt.
-        void this.save();
+      // The retry path is gated on `retryTicks > 0` rather than on the countdown
+      // alone so that "error" without a scheduled retry can never fall through
+      // to an every-tick attempt.
+      const due =
+        state === "dirty" ||
+        (state === "error" && this.retryTicks > 0 && --this.retryTicks === 0);
+      if (!due) return;
+      if (this.holds > 0) {
+        this.deferred = true;
+        return;
       }
+      // The idle rule (image sessions only): an edit whose debounce is still
+      // pending is not idle yet, and that debounce saves it. Keyed on the armed
+      // timer rather than a wall clock, so it cannot drift from the debounce.
+      if (this.idleMs !== null && this.debounceTimer !== undefined) return;
+      void this.save();
     }, seconds * 1000);
   }
 
@@ -1341,8 +1396,51 @@ export class ProjectSession {
 
   private markDirty(): void {
     this.saveState.set("dirty");
+    this.armDebounce();
+  }
+
+  /** (Re)start the autosave debounce. `debounceTimer` is undefined exactly when
+   *  no debounce is pending — the idle rule reads that — so every clear goes
+   *  through `clearDebounce` and the callback forgets its own id first. */
+  private armDebounce(): void {
+    this.clearDebounce();
+    this.debounceTimer = window.setTimeout(() => {
+      this.debounceTimer = undefined;
+      if (this.holds > 0) {
+        this.deferred = true;
+        return;
+      }
+      void this.save();
+    }, this.idleMs ?? AUTOSAVE_DEBOUNCE_MS);
+  }
+
+  private clearDebounce(): void {
     window.clearTimeout(this.debounceTimer);
-    this.debounceTimer = window.setTimeout(() => void this.save(), AUTOSAVE_DEBOUNCE_MS);
+    this.debounceTimer = undefined;
+  }
+
+  /**
+   * Defer AUTOSAVES (the debounce and the interval) until every hold is
+   * released. A save that came due while held runs, debounced, on the last
+   * release. Explicit `save()`, `relocate()` and `dispose()` are NOT deferred:
+   * leaving the editor mid-gesture must still flush. Ref-counted; each release
+   * is idempotent, so a double release cannot free somebody else's hold.
+   *
+   * What it is for: the image editor holds it while a pointer is down, so a
+   * stroke or a drag is never serialized to disk halfway through.
+   */
+  holdAutosave(): () => void {
+    this.holds++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.holds = Math.max(0, this.holds - 1);
+      if (this.holds === 0 && this.deferred) {
+        this.deferred = false;
+        if (!this.disposed) this.armDebounce();
+      }
+    };
   }
 
   /**
@@ -1441,7 +1539,7 @@ export class ProjectSession {
    *  caller a path with nothing on disk. */
   async relocate(dest: string): Promise<void> {
     if (this.disposed) throw new Error("This project is already closed.");
-    window.clearTimeout(this.debounceTimer);
+    this.clearDebounce();
     const previous = this._path;
     this._path = dest;
     this.lastWrittenPath = null;
@@ -1460,7 +1558,7 @@ export class ProjectSession {
 
   /** Flush and stop timers (called when leaving the editor). */
   async dispose(): Promise<void> {
-    window.clearTimeout(this.debounceTimer);
+    this.clearDebounce();
     window.clearInterval(this.intervalTimer);
     // `save()` now resolves only once the state at the time of this call has
     // actually been written, coalesced follow-up included, so `disposed` is set
@@ -1478,7 +1576,7 @@ export class ProjectSession {
    *  `disposed` makes save() short-circuit, so the later dispose() also skips
    *  its flush. Idempotent. */
   discard(): void {
-    window.clearTimeout(this.debounceTimer);
+    this.clearDebounce();
     window.clearInterval(this.intervalTimer);
     this.disposed = true;
   }

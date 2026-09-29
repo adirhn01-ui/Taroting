@@ -10,6 +10,9 @@
 //     "<file N.ext>" token, so the same file reads the same everywhere
 //   * the project name never appears
 //   * text-generator CONTENT never appears (only its length + styling)
+//   * a drawing never appears — only how many strokes and points it has, never
+//     a colour or a coordinate (a drawing can be a signature or handwriting)
+//   * the image editor's recent ink colours appear only as a count
 //   * free text (ffmpeg argv, log lines, messages) is swept for the user name
 //   * there is no machine id, install id or session id, here or anywhere else
 //   * nothing is sent anywhere; the report exists only where the user puts it
@@ -76,13 +79,16 @@ export interface ReportContext {
 }
 
 export interface RedactedGenerator {
-  type: "solid" | "text";
+  type: "solid" | "text" | "drawing";
   /** text generators only — the LENGTH of the text, never the text */
   chars?: number;
   fontFamily?: string;
   sizePx?: number;
   bold?: boolean;
   italic?: boolean;
+  /** drawings only — counts, never a colour or a coordinate */
+  strokes?: number;
+  points?: number;
 }
 
 export interface RedactedMedia {
@@ -103,6 +109,8 @@ export interface RedactedMedia {
 }
 
 export interface ProjectShape {
+  /** "image" for an image project, else "video" — a fixed word, never file text */
+  kind: "image" | "video";
   canvas: string;
   timebase: string;
   durationSec: number;
@@ -235,7 +243,8 @@ function redactMedia(m: MediaRef, mapPath: (p: string) => string): RedactedMedia
   const g = m.generator;
   if (g) {
     // The text itself is the one thing here that could be personal, so only
-    // its length and styling survive.
+    // its length and styling survive. A drawing is personal ALL the way down —
+    // it can be a signature — so it is reduced to two counts.
     out.generator =
       g.type === "text"
         ? {
@@ -246,9 +255,30 @@ function redactMedia(m: MediaRef, mapPath: (p: string) => string): RedactedMedia
             bold: g.bold,
             italic: g.italic,
           }
-        : { type: "solid" };
+        : g.type === "drawing"
+          ? { type: "drawing", ...drawingCounts(g.chunks) }
+          : { type: "solid" };
   }
   return out;
+}
+
+/** Strokes, and points across the ink/erase strokes (one point = 16 base64
+ *  chars of `p`; shapes carry none). Defensive about shape because a report
+ *  must never throw: it is built for whatever project is open, including one
+ *  whose drawing data is exactly what went wrong. */
+function drawingCounts(chunks: unknown): { strokes: number; points: number } {
+  let strokes = 0;
+  let points = 0;
+  if (!Array.isArray(chunks)) return { strokes, points };
+  for (const chunk of chunks) {
+    if (!Array.isArray(chunk)) continue;
+    for (const s of chunk) {
+      strokes++;
+      const p = (s as { p?: unknown } | null)?.p;
+      if (typeof p === "string") points += Math.floor(p.length / 16);
+    }
+  }
+  return { strokes, points };
 }
 
 /**
@@ -284,6 +314,7 @@ export function redactProjectShape(
 
   const shown = project.media.slice(0, MAX_MEDIA_ROWS);
   return {
+    kind: project.kind === "image" ? "image" : "video",
     canvas: `${t.width}x${t.height}`,
     timebase: `${t.fps.num}/${t.fps.den}`,
     durationSec: round3(timelineDuration(t)),
@@ -342,7 +373,9 @@ function mediaLine(m: RedactedMedia): string {
     bits.push(
       g.type === "text"
         ? `generator:text chars=${g.chars} ${g.fontFamily} ${g.sizePx}px${g.bold ? " bold" : ""}${g.italic ? " italic" : ""}`
-        : "generator:solid",
+        : g.type === "drawing"
+          ? `generator:drawing strokes=${g.strokes ?? 0} points=${g.points ?? 0}`
+          : "generator:solid",
     );
   }
   return bits.join("  ");
@@ -444,6 +477,7 @@ export function buildReport(ctx: ReportContext): string {
   if (ctx.project) {
     const shape = redactProjectShape(ctx.project, redactor.path);
     out.push(head("Project shape"));
+    out.push(row("Project kind", shape.kind));
     out.push(row("Canvas", shape.canvas));
     out.push(row("Timebase", shape.timebase));
     out.push(row("Duration", `${shape.durationSec}s`));
@@ -492,6 +526,8 @@ export function buildReport(ctx: ReportContext): string {
     out.push(row("Default export", s.defaultExportDir ? "set" : "not set"));
     out.push(row("Last export", s.lastExportDir ? "set" : "not set"));
     out.push(row("Shortcuts", custom === 0 ? "default" : `${custom} customised`));
+    // A count only: the colours themselves say nothing a bug needs.
+    out.push(row("Ink colours", Array.isArray(s.inkColors) ? s.inkColors.length : 0));
   }
 
   const recent = ctx.recentErrors;

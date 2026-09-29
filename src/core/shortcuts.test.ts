@@ -555,14 +555,106 @@ describe("ShortcutManager dispatch", () => {
     h.press(kev("ArrowRight", "ArrowRight"));
     expect(h.fired).toEqual([]);
   });
+
+  it("the image editor binds its tools and the shared chords, and nothing of the timeline", () => {
+    const h = harness("image", ALL);
+    h.press(kev("v", "KeyV"));
+    h.press(kev("ה", "KeyV")); // Hebrew: the letter comes back through the position
+    h.press(kev("p", "KeyP"));
+    h.press(kev("b", "KeyB"));
+    h.press(kev("h", "KeyH"));
+    h.press(kev("e", "KeyE"));
+    h.press(kev("u", "KeyU"));
+    h.press(kev("r", "KeyR"));
+    h.press(kev("[", "BracketLeft"));
+    h.press(kev("]", "BracketRight"));
+    h.press(kev("=", "Equal", { ctrl: true }));
+    h.press(kev("-", "Minus", { ctrl: true }));
+    h.press(kev("0", "Digit0", { ctrl: true }));
+    h.press(kev("1", "Digit1", { ctrl: true }));
+    h.press(kev("z", "KeyZ", { ctrl: true }));
+    h.press(kev("y", "KeyY", { ctrl: true }));
+    h.press(kev("c", "KeyC", { ctrl: true }));
+    h.press(kev("Delete", "Delete"));
+    h.press(kev("w", "KeyW", { ctrl: true }));
+    expect(h.fired).toEqual([
+      "imgSelect",
+      "imgSelect",
+      "imgPen",
+      "imgPencil",
+      "imgMarker",
+      "imgEraser",
+      "imgShape",
+      "imgRuler",
+      "imgSizeDown",
+      "imgSizeUp",
+      "imgZoomIn",
+      "imgZoomOut",
+      "imgZoomFit",
+      "imgZoom100",
+      "undo",
+      "redoAlt",
+      "copy",
+      "delete",
+      "goHome",
+    ]);
+    // The timeline's keys are not bound here, and go to the browser untouched.
+    // Ctrl+V above all: a bound chord is preventDefault()ed, which would kill
+    // the DOM `paste` event image mode reads pasted pixels from.
+    h.fired.length = 0;
+    for (const k of [
+      kev("v", "KeyV", { ctrl: true }),
+      kev("s", "KeyS"),
+      kev("ArrowRight", "ArrowRight"),
+      kev("m", "KeyM"),
+      kev("f", "KeyF"),
+    ]) {
+      expect(h.press(k).prevented, k.key).toBe(false);
+    }
+    expect(h.fired).toEqual([]);
+  });
+
+  it("Space in image mode is a hold the image editor resolves itself", () => {
+    // imgPanHold has no ShortcutManager handler (holding needs keyup), so the
+    // chord is left to the browser for the editor's own keydown/keyup pair —
+    // and it is never play/pause, which is not an image action.
+    const h = harness("image", ALL.filter((a) => a !== "imgPanHold"));
+    const p = h.press(kev(" ", "Space"));
+    expect(h.fired).toEqual([]);
+    expect(p.prevented).toBe(false);
+  });
+
+  it("the video editor and the viewer bind none of the image tools", () => {
+    for (const mode of ["editor", "viewer"] as const) {
+      const h = harness(mode, ALL);
+      for (const k of [
+        kev("v", "KeyV"),
+        kev("p", "KeyP"),
+        kev("b", "KeyB"),
+        kev("h", "KeyH"),
+        kev("e", "KeyE"),
+        kev("u", "KeyU"),
+        kev("r", "KeyR"),
+        kev("[", "BracketLeft"),
+        kev("]", "BracketRight"),
+        kev("=", "Equal", { ctrl: true }),
+        kev("1", "Digit1", { ctrl: true }),
+      ]) {
+        expect(h.press(k).prevented, `${mode} ${k.key}`).toBe(false);
+      }
+      expect(h.fired, mode).toEqual([]);
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("REPEATABLE", () => {
-  it("is exactly the stepping, seeking and undo/redo actions", () => {
+  it("is exactly the stepping, seeking, undo/redo, brush-size and zoom actions", () => {
     expect([...REPEATABLE].sort()).toEqual(
       [
         "stepFwd", "stepBack", "jumpFwd", "jumpBack", "undo", "redo",
         "redoAlt", "prevFile", "nextFile", "seekBack", "seekFwd",
+        "imgSizeDown", "imgSizeUp", "imgZoomIn", "imgZoomOut",
       ].sort(),
     );
   });

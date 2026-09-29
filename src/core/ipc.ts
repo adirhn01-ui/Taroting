@@ -5,8 +5,9 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { EncoderSummary, FfmpegFailure } from "./diagnostics";
 import { sanitizeProject } from "./project";
-import { MEDIA_FILE_EXTENSIONS } from "./types";
+import { MEDIA_EXTENSIONS, MEDIA_FILE_EXTENSIONS } from "./types";
 import type {
+  ImageExportFormat,
   MediaInfo,
   MediaRef,
   ProjectFile,
@@ -210,6 +211,24 @@ export interface JobFailed {
   logTail: string[];
 }
 
+/** Where an image-save stream lands — a mirror of `ImageSaveDest` in
+ *  src-tauri/src/image_save.rs (`kind`-tagged, camelCase fields; a wire test
+ *  there deserializes exactly these three shapes).
+ *
+ *  - `user`: an export the user named. `sources` = every non-generator media
+ *    path of the IN-MEMORY project, so the backend can refuse to write over an
+ *    original — including a layer added since the last save.
+ *  - `projectThumb`: the Home card of an image project (rendered, never the raw
+ *    photo). The backend derives the file name from `projectId`.
+ *  - `pasted`: a pasted image, written where the user can see and relink it
+ *    (Documents\Taroting\Pasted images). The backend picks the file name.
+ *
+ *  The destination travels ONLY in this JSON begin call, never in a header. */
+export type ImageSaveDest =
+  | { kind: "user"; path: string; sources: string[] }
+  | { kind: "projectThumb"; projectPath: string; projectId: string }
+  | { kind: "pasted"; projectName: string };
+
 /** Standalone (rather than an arrow inside `ipc`) so `ipc.getSettings` can be
  *  expressed in terms of it without the object literal referencing itself. */
 async function readSettings(): Promise<SettingsRead> {
@@ -311,6 +330,26 @@ export const ipc = {
    *  ("not available on this platform" — the picker matches that phrase to
    *  fall back to the web EyeDropper API). */
   screenPickColor: () => call<string | null>("screen_pick_color"),
+
+  /* image saves: begin (JSON) → chunk (raw body) ×N → commit, or abort.
+   * The backend writes `<target>.part` and renames it on commit, checking
+   * extension, magic bytes and size; see src-tauri/src/image_save.rs. */
+  /** Open a save. Resolves the token for the chunks and the path it will land at. */
+  imageSaveBegin: (dest: ImageSaveDest, format: ImageExportFormat, totalBytes: number) =>
+    call<{ token: number; path: string }>("image_save_begin", { dest, format, totalBytes }),
+  /** RAW body (application/octet-stream → InvokeBody::Raw). Never pass a plain
+   *  array: it would travel as JSON, one number per byte, and the backend
+   *  refuses a JSON body. The token rides in a header because the body is the
+   *  bytes themselves. */
+  imageSaveChunk: (token: number, bytes: Uint8Array) =>
+    inTauri
+      ? invoke<void>("image_save_chunk", bytes, { headers: { "x-taroting-save": String(token) } })
+      : Promise.reject(new Error("image_save_chunk is only available in the desktop app")),
+  /** Verify and move the finished file into place; resolves its final path. */
+  imageSaveCommit: (token: number) =>
+    call<{ token: number; path: string }>("image_save_commit", { token }),
+  /** Drop an open save and its partial file. Idempotent. */
+  imageSaveAbort: (token: number) => call<void>("image_save_abort", { token }),
 
   /* diagnostics — all three are on-demand only; nothing is buffered, probed
    * or written unless the user asked for a report. */
@@ -483,6 +522,19 @@ export async function pickMediaFiles(): Promise<string[]> {
   });
   if (result === null) return [];
   return Array.isArray(result) ? result : [result];
+}
+
+/** One still image (the image family of media-extensions.json): a new image
+ *  project from a photo, or a photo layer. Derived from the one list like
+ *  `pickMediaFiles`, so it can never offer a format drop or import refuses. */
+export async function pickImageFile(): Promise<string | null> {
+  if (!inTauri) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const result = await open({
+    multiple: false,
+    filters: [{ name: "Images", extensions: [...MEDIA_EXTENSIONS.image] }],
+  });
+  return typeof result === "string" ? result : null;
 }
 
 /* ---------------- window drag & drop ---------------- */

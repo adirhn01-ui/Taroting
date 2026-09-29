@@ -5,8 +5,8 @@ import "./editor.css";
 import "../ui/player-bar.css";
 import { escapeHtml, fileExt, fileStem, formatTimecode } from "../core/format";
 import { describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles } from "../core/ipc";
-import { navigate } from "../core/nav";
-import type { EditorRoute, Route } from "../core/nav";
+import { exitDest, navigate } from "../core/nav";
+import type { EditorRoute } from "../core/nav";
 import { createMonitorVolume } from "../core/monitor-volume";
 import type { MonitorVolumeState } from "../core/monitor-volume";
 import {
@@ -59,18 +59,10 @@ import { createTempExits, createTempLeaveGate } from "../ui/temp-project";
 import { PREVIEW_MIN_H, clampPanelHeight, maxPanelHeight } from "./timeline/panel-size";
 import { TimelineController } from "./timeline/timeline";
 
-/**
- * Where every exit from this editor lands: Back/Ctrl+W, the keep/discard
- * outcomes, and a failed load. An editor opened from the viewer ("Open as
- * project") goes back to the viewer on the same file; everything else goes
- * home. One function, so no exit can honour `returnTo` while another forgets it
- * (the guard-applied-to-three-of-four-exits shape this repo keeps finding). The
- * gear is deliberately NOT an exit here: it goes to Settings, whose Back goes
- * home.
- */
-export function exitDest(route: EditorRoute): Route {
-  return route.returnTo ? { view: "viewer", path: route.returnTo } : { view: "home" };
-}
+/** Where every exit from this editor lands. Defined in core/nav so the image
+ *  editor (a separate chunk) shares the one rule; re-exported for the callers
+ *  and tests that know it from here. */
+export { exitDest };
 
 /**
  * Mount the editor for `route` into `root`.
@@ -106,6 +98,32 @@ export async function mountEditor(
     return noop;
   }
   if (isStale()) return noop;
+
+  // An IMAGE project gets its own editor, from its own lazy chunk that nothing
+  // prefetches. The route carries no kind, so this is the first moment it is
+  // known — and nothing of the video editor has been built yet: no session, no
+  // media manager, no AudioContext. The video path pays one property read.
+  // The image editor takes the same `isStale` and the whole route (temp,
+  // returnTo), because it owes the app shell everything this function does:
+  // currentSession, the temp leave gate, the close tasks, returnTo exits.
+  if (loaded.project.kind === "image") {
+    let mountImageEditor: typeof import("../image/image-editor").mountImageEditor;
+    try {
+      ({ mountImageEditor } = await import("../image/image-editor"));
+    } catch (e) {
+      // A chunk that failed to load is a failed open, handled like a failed
+      // load above: without this the rejection escapes go() unhandled and
+      // leaves #app blank, with no way out but the window close.
+      if (isStale()) return noop;
+      toast.error(describeError(e));
+      navigate(exitDest(route));
+      return noop;
+    }
+    // The chunk load is an await: a navigation that superseded this mount
+    // meanwhile owns the screen, so step aside having touched nothing.
+    if (isStale()) return noop;
+    return mountImageEditor(root, route, isStale, loaded);
+  }
 
   const session = new ProjectSession(route.projectPath, loaded.project, {
     temp: route.temp === true,
@@ -842,7 +860,11 @@ export async function mountEditor(
         let sub: string;
         let name: string;
         if (gen) {
-          name = gen.type === "text" ? gen.text || "Text" : "Solid";
+          // Three-way on purpose: a drawing is an image-project layer that never
+          // reaches this bin (load_project refuses one in a video project), but
+          // if it ever did it must not be labelled "Solid".
+          name =
+            gen.type === "text" ? gen.text || "Text" : gen.type === "drawing" ? "Drawing" : "Solid";
           sub = gen.type;
           // Swatch emitted empty for the same reason as the progress fill above;
           // `paintMediaRows` fills it. And NOT via a `background: var(--accent)`
@@ -853,7 +875,9 @@ export async function mountEditor(
           thumb =
             gen.type === "solid"
               ? `<div class="media-row__swatch"></div>`
-              : `<span class="gen-glyph gen-glyph--lg">T</span>`;
+              : gen.type === "drawing"
+                ? `<span class="gen-glyph gen-glyph--lg">✎</span>`
+                : `<span class="gen-glyph gen-glyph--lg">T</span>`;
         } else {
           name = fileStem(m.path);
           sub = m.kind;
@@ -1087,13 +1111,21 @@ export async function mountEditor(
         inner =
           gen.type === "solid"
             ? `<span class="media-drag-ghost__swatch"></span>`
-            : `<span class="gen-glyph">T</span>`;
+            : gen.type === "drawing"
+              ? `<span class="gen-glyph">✎</span>`
+              : `<span class="gen-glyph">T</span>`;
       } else if (thumbUrl) {
         inner = `<img src="${escapeHtml(mediaUrl(thumbUrl))}" alt="" />`;
       } else {
         inner = icon(m.kind === "audio" ? "music" : "film", 16);
       }
-      const label = gen ? (gen.type === "text" ? gen.text || "Text" : "Solid") : fileStem(m.path);
+      const label = gen
+        ? gen.type === "text"
+          ? gen.text || "Text"
+          : gen.type === "drawing"
+            ? "Drawing"
+            : "Solid"
+        : fileStem(m.path);
       g.innerHTML = `<div class="media-drag-ghost__thumb">${inner}</div><span>${escapeHtml(label)}</span>`;
       // The generator's literal colour, through the CSSOM and not the markup:
       // the packaged build's style-src is a nonce policy, so a `style` attribute

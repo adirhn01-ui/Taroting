@@ -57,6 +57,7 @@ describe("sanitizeSettings", () => {
     monitorVolume: "loud",
     timelineHeight: { px: 400 }, // a CSS length built from this is "[object Object]px"
     customTheme: { background: 0xff0000, accent: "javascript:alert(1)", text: ["#fff"] },
+    inkColors: "#e5484d", // a string where a list belongs: iterating it yields characters
     shortcuts: {
       playPause: "Ctrl+Space", // legitimate rebind: must survive
       split: 7, // normalizeChord: stored.split is not a function
@@ -80,6 +81,7 @@ describe("sanitizeSettings", () => {
     expect(typeof s.monitorVolume).toBe("number");
     expect(Number.isInteger(s.timelineHeight)).toBe(true);
     expect(s.customTheme).toEqual(DEFAULT_CUSTOM_THEME);
+    expect(s.inkColors).toEqual([]);
   });
 
   it("keeps autosaveSeconds finite and >= 1 (setInterval must not hit 4 ms)", () => {
@@ -93,6 +95,33 @@ describe("sanitizeSettings", () => {
     );
     // a stringified number is a plausible hand-edit and is accepted
     expect(sanitizeSettings({ autosaveSeconds: "10" }).autosaveSeconds).toBe(10);
+  });
+
+  it("keeps at most six distinct, validated ink colours, newest first", () => {
+    const s = sanitizeSettings({
+      inkColors: [
+        "#E5484D",
+        "#abc",
+        "#e5484d", // the first one again, in another case
+        "red", // a colour name is not a colour here
+        7,
+        null,
+        "#aabbcc", // "#abc" again, spelled out
+        "javascript:alert(1)",
+        " 123456 ",
+        "#000000",
+        "#ffffff",
+        "#0f0f0f",
+        "#ffd400", // the seventh distinct colour: over the cap
+      ],
+    });
+    expect(s.inkColors).toEqual(["#e5484d", "#aabbcc", "#123456", "#000000", "#ffffff", "#0f0f0f"]);
+    for (const raw of [undefined, null, "#e5484d", { 0: "#e5484d" }, 42]) {
+      expect(sanitizeSettings({ inkColors: raw }).inkColors, String(raw)).toEqual([]);
+    }
+    // Always a fresh array: a caller pushing a recent colour cannot reach the
+    // defaults through it.
+    expect(sanitizeSettings({}).inkColors).not.toBe(DEFAULT_SETTINGS.inkColors);
   });
 
   it("drops non-string and unknown shortcut entries, keeping valid rebinds", () => {
@@ -2452,13 +2481,38 @@ describe("Store notifications when a subscriber throws", () => {
 /* ============================================================================
  * The shortcut map across an upgrade.
  *
- * 0.9 adds five actions. Every settings.json written by 0.8.x names the 22 it
- * knew about and none of these, so what the new ones get on first read is
- * decided here — and a new default must never take a chord the user already
- * put somewhere else on the same screen.
+ * 0.9 adds five editor/viewer actions and the image editor's fourteen. Every
+ * settings.json written by 0.8.x names the 22 it knew about and none of these,
+ * so what the new ones get on first read is decided here — and a new default
+ * must never take a chord the user already put somewhere else on the same
+ * screen.
  * ==========================================================================*/
 
-const ADDED_IN_090 = ["redoAlt", "prevFile", "nextFile", "seekBack", "seekFwd"] as const;
+/** The image editor's own actions: image mode only (ACTION_MODES). */
+const IMAGE_ACTIONS_090 = [
+  "imgSelect",
+  "imgPen",
+  "imgPencil",
+  "imgMarker",
+  "imgEraser",
+  "imgShape",
+  "imgRuler",
+  "imgSizeDown",
+  "imgSizeUp",
+  "imgZoomIn",
+  "imgZoomOut",
+  "imgZoomFit",
+  "imgZoom100",
+  "imgPanHold",
+] as const;
+const ADDED_IN_090 = [
+  "redoAlt",
+  "prevFile",
+  "nextFile",
+  "seekBack",
+  "seekFwd",
+  ...IMAGE_ACTIONS_090,
+] as const;
 
 /** A shortcut map exactly as a 0.8.1 settings.json stores it. */
 function shortcuts081(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -2497,6 +2551,23 @@ describe("sanitizeShortcuts", () => {
     expect(findConflicts(out)).toEqual([
       { chord: "ArrowRight", mode: "editor", actions: ["stepFwd", "fullscreen"] },
     ]);
+  });
+
+  it("gives the image tools their defaults unless the chord is the user's on the image screen", () => {
+    // copy and delete live on the image screen too: a user who put V on copy
+    // keeps it there, and the select tool waits, unbound, for them to choose.
+    const shared = sanitizeShortcuts(shortcuts081({ copy: "V", delete: "e" }));
+    expect(shared.copy).toBe("V");
+    expect(shared.delete).toBe("e");
+    expect(shared.imgSelect).toBe("");
+    expect(shared.imgEraser).toBe("");
+    expect(shared.imgPen).toBe(DEFAULT_SHORTCUTS.imgPen);
+    // split and toggleLoop never reach the image screen, so their chords take
+    // nothing from it: the same letters stay the image tools' defaults.
+    const timelineOnly = sanitizeShortcuts(shortcuts081({ split: "V", toggleLoop: "Ctrl+=" }));
+    expect(timelineOnly.imgSelect).toBe("V");
+    expect(timelineOnly.imgZoomIn).toBe("Ctrl+=");
+    expect(findConflicts(timelineOnly)).toEqual([]);
   });
 
   it("never unbinds a chord the user set for the new action themselves", () => {
@@ -2853,5 +2924,135 @@ describe("settingsWritesSettled", () => {
     expect(settled).toBe(true);
     expect(await first).toBe("failed"); // its own caller still hears about it
     await second;
+  });
+});
+
+/* ============================================================================
+ * ProjectSession autosave options: the image editor's idle debounce and
+ * holdAutosave. The video editor passes neither, and its autosave must be
+ * exactly what it was — the first case pins that side by side.
+ * ==========================================================================*/
+
+describe("ProjectSession debounceMs and holdAutosave", () => {
+  beforeEach(() => {
+    installGlobalStubs();
+    settingsStore.set(DEFAULT_SETTINGS);
+    vi.useFakeTimers(fakeTimerOptions());
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /** Records the project name of every write that reaches disk. */
+  function recordWrites(): string[] {
+    const written: string[] = [];
+    vi.spyOn(ipc, "saveProject").mockImplementation(async (_path, project) => {
+      written.push(project.name);
+      return { modifiedAt: project.modifiedAt };
+    });
+    return written;
+  }
+
+  const IDLE_MS = 2500;
+
+  it("an interval tick 300 ms after an edit saves a video session but not an idle-debounced one", async () => {
+    const written = recordWrites();
+    const video = new ProjectSession(PROJECT_PATH, createProject("video"));
+    const image = new ProjectSession(PROJECT_PATH, createProject("image"), { debounceMs: IDLE_MS });
+
+    await vi.advanceTimersByTimeAsync(TICK_MS - 300);
+    video.commit((p) => ({ ...p, name: "video edit" }));
+    image.commit((p) => ({ ...p, name: "image edit" }));
+    await vi.advanceTimersByTimeAsync(300); // the interval tick
+
+    // Video: the tick saves the dirty state, as it always has.
+    expect(written).toEqual(["video edit"]);
+    video.discard();
+    // Image: still inside its idle wait; the debounce saves it, once, on time.
+    await vi.advanceTimersByTimeAsync(IDLE_MS - 300 - 1);
+    expect(written).toEqual(["video edit"]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(written).toEqual(["video edit", "image edit"]);
+    image.discard();
+  });
+
+  it("defers every autosave while held, then saves once, debounced, on release", async () => {
+    const written = recordWrites();
+    const s = new ProjectSession(PROJECT_PATH, createProject("start"), { debounceMs: IDLE_MS });
+    const release = s.holdAutosave();
+    s.commit((p) => ({ ...p, name: "mid-stroke" }));
+
+    // Past the debounce and three interval ticks: nothing is written mid-gesture.
+    await vi.advanceTimersByTimeAsync(3 * TICK_MS + 1000);
+    expect(written).toEqual([]);
+    expect(s.saveState.get()).toBe("dirty");
+
+    release();
+    await vi.advanceTimersByTimeAsync(IDLE_MS - 1);
+    expect(written).toEqual([]); // the interval tick in between is not idle yet
+    await vi.advanceTimersByTimeAsync(1);
+    expect(written).toEqual(["mid-stroke"]);
+    s.discard();
+  });
+
+  it("counts holds, and a second release of the same hold frees nothing", async () => {
+    const written = recordWrites();
+    const s = new ProjectSession(PROJECT_PATH, createProject("start"), { debounceMs: IDLE_MS });
+    const pointer = s.holdAutosave();
+    const drag = s.holdAutosave();
+    s.commit((p) => ({ ...p, name: "edited" }));
+
+    pointer();
+    pointer(); // idempotent: must not release the drag's hold
+    await vi.advanceTimersByTimeAsync(2 * TICK_MS + IDLE_MS);
+    expect(written).toEqual([]);
+
+    drag();
+    await vi.advanceTimersByTimeAsync(IDLE_MS);
+    expect(written).toEqual(["edited"]);
+    s.discard();
+  });
+
+  it("never defers an explicit save or the final flush on dispose", async () => {
+    const written = recordWrites();
+    const s = new ProjectSession(PROJECT_PATH, createProject("start"), { debounceMs: IDLE_MS });
+    s.holdAutosave(); // never released: leaving mid-gesture must still flush
+
+    s.commit((p) => ({ ...p, name: "saved by Ctrl+S" }));
+    await s.save();
+    expect(written).toEqual(["saved by Ctrl+S"]);
+
+    s.commit((p) => ({ ...p, name: "flushed on leave" }));
+    await s.dispose();
+    expect(written).toEqual(["saved by Ctrl+S", "flushed on leave"]);
+  });
+
+  it("a release after the session is closed arms no timer", async () => {
+    const written = recordWrites();
+    const s = new ProjectSession(PROJECT_PATH, createProject("start"), { debounceMs: IDLE_MS });
+    const release = s.holdAutosave();
+    s.commit((p) => ({ ...p, name: "edited" }));
+    await vi.advanceTimersByTimeAsync(IDLE_MS); // the debounce comes due while held
+    s.discard();
+    expect(vi.getTimerCount()).toBe(0);
+    release(); // a pointer-up landing after the editor closed
+    // Timers, not writes: a closed session's save() writes nothing anyway, so
+    // only the timer count can tell a stray re-armed debounce apart.
+    expect(vi.getTimerCount()).toBe(0);
+    expect(written).toEqual([]);
+  });
+
+  it("treats a debounceMs that is not a finite, non-negative number as absent", async () => {
+    const written = recordWrites();
+    for (const odd of [Number.NaN, -1, Number.POSITIVE_INFINITY]) {
+      const s = new ProjectSession(PROJECT_PATH, createProject(`odd ${odd}`), { debounceMs: odd });
+      s.commit((p) => ({ ...p, name: `saved ${odd}` }));
+      await vi.advanceTimersByTimeAsync(DEBOUNCE_MS); // the video debounce
+      s.discard();
+    }
+    expect(written).toEqual(["saved NaN", "saved -1", "saved Infinity"]);
   });
 });

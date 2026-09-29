@@ -414,7 +414,8 @@ export class ShortcutManager {
 /** Actions a HELD key keeps firing; everything else fires once per press (a
  *  held S must not split at every frame it passes). The viewer's file stepping
  *  and seeking repeat like the editor's frame stepping; the alternate redo
- *  repeats like redo. Exported only so the membership is testable. */
+ *  repeats like redo; the image editor's brush size and zoom step like a
+ *  slider held by its key. Exported only so the membership is testable. */
 export const REPEATABLE: ReadonlySet<ActionId> = new Set<ActionId>([
   "stepFwd",
   "stepBack",
@@ -427,4 +428,8 @@ export const REPEATABLE: ReadonlySet<ActionId> = new Set<ActionId>([
   "nextFile",
   "seekBack",
   "seekFwd",
+  "imgSizeDown",
+  "imgSizeUp",
+  "imgZoomIn",
+  "imgZoomOut",
 ]);

@@ -12,7 +12,7 @@ import {
 } from "../../core/project";
 import { rat } from "../../core/time";
 import type { MediaInfo, ProjectFile } from "../../core/types";
-import { applyRelink, clampClipsToDuration, clampSrcWindow } from "./relink";
+import { applyRelink, clampClipsToDuration, clampSrcWindow, isStillInfo } from "./relink";
 import { addJobTarget, dropMediaTargets, type JobEntry, type JobTarget } from "./media";
 
 /** clampSrcWindow keeps the clip's source window inside a (possibly shorter)
@@ -144,6 +144,29 @@ describe("clampClipsToDuration", () => {
     const { p, mediaId, clipId } = projectWith(originalInfo);
     const q = clampClipsToDuration(p, mediaId, 12.5);
     expect(findClip(q, clipId)!.clip.srcOut).toBe(12.5);
+  });
+});
+
+describe("isStillInfo (the image project's stillsOnly relink gate)", () => {
+  const probe = (over: Partial<MediaInfo>): MediaInfo => ({
+    path: "D:\\photos\\found.png",
+    size: 4321,
+    mtimeMs: 17,
+    kind: "image",
+    duration: 0,
+    width: 641,
+    height: 361,
+    hasAudio: false,
+    ...over,
+  });
+
+  it("takes a still and refuses everything a photo layer cannot draw", () => {
+    expect(isStillInfo(probe({}))).toBe(true);
+    expect(isStillInfo(probe({ kind: "video", duration: 3.5, path: "D:\\a.mp4" }))).toBe(false);
+    expect(isStillInfo(probe({ kind: "gif", duration: 1.2, path: "D:\\a.gif" }))).toBe(false);
+    expect(isStillInfo(probe({ kind: "audio", width: undefined, height: undefined }))).toBe(false);
+    // A generator is never a probe result, and is refused all the same.
+    expect(isStillInfo(probe({ generator: { type: "solid", color: "#123456" } }))).toBe(false);
   });
 });
 

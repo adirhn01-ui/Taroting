@@ -155,6 +155,7 @@ mod tests {
                 detached: false,
             },
             keyframes: None,
+            adjust: None,
         };
         let track = Track {
             id: "vt".into(),
@@ -162,6 +163,7 @@ mod tests {
             name: "Video".into(),
             muted: false,
             clips: vec![clip],
+            hidden: None,
         };
         ExportSpec {
             media: vec![media()],

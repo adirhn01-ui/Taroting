@@ -419,10 +419,16 @@ class LayerScheduler {
 /* Generated-media rendering                                           */
 /* ------------------------------------------------------------------ */
 
+// A drawing never reaches the video stage: load_project refuses one in a video
+// project, and image projects never mount this scheduler. Its branches below
+// exist only so the union stays exhaustive — an empty transparent box, never a
+// "text" rendering of a shape that has no text.
 function generatorKey(mediaId: string, g: Generator): string {
   return g.type === "solid"
     ? `${mediaId}|solid|${g.color}`
-    : `${mediaId}|text|${g.text}|${g.fontFamily}|${g.sizePx}|${g.color}|${g.bold}|${g.italic}`;
+    : g.type === "text"
+      ? `${mediaId}|text|${g.text}|${g.fontFamily}|${g.sizePx}|${g.color}|${g.bold}|${g.italic}`
+      : `${mediaId}|drawing`;
 }
 
 /** Style the gen <div> so the DOM output matches the exported frame: solid uses
@@ -433,6 +439,13 @@ function styleGen(el: HTMLElement, g: Generator, w: number, h: number): void {
   el.style.height = `${h}px`;
   if (g.type === "solid") {
     el.style.background = g.color;
+    el.style.color = "";
+    el.style.font = "";
+    el.style.whiteSpace = "";
+    el.style.lineHeight = "";
+    el.textContent = "";
+  } else if (g.type !== "text") {
+    el.style.background = "transparent";
     el.style.color = "";
     el.style.font = "";
     el.style.whiteSpace = "";
