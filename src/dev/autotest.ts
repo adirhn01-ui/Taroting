@@ -3894,6 +3894,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         img.removeAttribute("src");
       }
     });
+    await (await import("./autotest-wave1")).runWave1Blocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
   } catch (e) {
     results.push({ name: "setup", pass: false, detail: String(e) });
   }

@@ -817,102 +817,10 @@ html[data-rescue-chrome] #ed-settings:focus-visible {
   cursor: none;
 }
 
-.theater-bar {
-  position: absolute;
-  /* Above the media layer sets (z 1..n) and the stage overlay (z 200) that
-   * share this container's stacking context, so the player controls always
-   * paint on top of the video. Local to .editor__preview.theater — see the
-   * z-index ladder in tokens.css (--z-theater-bar). */
-  z-index: var(--z-theater-bar);
-  left: 50%;
-  bottom: var(--sp-5);
-  transform: translateX(-50%);
-  display: none;
-  align-items: center;
-  gap: var(--sp-2);
-  width: min(880px, calc(100% - var(--sp-8)));
-  padding: var(--sp-2) var(--sp-4);
-  border-radius: var(--radius-l);
-  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-3);
-  backdrop-filter: blur(12px);
-  opacity: 1;
-  transition: opacity var(--dur) var(--ease);
-}
 .editor__preview.theater .theater-bar {
   display: flex;
 }
 .editor__preview.theater.theater--hidden .theater-bar {
   opacity: 0;
   pointer-events: none;
-}
-
-/* keep the glyph transparent to pointer events (same reasoning as the transport
- * play button): a rapid click always targets the button, never a swapped <svg>. */
-.theater-bar__btn svg {
-  pointer-events: none;
-}
-
-.theater-bar__time {
-  font-size: var(--fs-12);
-  color: var(--text-2);
-  padding: 0 var(--sp-2);
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-
-.theater-bar__seek {
-  position: relative;
-  flex: 1;
-  height: 14px;
-  display: flex;
-  align-items: center;
-  cursor: pointer;
-  touch-action: none;
-}
-/* the visible track (thin bar, centered in the taller hit area) */
-.theater-bar__seek::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  height: 4px;
-  border-radius: var(--radius-full);
-  background: var(--bg-active);
-}
-.theater-bar__seek-fill {
-  position: absolute;
-  left: 0;
-  width: 0;
-  height: 4px;
-  border-radius: var(--radius-full);
-  background: var(--accent);
-  pointer-events: none;
-}
-.theater-bar__seek-knob {
-  position: absolute;
-  top: 50%;
-  left: 0;
-  width: 12px;
-  height: 12px;
-  margin-left: -6px;
-  border-radius: var(--radius-full);
-  background: var(--accent-strong);
-  border: 2px solid var(--on-accent);
-  transform: translateY(-50%);
-  box-shadow: var(--shadow-1);
-  pointer-events: none;
-}
-
-/* monitor volume: speaker + inline slider, sits between the seek bar and exit.
- * flex:none so it keeps a fixed width while the seek bar takes the slack. */
-.theater-bar__volume {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  flex: none;
-}
-.theater-bar__volume-slider {
-  width: 84px;
 }

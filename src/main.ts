@@ -4,6 +4,13 @@ import "./style/components.css";
 import { fileExt, fileStem } from "./core/format";
 import { describeError, inTauri, ipc, onOpenPath } from "./core/ipc";
 import { navigate, setNavigator, type Route } from "./core/nav";
+import {
+  TEARDOWN_WAIT_MS,
+  createTeardowns,
+  isTempProjectPath,
+  openMediaAsProject,
+  runOnOpenChain,
+} from "./core/open-media";
 import { createProject, importMediaAsClip } from "./core/project";
 import { confirmLeaveCurrentSession, initSettings, settingsStore } from "./core/session";
 import { MEDIA_FILE_EXTENSIONS } from "./core/types";
@@ -51,11 +58,40 @@ type Disposer = () => void | Promise<void>;
 let dispose: Disposer | null = null;
 let navToken = 0;
 
+/**
+ * Every screen teardown still in flight (see core/open-media `createTeardowns`).
+ * `teardowns.settled()` is the unbounded wait the app's close gate wants.
+ *
+ * A teardown that THROWS is shown, not just logged. Session saves never throw
+ * (a failed write is reported through the save state), so a throw means some
+ * component's dispose broke part-way — and everything after it in the editor's
+ * teardown, the final save included, never ran. That is worth the user's
+ * attention, and a toast with details also puts it in Settings → Diagnostics.
+ * The next screen still mounts: this used to reject go() and leave #app half
+ * torn down.
+ */
+const teardowns = createTeardowns((e) =>
+  toast.error("The previous screen didn't close cleanly.", {
+    detail: describeError(e),
+    op: "Navigation",
+    title: "Close",
+  }),
+);
+
 async function go(route: Route): Promise<void> {
   const token = ++navToken;
   const prev = dispose;
   dispose = null;
-  if (prev) await prev();
+  if (prev) teardowns.track(prev);
+  // EVERY navigation waits for every teardown still running, not just its own
+  // `prev`. A go() that arrives while an earlier one is mid-dispose finds
+  // `dispose` already null; without this it painted over an editor still
+  // awaiting its final save, and reopening that same .trt could load the file
+  // from before the flush. BOUNDED (TEARDOWN_WAIT_MS): a save hung on an
+  // unreachable disk must not freeze every navigation after it, Explorer opens
+  // included. Nothing is said when the bound runs out — the teardown is still
+  // running and reports its own failure if it ends in one.
+  await teardowns.settledWithin(TEARDOWN_WAIT_MS);
   if (token !== navToken) return; // superseded while disposing
   // Clearing #app cannot reach an error dialog: those live on document.body so
   // they can sit above everything. A screen that owns one has just closed it in
@@ -76,9 +112,14 @@ async function go(route: Route): Promise<void> {
   } else {
     const { mountEditor } = await import("./editor/editor");
     if (token !== navToken) return;
-    const view = await mountEditor(app, route.projectPath, route.temp ?? false);
+    const view = await mountEditor(app, route, () => token !== navToken);
     if (token !== navToken) {
-      await view.dispose();
+      // Tracked like any other teardown. The screen that superseded this mount
+      // has usually mounted already (it passed its own wait while this one was
+      // still loading), so what this buys is the NEXT navigation and the close
+      // gate (`teardowns.settled()`): neither starts on top of a half-closed
+      // editor.
+      teardowns.track(() => view.dispose());
       return;
     }
     dispose = () => view.dispose();
@@ -92,26 +133,8 @@ void go({ view: "home" });
 // file starts a new project with that file placed on the timeline (an OS
 // "Open with" implies the user wants to work with it, not just stage it).
 // This differs from in-app import, which is bin-first (see home createNew).
-// Serialized so overlapping launches can't interleave two project creations.
-let openChain: Promise<void> = Promise.resolve();
-
-// The temp-projects dir, resolved once per app run (a stable OS path). Cached as
-// a promise so concurrent opens share the single IPC round-trip. Normalized to
-// backslashes + lowercase for a case-insensitive Windows prefix test. Empty in a
-// plain browser (ipc fallback), which makes the prefix test below always false.
-let tempDirPrefix: Promise<string> | null = null;
-function normalizePath(p: string): string {
-  return p.replace(/\//g, "\\").toLowerCase();
-}
-function tempProjectsDirPrefix(): Promise<string> {
-  if (!tempDirPrefix) {
-    tempDirPrefix = ipc
-      .tempProjectsDir()
-      .then((dir) => (dir ? normalizePath(dir) : ""))
-      .catch(() => "");
-  }
-  return tempDirPrefix;
-}
+// Serialized on the open chain (core/open-media) so overlapping launches can't
+// interleave two project creations.
 
 async function routeOpenPath(path: string): Promise<void> {
   const ext = fileExt(path);
@@ -134,8 +157,7 @@ async function routeOpenPath(path: string): Promise<void> {
     // scratch file: route it as temp so the editor shows the Temporary badge and
     // applies the keep gate on exit, matching the recents exclusion the backend
     // already enforces for that dir. Anything outside it is a normal project.
-    const prefix = await tempProjectsDirPrefix();
-    const temp = prefix.length > 0 && normalizePath(path).startsWith(prefix);
+    const temp = await isTempProjectPath(path);
     navigate(temp ? { view: "editor", projectPath: path, temp: true } : { view: "editor", projectPath: path });
     return;
   }
@@ -145,21 +167,26 @@ async function routeOpenPath(path: string): Promise<void> {
   // byte-identical.
   const temp = settingsStore.get().tempOpenWith;
   try {
-    const projectPath = temp
-      ? await ipc.tempProjectPath(fileStem(path))
-      : await ipc.newProjectPath(fileStem(path));
+    if (temp) {
+      const projectPath = await openMediaAsProject(path);
+      navigate({ view: "editor", projectPath, temp: true });
+      return;
+    }
+    const projectPath = await ipc.newProjectPath(fileStem(path));
     let project = createProject(fileStem(projectPath));
     const info = await ipc.probeMedia(path);
     project = importMediaAsClip(project, info).project;
     await ipc.saveProject(projectPath, project);
-    navigate(temp ? { view: "editor", projectPath, temp: true } : { view: "editor", projectPath });
+    navigate({ view: "editor", projectPath });
   } catch (e) {
     toast.error(describeError(e));
   }
 }
 
 function enqueueOpen(path: string): void {
-  openChain = openChain.then(() => routeOpenPath(path)).catch(() => {});
+  // routeOpenPath reports its own failures; the catch only keeps a rejection
+  // that escaped it from surfacing as unhandled.
+  void runOnOpenChain(() => routeOpenPath(path)).catch(() => {});
 }
 
 void (async () => {

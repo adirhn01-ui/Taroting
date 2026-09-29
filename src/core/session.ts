@@ -4,9 +4,11 @@
 import { History } from "./history";
 import { describeError, ipc, type SettingsRead } from "./ipc";
 import { touchModified } from "./project";
+import { normalizeChord } from "./shortcuts";
 import { Store } from "./store";
 import type { ActionId, CustomTheme, ProjectFile, Settings } from "./types";
 import {
+  ACTION_MODES,
   DEFAULT_CUSTOM_THEME,
   DEFAULT_SETTINGS,
   DEFAULT_SHORTCUTS,
@@ -845,9 +847,43 @@ function asCustomTheme(v: unknown): CustomTheme {
  *  stored map does not mention gets its DEFAULT chord UNLESS that chord (normalizeChord) is
  *  already bound, IN THE STORED MAP, to an action sharing a mode; then it is left unbound (""):
  *  a new default never steals a user's chord. Non-object input → fresh copy of DEFAULT_SHORTCUTS
- *  (keeps session.test.ts "non-object → DEFAULT_SETTINGS" true). */
-export function sanitizeShortcuts(_raw: unknown): Record<ActionId, string> {
-  throw new Error("not implemented");
+ *  (keeps session.test.ts "non-object → DEFAULT_SETTINGS" true).
+ *
+ *  Only KNOWN actions bound to a STRING survive, so neither an extra key nor a
+ *  non-string binding can reach normalizeChord.
+ *
+ *  WHY A NEW DEFAULT MAY NOT STEAL. Every release that adds an action meets a
+ *  settings.json written before that action existed. The old rebuild filled the
+ *  gap with the default unconditionally, so a user who had put toggleLoop on
+ *  Ctrl+Y would find, after upgrading, that Ctrl+Y ALSO meant the new
+ *  alternate redo: one of the two silently never fires, and Settings flags a
+ *  duplicate the user never made. The user's chord is the one they chose; the
+ *  new action waits, unbound, for them to give it one. The check reads the
+ *  STORED map only: an action the file does not mention has no chord of the
+ *  user's to protect. */
+export function sanitizeShortcuts(raw: unknown): Record<ActionId, string> {
+  const stored: Record<string, unknown> =
+    raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const actions = Object.keys(DEFAULT_SHORTCUTS) as ActionId[];
+  const out = { ...DEFAULT_SHORTCUTS };
+  for (const action of actions) {
+    const chord = stored[action];
+    if (typeof chord === "string") out[action] = chord;
+  }
+  for (const action of actions) {
+    if (typeof stored[action] === "string") continue; // the user's own binding
+    const fallback = normalizeChord(DEFAULT_SHORTCUTS[action]);
+    const modes = ACTION_MODES[action];
+    const taken = actions.some(
+      (other) =>
+        other !== action &&
+        typeof stored[other] === "string" &&
+        ACTION_MODES[other].some((m) => modes.includes(m)) &&
+        normalizeChord(stored[other] as string) === fallback,
+    );
+    if (taken) out[action] = "";
+  }
+  return out;
 }
 
 /** Coerce an arbitrary persisted value into a valid Settings. Never throws. */
@@ -855,18 +891,7 @@ export function sanitizeSettings(raw: unknown): Settings {
   const o: Record<string, unknown> =
     raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
 
-  // Rebuild the shortcut map from the defaults: only KNOWN actions bound to a
-  // STRING survive, so neither an extra key nor a non-string binding can reach
-  // normalizeChord.
-  const rawShortcuts: Record<string, unknown> =
-    o.shortcuts !== null && typeof o.shortcuts === "object"
-      ? (o.shortcuts as Record<string, unknown>)
-      : {};
-  const shortcuts = { ...DEFAULT_SHORTCUTS };
-  for (const action of Object.keys(DEFAULT_SHORTCUTS) as ActionId[]) {
-    const chord = rawShortcuts[action];
-    if (typeof chord === "string") shortcuts[action] = chord;
-  }
+  const shortcuts = sanitizeShortcuts(o.shortcuts);
 
   const theme = o.theme;
   return {
@@ -1212,6 +1237,14 @@ export class ProjectSession {
    *  retry. Both reset by any successful write. See SAVE_RETRY_MAX_TICKS. */
   private failedSaves = 0;
   private retryTicks = 0;
+  /** Backing field for `edited`. One boolean write per commit; never reset. */
+  private _edited = false;
+  /** The most recent write's rejection, so `relocate` can hand the caller the
+   *  backend's own reason instead of a generic one. */
+  private lastSaveError: unknown = undefined;
+  /** Where the most recent SUCCESSFUL write landed. `relocate` succeeds exactly
+   *  when this names the destination — see there for why not `saveState`. */
+  private lastWrittenPath: string | null = null;
 
   constructor(path: string, initial: ProjectFile, opts?: { temp?: boolean }) {
     this._path = path;
@@ -1239,7 +1272,7 @@ export class ProjectSession {
   /** True once the USER changed the project: commit/commitFrom/undo/redo that changed state,
    *  and replace() unless called with { edit: false }. Never reset. Drives the close prompt. */
   get edited(): boolean {
-    return false;
+    return this._edited;
   }
 
   get project(): ProjectFile {
@@ -1254,6 +1287,7 @@ export class ProjectSession {
     if (after === before) return;
     this.history.push(before);
     this.store.set(after);
+    this._edited = true;
     this.markDirty();
   }
 
@@ -1264,14 +1298,18 @@ export class ProjectSession {
   commitFrom(before: ProjectFile): void {
     if (this.store.get() === before) return;
     this.history.push(before);
+    this._edited = true;
     this.markDirty();
   }
 
   /** Replace state without a history entry (e.g. media relink fixups).
-   *  `edit: false` = a fixup the user did not make (default true). */
-  replace(next: ProjectFile, _opts?: { edit?: boolean }): void {
+   *  `edit: false` = a fixup the user did not make (default true): it still
+   *  autosaves, but it must not count as the user having changed the project —
+   *  `edited` decides whether closing the window asks about a temp project. */
+  replace(next: ProjectFile, opts?: { edit?: boolean }): void {
     if (next === this.store.get()) return;
     this.store.set(next);
+    if (opts?.edit !== false) this._edited = true;
     this.markDirty();
   }
 
@@ -1279,6 +1317,7 @@ export class ProjectSession {
     const prev = this.history.undo(this.store.get());
     if (prev) {
       this.store.set(prev);
+      this._edited = true;
       this.markDirty();
     }
   }
@@ -1287,6 +1326,7 @@ export class ProjectSession {
     const next = this.history.redo(this.store.get());
     if (next) {
       this.store.set(next);
+      this._edited = true;
       this.markDirty();
     }
   }
@@ -1350,12 +1390,18 @@ export class ProjectSession {
       try {
         const stamped = touchModified(this.store.get());
         this.store.set(stamped);
-        await ipc.saveProject(this.path, stamped);
+        // Read per PASS, not once per drain: `relocate` moves the path while a
+        // write may be out, and the follow-up pass it asks for must land at the
+        // new one.
+        const path = this.path;
+        await ipc.saveProject(path, stamped);
+        this.lastWrittenPath = path;
         this.failedSaves = 0;
         this.retryTicks = 0;
         // An edit made DURING the write already set "dirty"; don't paint over it.
         if (this.saveState.get() === "saving") this.saveState.set("saved");
-      } catch {
+      } catch (e) {
+        this.lastSaveError = e;
         this.failedSaves++;
         this.retryTicks = Math.min(2 ** (this.failedSaves - 1), SAVE_RETRY_MAX_TICKS);
         this.saveState.set("error");
@@ -1367,10 +1413,41 @@ export class ProjectSession {
   }
 
   /** Move autosave to `dest` and write the current state there, coalescing with any in-flight
-   *  write (edits made during it included). Failure: path reverts, the write's own error is
-   *  re-thrown. Does NOT touch `temp` or recents; callers do. */
-  async relocate(_dest: string): Promise<void> {
-    throw new Error("not implemented");
+   *  write (edits made during it included). Success means a write landed at `dest`; anything
+   *  else is failure: path reverts, the write's own error is re-thrown. Does NOT touch `temp`
+   *  or recents; callers do.
+   *
+   *  THE ONE WRITER. Moving the path and then calling `save()` means a write
+   *  already out to the old path is never raced by a second writer: `save()`
+   *  coalesces into it, and its drain runs one more pass that reads the NEW
+   *  path — so the last write, carrying every edit made meanwhile, lands at
+   *  `dest` (the same save-until-stable rule the old Keep loop followed).
+   *
+   *  SUCCESS MEANS A WRITE LANDED AT `dest`, not "saveState is not error". The
+   *  two differ at the edges, and both edges matter: a coalesced pass can
+   *  succeed at `dest` and a LATER pass (an edit's own autosave) fail — the
+   *  project did move, and reverting would strand a full copy at `dest` that
+   *  the next Keep then duplicates; and a `discard()` landing mid-write stops
+   *  the drain before the `dest` pass ever runs while the temp write reported
+   *  "saved" — the project did NOT move, and saying it did would hand the
+   *  caller a path with nothing on disk. */
+  async relocate(dest: string): Promise<void> {
+    if (this.disposed) throw new Error("This project is already closed.");
+    window.clearTimeout(this.debounceTimer);
+    const previous = this._path;
+    this._path = dest;
+    this.lastWrittenPath = null;
+    this.lastSaveError = undefined;
+    this.saveState.set("dirty");
+    await this.save();
+    if (this.lastWrittenPath === dest) return;
+    // Back to the temp file, and make sure autosave re-writes it: the state the
+    // failed pass carried may be newer than what is there. Not after a
+    // `discard()` that landed mid-write: markDirty would flip a dead session
+    // back to "dirty" and arm a debounce timer that outlives it.
+    this._path = previous;
+    if (!this.disposed) this.markDirty();
+    throw this.lastSaveError ?? new Error("This project is already closed.");
   }
 
   /** Flush and stop timers (called when leaving the editor). */

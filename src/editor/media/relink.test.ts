@@ -268,6 +268,29 @@ describe("applyRelink", () => {
     expect(findMedia(applyRelink(p, mediaId, other.path, other), mediaId)!.oriented).toBe(true);
   });
 
+  it("drops the old still's noAutorotate unless the new probe sets it too", () => {
+    // `noAutorotate` is decided per FILE (a WebP's EXIF, a PNG eXIf after the
+    // image data). Relinked to a photo the WebView DOES turn — a JPEG, whose
+    // probe stores it turned and reports no flag — an inherited flag would
+    // make the export decode it unturned against that turned size.
+    const late: MediaInfo = { ...imageInfo, path: "D:\\late.png", oriented: true, noAutorotate: true };
+    const { p, mediaId } = projectWith(late);
+    expect(findMedia(p, mediaId)!.noAutorotate).toBe(true);
+
+    const jpeg: MediaInfo = { ...imageInfo, path: "D:\\portrait.jpg", oriented: true, width: 3000, height: 4000 };
+    const toJpeg = findMedia(applyRelink(p, mediaId, jpeg.path, jpeg), mediaId)!;
+    expect(toJpeg.noAutorotate).toBeUndefined();
+    expect(toJpeg.oriented).toBe(true); // the one stamp the new probe did report stays
+    expect(JSON.parse(JSON.stringify(toJpeg))).not.toHaveProperty("noAutorotate");
+
+    const toVideo = findMedia(applyRelink(p, mediaId, originalInfo.path, originalInfo), mediaId)!;
+    expect(toVideo.noAutorotate).toBeUndefined();
+
+    // A new file flagged by its own probe keeps the flag.
+    const webp: MediaInfo = { ...late, path: "D:\\turned.webp" };
+    expect(findMedia(applyRelink(p, mediaId, webp.path, webp), mediaId)!.noAutorotate).toBe(true);
+  });
+
   it("relinking an image to another image never collapses the clip", () => {
     const { p, mediaId, clipId } = projectWith(imageInfo);
     const q = applyRelink(p, mediaId, "D:\\other.jpg", {

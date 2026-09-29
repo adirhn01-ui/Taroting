@@ -661,6 +661,22 @@ fn register_clip_input(
                 display_name(&media.path)
             )));
         }
+        // The bundled ffmpeg turns every still by its EXIF orientation on
+        // decode, but the preview's WebView leaves some unturned (a WebP's
+        // EXIF, a PNG eXIf after the image data — measured) — and the probe
+        // stored such a still at its CODED size for exactly that reason.
+        // Autorotate here would hand the filtergraph the transpose of the
+        // stored size: a squashed export, or a hard size-mismatch abort under
+        // a crop or an opacity keyframe. So it is switched off exactly where
+        // the media entry records that answer (`no_autorotate`, decided per
+        // file by `exif::read_still` at import or in the load-time repair):
+        // the builder stays a pure function of the spec, and never second-
+        // guesses the size the probe stored with the file it read. First
+        // among the input options, so the argv of every other still is
+        // byte-for-byte what it always was.
+        if media.no_autorotate == Some(true) {
+            flags.push("-noautorotate".into());
+        }
         flags.push("-loop".into());
         flags.push("1".into());
         // SOURCE seconds, not timeline seconds. `emit_clip_chain` puts a
@@ -1651,6 +1667,7 @@ mod tests {
             audio_rate: Some(48000),
             audio_channels: Some(2),
             generator: None,
+            no_autorotate: None,
         }
     }
 
@@ -1678,6 +1695,7 @@ mod tests {
             audio_rate: None,
             audio_channels: None,
             generator: Some(generator),
+            no_autorotate: None,
         }
     }
 
@@ -2625,6 +2643,129 @@ mod tests {
             );
             assert!(!a.contains(&"-ss".to_string()), "{container}: {a:?}");
         }
+    }
+
+    /// `-noautorotate` goes on a still exactly when its media entry says so
+    /// (`no_autorotate: Some(true)`), FIRST among its input options, and
+    /// nowhere else — whatever the still's format: the answer was decided per
+    /// file at import, and the builder reads it rather than re-deriving it
+    /// from the codec. So the same WebP and the same PNG appear both with the
+    /// flag and without it, a `Some(false)` from a hand-edited `.trt` is not
+    /// the flag, and a VIDEO entry carrying the flag still autorotates: a
+    /// rotated recording must keep its turn, which the `<video>` element
+    /// applies too.
+    #[test]
+    fn only_a_still_whose_entry_says_so_is_opened_with_noautorotate() {
+        let rows: [(&str, &str, Option<bool>, bool); 8] = [
+            ("webp_pipe", "webp", Some(true), true),
+            ("webp_pipe", "webp", None, false),
+            ("png_pipe", "png", Some(true), true),
+            ("png_pipe", "png", None, false),
+            ("png_pipe", "png", Some(false), false),
+            ("jpeg_pipe", "mjpeg", None, false),
+            ("image2", "bmp", None, false),
+            ("image2", "tiff", Some(true), true),
+        ];
+        for (container, vcodec, flag, raw) in rows {
+            let mut still = image_media("m1", r"C:\pics\still.webp");
+            still.container = Some(container.into());
+            still.vcodec = Some(vcodec.into());
+            still.no_autorotate = flag;
+            let mut vid = media("m2", r"C:\v.mp4", 1918, 1078, true);
+            vid.no_autorotate = Some(true);
+            let tl = timeline(
+                1280,
+                720,
+                Rational { num: 30, den: 1 },
+                vec![
+                    vtrack_id("top", vec![clip("c1", "m1", 1.0, 0.0, 3.0)]),
+                    vtrack_id("bot", vec![clip("c2", "m2", 0.0, 0.0, 5.0)]),
+                ],
+            );
+            let b = build(&spec(vec![still, vid], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc())
+                .unwrap_or_else(|e| panic!("{container}/{vcodec}/{flag:?}: {e}"));
+            let a = argstr(&b);
+            let i = a.iter().position(|s| s == r"C:\pics\still.webp").unwrap();
+            let tail = ["-loop", "1", "-t", "3.000000", "-i"];
+            assert_eq!(&a[i - 5..i], tail, "{container}/{vcodec}/{flag:?}: {a:?}");
+            assert_eq!(a[i - 6] == "-noautorotate", raw, "{container}/{vcodec}/{flag:?}: {a:?}");
+            let count = a.iter().filter(|s| *s == "-noautorotate").count();
+            assert_eq!(count, usize::from(raw), "{container}/{vcodec}/{flag:?}: only the still's input, once: {a:?}");
+        }
+    }
+
+    /// The whole chain on REAL files, which is what keeps the preview and the
+    /// export agreeing about a photo's shape: `probe_sync` stores a size and
+    /// its `noAutorotate`, the builder opens the file with its own input flags
+    /// built from that entry, and the bundled ffmpeg decodes it — the decoded
+    /// frame must BE the stored size. A JPEG turned by its EXIF, and a PNG
+    /// with the same orientation in an eXIf BEFORE its image data, decode
+    /// portrait (the WebView turns both); the same eXIf AFTER the image data,
+    /// and a WebP with that EXIF, decode at their coded landscape size (ffmpeg
+    /// would turn them, the WebView does not, so `-noautorotate` must be
+    /// there). 96x40 so a transposed answer can never pass for a right one.
+    #[test]
+    fn a_real_still_decodes_to_its_stored_size_through_the_builders_own_input() {
+        use crate::media::exif::tests::{jpeg_with_exif, png_with_exif, tiff_orientation, webp_with_exif};
+        let dir = std::env::temp_dir().join("taroting still input decode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = |ext: &str| {
+            let p = dir.join(format!("base.{ext}"));
+            let out = crate::jobs::ffmpeg::run(
+                "ffmpeg",
+                &["-y", "-f", "lavfi", "-i", "testsrc2=size=96x40", "-frames:v", "1", p.to_str().unwrap()],
+            )
+            .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            std::fs::read(&p).unwrap()
+        };
+        let (jpg, png, webp) = (base("jpg"), base("png"), base("webp"));
+        let t6 = tiff_orientation(6, false);
+        // (name, bytes, stored portrait, flagged noAutorotate)
+        let rows: Vec<(&str, Vec<u8>, bool, bool)> = vec![
+            ("o6.jpg", jpeg_with_exif(&jpg, &t6), true, false),
+            ("o6.webp", webp_with_exif(&webp, 96, 40, &t6), false, true),
+            ("o8 le.webp", webp_with_exif(&webp, 96, 40, &tiff_orientation(8, true)), false, true),
+            ("o6 early.png", png_with_exif(&png, &t6, false), true, false),
+            ("o6 late.png", png_with_exif(&png, &t6, true), false, true),
+            ("o8 late le.png", png_with_exif(&png, &tiff_orientation(8, true), true), false, true),
+            ("o1.webp", webp.clone(), false, false),
+            ("o1.png", png.clone(), false, false),
+        ];
+        for (name, bytes, portrait, flagged) in rows {
+            let file = dir.join(name);
+            std::fs::write(&file, bytes).unwrap();
+            let info = crate::media::probe::probe_sync(file.to_str().unwrap()).unwrap();
+            let want = if portrait { (40, 96) } else { (96, 40) };
+            assert_eq!((info.width, info.height), (Some(want.0), Some(want.1)), "{name}: stored");
+            assert_eq!(info.no_autorotate, flagged.then_some(true), "{name}: noAutorotate");
+
+            let mut m = image_media("m1", file.to_str().unwrap());
+            m.container = info.container.clone();
+            m.vcodec = info.vcodec.clone();
+            m.width = info.width;
+            m.height = info.height;
+            m.no_autorotate = info.no_autorotate;
+            let mut inputs = Vec::new();
+            register_clip_input(&mut inputs, &clip("c1", "m1", 0.0, 0.0, 1.0), &m).unwrap();
+            let InputSource::File(src) = &inputs[0].source;
+            let bmp = dir.join("decoded.bmp");
+            let out = crate::jobs::ffmpeg::command("ffmpeg")
+                .unwrap()
+                .arg("-y")
+                .args(&inputs[0].flags)
+                .arg(src)
+                .args(["-frames:v", "1"])
+                .arg(&bmp)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+            let b = std::fs::read(&bmp).unwrap();
+            assert_eq!(&b[..2], b"BM", "{name}: not a BMP");
+            let side = |at: usize| i32::from_le_bytes(b[at..at + 4].try_into().unwrap()).unsigned_abs();
+            assert_eq!((side(18), side(22)), want, "{name}: the builder's decode is not the stored size");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

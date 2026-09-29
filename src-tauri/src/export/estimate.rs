@@ -133,6 +133,7 @@ mod tests {
             audio_rate: Some(48000),
             audio_channels: Some(2),
             generator: None,
+            no_autorotate: None,
         }
     }
 

@@ -79,6 +79,10 @@ export type JobTarget =
  */
 export type JobEntry = JobTarget | JobTarget[];
 
+function isWaveform(t: JobTarget): boolean {
+  return t.type === "waveform";
+}
+
 /** Two targets are the same waiter when they name the same media and lane. */
 function sameTarget(a: JobTarget, b: JobTarget): boolean {
   return a.mediaId === b.mediaId && a.type === b.type;
@@ -272,9 +276,35 @@ export class MediaManager {
   }
 
   private targetFailed(target: JobTarget, e: JobFailed): void {
-    if (target.type === "playback" && !e.canceled) {
-      this.patchStatus(target.mediaId, { state: "failed", message: e.message });
+    if (!e.canceled) {
+      if (target.type === "playback") {
+        this.patchStatus(target.mediaId, { state: "failed", message: e.message });
+      }
+      return;
     }
+    // CANCELED UNDER US. A live manager never cancels a job it is listening
+    // to: every cancel it issues happens in or after `dispose`, which
+    // unlistens first, and only ever for a waveform. So this
+    // is SOMEONE ELSE'S cancel of a job we joined — the backend hands every
+    // consumer of one output path the same job, and a closing editor (or a
+    // viewer stepping past a file) cancels the one it started even when we
+    // are riding on it. Ignoring it, as this used to, left the media on
+    // "Preparing" for the rest of the session (or without a waveform), on a
+    // job that will never report again. Asking again is safe: the backend
+    // never hands a canceled job to a fresh request, it starts a new one. And
+    // it cannot spin — each round needs a fresh cancel from outside.
+    //
+    // `onFailed` has already deleted this job id from `jobs` before calling
+    // here, so `retrack`'s `dropMediaTargets` never touches the entry array
+    // the caller is still iterating.
+    if (target.type === "playback") {
+      this.retrack(target.mediaId);
+      return;
+    }
+    // A waveform re-asks for just the waveform: retracking would re-plan the
+    // playback too, and flash a perfectly good preview back to "checking".
+    const media = this.getProject().media.find((m) => m.id === target.mediaId);
+    if (media?.hasAudio) this.requestWaveform(media, this.generationOf(media.id));
   }
 
   /** Track every media item in the project (idempotent). */
@@ -376,38 +406,21 @@ export class MediaManager {
     }
 
     // Waveform peaks
-    if (media.hasAudio) {
-      void ipc
-        .ensureWaveform(keyOf(media), media.duration, true)
-        .then((wf) => {
-          if (this.disposed || this.overtaken(media.id, gen)) return;
-          if (wf.state === "ready") void this.loadWaveform(media.id, wf.path);
-          else if (wf.state === "pending") {
-            addJobTarget(this.jobs, wf.jobId, {
-              type: "waveform",
-              mediaId: media.id,
-              output: wf.output,
-            });
-          }
-        })
-        .catch((e: unknown) =>
-          this.noteSoftFailure(
-            "Waveform",
-            `Couldn't build the audio waveform for ${media.path}`,
-            describeError(e),
-          ),
-        );
-    }
+    if (media.hasAudio) this.requestWaveform(media, gen);
 
     // Playback plan
     try {
       const plan = await ipc.planPlayback(media, codecHints(), settingsStore.get().proxyMedia);
+      // Answered after dispose: a pending job is deliberately LEFT RUNNING,
+      // not canceled — see `cancelOrphan` for why playback preparation outlives
+      // the editor that asked for it.
+      if (this.disposed) return;
       // The one that was actually reachable, if only just: a relink cuts the
       // media loose from its old jobs, but a plan still in flight has not
       // registered one yet, so without this it registers the OLD job after the
       // cut and drags the relinked media back to "Preparing" on a job that will
       // never report to it.
-      if (this.disposed || this.overtaken(media.id, gen)) return;
+      if (this.overtaken(media.id, gen)) return;
       if (plan.mode === "direct" || plan.mode === "ready") {
         this.patchStatus(media.id, {
           state: "ready",
@@ -429,6 +442,67 @@ export class MediaManager {
       if (this.disposed || this.overtaken(media.id, gen)) return;
       this.patchStatus(media.id, { state: "failed", message: describeError(e) });
     }
+  }
+
+  /**
+   * Ask for one media entry's waveform peaks and register the job if one has
+   * to run. Split out of `ensure` so `targetFailed` can re-ask for JUST the
+   * waveform when someone else cancels a job we joined.
+   */
+  private requestWaveform(media: MediaRef, gen: number): void {
+    void ipc
+      .ensureWaveform(keyOf(media), media.duration, true)
+      .then((wf) => {
+        if (this.disposed) {
+          if (wf.state === "pending") this.cancelOrphan(wf.jobId);
+          return;
+        }
+        if (this.overtaken(media.id, gen)) return;
+        if (wf.state === "ready") void this.loadWaveform(media.id, wf.path);
+        else if (wf.state === "pending") {
+          addJobTarget(this.jobs, wf.jobId, {
+            type: "waveform",
+            mediaId: media.id,
+            output: wf.output,
+          });
+        }
+      })
+      .catch((e: unknown) =>
+        this.noteSoftFailure(
+          "Waveform",
+          `Couldn't build the audio waveform for ${media.path}`,
+          describeError(e),
+        ),
+      );
+  }
+
+  /**
+   * Cancel a WAVEFORM job nobody here will ever read.
+   *
+   * Only waveforms, deliberately. A closed editor's waveform scans are pure
+   * display, a few seconds of decode each, and cheap to redo — letting them run
+   * on for a project no longer on screen buys nothing. Playback preparation is
+   * the opposite on every count: a remux or proxy can be minutes of transcode,
+   * and its output is what the next open needs to play the file AT ALL. The
+   * backend shares one job per output path, so an editor closed mid-proxy and
+   * reopened (Editor → Settings → Editor, Edit → Back → Edit) rejoins the job
+   * still running, or finds the result in the cache — where canceling it here
+   * restarted the transcode from zero on every return. Those jobs are left to
+   * finish into the cache. Note the trim is NOT immediate: `enforceCache` runs
+   * on a `job:done` some live manager hears, so a proxy that lands after the
+   * last editor closed waits for the next trim to be counted against the cap.
+   *
+   * Two callers: `dispose` for every waveform job this manager registered, and
+   * `requestWaveform` for an answer that arrived after dispose — that job was
+   * started for us and is registered nowhere, so without this it escapes.
+   *
+   * A successor that had ALREADY joined the job hears it canceled and asks
+   * again (`targetFailed`); the backend never hands a canceled job to a fresh
+   * request. Best-effort — a job that finished in the meantime simply isn't
+   * there to cancel.
+   */
+  private cancelOrphan(jobId: number): void {
+    void ipc.cancelJob(jobId).catch(() => {});
   }
 
   private patchStatus(mediaId: string, state: MediaState): void {
@@ -516,6 +590,13 @@ export class MediaManager {
       clearTimeout(this.cacheTimer);
       this.cacheTimer = null;
       this.runEnforceCache();
+    }
+    // Waveform scans only; remuxes and proxies run on into the cache for the
+    // next open to rejoin or find (see `cancelOrphan`). A job id never mixes
+    // lanes (the two write different outputs), but the test is per waiter all
+    // the same: a job any playback waiter rides on is never canceled.
+    for (const [id, entry] of this.jobs) {
+      if (Array.isArray(entry) ? entry.every(isWaveform) : isWaveform(entry)) this.cancelOrphan(id);
     }
     this.jobs.clear();
   }

@@ -171,9 +171,7 @@ fn main() {
             media::thumbs::get_thumbnail,
             media::thumbs::ensure_filmstrip,
             media::siblings::list_siblings,
-            // PENDING: media::playability::classify_playback — add here once it
-            // exists (it returns PlaybackClassInfo, not a Result, so it has no
-            // inert placeholder that could be registered ahead of it).
+            media::playability::classify_playback,
             jobs::cancel_job,
             cache::cache_stats,
             cache::clear_cache,
@@ -200,7 +198,7 @@ fn main() {
             diagnostics::save_diagnostic_report,
             debug::debug_info,
             debug::debug_write_report,
-            // PENDING: debug::debug_push_open_path — add here once it exists.
+            debug::debug_push_open_path,
             os::take_pending_open_paths,
             os::uninstall_app,
             screen_pick::screen_pick_color,

@@ -1,7 +1,7 @@
 // Keyboard shortcut manager: chord normalization, an action registry bound
 // from settings, and focus guards so typing in inputs never triggers edits.
 
-import { ACTION_MODES } from "./types";
+import { ACTION_MODES, DEFAULT_SHORTCUTS } from "./types";
 import type { ActionId, ShortcutMode } from "./types";
 
 /** The parts of a KeyboardEvent a chord is built from. `code` is optional so
@@ -29,7 +29,43 @@ export interface ChordSource {
 export function chordOf(e: ChordSource): string | null {
   const key = normalizeKey(e.key);
   if (!key) return null;
+  if (isAltGraph(e) && e.key.length === 1 && key !== "Space" && key !== altGraphBase(e)) {
+    // AltGr is how a Polish user types "ą" and a German one "@" or "€": a
+    // CHARACTER key, not a Ctrl+Alt command. Windows reports it as ctrlKey AND
+    // altKey both down, so the plain join would turn every AltGr-typed
+    // character into a "Ctrl+Alt+…" chord and AltGr+A would fire a Ctrl+Alt+A
+    // binding the user never pressed. The chord is the character alone.
+    //
+    // ONLY when the layout actually typed something. A key AltGr does not map
+    // (German AltGr+S) still reports its own letter, and a named key (arrows,
+    // Space, F1) never types anything; stripping those would turn an inert
+    // Ctrl+Alt+S into a bare "S" that splits the clip, and would break a stored
+    // Ctrl+Alt+P binding if the engine flags a left Ctrl+Alt as AltGraph. Those
+    // fall through and keep what was physically pressed.
+    //
+    // Known limitation: Shift is dropped with Ctrl+Alt. normalizeKey uppercases
+    // a single character, so AltGr+A ("ą") and AltGr+Shift+A ("Ą") both chord
+    // as "Ą" and cannot be bound separately. Kept deliberately — the Shortcuts
+    // card captures through this same function, so what it stores always
+    // matches what fires.
+    return key;
+  }
   return joinChord(e, key);
+}
+
+/** The letter/digit printed on the key under an AltGr press, from `e.code`, or
+ *  null when the position carries none (Comma, Slash, …). Compared against the
+ *  typed character to tell "AltGr produced a character" from "AltGr is mapped
+ *  to nothing on this key". */
+function altGraphBase(e: ChordSource): string | null {
+  const m = e.code === undefined ? null : PHYSICAL_CODE.exec(e.code);
+  return m ? (m[1] ?? m[2] ?? null) : null;
+}
+
+/** True while AltGr is held. Only the real KeyboardEvent can say: ctrlKey plus
+ *  altKey is also exactly what a genuine Ctrl+Alt press looks like. */
+function isAltGraph(e: ChordSource): boolean {
+  return e.getModifierState?.("AltGraph") === true;
 }
 
 function joinChord(e: ChordSource, key: string): string {
@@ -44,8 +80,10 @@ function joinChord(e: ChordSource, key: string): string {
 function normalizeKey(key: string): string | null {
   if (key === " " || key === "Spacebar") return "Space";
   if (key === "Esc") return "Escape";
-  // modifier keys alone never form a chord
-  if (["Control", "Shift", "Alt", "Meta"].includes(key)) return null;
+  // Modifier keys alone never form a chord. "AltGraph" is what the AltGr key
+  // itself reports; without it a bare AltGr press in the Shortcuts capture
+  // would be stored as a binding instead of waiting for the key it modifies.
+  if (["Control", "Shift", "Alt", "Meta", "AltGraph"].includes(key)) return null;
   if (key.length === 1) return key.toUpperCase();
   return key; // ArrowLeft, Delete, Home, F1, …
 }
@@ -88,6 +126,11 @@ const PHYSICAL_CODE = /^(?:Key([A-Z])|Digit([0-9]))$/;
  * "Ctrl+'", which is exactly the key they pressed.
  */
 export function physicalChordOf(e: ChordSource): string | null {
+  // Under AltGr the Ctrl+Alt the OS reports is not a command. Where the layout
+  // typed a character, reading the position would hand AltGr+A ("ą",
+  // non-ASCII) to a Ctrl+Alt+A binding; an unmapped or named key is ASCII or a
+  // name and would stop at the check below anyway.
+  if (isAltGraph(e)) return null;
   // Named keys (ArrowLeft, Delete, F1, …) are already layout-independent, and a
   // single ASCII character is a label a Latin layout could legitimately mean.
   if (e.key.length !== 1 || e.key.codePointAt(0)! <= 127) return null;
@@ -96,16 +139,32 @@ export function physicalChordOf(e: ChordSource): string | null {
   return joinChord(e, m[1] ?? m[2]!);
 }
 
-/** Look an event up in a chord map: what the layout printed first, the physical
- *  position only if that matched nothing. Exported because that ORDER is the
- *  whole fix and `window` does not exist under the node test environment. */
-export function resolveChord<T>(e: ChordSource, bindings: ReadonlyMap<string, T>): T | undefined {
+/** e.key chord first; the physical chord only if the e.key chord yields no
+ *  ACCEPTED action. Within one chord the FIRST accepted action in list order
+ *  wins. Exported because that ORDER is the whole fix and `window` does not
+ *  exist under the node test environment.
+ *
+ *  A LIST per chord plus `accept`, because one chord can legitimately name
+ *  several actions. With one action per chord the row written LAST simply won,
+ *  so an action the screen had no handler for could shadow one it had, and the
+ *  key went silently dead. Asking "which of these can you run?" instead of
+ *  "who was written last?" removes that by construction. */
+export function resolveChord<T>(
+  e: ChordSource,
+  bindings: ReadonlyMap<string, readonly T[]>,
+  accept: (t: T) => boolean = () => true,
+): T | undefined {
   const chord = chordOf(e);
   if (!chord) return undefined;
-  const hit = bindings.get(chord);
+  const hit = firstAccepted(bindings.get(chord), accept);
   if (hit !== undefined) return hit;
   const physical = physicalChordOf(e);
-  return physical === null ? undefined : bindings.get(physical);
+  return physical === null ? undefined : firstAccepted(bindings.get(physical), accept);
+}
+
+function firstAccepted<T>(list: readonly T[] | undefined, accept: (t: T) => boolean): T | undefined {
+  if (list) for (const t of list) if (accept(t)) return t;
+  return undefined;
 }
 
 const KEY_ALIASES: Record<string, string> = {
@@ -160,18 +219,10 @@ export function normalizeChord(stored: string): string {
   return parts.join("+");
 }
 
-/** Find duplicate bindings in a shortcuts map. Returns conflicting chords. */
-export function findConflicts(shortcuts: Record<string, string>): string[] {
-  const seen = new Map<string, string>();
-  const conflicts = new Set<string>();
-  for (const [action, stored] of Object.entries(shortcuts)) {
-    const chord = normalizeChord(stored);
-    if (!chord) continue;
-    if (seen.has(chord) && seen.get(chord) !== action) conflicts.add(chord);
-    seen.set(chord, action);
-  }
-  return [...conflicts];
-}
+/** Every ShortcutMode, once. A Record so the compiler demands an entry when a
+ *  mode is added: a mode missing here would silently never report a conflict. */
+const MODE_SET: Record<ShortcutMode, true> = { editor: true, viewer: true, image: true };
+const MODES = Object.keys(MODE_SET) as ShortcutMode[];
 
 /** One chord bound to two or more actions that share a screen. */
 export interface ShortcutConflict {
@@ -180,9 +231,39 @@ export interface ShortcutConflict {
   actions: ActionId[];
 }
 
+/** Duplicate chords among actions that share a mode. Unknown keys ignored.
+ *
+ *  Per MODE, because a chord is only ambiguous where both of its actions can
+ *  fire: ArrowRight is the editor's next frame and the viewer's next file, which
+ *  is two screens with one meaning each, not a clash. Actions are walked in
+ *  DEFAULT_SHORTCUTS key order (the binding order), so `actions` lists them in
+ *  the order a ShortcutManager would try them. */
+export function findConflicts(shortcuts: Record<string, string>): ShortcutConflict[] {
+  const conflicts: ShortcutConflict[] = [];
+  for (const mode of MODES) {
+    const byChord = new Map<string, ActionId[]>();
+    for (const action of Object.keys(DEFAULT_SHORTCUTS) as ActionId[]) {
+      if (!ACTION_MODES[action].includes(mode)) continue;
+      const stored = shortcuts[action];
+      if (typeof stored !== "string") continue;
+      const chord = normalizeChord(stored);
+      if (!chord) continue;
+      const group = byChord.get(chord);
+      if (group) group.push(action);
+      else byChord.set(chord, [action]);
+    }
+    for (const [chord, actions] of byChord) {
+      if (actions.length >= 2) conflicts.push({ chord, mode, actions });
+    }
+  }
+  return conflicts;
+}
+
 /** Every action named in any conflict (per-row marking in Settings). */
-export function conflictingActions(_conflicts: readonly ShortcutConflict[]): Set<ActionId> {
-  throw new Error("not implemented");
+export function conflictingActions(conflicts: readonly ShortcutConflict[]): Set<ActionId> {
+  const out = new Set<ActionId>();
+  for (const c of conflicts) for (const a of c.actions) out.add(a);
+  return out;
 }
 
 /** True when the event target is a place where typing is expected. */
@@ -250,7 +331,8 @@ export type ActionHandler = (e: KeyboardEvent) => void;
 
 /** Binds window keydown to actions according to a (rebindable) chord map. */
 export class ShortcutManager {
-  private chordToAction = new Map<string, ActionId>();
+  /** chord → this mode's actions on it, in DEFAULT_SHORTCUTS key order. */
+  private chordToActions = new Map<string, ActionId[]>();
   private handlers = new Map<ActionId, ActionHandler>();
   private listener: (e: KeyboardEvent) => void;
   /** While this returns true the app's chords are inert. */
@@ -263,10 +345,12 @@ export class ShortcutManager {
     this.mode = mode;
     this.listener = (e) => {
       if (isTypingTarget(e.target)) return;
-      const action = resolveChord(e, this.chordToAction);
+      // Only an action this screen can actually run counts as a match. A chord
+      // whose actions are all unhandled resolves to nothing, and the key falls
+      // through to the browser untouched exactly as an unbound one does.
+      const action = resolveChord(e, this.chordToActions, (a) => this.handlers.has(a));
       if (!action) return;
-      const handler = this.handlers.get(action);
-      if (!handler) return;
+      const handler = this.handlers.get(action)!;
       // Checked BEFORE preventDefault so a blocked chord falls through to the
       // browser untouched — that is what lets Space/Enter activate a focused
       // button in an open dialog or context menu instead of being swallowed by
@@ -291,18 +375,26 @@ export class ShortcutManager {
     this.suppressed = fn;
   }
 
+  /** Binds ONLY actions whose ACTION_MODES include the mode; chord → ActionId[] in
+   *  DEFAULT_SHORTCUTS key order. Dispatch fires the first listed action that has a handler. */
   setBindings(shortcuts: Record<ActionId, string>): void {
-    this.chordToAction.clear();
-    for (const [action, stored] of Object.entries(shortcuts) as [ActionId, string][]) {
+    this.chordToActions.clear();
+    // Walked over the KNOWN actions in declared order, not over the map's own
+    // entries: the map is user data (settings.json, typed by a cast), so its key
+    // order is whatever was last written and it may name actions that do not
+    // exist. Declared order is what gives "first listed wins" a fixed meaning.
+    for (const action of Object.keys(DEFAULT_SHORTCUTS) as ActionId[]) {
       // Only this screen's actions. The editor and the viewer give ArrowLeft /
-      // ArrowRight different meanings (frame step vs previous/next file), and
-      // the viewer's rows come later in key order — bound here, they would
-      // shadow the editor's frame step with an action it has no handler for,
-      // and the arrows would silently do nothing. `?.` because the map is
-      // user data typed by a cast, not proof that every key is known.
-      if (!ACTION_MODES[action]?.includes(this.mode)) continue;
+      // ArrowRight different meanings (frame step vs previous/next file); the
+      // other screen's action has no business being tried here at all.
+      if (!ACTION_MODES[action].includes(this.mode)) continue;
+      const stored = shortcuts[action];
+      if (typeof stored !== "string") continue;
       const chord = normalizeChord(stored);
-      if (chord) this.chordToAction.set(chord, action);
+      if (!chord) continue; // "" = deliberately unbound
+      const list = this.chordToActions.get(chord);
+      if (list) list.push(action);
+      else this.chordToActions.set(chord, [action]);
     }
   }
 
@@ -319,4 +411,20 @@ export class ShortcutManager {
   }
 }
 
-const REPEATABLE = new Set<ActionId>(["stepFwd", "stepBack", "jumpFwd", "jumpBack", "undo", "redo"]);
+/** Actions a HELD key keeps firing; everything else fires once per press (a
+ *  held S must not split at every frame it passes). The viewer's file stepping
+ *  and seeking repeat like the editor's frame stepping; the alternate redo
+ *  repeats like redo. Exported only so the membership is testable. */
+export const REPEATABLE: ReadonlySet<ActionId> = new Set<ActionId>([
+  "stepFwd",
+  "stepBack",
+  "jumpFwd",
+  "jumpBack",
+  "undo",
+  "redo",
+  "redoAlt",
+  "prevFile",
+  "nextFile",
+  "seekBack",
+  "seekFwd",
+]);

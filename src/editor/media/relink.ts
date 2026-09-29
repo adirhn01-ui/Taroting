@@ -118,6 +118,10 @@ const BLANK_OPTIONAL_MEDIA: Partial<MediaRef> = {
   // OLD file. Relinked to a video (or anything else the probe does not stamp),
   // the record must not inherit it.
   oriented: undefined,
+  // "Export this file -noautorotate": decided per FILE from the old file's
+  // header. Inherited by a new file whose tag the WebView turns, it would
+  // make the export decode that photo unturned against its turned size.
+  noAutorotate: undefined,
 };
 
 /** Point `mediaId` at a freshly probed file and repair everything that derives

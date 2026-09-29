@@ -7,6 +7,7 @@ const paths: Record<string, string> = {
   film: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 5v14M17 5v14M3 10h4M3 14h4M17 10h4M17 14h4"/>',
   music: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
   chevronLeft: '<path d="m15 18-6-6 6-6"/>',
+  chevronRight: '<path d="m9 18 6-6-6-6"/>',
   play: '<path d="m6 4 14 8-14 8z"/>',
   pause: '<path d="M7 4h3v16H7zM14 4h3v16h-3z"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="1"/>',
@@ -28,6 +29,7 @@ const paths: Record<string, string> = {
   fullscreenExit: '<path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3m8 0v-3a2 2 0 0 1 2-2h3"/>',
   skipBack5: '<path d="M11 19 2 12l9-7z"/><path d="M22 19l-9-7 9-7z"/>',
   skipFwd5: '<path d="m13 19 9-7-9-7z"/><path d="M2 19l9-7-9-7z"/>',
+  more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
 };
 
 export function icon(name: keyof typeof paths | string, size = 16): string {

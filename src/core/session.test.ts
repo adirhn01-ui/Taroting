@@ -12,15 +12,20 @@ import {
   needsChromeRescue,
   needsNavRescue,
   normalizeHexColor,
+  confirmLeaveCurrentSession,
+  currentSession,
+  leaveBlockedReason,
   ProjectSession,
   SAFE_APPEARANCE,
   SAFE_THEME_VARS,
   sanitizeSettings,
+  sanitizeShortcuts,
   settingsLoadFailure,
   settingsStore,
+  settingsWritesSettled,
   updateSettings,
 } from "./session";
-import { normalizeChord } from "./shortcuts";
+import { findConflicts, normalizeChord } from "./shortcuts";
 import { Store } from "./store";
 import {
   DEFAULT_CUSTOM_THEME,
@@ -2393,5 +2398,412 @@ describe("Store notifications when a subscriber throws", () => {
 
     expect(seen).toEqual(["middle:b", "last:b"]);
     expect(errors).toHaveBeenCalledTimes(2);
+  });
+});
+
+/* ============================================================================
+ * The shortcut map across an upgrade.
+ *
+ * 0.9 adds five actions. Every settings.json written by 0.8.x names the 22 it
+ * knew about and none of these, so what the new ones get on first read is
+ * decided here — and a new default must never take a chord the user already
+ * put somewhere else on the same screen.
+ * ==========================================================================*/
+
+const ADDED_IN_090 = ["redoAlt", "prevFile", "nextFile", "seekBack", "seekFwd"] as const;
+
+/** A shortcut map exactly as a 0.8.1 settings.json stores it. */
+function shortcuts081(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const m: Record<string, unknown> = { ...DEFAULT_SHORTCUTS };
+  for (const a of ADDED_IN_090) delete m[a];
+  return { ...m, ...overrides };
+}
+
+describe("sanitizeShortcuts", () => {
+  it("gives the new actions their defaults when nothing of the user's is in the way", () => {
+    expect(Object.keys(shortcuts081())).toHaveLength(22);
+    // stepFwd/stepBack/jumpFwd/jumpBack are STORED on the very chords the
+    // viewer's new actions default to — but they are editor-only, so nothing
+    // on the viewer is taken.
+    expect(sanitizeShortcuts(shortcuts081())).toEqual(DEFAULT_SHORTCUTS);
+  });
+
+  it("leaves a new action unbound rather than steal the user's chord", () => {
+    for (const mine of ["Ctrl+Y", "ctrl + y"]) {
+      const out = sanitizeShortcuts(shortcuts081({ toggleLoop: mine }));
+      expect(out.redoAlt, mine).toBe("");
+      expect(out.toggleLoop, mine).toBe(mine); // a stored string is never rewritten
+      expect(out.prevFile, mine).toBe(DEFAULT_SHORTCUTS.prevFile);
+    }
+  });
+
+  it("only protects a chord on a screen the new action shares", () => {
+    // fullscreen lives on the editor AND the viewer; nextFile is viewer-only.
+    const out = sanitizeShortcuts(shortcuts081({ fullscreen: "ArrowRight" }));
+    expect(out.nextFile).toBe("");
+    expect(out.prevFile).toBe("ArrowLeft");
+    // The user's own editor clash is left exactly as they made it, and the
+    // Shortcuts card is what tells them about it.
+    expect(out.fullscreen).toBe("ArrowRight");
+    expect(out.stepFwd).toBe("ArrowRight");
+    expect(findConflicts(out)).toEqual([
+      { chord: "ArrowRight", mode: "editor", actions: ["stepFwd", "fullscreen"] },
+    ]);
+  });
+
+  it("never unbinds a chord the user set for the new action themselves", () => {
+    const out = sanitizeShortcuts(shortcuts081({ toggleLoop: "Ctrl+Y", redoAlt: "Ctrl+Y" }));
+    expect(out.redoAlt).toBe("Ctrl+Y");
+    expect(out.toggleLoop).toBe("Ctrl+Y");
+    // "" is a binding too: the user cleared it, and it stays cleared.
+    expect(sanitizeShortcuts(shortcuts081({ redoAlt: "" })).redoAlt).toBe("");
+  });
+
+  it("does not let a non-string entry hold a chord", () => {
+    const out = sanitizeShortcuts(shortcuts081({ toggleLoop: 7, fullscreen: null }));
+    expect(out.toggleLoop).toBe(DEFAULT_SHORTCUTS.toggleLoop);
+    expect(out.redoAlt).toBe("Ctrl+Y");
+    expect(out.fullscreen).toBe(DEFAULT_SHORTCUTS.fullscreen);
+  });
+
+  it("returns a fresh copy of the defaults for a non-object", () => {
+    for (const raw of [null, undefined, 0, "", "Ctrl+Y", true, []]) {
+      const out = sanitizeShortcuts(raw);
+      expect(out).toEqual(DEFAULT_SHORTCUTS);
+      expect(out).not.toBe(DEFAULT_SHORTCUTS);
+    }
+  });
+
+  it("is what sanitizeSettings reads the stored map through", () => {
+    const s = sanitizeSettings({ shortcuts: shortcuts081({ toggleLoop: "Ctrl+Y" }) });
+    expect(s.shortcuts.redoAlt).toBe("");
+    expect(s.shortcuts.toggleLoop).toBe("Ctrl+Y");
+  });
+});
+
+/* ============================================================================
+ * ProjectSession: edited, relocate, blockLeave.
+ * ==========================================================================*/
+
+const TEMP_PATH = "C:\\Users\\adirh\\AppData\\Local\\Taroting\\tmp-projects\\clip-4f2a.trt";
+const DEST_PATH = "C:\\Users\\adirh\\Documents\\Taroting\\Holiday clip.trt";
+/** session.ts AUTOSAVE_DEBOUNCE_MS. */
+const DEBOUNCE_MS = 500;
+
+describe("ProjectSession.edited", () => {
+  beforeEach(() => {
+    installGlobalStubs();
+    settingsStore.set(DEFAULT_SETTINGS);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("stays false through construction, no-op mutations and non-user fixups", () => {
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"), { temp: true });
+    expect(s.edited).toBe(false);
+    s.replace({ ...s.project, name: "relinked" }, { edit: false });
+    expect(s.edited).toBe(false);
+    s.commit((p) => p); // same reference: nothing changed
+    s.replace(s.project); // likewise
+    s.undo(); // nothing to undo
+    s.redo(); // nothing to redo
+    expect(s.edited).toBe(false);
+    s.discard();
+  });
+
+  it("turns true on a commit", () => {
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"));
+    s.commit((p) => ({ ...p, name: "trimmed" }));
+    expect(s.edited).toBe(true);
+    s.discard();
+  });
+
+  it("turns true on a live replace, the default", () => {
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"));
+    s.replace({ ...s.project, name: "dragged" });
+    expect(s.edited).toBe(true);
+    s.discard();
+  });
+
+  it("turns true when commitFrom records a change", () => {
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"));
+    const before = s.project;
+    s.replace({ ...before, name: "slid" }, { edit: false });
+    expect(s.edited).toBe(false);
+    s.commitFrom(before);
+    expect(s.edited).toBe(true);
+    s.discard();
+  });
+
+  it("turns true when an undo or a redo applies a step", () => {
+    const u = new ProjectSession(TEMP_PATH, createProject("clip"));
+    const a = u.project;
+    u.replace({ ...a, name: "b" }, { edit: false });
+    u.history.push(a);
+    expect(u.edited).toBe(false);
+    u.undo();
+    expect(u.edited).toBe(true);
+    u.discard();
+
+    const r = new ProjectSession(TEMP_PATH, createProject("clip"));
+    const start = r.project;
+    r.history.push(start);
+    r.history.undo({ ...start, name: "ahead" }); // leaves one step to redo
+    expect(r.edited).toBe(false);
+    r.redo();
+    expect(r.project.name).toBe("ahead");
+    expect(r.edited).toBe(true);
+    r.discard();
+  });
+});
+
+describe("ProjectSession.relocate", () => {
+  beforeEach(() => {
+    installGlobalStubs();
+    settingsStore.set(DEFAULT_SETTINGS);
+    vi.useFakeTimers(fakeTimerOptions());
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /** Records [path, project name] for every write, in the order they START.
+   *  `gate` holds the n-th write (1-based) until released; `fail` rejects the
+   *  n-th write, or every write to a path, with the given error. */
+  function recordingWriter(opts: {
+    gate?: number;
+    fail?: { nth?: number; path?: string; error: Error };
+  } = {}): { writes: [string, string][]; release: () => void } {
+    const writes: [string, string][] = [];
+    let release!: () => void;
+    const gated = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let n = 0;
+    vi.spyOn(ipc, "saveProject").mockImplementation(async (path, project) => {
+      const nth = ++n;
+      writes.push([path, project.name]);
+      if (nth === opts.gate) await gated;
+      const f = opts.fail;
+      if (f && (f.nth === nth || f.path === path)) throw f.error;
+      return { modifiedAt: project.modifiedAt };
+    });
+    return { writes, release };
+  }
+
+  it("writes the current state at the destination and autosaves there from then on", async () => {
+    const { writes } = recordingWriter();
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"), { temp: true });
+    s.commit((p) => ({ ...p, name: "trimmed" }));
+
+    await s.relocate(DEST_PATH);
+    expect(s.path).toBe(DEST_PATH);
+    expect(writes).toEqual([[DEST_PATH, "trimmed"]]);
+    // relocate moves the file, nothing else: `temp` is the caller's to flip.
+    expect(s.temp.get()).toBe(true);
+
+    s.commit((p) => ({ ...p, name: "titled" }));
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    expect(writes).toEqual([
+      [DEST_PATH, "trimmed"],
+      [DEST_PATH, "titled"],
+    ]);
+    s.discard();
+  });
+
+  it("puts the path back and rethrows the backend's own error when the write fails", async () => {
+    const refusal = new Error("Access is denied. (os error 5)");
+    const { writes } = recordingWriter({ fail: { path: DEST_PATH, error: refusal } });
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"), { temp: true });
+    s.commit((p) => ({ ...p, name: "trimmed" }));
+
+    await expect(s.relocate(DEST_PATH)).rejects.toBe(refusal);
+    expect(s.path).toBe(TEMP_PATH);
+
+    // ...and the temp file is re-written, so nothing the user did is lost
+    // while they are still in a temporary project.
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    expect(writes).toEqual([
+      [DEST_PATH, "trimmed"],
+      [TEMP_PATH, "trimmed"],
+    ]);
+    expect(s.saveState.get()).toBe("saved");
+    s.discard();
+  });
+
+  it("lets a write already out to the temp file finish, then writes the destination", async () => {
+    const { writes, release } = recordingWriter({ gate: 1 });
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"), { temp: true });
+    s.commit((p) => ({ ...p, name: "first edit" }));
+    const autosave = s.save(); // out to the temp path
+
+    s.commit((p) => ({ ...p, name: "second edit" }));
+    const moving = s.relocate(DEST_PATH);
+    await Promise.resolve();
+    await Promise.resolve();
+    // One writer at a time: nothing raced the write in flight.
+    expect(writes).toEqual([[TEMP_PATH, "first edit"]]);
+
+    release();
+    await moving;
+    await autosave;
+    expect(writes).toEqual([
+      [TEMP_PATH, "first edit"],
+      [DEST_PATH, "second edit"],
+    ]);
+    expect(s.path).toBe(DEST_PATH);
+    s.discard();
+  });
+
+  it("counts as moved once the destination was written, even if a later autosave fails", async () => {
+    // Reverting here would strand a complete copy at the destination, and the
+    // next Keep would duplicate it under another name.
+    const locked = new Error("The process cannot access the file.");
+    const { writes, release } = recordingWriter({ gate: 1, fail: { nth: 2, error: locked } });
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"), { temp: true });
+    s.commit((p) => ({ ...p, name: "first edit" }));
+    const moving = s.relocate(DEST_PATH);
+    s.commit((p) => ({ ...p, name: "second edit" }));
+    const followUp = s.save(); // coalesces: one more pass after the first
+
+    release();
+    await moving;
+    await followUp;
+    expect(writes).toEqual([
+      [DEST_PATH, "first edit"],
+      [DEST_PATH, "second edit"],
+    ]);
+    expect(s.path).toBe(DEST_PATH);
+    expect(s.saveState.get()).toBe("error"); // an ordinary autosave failure, retried there
+    s.discard();
+  });
+
+  it("fails, and stays put, when the session is discarded before the destination is written", async () => {
+    const { writes, release } = recordingWriter({ gate: 1 });
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"), { temp: true });
+    s.commit((p) => ({ ...p, name: "first edit" }));
+    const autosave = s.save();
+    const moving = s.relocate(DEST_PATH);
+    s.discard();
+
+    release();
+    await expect(moving).rejects.toThrow();
+    await autosave;
+    // The temp write succeeded, but nothing ever reached the destination —
+    // reporting success would hand the caller a path with no file behind it.
+    expect(writes).toEqual([[TEMP_PATH, "first edit"]]);
+    expect(s.path).toBe(TEMP_PATH);
+    // A closed session is not re-armed: no debounce timer outliving it. (Its
+    // saveState is "dirty" either way — relocate itself marks the move as owed
+    // before the write, and the discarded drain never clears it.)
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("refuses a discarded session without writing anything", async () => {
+    const { writes } = recordingWriter();
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"), { temp: true });
+    s.discard();
+    await expect(s.relocate(DEST_PATH)).rejects.toThrow();
+    expect(s.path).toBe(TEMP_PATH);
+    expect(writes).toEqual([]);
+    // Refused up front: a closed session is not re-armed as having unsaved work.
+    expect(s.saveState.get()).toBe("saved");
+  });
+});
+
+describe("leaving a session that must not be torn down", () => {
+  beforeEach(() => {
+    installGlobalStubs();
+    settingsStore.set(DEFAULT_SETTINGS);
+  });
+
+  afterEach(() => {
+    currentSession.set(null);
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("refuses while blockLeave is set, without asking the leave guard", async () => {
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"), { temp: true });
+    const guard = vi.fn(async () => true);
+    s.leaveGuard = guard;
+    s.blockLeave = "An export is running.";
+    currentSession.set(s);
+
+    expect(leaveBlockedReason()).toBe("An export is running.");
+    expect(await confirmLeaveCurrentSession()).toBe(false);
+    expect(guard).not.toHaveBeenCalled();
+
+    // Cleared: the guard is asked again, and its answer is the answer.
+    s.blockLeave = null;
+    expect(leaveBlockedReason()).toBeNull();
+    guard.mockResolvedValueOnce(false);
+    expect(await confirmLeaveCurrentSession()).toBe(false);
+    guard.mockResolvedValueOnce(true);
+    expect(await confirmLeaveCurrentSession()).toBe(true);
+    expect(guard).toHaveBeenCalledTimes(2);
+    s.discard();
+  });
+
+  it("has nothing to refuse with no session open", async () => {
+    currentSession.set(null);
+    expect(leaveBlockedReason()).toBeNull();
+    expect(await confirmLeaveCurrentSession()).toBe(true);
+  });
+});
+
+describe("settingsWritesSettled", () => {
+  beforeEach(() => {
+    installGlobalStubs();
+    settingsStore.set(DEFAULT_SETTINGS);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("resolves once every queued write has landed, and never rejects", async () => {
+    vi.spyOn(ipc, "readSettings").mockResolvedValue({
+      status: "ok",
+      settings: DEFAULT_SETTINGS,
+      recovered: false,
+    });
+    await initSettings();
+    const finish: Array<(fail: boolean) => void> = [];
+    vi.spyOn(ipc, "saveSettings").mockImplementation(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          finish.push((fail) => (fail ? reject(new Error("the file is in use")) : resolve()));
+        }),
+    );
+
+    const first = updateSettings({ cacheLimitMB: 4096 }).then(
+      () => "saved",
+      () => "failed",
+    );
+    const second = updateSettings({ autosaveSeconds: 17 });
+    let settled = false;
+    const all = settingsWritesSettled().then(() => {
+      settled = true;
+    });
+
+    await settle();
+    finish[0]!(true); // the first write FAILS
+    await settle();
+    expect(settled).toBe(false); // the second is still out
+    finish[1]!(false);
+    await all;
+    expect(settled).toBe(true);
+    expect(await first).toBe("failed"); // its own caller still hears about it
+    await second;
   });
 });

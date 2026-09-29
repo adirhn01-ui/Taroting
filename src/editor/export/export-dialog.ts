@@ -980,7 +980,10 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     // UNGATED preset on purpose: the project records what the user asked for,
     // and a global setting (or a machine with no hardware encoder) must never
     // get to rewrite that. runPreset() is what the export itself is handed.
-    session.replace({ ...session.project, export: projectPreset() });
+    // `edit: false`: saving the export settings is not the user changing the
+    // project, so it must not make an untouched temporary project ask "keep?"
+    // when the window closes.
+    session.replace({ ...session.project, export: projectPreset() }, { edit: false });
     // SAY SO if the write fails. Nothing else here reports it: the export runs
     // regardless, so a bare `void` meant a rejected write silently cost the user
     // their remembered destination — the next export opened somewhere else with

@@ -286,6 +286,12 @@ fn argv_snapshot(args: &[OsString]) -> Vec<String> {
     args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
 }
 
+// The redaction kinds deliberately name MORE types than the app imports (a
+// failure report may quote any path ffmpeg touched), so these stay hand
+// lists rather than reading media-extensions.json. They must never name
+// FEWER: `redaction_kind_covers_every_importable_extension` pins every
+// importable extension to its kind, so a type added to the JSON cannot
+// quietly redact as "file1.xyz".
 const VIDEO_EXT: &[&str] = &[
     "mp4", "mov", "mkv", "webm", "avi", "m4v", "wmv", "flv", "mpg", "mpeg", "ts", "m2ts", "mts",
     "ogv", "3gp", "gif",
@@ -746,6 +752,23 @@ mod unit {
         assert_eq!(r.argv[10], "<out.webm>");
     }
 
+    /// Every extension the app can import redacts as its own kind, read from
+    /// the shared table rather than a copy of it. A gif is a video to the
+    /// redactor: it moves, and VIDEO_EXT has always named it.
+    #[test]
+    fn redaction_kind_covers_every_importable_extension() {
+        use crate::media::extensions::{all, Family};
+        assert!(!all().is_empty(), "an empty table would pass this vacuously");
+        for (ext, family) in all() {
+            let want = match family {
+                Family::Video | Family::Gif => "video",
+                Family::Audio => "audio",
+                Family::Image => "image",
+            };
+            assert_eq!(kind_for(ext), want, "{ext} ({family:?}) redacts as the wrong kind");
+        }
+    }
+
     #[test]
     fn redaction_collapses_the_part_file_and_the_final_output() {
         let d = detail(
@@ -949,6 +972,7 @@ mod unit {
             audio_rate: None,
             audio_channels: None,
             generator: None,
+            no_autorotate: None,
         }
     }
 
@@ -1171,6 +1195,7 @@ mod e2e {
             audio_rate: Some(48000),
             audio_channels: Some(2),
             generator: None,
+            no_autorotate: None,
         };
         (src, media)
     }
@@ -1443,6 +1468,7 @@ mod e2e {
             container: None, vcodec: None, acodec: None, pix_fmt: None,
             bit_depth: None, has_audio: false, audio_rate: None, audio_channels: None,
             generator: Some(Generator::Solid { color: color.into() }),
+            no_autorotate: None,
         }
     }
 
@@ -1591,6 +1617,7 @@ mod e2e {
                 bold: true,
                 italic: false,
             }),
+            no_autorotate: None,
         };
         let bottom = vtrack("vbot", vec![clip_at("b1", "base", 0.0, 0.0, 2.0)]);
         let toptrack = vtrack("vtop", vec![clip_at("t1", "txt", 0.0, 0.0, 2.0)]);
@@ -1863,6 +1890,7 @@ mod e2e {
             container: info.container.clone(), vcodec: info.vcodec.clone(),
             acodec: None, pix_fmt: info.pix_fmt.clone(), bit_depth: Some(8),
             has_audio: false, audio_rate: None, audio_channels: None, generator: None,
+            no_autorotate: None,
         };
 
         // [top-left, top-right, bottom-left, bottom-right]
@@ -1971,6 +1999,7 @@ mod e2e {
             container: info.container.clone(), vcodec: info.vcodec.clone(),
             acodec: None, pix_fmt: info.pix_fmt.clone(), bit_depth: Some(8),
             has_audio: false, audio_rate: None, audio_channels: None, generator: None,
+            no_autorotate: None,
         };
         // No clip transform at all: every degree of turn here comes from the file.
         let c = clip_at("c1", "m1", 0.0, 0.0, 1.0);

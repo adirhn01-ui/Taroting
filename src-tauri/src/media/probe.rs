@@ -42,13 +42,26 @@ pub struct MediaInfo {
     pub audio_rate: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_channels: Option<u32>,
-    /// Stills only, and always `Some(true)` on one: `width`/`height` already
-    /// account for the file's EXIF orientation. The load-time repair in
-    /// `project/store.rs` reads it off the raw project JSON to know a still
-    /// has been through this probe (the typed `schema::MediaRef` deliberately
-    /// does not carry it — raw serde keeps it through every save).
+    /// Stills only, and always `Some(true)` on one: `width`/`height` are what
+    /// this app's decoders present, the same size in the preview and in the
+    /// export. For a file the WebView turns by its EXIF orientation (a JPEG, a
+    /// PNG with its eXIf before the image data) that is the oriented size and
+    /// export autorotates to match; for one it does not, see `no_autorotate`.
+    /// The load-time repair in `project/store.rs` reads it off the raw project
+    /// JSON to know a still has been through this probe (the typed
+    /// `schema::MediaRef` deliberately does not carry it — raw serde keeps it
+    /// through every save).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oriented: Option<bool>,
+    /// Stills only, `Some(true)` or absent: the file carries an orientation
+    /// tag ffmpeg would turn it by and the WebView draws it UNTURNED (a WebP's
+    /// EXIF, a PNG eXIf after the image data, a TIFF's IFD0), so `width`/
+    /// `height` are the CODED size and every decoder opens it `-noautorotate`.
+    /// Decided per file by `exif::read_still`; the frontend keeps it on the
+    /// media entry (`MediaRef.noAutorotate`), which is where the export
+    /// builder reads it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_autorotate: Option<bool>,
 }
 
 /* ffprobe JSON shapes (only the fields we read) */
@@ -173,12 +186,13 @@ fn display_rotation(stream: &FfStream) -> u32 {
 
 /// Whether a display rotation transposes the frame.
 ///
-/// ffmpeg autorotates on decode (there is no `-noautorotate` anywhere in this
-/// codebase), so on a quarter turn the frame that actually reaches the
-/// filtergraph is the transpose of the CODED size ffprobe reports — a 1920x1080
-/// portrait phone recording decodes to 1080x1920. The preview agrees: the
-/// `<video>` element autorotates too. A half turn flips both axes and leaves
-/// the dimensions alone.
+/// ffmpeg autorotates on decode (the only `-noautorotate` in this codebase is
+/// on a still the WebView does not turn — `exif::read_still` — never on a
+/// recording), so on a quarter turn the frame that actually
+/// reaches the filtergraph is the transpose of the CODED size ffprobe reports
+/// — a 1920x1080 portrait phone recording decodes to 1080x1920. The preview
+/// agrees: the `<video>` element autorotates too. A half turn flips both axes
+/// and leaves the dimensions alone.
 fn swaps_dimensions(rotation: u32) -> bool {
     rotation == 90 || rotation == 270
 }
@@ -306,14 +320,40 @@ pub(crate) fn frame_transposes(path: &str) -> Option<bool> {
 /// sniffed orientation stands in for it: at import the file is already known
 /// to open (the stream probe just succeeded), and a well-formed 5-8 is exactly
 /// what autorotate applies. A header the sniff will not vouch for goes straight
-/// to the frame probe: a format it does not know (bmp, jxl), a walk that hit a
-/// cap, two Exif blocks in one JPEG (or two eXIf chunks in a PNG), or an
-/// orientation entry it cannot read — rare files, and the only honest answer
-/// for them is the decoder's.
-fn still_transposes(path: &str) -> bool {
-    match exif::sniff(std::path::Path::new(path)) {
+/// to the frame probe: a walk that hit a cap, two Exif blocks in one JPEG (or
+/// two eXIf chunks in a PNG), or an orientation entry it cannot read — rare
+/// files, and the only honest answer for them is the decoder's.
+///
+/// `sniffed` is the header already read by `exif::read_still` for this file.
+/// Only ever asked of a still whose tag the WebView turns by too (or that has
+/// none); for any other the tag is ignored by every decoder the app runs, so
+/// there is nothing to ask — and no frame probe is spent on it.
+fn still_transposes(
+    path: &str,
+    sniffed: Option<exif::Sniff>,
+    frame_transposes: impl FnOnce(&str) -> Option<bool>,
+) -> bool {
+    match sniffed {
         Some(s) if !s.transposes() => false,
         sniffed => frame_transposes(path).unwrap_or_else(|| sniffed.is_some_and(|s| s.transposes())),
+    }
+}
+
+/// A still's two answers, from one header read: whether its stored size is
+/// the TRANSPOSE of the coded one, and its `noAutorotate`. A still whose tag
+/// the WebView ignores (`exif::read_still`) is coded and flagged, and never
+/// costs a frame probe; any other follows ffmpeg's turn (`still_transposes`).
+/// The frame probe is injected so a test can pin exactly when it runs.
+fn still_turn(
+    path: &str,
+    stream_swap: bool,
+    frame_transposes: impl FnOnce(&str) -> Option<bool>,
+) -> (bool, Option<bool>) {
+    let still = exif::read_still(std::path::Path::new(path));
+    if still.no_autorotate {
+        (false, Some(true))
+    } else {
+        (stream_swap || still_transposes(path, still.sniff, frame_transposes), None)
     }
 }
 
@@ -404,10 +444,21 @@ pub fn probe_sync(path: &str) -> Result<MediaInfo> {
     //
     // A still carries its turn somewhere else entirely: EXIF orientation,
     // which ffmpeg applies per FRAME and `-show_streams` never shows. Same
-    // consequence, same fix — see `still_transposes`.
+    // consequence, same fix — see `still_transposes` — but only for a file
+    // the WebView turns too. For one it does not (a WebP's EXIF, a PNG eXIf
+    // after the image data — measured), every decoder this app runs on the
+    // still is opened with `-noautorotate`, so the CODED size is the decoded
+    // size, the answer is recorded on the media entry for the export builder,
+    // and no frame probe is spent asking about a turn nothing will apply.
+    // The rule is `exif::read_still`, per FILE; the load-time repair and the
+    // thumbnail jobs ask the same function of the same file.
     let is_still = kind == "image";
-    let swapped = video.is_some_and(|v| swaps_dimensions(display_rotation(v)))
-        || (is_still && still_transposes(path));
+    let stream_swap = video.is_some_and(|v| swaps_dimensions(display_rotation(v)));
+    let (swapped, no_autorotate) = if is_still {
+        still_turn(path, stream_swap, frame_transposes)
+    } else {
+        (stream_swap, None)
+    };
     let (width, height) = match (video.and_then(|v| v.width), video.and_then(|v| v.height)) {
         (Some(w), Some(h)) if swapped => (Some(h), Some(w)),
         wh => wh,
@@ -431,6 +482,7 @@ pub fn probe_sync(path: &str) -> Result<MediaInfo> {
         audio_rate: audio.and_then(|a| a.sample_rate.as_deref().and_then(|r| r.parse().ok())),
         audio_channels: audio.and_then(|a| a.channels),
         oriented: is_still.then_some(true),
+        no_autorotate,
     })
 }
 
@@ -700,6 +752,44 @@ mod tests {
         let info = probe_sync(file.to_str().unwrap()).unwrap();
         assert_eq!(info.kind, "video");
         assert_eq!(info.oriented, None, "only a still carries the orientation stamp");
+        assert_eq!(info.no_autorotate, None, "a recording always keeps its autorotate");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The frame probe (~120 ms a still) runs only for a still whose tag the
+    /// app FOLLOWS and whose header says 5..=8 — never for one whose tag the
+    /// WebView ignores, however turned its header says it is: that one is
+    /// coded and flagged from the header alone. The injected probe answers
+    /// "turns" every time, so a row that asked it by mistake would come back
+    /// transposed as well as counted. Header-only files: nothing is decoded.
+    #[test]
+    fn a_still_whose_tag_is_ignored_never_costs_a_frame_probe() {
+        use crate::media::exif::tests::{
+            jpeg_with_exif, png_with_exif, riff, tiff_orientation, tiny_jpeg, tiny_png, vp8l, webp_with_exif,
+        };
+        let dir = std::env::temp_dir().join("taroting still turn test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let t6 = tiff_orientation(6, false);
+        // (name, bytes, frame probe asked, (transposed, noAutorotate))
+        let rows: Vec<(&str, Vec<u8>, bool, (bool, Option<bool>))> = vec![
+            ("o6 early.png", png_with_exif(&tiny_png(50, 20), &t6, false), true, (true, None)),
+            ("o6.jpg", jpeg_with_exif(&tiny_jpeg(64, 36), &t6), true, (true, None)),
+            ("o6 late.png", png_with_exif(&tiny_png(50, 20), &t6, true), false, (false, Some(true))),
+            ("o6.webp", webp_with_exif(&riff(&[vp8l(70, 40)]), 70, 40, &t6), false, (false, Some(true))),
+            ("o3.jpg", jpeg_with_exif(&tiny_jpeg(64, 36), &tiff_orientation(3, false)), false, (false, None)),
+            ("plain.png", tiny_png(50, 20), false, (false, None)),
+        ];
+        for (name, bytes, asks, want) in rows {
+            let file = dir.join(name);
+            std::fs::write(&file, bytes).unwrap();
+            let mut asked = false;
+            let got = still_turn(file.to_str().unwrap(), false, |_| {
+                asked = true;
+                Some(true)
+            });
+            assert_eq!(got, want, "{name}");
+            assert_eq!(asked, asks, "{name}: frame probe");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -770,13 +860,22 @@ mod tests {
     /// the source's EXIF block (measured), so reading it meant trusting the
     /// header sniffer — the code under test — and a 300-entry IFD0 comes back
     /// as a 302-entry eXIf that sniffer rightly refuses to read.
-    fn decoded_still_dims(dir: &std::path::Path, path: &std::path::Path) -> (u32, u32) {
+    ///
+    /// `noautorotate` opens the input the way every decoder in the app opens a
+    /// still the WebView does not turn. The export builder's own argv is
+    /// checked against this same decode in `export/builder.rs`.
+    fn decoded_still_dims(
+        dir: &std::path::Path,
+        path: &std::path::Path,
+        noautorotate: bool,
+    ) -> (u32, u32) {
         let bmp = dir.join("decoded still.bmp");
-        let out = ffmpeg::run(
-            "ffmpeg",
-            &["-y", "-i", path.to_str().unwrap(), "-frames:v", "1", bmp.to_str().unwrap()],
-        )
-        .unwrap();
+        let mut args = vec!["-y"];
+        if noautorotate {
+            args.push("-noautorotate");
+        }
+        args.extend(["-i", path.to_str().unwrap(), "-frames:v", "1", bmp.to_str().unwrap()]);
+        let out = ffmpeg::run("ffmpeg", &args).unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let b = std::fs::read(&bmp).unwrap();
         assert_eq!(&b[..2], b"BM", "not a BMP");
@@ -785,9 +884,20 @@ mod tests {
     }
 
     /// Ground truth for every EXIF orientation, in both TIFF byte orders, and
-    /// for PNG (eXIf before and after the image data) and WebP: the stored
-    /// size must be what the decoder hands the filtergraph. Before this, 5-8
-    /// stored the coded landscape size for a portrait-decoding photo.
+    /// for PNG (eXIf before and after the image data), WebP and TIFF: the
+    /// stored size must be what the app's decoders hand the filtergraph.
+    /// Before this, 5-8 stored the coded landscape size for a
+    /// portrait-decoding photo.
+    ///
+    /// The third and fourth columns — the stored size's orientation and
+    /// whether the still is flagged `noAutorotate` — are written out per row
+    /// rather than derived from the rule, so a change to the rule's table (or
+    /// to the probe's use of it) fails here. A JPEG follows ffmpeg's turn, and
+    /// so does a PNG whose eXIf sits before the image data: the WebView turns
+    /// both (measured). A PNG whose eXIf sits AFTER the image data, a WebP
+    /// and a TIFF keep their CODED size and are flagged, although ffmpeg's
+    /// autorotate would turn every one of them (measured): the WebView does
+    /// not, so nothing in the app does. A still with no tag is never flagged.
     #[test]
     fn probe_reports_the_decoded_size_of_every_exif_orientation() {
         use crate::media::exif::tests::{
@@ -801,23 +911,32 @@ mod tests {
         let png = encode_still(&dir, "base.png");
         let webp = encode_still(&dir, "base.webp");
 
-        let mut cases: Vec<(String, Vec<u8>, bool)> = Vec::new();
+        // (name, bytes, stored portrait, flagged noAutorotate)
+        let mut cases: Vec<(String, Vec<u8>, bool, bool)> = Vec::new();
         for o in 1..=8u16 {
-            cases.push((format!("o{o}.jpg"), jpeg_with_exif(&jpg, &tiff_orientation(o, false)), o >= 5));
+            cases.push((format!("o{o}.jpg"), jpeg_with_exif(&jpg, &tiff_orientation(o, false)), o >= 5, false));
         }
         for o in [3u16, 6, 7] {
-            cases.push((format!("o{o} le.jpg"), jpeg_with_exif(&jpg, &tiff_orientation(o, true)), o >= 5));
+            cases.push((format!("o{o} le.jpg"), jpeg_with_exif(&jpg, &tiff_orientation(o, true)), o >= 5, false));
         }
-        cases.push(("o6.png".into(), png_with_exif(&png, &tiff_orientation(6, false), false), true));
-        cases.push(("o8 late.png".into(), png_with_exif(&png, &tiff_orientation(8, true), true), true));
-        cases.push(("o1.png".into(), png.clone(), false));
-        cases.push(("o6.webp".into(), webp_with_exif(&webp, 96, 40, &tiff_orientation(6, false)), true));
-        cases.push(("o1.webp".into(), webp.clone(), false));
-        // TIFF autorotates too (measured); its orientation is an IFD0 entry of
-        // the file itself.
+        // The same eXIf 6 and 8, told apart by nothing but where they sit.
+        cases.push(("o6 early.png".into(), png_with_exif(&png, &tiff_orientation(6, false), false), true, false));
+        cases.push(("o8 early le.png".into(), png_with_exif(&png, &tiff_orientation(8, true), false), true, false));
+        cases.push(("o6 late.png".into(), png_with_exif(&png, &tiff_orientation(6, false), true), false, true));
+        cases.push(("o8 late le.png".into(), png_with_exif(&png, &tiff_orientation(8, true), true), false, true));
+        cases.push(("o1.png".into(), png.clone(), false, false));
+        // ffmpeg turns both of these on a plain decode (measured); the app
+        // does not, because WebView2 does not (measured). An untagged WebP is
+        // not flagged: nothing to turn, so its argv is what it always was.
+        cases.push(("o6.webp".into(), webp_with_exif(&webp, 96, 40, &tiff_orientation(6, false)), false, true));
+        cases.push(("o8 le.webp".into(), webp_with_exif(&webp, 96, 40, &tiff_orientation(8, true)), false, true));
+        cases.push(("o1.webp".into(), webp.clone(), false, false));
+        // TIFF autorotates in ffmpeg too (measured); its orientation is an
+        // IFD0 entry of the file itself. The WebView does not draw a TIFF at
+        // all, so no one measured it to turn one: coded, flagged.
         let tif = encode_still(&dir, "base.tif");
-        cases.push(("o6.tif".into(), tiff_with_orientation(&tif, 6), true));
-        cases.push(("o1.tif".into(), tif, false));
+        cases.push(("o6.tif".into(), tiff_with_orientation(&tif, 6), false, true));
+        cases.push(("o1.tif".into(), tif, false, false));
         // A header the sniff gives up on (200 comment segments ahead of the
         // Exif, past its walk cap) is not a header that says "upright": the
         // frame probe answers instead.
@@ -828,55 +947,71 @@ mod tests {
         }
         padded.extend_from_slice(&turned[2..]);
         assert_eq!(crate::media::exif::tests::sniff_bytes(&padded), None, "the fixture must defeat the sniff");
-        cases.push(("o6 unsniffable.jpg".into(), padded, true));
+        cases.push(("o6 unsniffable.jpg".into(), padded, true, false));
         // ffmpeg matches an APP1 on "Exif" alone and skips the next two bytes
         // unread, and honours a count-2 SHORT orientation on its first value:
         // all three decode PORTRAIT. The sniff used to call each of them
         // orientation 1, which skipped the frame probe and stored landscape.
         for (name, id) in [("o6 id 00FF.jpg", b"Exif\0\xFF"), ("o6 id XY.jpg", b"ExifXY")] {
-            cases.push((name.into(), jpeg_with_exif_id(&jpg, id, &tiff_orientation(6, false)), true));
+            cases.push((name.into(), jpeg_with_exif_id(&jpg, id, &tiff_orientation(6, false)), true, false));
         }
         let mut count2 = tiff_orientation(6, false);
         count2[17] = 2; // the entry's count, big-endian low byte
-        cases.push(("o6 count 2.jpg".into(), jpeg_with_exif(&jpg, &count2), true));
+        cases.push(("o6 count 2.jpg".into(), jpeg_with_exif(&jpg, &count2), true, false));
         // ...and the other way round: blocks ffmpeg DROPS whole — a value out
         // of line past the block, in IFD0 or in a sub-IFD it follows, or a
         // truncated sub-IFD — decode LANDSCAPE though the sniff still reads a
         // well-formed orientation 6. The frame probe is what keeps these
         // upright, here and in the load-time repair.
         for (name, t) in ffmpeg_rejected_exif() {
-            cases.push((format!("{name}.jpg"), jpeg_with_exif(&jpg, &t), false));
+            cases.push((format!("{name}.jpg"), jpeg_with_exif(&jpg, &t), false, false));
         }
         // Headers that are ffmpeg's call, not the sniff's: an orientation of
         // count 3 held out of line (in both byte orders, and ahead of a
         // readable 1), a 300-entry IFD0, two Exif APP1s, two eXIf chunks or a
         // late one with a bad CRC. Every portrait row here sniffed as
         // orientation 1 — no frame probe, landscape stored, the squash back.
-        // Each must now defeat the sniff, so the frame probe answers.
-        let jpgs = exif_left_to_ffmpeg(&jpg).into_iter().map(|(n, b, t)| (format!("{n}.jpg"), b, t));
-        let pngs = png_exif_left_to_ffmpeg(&png).into_iter().map(|(n, b, t)| (format!("{n}.png"), b, t));
-        for (name, bytes, portrait) in jpgs.chain(pngs) {
+        // Each must now defeat the sniff, so the frame probe answers — except
+        // where no answer is needed: the bad-CRC eXIf sits after the image
+        // data, where the WebView never looks, so it is coded and flagged
+        // whatever ffmpeg would do. The two-chunk rows each carry one before
+        // the image data: followed, like any early eXIf.
+        let jpgs = exif_left_to_ffmpeg(&jpg)
+            .into_iter()
+            .map(|(n, b, t)| (format!("{n}.jpg"), b, t, false));
+        let pngs = png_exif_left_to_ffmpeg(&png).into_iter().map(|(n, b, _)| {
+            let (portrait, flagged) = match n {
+                "png_1_then_late6" | "png_two_early_1_6" => (true, false),
+                "png_late6_badcrc" => (false, true),
+                other => panic!("{other}: a new row needs its own expectation here"),
+            };
+            (format!("{n}.png"), b, portrait, flagged)
+        });
+        for (name, bytes, portrait, flagged) in jpgs.chain(pngs) {
             let sniffed = crate::media::exif::tests::sniff_bytes(&bytes);
             assert_eq!(sniffed, None, "{name}: the fixture must defeat the sniff");
-            cases.push((name, bytes, portrait));
+            cases.push((name, bytes, portrait, flagged));
         }
 
-        for (name, bytes, portrait) in cases {
+        for (name, bytes, portrait, flagged) in cases {
             let file = dir.join(&name);
             std::fs::write(&file, bytes).unwrap();
             let info = probe_sync(file.to_str().unwrap()).unwrap();
             assert_eq!(info.kind, "image", "{name}");
             assert_eq!(info.oriented, Some(true), "{name}: every probed still is stamped");
+            assert_eq!(info.no_autorotate, flagged.then_some(true), "{name}: noAutorotate");
             let expected = if portrait { (40, 96) } else { (96, 40) };
             assert_eq!(
                 (info.width, info.height),
                 (Some(expected.0), Some(expected.1)),
                 "{name}"
             );
+            // Decoded the way the app decodes this still: with autorotate off
+            // exactly where the probe recorded that the WebView does not turn it.
             assert_eq!(
                 expected,
-                decoded_still_dims(&dir, &file),
-                "{name}: stored dims must equal what the decoder produces"
+                decoded_still_dims(&dir, &file, info.no_autorotate == Some(true)),
+                "{name}: stored dims must equal what the app's decoders produce"
             );
         }
 

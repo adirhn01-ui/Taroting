@@ -145,42 +145,13 @@ function clipBaseGain(clip: Clip, track: Track): number {
   );
 }
 
-/** Pure state for the monitor-volume control shared by the transport and
- *  theater bars. `level` is the live 0..1 value; `lastNonZero` is what a mute
- *  toggle restores to (seeded to 1 so an un-mute from a fresh 0 still makes
- *  sound). Both UIs drive this identically; it holds no DOM/audio references. */
-export interface MonitorVolumeState {
-  level: number;
-  lastNonZero: number;
-}
-
-// Total sanitizer: coerce anything (numeric string, NaN, null, boolean, …)
-// with Number(); a non-finite result falls back to the safe default 1 (a
-// corrupted persisted level must never blank the editor), then clamp to 0..1.
-const clampVol = (v: number): number => {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return 1;
-  return n <= 0 ? 0 : n >= 1 ? 1 : n;
-};
-
-/** Seed the state machine from a persisted level (clamped). */
-export function makeMonitorVolume(initial: number): MonitorVolumeState {
-  const level = clampVol(initial);
-  return { level, lastNonZero: level > 0 ? level : 1 };
-}
-
-/** User dragged the slider to `v`. Clamps; a non-zero value becomes the new
- *  restore point. Returns the next state (does not mutate the input). */
-export function setMonitorLevel(s: MonitorVolumeState, v: number): MonitorVolumeState {
-  const level = clampVol(v);
-  return { level, lastNonZero: level > 0 ? level : s.lastNonZero };
-}
-
-/** Speaker click: mute if audible, else restore the last non-zero level. */
-export function toggleMonitorMute(s: MonitorVolumeState): MonitorVolumeState {
-  if (s.level > 0) return { level: 0, lastNonZero: s.level };
-  return { level: s.lastNonZero, lastNonZero: s.lastNonZero };
-}
+// The monitor-volume state machine lives in core (the viewer drives it too,
+// and must not import the editor). Re-exported so this module's existing
+// importers — and src/editor/playback/monitor-volume.test.ts — stay unchanged.
+export { makeMonitorVolume, setMonitorLevel, toggleMonitorMute } from "../../core/monitor-volume";
+export type { MonitorVolumeState } from "../../core/monitor-volume";
+// The same total sanitizer, applied independently by setMonitorVolume below.
+import { clampMonitorLevel as clampVol } from "../../core/monitor-volume";
 
 /**
  * True only while the in-app E2E harness is driving the app. The flag is

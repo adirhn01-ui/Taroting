@@ -2,9 +2,13 @@
 // playback engine, canvas timeline, transport bar, and keyboard shortcuts.
 
 import "./editor.css";
+import "../ui/player-bar.css";
 import { escapeHtml, fileExt, fileStem, formatTimecode } from "../core/format";
 import { describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles } from "../core/ipc";
 import { navigate } from "../core/nav";
+import type { EditorRoute, Route } from "../core/nav";
+import { createMonitorVolume } from "../core/monitor-volume";
+import type { MonitorVolumeState } from "../core/monitor-volume";
 import {
   addAudioTrack,
   addMarkerAt,
@@ -40,13 +44,7 @@ import { openGeneratorDialog } from "./media/generators";
 import { MediaManager } from "./media/media";
 import { openRelinkDialog } from "./media/relink";
 import { statusChange } from "./media/status-diff";
-import {
-  AudioGraph,
-  makeMonitorVolume,
-  setMonitorLevel,
-  toggleMonitorMute,
-} from "./playback/audio-graph";
-import type { MonitorVolumeState } from "./playback/audio-graph";
+import { AudioGraph } from "./playback/audio-graph";
 import { PlaybackEngine } from "./playback/engine";
 import { Scheduler } from "./playback/scheduler";
 import { mountStage } from "./preview/preview";
@@ -56,42 +54,69 @@ import { collectCandidates, snapTime } from "./timeline/snap";
 import { laneLabels, laneLayout } from "./timeline/render";
 import { createLaneAutoScroll, type LaneAutoScroller } from "./timeline/interactions";
 import { trapTab } from "../ui/focus";
+import { createTempLeaveGate } from "../ui/temp-project";
 import { PREVIEW_MIN_H, clampPanelHeight, maxPanelHeight } from "./timeline/panel-size";
 import { TimelineController } from "./timeline/timeline";
 
+/**
+ * Mount the editor for `route` into `root`.
+ *
+ * `isStale` is the caller's navigation-token check. A mount is SUPERSEDED when
+ * another navigation starts while it is still awaiting (an OS open from File
+ * Explorer landing mid-load is the real case), and go() only re-checks its
+ * token AFTER this function returns — by which point the old code had already
+ * painted over the newer screen and put its session in `currentSession`, where
+ * the newer screen's own session belonged. So this checks after every await
+ * that precedes a visible or shared effect, and a stale mount returns a no-op
+ * handle having touched nothing: no toast, no navigation, no DOM, no
+ * currentSession, no media work started.
+ */
 export async function mountEditor(
   root: HTMLElement,
-  projectPath: string,
-  temp = false,
+  route: EditorRoute,
+  isStale: () => boolean,
 ): Promise<{ dispose(): Promise<void> }> {
+  const noop = { dispose: async (): Promise<void> => {} };
+  // Where every exit from this editor lands: Back/Ctrl+W, the keep/discard
+  // outcomes, and a failed load. One place, so honouring `route.returnTo` (back
+  // to the viewer on the same file) is a one-line change once that route exists.
+  const exitDest = (): Route => ({ view: "home" });
+
   let loaded;
   try {
-    loaded = await ipc.loadProject(projectPath);
+    loaded = await ipc.loadProject(route.projectPath);
   } catch (e) {
+    // A superseded mount whose load failed must neither toast nor navigate
+    // over the newer screen: the user has already moved on.
+    if (isStale()) return noop;
     toast.error(describeError(e));
-    navigate({ view: "home" });
-    return { dispose: async () => {} };
+    navigate(exitDest());
+    return noop;
   }
+  if (isStale()) return noop;
 
-  const session = new ProjectSession(projectPath, loaded.project);
-  currentSession.set(session);
+  const session = new ProjectSession(route.projectPath, loaded.project, {
+    temp: route.temp === true,
+  });
   // A quick-view session is a throwaway file that startup cleanup deletes, so
   // ANY route away from it must offer keep-or-discard first. Back/Ctrl+W/gear
-  // already call confirmLeaveTemp directly; this guard covers the one path that
-  // did not — an OS "open with" request arriving from File Explorer, which
-  // navigated straight past the prompt and silently destroyed the work.
-  // (confirmLeaveTemp is a hoisted declaration; the guard only runs later.)
-  if (temp) {
-    session.leaveGuard = () =>
-      new Promise<boolean>((resolve) =>
-        confirmLeaveTemp(
-          () => resolve(true),
-          () => resolve(false),
-        ),
-      );
-  }
+  // go through the gate directly; this guard covers the one path that does
+  // not — an OS "open with" request arriving from File Explorer, which used to
+  // navigate straight past the prompt and silently destroy the work.
+  const gate = createTempLeaveGate(session);
+  if (session.temp.get()) session.leaveGuard = () => gate.confirm();
   const media = new MediaManager(() => session.project);
   await media.init();
+  // The second await. Nothing shared has been touched yet, so a superseded
+  // mount unwinds privately: the session has no edits (dispose writes nothing,
+  // it only stops the autosave timers) and ensureAll below has not started any
+  // plan/waveform/thumbnail work for a screen nobody will see.
+  if (isStale()) {
+    media.dispose();
+    void session.dispose();
+    return noop;
+  }
+  currentSession.set(session);
   media.ensureAll(session.project);
 
   if (loaded.recovered) toast.info("Project restored from its automatic backup.");
@@ -189,48 +214,17 @@ export async function mountEditor(
   // transport flyout and the theater bar. It scales the audio graph's master
   // bus only — never per-clip audio, the project, or exports. Seeded from the
   // persisted Settings.monitorVolume; every change applies to the graph, is
-  // persisted via updateSettings, and notifies both UIs so they stay in sync.
-  let volState: MonitorVolumeState = makeMonitorVolume(settingsStore.get().monitorVolume);
-  graph.setMonitorVolume(volState.level);
-  const volSubs = new Set<(s: MonitorVolumeState) => void>();
-  // Persisting to disk on every drag frame would be dozens of writes/sec; the
-  // graph apply is immediate (smooth audio) but the settings write is debounced
-  // so only the settled level lands on disk.
-  let volSaveTimer: number | undefined;
-  let volSavePending = false;
-  const flushVolumeSave = (): void => {
-    window.clearTimeout(volSaveTimer);
-    if (!volSavePending) return;
-    volSavePending = false;
-    // SAY SO if the write fails. The slider already shows the new level (the
-    // graph is updated before the IPC is even issued), so a bare `void` here
-    // left a rejected write looking exactly like a successful one — silent
-    // until the next launch reverted it. Same shape as settings.ts persist().
-    void updateSettings({ monitorVolume: volState.level }).catch((e: unknown) => {
+  // persisted (debounced) via updateSettings, and notifies both UIs so they
+  // stay in sync. The controller lives in core so the viewer can share it.
+  const volume = createMonitorVolume(
+    (level) => graph.setMonitorVolume(level),
+    (e) =>
       toast.error("Couldn't save your settings.", {
         detail: describeError(e),
         op: "Settings",
         title: "Monitor volume",
-      });
-    });
-  };
-  const applyVolume = (next: MonitorVolumeState): void => {
-    volState = next;
-    graph.setMonitorVolume(next.level);
-    volSavePending = true;
-    window.clearTimeout(volSaveTimer);
-    volSaveTimer = window.setTimeout(flushVolumeSave, 300);
-    for (const fn of volSubs) fn(next);
-  };
-  const volume = {
-    get: (): MonitorVolumeState => volState,
-    setLevel: (v: number): void => applyVolume(setMonitorLevel(volState, v)),
-    toggleMute: (): void => applyVolume(toggleMonitorMute(volState)),
-    subscribe(fn: (s: MonitorVolumeState) => void): () => void {
-      volSubs.add(fn);
-      return () => volSubs.delete(fn);
-    },
-  };
+      }),
+  );
 
   // Refit the stage when the project canvas w/h changes (resolution adoption,
   // canvas settings). Cheap: compares two numbers per project change.
@@ -927,6 +921,25 @@ export async function mountEditor(
     }
   }
 
+  function paintSaveBadge(): void {
+    const s = session.saveState.get();
+    const badge = $("#ed-save");
+    badge.classList.toggle("editor__savestate--error", s === "error");
+    // A quick-view (temp) session isn't a real project on disk yet — its
+    // autosaves land in the scratch dir. Show "Temporary" so Save-failed is
+    // still surfaced but "Saved"/"Edited" don't imply a kept project.
+    badge.textContent = session.temp.get()
+      ? s === "error"
+        ? "Save failed"
+        : "Temporary"
+      : s === "saved"
+        ? "Saved"
+        : s === "saving"
+          ? "Saving"
+          : s === "dirty"
+            ? "Edited"
+            : "Save failed";
+  }
   const unsubs = [
     session.store.subscribe(() => {
       renderMedia();
@@ -944,28 +957,15 @@ export async function mountEditor(
       engine.refresh(); // proxies finishing may make the current frame playable
     }),
     media.thumbs.subscribe(renderMedia),
-    session.saveState.subscribe((s) => {
-      const badge = $("#ed-save");
-      badge.classList.toggle("editor__savestate--error", s === "error");
-      // A quick-view (temp) session isn't a real project on disk yet — its
-      // autosaves land in the scratch dir. Show "Temporary" so Save-failed is
-      // still surfaced but "Saved"/"Edited" don't imply a kept project.
-      badge.textContent = temp
-        ? s === "error"
-          ? "Save failed"
-          : "Temporary"
-        : s === "saved"
-          ? "Saved"
-          : s === "saving"
-            ? "Saving"
-            : s === "dirty"
-              ? "Edited"
-              : "Save failed";
-    }),
+    session.saveState.subscribe(paintSaveBadge),
+    // Keep flips a temp session to permanent without a remount: the badge has
+    // to leave "Temporary" for the normal states on its own.
+    session.temp.subscribe(paintSaveBadge),
   ];
-  // Reflect the temp badge immediately: the initial state is "saved", which
-  // won't fire the subscription, so the hard-coded "Saved" would otherwise show.
-  if (temp) $("#ed-save").textContent = "Temporary";
+  // Reflect the badge immediately: the initial state is "saved", which won't
+  // fire the subscription, so the hard-coded "Saved" would be wrong for a temp
+  // session.
+  paintSaveBadge();
   renderMedia();
 
   /* ---------------- media bin: generators, placement, drag & drop ---------------- */
@@ -1297,154 +1297,12 @@ export async function mountEditor(
     media.ensureAll(session.project);
   }
 
-  // Promote a live quick-view (temp) session to a permanent project. This is the
-  // "Keep project" gesture from the leave-the-editor confirmation (shared by Back,
-  // Ctrl+W and the Settings gear): save the project permanently to
-  // Documents\Taroting (which runs the standard recents + thumbnail upsert). The
-  // temp scratch file is left for startup cleanup.
-  //
-  // Save-loop until stable: `session.project` is `store.get()`, and EVERY mutation
-  // path (commit/replace/undo/redo and autosave's touchModified stamp) swaps the
-  // store reference (see core/session.ts), so an edit landing between our read and
-  // the save's completion changes the reference. We re-save until the reference we
-  // saved still matches the current one — otherwise that late edit would live only
-  // in the doomed temp file (lost-update).
-  async function keepTempProject(): Promise<void> {
-    const permPath = await ipc.newProjectPath(session.project.name);
-    let snap: typeof session.project;
-    do {
-      snap = session.project;
-      await ipc.saveProject(permPath, snap);
-    } while (snap !== session.project);
-  }
-
-  // Best-effort discard of the temp scratch file. `session.discard()` runs FIRST
-  // so the editor's dispose flush (which targets this same temp path) can't
-  // resurrect the file after we delete it. deleteProject fail-softs: a locked
-  // file is caught by startup cleanup. The media original is never touched — only
-  // the throwaway .trt (+ its .bak) go. No recents entry exists for a temp path,
-  // so deleteProject's recents-retain is a harmless no-op.
-  async function discardTempProject(): Promise<void> {
-    session.discard();
-    try {
-      await ipc.deleteProject(session.path);
-    } catch {
-      // Fail-soft: the temp file stays for the next startup's temp-dir sweep.
-    }
-  }
-
-  // `keeping` guards the WHOLE leave lifecycle for a temp session — from opening
-  // the confirmation to its resolution. It blocks a second modal (Back then gear
-  // while one is open does nothing) and any double promotion/discard. Cleared on
-  // every close path: cancel, keep (success or error → stay), and discard.
-  let keeping = false;
-
-  // Confirm leaving a temp quick-view: Keep promotes then navigates, Discard
-  // deletes then navigates, Cancel stays put with no side effects. Reuses the app
-  // modal pattern + trapTab (as in the delete-layer / home delete dialogs).
-  // `onCancel` MUST fire on every path that does not reach `dest()`, including
-  // the re-entrancy bail below: an OS open-path request awaits this decision, and
-  // a promise that never settles would stall the open queue for the rest of the
-  // session.
-  function confirmLeaveTemp(dest: () => void, onCancel?: () => void): void {
-    if (keeping) {
-      onCancel?.();
-      return;
-    }
-    keeping = true;
-
-    const backdrop = document.createElement("div");
-    backdrop.className = "modal-backdrop";
-    backdrop.innerHTML = `
-      <div class="modal" role="dialog" aria-modal="true" aria-label="Keep temporary project?">
-        <div class="modal__header"><span>Keep temporary project?</span><button class="btn btn--ghost btn--icon btn--sm" data-act="cancel" title="Cancel" aria-label="Cancel">${icon("x", 14)}</button></div>
-        <div class="modal__body">
-          <div class="modal__text">This project was opened as a quick view and isn't in your library yet. Keep it, or discard it? Discarding removes only this temporary copy — your media file is untouched.</div>
-        </div>
-        <div class="modal__footer">
-          <button class="btn" data-act="discard">Discard</button>
-          <button class="btn btn--primary" data-act="keep">Keep project</button>
-        </div>
-      </div>`;
-    document.body.appendChild(backdrop);
-
-    const releaseTrap = trapTab(backdrop);
-    let closed = false;
-    // Cancel path: tear the modal down and release the lifecycle guard so a later
-    // Back/gear can re-open it. Nothing is saved or deleted — stay in the editor.
-    const close = (): void => {
-      if (closed) return;
-      closed = true;
-      releaseTrap();
-      document.removeEventListener("keydown", onKey, true);
-      backdrop.remove();
-      keeping = false;
-      onCancel?.();
-    };
-    // Commit path (keep/discard): tear down the modal but KEEP the guard held —
-    // the async promote/delete is still in flight and must not be re-entered.
-    const dismiss = (): void => {
-      if (closed) return;
-      closed = true;
-      releaseTrap();
-      document.removeEventListener("keydown", onKey, true);
-      backdrop.remove();
-    };
-    const keep = async (): Promise<void> => {
-      dismiss();
-      try {
-        await keepTempProject();
-      } catch (e) {
-        keeping = false;
-        toast.error(`Couldn't save this project: ${describeError(e)}`);
-        onCancel?.();
-        return; // stay in the editor so the work isn't lost silently
-      }
-      dest();
-    };
-    const discard = async (): Promise<void> => {
-      dismiss();
-      await discardTempProject();
-      dest();
-    };
-    function onKey(e: KeyboardEvent): void {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        close();
-      }
-    }
-    document.addEventListener("keydown", onKey, true);
-    backdrop.addEventListener("pointerdown", (e) => {
-      if (e.target === backdrop) close();
-    });
-    backdrop.querySelector('[data-act="cancel"]')!.addEventListener("click", close);
-    backdrop.querySelector('[data-act="keep"]')!.addEventListener("click", () => void keep());
-    backdrop.querySelector('[data-act="discard"]')!.addEventListener("click", () => void discard());
-    requestAnimationFrame(() =>
-      backdrop.querySelector<HTMLButtonElement>('[data-act="keep"]')!.focus(),
-    );
-  }
-
-  // Back to home / Ctrl+W. For a temp session, confirm keep-or-discard first;
-  // both outcomes navigate home, Cancel stays. Non-temp: straight navigate.
-  function goHome(): void {
-    if (!temp) {
-      navigate({ view: "home" });
-      return;
-    }
-    confirmLeaveTemp(() => navigate({ view: "home" }));
-  }
-
-  // Settings gear: a temp session must be resolved (kept or discarded) before
-  // navigating away, or the editor's dispose would flush edits only to the doomed
-  // temp path (silent loss). Non-temp: straight navigate.
-  function goSettings(): void {
-    if (!temp) {
-      navigate({ view: "settings" });
-      return;
-    }
-    confirmLeaveTemp(() => navigate({ view: "settings" }));
-  }
+  // Back to home / Ctrl+W, and the Settings gear. A temp session is resolved
+  // (kept or discarded) by the gate first — otherwise the editor's dispose would
+  // flush edits only to the doomed temp path (silent loss). Cancel stays put.
+  // A permanent session passes straight through.
+  const goHome = (): void => gate.confirmLeave(() => navigate(exitDest()));
+  const goSettings = (): void => gate.confirmLeave(() => navigate({ view: "settings" }));
 
   $("#ed-home").addEventListener("click", () => goHome());
   $("#ed-settings").addEventListener("click", () => goSettings());
@@ -1585,6 +1443,7 @@ export async function mountEditor(
   bind("rippleDelete", () => actions.ripple());
   bind("undo", () => actions.undo());
   bind("redo", () => actions.redo());
+  bind("redoAlt", () => actions.redo());
   bind("save", () => void session.save());
   bind("copy", () => actions.copy());
   bind("paste", () => actions.paste());
@@ -1634,7 +1493,7 @@ export async function mountEditor(
       unTick();
       unGraphTick();
       unVolume();
-      flushVolumeSave();
+      volume.dispose();
       unRefit();
       unName();
       // Teardown mid-drag: the divider's own listeners die with the element, but
@@ -1652,7 +1511,9 @@ export async function mountEditor(
       graph.dispose();
       stage.dispose();
       media.dispose();
-      currentSession.set(null);
+      // Only clear what is still ours: a newer mount may already have claimed
+      // currentSession, and nulling it would strip that screen's leave guard.
+      if (currentSession.get() === session) currentSession.set(null);
       await session.dispose();
     },
   };

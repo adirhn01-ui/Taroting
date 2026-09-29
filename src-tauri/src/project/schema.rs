@@ -65,6 +65,29 @@ pub struct MediaRef {
     pub audio_channels: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generator: Option<Generator>,
+    /// Stills only: the WebView draws this file UNTURNED although it carries
+    /// an orientation tag the bundled ffmpeg would turn it by (a WebP's EXIF,
+    /// a PNG eXIf after the image data, a TIFF's IFD0), so the export opens it
+    /// `-noautorotate` and `width`/`height` are the coded size. Decided per
+    /// FILE from its header (`media::exif::read_still`) by the probe and the
+    /// load-time repair; the export builder only reads the stored answer.
+    ///
+    /// Only a literal `true` is the flag. Anything else a hand-edited `.trt`
+    /// puts here reads as absent rather than failing the whole project's
+    /// parse: 0.8.1 ignored this key as unknown, and a value it would have
+    /// opened must not become "invalid project file" now.
+    #[serde(
+        default,
+        deserialize_with = "true_or_none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub no_autorotate: Option<bool>,
+}
+
+/// `Some(true)` for a JSON `true`, `None` for anything else — a flag that is
+/// only ever written as `true` (`MediaRef.noAutorotate?: true`).
+fn true_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<bool>, D::Error> {
+    Ok((Value::deserialize(d)? == Value::Bool(true)).then_some(true))
 }
 
 /// A synthetic media source (solid color or styled text). Mirrors the TS
@@ -405,6 +428,46 @@ mod tests {
         assert_eq!(gen["fontFamily"], "Georgia");
         assert_eq!(gen["sizePx"], 96.0);
         assert_eq!(gen["bold"], true);
+    }
+
+    /// `noAutorotate` is a flag only a literal `true` sets. Every other value
+    /// a hand-edited `.trt` can hold reads as absent — never a parse failure,
+    /// which would turn a file 0.8.1 opened (the key was unknown to it) into
+    /// "invalid project file". Absent stays absent on the way back out, and
+    /// the flag is written camelCase.
+    #[test]
+    fn no_autorotate_is_only_ever_a_literal_true() {
+        let with = |v: Option<Value>| {
+            let mut m = serde_json::json!({
+                "id": "m1", "path": "C:\\p.webp", "size": 1, "mtimeMs": 1,
+                "kind": "image", "duration": 0.0, "hasAudio": false
+            });
+            if let Some(v) = v {
+                m["noAutorotate"] = v;
+            }
+            serde_json::from_value::<MediaRef>(m).map(|m| m.no_autorotate)
+        };
+        assert_eq!(with(Some(Value::Bool(true))).unwrap(), Some(true));
+        assert_eq!(with(None).unwrap(), None);
+        for odd in [
+            Value::Bool(false),
+            Value::from("yes"),
+            Value::from(1),
+            Value::Null,
+            serde_json::json!({ "v": true }),
+            serde_json::json!([true]),
+        ] {
+            assert_eq!(with(Some(odd.clone())).unwrap_or_else(|e| panic!("{odd}: {e}")), None, "{odd}");
+        }
+
+        let mut m: MediaRef = serde_json::from_value(serde_json::json!({
+            "id": "m1", "path": "C:\\p.webp", "size": 1, "mtimeMs": 1,
+            "kind": "image", "duration": 0.0, "hasAudio": false, "noAutorotate": true
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(&m).unwrap()["noAutorotate"], true);
+        m.no_autorotate = None;
+        assert!(serde_json::to_value(&m).unwrap().get("noAutorotate").is_none());
     }
 
     fn clip_at(id: &str, start: f64, src_in: f64, src_out: f64, speed: f64) -> Clip {

@@ -22,8 +22,9 @@ import {
   settingsStore,
   updateSettings,
 } from "../core/session";
-import { chordOf, findConflicts, normalizeChord } from "../core/shortcuts";
-import type { ActionId, CustomTheme, Settings } from "../core/types";
+import { chordOf, conflictingActions, findConflicts, normalizeChord } from "../core/shortcuts";
+import type { ShortcutConflict } from "../core/shortcuts";
+import type { ActionId, CustomTheme, Settings, ShortcutMode } from "../core/types";
 import { DEFAULT_CUSTOM_THEME, DEFAULT_SHORTCUTS } from "../core/types";
 import type { ColorPickerHandle } from "../ui/color-picker";
 import {
@@ -59,7 +60,8 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   toggleLoop: "Toggle loop",
   addMarker: "Add marker",
   export: "Export",
-  goHome: "Close project",
+  // One action, two screens: the editor closes the project, the viewer goes back.
+  goHome: "Back / close",
   fullscreen: "Fullscreen playback",
   redoAlt: "Redo (alternate)",
   prevFile: "Previous file (viewer)",
@@ -68,8 +70,20 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   seekFwd: "Forward 5s (viewer)",
 };
 
+/** The screens that have a ShortcutManager TODAY. The conflict warning names a
+ *  mode, and "Ctrl+Z (image)" would point at a screen the user cannot open —
+ *  every image action is also an editor action, so its clash already shows as
+ *  "(editor)". `"image"` joins this list in Phase 3, with the image editor. */
+export const LIVE_MODES: readonly ShortcutMode[] = ["editor", "viewer"];
+
+/** `findConflicts` restricted to LIVE_MODES — the one result the Shortcuts card
+ *  reads for both its row marks and its warning. */
+export function liveConflicts(shortcuts: Record<string, string>): ShortcutConflict[] {
+  return findConflicts(shortcuts).filter((c) => LIVE_MODES.includes(c.mode));
+}
+
 /** Action row order — mirrors the ActionId union for a predictable list. */
-const ACTION_ORDER: ActionId[] = [
+export const ACTION_ORDER: ActionId[] = [
   "playPause",
   "stop",
   "stepFwd",
@@ -84,6 +98,7 @@ const ACTION_ORDER: ActionId[] = [
   "rippleDelete",
   "undo",
   "redo",
+  "redoAlt",
   "save",
   "copy",
   "paste",
@@ -92,6 +107,10 @@ const ACTION_ORDER: ActionId[] = [
   "addMarker",
   "export",
   "goHome",
+  "prevFile",
+  "nextFile",
+  "seekBack",
+  "seekFwd",
 ];
 
 /** The three user-settable colours of the custom theme, in the order they are
@@ -323,11 +342,14 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     options: { value: string; label: string }[],
     attr: string,
   ): string {
+    // `btn--on` paints the choice; `aria-pressed` says it to a screen reader,
+    // which reads a class as nothing. Keep both: the custom-theme E2E reads the
+    // class.
     return `<div class="settings__segmented">${options
-      .map(
-        (o) =>
-          `<button class="btn btn--sm ${o.value === active ? "btn--on" : ""}" ${attr}="${escapeHtml(o.value)}">${escapeHtml(o.label)}</button>`,
-      )
+      .map((o) => {
+        const on = o.value === active;
+        return `<button class="btn btn--sm ${on ? "btn--on" : ""}" aria-pressed="${on}" ${attr}="${escapeHtml(o.value)}">${escapeHtml(o.label)}</button>`;
+      })
       .join("")}</div>`;
   }
 
@@ -500,10 +522,16 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   }
 
   function shortcutsSection(s: Settings): string {
-    const conflicts = new Set(findConflicts(s.shortcuts));
+    // Computed ONCE and read by both the row marks and the warning, so the two
+    // can never disagree about what a conflict is. Marked per ACTION, not per
+    // chord: the editor's ArrowRight and the viewer's ArrowRight share a chord
+    // and are not a conflict, so "is this chord in a conflict" would paint rows
+    // that are fine.
+    const conflicts = liveConflicts(s.shortcuts);
+    const marked = conflictingActions(conflicts);
     const rows = ACTION_ORDER.map((action) => {
       const chord = normalizeChord(s.shortcuts[action] ?? "");
-      const isConflict = chord !== "" && conflicts.has(chord);
+      const isConflict = marked.has(action);
       const isCapturing = capturing === action;
       let valueHtml: string;
       if (isCapturing) {
@@ -523,10 +551,11 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
         </div>`;
     }).join("");
 
-    const dupes = findConflicts(s.shortcuts);
+    // "ArrowRight (viewer)": the mode is what tells the user where the clash
+    // bites, since the same chord may be fine on the other screen.
     const warning =
-      dupes.length > 0
-        ? `<div class="settings__conflict-warn">${icon("warning", 14)}<span>Duplicate shortcuts: ${escapeHtml(dupes.join(", "))}</span></div>`
+      conflicts.length > 0
+        ? `<div class="settings__conflict-warn">${icon("warning", 14)}<span>Duplicate shortcuts: ${escapeHtml(conflicts.map((c) => `${c.chord} (${c.mode})`).join(", "))}</span></div>`
         : "";
 
     return `

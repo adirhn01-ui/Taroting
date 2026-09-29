@@ -4,7 +4,8 @@
 // BEST-EFFORT true element fullscreen via container.requestFullscreen(). Stage 1
 // always works (so tests and no-activation contexts still get the big view);
 // stage 2 is opportunistic and, when granted, its OS-level Esc is caught by a
-// fullscreenchange listener that tears the whole mode down.
+// fullscreenchange listener that tears the whole mode down (ui/fullscreen.ts,
+// shared with every surface that goes fullscreen).
 //
 // The bottom control bar (play/pause, ±5s, time readout, seek bar, exit) is
 // built ONCE and toggled; per-tick work is a handful of style/text writes gated
@@ -13,20 +14,17 @@
 // no-op early-return and the bar is display:none.
 
 import { formatTimecode } from "../../core/format";
+import type { MonitorVolumeController, MonitorVolumeState } from "../../core/monitor-volume";
 import { isTypingTarget, shortcutsBlocked } from "../../core/shortcuts";
+import { elementFullscreen } from "../../ui/fullscreen";
 import { icon } from "../../ui/icons";
-import type { MonitorVolumeState } from "../playback/audio-graph";
 import type { PlaybackEngine } from "../playback/engine";
 
-/** The shared monitor-volume controller (owned by editor.ts). Both the
+/** The shared monitor-volume controller now lives in core (the viewer drives
+ *  one too); re-exported so existing importers keep their import path. Both the
  *  transport flyout and this bar drive the same level; subscribing keeps the
  *  glyph + slider in sync when the other UI changes it. */
-export interface MonitorVolumeController {
-  get(): MonitorVolumeState;
-  setLevel(v: number): void;
-  toggleMute(): void;
-  subscribe(fn: (s: MonitorVolumeState) => void): () => void;
-}
+export type { MonitorVolumeController };
 
 export interface TheaterCtx {
   engine: PlaybackEngine;
@@ -341,21 +339,15 @@ export function mountTheater(ctx: TheaterCtx): Theater {
 
   /* ---------------- fullscreen sync ---------------- */
 
-  // OS-level Esc exits element fullscreen but not our in-window layer; catch the
-  // resulting fullscreenchange (document.fullscreenElement cleared) and finish
-  // the teardown so the two stages never desync. Either direction (gain OR lose
-  // element fullscreen) resizes the container, so refit on every change.
-  const onFsChange = (): void => {
-    // Exact-element, not merely "any fullscreen": in the rejected-request
-    // fallback no fullscreenchange ever fires for US, so an event that arrives
-    // while we are active is either our own element changing state or another
-    // element taking the screen — and theater should stand down for both
-    // departures. Today no other element CAN enter fullscreen (the pooled
-    // videos carry no `controls` attribute), so the distinction is free
-    // future-proofing, not a behaviour change.
-    if (active && document.fullscreenElement !== container) exit();
-    else scheduleRefit();
-  };
+  // Stage 2. Losing element fullscreen while theater is up (OS-level Esc)
+  // finishes the teardown so the two stages never desync; any other change
+  // (gaining it, or losing it after exit) resizes the container, so refit.
+  // `exit` is a hoisted declaration below, read only when an event fires.
+  const fs = elementFullscreen(container, {
+    stillWanted: () => active,
+    onLost: exit,
+    onChange: scheduleRefit,
+  });
 
   /* ---------------- enter / exit ---------------- */
 
@@ -389,27 +381,12 @@ export function mountTheater(ctx: TheaterCtx): Theater {
     updateReadout();
 
     document.addEventListener("keydown", onKeyDown, true);
-    document.addEventListener("fullscreenchange", onFsChange);
     container.addEventListener("pointermove", onPointerMove);
 
     // best-effort true fullscreen; rejects without a user gesture (tests) — the
-    // in-window theater is already up, so we simply ignore the rejection.
-    const rf = container.requestFullscreen?.();
-    if (rf) {
-      rf.then(
-        () => {
-          // Resolved after exit() already ran (a fast F→Esc): the fullscreen
-          // element is not populated until the OS transition completes, so
-          // exit()'s own check read null and could not undo a transition that
-          // had not landed — and it had already detached onFsChange, so nothing
-          // else will. The window is fullscreen with no theater over it; hand
-          // it back. `active` alone is the right predicate — if a NEW session
-          // has started meanwhile, fullscreen is wanted, whoever requested it.
-          if (!active) document.exitFullscreen?.().catch(() => {});
-        },
-        () => {},
-      );
-    }
+    // in-window theater is already up, so the rejection is simply ignored. A
+    // request that resolves after exit() (a fast F→Esc) is handed back there.
+    fs.request();
 
     // the container jumped to fixed inset-0: refit the letterbox to the new box
     // so the video scales crisply (no stale windowed size / transient stretch).
@@ -428,10 +405,9 @@ export function mountTheater(ctx: TheaterCtx): Theater {
     container.classList.remove("theater");
 
     document.removeEventListener("keydown", onKeyDown, true);
-    document.removeEventListener("fullscreenchange", onFsChange);
     container.removeEventListener("pointermove", onPointerMove);
 
-    if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+    fs.release();
 
     // the container returned to its windowed flow box: refit back down so the
     // stage doesn't keep the fullscreen-sized letterbox.
@@ -452,6 +428,7 @@ export function mountTheater(ctx: TheaterCtx): Theater {
     isActive: () => active,
     dispose(): void {
       exit();
+      fs.dispose();
       unTick();
       unVolume();
       window.clearTimeout(hideTimer);

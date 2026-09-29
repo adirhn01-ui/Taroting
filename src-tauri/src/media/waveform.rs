@@ -4,11 +4,9 @@
 //!
 //! Format: "TPK1" magic · u32le pairsPerSec · u32le pairCount · [i8 min, i8 max]×
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::{AppHandle, State};
@@ -16,7 +14,7 @@ use tauri::{AppHandle, State};
 use crate::cache::{Cache, CacheKind, MediaKey};
 use crate::error::{AppError, Result};
 use crate::jobs::{self, JobId, JobKind, Jobs, Lane};
-use crate::media::playability::Inflight;
+use crate::media::playability::{job_tmp_suffix, Inflight};
 
 pub const SAMPLE_RATE: u32 = 8000;
 pub const PAIRS_PER_SEC: u32 = 100;
@@ -74,6 +72,12 @@ fn extract(
     duration: f64,
     dst: &std::path::Path,
 ) -> Result<()> {
+    // Same guard `execute_ffmpeg` has: a job canceled while still QUEUED must
+    // not even start ffmpeg (closing the editor cancels every waveform job, so
+    // this is the normal path, not an edge one).
+    if handle.is_canceled() {
+        return Err(AppError::Ffmpeg("canceled".into()));
+    }
     let mut cmd = jobs::ffmpeg::command("ffmpeg")?;
     cmd.args([
         "-v", "error",
@@ -139,6 +143,12 @@ fn extract(
     }
 
     let status = child.wait()?;
+    // A cancel that lands during the last read makes the loop exit on EOF with
+    // the kill already sent; without this the truncated peaks would be written
+    // and renamed over the final `.pk`, and the job completed as if it were live.
+    if handle.is_canceled() {
+        return Err(AppError::Ffmpeg("canceled".into()));
+    }
     if !status.success() {
         return Err(AppError::Ffmpeg(format!("waveform decode failed ({status})")));
     }
@@ -152,40 +162,6 @@ pub enum WaveformResult {
     Pending { job_id: JobId, output: String },
     /// media has no audio stream
     None,
-}
-
-/// Reserve the in-flight slot for `output`, or report the job already producing
-/// it.
-///
-/// `allocate` runs ONLY on a miss, and it runs while the lock is held. Both
-/// halves matter: allocating first and dropping the handle on a hit leaks a job
-/// the frontend never sees finish, and releasing the lock between the lookup and
-/// the insert re-opens the exact race this closes.
-///
-/// Poison-tolerant for the same reason the cache index is: with
-/// `panic = "abort"` a poisoned map would turn a waveform request into a dead
-/// process, and the map holds nothing worth protecting — a stale entry costs one
-/// redundant decode, never a wrong answer.
-fn claim_output<T>(
-    inflight: &Mutex<HashMap<PathBuf, JobId>>,
-    output: &Path,
-    allocate: impl FnOnce() -> (JobId, T),
-) -> std::result::Result<(JobId, T), JobId> {
-    let mut map = inflight.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&existing) = map.get(output) {
-        return Err(existing);
-    }
-    let claimed = allocate();
-    map.insert(output.to_path_buf(), claimed.0);
-    Ok(claimed)
-}
-
-/// Release the slot once the job that owns it has stopped writing.
-fn release_output(inflight: &Mutex<HashMap<PathBuf, JobId>>, output: &Path) {
-    inflight
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(output);
 }
 
 #[tauri::command]
@@ -209,7 +185,6 @@ pub fn ensure_waveform(
     }
     cache.ensure_kind_dir(CacheKind::Waveform)?;
     let final_path = cache.file_path(CacheKind::Waveform, &hash, ".pk");
-    let tmp_path = cache.file_path(CacheKind::Waveform, &hash, ".pk.tmp");
 
     // Two clips on the same media — or one project opened while its previous
     // mount is still tearing down — used to start two decodes of the SAME file
@@ -219,8 +194,10 @@ pub fn ensure_waveform(
     // has guarded its own outputs this way since v0.6; this is the sibling call
     // site that was missed, and it shares the same registry because the map is
     // keyed by the absolute output path — a waveform's `.pk` can never collide
-    // with a remux's or proxy's `.mp4`.
-    let (job_id, handle) = match claim_output(&inflight.0, &final_path, || {
+    // with a remux's or proxy's `.mp4`. Both claim sites use the same
+    // `Inflight::claim`/`release` pair, so a canceled decode is replaced here
+    // exactly as a canceled remux is there.
+    let (job_id, handle) = match inflight.claim(&jobs, &final_path, || {
         let h = jobs.allocate(JobKind::Waveform);
         (h.id, h)
     }) {
@@ -232,11 +209,13 @@ pub fn ensure_waveform(
             })
         }
     };
+    // Per job, never a shared `.pk.tmp`: see `job_tmp_suffix`.
+    let tmp_path = cache.file_path(CacheKind::Waveform, &hash, &job_tmp_suffix(".pk", job_id));
 
     let app_clone = app.clone();
     let jobs_arc = Arc::clone(&jobs);
     let cache_arc = Arc::clone(&cache);
-    let inflight_arc = Arc::clone(&inflight.0);
+    let inflight_arc = Inflight::clone(&inflight);
     let src = key.path.clone();
     let final_clone = final_path.clone();
 
@@ -249,7 +228,7 @@ pub fn ensure_waveform(
             // decode is what must not be duplicated, and a request arriving
             // during the rename either finds the finished file or starts a fresh
             // job, both of which are correct.
-            release_output(&inflight_arc, &final_clone);
+            inflight_arc.release(&final_clone, handle.id);
             match extracted {
                 Ok(()) => {
                     if std::fs::rename(&tmp_path, &final_clone).is_ok() {
@@ -336,7 +315,12 @@ mod tests {
     /// pair cannot pass.
     #[test]
     fn a_second_request_for_the_same_waveform_joins_the_running_job() {
-        let map: Mutex<HashMap<PathBuf, JobId>> = Mutex::new(HashMap::new());
+        // Moved with the helpers onto `Inflight`; same assertions. None of these
+        // ids is registered with `jobs`, so none reads as canceled: they model
+        // live jobs, the case this test has always pinned.
+        use std::path::PathBuf;
+        let jobs = Jobs::default();
+        let inflight = Inflight::default();
         let pk = PathBuf::from(r"C:\cache\waveform\1122334455667788.pk");
         let other = PathBuf::from(r"C:\cache\waveform\99aabbccddeeff00.pk");
 
@@ -355,14 +339,14 @@ mod tests {
         let allocate = |id, tag| allocator(&allocations, id, tag);
 
         // First request wins the slot and gets its own handle back.
-        let first = claim_output(&map, &pk, allocate(41, "handle-41")).expect("slot was free");
+        let first = inflight.claim(&jobs, &pk, allocate(41, "handle-41")).expect("slot was free");
         assert_eq!(first, (41, "handle-41"));
         assert_eq!(allocations.get(), 1);
 
         // The duplicate the timeline fires while drawing the second clip of the
         // same media joins job 41 instead of starting a second decode onto the
         // same file — and must NOT allocate a handle it would then drop.
-        let dup = claim_output(&map, &pk, allocate(77, "handle-77")).expect_err("must join");
+        let dup = inflight.claim(&jobs, &pk, allocate(77, "handle-77")).expect_err("must join");
         assert_eq!(dup, 41, "the joiner must be told the RUNNING job's id");
         assert_eq!(
             allocations.get(),
@@ -371,17 +355,38 @@ mod tests {
         );
 
         // A different media is a different output: it must still get its own job.
-        let second = claim_output(&map, &other, allocate(77, "handle-77")).expect("distinct output");
+        let second = inflight.claim(&jobs, &other, allocate(77, "handle-77")).expect("distinct output");
         assert_eq!(second, (77, "handle-77"));
         assert_eq!(allocations.get(), 2);
 
         // Once the decode finishes the slot frees, so a later request (a cache
         // miss after eviction, say) starts a fresh job rather than joining a
         // dead one.
-        release_output(&map, &pk);
-        let again = claim_output(&map, &pk, allocate(93, "handle-93")).expect("slot released");
+        inflight.release(&pk, 41);
+        let again = inflight.claim(&jobs, &pk, allocate(93, "handle-93")).expect("slot released");
         assert_eq!(again, (93, "handle-93"));
         assert_eq!(allocations.get(), 3);
+    }
+
+    /// `extract` needs an `AppHandle`, so its cancel guards are pinned in the
+    /// source, over the code before the test module (the needles appear as
+    /// literals here too). Order matters: the first guard must precede the spawn,
+    /// the second must sit between `wait` and the `.pk` write.
+    #[test]
+    fn extract_honours_cancel_before_spawn_and_before_writing() {
+        let code = include_str!("waveform.rs").split("#[cfg(test)]").next().unwrap();
+        let body_start = code.find("fn extract(").expect("extract exists");
+        let end = code[body_start..].find("pub enum WaveformResult").expect("extract ends");
+        // Whitespace-free, so the check survives a reformat and any line endings.
+        let body: String = code[body_start..body_start + end].split_whitespace().collect();
+        let guard = "ifhandle.is_canceled(){returnErr(AppError::Ffmpeg(\"canceled\".into()));}";
+        let spawn = body.find("cmd.spawn()").expect("spawns ffmpeg");
+        let first = body.find(guard).expect("a guard exists");
+        assert!(first < spawn, "a canceled queued job must not start ffmpeg");
+        let wait = body.find("child.wait()?").expect("waits for ffmpeg");
+        let write = body.find("write_pk(dst").expect("writes the peaks");
+        let after_wait = body[wait..].find(guard).map(|i| i + wait).expect("guard after wait");
+        assert!(after_wait < write, "a canceled job must not write or rename its peaks");
     }
 
     #[test]

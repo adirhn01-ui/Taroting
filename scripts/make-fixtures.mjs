@@ -162,6 +162,134 @@ if (!fs.existsSync(turned)) {
   fs.writeFileSync(turned, jpegWithOrientation(fs.readFileSync(plain), 6));
   fs.rmSync(plain);
 }
+
+/* --- the same photo as a WebP, which pins whether the webview turns a WebP
+   by its EXIF too (ffmpeg does: measured 36x64 on decode). The EXIF chunk
+   holds the RAW TIFF block, no "Exif\0\0" prefix — with one, ffmpeg refuses
+   the block and does NOT turn the frame. A simple lossy WebP has no room for
+   metadata, so its VP8 chunk is rewrapped as an extended file: VP8X (flag
+   0x08 = EXIF present, canvas = the coded size) → VP8 verbatim → EXIF, the
+   order the container spec gives. The coded size is read back from the VP8
+   frame header rather than assumed, so the canvas can never disagree with
+   the bitstream. */
+function riffChunk(tag, data) {
+  const head = Buffer.alloc(8);
+  head.write(tag, 0, "ascii");
+  head.writeUInt32LE(data.length, 4);
+  // RIFF chunks are padded to an even length.
+  return Buffer.concat([head, data, Buffer.alloc(data.length & 1)]);
+}
+function webpWithOrientation(src, o) {
+  if (src.toString("ascii", 0, 4) !== "RIFF" || src.toString("ascii", 8, 12) !== "WEBP") {
+    throw new Error("not a WebP");
+  }
+  if (src.toString("ascii", 12, 16) !== "VP8 ") throw new Error("expected a simple lossy WebP");
+  const len = src.readUInt32LE(16);
+  const vp8 = src.subarray(20, 20 + len);
+  // VP8 key frame: 3-byte frame tag, start code 9d 01 2a, then 14-bit sizes.
+  if (vp8[3] !== 0x9d || vp8[4] !== 0x01 || vp8[5] !== 0x2a) throw new Error("bad VP8 start code");
+  const w = vp8.readUInt16LE(6) & 0x3fff;
+  const h = vp8.readUInt16LE(8) & 0x3fff;
+  const vp8x = Buffer.alloc(10);
+  vp8x[0] = 0x08;
+  vp8x.writeUIntLE(w - 1, 4, 3);
+  vp8x.writeUIntLE(h - 1, 7, 3);
+  const body = Buffer.concat([
+    Buffer.from("WEBP", "ascii"),
+    riffChunk("VP8X", vp8x),
+    riffChunk("VP8 ", vp8),
+    riffChunk("EXIF", tiffOrientation(o)),
+  ]);
+  const head = Buffer.alloc(8);
+  head.write("RIFF", 0, "ascii");
+  head.writeUInt32LE(body.length, 4);
+  return Buffer.concat([head, body]);
+}
+const turnedWebp = path.join(outDir, "photo_o6.webp");
+if (!fs.existsSync(turnedWebp)) {
+  console.log("create photo_o6.webp");
+  const plain = path.join(outDir, "photo_o6.plain.webp");
+  execFileSync(ffmpeg, [
+    "-y", "-hide_banner", "-loglevel", "error",
+    "-f", "lavfi", "-i", "testsrc2=size=64x36", "-frames:v", "1",
+    "-c:v", "libwebp", "-pix_fmt", "yuv420p", plain,
+  ]);
+  fs.writeFileSync(turnedWebp, webpWithOrientation(fs.readFileSync(plain), 6));
+  fs.rmSync(plain);
+}
+
+/* --- the same photo as a PNG, twice: eXIf BEFORE the image data (early, where
+   the spec puts it) and AFTER it (late, just before IEND, where some tools
+   append it). ffmpeg turns both; WebView2 turns only the early one (measured).
+   The exif-orientation-png-* blocks pin that, and exif::read_still in
+   src-tauri/src/media/exif.rs decides per file from it. The chunk holds the RAW
+   TIFF block — with an "Exif\0\0" prefix ffmpeg fails the whole decode. */
+const crcTable = Array.from({ length: 256 }, (_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (const b of buf) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+function pngWithOrientation(src, o, late) {
+  if (!src.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    throw new Error("not a PNG");
+  }
+  const data = tiffOrientation(o);
+  const typed = Buffer.concat([Buffer.from("eXIf", "ascii"), data]);
+  const exif = Buffer.alloc(12 + data.length);
+  exif.writeUInt32BE(data.length, 0);
+  typed.copy(exif, 4);
+  exif.writeUInt32BE(crc32(typed), 8 + data.length);
+  const out = [src.subarray(0, 8)];
+  let placed = false;
+  for (let i = 8; i < src.length; ) {
+    const len = src.readUInt32BE(i);
+    const type = src.toString("ascii", i + 4, i + 8);
+    if (!placed && type === (late ? "IEND" : "IDAT")) {
+      out.push(exif);
+      placed = true;
+    }
+    out.push(src.subarray(i, i + 12 + len));
+    i += 12 + len;
+  }
+  if (!placed) throw new Error("no IDAT/IEND to place the eXIf before");
+  return Buffer.concat(out);
+}
+/* What ffmpeg's autorotate decodes a file to: one frame as a BMP on stdout
+   (BMP carries no EXIF of its own), width and height little-endian at 18/22. */
+function decodedSize(file) {
+  const bmp = execFileSync(ffmpeg, [
+    "-hide_banner", "-loglevel", "error",
+    "-i", file, "-frames:v", "1", "-f", "image2pipe", "-c:v", "bmp", "pipe:1",
+  ]);
+  return [Math.abs(bmp.readInt32LE(18)), Math.abs(bmp.readInt32LE(22))];
+}
+for (const [name, late] of [["photo_o6_early.png", false], ["photo_o6_late.png", true]]) {
+  const target = path.join(outDir, name);
+  if (fs.existsSync(target)) {
+    console.log(`skip   ${name}`);
+    continue;
+  }
+  console.log(`create ${name}`);
+  const plain = path.join(outDir, name.replace(".png", ".plain.png"));
+  execFileSync(ffmpeg, [
+    "-y", "-hide_banner", "-loglevel", "error",
+    "-f", "lavfi", "-i", "testsrc2=size=64x36", "-frames:v", "1", plain,
+  ]);
+  fs.writeFileSync(target, pngWithOrientation(fs.readFileSync(plain), 6, late));
+  fs.rmSync(plain);
+  // A chunk ffmpeg does not read would leave both the probe and the webview
+  // at 64x36, and the E2E block would go green having measured nothing.
+  const [w, h] = decodedSize(target);
+  if (w !== 36 || h !== 64) {
+    fs.rmSync(target);
+    throw new Error(`${name}: ffmpeg decodes it ${w}x${h}, not 36x64 — its eXIf is not being read`);
+  }
+}
 const seqDir = path.join(outDir, "png_sequence");
 if (!fs.existsSync(seqDir)) {
   console.log("create png_sequence/ (90 frames)");

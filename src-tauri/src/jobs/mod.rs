@@ -165,6 +165,23 @@ impl Jobs {
     pub fn finish(&self, id: JobId) {
         self.registry.lock().unwrap().remove(&id);
     }
+
+    /// True while `id` is registered AND has been told to stop.
+    ///
+    /// A canceled job stays registered until its worker reaches `fail_job`,
+    /// which for a QUEUED one can be long after the cancel — it has to wait for
+    /// a lane to dequeue it first. That window is where the preparation
+    /// registry used to hand the dead id to the next request for the same
+    /// file, which then waited on a job that could only ever fail. Unknown and
+    /// finished ids are `false`: nothing is left to stop, and a finished job
+    /// has already released anything it held.
+    pub fn is_canceled(&self, id: JobId) -> bool {
+        self.registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .is_some_and(JobHandle::is_canceled)
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -448,6 +465,65 @@ mod tests {
             "a completed encode must survive the failure path"
         );
         assert_eq!(std::fs::read(&finished).unwrap(), b"a complete encode");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Canceled means "registered and told to stop": a live job is not, and
+    /// once a canceled job finishes it is unknown again — nothing left to stop.
+    #[test]
+    fn is_canceled_tracks_the_registry() {
+        let jobs = Jobs::default();
+        let live = jobs.allocate(JobKind::Proxy);
+        let doomed = jobs.allocate(JobKind::Waveform);
+        assert!(!jobs.is_canceled(live.id));
+        assert!(!jobs.is_canceled(9_999), "an id never allocated");
+
+        assert!(jobs.cancel(doomed.id));
+        assert!(jobs.is_canceled(doomed.id));
+        assert!(!jobs.is_canceled(live.id), "cancel is per job");
+
+        jobs.finish(doomed.id);
+        assert!(!jobs.is_canceled(doomed.id), "a finished job is unknown");
+    }
+
+    /// A job canceled while QUEUED is replaced at once, and only later
+    /// dequeued — where `execute_ffmpeg` bails on the cancel and `fail_job`
+    /// deletes the job's output. Both jobs prepare into the SAME cache file,
+    /// so their partial names come from `job_tmp_suffix`; with one shared
+    /// `.tmp` the dead job's cleanup erased the successor's half-written file.
+    #[test]
+    fn canceled_queued_job_does_not_delete_the_successors_tmp() {
+        use crate::media::playability::job_tmp_suffix;
+        let jobs = Jobs::default();
+        let dir = std::env::temp_dir().join(format!(
+            "taroting-jobs-tmp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_for = |h: &JobHandle| dir.join(format!("0123456789abcdef{}", job_tmp_suffix(".mp4", h.id)));
+
+        let dead = jobs.allocate(JobKind::Remux);
+        let successor = jobs.allocate(JobKind::Remux);
+        dead.set_output(tmp_for(&dead));
+        successor.set_output(tmp_for(&successor));
+        std::fs::write(tmp_for(&successor), b"successor, half written").unwrap();
+
+        jobs.cancel(dead.id);
+        dead.cleanup_output();
+        assert_eq!(
+            std::fs::read(tmp_for(&successor)).unwrap(),
+            b"successor, half written",
+            "the canceled job must delete only its own partial file"
+        );
+
+        // The dead job's own partial file still goes when it had one.
+        std::fs::write(tmp_for(&dead), b"dead").unwrap();
+        dead.set_output(tmp_for(&dead));
+        dead.cleanup_output();
+        assert!(!tmp_for(&dead).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
