@@ -78,6 +78,10 @@ const teardowns = createTeardowns((e) =>
   }),
 );
 
+/** The mounted viewer, so a second Explorer open swaps the file in place
+ *  instead of remounting (ViewerHandle.show). */
+let activeViewer: import("./viewer/viewer").ViewerHandle | null = null;
+
 async function go(route: Route): Promise<void> {
   const token = ++navToken;
   const prev = dispose;
@@ -109,6 +113,17 @@ async function go(route: Route): Promise<void> {
     if (token !== navToken) return;
     const view = mountSettings(app);
     dispose = () => view.dispose();
+  } else if (route.view === "viewer") {
+    // Lazy and never prefetched: a user who never opens a file from Explorer
+    // never pays for the viewer chunk.
+    const { mountViewer } = await import("./viewer/viewer");
+    if (token !== navToken) return;
+    const v = mountViewer(app, route.path);
+    activeViewer = v;
+    dispose = () => {
+      if (activeViewer === v) activeViewer = null;
+      v.dispose();
+    };
   } else {
     const { mountEditor } = await import("./editor/editor");
     if (token !== navToken) return;
@@ -165,7 +180,9 @@ async function routeOpenPath(path: string): Promise<void> {
   // temporary project in the temp dir (never in recents) until the user chooses
   // to keep it when leaving the editor. Off → the classic permanent flow,
   // byte-identical.
-  const temp = settingsStore.get().tempOpenWith;
+  // BRIDGE until the viewer lands (Wave 2): "editor" keeps 0.8's quick view;
+  // "viewer" still takes the old permanent-project path below.
+  const temp = settingsStore.get().openWith === "editor";
   try {
     if (temp) {
       const projectPath = await openMediaAsProject(path);

@@ -53,7 +53,7 @@ describe("sanitizeSettings", () => {
     cacheLimitMB: null,
     proxyMedia: "true",
     snapCenterGuides: 0,
-    tempOpenWith: "yes",
+    openWith: 7, // junk new key and no legacy `true` → the viewer
     monitorVolume: "loud",
     timelineHeight: { px: 400 }, // a CSS length built from this is "[object Object]px"
     customTheme: { background: 0xff0000, accent: "javascript:alert(1)", text: ["#fff"] },
@@ -76,7 +76,7 @@ describe("sanitizeSettings", () => {
     expect(typeof s.cacheLimitMB).toBe("number");
     expect(typeof s.proxyMedia).toBe("boolean");
     expect(typeof s.snapCenterGuides).toBe("boolean");
-    expect(typeof s.tempOpenWith).toBe("boolean");
+    expect(s.openWith).toBe("viewer");
     expect(typeof s.monitorVolume).toBe("number");
     expect(Number.isInteger(s.timelineHeight)).toBe(true);
     expect(s.customTheme).toEqual(DEFAULT_CUSTOM_THEME);
@@ -190,7 +190,7 @@ describe("sanitizeSettings", () => {
       cacheLimitMB: 5120,
       proxyMedia: false,
       snapCenterGuides: false,
-      tempOpenWith: true,
+      openWith: "editor", // not the default — a round-trip that dropped it would fail
       monitorVolume: 0.5,
       // Deliberately NOT the default: a sanitizer that ignored the stored value
       // and always wrote DEFAULT_SETTINGS.timelineHeight would pass this test

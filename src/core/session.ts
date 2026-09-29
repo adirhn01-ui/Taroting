@@ -909,7 +909,15 @@ export function sanitizeSettings(raw: unknown): Settings {
     cacheLimitMB: asNum(o.cacheLimitMB, DEFAULT_SETTINGS.cacheLimitMB, 1, 1024 * 1024),
     proxyMedia: asBool(o.proxyMedia, DEFAULT_SETTINGS.proxyMedia),
     snapCenterGuides: asBool(o.snapCenterGuides, DEFAULT_SETTINGS.snapCenterGuides),
-    tempOpenWith: asBool(o.tempOpenWith, DEFAULT_SETTINGS.tempOpenWith),
+    // 0.8's boolean is read ONCE as a migration hint (true meant "open as a
+    // temporary project", i.e. the editor) and never written back: this object
+    // has no tempOpenWith field, so the next save drops it.
+    openWith:
+      o.openWith === "viewer" || o.openWith === "editor"
+        ? o.openWith
+        : o.tempOpenWith === true
+          ? "editor"
+          : "viewer",
     monitorVolume: asNum(o.monitorVolume, DEFAULT_SETTINGS.monitorVolume, 0, 1),
     // The same clamp the drag handle applies, so the two can never disagree
     // about what a legal height is: a hand-edited 40 leaves no lane to drop a

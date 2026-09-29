@@ -284,6 +284,10 @@ export interface CustomTheme {
   text: string;
 }
 
+/** Where a media file opened from File Explorer lands. Neither creates anything permanent:
+ *  "viewer" shows it with no project; "editor" makes a TEMPORARY project. */
+export type OpenWith = "viewer" | "editor";
+
 export interface Settings {
   schema: 1;
   theme: "dark" | "light" | "system" | "custom";
@@ -298,10 +302,10 @@ export interface Settings {
   proxyMedia: boolean;
   /** drag a clip on the canvas → snap its center to the project center */
   snapCenterGuides: boolean;
-  /** open-with a media file from Explorer → temporary project; leaving the
-   *  editor asks Keep (→ Documents) or Discard. Off = the classic
-   *  permanent-project flow. */
-  tempOpenWith: boolean;
+  /** where a media file opened from File Explorer lands (see `OpenWith`).
+   *  Replaces 0.8's `tempOpenWith` boolean, which the sanitizer still reads
+   *  once as a migration hint and never writes back. */
+  openWith: OpenWith;
   /** preview/monitor listening level 0..1 — NOT baked into clips or exports */
   monitorVolume: number;
   /** Height of the timeline panel in px, written by dragging its top divider.
@@ -437,7 +441,7 @@ export const DEFAULT_SETTINGS: Settings = {
   cacheLimitMB: 2048,
   proxyMedia: true,
   snapCenterGuides: true,
-  tempOpenWith: false,
+  openWith: "viewer",
   monitorVolume: 1,
   timelineHeight: 280,
   shortcuts: DEFAULT_SHORTCUTS,

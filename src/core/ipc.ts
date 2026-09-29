@@ -334,6 +334,9 @@ export const ipc = {
   /** Queue `path` exactly as a second launch would and emit "open-path", so the
    *  E2E drives the real open routing with no second process and no window. */
   debugPushOpenPath: (path: string) => call<void>("debug_push_open_path", { path }),
+  /** tells the Rust close escape hatch (os::CloseWatch) that the webview
+   *  answered this close request, so a later X is not treated as a hang */
+  closeAck: () => call<void>("close_ack", undefined, () => undefined),
 };
 
 /* ---------------- app identity ---------------- */
@@ -370,6 +373,27 @@ export async function getWindowTitle(): Promise<string> {
   if (!inTauri) return "";
   const { getCurrentWindow } = await import("@tauri-apps/api/window");
   return getCurrentWindow().title();
+}
+
+/** Intercept the window's close requests (X, Alt+F4, taskbar). The inner
+ *  handler ALWAYS preventDefaults and fires `handler` without awaiting it: the
+ *  close flow decides, and destroys the window itself (`destroyWindow`). A
+ *  webview that never answers is covered by the Rust escape hatch
+ *  (os::CloseWatch), not here. Returns an unlisten function. */
+export async function onCloseRequested(handler: () => void): Promise<() => void> {
+  if (!inTauri) return () => {};
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  return getCurrentWindow().onCloseRequested((ev) => {
+    ev.preventDefault();
+    handler();
+  });
+}
+
+/** Close the window for real (`core:window:allow-destroy` in capabilities). */
+export async function destroyWindow(): Promise<void> {
+  if (!inTauri) return;
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  await getCurrentWindow().destroy();
 }
 
 /** Open File Explorer with `path` selected (`opener:default` is granted). */
@@ -442,6 +466,17 @@ export async function pickProjectFile(): Promise<string | null> {
   const result = await open({
     multiple: false,
     filters: [{ name: "Taroting project", extensions: ["trt"] }],
+  });
+  return typeof result === "string" ? result : null;
+}
+
+/** Home's Open picker: a project or a media file, one filter. */
+export async function pickOpenFile(): Promise<string | null> {
+  if (!inTauri) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const result = await open({
+    multiple: false,
+    filters: [{ name: "Projects and media", extensions: ["trt", ...MEDIA_FILE_EXTENSIONS] }],
   });
   return typeof result === "string" ? result : null;
 }

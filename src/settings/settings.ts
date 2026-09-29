@@ -474,7 +474,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
         ${switchRow(
           "settings-temp-open",
           "Quick view from File Explorer",
-          s.tempOpenWith,
+          s.openWith === "editor",
           "Media opened from File Explorer becomes a temporary project. You choose whether to keep it when you leave",
         )}
       </section>`;
@@ -703,7 +703,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     inner
       .querySelector<HTMLInputElement>("#settings-temp-open")
       ?.addEventListener("change", (e) => {
-        persist({ tempOpenWith: (e.target as HTMLInputElement).checked });
+        persist({ openWith: (e.target as HTMLInputElement).checked ? "editor" : "viewer" });
       });
 
     // Cache limit

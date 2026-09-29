@@ -140,6 +140,43 @@ fn run_uninstaller() -> Result<()> {
     std::process::exit(0);
 }
 
+/* ------------------------------------------------------------------ */
+/* Close escape hatch                                                  */
+/* ------------------------------------------------------------------ */
+
+/// A JS close listener makes Tauri swallow the native close, so a hung or
+/// crashed renderer would leave X doing nothing, forever. This remembers the
+/// first close request the webview has not acknowledged (`close_ack`).
+#[derive(Default)]
+pub struct CloseWatch {
+    first_unacked: Mutex<Option<std::time::Instant>>,
+}
+
+/// Force-destroy when a close request arrives this long after an earlier one
+/// the webview never acknowledged.
+pub const FORCE_CLOSE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Pure decision (SEAM STUB — Wave 2 fills it in).
+pub fn should_force_close(
+    first_unacked: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    let _ = (first_unacked, now);
+    false
+}
+
+/// Called from main.rs `.on_window_event` for `WindowEvent::CloseRequested`
+/// (SEAM STUB — Wave 2 fills it in).
+pub fn on_close_requested<R: tauri::Runtime>(window: &tauri::Window<R>, watch: &CloseWatch) {
+    let _ = (window, &watch.first_unacked);
+}
+
+/// The webview answered: clear the pending timestamp (SEAM STUB).
+#[tauri::command]
+pub fn close_ack(watch: tauri::State<'_, CloseWatch>) {
+    let _ = &watch.first_unacked;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

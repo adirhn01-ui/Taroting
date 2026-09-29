@@ -163,6 +163,12 @@ fn main() {
         .manage(open_paths)
         .manage(media::playability::Inflight::default())
         .manage(export::LastExportFailure::default())
+        .manage(os::CloseWatch::default())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                os::on_close_requested(window, &window.state::<os::CloseWatch>());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             media::probe::probe_media,
             media::playability::plan_playback,
@@ -201,6 +207,7 @@ fn main() {
             debug::debug_push_open_path,
             os::take_pending_open_paths,
             os::uninstall_app,
+            os::close_ack,
             screen_pick::screen_pick_color,
         ]);
 
