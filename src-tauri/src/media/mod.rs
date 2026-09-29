@@ -1,7 +1,9 @@
 pub mod exif;
+pub mod extensions;
 pub mod normalize;
 pub mod playability;
 pub mod prepare;
 pub mod probe;
+pub mod siblings;
 pub mod thumbs;
 pub mod waveform;

@@ -55,7 +55,7 @@ describe("findConflicts", () => {
  * ==========================================================================*/
 
 import { blockShortcuts, physicalChordOf, resolveChord, shortcutsBlocked } from "./shortcuts";
-import { DEFAULT_SHORTCUTS } from "./types";
+import { ACTION_MODES, DEFAULT_SHORTCUTS } from "./types";
 import type { ActionId } from "./types";
 
 /** An event with a physical `code`, as the browser delivers. */
@@ -65,10 +65,13 @@ const kev = (
   mods: Partial<Record<"ctrl" | "alt" | "shift" | "meta", boolean>> = {},
 ) => ({ ...ev(key, mods), code });
 
-/** The app's real bindings, mapped exactly as ShortcutManager.setBindings does. */
+/** The editor's real bindings, mapped exactly as ShortcutManager("editor").setBindings
+ *  does — viewer-only actions (prevFile/nextFile on the bare arrows) are never bound
+ *  there. */
 const defaults = (): ReadonlyMap<string, ActionId> => {
   const m = new Map<string, ActionId>();
   for (const [action, stored] of Object.entries(DEFAULT_SHORTCUTS) as [ActionId, string][]) {
+    if (!ACTION_MODES[action].includes("editor")) continue;
     const chord = normalizeChord(stored);
     if (chord) m.set(chord, action);
   }
@@ -207,11 +210,15 @@ describe("resolveChord never misfires on a rearranged Latin layout", () => {
       ["US-Dvorak", "o", {}, "KeyS"], // would be split
       ["US-Dvorak", "b", {}, "KeyN"], // would be toggleSnap
       ["FR-AZERTY", ",", {}, "KeyM"], // would be addMarker
-      ["DE-QWERTZ", "y", { ctrl: true }, "KeyZ"], // would be undo
     ];
     for (const [layout, key, mods, code] of traps) {
       expect(resolveChord(kev(key, code, mods), map), `${layout} ${key}`).toBeUndefined();
     }
+    // DE-QWERTZ prints "y" on KeyZ. It used to sit in the table above (would be
+    // undo); since Ctrl+Y became the alternate redo the LAYOUT chord legitimately
+    // resolves — the key says Y, so it redoes. What must still never happen is
+    // the physical fallback reading KeyZ as undo.
+    expect(resolveChord(kev("y", "KeyZ", { ctrl: true }), map), "DE-QWERTZ y").toBe("redoAlt");
   });
 
   it("prefers the layout chord when both it and the position are bound", () => {

@@ -61,6 +61,11 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   export: "Export",
   goHome: "Close project",
   fullscreen: "Fullscreen playback",
+  redoAlt: "Redo (alternate)",
+  prevFile: "Previous file (viewer)",
+  nextFile: "Next file (viewer)",
+  seekBack: "Back 5s (viewer)",
+  seekFwd: "Forward 5s (viewer)",
 };
 
 /** Action row order — mirrors the ActionId union for a predictable list. */

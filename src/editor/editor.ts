@@ -1535,7 +1535,7 @@ export async function mountEditor(
 
   /* ---------------- shortcuts ---------------- */
 
-  const shortcuts = new ShortcutManager();
+  const shortcuts = new ShortcutManager("editor");
   shortcuts.setBindings(settingsStore.get().shortcuts);
 
   // Modal guard. Nothing else stops a global shortcut from firing behind an open

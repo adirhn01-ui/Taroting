@@ -18,8 +18,11 @@ serde_json = "1"
 thiserror = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
-# The native screen eyedropper (src/screen_pick.rs). Windows-only by
-# construction; the seam is per-platform and other platforms get their own.
+# The native screen eyedropper (src/screen_pick.rs), and Explorer's own
+# natural file-name order for the viewer's folder stepping (StrCmpLogicalW in
+# src/media/siblings.rs). Windows-only by construction; the seams are
+# per-platform and other platforms get their own. Features are compile-time
+# only: no new crate, nothing in Cargo.lock.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
@@ -27,6 +30,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_LibraryLoader",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

@@ -1,6 +1,8 @@
 // Single source of truth for all shared data shapes.
 // The Rust side mirrors these with serde(rename_all = "camelCase").
 
+import MEDIA_EXT from "./media-extensions.json";
+
 export interface Rational {
   num: number;
   den: number;
@@ -226,7 +228,12 @@ export type ActionId =
   | "addMarker"
   | "export"
   | "goHome"
-  | "fullscreen";
+  | "fullscreen"
+  | "redoAlt"
+  | "prevFile"
+  | "nextFile"
+  | "seekBack"
+  | "seekFwd";
 
 /** The three user-settable colours of the "custom" theme.
  *
@@ -339,6 +346,53 @@ export const DEFAULT_SHORTCUTS: Record<ActionId, string> = {
   export: "Ctrl+E",
   goHome: "Ctrl+W",
   fullscreen: "F",
+  // New actions go at the END: key order is the binding order (a chord bound to
+  // several actions of one mode dispatches the first one listed that has a
+  // handler), so appending never changes what an existing chord does.
+  redoAlt: "Ctrl+Y",
+  prevFile: "ArrowLeft",
+  nextFile: "ArrowRight",
+  seekBack: "Shift+ArrowLeft",
+  seekFwd: "Shift+ArrowRight",
+};
+
+/** Which screens an action lives on. A chord conflicts only with an action that shares a
+ *  mode; a ShortcutManager binds only its own mode's actions. `image` is the Phase-3 image
+ *  editor: Phase 3 adds its own ActionIds and may WIDEN an existing row (copy/paste/delete),
+ *  never narrow one. Record<ActionId, …> makes the compiler demand a row per new action.
+ *
+ *  Why seekBack/seekFwd are their own actions rather than jumpBack/jumpFwd in the viewer:
+ *  the viewer seeks ±5 s while the editor's jump is ±1 s ("Jump forward 1s"), one action
+ *  cannot mean both, and both must stay rebindable. */
+export type ShortcutMode = "editor" | "viewer" | "image";
+export const ACTION_MODES: Readonly<Record<ActionId, readonly ShortcutMode[]>> = {
+  playPause: ["editor", "viewer"],
+  stop: ["editor"],
+  stepFwd: ["editor"],
+  stepBack: ["editor"],
+  jumpFwd: ["editor"],
+  jumpBack: ["editor"],
+  goStart: ["editor", "viewer"],
+  goEnd: ["editor", "viewer"],
+  split: ["editor"],
+  delete: ["editor"],
+  rippleDelete: ["editor"],
+  undo: ["editor", "image"],
+  redo: ["editor", "image"],
+  redoAlt: ["editor", "image"],
+  save: ["editor", "image"],
+  copy: ["editor"],
+  paste: ["editor"],
+  toggleSnap: ["editor"],
+  toggleLoop: ["editor"],
+  addMarker: ["editor"],
+  export: ["editor", "image"],
+  goHome: ["editor", "viewer", "image"],
+  fullscreen: ["editor", "viewer"],
+  prevFile: ["viewer"],
+  nextFile: ["viewer"],
+  seekBack: ["viewer"],
+  seekFwd: ["viewer"],
 };
 
 /** The stock DARK palette's --bg-app, --accent and --text-1 — so switching to
@@ -376,11 +430,31 @@ export const DEFAULT_SETTINGS: Settings = {
   shortcuts: DEFAULT_SHORTCUTS,
 };
 
-export const MEDIA_FILE_EXTENSIONS = new Set([
-  "mp4", "mov", "mkv", "avi", "webm", "gif",
-  "mp3", "wav", "flac", "aac", "m4a", "ogg",
-  "png", "jpg", "jpeg",
-]);
+/** Which family a media extension belongs to (see media-extensions.json). */
+export type MediaFamily = "video" | "gif" | "image" | "audio";
+/** What the viewer steps through together: video+gif+image, or audio alone. */
+export type StepFamily = "visual" | "audio";
+
+/** The ONE list of media extensions, shared with the backend: the Rust side
+ *  reads the same JSON with `include_str!` (src-tauri/src/media/extensions.rs),
+ *  so the picker, drop, open-with and the viewer's folder stepping can never
+ *  disagree about what counts as media. Lowercase, no dots, no extension in two
+ *  families, and never `trt` — src/dev/media-extensions.test.ts pins all four. */
+export const MEDIA_EXTENSIONS: Readonly<Record<MediaFamily, readonly string[]>> = MEDIA_EXT;
+/** Every importable media extension. Derived: never hand-edit a copy. */
+export const MEDIA_FILE_EXTENSIONS: ReadonlySet<string> = new Set(Object.values(MEDIA_EXT).flat());
+
+/** `ext` lowercased, no dot (core/format.ts `fileExt` returns exactly that). */
+export function mediaFamilyOf(ext: string): MediaFamily | null {
+  for (const f of ["video", "gif", "image", "audio"] as const) {
+    if (MEDIA_EXTENSIONS[f].includes(ext)) return f;
+  }
+  return null;
+}
+export function stepFamilyOf(ext: string): StepFamily | null {
+  const f = mediaFamilyOf(ext);
+  return f === null ? null : f === "audio" ? "audio" : "visual";
+}
 
 export const DEFAULT_EXPORT_PRESET: ExportPreset = {
   format: "mp4",

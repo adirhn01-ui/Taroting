@@ -3,8 +3,8 @@
 // jobs, loads waveform peaks and thumbnails, and exposes reactive maps the
 // editor UI renders from.
 
-import type { CodecHints, JobDone, JobFailed, JobProgress, MediaKey } from "../../core/ipc";
-import { describeError, inTauri, ipc, mediaUrl, onJobEvents } from "../../core/ipc";
+import type { JobDone, JobFailed, JobProgress, MediaKey } from "../../core/ipc";
+import { codecHints, describeError, ipc, mediaUrl, onJobEvents } from "../../core/ipc";
 import { settingsStore } from "../../core/session";
 import { Store } from "../../core/store";
 import type { MediaRef, ProjectFile } from "../../core/types";
@@ -26,13 +26,9 @@ export function keyOf(m: MediaRef): MediaKey {
   return { path: m.path, size: m.size, mtimeMs: m.mtimeMs };
 }
 
-export function codecHints(): CodecHints {
-  if (!inTauri || typeof MediaSource === "undefined") return { hevc: false, av1: true };
-  return {
-    hevc: MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L123.B0"'),
-    av1: MediaSource.isTypeSupported('video/mp4; codecs="av01.0.08M.08"'),
-  };
-}
+// Moved to core/ipc.ts (the viewer asks the same question); re-exported so
+// existing importers keep working.
+export { codecHints };
 
 function parsePk(buf: ArrayBuffer): WaveformData | null {
   const view = new DataView(buf);

@@ -1,7 +1,8 @@
 // Keyboard shortcut manager: chord normalization, an action registry bound
 // from settings, and focus guards so typing in inputs never triggers edits.
 
-import type { ActionId } from "./types";
+import { ACTION_MODES } from "./types";
+import type { ActionId, ShortcutMode } from "./types";
 
 /** The parts of a KeyboardEvent a chord is built from. `code` is optional so
  *  plain object literals (tests, the settings capture) still satisfy it. */
@@ -13,6 +14,9 @@ export interface ChordSource {
   key: string;
   /** Physical key position, layout-independent — see `physicalChordOf`. */
   code?: string;
+  /** KeyboardEvent.getModifierState. Optional so plain-object test sources still type-check.
+   *  Used ONLY to detect AltGraph (Windows reports AltGr as ctrlKey+altKey both true). */
+  getModifierState?(key: string): boolean;
 }
 
 /** Normalize a KeyboardEvent (or stored string) to a canonical chord like
@@ -169,6 +173,18 @@ export function findConflicts(shortcuts: Record<string, string>): string[] {
   return [...conflicts];
 }
 
+/** One chord bound to two or more actions that share a screen. */
+export interface ShortcutConflict {
+  chord: string;
+  mode: ShortcutMode;
+  actions: ActionId[];
+}
+
+/** Every action named in any conflict (per-row marking in Settings). */
+export function conflictingActions(_conflicts: readonly ShortcutConflict[]): Set<ActionId> {
+  throw new Error("not implemented");
+}
+
 /** True when the event target is a place where typing is expected. */
 export function isTypingTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -239,8 +255,12 @@ export class ShortcutManager {
   private listener: (e: KeyboardEvent) => void;
   /** While this returns true the app's chords are inert. */
   private suppressed: (() => boolean) | null = null;
+  /** The screen this manager serves; only actions whose ACTION_MODES row names
+   *  it are ever bound. */
+  private readonly mode: ShortcutMode;
 
-  constructor() {
+  constructor(mode: ShortcutMode) {
+    this.mode = mode;
     this.listener = (e) => {
       if (isTypingTarget(e.target)) return;
       const action = resolveChord(e, this.chordToAction);
@@ -274,6 +294,13 @@ export class ShortcutManager {
   setBindings(shortcuts: Record<ActionId, string>): void {
     this.chordToAction.clear();
     for (const [action, stored] of Object.entries(shortcuts) as [ActionId, string][]) {
+      // Only this screen's actions. The editor and the viewer give ArrowLeft /
+      // ArrowRight different meanings (frame step vs previous/next file), and
+      // the viewer's rows come later in key order — bound here, they would
+      // shadow the editor's frame step with an action it has no handler for,
+      // and the arrows would silently do nothing. `?.` because the map is
+      // user data typed by a cast, not proof that every key is known.
+      if (!ACTION_MODES[action]?.includes(this.mode)) continue;
       const chord = normalizeChord(stored);
       if (chord) this.chordToAction.set(chord, action);
     }

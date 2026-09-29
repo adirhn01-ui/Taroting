@@ -5,7 +5,15 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { EncoderSummary, FfmpegFailure } from "./diagnostics";
 import { sanitizeProject } from "./project";
-import type { MediaInfo, MediaRef, ProjectFile, RecentsIndex, Settings } from "./types";
+import { MEDIA_FILE_EXTENSIONS } from "./types";
+import type {
+  MediaInfo,
+  MediaRef,
+  ProjectFile,
+  RecentsIndex,
+  Settings,
+  StepFamily,
+} from "./types";
 
 export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -138,6 +146,46 @@ export interface CodecHints {
   av1: boolean;
 }
 
+/** What this webview can decode natively, as the backend's playback planner
+ *  needs to know it. Lives here (not in the editor's media manager) because the
+ *  viewer asks the same question and must get the same answer. */
+export function codecHints(): CodecHints {
+  if (!inTauri || typeof MediaSource === "undefined") return { hevc: false, av1: true };
+  return {
+    hevc: MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L123.B0"'),
+    av1: MediaSource.isTypeSupported('video/mp4; codecs="av01.0.08M.08"'),
+  };
+}
+
+/** A media file's neighbours in its folder — a mirror of `SiblingWindow` in
+ *  src-tauri/src/media/siblings.rs. Bounded by `radius` on each side so a
+ *  folder of thousands of photos never crosses the IPC boundary whole. */
+export interface SiblingWindow {
+  /** ascending natural order, nearest neighbour LAST, at most `radius` entries */
+  before: string[];
+  /** ascending natural order, nearest neighbour FIRST, at most `radius` entries */
+  after: string[];
+  /** 1-based position of `path` among the family's files; null when it is not listed
+   *  (vanished, hidden, or renamed since it was opened) */
+  index: number | null;
+  /** number of files of the family in the folder (a vanished current file is not counted) */
+  total: number;
+  family: StepFamily;
+}
+
+/** How a file would play, decided WITHOUT starting any job — a mirror of
+ *  `PlaybackClass` in src-tauri/src/media/playability.rs, derived there from the
+ *  same decision `plan_playback` acts on so the two can never disagree.
+ *  `containerOnly` = only the container is wrong (a quick remux); `remux` = the
+ *  audio needs re-encoding too; `proxy` = the video must be transcoded. */
+export type PlaybackClass = "direct" | "containerOnly" | "remux" | "proxy";
+export interface PlaybackClassInfo {
+  class: PlaybackClass;
+  /** a remux/proxy of this exact file ({path,size,mtimeMs}) is already in the cache, so planning
+   *  would return `ready` without starting a job. Always false for `direct`. */
+  prepared: boolean;
+}
+
 export interface JobProgress {
   id: number;
   kind: string;
@@ -223,6 +271,14 @@ export const ipc = {
 
   planPlayback: (media: MediaRef, hints: CodecHints, forceProxyLarge: boolean) =>
     call<PlaybackPlan>("plan_playback", { media, hints, forceProxyLarge }),
+  /** Pure: one decision + one cache stat, no job, no ffmpeg. */
+  classifyPlayback: (media: MediaRef, hints: CodecHints, forceProxyLarge: boolean) =>
+    call<PlaybackClassInfo>("classify_playback", { media, hints, forceProxyLarge },
+      () => ({ class: "direct", prepared: false })),
+  /** The folder neighbours of `path` in its own step family (see SiblingWindow). */
+  listSiblings: (path: string, radius: number) =>
+    call<SiblingWindow>("list_siblings", { path, radius },
+      () => ({ before: [], after: [], index: 1, total: 1, family: "visual" })),
   ensureWaveform: (key: MediaKey, duration: number, hasAudio: boolean) =>
     call<WaveformResult>("ensure_waveform", { key, duration, hasAudio }),
   getThumbnail: (key: MediaKey, atSec: number) =>
@@ -275,6 +331,9 @@ export const ipc = {
   debugInfo: () =>
     call<{ autotest: boolean; fixturesDir: string; reportPath: string }>("debug_info"),
   debugWriteReport: (content: string) => call<void>("debug_write_report", { content }),
+  /** Queue `path` exactly as a second launch would and emit "open-path", so the
+   *  E2E drives the real open routing with no second process and no window. */
+  debugPushOpenPath: (path: string) => call<void>("debug_push_open_path", { path }),
 };
 
 /* ---------------- app identity ---------------- */
@@ -293,6 +352,31 @@ export async function appVersion(): Promise<string> {
     cachedVersion = "unknown";
   }
   return cachedVersion;
+}
+
+/* ---------------- the app window ---------------- */
+
+/** Set the OS window title (taskbar, alt-tab). No-op outside the desktop app.
+ *  `core:window:allow-set-title` is granted in capabilities/main.json. */
+export async function setWindowTitle(title: string): Promise<void> {
+  if (!inTauri) return;
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  await getCurrentWindow().setTitle(title);
+}
+
+/** The OS window title ("" outside the desktop app). `core:window:allow-title`
+ *  comes with `core:window:default`. */
+export async function getWindowTitle(): Promise<string> {
+  if (!inTauri) return "";
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  return getCurrentWindow().title();
+}
+
+/** Open File Explorer with `path` selected (`opener:default` is granted). */
+export async function revealInFolder(path: string): Promise<void> {
+  if (!inTauri) return;
+  const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+  await revealItemInDir(path);
 }
 
 /* ---------------- job events ---------------- */
@@ -367,16 +451,10 @@ export async function pickMediaFiles(): Promise<string[]> {
   const { open } = await import("@tauri-apps/plugin-dialog");
   const result = await open({
     multiple: true,
-    filters: [
-      {
-        name: "Media",
-        extensions: [
-          "mp4", "mov", "mkv", "avi", "webm", "gif",
-          "mp3", "wav", "flac", "aac", "m4a", "ogg",
-          "png", "jpg", "jpeg",
-        ],
-      },
-    ],
+    // Derived from media-extensions.json, so the picker can never offer a
+    // different set than drop and open-with accept. media-extensions.test.ts
+    // fails if a quoted extension literal reappears in this function.
+    filters: [{ name: "Media", extensions: [...MEDIA_FILE_EXTENSIONS] }],
   });
   if (result === null) return [];
   return Array.isArray(result) ? result : [result];

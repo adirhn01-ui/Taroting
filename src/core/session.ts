@@ -841,6 +841,15 @@ function asCustomTheme(v: unknown): CustomTheme {
   };
 }
 
+/** Rebuild a stored shortcut map over every known action. A stored STRING wins. An action the
+ *  stored map does not mention gets its DEFAULT chord UNLESS that chord (normalizeChord) is
+ *  already bound, IN THE STORED MAP, to an action sharing a mode; then it is left unbound (""):
+ *  a new default never steals a user's chord. Non-object input → fresh copy of DEFAULT_SHORTCUTS
+ *  (keeps session.test.ts "non-object → DEFAULT_SETTINGS" true). */
+export function sanitizeShortcuts(_raw: unknown): Record<ActionId, string> {
+  throw new Error("not implemented");
+}
+
 /** Coerce an arbitrary persisted value into a valid Settings. Never throws. */
 export function sanitizeSettings(raw: unknown): Settings {
   const o: Record<string, unknown> =
@@ -1109,6 +1118,12 @@ function writeSettingsInOrder(): Promise<void> {
   return write;
 }
 
+/** Resolves when every queued settings.json write has landed. Never rejects:
+ *  the tail absorbs failures (each write's own caller hears about its error). */
+export function settingsWritesSettled(): Promise<void> {
+  return settingsWriteTail;
+}
+
 export async function updateSettings(patch: Partial<Settings>): Promise<void> {
   // Only ever true after a boot read that came back empty or failed, and only
   // for the first write of that session — see the block comment above. It is
@@ -1170,12 +1185,20 @@ export class ProjectSession {
   readonly store: Store<ProjectFile>;
   readonly saveState = new Store<SaveState>("saved");
   readonly history = new History<ProjectFile>();
-  readonly path: string;
+  /** True while the session lives in tmp-projects. keepTempSession flips it to false. */
+  readonly temp: Store<boolean>;
 
   /** Optional keep-or-discard gate, set by the view that owns this session and
    *  scoped to its lifetime (the session reference is dropped on dispose, so
    *  there is nothing to unregister). `null` means "nothing to confirm". */
   leaveGuard: LeaveGuard | null = null;
+
+  /** Non-null while something (a running export) must not be torn down by a navigation it did
+   *  not start. The string is the user-facing reason. */
+  blockLeave: string | null = null;
+
+  /** Backing field for `path`; changes only through relocate(). */
+  private _path: string;
 
   private debounceTimer: number | undefined;
   private intervalTimer: number | undefined;
@@ -1190,8 +1213,9 @@ export class ProjectSession {
   private failedSaves = 0;
   private retryTicks = 0;
 
-  constructor(path: string, initial: ProjectFile) {
-    this.path = path;
+  constructor(path: string, initial: ProjectFile, opts?: { temp?: boolean }) {
+    this._path = path;
+    this.temp = new Store<boolean>(opts?.temp ?? false);
     this.store = new Store(initial);
     const seconds = Math.max(1, settingsStore.get().autosaveSeconds);
     this.intervalTimer = window.setInterval(() => {
@@ -1205,6 +1229,17 @@ export class ProjectSession {
         void this.save();
       }
     }, seconds * 1000);
+  }
+
+  /** Where autosave writes. Changes only through relocate(). (Was `readonly path: string`.) */
+  get path(): string {
+    return this._path;
+  }
+
+  /** True once the USER changed the project: commit/commitFrom/undo/redo that changed state,
+   *  and replace() unless called with { edit: false }. Never reset. Drives the close prompt. */
+  get edited(): boolean {
+    return false;
   }
 
   get project(): ProjectFile {
@@ -1232,8 +1267,9 @@ export class ProjectSession {
     this.markDirty();
   }
 
-  /** Replace state without a history entry (e.g. media relink fixups). */
-  replace(next: ProjectFile): void {
+  /** Replace state without a history entry (e.g. media relink fixups).
+   *  `edit: false` = a fixup the user did not make (default true). */
+  replace(next: ProjectFile, _opts?: { edit?: boolean }): void {
     if (next === this.store.get()) return;
     this.store.set(next);
     this.markDirty();
@@ -1330,6 +1366,13 @@ export class ProjectSession {
     } while (this.pendingSave && !this.disposed);
   }
 
+  /** Move autosave to `dest` and write the current state there, coalescing with any in-flight
+   *  write (edits made during it included). Failure: path reverts, the write's own error is
+   *  re-thrown. Does NOT touch `temp` or recents; callers do. */
+  async relocate(_dest: string): Promise<void> {
+    throw new Error("not implemented");
+  }
+
   /** Flush and stop timers (called when leaving the editor). */
   async dispose(): Promise<void> {
     window.clearTimeout(this.debounceTimer);
@@ -1365,6 +1408,14 @@ export const currentSession = new Store<ProjectSession | null>(null);
  *  lets a temporary project be flushed to a path that startup cleanup deletes.
  *  Resolves true when there is nothing to confirm. */
 export async function confirmLeaveCurrentSession(): Promise<boolean> {
+  // A session that must not be torn down (a running export) refuses outright,
+  // before any keep/discard prompt could be shown for it.
+  if (leaveBlockedReason() !== null) return false;
   const guard = currentSession.get()?.leaveGuard;
   return guard ? await guard() : true;
+}
+
+/** The open session's blockLeave reason, or null. */
+export function leaveBlockedReason(): string | null {
+  return currentSession.get()?.blockLeave ?? null;
 }

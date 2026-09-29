@@ -1,0 +1,6 @@
+{
+  "video": ["mp4", "m4v", "mov", "mkv", "avi", "webm", "wmv", "mts", "m2ts", "3gp", "mpg", "mpeg"],
+  "gif": ["gif"],
+  "image": ["png", "jpg", "jpeg", "webp", "bmp"],
+  "audio": ["mp3", "wav", "flac", "aac", "m4a", "ogg"]
+}
