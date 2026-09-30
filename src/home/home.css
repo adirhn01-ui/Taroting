@@ -341,3 +341,40 @@ html[data-rescue-nav] #home-settings:focus-visible {
   font-weight: 600;
   color: var(--accent-strong);
 }
+
+/* ---------- New image dialog (new-image-dialog.ts) ----------
+   Its rows, segmented control and number fields are the export dialog's own
+   classes (editor/export/export.css, imported by the dialog's chunk); only
+   what that sheet has no rule for lives here. */
+/* The export dialog's own width: its rows are that sheet's, and at 500px the
+   four Background choices ran past the control column into a scrollbar. */
+.nimg-modal {
+  width: 560px;
+  max-width: min(560px, calc(100vw - 48px));
+}
+/* "From a photo" is the other way in, not a step of this form: parked on the
+   left, away from Cancel and Create. */
+.nimg-from-photo {
+  margin-right: auto;
+}
+/* The small chip on each Background choice. Fixed content colours, like the
+   canvas itself: a background is part of the picture, not of the theme. */
+.nimg-swatch {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid var(--border-strong);
+}
+.nimg-swatch--transparent {
+  background: repeating-conic-gradient(#c8c8c8 0 25%, #ffffff 0 50%) 0 0 / 6px 6px;
+}
+.nimg-swatch--white {
+  background: #ffffff;
+}
+.nimg-swatch--black {
+  background: #000000;
+}
+/* (.nimg-swatch--colour is painted through the CSSOM with the picked value.
+   The colour picker it opens is lifted above the modal by color-picker.css's
+   own --z-modal-popover rule, not here.) */

@@ -113,6 +113,9 @@
   --z-theater-bar: 300;
   --z-menu: 1000;
   --z-modal: 1100;
+  /* a popover a modal opens over itself (the colour picker from a dialog):
+     above its own modal, still under toasts */
+  --z-modal-popover: 1150;
   --z-toast: 1200;
 }
 

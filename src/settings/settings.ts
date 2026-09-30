@@ -85,13 +85,12 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   imgPanHold: "Hold to pan (image)",
 };
 
-/** The screens that have a ShortcutManager TODAY. The conflict warning names a
- *  mode, and "Ctrl+Z (image)" would point at a screen the user cannot open.
- *  The shared actions (undo, redo, save, copy, delete, …) are editor actions
- *  too, so their clashes already show as "(editor)"; the image-only `img*`
- *  actions show none until `"image"` joins this list — which it does together
- *  with the image editor itself, not before. */
-export const LIVE_MODES: readonly ShortcutMode[] = ["editor", "viewer"];
+/** The screens that have a ShortcutManager. The conflict warning names a mode,
+ *  so a mode joins this list only together with the screen that binds it —
+ *  "Ctrl+Z (image)" must never point at a screen the user cannot open. The
+ *  image editor mounts `new ShortcutManager("image")`, so image clashes are
+ *  real and shown. */
+export const LIVE_MODES: readonly ShortcutMode[] = ["editor", "viewer", "image"];
 
 /** `findConflicts` restricted to LIVE_MODES — the one result the Shortcuts card
  *  reads for both its row marks and its warning. */

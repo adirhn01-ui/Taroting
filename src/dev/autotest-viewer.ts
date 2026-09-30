@@ -683,27 +683,69 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
   await test("viewer-photo-canvas", async () => {
     const t0 = performance.now();
     let tempPath = "";
+    // A photo opened as a project is an IMAGE project, mounted by the image
+    // editor — which publishes __tarotingImageDev, never the video editor's
+    // __tarotingDev, so the video editor's mount wait cannot see it.
+    const imageHook = (): { session: ProjectSession } | undefined =>
+      (window as unknown as { __tarotingImageDev?: { session: ProjectSession } }).__tarotingImageDev;
+    // The image editor's lazy chunk, as far as this page can tell: Vite's dev
+    // <style> for each of its CSS imports (tagged with the file), plus any
+    // resource-timing entry. The timing buffer holds 250 entries and may be
+    // full by now, which is why the probe is also shown to SEE the chunk once
+    // it has loaded.
+    const imageChunk = (): string[] =>
+      [
+        ...Array.from(document.querySelectorAll("style[data-vite-dev-id]"), (s) => s.getAttribute("data-vite-dev-id") ?? ""),
+        ...performance.getEntriesByType("resource").map((e) => e.name),
+      ].filter((u) => u.replace(/\\/g, "/").includes("/src/image/"));
     try {
       needFixtures();
       await setOpenWith("viewer");
       await openInViewer("IMG_7.JPG");
       await until(() => stillShown(200, 150), 3_000, () => `IMG_7.JPG (200x150) — ${viewerState()}`);
-      const prev = editorDev();
+      // The run's first image project: every block before this one (Home, the
+      // video editor, the viewer, Settings) must have left the chunk unloaded,
+      // because nothing may prefetch it.
+      const early = imageChunk();
+      assert(
+        early.length === 0,
+        `the image editor's chunk was loaded before any image project was opened: ${early.slice(0, 3).map(baseName).join(", ")}`,
+      );
+      const prev = imageHook();
       await viewerMenu("Open as project");
-      const session = await waitEditor(prev, "Open as project on IMG_7.JPG");
+      const hook = await until(
+        () => {
+          const h = imageHook();
+          return h && h !== prev && $(".imged") && $("#ed-save") ? h : null;
+        },
+        8_000,
+        () => `the image editor to mount (Open as project on IMG_7.JPG) — on screen: ${$(".imged") ? "image editor" : $(".editor") ? "video editor" : $("#vw") ? `viewer (${viewerState()})` : $(".home") ? "home" : "?"}, dialog ${$(".modal-backdrop") ? "OPEN" : "none"}`,
+      );
+      const session = hook.session;
       tempPath = session.path;
-      const tl = session.project.timeline;
+      const p = session.project;
+      assert(
+        p.kind === "image" && p.schema === 3,
+        `Open as project on a photo made kind ${String(p.kind)} schema ${p.schema}, not an image project (kind "image", schema 3)`,
+      );
+      const tl = p.timeline;
       // 200x150 is neither the 1920x1080 default nor any preset, so only a
       // canvas adopted from the photo lands here.
       assert(
         tl.width === 200 && tl.height === 150,
         `the photo's project canvas is ${tl.width}x${tl.height}, not the photo's 200x150`,
       );
+      assert(session.temp.get() === true, "Open as project made a PERMANENT image project — it must be temporary");
+      const late = imageChunk();
+      assert(
+        late.length > 0,
+        "the image editor is on screen yet no /src/image/ module shows as loaded — the lazy-chunk check above is blind",
+      );
       // Discarded directly: Back → Discard → the viewer remounting is
-      // viewer-open-as-project's to pin, and here it only cost a mount.
+      // viewer-open-as-project's (and image-viewer-exits') to pin.
       await discardTempSession(session);
       await waitGone(tempPath, "the discarded temp project is still on disk");
-      return `IMG_7.JPG → temp project with a 200x150 canvas → discarded — ${ms(t0)}`;
+      return `image chunk unloaded until now (${late.length} of its modules after); IMG_7.JPG → temporary IMAGE project (schema 3) with a 200x150 canvas → discarded — ${ms(t0)}`;
     } finally {
       await backHome();
       if (tempPath) await ipc.deleteProject(tempPath).catch(() => {});

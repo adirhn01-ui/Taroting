@@ -1115,8 +1115,28 @@ export function sanitizeProject(p: ProjectFile): ProjectFile {
   // [16, 8192], enforced by setProjectCanvas), but it is arithmetic: NaN in,
   // NaN out. A canvas of 0 is what `u32` lets through and what `scale=0:0`
   // chokes on.
-  const width = Number.isFinite(t.width) ? clampCanvas(t.width) : 1920;
-  const height = Number.isFinite(t.height) ? clampCanvas(t.height) : 1080;
+  //
+  // An IMAGE project's canvas has its own rule (clampImageCanvas: any integer
+  // in [1, 65535]). This branch has to live here, in the main chunk, because
+  // ipc.loadProject runs this function BEFORE the image editor is dispatched
+  // — the even/8192 rule would otherwise turn a 641×361 photo into 642×362 on
+  // every open. Stroke and structure checks stay in the image chunk
+  // (validateImageProject).
+  const img = p.kind === "image";
+  const width = Number.isFinite(t.width)
+    ? img
+      ? clampImageCanvas(t.width)
+      : clampCanvas(t.width)
+    : img
+      ? 1
+      : 1920;
+  const height = Number.isFinite(t.height)
+    ? img
+      ? clampImageCanvas(t.height)
+      : clampCanvas(t.height)
+    : img
+      ? 1
+      : 1080;
 
   // THE ONE STRUCTURAL REPAIR, and the reason it is the only one.
   //
@@ -1219,12 +1239,17 @@ export function checkInvariants(p: ProjectFile): string[] {
     else if (seenAudio) errors.push("video track after an audio track (non-contiguous)");
   }
 
-  // canvas: even integers within bounds
+  // canvas: even integers within bounds — or, for an image project, any
+  // integer in [1, IMAGE_CANVAS_MAX_SIDE] (the clampImageCanvas rule)
+  const img = p.kind === "image";
   for (const [dim, val] of [
     ["width", p.timeline.width],
     ["height", p.timeline.height],
   ] as const) {
-    if (!Number.isInteger(val) || val % 2 !== 0 || val < MIN_CANVAS || val > MAX_CANVAS)
+    if (img) {
+      if (!Number.isInteger(val) || val < 1 || val > IMAGE_CANVAS_MAX_SIDE)
+        errors.push(`timeline ${dim} ${val} not an integer in [1, ${IMAGE_CANVAS_MAX_SIDE}]`);
+    } else if (!Number.isInteger(val) || val % 2 !== 0 || val < MIN_CANVAS || val > MAX_CANVAS)
       errors.push(`timeline ${dim} ${val} not an even integer in [16, 8192]`);
   }
 

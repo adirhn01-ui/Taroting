@@ -1,0 +1,102 @@
+/* Ink surface, brush cursor and ruler. Loaded with the image chunk only.
+
+   Stacking: everything here sits at the stage-overlay level (the same token as
+   the video editor's manipulation chrome) and is ordered by DOM: the ink surface
+   is kept before the ruler, so the ruler is on top of it. */
+
+/* The pointer surface over the canvas, present only while an ink tool is
+   active. touch-action: none so a finger or pen draws instead of scrolling. */
+.imged-ink {
+  position: absolute;
+  inset: 0;
+  z-index: var(--z-stage-overlay);
+  touch-action: none;
+  user-select: none;
+  cursor: crosshair;
+  overflow: hidden;
+}
+
+/* The brush circle, at the tool's size on screen. It sits over picture
+   content of any colour, so like the checkerboard it is content-neutral rather
+   than theme-derived: a white ring with a dark hairline either side reads on
+   black, on white and on everything between. */
+.imged-ink__cursor {
+  position: absolute;
+  left: 0;
+  top: 0;
+  box-sizing: border-box;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.55),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+  will-change: transform;
+}
+.imged-ink__cursor[hidden] {
+  display: none;
+}
+
+/* ---------- ruler ----------
+   Built only from tokens: a --bg-raised body at 90%, --border-strong ticks
+   along both long edges (minor and every tenth major, spacing set from the
+   zoom through --imged-ruler-minor/major), a mono angle readout in --text-2,
+   and the edge ink is following lit in --accent. Focus uses the app's own
+   :focus-visible ring. */
+.imged-ruler {
+  --imged-ruler-minor: 10px;
+  --imged-ruler-major: 100px;
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: var(--z-stage-overlay);
+  transform-origin: 0 0;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-top: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
+  background-color: color-mix(in srgb, var(--bg-raised) 90%, transparent);
+  background-image:
+    repeating-linear-gradient(to right, var(--border-strong) 0 1px, transparent 1px var(--imged-ruler-minor)),
+    repeating-linear-gradient(to right, var(--border-strong) 0 1px, transparent 1px var(--imged-ruler-major)),
+    repeating-linear-gradient(to right, var(--border-strong) 0 1px, transparent 1px var(--imged-ruler-minor)),
+    repeating-linear-gradient(to right, var(--border-strong) 0 1px, transparent 1px var(--imged-ruler-major));
+  background-size:
+    100% 7px,
+    100% 13px,
+    100% 7px,
+    100% 13px;
+  background-position:
+    0 0,
+    0 0,
+    0 100%,
+    0 100%;
+  background-repeat: repeat-x;
+  box-shadow: var(--shadow-1);
+  touch-action: none;
+  user-select: none;
+  cursor: grab;
+}
+.imged-ruler:active {
+  cursor: grabbing;
+}
+.imged-ruler--edge-top {
+  border-top-color: var(--accent);
+  box-shadow:
+    var(--shadow-1),
+    inset 0 1px 0 var(--accent);
+}
+.imged-ruler--edge-bottom {
+  border-bottom-color: var(--accent);
+  box-shadow:
+    var(--shadow-1),
+    inset 0 -1px 0 var(--accent);
+}
+.imged-ruler__readout {
+  font-size: var(--fs-11);
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}

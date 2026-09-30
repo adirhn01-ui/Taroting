@@ -60,3 +60,38 @@ describe("the image chunk boundary", () => {
     expect(editor).toContain('await import("../image/image-editor")');
   });
 });
+
+/** The modules the boot screen (Home) and the always-loaded shell pull in. */
+const BOOT_PATH = [
+  "src/main.ts",
+  "src/home/home.ts",
+  "src/core/open-media.ts",
+  "src/core/app-close.ts",
+  "src/core/session.ts",
+  "src/core/ipc.ts",
+  "src/core/types.ts",
+  "src/core/diagnostics.ts",
+];
+/** A static import of a module that only a lazy screen needs. */
+const staticImportOf = (mod: string): RegExp =>
+  // String.raw: in a plain template literal "\s" collapses to "s" and the
+  // pattern silently matches nothing.
+  new RegExp(String.raw`^\s*import\b[^;]*?from\s+["'](?:\.\.?\/)+(?:core\/)?${mod}["']`, "m");
+
+describe("off the boot path", () => {
+  // Startup parses only what Home needs. Photo/blank image-project creation
+  // and the export run hold are used by lazy screens alone (open-media awaits
+  // the former; both export dialogs import the latter), and one static import
+  // from a boot module would put them back on every launch unnoticed.
+  it("no boot module statically imports image-project or export-hold", () => {
+    for (const f of BOOT_PATH) {
+      const src = read(f);
+      expect(src, f).not.toMatch(staticImportOf("image-project"));
+      expect(src, f).not.toMatch(staticImportOf("export-hold"));
+    }
+  });
+
+  it("open-media reaches image-project only through the awaited dynamic import", () => {
+    expect(read("src/core/open-media.ts")).toContain('await import("./image-project")');
+  });
+});

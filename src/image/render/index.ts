@@ -1,15 +1,20 @@
 // The one Canvas2D renderer for image projects, preview AND export (WYSIWYG):
 // `renderComposite` draws a ProjectFile through a `RenderResources` provider.
 // The preview hands it working-resolution resources sized to the stage's
-// device pixels; export hands it full-resolution ones on an OffscreenCanvas.
-// No Web Worker anywhere (the CSP says `worker-src 'none'`).
+// device pixels (`PreviewResources`); export hands it full-resolution ones on
+// an OffscreenCanvas (render/export.ts). No Web Worker anywhere (the CSP says
+// `worker-src 'none'`).
 //
-// Not implemented yet: the declarations below are the contract the rest of the
-// image editor compiles against. The stubs are INERT rather than throwing,
-// because the editor shell constructs `PreviewResources` and renders on mount.
+// Nothing here runs until an image project is open: this module is only
+// reachable through the lazily loaded image chunk, and it allocates no canvas
+// or bitmap at import time.
 
 import type { ProjectFile } from "../../core/types";
-import type { Layer } from "../layers";
+import { layersOf, type Layer } from "../layers";
+import { pickCheckerPalette } from "./checker";
+import { releaseRenderScratch } from "./composite";
+import { DrawingRasters } from "./drawings";
+import { PhotoCache } from "./photos";
 
 export type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
@@ -46,46 +51,47 @@ export interface RenderResources {
   drawingRaster(l: Layer, view: ViewXf): CanvasImageSource | null;
 }
 
-export function renderComposite(
-  ctx: Ctx2D,
-  doc: ProjectFile,
-  res: RenderResources,
-  view: ViewXf,
-  opts: RenderOpts,
-): void;
-export function renderComposite(): void {
-  // inert until implemented
-}
+export { renderComposite } from "./composite";
 
 /** Preview resources: working bitmaps sized to stage device px, adjusted
  *  caches, per-drawing-layer rasters for the current view; invalidated by
  *  identity. */
 export class PreviewResources implements RenderResources {
-  constructor(getDoc: () => ProjectFile);
-  constructor() {
-    // inert until implemented
+  private readonly photos: PhotoCache;
+  private readonly drawings: DrawingRasters;
+  private readonly changeListeners = new Set<() => void>();
+  private disposed = false;
+  private pruneQueued = false;
+
+  constructor(private readonly getDoc: () => ProjectFile) {
+    const emit = (): void => this.emitChange();
+    this.photos = new PhotoCache(emit);
+    this.drawings = new DrawingRasters(emit);
+    // The checker palette follows the app theme once per mount (content, not
+    // chrome: it never re-themes under the user mid-edit).
+    pickCheckerPalette();
   }
 
-  photo(l: Layer, needScale: number): CanvasImageSource | null;
-  photo(): null {
-    return null;
+  photo(l: Layer, needScale: number): CanvasImageSource | null {
+    this.queuePrune();
+    return this.photos.photo(l, needScale);
   }
 
-  drawingRaster(l: Layer, view: ViewXf): CanvasImageSource | null;
-  drawingRaster(): null {
-    return null;
+  drawingRaster(l: Layer, view: ViewXf): CanvasImageSource | null {
+    this.queuePrune();
+    return this.drawings.raster(this.getDoc(), l, view);
   }
 
   /** tell the cache the current zoom/stage so it picks working sizes (debounced re-decode) */
-  setView(view: ViewXf, stageDevice: { w: number; h: number }): void;
-  setView(): void {
-    // inert until implemented
+  setView(view: ViewXf, stageDevice: { w: number; h: number }): void {
+    void view;
+    this.drawings.setStage(stageDevice.w, stageDevice.h);
   }
 
   /** fires when an async decode/adjust finishes → caller requests a render */
-  onChange(fn: () => void): () => void;
-  onChange(): () => void {
-    return () => {};
+  onChange(fn: () => void): () => void {
+    this.changeListeners.add(fn);
+    return () => this.changeListeners.delete(fn);
   }
 
   /** per-layer status for the Layers panel */
@@ -93,25 +99,64 @@ export class PreviewResources implements RenderResources {
     state: "loading" | "ready" | "failed";
     message?: string;
     natural?: { w: number; h: number };
-  };
-  status(): { state: "loading" } {
-    return { state: "loading" };
+  } {
+    const l = layersOf(this.getDoc()).find((x) => x.trackId === trackId);
+    if (l && l.media.generator) return { state: "ready" };
+    return this.photos.status(l?.media);
   }
 
   /** drop cached pixels for one layer (relink, adjust reset) or all */
-  invalidate(trackId?: string): void;
-  invalidate(): void {
-    // inert until implemented
+  invalidate(trackId?: string): void {
+    if (trackId === undefined) {
+      this.photos.invalidate();
+      this.drawings.invalidate();
+      return;
+    }
+    this.drawings.invalidate(trackId);
+    const l = layersOf(this.getDoc()).find((x) => x.trackId === trackId);
+    if (l) this.photos.invalidate(l.media.id);
   }
 
-  /** decoded (EXIF-applied) dims disagree with MediaRef width/height → caller
-   *  repairs via session.replace(updateMedia(...), { edit: false }) */
-  onMediaDims(fn: (mediaId: string, w: number, h: number) => void): () => void;
-  onMediaDims(): () => void {
-    return () => {};
+  /** The decoded size of a photo whose MediaRef has NO usable size (a crafted
+   *  or pre-probe file) → the caller records it via
+   *  session.replace(updateMedia(...), { edit: false }). A recorded size is
+   *  never overridden by the decoder (see photos.ts): the photo is drawn into
+   *  it whatever the engine decoded. */
+  onMediaDims(fn: (mediaId: string, w: number, h: number) => void): () => void {
+    return this.photos.onMediaDims(fn);
   }
 
   dispose(): void {
-    // inert until implemented
+    if (this.disposed) return;
+    this.disposed = true;
+    this.photos.dispose();
+    this.drawings.dispose();
+    this.changeListeners.clear();
+    releaseRenderScratch();
+  }
+
+  private emitChange(): void {
+    if (this.disposed) return;
+    for (const fn of this.changeListeners) fn();
+  }
+
+  /** Once per render pass: let go of pixels for layers that were deleted, and
+   *  of drawing rasters for layers that are hidden (they hold none). */
+  private queuePrune(): void {
+    if (this.pruneQueued) return;
+    this.pruneQueued = true;
+    queueMicrotask(() => {
+      this.pruneQueued = false;
+      if (this.disposed) return;
+      const layers = layersOf(this.getDoc());
+      const media = new Set<string>();
+      const visible = new Set<string>();
+      for (const l of layers) {
+        media.add(l.media.id);
+        if (!l.hidden) visible.add(l.trackId);
+      }
+      this.photos.retain(media);
+      this.drawings.retain(visible);
+    });
   }
 }

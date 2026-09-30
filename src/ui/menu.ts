@@ -141,7 +141,11 @@ function removeListeners(): void {
   releaseShortcuts = null;
 }
 
-export function showMenu(x: number, y: number, menuItems: MenuItem[]): void {
+/** `flipAboveY`: for a menu anchored to a control, the anchor's top edge. When
+ *  the menu does not fit below `y` it opens ABOVE that edge (as native menus
+ *  do) instead of being clamped up over the control that opened it. Omitted,
+ *  the menu is only clamped into the viewport — every point-anchored menu. */
+export function showMenu(x: number, y: number, menuItems: MenuItem[], flipAboveY?: number): void {
   const wasOpen = isOpen();
   // Read before the host is rebuilt below: emptying it drops focus to <body>,
   // so on a menu that replaces another menu there would be nothing left to read.
@@ -175,7 +179,9 @@ export function showMenu(x: number, y: number, menuItems: MenuItem[]): void {
   const rect = el.getBoundingClientRect();
   const pad = 4;
   const left = Math.max(pad, Math.min(x, window.innerWidth - rect.width - pad));
-  const top = Math.max(pad, Math.min(y, window.innerHeight - rect.height - pad));
+  const fitsBelow = y + rect.height <= window.innerHeight - pad;
+  const want = !fitsBelow && flipAboveY !== undefined ? flipAboveY - rect.height : y;
+  const top = Math.max(pad, Math.min(want, window.innerHeight - rect.height - pad));
   el.style.left = `${left}px`;
   el.style.top = `${top}px`;
 

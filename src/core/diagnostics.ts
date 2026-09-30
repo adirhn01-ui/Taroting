@@ -527,7 +527,7 @@ export function buildReport(ctx: ReportContext): string {
     out.push(row("Last export", s.lastExportDir ? "set" : "not set"));
     out.push(row("Shortcuts", custom === 0 ? "default" : `${custom} customised`));
     // A count only: the colours themselves say nothing a bug needs.
-    out.push(row("Ink colours", Array.isArray(s.inkColors) ? s.inkColors.length : 0));
+    out.push(row("Ink colors", Array.isArray(s.inkColors) ? s.inkColors.length : 0));
   }
 
   const recent = ctx.recentErrors;

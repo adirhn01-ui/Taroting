@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::image_rules;
 use super::schema::{self, ProjectFile};
 use crate::error::{AppError, Result};
 use crate::paths;
@@ -252,7 +253,44 @@ fn read_recents_checked() -> Recents {
     }
 }
 
+/// The one lock every recents.json read-modify-write holds, from the read to
+/// the write. Until image saves, every writer was a sync command on the main
+/// thread and could not overlap another; a project card's commit now stamps
+/// its entry from a blocking-pool thread (`set_recent_thumb`) while a save, an
+/// open or Home's thumbnail backfill runs on the main one. Unlocked, one of the
+/// two updates was lost (whichever read first wrote last, from its stale copy)
+/// and both `atomic_write`s shared one `recents.json.tmp`, so their bytes could
+/// interleave into the file that is then renamed into place.
+///
+/// Held only across the file work itself — never across ffmpeg, a probe or an
+/// await — and never taken twice on one thread: `std::sync::Mutex` is not
+/// re-entrant, so a helper that locks must not call another that does.
+static RECENTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Poison-tolerant: a poisoned lock only means an earlier holder panicked,
+/// which under `panic = "abort"` cannot happen in a release build — never
+/// worth taking recents (or the app) down over.
+fn lock_recents() -> std::sync::MutexGuard<'static, ()> {
+    RECENTS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Read, edit and write back the recents index as ONE step under
+/// `RECENTS_LOCK`. `edit` returns whether it changed anything; an unchanged
+/// index is not rewritten. The write follows `write_recents_checked`, so an
+/// index that exists but could not be read is never replaced.
+fn update_recents(edit: impl FnOnce(&mut RecentsIndex) -> bool) -> Result<()> {
+    let _guard = lock_recents();
+    let mut recents = read_recents_checked();
+    if !edit(&mut recents.index) {
+        return Ok(());
+    }
+    write_recents_checked(&recents)
+}
+
+/// A plain read, under the lock so it never meets a write halfway through its
+/// renames (the primary rotated to `.bak`, the new one not yet in place).
 fn read_recents() -> RecentsIndex {
+    let _guard = lock_recents();
     read_recents_checked().index
 }
 
@@ -275,21 +313,52 @@ fn write_recents_checked(recents: &Recents) -> Result<()> {
 }
 
 fn upsert_recent(mut item: RecentItem) -> Result<()> {
-    let mut recents = read_recents_checked();
-    // Preserve a prior openedAt when the caller doesn't supply one, and refresh
-    // the on-disk size so callers don't all have to stat.
-    if let Some(prev) = recents.index.items.iter().find(|r| r.path == item.path) {
-        if item.opened_at.is_none() {
-            item.opened_at = prev.opened_at.clone();
-        }
-    }
+    // Refresh the on-disk size so callers don't all have to stat — before the
+    // lock, which covers the recents file and nothing else.
     if let Ok(meta) = std::fs::metadata(&item.path) {
         item.size_bytes = meta.len();
     }
-    recents.index.items.retain(|r| r.path != item.path);
-    recents.index.items.insert(0, item);
-    recents.index.items.truncate(MAX_RECENTS);
-    write_recents_checked(&recents)
+    update_recents(|index| {
+        // Preserve a prior openedAt when the caller doesn't supply one.
+        if let Some(prev) = index.items.iter().find(|r| r.path == item.path) {
+            if item.opened_at.is_none() {
+                item.opened_at = prev.opened_at.clone();
+            }
+            // An image project's card is a RENDERED picture the image editor
+            // writes (`set_recent_thumb`), never a frame the backend can look
+            // up, so a save, which knows no thumbnail, must not blank the one
+            // the card already has.
+            if item.kind.as_deref() == Some("image") && item.thumb.is_none() {
+                item.thumb = prev.thumb.clone();
+            }
+        }
+        index.items.retain(|r| r.path != item.path);
+        index.items.insert(0, item);
+        index.items.truncate(MAX_RECENTS);
+        true
+    })
+}
+
+/// Point an image project's recents card at the picture the image editor just
+/// rendered (`image_save`, `ProjectThumb`). Only an EXISTING entry is touched:
+/// a card appears when a project is saved or opened, never because a
+/// thumbnail landed. A temporary project has no card at all, so nothing is
+/// read or written for one. Best-effort like every recents side effect — a
+/// failure here must not fail the save that produced the picture.
+pub(crate) fn set_recent_thumb(project_path: &str, thumb: &str) {
+    if is_temp_project_path(project_path) {
+        return;
+    }
+    let _ = update_recents(|index| {
+        let Some(entry) = index.items.iter_mut().find(|r| r.path == project_path) else {
+            return false;
+        };
+        if entry.thumb.as_deref() == Some(thumb) {
+            return false;
+        }
+        entry.thumb = Some(thumb.to_string());
+        true
+    });
 }
 
 #[tauri::command]
@@ -314,9 +383,10 @@ pub fn list_recents() -> Result<RecentsIndex> {
 
 #[tauri::command]
 pub fn remove_recent(path: String) -> Result<()> {
-    let mut recents = read_recents_checked();
-    recents.index.items.retain(|r| r.path != path);
-    write_recents_checked(&recents)
+    update_recents(|index| {
+        index.items.retain(|r| r.path != path);
+        true
+    })
 }
 
 /* ------------------------------------------------------------------ */
@@ -343,14 +413,25 @@ fn mtime_ms_of(meta: &std::fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
-/// The `.bak` sibling, parsed as JSON. `None` when it is absent or corrupt too.
+/// The `.bak` sibling, parsed as JSON. `None` when it is absent or corrupt too
+/// (or over the `.trt` size cap).
 fn read_bak_value(path: &Path) -> Option<Value> {
-    let bytes = std::fs::read(bak_path(path)).ok()?;
+    let bytes = image_rules::read_capped(&bak_path(path)).ok()?;
     serde_json::from_slice::<Value>(&bytes).ok()
 }
 
+/// An oversize `.trt` (see `image_rules::read_capped`) as the user-facing
+/// refusal; every other io error keeps its own kind.
+fn capped_read_error(e: std::io::Error) -> AppError {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        AppError::BadInput(e.to_string())
+    } else {
+        e.into()
+    }
+}
+
 fn read_project_value(path: &Path) -> Result<(Value, bool)> {
-    match std::fs::read(path) {
+    match image_rules::read_capped(path) {
         Ok(bytes) => {
             if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                 return Ok((v, false));
@@ -375,7 +456,7 @@ fn read_project_value(path: &Path) -> Result<(Value, bool)> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             read_bak_value(path).map(|v| (v, true)).ok_or_else(|| e.into())
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(capped_read_error(e)),
     }
 }
 
@@ -936,6 +1017,12 @@ pub fn load_project(path: String) -> Result<LoadedProject> {
     let schema::Migrated { mut value, from } = schema::migrate(raw)?;
     let typed: ProjectFile = ProjectFile::deserialize(&value)
         .map_err(|e| AppError::BadInput(format!("invalid project file: {e}")))?;
+    // A drawing is an image project's layer; in a video project it is a
+    // crafted or damaged file, refused before the editor sees it. The full
+    // stroke validation is NOT run here: a damaged stroke must not make an
+    // image project unopenable (the image editor drops it with a notice), and
+    // `save_project` re-validates everything it writes.
+    image_rules::refuse_misplaced_drawings(&typed)?;
 
     // Verify media identity (path exists + size/mtime match). Generated media
     // (text/solid) has no file identity — its `path` is a display label.
@@ -983,31 +1070,43 @@ fn recent_kind(typed: &ProjectFile) -> Option<String> {
     (typed.kind.as_deref() == Some("image")).then(|| "image".to_string())
 }
 
+/// The duration a recents card shows. An image project has none: its layers
+/// are one-unit clips (`srcOut 1`), so the timeline arithmetic would put a
+/// "0:01" on a picture's card.
+fn recent_duration(typed: &ProjectFile) -> f64 {
+    if recent_kind(typed).is_some() {
+        0.0
+    } else {
+        finite_duration(typed.timeline.duration())
+    }
+}
+
 /// Record that `path` was just opened. Updates the existing recents entry's
 /// `opened_at`, or inserts a fresh entry built from the loaded project.
 fn stamp_opened(path: &str, typed: &ProjectFile) {
     let now = now_iso8601();
-    let mut recents = read_recents_checked();
-    if let Some(entry) = recents.index.items.iter_mut().find(|r| r.path == path) {
-        entry.opened_at = Some(now);
-    } else {
-        let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        recents.index.items.insert(
-            0,
-            RecentItem {
-                path: path.to_string(),
-                name: typed.name.clone(),
-                modified_at: typed.modified_at.clone(),
-                duration_sec: finite_duration(typed.timeline.duration()),
-                thumb: None,
-                size_bytes,
-                opened_at: Some(now),
-                kind: recent_kind(typed),
-            },
-        );
-        recents.index.items.truncate(MAX_RECENTS);
-    }
-    let _ = write_recents_checked(&recents);
+    let _ = update_recents(|index| {
+        if let Some(entry) = index.items.iter_mut().find(|r| r.path == path) {
+            entry.opened_at = Some(now);
+        } else {
+            let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            index.items.insert(
+                0,
+                RecentItem {
+                    path: path.to_string(),
+                    name: typed.name.clone(),
+                    modified_at: typed.modified_at.clone(),
+                    duration_sec: recent_duration(typed),
+                    thumb: None,
+                    size_bytes,
+                    opened_at: Some(now),
+                    kind: recent_kind(typed),
+                },
+            );
+            index.items.truncate(MAX_RECENTS);
+        }
+        true
+    });
 }
 
 #[derive(Debug, Serialize)]
@@ -1054,9 +1153,28 @@ pub fn save_project(
     path: String,
     project: Value,
 ) -> Result<SavedProject> {
+    save_project_at(&cache, path, project)
+}
+
+/// `save_project` minus the Tauri state wrapper, so the tests can drive the
+/// real save path (validation, write, recents) against a scratch cache.
+fn save_project_at(cache: &crate::cache::Cache, path: String, project: Value) -> Result<SavedProject> {
     // Validate before writing — never persist something we can't read back.
     let typed: ProjectFile = ProjectFile::deserialize(&project)
         .map_err(|e| AppError::BadInput(format!("refusing to save invalid project: {e}")))?;
+    // The typed parse is lenient about image-project content (a damaged
+    // stroke is skipped, not refused), so it proves the shape of nothing
+    // there: the raw value about to be written is checked instead. For a
+    // video project this is the drawing refusal plus the schema/kind pairing
+    // the loader insists on; everything else is image-only.
+    let refuse = |e: AppError| match e {
+        AppError::BadInput(m) => AppError::BadInput(format!("refusing to save invalid project: {m}")),
+        other => other,
+    };
+    image_rules::refuse_misplaced_drawings(&typed).map_err(refuse)?;
+    image_rules::check_schema_kind(&typed).map_err(refuse)?;
+    image_rules::validate_image_project(&project, &typed).map_err(refuse)?;
+    let image = recent_kind(&typed).is_some();
 
     atomic_write(
         Path::new(&path),
@@ -1067,8 +1185,13 @@ pub fn save_project(
     // recents. Pressing Back re-saves to a permanent Documents path, which does
     // upsert. Skip both the thumb lookup and the upsert for temp-dir paths.
     if !is_temp_project_path(&path) {
-        // Thumbnail for the recents grid: any cached thumb of the first clip's media.
-        let thumb = first_clip_media(&typed)
+        // Thumbnail for the recents grid: any cached thumb of the first clip's
+        // media. Never for an image project: its card is the rendered picture
+        // the image editor writes, and the raw first photo would overwrite it
+        // (`upsert_recent` keeps the card's current thumb instead).
+        let thumb = (!image)
+            .then(|| first_clip_media(&typed))
+            .flatten()
             .map(|m| {
                 crate::cache::MediaKey {
                     path: m.path.clone(),
@@ -1077,14 +1200,14 @@ pub fn save_project(
                 }
                 .hash()
             })
-            .and_then(|h| crate::media::thumbs::any_thumb_for(&cache, &h))
+            .and_then(|h| crate::media::thumbs::any_thumb_for(cache, &h))
             .map(|p| p.to_string_lossy().into_owned());
 
         upsert_recent(RecentItem {
             path: path.clone(),
             name: typed.name.clone(),
             modified_at: typed.modified_at.clone(),
-            duration_sec: finite_duration(typed.timeline.duration()),
+            duration_sec: recent_duration(&typed),
             thumb,
             size_bytes: 0, // filled by upsert_recent via fs metadata
             opened_at: None, // preserved from any prior entry by upsert_recent
@@ -1105,6 +1228,12 @@ pub fn save_project(
 fn thumb_source_for(path: &str) -> Option<(crate::cache::MediaKey, f64)> {
     let (raw, _) = read_project_value(Path::new(path)).ok()?;
     let typed: ProjectFile = serde_json::from_value(schema::migrate(raw).ok()?.value).ok()?;
+    // An image project's card is the rendered picture its editor writes; a
+    // frame of its first photo would replace it on every Home mount (and
+    // after a cache eviction, until the next edit renders a new one).
+    if typed.kind.as_deref() == Some("image") {
+        return None;
+    }
 
     // Generated media (text/solid) has no file; audio has no frame. Both are
     // skipped exactly as the editor's bin does — placeholder is acceptable.
@@ -1209,21 +1338,21 @@ fn refresh_thumbs_for(
     }
 
     // Persist so future mounts skip generation. Best-effort: a write failure
-    // just means we regenerate next time.
+    // just means we regenerate next time. Only this write-back holds the
+    // recents lock; the ffmpeg work above never does.
     if !resolved.is_empty() {
-        let mut recents = read_recents_checked();
-        let mut changed = false;
-        for (path, thumb) in &resolved {
-            if let Some(entry) = recents.index.items.iter_mut().find(|r| r.path == *path) {
-                if entry.thumb.as_deref() != Some(thumb.as_str()) {
-                    entry.thumb = Some(thumb.clone());
-                    changed = true;
+        let _ = update_recents(|index| {
+            let mut changed = false;
+            for (path, thumb) in &resolved {
+                if let Some(entry) = index.items.iter_mut().find(|r| r.path == *path) {
+                    if entry.thumb.as_deref() != Some(thumb.as_str()) {
+                        entry.thumb = Some(thumb.clone());
+                        changed = true;
+                    }
                 }
             }
-        }
-        if changed {
-            let _ = write_recents_checked(&recents);
-        }
+            changed
+        });
     }
 
     resolved
@@ -1457,10 +1586,20 @@ fn free_path_in(dir: &Path, base: &str, exclude: Option<&Path>) -> Result<PathBu
 }
 
 /// Read a project file as a raw JSON `Value`, preserving unknown fields.
+///
+/// Only an OBJECT is a project. Rename and duplicate assign `value["name"]` /
+/// `value["id"]` next, and serde_json's `IndexMut` panics on an array, a
+/// number, a string or a bool (only `null` becomes an object) — under
+/// `panic = "abort"` that kills the app, every other window's unsaved work
+/// included, for a Home card whose `.trt` was replaced on disk by `[]`.
 fn read_raw_value(path: &Path) -> Result<Value> {
-    let bytes = std::fs::read(path)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|_| AppError::BadInput(format!("{} is not valid JSON", path.display())))
+    let bytes = image_rules::read_capped(path).map_err(capped_read_error)?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::BadInput(format!("{} is not valid JSON", path.display())))?;
+    if !value.is_object() {
+        return Err(AppError::BadInput(format!("{} is not a Taroting project", path.display())));
+    }
+    Ok(value)
 }
 
 /// Rename a project on disk: rewrite its inner `name`, move the file to a
@@ -1496,15 +1635,36 @@ pub fn rename_project(path: String, new_name: String) -> Result<String> {
 
     // Replace the recents entry's path + name, preserving the rest.
     let new_path_str = new_path.to_string_lossy().into_owned();
-    let mut recents = read_recents_checked();
     let name_field = value["name"].as_str().unwrap_or_default().to_string();
-    if let Some(entry) = recents.index.items.iter_mut().find(|r| r.path == path) {
+    let _ = update_recents(|index| {
+        let Some(entry) = index.items.iter_mut().find(|r| r.path == path) else {
+            return false;
+        };
         entry.path = new_path_str.clone();
         entry.name = name_field;
-    }
-    let _ = write_recents_checked(&recents);
+        true
+    });
 
     Ok(new_path_str)
+}
+
+/// A copy of an image project's rendered card, named for the duplicate's own
+/// project id and path (`card_file_name`) and placed beside the original.
+/// `None` (the card shows its placeholder until the copy is first edited) when
+/// the id is not one the save protocol would accept, when the source is not a
+/// rendered card, or when the copy fails.
+fn copy_image_card(src: &Path, new_id: &Value, new_path: &str) -> Option<String> {
+    let name = crate::image_save::card_file_name(new_id.as_str()?, new_path)?;
+    let from_card = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(crate::image_save::CARD_PREFIX));
+    if !from_card {
+        return None;
+    }
+    let dest = src.parent()?.join(name);
+    std::fs::copy(src, &dest).ok()?;
+    Some(dest.to_string_lossy().into_owned())
 }
 
 /// Duplicate a project: copy its raw JSON with a new `name` + `id`, to a
@@ -1531,6 +1691,19 @@ pub fn duplicate_project(path: String, new_name: String, new_id: String) -> Resu
     // Carry the source's duration/thumb across so the new card looks right
     // before it is ever opened+saved.
     let src_recent = read_recents().items.into_iter().find(|r| r.path == path);
+    // From the copied file itself, not the source's recents entry: the file is
+    // what Home will open, and an entry can be missing or stale.
+    let image = value.get("kind").and_then(Value::as_str) == Some("image");
+    let src_thumb = src_recent.as_ref().and_then(|r| r.thumb.clone());
+    let thumb = if image {
+        // An image card is a rendered file named after the project id and
+        // path, which the SOURCE keeps rewriting as it is edited. Sharing that
+        // file would make the copy's card follow the original's edits, so the
+        // copy gets its own (under its own id and path) or no card picture.
+        src_thumb.and_then(|t| copy_image_card(Path::new(&t), &value["id"], &new_path_str))
+    } else {
+        src_thumb
+    };
     upsert_recent(RecentItem {
         path: new_path_str.clone(),
         name: new_name,
@@ -1539,13 +1712,10 @@ pub fn duplicate_project(path: String, new_name: String, new_id: String) -> Resu
             .as_ref()
             .map(|r| finite_duration(r.duration_sec))
             .unwrap_or(0.0),
-        thumb: src_recent.and_then(|r| r.thumb),
+        thumb,
         size_bytes,
         opened_at: None,
-        // From the copied file itself, not the source's recents entry: the
-        // file is what Home will open, and an entry can be missing or stale.
-        kind: (value.get("kind").and_then(Value::as_str) == Some("image"))
-            .then(|| "image".to_string()),
+        kind: image.then(|| "image".to_string()),
     })?;
 
     Ok(new_path_str)
@@ -1560,9 +1730,10 @@ pub fn delete_project(path: String) -> Result<()> {
     bak.push(".bak");
     let _ = std::fs::remove_file(PathBuf::from(bak));
 
-    let mut recents = read_recents_checked();
-    recents.index.items.retain(|r| r.path != path);
-    write_recents_checked(&recents)
+    update_recents(|index| {
+        index.items.retain(|r| r.path != path);
+        true
+    })
 }
 
 pub fn sanitize_filename(name: &str) -> String {
@@ -4164,5 +4335,405 @@ mod tests {
         assert_eq!(out["kind"], "image");
         let video = serde_json::to_value(&index.items[1]).unwrap();
         assert!(video.get("kind").is_none(), "{video}");
+    }
+
+    /* ---------------------------- image projects ---------------------------- */
+
+    /// A photo file with a real PNG signature and a true identity entry for it.
+    /// Nothing here decodes it; what matters is that it RESOLVES, so a `None`
+    /// from the thumbnail resolver is the kind skip and not a missing file.
+    fn photo_media(dir: &Path, id: &str) -> Value {
+        let file = dir.join(format!("{id}.png"));
+        std::fs::write(&file, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13]).unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        serde_json::json!({
+            "id": id, "path": file.to_string_lossy(), "size": meta.len(), "mtimeMs": mtime_ms_of(&meta),
+            "kind": "image", "duration": 0.0, "hasAudio": false, "width": 801, "height": 603
+        })
+    }
+
+    fn drawing_media(id: &str, colour: &str) -> Value {
+        serde_json::json!({
+            "id": id, "path": "Drawing", "size": 0, "mtimeMs": 0, "kind": "image",
+            "duration": 0.0, "hasAudio": false, "width": 640, "height": 480,
+            "generator": { "type": "drawing", "chunks": [[
+                { "t": "pen", "c": colour, "w": 4.5, "o": 1.0, "p": "AB+/AB+/AB+/AB+/" }
+            ]]}
+        })
+    }
+
+    fn layer(id: &str, name: &str, media_id: &str) -> Value {
+        serde_json::json!({ "id": id, "kind": "video", "name": name, "muted": false, "clips": [{
+            "id": format!("c-{id}"), "mediaId": media_id,
+            "timelineStart": 0.0, "srcIn": 0.0, "srcOut": 1.0, "speed": 1.0,
+            "audio": { "volume": 1.0, "muted": false, "fadeInSec": 0.0, "fadeOutSec": 0.0,
+                       "gainOffsetDb": 0.0, "detached": false }
+        }]})
+    }
+
+    /// An image project: schema 3, kind image, the photo layer on top, a
+    /// drawing below it. Its layers are one-unit clips, so a duration taken
+    /// from the timeline would read 1.0 — never the 0 a picture's card shows.
+    fn image_project(id: &str, media: Value, tracks: Value) -> Value {
+        serde_json::json!({
+            "schema": 3, "kind": "image", "app": "taroting", "id": id, "name": "Card",
+            "createdAt": "2026-09-01T00:00:00Z", "modifiedAt": "2026-09-02T00:00:00Z",
+            "image": { "background": "#fafafa" }, "media": media,
+            "timeline": { "fps": { "num": 30, "den": 1 }, "width": 1001, "height": 707, "tracks": tracks },
+            "export": {}
+        })
+    }
+
+    /// The exact entry recents holds for `path`, if any.
+    fn recent(path: &str) -> Option<RecentItem> {
+        read_recents().items.into_iter().find(|r| r.path == path)
+    }
+
+    /// A drawing is refused in a video project on load — as an error, never a
+    /// panic — and the same content as an image project opens, lands in
+    /// recents as an image card with no duration.
+    #[test]
+    fn load_refuses_a_drawing_only_outside_an_image_project() {
+        with_isolated("img-load", |dir| {
+            let media = serde_json::json!([photo_media(dir, "ph"), drawing_media("d1", "#1a2b3c")]);
+            let tracks = serde_json::json!([layer("t1", "Photo", "ph"), layer("t2", "Drawing 1", "d1")]);
+
+            let mut video = image_project("p-1", media.clone(), tracks.clone());
+            video["schema"] = 2.into();
+            video.as_object_mut().unwrap().remove("kind");
+            let bad = dir.join("Crafted.trt");
+            write_json(&bad, &video);
+            match load_project(bad.to_string_lossy().into_owned()) {
+                Err(AppError::BadInput(m)) => assert!(m.contains("drawing"), "{m}"),
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+            assert!(recent(&bad.to_string_lossy()).is_none(), "a refused file gets no card");
+
+            let good = dir.join("Card.trt");
+            write_json(&good, &image_project("p-1", media, tracks));
+            let loaded = load_project(good.to_string_lossy().into_owned()).expect("an image project opens");
+            assert_eq!(loaded.project["kind"], "image");
+            let card = recent(&good.to_string_lossy()).expect("stamped");
+            assert_eq!(card.kind.as_deref(), Some("image"));
+            assert_eq!(card.duration_sec, 0.0);
+        });
+    }
+
+    #[test]
+    fn save_refuses_what_it_could_not_read_back_and_writes_nothing() {
+        with_isolated("img-save-refuse", |dir| {
+            let cache = crate::cache::Cache::new_at(dir.join("cache"));
+            let tracks = serde_json::json!([layer("t2", "Drawing 1", "d1")]);
+            let refused = |name: &str, project: Value, want: &str| {
+                let path = dir.join(name);
+                match save_project_at(&cache, path.to_string_lossy().into_owned(), project) {
+                    Err(AppError::BadInput(m)) => {
+                        assert!(m.starts_with("refusing to save invalid project"), "{m}");
+                        assert!(m.contains(want), "{name}: '{m}' lacks '{want}'");
+                    }
+                    other => panic!("{name}: expected a refusal, got {other:?}"),
+                }
+                assert!(!path.exists() && !bak_path(&path).exists(), "{name} was written");
+            };
+
+            let valid = image_project("p-2", serde_json::json!([drawing_media("d1", "#1a2b3c")]), tracks.clone());
+            let mut video = valid.clone();
+            video["schema"] = 2.into();
+            video.as_object_mut().unwrap().remove("kind");
+            refused("Video.trt", video, "drawing layers");
+
+            let mut stale = valid.clone();
+            stale["schema"] = 2.into();
+            refused("Schema2.trt", stale, "must be schema 3");
+
+            let bad_colour =
+                image_project("p-2", serde_json::json!([drawing_media("d1", "#12345g")]), tracks.clone());
+            refused("Colour.trt", bad_colour, "stroke 1 of layer 'Drawing 1': color is not #rrggbb");
+
+            let mut video3 = image_project("p-2", serde_json::json!([]), serde_json::json!([]));
+            video3.as_object_mut().unwrap().remove("kind");
+            refused("Video3.trt", video3, "only valid for an image project");
+
+            save_project_at(&cache, dir.join("Fine.trt").to_string_lossy().into_owned(), valid)
+                .expect("the valid fixture saves");
+        });
+    }
+
+    /// A saved image project's card: kind image, no duration, and the rendered
+    /// picture the image editor pointed it at survives every later save — a
+    /// save knows no thumbnail, and the first photo must never replace it. A
+    /// video project saved alongside keeps today's card exactly.
+    #[test]
+    fn saving_an_image_project_keeps_its_rendered_card() {
+        with_isolated("img-save", |dir| {
+            let cache = crate::cache::Cache::new_at(dir.join("cache"));
+            let photo = photo_media(dir, "ph");
+            // A cached frame of the photo exists, so a video-style lookup WOULD
+            // find one: the image branch must not.
+            let key = crate::cache::MediaKey {
+                path: photo["path"].as_str().unwrap().into(),
+                size: photo["size"].as_u64().unwrap(),
+                mtime_ms: photo["mtimeMs"].as_u64().unwrap(),
+            };
+            let thumbs = cache.ensure_kind_dir(crate::cache::CacheKind::Thumbs).unwrap();
+            std::fs::write(thumbs.join(format!("{}_0.5.jpg", key.hash())), b"frame").unwrap();
+
+            let project = image_project(
+                "p-3",
+                serde_json::json!([photo.clone(), drawing_media("d1", "#1a2b3c")]),
+                serde_json::json!([layer("t1", "Photo", "ph"), layer("t2", "Drawing 1", "d1")]),
+            );
+            let path = dir.join("Card.trt").to_string_lossy().into_owned();
+            save_project_at(&cache, path.clone(), project.clone()).unwrap();
+            let card = recent(&path).unwrap();
+            assert_eq!(
+                (card.kind.as_deref(), card.duration_sec, card.thumb.as_deref()),
+                (Some("image"), 0.0, None)
+            );
+
+            let rendered = thumbs.join("imgproj-p-3.jpg").to_string_lossy().into_owned();
+            set_recent_thumb(&path, &rendered);
+            save_project_at(&cache, path.clone(), project).unwrap();
+            assert_eq!(recent(&path).unwrap().thumb.as_deref(), Some(rendered.as_str()));
+
+            // The same media as a video project: the frame lookup and the
+            // timeline duration are exactly what they always were.
+            let mut video = image_project(
+                "p-4",
+                serde_json::json!([photo]),
+                serde_json::json!([layer("t1", "Photo", "ph")]),
+            );
+            video["schema"] = 2.into();
+            video.as_object_mut().unwrap().remove("kind");
+            video["timeline"]["tracks"][0]["clips"][0]["srcOut"] = 2.5.into();
+            let vpath = dir.join("Cut.trt").to_string_lossy().into_owned();
+            save_project_at(&cache, vpath.clone(), video).unwrap();
+            let vcard = recent(&vpath).unwrap();
+            assert_eq!((vcard.kind.as_deref(), vcard.duration_sec), (None, 2.5));
+            assert!(vcard.thumb.as_deref().is_some_and(|t| t.contains(&key.hash())), "{:?}", vcard.thumb);
+        });
+    }
+
+    #[test]
+    fn the_thumbnail_backfill_never_replaces_an_image_card() {
+        with_isolated("img-thumb", |dir| {
+            let photo = photo_media(dir, "ph");
+            let tracks = serde_json::json!([layer("t1", "Photo", "ph")]);
+            let image = dir.join("Card.trt");
+            write_json(&image, &image_project("p-5", serde_json::json!([photo.clone()]), tracks.clone()));
+            assert!(thumb_source_for(&image.to_string_lossy()).is_none());
+
+            // The identical project as a video one resolves: the file is there.
+            let mut video = image_project("p-5", serde_json::json!([photo]), tracks);
+            video["schema"] = 2.into();
+            video.as_object_mut().unwrap().remove("kind");
+            let vpath = dir.join("Cut.trt");
+            write_json(&vpath, &video);
+            let (key, _) = thumb_source_for(&vpath.to_string_lossy()).expect("the photo resolves");
+            assert!(key.path.ends_with("ph.png"));
+        });
+    }
+
+    /// A duplicate is an image project too, and its card is its OWN copy of
+    /// the rendered picture (named for the new id), so later edits to the
+    /// original never show on the copy's card.
+    #[test]
+    fn duplicating_an_image_project_carries_its_kind_and_copies_its_card() {
+        with_isolated("img-dup", |dir| {
+            let cache = crate::cache::Cache::new_at(dir.join("cache"));
+            let project = image_project(
+                "p-6",
+                serde_json::json!([drawing_media("d1", "#1a2b3c")]),
+                serde_json::json!([layer("t2", "Drawing 1", "d1")]),
+            );
+            let src = dir.join("Card.trt").to_string_lossy().into_owned();
+            save_project_at(&cache, src.clone(), project).unwrap();
+            let thumbs = cache.ensure_kind_dir(crate::cache::CacheKind::Thumbs).unwrap();
+            let card = thumbs.join("imgproj-p-6.jpg");
+            std::fs::write(&card, b"rendered card of p-6").unwrap();
+            set_recent_thumb(&src, &card.to_string_lossy());
+
+            let copy = duplicate_project(src.clone(), "Card copy".into(), "q-7".into()).unwrap();
+            let entry = recent(&copy).unwrap();
+            assert_eq!(entry.kind.as_deref(), Some("image"));
+            // Named for the copy's own id AND path, exactly as its first card
+            // save will name it.
+            let own = thumbs.join(crate::image_save::card_file_name("q-7", &copy).unwrap());
+            assert!(own.file_name().unwrap().to_string_lossy().starts_with("imgproj-q-7-"), "{own:?}");
+            assert_eq!(entry.thumb.as_deref(), Some(own.to_string_lossy().as_ref()));
+            assert_eq!(std::fs::read(&own).unwrap(), b"rendered card of p-6");
+            assert_eq!(std::fs::read(&card).unwrap(), b"rendered card of p-6", "the original's card is untouched");
+
+            // An id the card name could not be built from: no picture, never a
+            // shared one or a path outside the thumbnail dir.
+            let odd = duplicate_project(src, "Card odd".into(), "..\\x".into()).unwrap();
+            assert_eq!(recent(&odd).unwrap().thumb, None);
+        });
+    }
+
+    /// Only an existing, permanent recents entry takes a rendered card: a
+    /// temporary project has none, and a thumbnail landing never creates one.
+    #[test]
+    fn set_recent_thumb_touches_only_an_existing_permanent_entry() {
+        with_isolated("img-card", |dir| {
+            let temp_dir = paths::temp_projects_dir().unwrap();
+            let temp = temp_dir.join("Quick.trt").to_string_lossy().into_owned();
+            let perm = dir.join("Kept.trt").to_string_lossy().into_owned();
+            let entry = |path: &str| RecentItem {
+                path: path.into(),
+                name: "n".into(),
+                modified_at: "m".into(),
+                duration_sec: 0.0,
+                thumb: None,
+                size_bytes: 0,
+                opened_at: None,
+                kind: Some("image".into()),
+            };
+            write_recents(&RecentsIndex { schema: 1, items: vec![entry(&temp), entry(&perm)] }).unwrap();
+
+            set_recent_thumb(&perm, r"C:\cache\thumbs\imgproj-a.jpg");
+            set_recent_thumb(&temp, r"C:\cache\thumbs\imgproj-b.jpg");
+            set_recent_thumb(&dir.join("Unknown.trt").to_string_lossy(), r"C:\cache\thumbs\imgproj-c.jpg");
+
+            let items = read_recents().items;
+            assert_eq!(items.len(), 2, "no entry is created");
+            assert_eq!(recent(&perm).unwrap().thumb.as_deref(), Some(r"C:\cache\thumbs\imgproj-a.jpg"));
+            assert_eq!(recent(&temp).unwrap().thumb, None, "a temporary project has no card");
+        });
+    }
+
+    /// The card commit as the command runs it: each card lands in the cache,
+    /// and only the PERMANENT project's recents entry is pointed at its own
+    /// card — the temporary one stays without, and an unrelated entry is
+    /// never touched.
+    #[test]
+    fn a_card_commit_stamps_only_the_permanent_recents_entry() {
+        use crate::image_save::{begin_thumb, chunk_body, commit_and_stamp, ImageFormat, ImageSaves};
+        with_isolated("img-commit", |dir| {
+            let cache = crate::cache::Cache::new_at(dir.join("cache"));
+            let temp = paths::temp_projects_dir().unwrap().join("Quick.trt").to_string_lossy().into_owned();
+            let perm = dir.join("Kept.trt").to_string_lossy().into_owned();
+            let other = dir.join("Other.trt").to_string_lossy().into_owned();
+            let entry = |path: &str| RecentItem {
+                path: path.into(),
+                name: "n".into(),
+                modified_at: "m".into(),
+                duration_sec: 0.0,
+                thumb: None,
+                size_bytes: 0,
+                opened_at: None,
+                kind: Some("image".into()),
+            };
+            write_recents(&RecentsIndex { schema: 1, items: vec![entry(&temp), entry(&perm), entry(&other)] })
+                .unwrap();
+
+            let saves = ImageSaves::default();
+            let jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F', 0, 7];
+            let mut landed = Vec::new();
+            for (path, id) in [(&perm, "p-perm"), (&temp, "p-temp")] {
+                let b = begin_thumb(&saves, &cache, path, id, ImageFormat::Jpeg, jpeg.len() as u64).unwrap();
+                chunk_body(&saves, b.token, Ok(jpeg.to_vec())).unwrap();
+                let saved = commit_and_stamp(&saves, Some(&cache), b.token).unwrap();
+                assert_eq!(std::fs::read(&saved.path).unwrap(), jpeg);
+                landed.push(saved.path);
+            }
+            let perm_card = crate::image_save::card_file_name("p-perm", &perm).unwrap();
+            assert!(landed[0].ends_with(&perm_card), "{} vs {perm_card}", landed[0]);
+            assert_eq!(recent(&perm).unwrap().thumb.as_deref(), Some(landed[0].as_str()));
+            assert_eq!(recent(&temp).unwrap().thumb, None, "a temporary project has no card");
+            assert_eq!(recent(&other).unwrap().thumb, None);
+            assert_eq!(read_recents().items.len(), 3, "no entry is created");
+        });
+    }
+
+    /// An oversize `.trt` reaches the user as a plain refusal; every other
+    /// read error keeps its own kind (the `.bak` recovery needs NotFound).
+    #[test]
+    fn an_oversize_project_read_is_a_refusal() {
+        let big = std::io::Error::new(std::io::ErrorKind::InvalidData, "project file is larger than 512 MB");
+        assert!(matches!(capped_read_error(big), AppError::BadInput(m) if m == "project file is larger than 512 MB"));
+        let gone = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        assert!(matches!(capped_read_error(gone), AppError::Io(e) if e.kind() == std::io::ErrorKind::NotFound));
+    }
+
+    /// A card commit stamps recents from a blocking-pool thread while a save
+    /// upserts from the main one. Each thread owns one entry and reads it back
+    /// after every write of its own: an update the OTHER thread wrote over from
+    /// a stale read shows up as a regression, and the file must parse as the
+    /// primary (not via `.bak`) at every step.
+    #[test]
+    fn concurrent_recents_updates_never_lose_one() {
+        with_isolated("recents-race", |dir| {
+            let a = dir.join("A.trt").to_string_lossy().into_owned();
+            let b = dir.join("B.trt").to_string_lossy().into_owned();
+            let item = |path: &str, modified: String| RecentItem {
+                path: path.into(),
+                name: "n".into(),
+                modified_at: modified,
+                duration_sec: 0.0,
+                thumb: None,
+                size_bytes: 0,
+                opened_at: None,
+                kind: Some("image".into()),
+            };
+            upsert_recent(item(&a, "0".into())).unwrap();
+            upsert_recent(item(&b, "0".into())).unwrap();
+            let file = recents_path().unwrap();
+            let find = |path: &str| read_recents().items.into_iter().find(|r| r.path == path);
+            const ROUNDS: usize = 150;
+            std::thread::scope(|s| {
+                // The card commit's writer: A's thumb only.
+                s.spawn(|| {
+                    for i in 0..ROUNDS {
+                        let thumb = format!("card-{i}");
+                        set_recent_thumb(&a, &thumb);
+                        let entry = find(&a).expect("A's entry was lost");
+                        assert_eq!(entry.thumb.as_deref(), Some(thumb.as_str()), "A's card update was lost");
+                        let _guard = lock_recents();
+                        assert!(
+                            matches!(read_json_status::<RecentsIndex>(&file), JsonRead::Parsed { recovered: false, .. }),
+                            "recents.json did not parse on its own at round {i}"
+                        );
+                    }
+                });
+                // A save's writer: B's entry only.
+                s.spawn(|| {
+                    for i in 0..ROUNDS {
+                        upsert_recent(item(&b, i.to_string())).expect("a save's recents update failed");
+                        let entry = find(&b).expect("B's entry was lost");
+                        assert_eq!(entry.modified_at, i.to_string(), "B's save update was lost");
+                    }
+                });
+            });
+            let last = format!("card-{}", ROUNDS - 1);
+            assert_eq!(find(&a).unwrap().thumb.as_deref(), Some(last.as_str()));
+            assert_eq!(find(&b).unwrap().modified_at, (ROUNDS - 1).to_string());
+            assert_eq!(read_recents().items.len(), 2);
+        });
+    }
+
+    /// Only an object is a project: Rename and Duplicate index into it, and
+    /// serde_json's `IndexMut` panics on anything but an object or null —
+    /// which under `panic = "abort"` is the whole app. Refused, file untouched.
+    #[test]
+    fn rename_and_duplicate_refuse_a_file_that_is_not_an_object() {
+        with_isolated("not-object", |dir| {
+            for (i, body) in ["[]", "0", "\"x\"", "true", "null"].into_iter().enumerate() {
+                let p = dir.join(format!("Odd {i}.trt"));
+                std::fs::write(&p, body).unwrap();
+                let path = p.to_string_lossy().into_owned();
+                for r in [
+                    rename_project(path.clone(), "Renamed".into()),
+                    duplicate_project(path.clone(), "Copy".into(), "q-1".into()),
+                ] {
+                    assert!(
+                        matches!(&r, Err(AppError::BadInput(m)) if m.ends_with("is not a Taroting project")),
+                        "{body}: {r:?}"
+                    );
+                }
+                assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
+            }
+            assert!(!dir.join("Renamed.trt").exists() && !dir.join("Copy.trt").exists());
+        });
     }
 }

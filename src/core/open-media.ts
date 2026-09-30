@@ -2,14 +2,16 @@
 // launch, the viewer's "Open as project"): the one serialized chain every
 // open/creation step runs on, the record of screen teardowns an open has to
 // wait for, the temp-projects path test, and the one place a media file
-// becomes a temporary one-clip project.
+// becomes a temporary project (a photo an image project, anything else a
+// one-clip video project).
 //
 // core, not ui: nothing here toasts or navigates. Callers own both, so the same
 // creation step can serve main.ts's open routing and a screen's own menu.
 
 import { fileStem } from "./format";
 import { ipc } from "./ipc";
-import { MAX_CANVAS, createProject, importMediaAsClip, setProjectCanvas } from "./project";
+import { createProject, importMediaAsClip } from "./project";
+import type { MediaInfo, ProjectFile } from "./types";
 
 /* ------------------------------------------------------------------ */
 /* The open chain                                                      */
@@ -162,52 +164,27 @@ export async function isTempProjectPath(path: string): Promise<boolean> {
 /* Media → temporary project                                           */
 /* ------------------------------------------------------------------ */
 
-/** Aspect-preserving clamp of a photo's display-oriented size so the LONG side is ≤ MAX_CANVAS;
- *  setProjectCanvas then applies even/16 rounding. 12000x3000 → 8192x2048; 1001x667 → 1001x667
- *  (setProjectCanvas makes it 1002x668). */
-export function photoCanvas(width: number, height: number): { width: number; height: number } {
-  // Not a size at all (a probe that reported none): hand it back untouched and
-  // let the caller decide — scaling NaN would only launder it into a canvas.
-  if (!(width > 0 && height > 0) || !Number.isFinite(width) || !Number.isFinite(height)) {
-    return { width, height };
-  }
-  const long = Math.max(width, height);
-  if (long <= MAX_CANVAS) return { width, height };
-  const k = MAX_CANVAS / long;
-  // The long side is pinned to exactly MAX_CANVAS rather than recomputed, so
-  // rounding can never nudge it one past the cap. The short side keeps at
-  // least one pixel; setProjectCanvas lifts it to its own 16 px floor.
-  return width >= height
-    ? { width: MAX_CANVAS, height: Math.max(1, Math.round(height * k)) }
-    : { width: Math.max(1, Math.round(width * k)), height: MAX_CANVAS };
-}
-
-/** Create a TEMPORARY one-clip project for `path`: tempProjectPath(fileStem) → createProject →
- *  probeMedia → importMediaAsClip → [kind "image": setProjectCanvas(photoCanvas(w,h)) —
- *  PHASE-3 SEAM: Phase 3 replaces this branch with image-project creation] → saveProject.
- *  Returns the .trt path. Does NOT navigate. NOT chain-wrapped: callers outside the chain wrap
- *  it in runOnOpenChain. Throws on failure after best-effort deleting a .trt it already wrote. */
+/** Create a TEMPORARY project for `path` in tmp-projects: tempProjectPath(fileStem) →
+ *  probeMedia → a still (kind "image", no generator) becomes an IMAGE project
+ *  (createPhotoImageProject: schema 3, canvas = the photo, one photo layer); anything else
+ *  becomes the one-clip VIDEO project it always was (createProject → importMediaAsClip) →
+ *  saveProject. Returns the .trt path. Does NOT navigate. NOT chain-wrapped: callers outside
+ *  the chain wrap it in runOnOpenChain. Throws on failure after best-effort deleting a .trt
+ *  it already wrote. */
 export async function openMediaAsProject(path: string): Promise<string> {
   const projectPath = await ipc.tempProjectPath(fileStem(path));
   // Nothing exists on disk until saveProject lands (tempProjectPath only picks
   // a free name), so a failure before it has nothing to clean up.
   let written = false;
   try {
-    let project = createProject(fileStem(projectPath));
     const info = await ipc.probeMedia(path);
-    project = importMediaAsClip(project, info).project;
-    // PHASE-3 SEAM: a photo becomes an image project here instead.
-    // Until then it gets a video project whose canvas IS the photo, rather
-    // than the 1920x1080 default letterboxing a portrait shot into a sliver.
-    // addMedia adopts a VIDEO's size already; stills are left to us. `info` is
-    // a probe result, so `generator` is never set — tested anyway, the same way
-    // every other `kind === "image"` check in the tree tests it first.
-    const w = info.width ?? 0;
-    const h = info.height ?? 0;
-    if (info.kind === "image" && !info.generator && w > 0 && h > 0) {
-      const c = photoCanvas(w, h);
-      project = setProjectCanvas(project, c.width, c.height);
-    }
+    // `info` is a probe result, so `generator` is never set — tested anyway,
+    // the same way every other `kind === "image"` check in the tree tests it
+    // first: a generator is not a photo and has no file to paint.
+    const project =
+      info.kind === "image" && !info.generator
+        ? await photoProject(fileStem(projectPath), info)
+        : importMediaAsClip(createProject(fileStem(projectPath)), info).project;
     await ipc.saveProject(projectPath, project);
     written = true;
     // Any step added after the save goes HERE, inside the try: the catch below
@@ -217,4 +194,31 @@ export async function openMediaAsProject(path: string): Promise<string> {
     if (written) await ipc.deleteProject(projectPath).catch(() => {});
     throw e;
   }
+}
+
+/** Why a probed still cannot become an image project's canvas, or null when it can: its
+ *  canvas IS the photo, so one the probe could not size is refused in words rather than
+ *  dropped onto a made-up canvas. The probe already refuses a 0x0 still, so this is the
+ *  crafted-or-broken-file case. The ONE copy of the check — every way a photo becomes a
+ *  project (this module, Home's "New image" dialog) asks it, so they cannot drift apart. */
+export function stillSizeProblem(info: MediaInfo): string | null {
+  const w = info.width ?? 0;
+  const h = info.height ?? 0;
+  if (w > 0 && h > 0 && Number.isFinite(w) && Number.isFinite(h)) return null;
+  return `Couldn't read the size of ${fileStem(info.path)}.`;
+}
+
+/** A photo opened as a project is an IMAGE project, whatever the caller (File Explorer's
+ *  "Editor" mode, the viewer's "Open as project") — never a video project that happens to
+ *  hold a still.
+ *
+ *  core/image-project is fetched HERE, on the one path that needs it, never at boot: this
+ *  module is in the main chunk, and a photo opened as a project is the only reason it
+ *  would carry image-project creation. The size check runs first, so a still that is
+ *  refused never fetches it. */
+async function photoProject(name: string, info: MediaInfo): Promise<ProjectFile> {
+  const problem = stillSizeProblem(info);
+  if (problem) throw new Error(problem);
+  const { createPhotoImageProject } = await import("./image-project");
+  return createPhotoImageProject(name, info);
 }

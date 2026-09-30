@@ -160,14 +160,19 @@ export function applyRelink(
   return q;
 }
 
-export function openRelinkDialog(ctx: RelinkCtx): void {
+/** Returns the dialog's closer for the screen that opened it: the dialog is
+ *  parked on document.body, so a navigation that tears the editor down (an
+ *  Explorer open, the window's own flow) must close it too — left behind it
+ *  sits over the next screen and relinks into a project nobody saves. The
+ *  closer is quiet (no "still missing" toast) and a no-op once closed. */
+export function openRelinkDialog(ctx: RelinkCtx): () => void {
   const { session, media } = ctx;
   // resolve ids → refs once; ignore ids no longer present
   const rows = ctx.missing
     .map((id) => findMedia(session.project, id))
     .filter((m): m is MediaRef => m !== undefined);
 
-  if (rows.length === 0) return;
+  if (rows.length === 0) return () => {};
 
   const resolved = new Set<string>();
 
@@ -193,10 +198,14 @@ export function openRelinkDialog(ctx: RelinkCtx): void {
 
   const releaseTrap = trapTab(backdrop);
 
-  function close(): void {
+  let closed = false;
+  function close(quiet = false): void {
+    if (closed) return;
+    closed = true;
     document.removeEventListener("keydown", onKeydown, true);
     releaseTrap();
     backdrop.remove();
+    if (quiet) return;
     const left = rows.length - resolved.size;
     if (left > 0) {
       toast.error(`${left} media file(s) still missing on disk.`);
@@ -214,8 +223,8 @@ export function openRelinkDialog(ctx: RelinkCtx): void {
   backdrop.addEventListener("mousedown", (e) => {
     if (e.target === backdrop) close();
   });
-  backdrop.querySelector("[data-close]")!.addEventListener("click", close);
-  backdrop.querySelector("[data-close-btn]")!.addEventListener("click", close);
+  backdrop.querySelector("[data-close]")!.addEventListener("click", () => close());
+  backdrop.querySelector("[data-close-btn]")!.addEventListener("click", () => close());
 
   /** Apply a probed replacement for a media id. */
   function apply(m: MediaRef, path: string, info: MediaInfo): void {
@@ -338,4 +347,5 @@ export function openRelinkDialog(ctx: RelinkCtx): void {
   // header X, and the footer button is the one the eye goes to.
   const firstLocate = backdrop.querySelector("[data-locate]");
   focusFirst(backdrop, firstLocate ? "[data-locate]" : "[data-close-btn]");
+  return () => close(true);
 }

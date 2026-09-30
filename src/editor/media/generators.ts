@@ -21,7 +21,7 @@
 import "./generators.css";
 import { addGeneratedMedia } from "../../core/project";
 import type { ProjectSession } from "../../core/session";
-import type { FontFamily, Generator } from "../../core/types";
+import { IMAGE_CANVAS_MAX_SIDE, type FontFamily, type Generator } from "../../core/types";
 import { trapTab } from "../../ui/focus";
 import { toast } from "../../ui/toast";
 import type { MediaManager } from "./media";
@@ -30,6 +30,32 @@ export interface GeneratorDialogCtx {
   session: ProjectSession;
   media: MediaManager;
 }
+
+/** The image editor's use of the same two dialogs: nothing goes into a bin —
+ *  the confirmed element is handed to `onCreate`, which makes it a layer (one
+ *  commit, owned by the caller). `defaultSize` pre-fills a solid's box (the
+ *  image canvas). An image project's sizes are plain integers ≥ 1: its canvas
+ *  is never even-rounded, so neither is a solid that is meant to cover it — a
+ *  641×361 canvas gets a 641×361 solid, not a 642×362 one overhanging it. */
+export type GeneratorCreate = {
+  session: ProjectSession;
+  onCreate(
+    gen: Extract<Generator, { type: "solid" | "text" }>,
+    w: number,
+    h: number,
+    label: string,
+  ): void;
+  defaultSize?: { w: number; h: number };
+  /** Runs exactly once, last, on EVERY close path — Add, Cancel, Escape, the
+   *  backdrop, X and the returned closer alike — so a caller that registered
+   *  the dialog somewhere (the image shell's overlay set) can drop it on a
+   *  Cancel too, not only on a create. */
+  onClose?(): void;
+};
+
+/** A solid's side in an image project: an integer in [1, IMAGE_CANVAS_MAX_SIDE]. */
+const imageDim = (v: number): number =>
+  clamp(Math.round(Number.isFinite(v) ? v : 1), 1, IMAGE_CANVAS_MAX_SIDE);
 
 /** The 6 fonts a text generator may use (all ship with Windows). */
 export const TEXT_FONTS: FontFamily[] = [
@@ -115,7 +141,7 @@ interface Modal {
   close(): void;
 }
 
-function openModal(title: string): Modal {
+function openModal(title: string, onClose?: () => void): Modal {
   const backdrop = document.createElement("div");
   backdrop.className = "modal-backdrop";
   backdrop.innerHTML = `
@@ -133,10 +159,16 @@ function openModal(title: string): Modal {
   const footer = backdrop.querySelector<HTMLElement>(".gen-footer")!;
 
   const releaseTrap = trapTab(backdrop);
+  // Idempotent: a create closes it, and the caller's teardown may call the
+  // returned closer again afterwards — `onClose` must still fire only once.
+  let closed = false;
   const close = (): void => {
+    if (closed) return;
+    closed = true;
     document.removeEventListener("keydown", onKeydown, true);
     releaseTrap();
     backdrop.remove();
+    onClose?.();
   };
   function onKeydown(e: KeyboardEvent): void {
     if (e.key === "Escape") {
@@ -176,16 +208,20 @@ function makeButton(label: string, cls: string): HTMLButtonElement {
 /* ------------------------------------------------------------------ */
 
 /** Open the creation dialog for a text or solid element; on confirm the media
- *  is added to the project bin (not the timeline). */
-export function openGeneratorDialog(kind: "text" | "solid", ctx: GeneratorDialogCtx): void {
-  if (kind === "text") openTextDialog(ctx);
-  else openSolidDialog(ctx);
+ *  is added to the project bin (not the timeline) — or, for the image editor
+ *  (`GeneratorCreate`), handed to its `onCreate`. Returns the dialog's closer
+ *  (idempotent), so a screen that is torn down can close a dialog it opened. */
+export function openGeneratorDialog(
+  kind: "text" | "solid",
+  ctx: GeneratorDialogCtx | GeneratorCreate,
+): () => void {
+  return kind === "text" ? openTextDialog(ctx) : openSolidDialog(ctx);
 }
 
 /* ---------------- TEXT ---------------- */
 
-function openTextDialog(ctx: GeneratorDialogCtx): void {
-  const m = openModal("Add text");
+function openTextDialog(ctx: GeneratorDialogCtx | GeneratorCreate): () => void {
+  const m = openModal("Add text", "onCreate" in ctx ? ctx.onClose : undefined);
 
   // Content
   const textarea = document.createElement("textarea");
@@ -310,10 +346,14 @@ function openTextDialog(ctx: GeneratorDialogCtx): void {
     // preview did it too — so the preview styles a div and only the confirm
     // measures. The result is committed as-is, whatever its size.
     const { width, height } = measureText(gen);
-    ctx.session.commit(
-      (p) => addGeneratedMedia(p, gen, width, height, textLabel(gen.text)).project,
-    );
-    ctx.media.ensureAll(ctx.session.project);
+    if ("onCreate" in ctx) {
+      ctx.onCreate(gen, width, height, textLabel(gen.text));
+    } else {
+      ctx.session.commit(
+        (p) => addGeneratedMedia(p, gen, width, height, textLabel(gen.text)).project,
+      );
+      ctx.media.ensureAll(ctx.session.project);
+    }
     toast.info(`Added text — ${width}×${height}`);
     m.close();
   });
@@ -323,13 +363,20 @@ function openTextDialog(ctx: GeneratorDialogCtx): void {
     textarea.focus();
     textarea.select();
   }, 0);
+  return m.close;
 }
 
 /* ---------------- SOLID ---------------- */
 
-function openSolidDialog(ctx: GeneratorDialogCtx): void {
-  const m = openModal("Add solid");
+function openSolidDialog(ctx: GeneratorDialogCtx | GeneratorCreate): () => void {
+  const m = openModal("Add solid", "onCreate" in ctx ? ctx.onClose : undefined);
   const p = ctx.session.project;
+  // Image mode: integer sides ≥ 1 (never even-rounded, never 16..8192-clamped),
+  // pre-filled with the caller's size. The video branch is unchanged.
+  const image = "onCreate" in ctx;
+  const initial = image && ctx.defaultSize
+    ? ctx.defaultSize
+    : { w: p.timeline.width, h: p.timeline.height };
 
   const colorInput = document.createElement("input");
   colorInput.type = "color";
@@ -360,17 +407,17 @@ function openSolidDialog(ctx: GeneratorDialogCtx): void {
   const wInput = document.createElement("input");
   wInput.type = "number";
   wInput.className = "input gen-num";
-  wInput.min = String(MIN_DIM);
-  wInput.max = String(MAX_DIM);
-  wInput.step = "2";
-  wInput.value = String(p.timeline.width);
+  wInput.min = String(image ? 1 : MIN_DIM);
+  wInput.max = String(image ? IMAGE_CANVAS_MAX_SIDE : MAX_DIM);
+  wInput.step = image ? "1" : "2";
+  wInput.value = String(initial.w);
   const hInput = document.createElement("input");
   hInput.type = "number";
   hInput.className = "input gen-num";
-  hInput.min = String(MIN_DIM);
-  hInput.max = String(MAX_DIM);
-  hInput.step = "2";
-  hInput.value = String(p.timeline.height);
+  hInput.min = String(image ? 1 : MIN_DIM);
+  hInput.max = String(image ? IMAGE_CANVAS_MAX_SIDE : MAX_DIM);
+  hInput.step = image ? "1" : "2";
+  hInput.value = String(initial.h);
 
   const dimRow = document.createElement("div");
   dimRow.className = "gen-row";
@@ -394,15 +441,24 @@ function openSolidDialog(ctx: GeneratorDialogCtx): void {
     if (submitted) return;
     submitted = true;
     const hex = colorInput.value;
-    const w = evenDim(Number(wInput.value) || MIN_DIM);
-    const h = evenDim(Number(hInput.value) || MIN_DIM);
-    const g: Generator = { type: "solid", color: hex };
-    ctx.session.commit((pr) => addGeneratedMedia(pr, g, w, h, `Solid ${hex}`).project);
-    ctx.media.ensureAll(ctx.session.project);
+    let w: number;
+    let h: number;
+    if ("onCreate" in ctx) {
+      w = imageDim(Number(wInput.value) || 1);
+      h = imageDim(Number(hInput.value) || 1);
+      ctx.onCreate({ type: "solid", color: hex }, w, h, `Solid ${hex}`);
+    } else {
+      w = evenDim(Number(wInput.value) || MIN_DIM);
+      h = evenDim(Number(hInput.value) || MIN_DIM);
+      const g: Generator = { type: "solid", color: hex };
+      ctx.session.commit((pr) => addGeneratedMedia(pr, g, w, h, `Solid ${hex}`).project);
+      ctx.media.ensureAll(ctx.session.project);
+    }
     toast.info(`Added solid — ${w}×${h}`);
     m.close();
   });
   m.footer.append(cancel, confirm);
 
   setTimeout(() => colorInput.focus(), 0);
+  return m.close;
 }

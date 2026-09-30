@@ -79,6 +79,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
             <div class="home__title">Projects</div>
             <div class="row home__actions" id="home-actions">
               <button class="btn btn--primary" id="btn-new">${icon("plus")}New project</button>
+              <button class="btn" id="btn-new-image">${icon("image")}New image</button>
               <button class="btn" id="btn-open">${icon("folder")}Open</button>
               <button class="btn btn--ghost" id="btn-select" title="Select projects" hidden>Select</button>
             </div>
@@ -138,14 +139,22 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
 
   /* ---------------- rendering ---------------- */
 
+  /** A card with no picture: the kind's own glyph, so an image project never
+   *  borrows the film strip. */
+  function placeholderFor(item: RecentItem | undefined): string {
+    return icon(item?.kind === "image" ? "image" : "film", 28);
+  }
+
   function cardHtml(item: RecentItem): string {
     const thumb = item.thumb
       ? `<img src="${escapeHtml(mediaUrl(item.thumb))}" alt="" loading="lazy" />`
-      : icon("film", 28);
+      : placeholderFor(item);
     const size = item.sizeBytes > 0 ? `<span>·</span><span>${formatBytes(item.sizeBytes)}</span>` : "";
     const selected = selectMode && selection.has(item.path);
+    // An image has no running time, so its card never shows one: the duration
+    // is printed only above zero, and an image project's recents entry carries 0.
     return `
-      <div class="project-card${selected ? " is-selected" : ""}" data-path="${escapeHtml(item.path)}" tabindex="0" role="button"${selected ? ' aria-pressed="true"' : ""}>
+      <div class="project-card${selected ? " is-selected" : ""}" data-path="${escapeHtml(item.path)}"${item.kind === "image" ? ' data-kind="image"' : ""} tabindex="0" role="button"${selected ? ' aria-pressed="true"' : ""}>
         <div class="project-card__thumb">${thumb}</div>
         <div class="project-card__meta">
           <div class="project-card__name" title="${escapeHtml(item.path)}">${escapeHtml(item.name)}</div>
@@ -316,6 +325,13 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   function backfillThumbs(): void {
     const pending: string[] = [];
     for (const item of recents) {
+      // An image project's card picture is RENDERED by the image editor when
+      // it is left, never derived from a source file, so there is nothing to
+      // backfill. Skipped before the IPC, not just in Rust:
+      // refresh_recent_thumbs is a SYNC command, and asking would read and
+      // parse a possibly multi-megabyte .trt on the main thread for every
+      // picture-less image card on every Home visit, only to be told no.
+      if (item.kind === "image") continue;
       if (item.thumb || thumbTried.has(item.path)) continue;
       thumbTried.add(item.path);
       pending.push(item.path);
@@ -337,6 +353,40 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
           // thumbTried, so the next home visit retries.
         });
     }
+  }
+
+  /* A card picture whose file is gone. "Clear cache" empties the thumbs folder
+     but cannot reach the recents list, so every entry keeps naming a file that
+     no longer exists, and the card showed the webview's broken-image glyph for
+     good. `error` does not bubble, so this listens in the capture phase on the
+     grid (never an inline onerror: the CSP refuses it).
+
+     The dead name is dropped from the model, so a later re-render (search,
+     sort, rename) paints the placeholder instead of the broken <img> again,
+     and a video card then goes through the ordinary backfill, which makes the
+     picture again from the project's first clip. That backfill is one shot per
+     card per mount (`thumbTried`), so a picture that still cannot be shown
+     settles on the placeholder rather than looping. An image card just keeps
+     its placeholder until the image editor renders a new picture — never the
+     raw photo, which would show none of the edits. Errors from one render are
+     gathered for a moment so a cleared cache costs the same batched calls as a
+     mount's own backfill, not one call per card. */
+  let thumbRetry: number | undefined;
+  function onThumbError(e: Event): void {
+    const img = e.target;
+    if (!(img instanceof HTMLImageElement)) return;
+    const thumbEl = img.closest<HTMLElement>(".project-card__thumb");
+    const card = img.closest<HTMLElement>(".project-card");
+    if (!thumbEl || !card) return;
+    const model = recentByPath(card.dataset.path ?? "");
+    if (model) model.thumb = null;
+    thumbEl.innerHTML = placeholderFor(model);
+    if (!model || model.kind === "image" || thumbTried.has(model.path)) return;
+    window.clearTimeout(thumbRetry);
+    thumbRetry = window.setTimeout(() => {
+      thumbRetry = undefined;
+      if (!disposed) backfillThumbs();
+    }, 100);
   }
 
   async function refresh(): Promise<void> {
@@ -516,6 +566,37 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       // and upserted it into recents, so it is one click away on the next visit.
       if (disposed) return;
       navigate({ view: "editor", projectPath });
+    } catch (e) {
+      toast.error(describeError(e));
+    } finally {
+      busy = false;
+    }
+  }
+
+  /* "New image": a dialog rather than one click, because a blank image needs a
+     size and a background before it is anything. The dialog is its own small
+     chunk, fetched on this click and never at boot; the image editor it leads
+     to is another, fetched only when the project opens. `busy` covers only the
+     fetch: the dialog runs its own guard, and Home must not sit frozen behind
+     a dialog the user may simply cancel. */
+  async function openNewImage(): Promise<void> {
+    if (guard()) return;
+    try {
+      const { openNewImageDialog } = await import("./new-image-dialog");
+      if (disposed) return;
+      // The dialog lives on document.body; teardown closes it (see
+      // openOverlays). Every way it closes — Create, Cancel, Escape, the
+      // teardown itself — drops its entry through onClosed, so a cancelled
+      // dialog's detached DOM is not held until Home unmounts.
+      let close: () => void = () => {};
+      close = openNewImageDialog({
+        onCreated: (projectPath) => {
+          if (!disposed) navigate({ view: "editor", projectPath });
+        },
+        onClosed: () => openOverlays.delete(close),
+        isDisposed: () => disposed,
+      });
+      openOverlays.add(close);
     } catch (e) {
       toast.error(describeError(e));
     } finally {
@@ -711,6 +792,8 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   /* ---------------- wiring ---------------- */
 
   root.querySelector("#btn-new")!.addEventListener("click", () => void createNew([]));
+  root.querySelector("#btn-new-image")!.addEventListener("click", () => void openNewImage());
+  grid.addEventListener("error", onThumbError, true);
   root.querySelector("#btn-open")!.addEventListener("click", () => void openViaDialog());
   root.querySelector("#home-settings")!.addEventListener("click", () => navigate({ view: "settings" }));
   search.addEventListener("input", renderGrid);
@@ -812,6 +895,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   return {
     dispose() {
       disposed = true;
+      window.clearTimeout(thumbRetry);
       unlistenDrop?.();
       unlistenDrop = null;
       document.removeEventListener("keydown", onEscape, true);

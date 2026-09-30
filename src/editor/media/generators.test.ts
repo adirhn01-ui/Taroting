@@ -34,10 +34,10 @@
 // node and in the webview. Widths are asserted by parity and by inequality, so
 // a metric change makes a test fail rather than pass vacuously.
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { addGeneratedMedia, createProject } from "../../core/project";
 import type { Generator } from "../../core/types";
-import { measureText, textLabel } from "./generators";
+import { measureText, openGeneratorDialog, textLabel } from "./generators";
 
 /** The caps this path used to be subjected to, kept only so the cases below can
  *  say "and this is comfortably past the number that used to trigger a shrink".
@@ -190,5 +190,134 @@ describe("the fit layer stays deleted", () => {
     for (const gone of ["fitText", "fitTextSize", "textShrunkNote", "showTextTooLarge", "MAX_DIM"]) {
       expect(keys, `${gone} must stay deleted`).not.toContain(gone);
     }
+  });
+});
+
+// The dialogs themselves, against a small fake DOM (the environment is
+// "node"): every element answers querySelector with one stable child per
+// selector, so the modal shell's X / body / footer are addressable, and the
+// document keeps its capture listeners so an Escape can be dispatched.
+type Listener = (e: unknown) => void;
+class FakeEl {
+  [k: string]: unknown;
+  style: Record<string, string> = {};
+  children: FakeEl[] = [];
+  listeners = new Map<string, Listener[]>();
+  removed = false;
+  private picks = new Map<string, FakeEl>();
+  constructor(public tag: string) {}
+  append(...els: FakeEl[]): void {
+    this.children.push(...els);
+  }
+  prepend(el: FakeEl): void {
+    this.children.unshift(el);
+  }
+  appendChild(el: FakeEl): FakeEl {
+    this.children.push(el);
+    return el;
+  }
+  addEventListener(type: string, fn: Listener): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), fn]);
+  }
+  removeEventListener(type: string, fn: Listener): void {
+    this.listeners.set(type, (this.listeners.get(type) ?? []).filter((f) => f !== fn));
+  }
+  fire(type: string, e: Record<string, unknown> = {}): void {
+    for (const fn of [...(this.listeners.get(type) ?? [])]) fn({ target: this, preventDefault() {}, stopPropagation() {}, ...e });
+  }
+  querySelector(sel: string): FakeEl {
+    let el = this.picks.get(sel);
+    if (!el) this.picks.set(sel, (el = new FakeEl(sel)));
+    return el;
+  }
+  remove(): void {
+    this.removed = true;
+  }
+  focus(): void {}
+  select(): void {}
+  getContext(): null {
+    return null;
+  }
+  /** Depth-first: the first button whose label is `text`. */
+  button(text: string): FakeEl {
+    const walk = (el: FakeEl): FakeEl | null => {
+      if (el.tag === "button" && el.textContent === text) return el;
+      for (const c of el.children) {
+        const hit = walk(c);
+        if (hit) return hit;
+      }
+      return null;
+    };
+    const hit = walk(this);
+    if (!hit) throw new Error(`no ${text} button`);
+    return hit;
+  }
+}
+
+vi.mock("../../ui/toast", () => ({ toast: { info: () => {}, error: () => {} } }));
+
+function fakeDocument() {
+  const body = new FakeEl("body");
+  const doc = new FakeEl("document");
+  Object.assign(doc, { body, createElement: (tag: string) => new FakeEl(tag) });
+  vi.stubGlobal("document", doc);
+  const backdrop = (): FakeEl => body.children[body.children.length - 1]!;
+  return { doc, backdrop };
+}
+
+describe("the generator dialogs' onClose", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const project = () => createProject("t");
+  const imageCtx = (onClose: () => void) => ({
+    session: { project: project() } as never,
+    defaultSize: { w: 641, h: 361 },
+    onCreate: vi.fn(),
+    onClose,
+  });
+
+  // Each exit, then the returned closer called on top of it (a teardown after
+  // the user already left): onClose must still have fired exactly once.
+  const paths: [string, (m: { doc: FakeEl; backdrop: FakeEl; closer: () => void }, add: string) => void][] = [
+    ["create", (m, add) => m.backdrop.querySelector(".gen-footer").button(add).fire("click")],
+    ["Cancel", (m) => m.backdrop.querySelector(".gen-footer").button("Cancel").fire("click")],
+    ["Escape", (m) => m.doc.fire("keydown", { key: "Escape" })],
+    ["the backdrop", (m) => m.backdrop.fire("mousedown", { target: m.backdrop })],
+    ["X", (m) => m.backdrop.querySelector("[data-close]").fire("click")],
+    ["the returned closer", (m) => m.closer()],
+  ];
+  for (const kind of ["text", "solid"] as const) {
+    const add = kind === "text" ? "Add text" : "Add solid";
+    for (const [name, exit] of paths) {
+      it(`${kind}: fires once on ${name}`, () => {
+        const { doc, backdrop } = fakeDocument();
+        const onClose = vi.fn();
+        const ctx = imageCtx(onClose);
+        const closer = openGeneratorDialog(kind, ctx);
+        const m = { doc, backdrop: backdrop(), closer };
+        expect(onClose).not.toHaveBeenCalled();
+        exit(m, add);
+        expect(onClose).toHaveBeenCalledTimes(1);
+        expect(m.backdrop.removed).toBe(true);
+        expect(ctx.onCreate).toHaveBeenCalledTimes(name === "create" ? 1 : 0);
+        closer();
+        doc.fire("keydown", { key: "Escape" });
+        expect(onClose).toHaveBeenCalledTimes(1);
+      });
+    }
+  }
+
+  it("the video editor's dialogs close as before, with nothing to call", () => {
+    const { doc, backdrop } = fakeDocument();
+    const closer = openGeneratorDialog("solid", {
+      session: { project: project() } as never,
+      media: {} as never,
+    });
+    const b = backdrop();
+    doc.fire("keydown", { key: "Escape" });
+    expect(b.removed).toBe(true);
+    expect(() => closer()).not.toThrow();
   });
 });

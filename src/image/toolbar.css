@@ -1,0 +1,104 @@
+/* Image editor tool row. It lives in the shell's `.transport` row, so buttons,
+   selects and spacing are the video transport's own; only the pieces that row
+   never needed are defined here, each from tokens. */
+
+.imged-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+/* Swapped glyphs must never be the click target (see .transport .btn svg). */
+.imged-toolbar .btn svg {
+  pointer-events: none;
+}
+
+/* `.imged-sep` (the vertical rule between groups) is the shell's, shared with
+   the view controls: image-editor.css. */
+
+/* The active tool's colour. The ring sits OUTSIDE the face, as on the Settings
+   colour swatch, so every pixel of the face is the colour itself. */
+.imged-swatch {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px var(--swatch-ring);
+  pointer-events: none;
+}
+
+/* ---------- size (the monitor-volume flyout pattern) ---------- */
+.imged-brush {
+  position: relative;
+  display: flex;
+}
+.imged-brush[hidden] {
+  display: none;
+}
+.imged-brush__dot {
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+  pointer-events: none;
+}
+.imged-brush__flyout {
+  position: absolute;
+  /* flush to the button top, like .tr-volume__flyout: no dead gap to cross */
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: var(--z-editor-chrome);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius-m);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-2);
+}
+.imged-brush__flyout[hidden] {
+  display: none;
+}
+.imged-brush__slider {
+  width: 128px;
+}
+.imged-brush__num {
+  width: 56px;
+  height: 26px;
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-12);
+  text-align: right;
+}
+.imged-brush__unit {
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+
+/* Eraser mode: two small buttons read as one segmented control. */
+.imged-seg {
+  display: flex;
+  gap: 2px;
+}
+.imged-seg[hidden] {
+  display: none;
+}
+
+.imged-shape[hidden] {
+  display: none;
+}
+
+.imged-hint {
+  font-size: var(--fs-12);
+  color: var(--text-3);
+  padding: 0 var(--sp-2);
+  white-space: nowrap;
+}
+.imged-hint[hidden] {
+  display: none;
+}
+
+.imged-swatch-btn[hidden] {
+  display: none;
+}

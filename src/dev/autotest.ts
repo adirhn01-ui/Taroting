@@ -3902,6 +3902,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     });
     await (await import("./autotest-wave1")).runWave1Blocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-viewer")).runViewerBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-image")).runImageBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
   } catch (e) {
     results.push({ name: "setup", pass: false, detail: String(e) });
   }

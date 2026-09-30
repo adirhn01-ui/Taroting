@@ -1,0 +1,28 @@
+/* Image export dialog: only what the video export dialog's sheet
+   (editor/export/export.css) has no row for. Everything else is its classes. */
+
+/* quality: slider + a fixed-width readout (a number, or "Lossless") */
+.imgx-quality .slider {
+  flex: 1 1 auto;
+}
+.imgx-quality__value {
+  flex: none;
+  min-width: 64px;
+  text-align: right;
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}
+
+/* the pixel size a percentage works out to */
+.imgx-px {
+  flex: none;
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+
+/* the always-on privacy line under the output path */
+.imgx-privacy {
+  font-size: var(--fs-12);
+  line-height: 1.45;
+  color: var(--text-3);
+}

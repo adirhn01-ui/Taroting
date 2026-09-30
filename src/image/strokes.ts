@@ -12,8 +12,10 @@
 // padding, so a valid `p` is always a positive multiple of 16 characters and
 // the Rust side can check its shape without decoding it.
 
-import type { Stroke } from "../core/types";
-export { STROKE_CHUNK } from "../core/types";
+import type { InkKind, ShapeKind, Stroke } from "../core/types";
+import { STROKE_CHUNK } from "../core/types";
+import { normalizeHexColor } from "../core/session";
+export { STROKE_CHUNK };
 
 /** Bytes per point: three little-endian Float32s. */
 const POINT_BYTES = 12;
@@ -98,17 +100,56 @@ export function pointsOf(s: Extract<Stroke, { p: string }>): Float32Array {
   return pts;
 }
 
-/** Copies only the chunk index and the last chunk (O(STROKE_CHUNK + chunks.length)). */
-export function appendStroke(chunks: readonly Stroke[][], s: Stroke): Stroke[][];
-export function appendStroke(): never {
-  throw new Error("not implemented");
+/** Append one stroke. Copies only the chunk index and the last chunk
+ *  (O(STROKE_CHUNK + chunks.length)): every other chunk array is shared with
+ *  the previous snapshot, which is what keeps unlimited undo linear. A full
+ *  last chunk is left untouched and a fresh one-stroke chunk is started. */
+export function appendStroke(chunks: readonly Stroke[][], s: Stroke): Stroke[][] {
+  const n = chunks.length;
+  const last = n > 0 ? chunks[n - 1]! : null;
+  if (last !== null && last.length < STROKE_CHUNK) {
+    const out = chunks.slice(0, n - 1);
+    out.push(sealed([...last, s]));
+    return out;
+  }
+  const out = chunks.slice();
+  out.push(sealed([s]));
+  return out;
 }
 
-/** Copies only chunks that lose a stroke; drops chunks that become empty. Same
- *  ref if nothing removed. */
-export function removeStrokes(chunks: readonly Stroke[][], doomed: ReadonlySet<Stroke>): Stroke[][];
-export function removeStrokes(): never {
-  throw new Error("not implemented");
+/** Remove every stroke in `doomed`. Copies only the chunks that lose a stroke
+ *  and drops chunks that become empty; untouched chunks are shared. Returns
+ *  `chunks` itself (same reference) when nothing was removed, so an eraser
+ *  pass that hit nothing records no undo step. */
+export function removeStrokes(chunks: readonly Stroke[][], doomed: ReadonlySet<Stroke>): Stroke[][] {
+  if (doomed.size === 0) return chunks as Stroke[][];
+  let out: Stroke[][] | null = null;
+  for (let c = 0; c < chunks.length; c++) {
+    const chunk = chunks[c]!;
+    let hit = false;
+    for (const s of chunk) {
+      if (doomed.has(s)) {
+        hit = true;
+        break;
+      }
+    }
+    if (!hit) {
+      out?.push(chunk);
+      continue;
+    }
+    out ??= chunks.slice(0, c);
+    const kept = chunk.filter((s) => !doomed.has(s));
+    if (kept.length > 0) out.push(sealed(kept));
+  }
+  return out ?? (chunks as Stroke[][]);
+}
+
+/** In a dev build, freeze each chunk this module creates, so a caller that
+ *  mutates one in place — rewriting every history snapshot that shares it —
+ *  throws in the tests instead of silently corrupting undo. A production build
+ *  pays nothing. */
+function sealed(chunk: Stroke[]): Stroke[] {
+  return import.meta.env.DEV ? (Object.freeze(chunk) as Stroke[]) : chunk;
 }
 
 /** Total strokes across every chunk. */
@@ -129,9 +170,134 @@ export function forEachStroke(
   }
 }
 
-/** Structural + value validation of an untrusted stroke. Returns a clean
- *  Stroke or null. */
-export function validateStroke(raw: unknown): Stroke | null;
-export function validateStroke(): never {
-  throw new Error("not implemented");
+/* ------------------------------------------------------------------ */
+/* Validation of untrusted strokes                                     */
+/* ------------------------------------------------------------------ */
+
+/** Crafted-file caps. The SAME three numbers are enforced on save by
+ *  `validate_image_project` in src-tauri/src/project/image_rules.rs — change
+ *  them together, or a project the editor accepts could never be saved. A
+ *  hand-drawn stroke is a few hundred points and a heavy drawing a few hundred
+ *  thousand, so none of these is a limit a person can reach by drawing. */
+export const MAX_STROKE_POINTS = 1_000_000;
+export const MAX_TOTAL_POINTS = 20_000_000;
+export const MAX_TOTAL_STROKES = 2_000_000;
+
+/** Widest nominal stroke accepted, in source px (the Rust rule too). */
+const MAX_WIDTH = 65535;
+/** Shape endpoints further than this from the layer origin are not a mark
+ *  anyone drew: they are a crafted value on its way into a canvas path. */
+const MAX_COORD = 1e7;
+
+const INK: ReadonlySet<string> = new Set(["pen", "pencil", "marker"]);
+const SHAPES: ReadonlySet<string> = new Set(["line", "rect", "ellipse", "arrow"]);
+
+/** Points held by a `p` of this length, without decoding it. */
+export function pointCountOf(p: string): number {
+  return Math.floor(p.length / POINT_CHARS);
+}
+
+function validWidth(w: unknown): w is number {
+  return typeof w === "number" && Number.isFinite(w) && w > 0 && w <= MAX_WIDTH;
+}
+
+function validPair(v: unknown): v is [number, number] {
+  if (!Array.isArray(v) || v.length !== 2) return false;
+  const x: unknown = v[0];
+  const y: unknown = v[1];
+  return (
+    typeof x === "number" &&
+    typeof y === "number" &&
+    Number.isFinite(x) &&
+    Number.isFinite(y) &&
+    Math.abs(x) <= MAX_COORD &&
+    Math.abs(y) <= MAX_COORD
+  );
+}
+
+/** The opacity an ink stroke is drawn at when its own is missing or not a
+ *  number: what the tool would have given it (pen 1, marker 0.4, pencil from
+ *  its mean pressure). A bad `o` must not reach `globalAlpha` as-is — the
+ *  canvas IGNORES a non-finite or out-of-range assignment and silently keeps
+ *  whatever the previous stroke used. */
+function defaultOpacity(t: string, pts: Float32Array): number {
+  if (t === "pen") return 1;
+  if (t === "marker") return 0.4;
+  const n = pts.length / 3;
+  let sum = 0;
+  for (let i = 2; i < pts.length; i += 3) sum += pts[i]!;
+  return 0.3 + 0.7 * (n > 0 ? sum / n : 1);
+}
+
+/** Decode a `p` for validation, refusing an oversized one BEFORE decoding it:
+ *  the length alone says how many points it holds. */
+function checkedPoints(p: unknown): Float32Array | null {
+  if (typeof p !== "string" || pointCountOf(p) > MAX_STROKE_POINTS) return null;
+  return decodePoints(p);
+}
+
+/** Structural + value validation of an untrusted stroke (a `.trt` is plain
+ *  JSON, and the loader hands the image editor the raw value). Returns a clean
+ *  Stroke, or null when it cannot be one. Total: never throws.
+ *
+ *  - `t` must be one of the eight kinds.
+ *  - `c` (ink and shapes) goes through `normalizeHexColor`; an unreadable
+ *    colour rejects the stroke.
+ *  - `w` must be finite and in (0, 65535].
+ *  - `o` (ink) is clamped into [0, 1]; a missing or non-numeric one takes the
+ *    tool's own default.
+ *  - `p` (ink and erase) must decode (`decodePoints`) and hold at most
+ *    MAX_STROKE_POINTS points.
+ *  - `a` / `b` (shapes) must be finite pairs within ±1e7.
+ *
+ *  Returns `raw` ITSELF when it is already exactly clean (nothing repaired, no
+ *  extra key), so a healthy project keeps every stroke's identity — and with
+ *  it every chunk's, which is what lets `validateImageProject` hand back the
+ *  same project. The points decoded here are given to `pointsOf`'s cache for
+ *  the object returned, so a load decodes each stroke once, not once here and
+ *  again at the first render. */
+export function validateStroke(raw: unknown): Stroke | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const o = raw as Record<string, unknown>;
+  const t = o.t;
+  if (typeof t !== "string" || !validWidth(o.w)) return null;
+  const w = o.w;
+  const keys = Object.keys(o).length;
+
+  if (t === "erase") {
+    const pts = checkedPoints(o.p);
+    if (!pts) return null;
+    const clean: Stroke = keys === 3 ? (raw as Stroke) : { t: "erase", w, p: o.p as string };
+    decoded.set(clean, pts);
+    return clean;
+  }
+
+  const c = normalizeHexColor(o.c, "");
+  if (c === "") return null;
+
+  if (INK.has(t)) {
+    const pts = checkedPoints(o.p);
+    if (!pts) return null;
+    const rawO = o.o;
+    const op =
+      typeof rawO === "number" && Number.isFinite(rawO)
+        ? Math.min(Math.max(rawO, 0), 1)
+        : defaultOpacity(t, pts);
+    const clean: Stroke =
+      keys === 5 && c === o.c && op === rawO
+        ? (raw as Stroke)
+        : { t: t as InkKind, c, w, o: op, p: o.p as string };
+    decoded.set(clean, pts);
+    return clean;
+  }
+
+  if (SHAPES.has(t)) {
+    const a = o.a;
+    const b = o.b;
+    if (!validPair(a) || !validPair(b)) return null;
+    if (keys === 5 && c === o.c) return raw as Stroke;
+    return { t: t as ShapeKind, c, w, a: [a[0], a[1]], b: [b[0], b[1]] };
+  }
+
+  return null;
 }

@@ -1047,12 +1047,16 @@ export async function mountEditor(
 
   /* ---------------- media bin: generators, placement, drag & drop ---------------- */
 
-  $("#ed-add-text").addEventListener("click", () =>
-    openGeneratorDialog("text", { session, media }),
-  );
-  $("#ed-add-solid").addEventListener("click", () =>
-    openGeneratorDialog("solid", { session, media }),
-  );
+  // The dialogs live on document.body: dispose closes the open one, or an
+  // Explorer open would leave it over the next screen, adding into a session
+  // that has been torn down (the relink dialog's bug, applied everywhere).
+  let closeGenerator: () => void = () => {};
+  $("#ed-add-text").addEventListener("click", () => {
+    closeGenerator = openGeneratorDialog("text", { session, media });
+  });
+  $("#ed-add-solid").addEventListener("click", () => {
+    closeGenerator = openGeneratorDialog("solid", { session, media });
+  });
 
   const mediaById = (id: string): MediaRef | undefined =>
     session.project.media.find((m) => m.id === id);
@@ -1547,10 +1551,12 @@ export async function mountEditor(
   engine.seek(0);
   graph.tick(engine.time, engine.playing, engine.previewSpeed);
 
-  // Offer to relink any media whose file is missing/changed on disk.
-  if (loaded.missing.length > 0) {
-    openRelinkDialog({ session, media, missing: loaded.missing });
-  }
+  // Offer to relink any media whose file is missing/changed on disk. The
+  // dialog lives on document.body, so dispose closes it: a navigation that
+  // leaves this editor (an Explorer open) must not leave it over the next
+  // screen, relinking into a project nobody saves.
+  const closeRelink =
+    loaded.missing.length > 0 ? openRelinkDialog({ session, media, missing: loaded.missing }) : () => {};
 
   // dev hook for the in-app autotest harness
   if (import.meta.env.DEV) {
@@ -1574,6 +1580,8 @@ export async function mountEditor(
       // callbacks — and, now that an open menu holds the keyboard, would leave
       // the next editor's shortcuts inert until something dismissed it.
       closeMenu();
+      closeRelink();
+      closeGenerator();
       shortcuts.detach();
       unsubSettings();
       unTick();

@@ -191,37 +191,6 @@ describe("createTeardowns", () => {
   });
 });
 
-describe("photoCanvas", () => {
-  // Every row differs in orientation, scale and which side is long, so a
-  // swapped axis, a clamp on the wrong side or an off-by-one cap each fail a
-  // different row.
-  const rows: Array<[w: number, h: number, ew: number, eh: number]> = [
-    [12000, 3000, 8192, 2048], // landscape over the cap
-    [3000, 12000, 2048, 8192], // portrait over the cap: the axes must not swap
-    [1001, 667, 1001, 667], // under the cap: untouched (setProjectCanvas evens it)
-    [8192, 8192, 8192, 8192], // exactly the cap: untouched
-    [8200, 4100, 8192, 4096], // just past the cap: scaled, both sides
-    [9000, 9000, 8192, 8192], // square over the cap
-    [16, 9000, 15, 8192], // sliver: the short side stays proportional (14.56 rounds up)
-    [9000, 16, 8192, 15], // the same sliver lying down
-    [1, 90000, 1, 8192], // a sliver that would round to 0 keeps one pixel
-  ];
-  it.each(rows)("%i x %i → %i x %i", async (w, h, ew, eh) => {
-    const { om } = await fresh();
-    expect(om.photoCanvas(w, h)).toEqual({ width: ew, height: eh });
-  });
-
-  it("hands back a size that is not a size at all", async () => {
-    const { om } = await fresh();
-    expect(om.photoCanvas(0, 500)).toEqual({ width: 0, height: 500 });
-    expect(om.photoCanvas(Number.NaN, 9000)).toEqual({ width: Number.NaN, height: 9000 });
-    expect(om.photoCanvas(Number.POSITIVE_INFINITY, 9000)).toEqual({
-      width: Number.POSITIVE_INFINITY,
-      height: 9000,
-    });
-  });
-});
-
 describe("isTempProjectPath", () => {
   const DIR = "C:\\Users\\Ana\\AppData\\Local\\Taroting\\tmp-projects";
 
@@ -322,8 +291,11 @@ describe("openMediaAsProject", () => {
     return { om, calls, saved, save, del };
   }
 
-  it("gives a photo a canvas of its own shape, in the temp dir", async () => {
-    const h = await harness(mediaInfo({ path: "D:\\Pictures\\harbour.jpg", width: 3024, height: 4032 }));
+  it("makes a photo an IMAGE project whose canvas is the photo, in the temp dir", async () => {
+    // ODD sides on purpose: the video canvas rule rounds to even (642x362), so
+    // a still that slipped down the video path, or an image canvas that picked
+    // up the video clamp, fails here rather than passing by coincidence.
+    const h = await harness(mediaInfo({ path: "D:\\Pictures\\harbour.jpg", width: 641, height: 361 }));
     const out = await h.om.openMediaAsProject("D:\\Pictures\\harbour.jpg");
     expect(out).toBe(`${TMP}\\harbour (2).trt`);
     expect(h.calls).toEqual([
@@ -332,38 +304,80 @@ describe("openMediaAsProject", () => {
       `saveProject:${TMP}\\harbour (2).trt`,
     ]);
     const p = h.saved[0]!.project;
-    // Portrait stays portrait: the default 1920x1080 would pillarbox it.
-    expect([p.timeline.width, p.timeline.height]).toEqual([3024, 4032]);
+    expect(p.kind).toBe("image");
+    expect(p.schema).toBe(3);
+    expect([p.timeline.width, p.timeline.height]).toEqual([641, 361]);
+    // A photo project starts with just the photo, over transparency.
+    expect(p.image).toEqual({ background: "transparent" });
     expect(p.name).toBe("harbour (2)");
     expect(p.media).toHaveLength(1);
-    expect(p.timeline.tracks.flatMap((t) => t.clips)).toHaveLength(1);
+    expect(p.media[0]!.path).toBe("D:\\Pictures\\harbour.jpg");
+    const clips = p.timeline.tracks.flatMap((t) => t.clips);
+    expect(clips).toHaveLength(1);
+    // Native pixels: one photo pixel per canvas pixel, centred.
+    expect(clips[0]!.transform).toMatchObject({ x: 0, y: 0, scale: 1 });
+    expect(clips[0]!.mediaId).toBe(p.media[0]!.id);
   });
 
-  it("caps an oversized photo on its long side and keeps the aspect", async () => {
-    const h = await harness(mediaInfo({ width: 12000, height: 3000 }));
+  it("never caps or rounds a big photo's canvas", async () => {
+    // Past the video canvas cap (8192) on the long side and odd on both: the
+    // image canvas is the photo, pixel for pixel.
+    const h = await harness(mediaInfo({ width: 12001, height: 3001 }));
     await h.om.openMediaAsProject("D:\\Pictures\\harbour.jpg");
     const p = h.saved[0]!.project;
-    expect([p.timeline.width, p.timeline.height]).toEqual([8192, 2048]);
+    expect([p.timeline.width, p.timeline.height]).toEqual([12001, 3001]);
+    expect(p.kind).toBe("image");
   });
 
-  it("leaves a video's canvas to the import, which already adopts its size", async () => {
-    // OVERSIZED on purpose. A video under the cap comes out the same whichever
-    // branch sizes it, so the `kind === "image"` gate would be untested: here
-    // the import clamps each side on its own (8192x3000) while the photo branch
-    // would scale both (8192x2048), and only the first is right for a video.
+  it("keeps a video a VIDEO project, shaped exactly as before", async () => {
+    // OVERSIZED on purpose: the import clamps each side on its own (8192x3000),
+    // while an image project would take 12000x3000 whole — so a video that
+    // wandered into the photo branch fails here even before the kind check.
     const h = await harness(
       mediaInfo({ path: "D:\\Clips\\dive.mp4", kind: "video", width: 12000, height: 3000, duration: 12 }),
     );
     await h.om.openMediaAsProject("D:\\Clips\\dive.mp4");
     const p = h.saved[0]!.project;
     expect([p.timeline.width, p.timeline.height]).toEqual([8192, 3000]);
+    expect(p.schema).toBe(2);
+    // Absent, not undefined: a video .trt must stay byte-identical on disk.
+    expect("kind" in p).toBe(false);
+    expect("image" in p).toBe(false);
+    expect(p.timeline.tracks.flatMap((t) => t.clips)).toHaveLength(1);
   });
 
-  it("keeps the default canvas for a photo the probe could not size", async () => {
-    const h = await harness(mediaInfo({ width: undefined, height: undefined }));
+  it("keeps an animated GIF a video project", async () => {
+    // A GIF is a moving picture: only the still family becomes an image project.
+    const h = await harness(
+      mediaInfo({ path: "D:\\Clips\\wave.gif", kind: "gif", width: 641, height: 361, duration: 3 }),
+    );
+    await h.om.openMediaAsProject("D:\\Clips\\wave.gif");
+    const p = h.saved[0]!.project;
+    expect("kind" in p).toBe(false);
+    expect(p.schema).toBe(2);
+  });
+
+  it("never makes an image project of a generator, even one tagged as an image", async () => {
+    // A probe never returns one; the guard is the same one every other
+    // `kind === "image"` test in the tree carries, and it is pinned here.
+    const h = await harness(
+      mediaInfo({ width: 641, height: 361, generator: { type: "solid", color: "#204080" } }),
+    );
     await h.om.openMediaAsProject("D:\\Pictures\\harbour.jpg");
     const p = h.saved[0]!.project;
-    expect([p.timeline.width, p.timeline.height]).toEqual([1920, 1080]);
+    expect("kind" in p).toBe(false);
+    expect(p.schema).toBe(2);
+  });
+
+  it("refuses a photo the probe could not size, and writes nothing", async () => {
+    // Its canvas IS the photo: there is no honest size to make one at, and it
+    // must not quietly become a video project instead.
+    const h = await harness(mediaInfo({ width: undefined, height: 361 }));
+    await expect(h.om.openMediaAsProject("D:\\Pictures\\harbour.jpg")).rejects.toThrow(
+      "Couldn't read the size of harbour.",
+    );
+    expect(h.save).not.toHaveBeenCalled();
+    expect(h.del).not.toHaveBeenCalled();
   });
 
   it("writes nothing and deletes nothing when the probe fails", async () => {
@@ -378,5 +392,44 @@ describe("openMediaAsProject", () => {
     h.save.mockRejectedValueOnce(new Error("disk full"));
     await expect(h.om.openMediaAsProject("D:\\Pictures\\harbour.jpg")).rejects.toThrow("disk full");
     expect(h.del).not.toHaveBeenCalled();
+  });
+});
+
+describe("stillSizeProblem", () => {
+  // The one size check both ways in share (openMediaAsProject above, Home's
+  // "New image" dialog through its photoProblem) — pinned here, at its home.
+  function still(over: Partial<MediaInfo>): MediaInfo {
+    return {
+      path: "D:\\Pictures\\harbour.jpg",
+      size: 5_242_880,
+      mtimeMs: 1_726_000_000_000,
+      kind: "image",
+      duration: 0,
+      hasAudio: false,
+      width: 641,
+      height: 361,
+      ...over,
+    };
+  }
+
+  it("passes a sized still", async () => {
+    const { om } = await fresh();
+    expect(om.stillSizeProblem(still({}))).toBeNull();
+    expect(om.stillSizeProblem(still({ width: 1, height: 1 }))).toBeNull();
+  });
+
+  // One row per way a side can be unusable, each on ONE side only, so a check
+  // that looked at the width alone (or the height alone) fails a row.
+  const bad: Array<[label: string, over: Partial<MediaInfo>]> = [
+    ["missing width", { width: undefined }],
+    ["missing height", { height: undefined }],
+    ["zero height", { height: 0 }],
+    ["negative width", { width: -641 }],
+    ["NaN width", { width: Number.NaN }],
+    ["infinite height", { height: Number.POSITIVE_INFINITY }],
+  ];
+  it.each(bad)("names the photo when the %s", async (_label, over) => {
+    const { om } = await fresh();
+    expect(om.stillSizeProblem(still(over))).toBe("Couldn't read the size of harbour.");
   });
 });

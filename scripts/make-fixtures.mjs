@@ -409,4 +409,95 @@ if (!fs.existsSync(hidden)) {
 // on a file that already has it is a no-op.
 if (process.platform === "win32") execFileSync("attrib", ["+h", hidden]);
 
+/* --- image projects (src/dev/autotest-image.ts). Written byte by byte, not
+   through lavfi: the colour source and drawbox work in YUV 4:2:0, and that
+   round trip at odd sizes moves a flat colour by a unit or two, while the E2E
+   compares decoded pixels at ±1. Sizes and colours differ on every axis
+   (641 ≠ 361, 97 ≠ 61; no quadrant shares its colour with a neighbour), so a
+   transposed canvas, a swapped quadrant or a dropped alpha channel cannot land
+   on a matching number. Each file is decoded back through ffmpeg on creation
+   and refused if a pixel is not what the blocks expect. */
+const { deflateSync } = await import("node:zlib");
+function pngOf(w, h, channels, pixelAt) {
+  const rowLen = 1 + w * channels;
+  const raw = Buffer.alloc(rowLen * h);
+  for (let y = 0; y < h; y++) {
+    raw[y * rowLen] = 0; // filter: none
+    for (let x = 0; x < w; x++) {
+      const px = pixelAt(x, y);
+      for (let c = 0; c < channels; c++) raw[y * rowLen + 1 + x * channels + c] = px[c];
+    }
+  }
+  const chunk = (type, data) => {
+    const typed = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const out = Buffer.alloc(12 + data.length);
+    out.writeUInt32BE(data.length, 0);
+    typed.copy(out, 4);
+    out.writeUInt32BE(crc32(typed), 8 + data.length);
+    return out;
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = channels === 4 ? 6 : 2; // RGBA : RGB
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+/** ffmpeg's own decode of `file` as RGBA, and a pixel reader over it. */
+function rgbaOf(file, w) {
+  const buf = execFileSync(ffmpeg, [
+    "-hide_banner", "-loglevel", "error",
+    "-i", file, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
+  ]);
+  return (x, y) => Array.from(buf.subarray((y * w + x) * 4, (y * w + x) * 4 + 4));
+}
+function imageFixture(name, w, h, channels, pixelAt, checks) {
+  const target = path.join(outDir, name);
+  if (fs.existsSync(target)) {
+    console.log(`skip   ${name}`);
+    return;
+  }
+  console.log(`create ${name}`);
+  fs.writeFileSync(target, pngOf(w, h, channels, pixelAt));
+  const at = rgbaOf(target, w);
+  for (const [x, y, want] of checks) {
+    const got = at(x, y);
+    if (got.some((v, i) => v !== want[i])) {
+      fs.rmSync(target);
+      throw new Error(`${name}: ffmpeg decodes (${x},${y}) as ${got.join(",")}, not ${want.join(",")}`);
+    }
+  }
+}
+// 641x361: TL 320x180 (224,64,32), BR 321x181 (32,192,96), TR and BL the
+// background (32,64,128).
+const GRID_TL = [224, 64, 32];
+const GRID_BR = [32, 192, 96];
+const GRID_BG = [32, 64, 128];
+imageFixture(
+  "image_grid_641x361.png", 641, 361, 3,
+  (x, y) => (x < 320 && y < 180 ? GRID_TL : x >= 320 && y >= 180 ? GRID_BR : GRID_BG),
+  [
+    [0, 0, [...GRID_TL, 255]], [319, 179, [...GRID_TL, 255]],
+    [320, 180, [...GRID_BR, 255]], [640, 360, [...GRID_BR, 255]],
+    [640, 0, [...GRID_BG, 255]], [0, 360, [...GRID_BG, 255]],
+  ],
+);
+// 97x61, one colour (48,80,160); columns 0-39 fully transparent. The
+// transparent pixels keep the SAME blue, so a path that drops the alpha shows
+// blue there, never the white a JPEG flattens transparency onto.
+const ALPHA_RGB = [48, 80, 160];
+imageFixture(
+  "image_alpha_97x61.png", 97, 61, 4,
+  (x) => [...ALPHA_RGB, x < 40 ? 0 : 255],
+  [
+    [0, 0, [...ALPHA_RGB, 0]], [39, 60, [...ALPHA_RGB, 0]],
+    [40, 0, [...ALPHA_RGB, 255]], [96, 60, [...ALPHA_RGB, 255]],
+  ],
+);
+
 console.log("fixtures ready at", outDir);

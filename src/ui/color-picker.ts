@@ -6,8 +6,8 @@
 // dynamically on the click that opens it, every listener is registered in
 // openColorPicker and torn down by close(), and there is no rAF loop and no
 // polling — drags are driven by pointer events with a rect cached for the whole
-// gesture, so a move never reads layout. Styles live in settings/settings.css
-// (the only route that opens this) under a "colour picker" heading.
+// gesture, so a move never reads layout. Styles live in ./color-picker.css,
+// imported below so they load with this module and with nothing else.
 //
 // The two 1-D controls are native <input type="range"> on purpose: keyboard
 // support, pointer capture and touch behaviour come for free and correct, which
@@ -24,9 +24,11 @@
 // under `npm run dev`. The full chain is documented above `colorRow` in
 // src/settings/settings.ts.
 
+import "./color-picker.css";
 import { escapeHtml } from "../core/format";
 import { describeError, ipc, onScreenPickHover } from "../core/ipc";
 import { normalizeHexColor } from "../core/session";
+import { blockShortcuts } from "../core/shortcuts";
 import { trapTab } from "./focus";
 import { toast } from "./toast";
 
@@ -578,6 +580,12 @@ export function openColorPicker(opts: ColorPickerOptions): ColorPickerHandle {
   /* ---------------- lifecycle ---------------- */
 
   const releaseTrap = trapTab(el);
+  // The popover holds the keyboard while it is open, like a menu or a dialog:
+  // its square is a div (not a typing target), so without this every screen
+  // shortcut fired behind it — and a screen's own capture-phase Escape ran
+  // before the popover's, putting the tool down and COMMITTING the preview
+  // instead of cancelling it.
+  const releaseKeys = blockShortcuts();
 
   function onOutsidePointerDown(e: PointerEvent): void {
     const t = e.target as Node;
@@ -603,6 +611,7 @@ export function openColorPicker(opts: ColorPickerOptions): ColorPickerHandle {
     window.removeEventListener("resize", onDismiss);
     window.removeEventListener("scroll", onDismiss, true);
     releaseTrap();
+    releaseKeys();
     el.remove();
     // Escape is a real cancel: the value the popover opened on wins.
     opts.onCommit(cancel ? initial : current());

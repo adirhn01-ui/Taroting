@@ -1,3 +1,89 @@
 /* Image editor shell. Reuses the video editor's shell classes (and its route-out
    control ids, so the nav rescue applies unchanged); only what is genuinely new
    to image mode lives here, built from the tokens in style/tokens.css. */
+
+/* ---------- stage ----------
+   The canvas fills the stage; its backing store is sized to the stage's device
+   pixels by view.ts, and everything outside the image is plain app surface.
+   touch-action none: two fingers pan/pinch the image, a pen draws — neither may
+   scroll or zoom the page. Tools append their own surfaces in here. */
+.imged-stage {
+  position: relative;
+  overflow: hidden;
+  background: var(--bg-app);
+  touch-action: none;
+}
+.imged-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Hold-to-pan (Space) and a pan in progress. The descendant rule outranks a
+   tool surface's own cursor (0-2-0 over 0-1-0), so the hand shows everywhere
+   on the stage while a pan owns the pointer. */
+.imged-stage.imged-stage--pan,
+.imged-stage.imged-stage--pan * {
+  cursor: grab;
+}
+.imged-stage.imged-stage--panning,
+.imged-stage.imged-stage--panning * {
+  cursor: grabbing;
+}
+
+/* ---------- tool row ----------
+   The video transport's row, under the stage instead of above a timeline. */
+.imged-toolrow {
+  border-bottom: 0;
+  border-top: 1px solid var(--border);
+}
+.imged-tools,
+.imged-viewctl {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+.imged-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  margin: 0 var(--sp-1);
+  background: var(--border);
+}
+/* The zoom readout: the transport time's look, as a button (click = fit). */
+.imged-zoom {
+  min-width: 52px;
+  justify-content: center;
+  color: var(--text-2);
+  font-size: var(--fs-12);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- crop image ----------
+   The video editor's crop chrome, shown: the window's huge box-shadow is the
+   dim outside the crop, its handles are the stage-overlay handles. */
+.imged-crop .stage-overlay__veil,
+.imged-crop .stage-overlay__window {
+  display: block;
+}
+.imged-crop .stage-overlay__veil {
+  pointer-events: auto;
+}
+.imged-crop .stage-overlay__window {
+  cursor: move;
+}
+.imged-cropbar {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  box-shadow: var(--shadow-2);
+  white-space: nowrap;
+}

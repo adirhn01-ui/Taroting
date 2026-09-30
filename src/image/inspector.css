@@ -1,0 +1,27 @@
+/* The image inspector reuses the video inspector's sheet whole
+   (src/editor/inspector/inspector.css: .insp-section, .insp-slider, the twin
+   number, .insp-crop, .insp-readout). Only the background button set is new. */
+
+/* Transparent / White / Black / Color: two by two, because "Transparent" does
+   not fit a quarter of the panel. The buttons are the ordinary .btn--sm with
+   .btn--on for the current choice — the segmented look used elsewhere. */
+.imged-insp-bg {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-2);
+}
+
+/* The picked colour inside the Color button. Every pixel of the face is the
+   colour itself; the hairline ring sits outside it (the .settings__color-swatch
+   treatment), so a pick that matches the button stays findable. The colour is
+   written through the CSSOM. */
+.imged-insp-swatch {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px var(--swatch-ring);
+}
+.imged-insp-swatch[hidden] {
+  display: none;
+}

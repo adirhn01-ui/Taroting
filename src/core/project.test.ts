@@ -1146,3 +1146,52 @@ describe("moveClip no-op detection", () => {
     expect(moved).toBe(p);
   });
 });
+
+describe("image-project canvas (the kind branch)", () => {
+  /** A project of the given kind with a hand-edited canvas, sanitized. */
+  function canvasAfterLoad(kind: "image" | undefined, w: number, h: number): [number, number] {
+    const p = createProject("Canvas");
+    const raw: ProjectFile = { ...p, timeline: { ...p.timeline, width: w, height: h } };
+    if (kind) Object.assign(raw, { schema: 3, kind });
+    const t = sanitizeProject(raw).timeline;
+    return [t.width, t.height];
+  }
+
+  it("keeps an image canvas's odd size; a video canvas of the same numbers is evened", () => {
+    // Same input both ways, so the only thing that differs is the kind.
+    expect(canvasAfterLoad("image", 641, 361)).toEqual([641, 361]);
+    expect(canvasAfterLoad(undefined, 641, 361)).toEqual([642, 362]);
+  });
+
+  it("caps an image canvas at 65535 (not 8192) and floors it at 1 (not 16)", () => {
+    expect(canvasAfterLoad("image", 70000, 9000)).toEqual([65535, 9000]);
+    expect(canvasAfterLoad(undefined, 70000, 9000)).toEqual([MAX_CANVAS, MAX_CANVAS]);
+    expect(canvasAfterLoad("image", 0, 3)).toEqual([1, 3]);
+  });
+
+  it("reads a NaN image side as 1, where a video's reads as 1920 × 1080", () => {
+    expect(canvasAfterLoad("image", NaN, NaN)).toEqual([1, 1]);
+    expect(canvasAfterLoad(undefined, NaN, NaN)).toEqual([1920, 1080]);
+  });
+
+  it("hands a healthy image project back as the same reference", () => {
+    const p = createProject("Canvas");
+    const img: ProjectFile = { ...p, schema: 3, kind: "image", timeline: { ...p.timeline, width: 641, height: 361 } };
+    expect(sanitizeProject(img)).toBe(img);
+  });
+
+  it("checkInvariants holds an image canvas to integers in [1, 65535]", () => {
+    const p = createProject("Canvas");
+    const at = (kind: "image" | undefined, w: number, h: number): string[] => {
+      const q: ProjectFile = { ...p, timeline: { ...p.timeline, width: w, height: h } };
+      if (kind) Object.assign(q, { schema: 3, kind });
+      return checkInvariants(q);
+    };
+    expect(at("image", 641, 1)).toEqual([]);
+    expect(at("image", 65535, 9000)).toEqual([]);
+    expect(at("image", 0, 361)).toEqual(["timeline width 0 not an integer in [1, 65535]"]);
+    expect(at("image", 641, 65536)).toEqual(["timeline height 65536 not an integer in [1, 65535]"]);
+    expect(at("image", 641.5, 361)).toEqual(["timeline width 641.5 not an integer in [1, 65535]"]);
+    expect(at(undefined, 641, 360)).toEqual(["timeline width 641 not an even integer in [16, 8192]"]);
+  });
+});

@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { findConflicts } from "../core/shortcuts";
 import { ACTION_MODES, DEFAULT_SHORTCUTS } from "../core/types";
 import type { ActionId } from "../core/types";
 import { ACTION_LABELS, ACTION_ORDER, LIVE_MODES, colorRow, liveConflicts } from "./settings";
@@ -14,17 +13,20 @@ describe("ACTION_ORDER", () => {
 });
 
 describe("liveConflicts", () => {
-  it("never names a screen that does not exist yet", () => {
-    // undo and redo share the editor AND image modes, so the raw finder reports
-    // the clash twice — the image one is the row the card must not print.
+  it("reports a clash on every screen that binds both actions", () => {
+    // undo and redo share the editor AND image modes, and both screens exist,
+    // so one clash is two rows — one per screen the user can meet it on.
     const shortcuts = { ...DEFAULT_SHORTCUTS, redo: "Ctrl+Z" };
     expect(ACTION_MODES.undo).toContain("image");
-    expect(findConflicts(shortcuts).map((c) => c.mode)).toContain("image");
+    expect(LIVE_MODES).toContain("image");
 
     const live = liveConflicts(shortcuts);
-    expect(live).toEqual([{ chord: "Ctrl+Z", mode: "editor", actions: ["undo", "redo"] }]);
-    expect(LIVE_MODES).not.toContain("image");
+    expect(live).toEqual([
+      { chord: "Ctrl+Z", mode: "editor", actions: ["undo", "redo"] },
+      { chord: "Ctrl+Z", mode: "image", actions: ["undo", "redo"] },
+    ]);
   });
+
 
   it("keeps a clash on the viewer", () => {
     const live = liveConflicts({ ...DEFAULT_SHORTCUTS, nextFile: "Space" });

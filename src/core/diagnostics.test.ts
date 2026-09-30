@@ -515,9 +515,9 @@ describe("buildReport", () => {
     const text = buildReport(
       baseCtx({ settings: makeSettings({ inkColors: ["#a1b2c3", "#d4e5f6", "#0f1e2d"] }) }),
     );
-    expect(text).toContain("Ink colours     3\n");
+    expect(text).toContain("Ink colors      3\n");
     for (const c of ["a1b2c3", "d4e5f6", "0f1e2d"]) expect(text).not.toContain(c);
-    expect(buildReport(baseCtx({ settings: makeSettings() }))).toContain("Ink colours     0\n");
+    expect(buildReport(baseCtx({ settings: makeSettings() }))).toContain("Ink colors      0\n");
   });
 
   it("says where a file opened from File Explorer lands, as its own padded line", () => {

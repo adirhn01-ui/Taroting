@@ -1,0 +1,108 @@
+/* Image editor: the Layers panel and the select tool's stage chrome.
+   Everything here extends the video editor's own classes (.media-row*,
+   .stage-overlay*) from editor.css and is built only from the tokens in
+   style/tokens.css; no new stacking layer (the stage chrome sits in
+   --z-stage-overlay through .stage-overlay). */
+
+/* ---------- Layers panel ---------- */
+
+/* the drop line is positioned against the list's scrolled content */
+.imged-layer-list {
+  position: relative;
+}
+
+.imged-layer {
+  gap: var(--sp-2);
+  border: 1px solid transparent;
+}
+.imged-layer.is-selected,
+.imged-layer.is-selected:hover {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+.imged-layer.is-hidden .media-row__thumb,
+.imged-layer.is-hidden .media-row__meta {
+  opacity: 0.45;
+}
+.imged-layer.is-dragging {
+  opacity: 0.5;
+}
+
+.imged-layer__thumb {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.imged-layer__status {
+  flex: none;
+}
+
+.imged-layer__actions {
+  display: flex;
+  flex: none;
+  gap: 2px;
+}
+.imged-layer__actions .btn svg {
+  pointer-events: none;
+}
+
+.imged-layer__rename {
+  width: 100%;
+  height: 22px;
+  padding: 0 var(--sp-1);
+  font-size: var(--fs-12);
+  font-weight: 500;
+}
+
+/* reorder insertion line — the timeline drop guide's look, horizontal */
+.imged-layer-drop {
+  position: absolute;
+  top: 0;
+  left: var(--sp-2);
+  right: var(--sp-2);
+  height: 2px;
+  display: none;
+  background: var(--accent);
+  pointer-events: none;
+  will-change: transform;
+}
+
+/* ---------- select tool (stage chrome) ---------- */
+
+/* Outside crop mode the overlay never takes the pointer: the canvas stays the
+   hit target and a click is read by the stage. Only the corner handles take
+   events. In crop mode the whole overlay does. */
+.stage-overlay.imged-select {
+  pointer-events: none;
+}
+.imged-select .stage-overlay__selbox .stage-overlay__handle {
+  pointer-events: auto;
+}
+.stage-overlay.imged-select.is-cropping {
+  pointer-events: auto;
+}
+
+/* the full source of the layer being cropped, drawn under the window */
+.imged-select__ghost {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: none;
+  opacity: 0.4;
+  pointer-events: none;
+}
+.imged-select.is-cropping .imged-select__ghost {
+  display: block;
+}
+
+/* The layer crop's bar wears the canvas crop's .imged-cropbar (one look for
+   both crops); only its placement and its hidden-until-cropping state are its
+   own. Compound, so it outranks .imged-cropbar's display: flex whatever order
+   the two stylesheets load in — the JS shows it only while cropping. */
+.imged-cropbar.imged-select__cropbar {
+  left: 0;
+  top: 0;
+  display: none;
+}

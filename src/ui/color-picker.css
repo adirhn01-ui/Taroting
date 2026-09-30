@@ -1,0 +1,190 @@
+/* Colour picker popover (src/ui/color-picker.ts).
+
+   Its own sheet, imported by the module itself, so the styles ride along with
+   every lazy import of the picker — Settings → Appearance, the image editor's
+   ink colour and its background colour — and cost nothing until one opens.
+   Every colour the picker shows at runtime (the preview swatch, the presets,
+   the gradient stops) is written through the CSSOM; see the header comment in
+   color-picker.ts for why a style attribute would render blank in the
+   packaged build. */
+
+/* The escape hatch travels with the picker. "Reset to default" lives in it, so
+   when a custom theme makes the Appearance card unreadable
+   (html[data-rescue-appearance], stamped by applyTheme — the full rationale
+   sits above the matching rule in settings/settings.css) the popover repaints
+   from the same fixed --safe-* palette as the card. A readable card that opens
+   an unreadable "Reset to default" is the same dead end as an unreadable card.
+   The attribute only exists under a custom theme, where the --safe-* values
+   are published, so under Dark/Light this rule cannot match. */
+html[data-rescue-appearance] .cp {
+  --bg-panel: var(--safe-panel);
+  --bg-raised: var(--safe-raised);
+  --bg-input: var(--safe-input);
+  --bg-hover: var(--safe-hover);
+  --bg-active: var(--safe-active);
+  --border: var(--safe-border);
+  --border-strong: var(--safe-border-strong);
+  --text-1: var(--safe-text-1);
+  --text-2: var(--safe-text-2);
+  --text-3: var(--safe-text-3);
+  --accent: var(--safe-accent);
+  --accent-strong: var(--safe-accent-strong);
+  --accent-dim: var(--safe-accent-dim);
+}
+
+.cp {
+  position: fixed;
+  z-index: var(--z-menu); /* a transient popover, same rung as a context menu — see z-index scale in tokens.css */
+  width: 236px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-m);
+  box-shadow: var(--shadow-2);
+  user-select: none;
+}
+
+/* Opened from a dialog, the picker would sit on the menu rung BELOW the modal
+   rung — behind the very backdrop it was opened from. Every dialog is a
+   .modal-backdrop appended to <body>, and the picker is appended after it, so
+   this sibling rule lifts exactly a popover opened over a modal, from any
+   dialog, one rung up (still under toasts). Anywhere else it matches nothing. */
+.modal-backdrop ~ .cp {
+  z-index: var(--z-modal-popover);
+}
+
+.cp__title {
+  font-size: var(--fs-12);
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+/* Saturation across x, brightness down y, over the pure hue. */
+.cp__sv {
+  position: relative;
+  height: 132px;
+  border-radius: var(--radius-s);
+  cursor: crosshair;
+  touch-action: none;
+  background:
+    linear-gradient(to top, #000, rgba(0, 0, 0, 0)),
+    linear-gradient(to right, #fff, var(--cp-hue-color, #ff0000));
+}
+.cp__sv:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cp__sv-thumb {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+
+.cp__slider-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.cp__slider-label {
+  width: 58px;
+  flex: none;
+  font-size: var(--fs-11);
+  color: var(--text-3);
+}
+.cp .cp__range {
+  flex: 1;
+  min-width: 0;
+  height: 10px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border);
+}
+.cp .cp__hue {
+  background: linear-gradient(
+    to right,
+    #ff0000,
+    #ffff00,
+    #00ff00,
+    #00ffff,
+    #0000ff,
+    #ff00ff,
+    #ff0000
+  );
+}
+.cp .cp__bright {
+  background: linear-gradient(to right, #000, var(--cp-bright-to, #ffffff));
+}
+.cp .cp__range::-webkit-slider-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-1);
+}
+
+.cp__hexrow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+/* Same ring-outside-the-face treatment as .settings__color-swatch above: every
+   pixel of the box is the colour under judgment, the hairline sits beyond it. */
+.cp__swatch {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: var(--radius-s);
+  box-shadow: 0 0 0 1px var(--swatch-ring);
+}
+.cp .cp__hex {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  padding: 0 var(--sp-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+  user-select: text;
+}
+.cp .cp__hex--bad {
+  border-color: var(--danger);
+}
+.cp .cp__eyedropper {
+  flex: none;
+}
+
+.cp__presets {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: var(--sp-1);
+}
+.cp__preset {
+  height: 20px;
+  padding: 0;
+  border: none;
+  box-shadow: 0 0 0 1px var(--swatch-ring);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: transform var(--dur) var(--ease);
+}
+.cp__preset:hover {
+  transform: scale(1.12);
+}
+.cp__preset:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.cp__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}

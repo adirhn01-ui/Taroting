@@ -3,7 +3,8 @@
 // cancel and a success / error result view.
 
 import "./export.css";
-import { createExportRunHold, registerCloseTask } from "../../core/app-close";
+import { registerCloseTask } from "../../core/app-close";
+import { createExportRunHold } from "../../core/export-hold";
 import type { ReportContext } from "../../core/diagnostics";
 import { escapeHtml, fileExt, formatBytes } from "../../core/format";
 import { appVersion, describeError, errorDetail, ipc, onJobEvents } from "../../core/ipc";
@@ -369,8 +370,8 @@ function formatEta(sec: number): string {
 }
 
 // The export run hold is shared with the image editor's export dialog (its own
-// chunk), so it lives in core/app-close beside the close tasks it registers.
-export { EXPORT_RUNNING_REASON, createExportRunHold, type ExportRunHold } from "../../core/app-close";
+// chunk), so it lives in core/export-hold — off the boot path.
+export { EXPORT_RUNNING_REASON, createExportRunHold, type ExportRunHold } from "../../core/export-hold";
 
 /* ---------------- dialog ---------------- */
 

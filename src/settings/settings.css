@@ -240,8 +240,9 @@ html[data-custom-theme] .settings__segmented .btn--on {
    truly cannot see it", effectively the all-one-colour case. See
    needsAppearanceRescue in src/core/session.ts for the surface list and why 1.5.
 
-   Both selectors carry the flag on purpose: a readable card that opens an
-   unreadable "Reset to default" is the same dead end as an unreadable card.
+   The colour picker carries the same flag (src/ui/color-picker.css) on
+   purpose: a readable card that opens an unreadable "Reset to default" is the
+   same dead end as an unreadable card.
 
    Two things are deliberately NOT overridden:
      * the colour swatches, which must show the literal picks — their
@@ -255,8 +256,7 @@ html[data-custom-theme] .settings__segmented .btn--on {
    applyTheme's custom branch, so under Dark/Light these rules cannot match —
    there the --safe-* properties do not exist, and a var() with no fallback
    would resolve to the guaranteed-invalid value rather than to the palette. */
-html[data-rescue-appearance] .settings__card--appearance,
-html[data-rescue-appearance] .cp {
+html[data-rescue-appearance] .settings__card--appearance {
   --bg-panel: var(--safe-panel);
   --bg-raised: var(--safe-raised);
   --bg-input: var(--safe-input);
@@ -276,157 +276,6 @@ html[data-rescue-appearance] .cp {
    is the same dead end as one you cannot read. */
 html[data-rescue-appearance] .settings__card--appearance {
   border-color: var(--safe-border-strong);
-}
-
-/* ---------- Colour picker popover (src/ui/color-picker.ts) ----------
-   Lives here rather than in components.css because the Appearance card is the
-   only thing that opens it, and this is the stylesheet that route loads. */
-.cp {
-  position: fixed;
-  z-index: var(--z-menu); /* a transient popover, same rung as a context menu — see z-index scale in tokens.css */
-  width: 236px;
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-3);
-  padding: var(--sp-3);
-  background: var(--bg-raised);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-m);
-  box-shadow: var(--shadow-2);
-  user-select: none;
-}
-
-.cp__title {
-  font-size: var(--fs-12);
-  font-weight: 600;
-  color: var(--text-2);
-}
-
-/* Saturation across x, brightness down y, over the pure hue. */
-.cp__sv {
-  position: relative;
-  height: 132px;
-  border-radius: var(--radius-s);
-  cursor: crosshair;
-  touch-action: none;
-  background:
-    linear-gradient(to top, #000, rgba(0, 0, 0, 0)),
-    linear-gradient(to right, #fff, var(--cp-hue-color, #ff0000));
-}
-.cp__sv:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-.cp__sv-thumb {
-  position: absolute;
-  width: 12px;
-  height: 12px;
-  margin: -6px 0 0 -6px;
-  border-radius: 50%;
-  border: 2px solid #fff;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55);
-  pointer-events: none;
-}
-
-.cp__slider-row {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-}
-.cp__slider-label {
-  width: 58px;
-  flex: none;
-  font-size: var(--fs-11);
-  color: var(--text-3);
-}
-.cp .cp__range {
-  flex: 1;
-  min-width: 0;
-  height: 10px;
-  border-radius: var(--radius-full);
-  border: 1px solid var(--border);
-}
-.cp .cp__hue {
-  background: linear-gradient(
-    to right,
-    #ff0000,
-    #ffff00,
-    #00ff00,
-    #00ffff,
-    #0000ff,
-    #ff00ff,
-    #ff0000
-  );
-}
-.cp .cp__bright {
-  background: linear-gradient(to right, #000, var(--cp-bright-to, #ffffff));
-}
-.cp .cp__range::-webkit-slider-thumb {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: #fff;
-  border: 1px solid rgba(0, 0, 0, 0.45);
-  box-shadow: var(--shadow-1);
-}
-
-.cp__hexrow {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-}
-/* Same ring-outside-the-face treatment as .settings__color-swatch above: every
-   pixel of the box is the colour under judgment, the hairline sits beyond it. */
-.cp__swatch {
-  width: 26px;
-  height: 26px;
-  flex: none;
-  border-radius: var(--radius-s);
-  box-shadow: 0 0 0 1px var(--swatch-ring);
-}
-.cp .cp__hex {
-  flex: 1;
-  min-width: 0;
-  height: 26px;
-  padding: 0 var(--sp-2);
-  font-family: var(--font-mono);
-  font-size: var(--fs-12);
-  user-select: text;
-}
-.cp .cp__hex--bad {
-  border-color: var(--danger);
-}
-.cp .cp__eyedropper {
-  flex: none;
-}
-
-.cp__presets {
-  display: grid;
-  grid-template-columns: repeat(6, 1fr);
-  gap: var(--sp-1);
-}
-.cp__preset {
-  height: 20px;
-  padding: 0;
-  border: none;
-  box-shadow: 0 0 0 1px var(--swatch-ring);
-  border-radius: 4px;
-  cursor: pointer;
-  transition: transform var(--dur) var(--ease);
-}
-.cp__preset:hover {
-  transform: scale(1.12);
-}
-.cp__preset:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-
-.cp__foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-2);
 }
 
 /* ---------- Export path ---------- */
