@@ -62,8 +62,8 @@ if (!import.meta.env.DEV) {
 // instant without slowing startup — and a launch that opens a file in the
 // viewer never fetches it unless the user goes on to Home.
 // The viewer is a separate chunk too, and deliberately NOT prefetched: it is
-// only ever reached from File Explorer or Home's Open, and a user who never
-// goes there must not pay for it.
+// only ever reached from File Explorer (or back from a project opened from
+// it), and a user who never goes there must not pay for it.
 
 const app = document.getElementById("app")!;
 
@@ -98,6 +98,10 @@ let activeViewer: import("./viewer/viewer").ViewerHandle | null = null;
 /** The idle editor prefetch has been asked for (once per app lifetime). */
 let editorWarmed = false;
 
+/** The viewer left for "Open as project" (an editor route with returnTo) and
+ *  asked the backend to keep its folder order for the way back. */
+let siblingOrderHeld = false;
+
 async function go(route: Route): Promise<void> {
   const token = ++navToken;
   const prev = dispose;
@@ -113,6 +117,17 @@ async function go(route: Route): Promise<void> {
   // running and reports its own failure if it ends in one.
   await teardowns.settledWithin(TEARDOWN_WAIT_MS);
   if (token !== navToken) return; // superseded while disposing
+  // The folder order held for a viewer → project → viewer round trip goes as
+  // soon as the app heads anywhere else (the gear to Settings, Home, another
+  // project): a later open of that folder with no Explorer window showing it
+  // must not step in a stale order. Back in the viewer, the viewer owns it
+  // again (its own dispose drops it). A plain launch never gets here set.
+  if (route.view === "editor" && route.returnTo !== undefined) siblingOrderHeld = true;
+  else if (route.view === "viewer") siblingOrderHeld = false;
+  else if (siblingOrderHeld) {
+    siblingOrderHeld = false;
+    void ipc.forgetSiblingOrder().catch(() => {});
+  }
   // Clearing #app cannot reach an error dialog: those live on document.body so
   // they can sit above everything. A screen that owns one has just closed it in
   // dispose(); this catches the ones nobody owns — a toast's "Details" dialog

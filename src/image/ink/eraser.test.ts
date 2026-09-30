@@ -29,6 +29,15 @@ describe("strokeHit", () => {
     expect(strokeHit(pen, 30, 20, 70, 60, 1)).toBe(true);
   });
 
+  it("reaches a pencil mark's full painted width, a pen only its own", () => {
+    // Same 6-wide line; a mouse pencil paints a half-width of 0.75w = 4.5, so
+    // a point 0.7w = 4.2 from the centre sits on grey the pen never paints.
+    const pencil: Stroke = { ...pen, t: "pencil" };
+    expect(strokeHit(pencil, 50, 44.2, 50, 44.2, 0)).toBe(true);
+    expect(strokeHit(pen, 50, 44.2, 50, 44.2, 0)).toBe(false);
+    expect(strokeHit(pencil, 50, 44.51, 50, 44.51, 0)).toBe(false);
+  });
+
   it("hits a shape by its outline, not its inside", () => {
     const rect: Stroke = { t: "rect", c: "#e5484d", w: 2, a: [0, 0], b: [100, 60] };
     expect(strokeHit(rect, 50, 30, 50, 30, 4)).toBe(false);

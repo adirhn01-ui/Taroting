@@ -53,7 +53,7 @@ import {
   simplifyStroke,
 } from "./input";
 import "./ink.css";
-import { createScratch, paintLiveMark, paintLiveShape } from "./paint";
+import { PENCIL_MAX_WIDTHS, createScratch, paintLiveMark, paintLiveShape, strokeBounds } from "./paint";
 import { mountRuler } from "./ruler";
 import { constrainShape, shapeEndsInRange, shapeLongEnough, shapeStroke, type Pt } from "./shapes";
 
@@ -76,6 +76,36 @@ const SHAPE_MIN_CSS = 1;
 export function pencilOpacity(meanPressure: number): number {
   const p = Number.isFinite(meanPressure) ? Math.min(Math.max(meanPressure, 0), 1) : 1;
   return 0.3 + 0.7 * p;
+}
+
+interface Box {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** The canvas-px box of `pts` ([x, y, p]*), grown by `pad` on every side. */
+function pointsBox(pts: Float32Array, pad: number): Box {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i + 2 < pts.length; i += 3) {
+    minX = Math.min(minX, pts[i]!);
+    minY = Math.min(minY, pts[i + 1]!);
+    maxX = Math.max(maxX, pts[i]!);
+    maxY = Math.max(maxY, pts[i + 1]!);
+  }
+  return { x: minX - pad, y: minY - pad, w: maxX - minX + 2 * pad, h: maxY - minY + 2 * pad };
+}
+
+/** Does a canvas-px box lie wholly outside the W×H canvas? The preview is
+ *  clipped to the canvas, so a mark out there would never be seen: it is not
+ *  kept (no stroke, no new drawing layer, no undo step). A mark that crosses
+ *  the edge is kept whole. NaN reads as outside. */
+function missesCanvas(b: Box, W: number, H: number): boolean {
+  return !(b.x + b.w > 0 && b.y + b.h > 0 && b.x < W && b.y < H);
 }
 
 /** Where a gesture's mark goes, and how to get there from canvas px. */
@@ -430,8 +460,11 @@ export function mountInk(ctx: ImageEditorCtx): { dispose(): void } {
     const pts = simplifyStroke(gi.sampler.points, gi.sampler.count, SIMPLIFY_CSS * k);
     const o = inkOpacity(gi);
     const tool = gi.tool;
+    // What the mark can paint, in canvas px (the pencil up to its full width).
+    const box = pointsBox(pts, (gi.sizeCss * k * (tool === "pencil" ? PENCIL_MAX_WIDTHS : 1)) / 2);
     commitMark(
       (p, t) => {
+        if (missesCanvas(box, p.timeline.width, p.timeline.height)) return null;
         const local = encodePoints(toLocal(p, t, pts, pts.length / 3));
         const w = widthFor(gi.sizeCss, gi.dpr, gi.zoom, t.t.scale);
         return tool === "erase" ? { t: "erase", w, p: local } : { t: tool, c: gi.color, w, o, p: local };
@@ -448,6 +481,10 @@ export function mountInk(ctx: ImageEditorCtx): { dispose(): void } {
     commitMark((p, t) => {
       const W = p.timeline.width;
       const H = p.timeline.height;
+      // Wholly off the canvas: nothing to see, nothing kept, nothing said. The
+      // same shape in canvas px gives its painted box (an arrow's wings too).
+      const drawn: Stroke = { t: gs.shape, c: gs.color, w: gs.sizeCss * k, a: gs.a, b: gs.b };
+      if (missesCanvas(strokeBounds(drawn), W, H)) return null;
       const la = canvasToLayer(t.t, t.srcW, t.srcH, W, H, gs.a[0], gs.a[1]);
       const lb = canvasToLayer(t.t, t.srcW, t.srcH, W, H, gs.b[0], gs.b[1]);
       const a: Pt = [la.x, la.y];

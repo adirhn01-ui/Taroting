@@ -42,6 +42,10 @@ pub struct BuiltExport {
     pub duration_sec: f64,
     /// (placeholder, file-content) pairs for drawtext textfiles.
     pub text_payloads: Vec<(String, String)>,
+    /// The file behind every `-i`, in argv order: exactly the files ffmpeg
+    /// will open (a generator opens none, a muted clip's audio is never
+    /// added). `start_export` checks these are still on disk.
+    pub sources: Vec<OsString>,
 }
 
 /// Sentinel argv entry replaced by `start_export` with either the inline
@@ -54,6 +58,10 @@ pub const FILTER_PLACEHOLDER: &str = "\u{0}TAROTING_FILTER\u{0}";
 pub fn text_placeholder(i: usize) -> String {
     format!("\u{0}TAROTING_TEXT_{i}\u{0}")
 }
+
+/// The fastest rate a GIF is written at (see the cap in `build`). Whole: its
+/// `Display` is the `fps=` value, so it must print without a fraction.
+pub(crate) const GIF_MAX_FPS: f64 = 30.0;
 
 /// The square the animated-opacity alpha mask is evaluated on, and the rung it
 /// is enlarged through on its way to the clip's post-crop size.
@@ -866,7 +874,18 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     // is where mixing them up used to mis-place off-centre clips.
     let (out_w, out_h) = preset.output_dims(spec.timeline.width, spec.timeline.height);
     let canvas = (spec.timeline.width, spec.timeline.height);
-    let fps_str = preset.output_fps(&spec.timeline);
+    let mut fps_str = preset.output_fps(&spec.timeline);
+    // A GIF frame delay is whole centiseconds, so above 50 fps some frames get
+    // 1 cs (a 60 fps graph alternates 2 cs and 1 cs frames, measured), and
+    // browsers play any delay of 1 cs or less as 10 cs: a 60 fps phone clip
+    // exported at the "Original" rate stuttered at about a third of its speed.
+    // The dialog caps its own GIF numbers at 30 but never "Original", and a
+    // crafted project can carry any Custom rate, so the same 30 is applied
+    // here, where every GIF passes. The size estimate caps GIF at it too.
+    let timeline_fps = spec.timeline.fps.num as f64 / spec.timeline.fps.den.max(1) as f64;
+    if is_gif && preset.fps_value(timeline_fps) > GIF_MAX_FPS {
+        fps_str = format!("{GIF_MAX_FPS}");
+    }
     let duration_sec = spec.timeline.duration();
 
     // Video tracks are a contiguous prefix; tracks[0] is TOPMOST, the last
@@ -1020,6 +1039,12 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     for a in ["-y", "-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1"] {
         args.push(a.into());
     }
+    let sources: Vec<OsString> = inputs
+        .iter()
+        .map(|entry| match &entry.source {
+            InputSource::File(p) => p.clone(),
+        })
+        .collect();
     for entry in inputs {
         args.extend(entry.flags);
         match entry.source {
@@ -1066,6 +1091,7 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
         filter_complex: fc,
         duration_sec,
         text_payloads,
+        sources,
     })
 }
 
@@ -2094,6 +2120,31 @@ mod tests {
             assert!((2 * num(ox) + num(dw) - out_w).abs() <= 1, "{r}: {xy} / {sz}");
             assert!((2 * num(oy) + num(dh) - out_h).abs() <= 1, "{r}: {xy} / {sz}");
         }
+    }
+
+    /// A portrait (phone) canvas at a named preset: the preset is the frame's
+    /// WIDTH. A 1080x1350 project at "720p" is written 720x900 — it was 576x720
+    /// while the preset meant the height everywhere — and a landscape clip on
+    /// it fits the 720 px width and is centred in the 900 px height.
+    #[test]
+    fn a_portrait_canvas_exports_the_named_preset_as_its_width() {
+        let m = media("m1", r"C:\v.mp4", 1920, 1080, false);
+        let c = clip("c1", "m1", 0.0, 0.0, 2.0);
+        let tl = timeline(1080, 1350, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+        let b = build(
+            &spec(vec![m], tl, preset_at("mp4", "h264", "720p"), r"C:\o.mp4"),
+            &enc(),
+        )
+        .unwrap();
+        let fc = &b.filter_complex;
+        assert!(fc.contains("color=black:s=720x900:"), "{fc}");
+        assert!(!fc.contains("s=576x720"), "{fc}");
+        let num = |s: &str| s.parse::<i64>().unwrap_or_else(|_| panic!("not a number: {s}"));
+        let (xy, sz) = overlay_and_scale(&b);
+        let (ox, oy) = xy.split_once(':').expect("ox:oy");
+        let (dw, dh) = sz.split_once(':').expect("dw:dh");
+        assert_eq!((num(ox), num(dw)), (0, 720), "{xy} / {sz}");
+        assert!((2 * num(oy) + num(dh) - 900).abs() <= 1, "{xy} / {sz}");
     }
 
     #[test]
@@ -3150,6 +3201,54 @@ mod tests {
         assert!(a.windows(2).any(|w| w[0] == "-map" && w[1] == "[gifout]"));
         assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "gif"));
         assert!(!a.windows(2).any(|w| w[0] == "-c:a"));
+    }
+
+    /// Every frame rate the graph names: each `fps=` filter and each `r=` of a
+    /// synthesized source (the gap's black), in order.
+    fn graph_rates(fc: &str) -> Vec<String> {
+        let mut rates = Vec::new();
+        for head in ["fps=", ":r="] {
+            let mut rest = fc;
+            while let Some(i) = rest.find(head) {
+                rest = &rest[i + head.len()..];
+                let end = rest.find([',', ':', ';', '[']).unwrap_or(rest.len());
+                rates.push(rest[..end].to_string());
+            }
+        }
+        rates
+    }
+
+    /// A GIF is never written faster than 30 fps: GIF delays are whole
+    /// centiseconds, so a 60 fps GIF alternates 2 cs and 1 cs frames, and
+    /// browsers hold every 1 cs frame for 10 cs. The cap covers the timeline's
+    /// own rate at "Original" (a phone clip makes the timeline 60) and a Custom
+    /// rate the dialog would never send; a rate at or under 30, and every other
+    /// container, keep the rate they asked for.
+    #[test]
+    fn a_gif_is_written_at_no_more_than_30_fps() {
+        let original = || FpsPreset::Original("original".into());
+        let rows: [(&str, Rational, FpsPreset, &str); 6] = [
+            ("gif", Rational { num: 60, den: 1 }, original(), "30"),
+            ("gif", Rational { num: 25, den: 1 }, FpsPreset::Custom(48.0), "30"),
+            ("gif", Rational { num: 30000, den: 1001 }, original(), "30000/1001"),
+            ("gif", Rational { num: 60, den: 1 }, FpsPreset::Custom(24.0), "24"),
+            ("gif", Rational { num: 25, den: 1 }, original(), "25"),
+            ("mp4", Rational { num: 60, den: 1 }, original(), "60"),
+        ];
+        for (format, fps, want_fps, want) in rows {
+            let m = media("m1", r"C:\v.mp4", 854, 482, false);
+            // Starts at 0.5 s, so the bottom track opens with a black gap and
+            // the graph names the rate in a source's `r=` as well as `fps=`.
+            let c = clip("c1", "m1", 0.5, 0.0, 1.5);
+            let tl = timeline(640, 360, fps, vec![vtrack(vec![c])]);
+            let mut p = preset(format, "h264");
+            p.fps = want_fps;
+            let b = build(&spec(vec![m], tl, p, r"C:\o.gif"), &enc()).unwrap();
+            let rates = graph_rates(&b.filter_complex);
+            let tag = format!("{format} at {}/{}", fps.num, fps.den);
+            assert!(rates.len() >= 2, "{tag}: {rates:?} in {}", b.filter_complex);
+            assert!(rates.iter().all(|r| r == want), "{tag}: want {want}, got {rates:?}");
+        }
     }
 
     #[test]

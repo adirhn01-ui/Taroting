@@ -109,6 +109,15 @@ export function dropRefusal(mode: "idle" | "crop-image" | "crop-layer", modal: b
   return addRefusal(mode, modal, blocked, "drop the images again");
 }
 
+/** The tool row's Canvas button: it opens the menu of whole-picture
+ *  operations (image-menu.ts). Named for what it acts on, with the artboard
+ *  glyph rather than the crop one, so it is never read as "edit the selected
+ *  layer" — the inspector does that. */
+export function canvasMenuButton(): string {
+  const title = "Canvas: crop, resize, rotate or flip the whole picture";
+  return `<button class="btn btn--ghost btn--sm" id="imged-menu" title="${title}" aria-haspopup="menu">${imgIcon("canvas", 14)}Canvas</button>`;
+}
+
 /** The pixel-bearing parts of a project: a change to anything else (the
  *  autosave's `modifiedAt` stamp, the name, the export preset) repaints nothing. */
 interface Pixels {
@@ -275,7 +284,6 @@ function mount(
           <div class="editor__preview imged-stage" id="imged-stage"><canvas class="imged-canvas" id="imged-canvas"></canvas></div>
           <div class="transport imged-toolrow no-select">
             <div class="imged-tools" id="imged-tools"></div>
-            <div class="grow"></div>
             <div class="imged-viewctl" id="imged-viewctl">
               <button class="btn btn--ghost btn--icon btn--sm" id="imged-undo" title="${titled("Undo", "undo")}" aria-label="Undo" disabled>${imgIcon("undo", 14)}</button>
               <button class="btn btn--ghost btn--icon btn--sm" id="imged-redo" title="${titled("Redo", "redo")}" aria-label="Redo" disabled>${imgIcon("redo", 14)}</button>
@@ -284,7 +292,7 @@ function mount(
               <button class="btn btn--ghost btn--sm mono imged-zoom" id="imged-zoom" title="${titled("Fit to window", "imgZoomFit")}" aria-label="Zoom level — fit to window">100%</button>
               <button class="btn btn--ghost btn--icon btn--sm" id="imged-zoom-in" title="${titled("Zoom in", "imgZoomIn")}" aria-label="Zoom in">${icon("zoomIn", 14)}</button>
               <span class="imged-sep" aria-hidden="true"></span>
-              <button class="btn btn--ghost btn--sm" id="imged-menu" title="Crop, rotate, flip and canvas size" aria-haspopup="menu">${imgIcon("crop", 14)}Image</button>
+              ${canvasMenuButton()}
             </div>
           </div>
         </div>
@@ -573,7 +581,7 @@ function mount(
     }
   });
 
-  /* ---------------- tool row: undo/redo, zoom, Image menu ---------------- */
+  /* ---------------- tool row: undo/redo, zoom, Canvas menu ---------------- */
 
   const undoBtn = $<HTMLButtonElement>("#imged-undo");
   const redoBtn = $<HTMLButtonElement>("#imged-redo");
@@ -646,8 +654,9 @@ function mount(
   // Open FIRST, blur after: the menu records the focused element as the one to
   // return focus to, so blurring first would hand a keyboard user back to
   // <body> on Escape. The blur still frees Space for panning after a click.
-  menuBtn.addEventListener("click", () => {
-    openImageMenu(menuBtn, ctx);
+  // A keyboard activation (detail 0) opens with the first row focused.
+  menuBtn.addEventListener("click", (e) => {
+    openImageMenu(menuBtn, ctx, e.detail === 0);
     menuBtn.blur();
   });
   refreshUndo();
@@ -750,7 +759,12 @@ function mount(
   };
   mountChild(mountLayersPanel($("#imged-layers"), ctx));
   mountChild(mountToolbar($("#imged-tools"), ctx));
-  const inspector = mountImageInspector($("#imged-inspector"), ctx);
+  // The inspector's Crop button enters the select tool's own on-canvas layer
+  // crop. Looked up at click time: the select tool mounts just below, and the
+  // mount order is the teardown order the close hooks rely on.
+  const inspector = mountImageInspector($("#imged-inspector"), ctx, {
+    cropLayer: (trackId) => selectTool.cropLayer(trackId),
+  });
   mountChild(inspector);
   const selectTool = mountSelectTool(ctx);
   mountChild(selectTool);

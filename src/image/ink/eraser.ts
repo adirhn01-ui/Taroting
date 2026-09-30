@@ -13,7 +13,7 @@
 
 import type { Stroke } from "../../core/types";
 import { forEachStroke, pointsOf } from "../strokes";
-import { strokeBounds } from "./paint";
+import { PENCIL_MAX_WIDTHS, strokeBounds } from "./paint";
 import { shapePolylines } from "./shapes";
 
 /** Squared distance from P to segment AB. */
@@ -68,7 +68,9 @@ export function strokeHit(s: Stroke, ax: number, ay: number, bx: number, by: num
   // bbox reject: strokeBounds already includes the stroke's half-width.
   if (Math.max(ax, bx) + r < box.x || Math.min(ax, bx) - r > box.x + box.w) return false;
   if (Math.max(ay, by) + r < box.y || Math.min(ay, by) - r > box.y + box.h) return false;
-  const reach = r + s.w / 2;
+  // The pencil paints up to PENCIL_MAX_WIDTHS × w wide (a mouse or finger is
+  // full pressure), the same pad strokeBounds gives it.
+  const reach = r + ((s.t === "pencil" ? PENCIL_MAX_WIDTHS : 1) * s.w) / 2;
   if ("p" in s) {
     const pts = pointsOf(s);
     const n = pts.length / 3;

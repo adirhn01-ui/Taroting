@@ -270,7 +270,7 @@ export function colorRow(role: ColorRole, hex: string): string {
 const OPEN_WITH_HINTS: Record<OpenWith, string> = {
   viewer: "Shows the file on its own. Use the arrows to move through its folder.",
   editor:
-    "Opens a temporary project with the file on the timeline. You choose whether to keep it when you leave.",
+    "Opens a temporary project with the file in it: a picture as an image project, anything else on a timeline. You choose whether to keep it when you leave.",
 };
 
 const AUTOSAVE_OPTIONS = [1, 3, 5, 10, 30];

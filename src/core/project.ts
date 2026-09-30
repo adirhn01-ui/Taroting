@@ -96,16 +96,20 @@ export function createProject(name: string): ProjectFile {
 }
 
 /** Register a media file. If it's the first visual media on an empty timeline,
- *  the project adopts its resolution and frame rate. */
+ *  the project adopts its resolution and frame rate. Import is bin-first, so a
+ *  whole batch lands on an empty timeline: only a file arriving while no
+ *  visual media is in the bin adopts, never each later one in turn. */
 export function addMedia(
   p: ProjectFile,
   info: MediaInfo,
 ): { project: ProjectFile; media: MediaRef } {
   const media: MediaRef = { id: uid(), ...info };
   let timeline = p.timeline;
-  const isVisual = info.kind === "video" || info.kind === "gif" || info.kind === "imageSeq";
+  const visual = (k: MediaInfo["kind"]) => k === "video" || k === "gif" || k === "imageSeq";
+  const isVisual = visual(info.kind);
+  const hasVisual = p.media.some((m) => visual(m.kind));
   const timelineEmpty = p.timeline.tracks.every((t) => t.clips.length === 0);
-  if (isVisual && timelineEmpty && info.width && info.height) {
+  if (isVisual && !hasVisual && timelineEmpty && info.width && info.height) {
     timeline = {
       ...timeline,
       width: clampCanvas(info.width),

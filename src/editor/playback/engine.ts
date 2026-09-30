@@ -131,6 +131,9 @@ export class PlaybackEngine {
     if (!fromStep) this.steppedFrame = null;
     const dur = this.duration();
     this.t = Math.min(Math.max(0, time), dur);
+    // a step clamped at either end re-bases the chain on the frame the playhead
+    // actually sits on, so the first opposite step moves it
+    if (fromStep && this.t !== time) this.steppedFrame = frameOf(this.t, this.fps());
     this.anchor(this.t);
     this.boundary = this.scheduler.activate(this.t, this.playing_).boundary;
     this.scheduler.animate(this.t);

@@ -4,12 +4,13 @@ import "./home.css";
 import {
   escapeHtml,
   fileExt,
+  fileName,
   fileStem,
   formatBytes,
   formatDuration,
   formatRelative,
 } from "../core/format";
-import { describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles, pickOpenFile } from "../core/ipc";
+import { describeError, ipc, mediaUrl, onDragDrop, pickOpenFiles } from "../core/ipc";
 import { navigate } from "../core/nav";
 import { isTempProjectPath } from "../core/open-media";
 import { addMedia, createProject } from "../core/project";
@@ -55,6 +56,89 @@ function sortRecents(items: RecentItem[], key: SortKey): RecentItem[] {
   return out;
 }
 
+/* ---------------- Open and drop routing ---------------- */
+
+/** Where a set of chosen (or dropped) files goes. There is deliberately no
+ *  viewer here: opening media from Home is starting a project with it, and
+ *  the "Open as" dialog asks which kind. */
+export type OpenRoute =
+  | { kind: "nothing" }
+  /** `ignored`: the other files that came with it (a drop only; Open refuses) */
+  | { kind: "project"; path: string; ignored: number }
+  /** a .trt together with anything else, another .trt included */
+  | { kind: "mixed" }
+  | { kind: "unsupported"; count: number }
+  /** allowlisted media in natural name order, plus how many files were not */
+  | { kind: "media"; media: string[]; skipped: number };
+
+/** The allowlist, then natural name order ("2" before "10"): the pickers hand
+ *  files back in no particular order, and the first file names the project
+ *  and, for an image project, sets the canvas and the bottom layer. The
+ *  pickers' filters can be typed around ("*.*"), so the allowlist is applied
+ *  here too, as it is on every other way in. */
+function mediaRoute(paths: readonly string[]): OpenRoute {
+  const media = paths.filter((p) => MEDIA_FILE_EXTENSIONS.has(fileExt(p)));
+  const skipped = paths.length - media.length;
+  if (media.length === 0) return { kind: "unsupported", count: skipped };
+  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+  media.sort((a, b) => collator.compare(fileName(a), fileName(b)));
+  return { kind: "media", media, skipped };
+}
+
+/** Home's Open: one project opens; media goes to "Open as"; a project picked
+ *  together with anything else is refused rather than guessed at. */
+export function routeOpenPicks(paths: readonly string[]): OpenRoute {
+  if (paths.length === 0) return { kind: "nothing" };
+  if (paths.some((p) => fileExt(p) === "trt")) {
+    return paths.length === 1 ? { kind: "project", path: paths[0]!, ignored: 0 } : { kind: "mixed" };
+  }
+  return mediaRoute(paths);
+}
+
+/** A drop on Home: a dropped project still opens directly (the first one, as
+ *  it always has), and the rest are counted so Home can say they were not
+ *  opened; media takes the same "Open as" question as Open. */
+export function routeDrop(paths: readonly string[]): OpenRoute {
+  if (paths.length === 0) return { kind: "nothing" };
+  const project = paths.find((p) => fileExt(p) === "trt");
+  if (project) return { kind: "project", path: project, ignored: paths.length - 1 };
+  return mediaRoute(paths);
+}
+
+/** The information (not error) toast for a route, if any: a dropped project
+ *  opens, but the files dropped with it do not, and Open refuses the same set
+ *  out loud, so the drop says so too. */
+export function openRouteInfo(route: OpenRoute): string | null {
+  if (route.kind !== "project" || route.ignored === 0) return null;
+  return `Opened the project. The other ${route.ignored === 1 ? "file was" : `${route.ignored} files were`} not opened.`;
+}
+
+/** The toast a route shows, if any. */
+export function openRouteNotice(route: OpenRoute): string | null {
+  switch (route.kind) {
+    case "mixed":
+      return "Open one project at a time, or choose media files to start a new project.";
+    case "unsupported":
+      return route.count === 1 ? "Unsupported file type." : `None of these ${route.count} files is a supported type.`;
+    case "media":
+      if (route.skipped === 0) return null;
+      return route.skipped === 1
+        ? "Skipped 1 file of an unsupported type."
+        : `Skipped ${route.skipped} files of an unsupported type.`;
+    default:
+      return null;
+  }
+}
+
+/** What Home publishes on window for the in-app E2E (dev + autotest only):
+ *  the native file picker cannot be driven, so a block hands paths straight
+ *  to the same routing the picker's result and a drop take. */
+interface HomeDev {
+  open(paths: string[]): void;
+  drop(paths: string[]): void;
+}
+type HomeDevWindow = { __tarotingHomeDev?: HomeDev; __tarotingAutotest?: boolean };
+
 /* three-dot "More" glyph (icons.ts has no such icon and isn't ours to edit) */
 const MORE_SVG =
   '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">' +
@@ -78,8 +162,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
           <div class="home__hero">
             <div class="home__title">Projects</div>
             <div class="row home__actions" id="home-actions">
-              <button class="btn btn--primary" id="btn-new">${icon("plus")}New project</button>
-              <button class="btn" id="btn-new-image">${icon("image")}New image</button>
+              <button class="btn btn--primary" id="btn-new" aria-haspopup="menu">${icon("plus")}New project</button>
               <button class="btn" id="btn-open">${icon("folder")}Open</button>
               <button class="btn btn--ghost" id="btn-select" title="Select projects" hidden>Select</button>
             </div>
@@ -119,6 +202,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   const selectDeleteBtn = root.querySelector<HTMLButtonElement>("#btn-select-delete")!;
   const selectAllBtn = root.querySelector<HTMLButtonElement>("#btn-select-all")!;
   const selectCancelBtn = root.querySelector<HTMLButtonElement>("#btn-select-cancel")!;
+  const newBtn = root.querySelector<HTMLButtonElement>("#btn-new")!;
 
   let recents: RecentItem[] = [];
   let sortKey: SortKey = loadSort();
@@ -573,12 +657,40 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     }
   }
 
-  /* "New image": a dialog rather than one click, because a blank image needs a
-     size and a background before it is anything. The dialog is its own small
-     chunk, fetched on this click and never at boot; the image editor it leads
-     to is another, fetched only when the project opens. `busy` covers only the
-     fetch: the dialog runs its own guard, and Home must not sit frozen behind
-     a dialog the user may simply cancel. */
+  /* "New project" asks which kind in a menu under the button: a video project
+     is made on the spot, an image project through the "New image project"
+     dialog. `fromKeyboard`: opened with Enter/Space, so the menu starts on
+     its first row and the next Enter chooses it. */
+  function openNewMenu(fromKeyboard = false): void {
+    const r = newBtn.getBoundingClientRect();
+    showMenu(
+      r.left,
+      r.bottom + 4,
+      [
+        {
+          label: "Video project",
+          icon: icon("film", 18),
+          hint: "Clips, photos and music on a timeline",
+          onSelect: () => void createNew([]),
+        },
+        {
+          label: "Image project",
+          icon: icon("image", 18),
+          hint: "Draw on, adjust and export a picture",
+          onSelect: () => void openNewImage(),
+        },
+      ],
+      r.top - 4,
+      fromKeyboard,
+    );
+  }
+
+  /* "New image project": a dialog rather than one click, because a blank image
+     needs a size and a background before it is anything. The dialog is its
+     own small chunk, fetched on this choice and never at boot; the image
+     editor it leads to is another, fetched only when the project opens. `busy`
+     covers only the fetch: the dialog runs its own guard, and Home must not
+     sit frozen behind a dialog the user may simply cancel. */
   async function openNewImage(): Promise<void> {
     if (guard()) return;
     try {
@@ -604,26 +716,19 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     }
   }
 
-  async function openPath(path: string): Promise<void> {
+  /** `openedInfo`: an information toast shown only once the project really
+   *  opens (openRouteInfo), so a missing file never reads "Opened". */
+  async function openPath(path: string, openedInfo: string | null = null): Promise<void> {
     if (guard()) return;
     try {
       const ext = fileExt(path);
       if (ext !== "trt") {
-        // Only Home's Open picker hands a media file here (drops and recents
-        // never do). The picker's filter can be typed around ("*.*"), so the
-        // allowlist is applied here too, as it is on every other way in.
-        if (!MEDIA_FILE_EXTENSIONS.has(ext)) {
-          toast.error("Unsupported file type.");
-          return;
-        }
-        // The dialog was open for as long as the user took; see createNew
-        // for why a disposed screen must not navigate once it resolves.
-        if (disposed) return;
-        // Always the viewer, whatever "Open files from File Explorer in" says:
-        // that setting is about Explorer. Opening a file from here is looking
-        // at it; making a project of it is one click away in the viewer, and
-        // "New project" stays the way to start one for keeps.
-        navigate({ view: "viewer", path });
+        // Only projects come here. Media chosen with Open or dropped on Home
+        // never goes to the viewer, whatever "Open files from File Explorer
+        // in" says (that setting is about Explorer): opening files from Home
+        // is starting a project with them, so they go to the "Open as" dialog
+        // (routeOpenPicks / routeDrop) and the user says which kind.
+        toast.error("Unsupported file type.");
         return;
       }
       if (!(await ipc.pathExists(path))) {
@@ -641,14 +746,70 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       // screen must not navigate once they resolve.
       if (disposed) return;
       navigate(temp ? { view: "editor", projectPath: path, temp: true } : { view: "editor", projectPath: path });
+      if (openedInfo) toast.info(openedInfo);
     } finally {
       busy = false;
     }
   }
 
+  /* Media → the "Open as" dialog, its own small chunk fetched on use and never
+     at boot. `busy` covers only the fetch, as for the New image project
+     dialog: the choice then runs createNew or makeImageProject, each under
+     its own guard, and the dialog stays up, busy, until that promise
+     settles (or this screen's teardown closes it on the way out). */
+  async function offerOpenAs(media: string[]): Promise<void> {
+    if (guard()) return;
+    try {
+      const dialog = await import("./open-as-dialog");
+      if (disposed) return;
+      let close: () => void = () => {};
+      close = dialog.openOpenAsDialog({
+        paths: media,
+        onVideo: () => createNew(media),
+        onImage: () => makeImageProject(dialog.createImageProjectFrom, media),
+        onClosed: () => openOverlays.delete(close),
+      });
+      openOverlays.add(close);
+    } catch (e) {
+      toast.error(describeError(e));
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** "Image project" from "Open as": a real library project, like createNew's. */
+  async function makeImageProject(
+    create: (paths: readonly string[], gone: () => boolean) => Promise<string | null>,
+    media: string[],
+  ): Promise<void> {
+    if (guard()) return;
+    try {
+      const projectPath = await create(media, () => disposed);
+      // See createNew for why a disposed screen must not navigate.
+      if (projectPath && !disposed) navigate({ view: "editor", projectPath });
+    } catch (e) {
+      if (!disposed) toast.error(describeError(e));
+    } finally {
+      busy = false;
+    }
+  }
+
+  function followRoute(route: OpenRoute): void {
+    const notice = openRouteNotice(route);
+    if (notice) toast.error(notice);
+    if (route.kind === "project") void openPath(route.path, openRouteInfo(route));
+    else if (route.kind === "media") void offerOpenAs(route.media);
+  }
+
   async function openViaDialog(): Promise<void> {
-    const path = await pickOpenFile();
-    if (path) await openPath(path);
+    // A project is being made (or opened): a pick now would be dropped by the
+    // guard with no word, so do not open the picker at all.
+    if (busy) return;
+    const paths = await pickOpenFiles();
+    // The picker was open for as long as the user took; see createNew for why
+    // a disposed screen must not act once it resolves.
+    if (disposed) return;
+    followRoute(routeOpenPicks(paths));
   }
 
   function removeFromList(path: string): void {
@@ -776,23 +937,24 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   }
 
   function handleDroppedPaths(paths: string[]): void {
-    const project = paths.find((p) => fileExt(p) === "trt");
-    if (project) {
-      void openPath(project);
+    // A second dialog over an open one would stack two focus traps, and one
+    // Escape would close both. Say why the drop did nothing — and a busy
+    // Open as dialog cannot be closed, so do not ask for that.
+    if (busy && openOverlays.size > 0) {
+      toast.info("A project is being made. Wait for it to open.");
       return;
     }
-    const media = paths.filter((p) => MEDIA_FILE_EXTENSIONS.has(fileExt(p)));
-    if (media.length === 0) {
-      toast.error("Unsupported file type.");
+    if (openOverlays.size > 0 || document.querySelector(".modal-backdrop")) {
+      toast.info("Close the open dialog first, then drop the files again.");
       return;
     }
-    void createNew(media);
+    followRoute(routeDrop(paths));
   }
 
   /* ---------------- wiring ---------------- */
 
-  root.querySelector("#btn-new")!.addEventListener("click", () => void createNew([]));
-  root.querySelector("#btn-new-image")!.addEventListener("click", () => void openNewImage());
+  // detail 0: activated from the keyboard (Enter/Space), not by a pointer.
+  newBtn.addEventListener("click", (e) => openNewMenu(e.detail === 0));
   grid.addEventListener("error", onThumbError, true);
   root.querySelector("#btn-open")!.addEventListener("click", () => void openViaDialog());
   root.querySelector("#home-settings")!.addEventListener("click", () => navigate({ view: "settings" }));
@@ -863,13 +1025,23 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     openMore(card.dataset.path!, e.clientX, e.clientY);
   });
 
-  // “New project” should also work with a picker when users prefer clicking.
-  root.querySelector("#btn-new")!.addEventListener("contextmenu", (e) => {
+  // A right-click on "New project" is the same question as a click. (It used
+  // to open a media picker and make a VIDEO project of the pick unasked; Open
+  // now picks media, and asks.)
+  newBtn.addEventListener("contextmenu", (e) => {
     e.preventDefault();
-    void pickMediaFiles().then((files) => {
-      if (files.length) void createNew(files);
-    });
+    openNewMenu();
   });
+
+  const devWin = window as unknown as HomeDevWindow;
+  const dev: HomeDev | null =
+    import.meta.env.DEV && devWin.__tarotingAutotest === true
+      ? {
+          open: (paths) => followRoute(routeOpenPicks(paths)),
+          drop: (paths) => handleDroppedPaths(paths),
+        }
+      : null;
+  if (dev) devWin.__tarotingHomeDev = dev;
 
   // Registration is async, so dispose() can land BEFORE the listener exists.
   // Start from null (not a no-op) and hand the real unlisten straight back if
@@ -905,6 +1077,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       // Closing them is teardown's job; nothing else will ever do it.
       closeMenu();
       closeOverlays();
+      if (dev && devWin.__tarotingHomeDev === dev) delete devWin.__tarotingHomeDev;
     },
   };
 }

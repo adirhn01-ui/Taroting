@@ -1,10 +1,12 @@
-// Crop image: the whole-canvas crop (stage mode "crop-image"). A window over
+// Crop canvas: the whole-canvas crop (stage mode "crop-image"). A window over
 // the stage in canvas px, eight handles, an aspect choice, Cancel and Apply —
 // built from the video editor's own crop chrome (.stage-overlay, __veil,
 // __window, __handle--*), so it looks like the crop the app already has.
 //
 // Everything is in CANVAS px, integers ≥ 1, clamped inside the canvas: this
-// crops, it never grows (Canvas size does that). Apply is one commit of
+// crops, it never grows (Resize canvas does that). It starts as the whole
+// canvas, so the window can only be moved (drag inside it) once an edge or a
+// ratio has made it smaller. Apply is one commit of
 // `cropImage`; the shell refits the view when the canvas size changes. While
 // open it holds the keyboard (`blockShortcuts`) — a stray Delete or Ctrl+Z
 // behind the crop would edit the image the user is framing — and answers Enter
@@ -194,6 +196,10 @@ export function startImageCrop(ctx: ImageEditorCtx): () => void {
 
   const bar = document.createElement("div");
   bar.className = "imged-cropbar";
+  // Says what is being cropped: the layer crop's bar says "Crop layer".
+  const label = document.createElement("span");
+  label.className = "imged-cropbar__label";
+  label.textContent = "Crop canvas";
   const aspect = document.createElement("select");
   aspect.className = "select select--sm";
   aspect.title = "Aspect ratio";
@@ -210,7 +216,7 @@ export function startImageCrop(ctx: ImageEditorCtx): () => void {
   const applyBtn = document.createElement("button");
   applyBtn.className = "btn btn--primary btn--sm";
   applyBtn.textContent = "Apply";
-  bar.append(aspect, cancelBtn, applyBtn);
+  bar.append(label, aspect, cancelBtn, applyBtn);
 
   overlay.append(veil, win, bar);
   stage.appendChild(overlay);
@@ -308,7 +314,7 @@ export function startImageCrop(ctx: ImageEditorCtx): () => void {
     // reachable while framing): its Enter/Escape are the field's. The crop's
     // own aspect list stays ours, so Escape there still cancels.
     if (isTypingTarget(e.target) && !overlay.contains(e.target as Node)) return;
-    // And an open context menu (the Image menu stays clickable here): its
+    // And an open context menu (the Canvas menu stays clickable here): its
     // listener sits on the same target after this one, where stopPropagation
     // cannot reach, so one Escape would close the menu AND drop the crop.
     if (menuOpen()) return;

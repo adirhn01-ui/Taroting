@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("./layers", () => ({ cropImage: vi.fn() }));
 
 import { aspectRect, dragCrop, roundCrop } from "./crop-image";
-import { keptSide, parseSide } from "./canvas-size-dialog";
+import { CANVAS_SIZE_TITLE, canvasSizeMarkup, keptSide, parseSide } from "./canvas-size-dialog";
 
 // A canvas and a start rect that differ on every axis, so a swapped x/y or w/h
 // (or a handle mapped to the wrong edge) cannot pass.
@@ -38,6 +38,25 @@ describe("dragCrop (free)", () => {
     expect(dragCrop(start, "move", 12, -9, null, W, H)).toEqual({ x: 112, y: 31, w: 300, h: 200 });
     expect(dragCrop(start, "move", 900, 900, null, W, H)).toEqual({ x: W - 300, y: H - 200, w: 300, h: 200 });
     expect(dragCrop(start, "move", -900, -900, null, W, H)).toEqual({ x: 0, y: 0, w: 300, h: 200 });
+  });
+});
+
+describe("dragCrop (move with a ratio)", () => {
+  it("moves the window freely, keeping its size, clamped at the canvas edges", () => {
+    // The ratio never reaches a move: the window keeps its shape as it is.
+    const sq = { x: 140, y: 0, w: 361, h: 361 };
+    for (const ratio of [1, 16 / 9, 9 / 16]) {
+      expect(dragCrop(start, "move", 12, -9, ratio, W, H)).toEqual({ x: 112, y: 31, w: 300, h: 200 });
+      expect(dragCrop(start, "move", 900, 900, ratio, W, H)).toEqual({ x: W - 300, y: H - 200, w: 300, h: 200 });
+    }
+    expect(dragCrop(sq, "move", -60, 25, 1, W, H)).toEqual({ x: 80, y: 0, w: 361, h: 361 });
+    expect(dragCrop(sq, "move", 500, 0, 1, W, H)).toEqual({ x: W - 361, y: 0, w: 361, h: 361 });
+  });
+
+  it("the whole-canvas start has nowhere to move to", () => {
+    // Why a fresh crop "can't move": it starts as the whole canvas.
+    const whole = { x: 0, y: 0, w: W, h: H };
+    expect(dragCrop(whole, "move", 40, 30, null, W, H)).toEqual(whole);
   });
 });
 
@@ -92,6 +111,27 @@ describe("aspectRect / roundCrop", () => {
   it("rounds to integers at least 1×1 inside the canvas", () => {
     expect(roundCrop({ x: -3.4, y: 400, w: 0.2, h: 12.6 }, W, H)).toEqual({ x: 0, y: 348, w: 1, h: 13 });
     expect(roundCrop({ x: 630.6, y: 1.5, w: 30, h: 999 }, W, H)).toEqual({ x: 611, y: 0, w: 30, h: 361 });
+  });
+});
+
+describe("the Resize canvas dialog", () => {
+  it("is titled for what it does, header and accessible name alike", () => {
+    expect(CANVAS_SIZE_TITLE).toBe("Resize canvas");
+    const html = canvasSizeMarkup("<svg></svg>");
+    expect(html).toContain('<div class="modal__header"><span>Resize canvas</span>');
+    expect(html).toContain('aria-label="Resize canvas"');
+    expect(html).not.toContain("Canvas size");
+  });
+
+  it("says it pads or trims around the picture, and points scaling to Export", () => {
+    // Keep aspect ticked reads as "scale my picture"; the note must say what
+    // Apply really does (layers keep their pixel size) and where scaling lives.
+    const html = canvasSizeMarkup("<svg></svg>");
+    expect(html).toContain(
+      "Adds or trims space around the picture — layers keep their size. To make the picture smaller, pick a size in Export.",
+    );
+    expect(html).not.toContain("Layers stay centred.");
+    expect(html).toMatch(/id="imged-size-keep" type="checkbox" checked/);
   });
 });
 

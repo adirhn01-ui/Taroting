@@ -11,7 +11,7 @@ import { appVersion, describeError, errorDetail, ipc, onJobEvents } from "../../
 import type { JobDone, JobFailed, JobProgress } from "../../core/ipc";
 import { ProjectSession, settingsStore, updateSettings } from "../../core/session";
 import { timelineDuration } from "../../core/time";
-import type { ExportPreset, ResolutionPreset } from "../../core/types";
+import type { ExportPreset, ProjectFile, ResolutionPreset } from "../../core/types";
 import { detailPane, recentErrors, recordError } from "../../ui/errors";
 import { focusFirst, trapTab } from "../../ui/focus";
 import { icon } from "../../ui/icons";
@@ -249,6 +249,16 @@ function comparablePath(path: string): string {
 }
 
 /**
+ * What Export says instead of running, or null when there is something to
+ * export. Import is bin-first, so every new project and every fresh import
+ * starts with no clip placed — a normal state, not a fault, and it must not
+ * reach the failure view (or the Diagnostics log) through the backend's refusal.
+ */
+export function nothingToExport(p: ProjectFile): string | null {
+  return p.timeline.tracks.every((t) => t.clips.length === 0) ? "Add a clip to the timeline first." : null;
+}
+
+/**
  * Whether `target` is one of the files this project reads. Exporting onto one
  * would replace an original, so the overwrite strip must not offer Replace for
  * it. Generated media have no file (their `path` is a placeholder) and never
@@ -375,7 +385,7 @@ export { EXPORT_RUNNING_REASON, createExportRunHold, type ExportRunHold } from "
 
 /* ---------------- dialog ---------------- */
 
-export function openExportDialog(ctx: { session: ProjectSession }): void {
+export function openExportDialog(ctx: { session: ProjectSession }): () => void {
   const { session } = ctx;
 
   /* -------- working preset (a mutable copy of the persisted one) --------
@@ -934,7 +944,10 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
       defaultPath: outPath() || undefined,
       filters: [{ name: format.toUpperCase(), extensions: [ext] }],
     });
-    if (!chosen) return null;
+    // The editor can close while Save As is open (an Explorer open disposes
+    // it): a destination picked for a dialog that no longer exists starts
+    // nothing — and re-arms no estimate timer.
+    if (!chosen || closed) return null;
     const { dir, file } = splitPath(chosen);
     folder = dir;
     // strip the extension the dialog appended; the ext follows the format
@@ -989,6 +1002,12 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
 
   /* -------- Export click flow -------- */
   async function onExportClick(): Promise<void> {
+    // Before any Save As dialog: there is nothing to ask a destination for.
+    const nothing = nothingToExport(session.project);
+    if (nothing) {
+      toast.info(nothing);
+      return;
+    }
     // Force a Save As dialog if we have no destination folder at all.
     if (!folder) {
       const picked = await chooseDestination();
@@ -1021,7 +1040,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
 
     const target = outPath();
     // Media read live, like everything else the export is built from.
-    const offer = overwriteOffer(target, await pathExists(target), session.project.media);
+    const exists = await pathExists(target);
+    if (closed) return;
+    const offer = overwriteOffer(target, exists, session.project.media);
     if (offer !== "free") {
       showOverwriteWarning(
         offer === "replace" ? () => void beginExport(target) : null,
@@ -1044,6 +1065,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     const free = await renameWithSuffix(filename, (candidate) =>
       pathExists(joinPath(dir, `${candidate}.${ext}`)),
     );
+    if (closed) return;
     if (free === null) {
       // Every candidate was taken. The old loop fell out of its guard holding
       // the last one and exported over it; there is no free name to offer, so
@@ -1069,6 +1091,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
      ============================================================ */
 
   async function beginExport(target: string): Promise<void> {
+    // Nothing starts for a dialog that has already closed: a run begun here
+    // would hold the session with no progress view to ever release it.
+    if (exporting || closed) return;
     lastTaskbarPct = -1;
     const live = session.project;
     const spec: ExportSpec = {
@@ -1385,4 +1410,8 @@ export function openExportDialog(ctx: { session: ProjectSession }): void {
     .catch(() => {
       /* estimate + export still work; badge just stays hidden */
     });
+
+  // The editor's dispose() calls this, so the dialog never outlives the screen
+  // that opened it. A no-op while an export runs (see close()).
+  return close;
 }

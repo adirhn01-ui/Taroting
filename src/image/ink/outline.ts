@@ -1,36 +1,48 @@
-// The pen's (and the pencil's) variable-width mark: ONE closed outline around
-// the points, filled nonzero.
+// The pen's (and the pencil's) variable-width mark: closed outlines around the
+// points, filled nonzero as ONE path.
 //
 // Why an outline and not `ctx.stroke()` per segment: a stroked polyline has
 // one lineWidth, so pressure could only vary by stroking every segment on its
 // own — and at any opacity below 1 each overlap (every joint, every place a
 // loop crosses itself) would paint twice and show as a darker bead. One filled
-// polygon paints every covered pixel exactly once, whatever the stroke does to
+// path paints every covered pixel exactly once, whatever the stroke does to
 // itself: nonzero, not evenodd, because a loop's self-overlap winds twice in the
 // same direction and evenodd would punch a hole there.
 //
 // Shape: a left and a right chain offset by the half-width along the normal
 // (centred differences, so a point's normal is the average of the segments on
-// either side), joined by 8-segment round caps. Sharp turns also get a round
-// join disk — a centred-difference normal cuts the outer corner of a hairpin
-// and pinches the mark there. The disks are wound the SAME way as the ribbon
-// (see `JOIN_ANTICLOCKWISE`): an opposite winding would cancel to zero under
-// nonzero and leave a hole in the ink.
+// either side), joined by 8-segment round caps.
+//
+// A SHARP turn (past JOIN_TURN) splits the outline into separate sub-rings,
+// each with its own round caps; the two caps meeting at the turn are its round
+// join. One ribbon cannot follow a sharp turn. Past 90° the centred tangent can
+// point against one of the two segments, the ribbon twists (its chains swap
+// sides), and the twisted piece winds the other way and cancels the ink under
+// it: ink along the ruler doubles back on one line every time the hand goes
+// back and forth, and once simplified each reversal is a single 180° cusp —
+// one ribbon filled it as a thin line with wedge-shaped blanks. Between 35°
+// and 90° the ribbon holds together but its corner normal is the bisector, so
+// the offset there sits only h·cos(θ/2) off each segment and the mark visibly
+// thins into the corner. Split, every run's end normal is its own segment's,
+// so the mark keeps its full width right up to the round join. Every sub-ring
+// is wound like the others (left chain forward, right chain back), so nonzero
+// unions them. A gentle curve (every turn under JOIN_TURN) is one ring, exactly
+// as before.
 //
 // The geometry is computed as plain numbers (`outlinePolygon`) so it can be
 // measured in a test; `outlinePath` turns it into the Path2D the painter fills.
 
 /** Round caps are built from this many segments (the spec's 8). */
 export const CAP_SEGMENTS = 8;
-/** A turn sharper than this (radians between successive segments) gets a
- *  round join disk. ~35°: below it the ribbon's own corner is indistinguishable
- *  from round at any width a pen makes. */
+/** A turn sharper than this (radians between successive segments) splits the
+ *  outline. ~35°: below it the corner thins by under 5% of the width
+ *  (1 − cos 17.5°), which no pen width makes visible. */
 const JOIN_TURN = 0.6;
-/** The ribbon is wound with a NEGATIVE shoelace area in raw canvas coordinates
+/** The rings are wound with a NEGATIVE shoelace area in raw canvas coordinates
  *  (left chain forward along the stroke, right chain back, with the normal the
- *  tangent turned +90°). `arc(..., anticlockwise = true)` winds the same way, so
- *  under nonzero a join disk unions with the ribbon instead of cancelling it. */
-const JOIN_ANTICLOCKWISE = true;
+ *  tangent turned +90°). A dot is drawn with `arc(..., anticlockwise = true)`,
+ *  which winds the same way. */
+const DOT_ANTICLOCKWISE = true;
 /** A whole circle drawn anticlockwise from angle 0. NEGATIVE on purpose: with
  *  anticlockwise set, canvas treats the arc as the full circumference only when
  *  start − end ≥ 2π; `0 → +2π` would be read as a zero-length arc and draw no
@@ -52,15 +64,18 @@ export function pencilHalfWidth(w: number): HalfWidth {
 }
 
 export interface Outline {
-  /** The closed ribbon + caps, flat [x0, y0, x1, y1, …]. */
+  /** The closed sub-rings (ribbon + caps each), flat [x0, y0, x1, y1, …], one
+   *  after another. */
   ring: number[];
-  /** Index (in POINTS, not values) where the right chain starts in `ring`:
-   *  ring[0 .. n) is the left chain, then the end cap, then the right chain
-   *  (reversed), then the start cap. Exposed for the width test. */
+  /** Where each sub-ring ends in `ring`, in POINTS (exclusive): one entry for
+   *  a stroke without sharp turns, one more per sharp turn. */
+  ends: number[];
+  /** Index (in POINTS, not values) where the FIRST sub-ring's right chain
+   *  starts in `ring`: ring[0 .. leftCount) is its left chain, then the end
+   *  cap, then the right chain (reversed), then the start cap. Exposed for the
+   *  width test. */
   leftCount: number;
   rightStart: number;
-  /** Round joins at sharp turns: flat [x, y, r]*. */
-  joins: number[];
   /** A single point (or a stroke whose points all coincide): a dot. */
   dot: { x: number; y: number; r: number } | null;
 }
@@ -74,7 +89,7 @@ export interface Outline {
  */
 export function outlinePolygon(pts: ArrayLike<number>, count: number, half: HalfWidth): Outline {
   const n = Math.min(count, Math.floor(pts.length / 3));
-  const out: Outline = { ring: [], leftCount: 0, rightStart: 0, joins: [], dot: null };
+  const out: Outline = { ring: [], ends: [], leftCount: 0, rightStart: 0, dot: null };
   if (n <= 0) return out;
 
   // Collapse runs of coincident points: a zero-length segment has no direction.
@@ -99,47 +114,63 @@ export function outlinePolygon(pts: ArrayLike<number>, count: number, half: Half
   const nx = new Float64Array(m);
   const ny = new Float64Array(m);
   const h = new Float64Array(m);
-  let lastX = 0;
-  let lastY = 1;
-  for (let k = 0; k < m; k++) {
-    const a = k === 0 ? 0 : k - 1;
-    const b = k === m - 1 ? m - 1 : k + 1;
-    let tx = X(b) - X(a);
-    let ty = Y(b) - Y(a);
-    const len = Math.hypot(tx, ty);
-    if (len > 0) {
-      tx /= len;
-      ty /= len;
-      // normal = tangent turned +90°
-      lastX = -ty;
-      lastY = tx;
-    }
-    // A hairpin whose neighbours cancel keeps the previous normal.
-    nx[k] = lastX;
-    ny[k] = lastY;
-    h[k] = half(P(k));
-  }
+  for (let k = 0; k < m; k++) h[k] = half(P(k));
 
+  // One sub-ring per run [s .. e] between sharp turns. For the incoming
+  // segment a and the outgoing b (lengths La, Lb, turn θ) the centred tangent
+  // a·La + b·Lb points against b when La·cosθ + Lb < 0 and against a when
+  // La + Lb·cosθ < 0: both need θ > 90°, and past 90° some ratio of La to Lb
+  // always twists the ribbon (a long line that doubles back a little way). The
+  // split happens earlier, at JOIN_TURN, for the thinning (see the header).
   const ring = out.ring;
-  // left chain, forward
-  for (let k = 0; k < m; k++) ring.push(X(k) + nx[k]! * h[k]!, Y(k) + ny[k]! * h[k]!);
-  out.leftCount = m;
-  // end cap: from +n round the front (+t) to −n
-  capAround(ring, X(m - 1), Y(m - 1), nx[m - 1]!, ny[m - 1]!, h[m - 1]!);
-  out.rightStart = ring.length / 2;
-  // right chain, backward
-  for (let k = m - 1; k >= 0; k--) ring.push(X(k) - nx[k]! * h[k]!, Y(k) - ny[k]! * h[k]!);
-  // start cap: from −n round the back (−t) to +n
-  capAround(ring, X(0), Y(0), -nx[0]!, -ny[0]!, h[0]!);
+  let s = 0;
+  while (s < m - 1) {
+    let e = s + 1;
+    for (; e < m - 1; e++) {
+      const ax = X(e) - X(e - 1);
+      const ay = Y(e) - Y(e - 1);
+      const bx = X(e + 1) - X(e);
+      const by = Y(e + 1) - Y(e);
+      if (Math.atan2(Math.abs(ax * by - ay * bx), ax * bx + ay * by) > JOIN_TURN) break;
+    }
 
-  // Round joins where the path turns sharply.
-  for (let k = 1; k < m - 1; k++) {
-    const ax = X(k) - X(k - 1);
-    const ay = Y(k) - Y(k - 1);
-    const bx = X(k + 1) - X(k);
-    const by = Y(k + 1) - Y(k);
-    const turn = Math.atan2(Math.abs(ax * by - ay * bx), ax * bx + ay * by);
-    if (turn > JOIN_TURN) out.joins.push(X(k), Y(k), h[k]!);
+    // Normals with the neighbours clamped to the run: one-sided at its ends,
+    // so a cap at a cusp faces its own segment.
+    let lastX = 0;
+    let lastY = 1;
+    for (let k = s; k <= e; k++) {
+      const a = k === s ? s : k - 1;
+      const b = k === e ? e : k + 1;
+      let tx = X(b) - X(a);
+      let ty = Y(b) - Y(a);
+      const len = Math.hypot(tx, ty);
+      if (len > 0) {
+        tx /= len;
+        ty /= len;
+        // normal = tangent turned +90°
+        lastX = -ty;
+        lastY = tx;
+      }
+      // Neighbours that cancel (a hairpin — split off above, so only a
+      // defensive case here) keep the previous normal.
+      nx[k] = lastX;
+      ny[k] = lastY;
+    }
+
+    // left chain, forward
+    for (let k = s; k <= e; k++) ring.push(X(k) + nx[k]! * h[k]!, Y(k) + ny[k]! * h[k]!);
+    // end cap: from +n round the front (+t) to −n
+    capAround(ring, X(e), Y(e), nx[e]!, ny[e]!, h[e]!);
+    if (s === 0) {
+      out.leftCount = e + 1;
+      out.rightStart = ring.length / 2;
+    }
+    // right chain, backward
+    for (let k = e; k >= s; k--) ring.push(X(k) - nx[k]! * h[k]!, Y(k) - ny[k]! * h[k]!);
+    // start cap: from −n round the back (−t) to +n
+    capAround(ring, X(s), Y(s), -nx[s]!, -ny[s]!, h[s]!);
+    out.ends.push(ring.length / 2);
+    s = e;
   }
   return out;
 }
@@ -164,29 +195,27 @@ export interface PathSink {
   closePath(): void;
 }
 
-/** Emit an outline into a path: the ring as one closed subpath, then each join
- *  disk (and the dot) as its own closed subpath wound like the ring. */
+/** Emit an outline into a path: each sub-ring as one closed subpath, or the
+ *  dot as its own. */
 export function emitOutline(o: Outline, path: PathSink): void {
   if (o.dot) {
     if (o.dot.r > 0) {
       path.moveTo(o.dot.x + o.dot.r, o.dot.y);
-      path.arc(o.dot.x, o.dot.y, o.dot.r, 0, FULL_TURN, JOIN_ANTICLOCKWISE);
+      path.arc(o.dot.x, o.dot.y, o.dot.r, 0, FULL_TURN, DOT_ANTICLOCKWISE);
       path.closePath();
     }
     return;
   }
   const r = o.ring;
-  if (r.length < 6) return;
-  path.moveTo(r[0]!, r[1]!);
-  for (let i = 2; i < r.length; i += 2) path.lineTo(r[i]!, r[i + 1]!);
-  path.closePath();
-  const j = o.joins;
-  for (let i = 0; i < j.length; i += 3) {
-    const rad = j[i + 2]!;
-    if (!(rad > 0)) continue;
-    path.moveTo(j[i]! + rad, j[i + 1]!);
-    path.arc(j[i]!, j[i + 1]!, rad, 0, FULL_TURN, JOIN_ANTICLOCKWISE);
-    path.closePath();
+  let from = 0;
+  for (let e = 0; e < o.ends.length; e++) {
+    const to = o.ends[e]!;
+    if (to - from >= 3) {
+      path.moveTo(r[from * 2]!, r[from * 2 + 1]!);
+      for (let i = from + 1; i < to; i++) path.lineTo(r[i * 2]!, r[i * 2 + 1]!);
+      path.closePath();
+    }
+    from = to;
   }
 }
 

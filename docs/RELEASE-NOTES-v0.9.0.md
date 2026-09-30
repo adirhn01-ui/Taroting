@@ -10,8 +10,9 @@ a full review of the app. Free and open source, as always.
 
 - **Open a photo, clip, GIF or song from File Explorer and it shows on its
   own**, in a viewer with arrows (or ← →) to move through the rest of its
-  folder in File Explorer's own name order. Hidden, system and non-media files
-  are skipped. Photos, GIFs and videos step together; music steps through
+  folder in the same order as the File Explorer window you opened it from —
+  by date, size, name or however you sorted it (name order when no Explorer
+  window shows the folder). Hidden, system and non-media files are skipped. Photos, GIFs and videos step together; music steps through
   music. Holding an arrow key flies through the folder and only loads the file
   you stop on.
 - **Videos play directly** when they can. Files that only need a quick
@@ -24,6 +25,10 @@ a full review of the app. Free and open source, as always.
 - **Settings → Opening files** chooses where a file opened from File Explorer
   lands: the viewer, or straight into a temporary project in the editor (what
   Quick view used to do). Whichever way Quick view was set carries over.
+- **Open on the home screen starts a project from your files.** Pick one
+  file or many and choose whether they become a video project or an image
+  project; Taroting never picks for you. **New project** asks the same
+  question. Dropping files on the home screen works the same way.
 - **Opening a file from File Explorer skips the home screen** and goes
   straight to the viewer or the editor. Measured: a video reaches the viewer
   about 46 ms sooner than it would have through the home screen; opening
@@ -31,8 +36,9 @@ a full review of the app. Free and open source, as always.
 
 ## New: image projects
 
-Start one with **New image** on the home screen (a blank canvas at a size of
-your choice) or open a photo as a project from the viewer.
+Start one with **New project → Image project** on the home screen (a blank
+canvas at a size of your choice), pick pictures with **Open**, or open a photo
+as a project from the viewer.
 
 - **Drawing:** a pen that follows pressure, a pencil with grain, a highlighter
   that sits under your ink, an eraser that removes whole strokes or rubs out
@@ -44,8 +50,12 @@ your choice) or open a photo as a project from the viewer.
 - **Layers:** photos, drawings, text and solid colours — reorder, hide,
   rename, duplicate, delete, move, scale, rotate, flip, set the opacity of and
   crop each one.
-- **The whole image** can be cropped, rotated, flipped and resized, on a
-  transparent, white, black or chosen-colour background.
+- **The canvas has its own controls**, kept apart from the layers on it: the
+  **Canvas** button under the picture (or the side panel with no layer
+  selected) crops, resizes, rotates and flips the whole picture and sets a
+  transparent, white, black or chosen-colour background. A layer is cropped,
+  rotated and flipped from the side panel when it is selected. The editor shows
+  exactly what the canvas holds, so what you see is what exports.
 - **Export** to PNG, JPEG or WebP (WebP at 100 is lossless) at any quality and
   size, or copy the image to the clipboard. The source photo is never
   overwritten, and exported files carry no location or camera details.
@@ -113,9 +123,25 @@ before.
 - **Ctrl+Y redoes**, alongside Ctrl+Shift+Z. Keyboard shortcuts now belong to
   the screen they act on, a new default never takes a chord you already bound
   yourself, and keyboard layouts that use AltGr keep their characters.
-- **Dialogs close with the editor that opened them**: a relink, Add text or
-  Add solid dialog left open when the editor is closed from outside no longer
-  stays over the next screen.
+- **Dialogs close with the editor that opened them**: a relink, Add text,
+  Add solid, export or delete-layer dialog left open when the editor is closed
+  from outside no longer stays over the next screen.
+- **Resolution presets follow a portrait video's short side**: 1080p on a
+  phone video exports 1080×1920, not 606×1080 (and 720p, 4K the same way).
+  Landscape exports are unchanged.
+- **GIF exports play at the right speed**: a GIF is written at up to 30
+  frames per second, so a 60 fps clip no longer plays slowly in browsers.
+- **A new project takes its size and frame rate from the first video you
+  add**, not the last one of the batch.
+- **Exporting with a missing source file names the file** instead of failing
+  with an ffmpeg code, and Export on an empty timeline says to add a clip
+  first.
+- **Replace media refuses a file of the wrong kind** for the layer (a song on
+  a video layer), which used to fail only at export.
+- **Stepping frame by frame past the start or end** no longer swallows the
+  next presses the other way.
+- **Deleting a layer asks with Cancel focused**, and Enter no longer deletes
+  when Cancel is the focused button.
 - **The colour picker holds the keyboard while it is open**: shortcuts no
   longer act behind it, and Escape cancels the colour instead of keeping it.
 - **The list of recent projects can no longer lose an update** when a save and

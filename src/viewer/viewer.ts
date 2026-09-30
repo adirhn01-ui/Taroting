@@ -191,6 +191,10 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   let dwellTimer: number | undefined;
   /** "Open as project" is running: user stepping and Back wait for it. */
   let busy = false;
+  /** The viewer is being left for the project "Open as project" made, whose
+   *  exit comes back here: the folder order the backend holds must survive
+   *  that round trip, so dispose() does not drop it. */
+  let leavingForProject = false;
   let lastAnnounce = "";
 
   /** What is loaded into each element, so an `error` fired by clearing a src
@@ -492,8 +496,11 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   /* ---------------- folder window ---------------- */
 
   /** List the folder around `p` (latest wins) and re-anchor on whatever file is
-   *  shown when the answer lands — a held key may have moved on meanwhile. */
-  function refresh(p: string, wantAnnounce: boolean): void {
+   *  shown when the answer lands — a held key may have moved on meanwhile.
+   *  `fresh` only for the first listing of a file the viewer was SENT to
+   *  (show): that one reads File Explorer's order for the folder; every
+   *  refill and settle reuses the order the backend holds. */
+  function refresh(p: string, wantAnnounce: boolean, fresh = false): void {
     if (listBusy) {
       listQueued = { p, wantAnnounce };
       return;
@@ -506,7 +513,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
       listQueued = null;
       return q;
     };
-    ipc.listSiblings(p, WINDOW_RADIUS).then(
+    ipc.listSiblings(p, WINDOW_RADIUS, fresh).then(
       (w) => {
         if (disposed || my !== listGen) return;
         listBusy = false;
@@ -667,7 +674,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     listGen++;
     listBusy = false;
     listQueued = null;
-    refresh(p, true);
+    refresh(p, true, true);
   }
 
   /* ---------------- playback ---------------- */
@@ -879,6 +886,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
         await ipc.deleteProject(p).catch(() => {});
         return;
       }
+      leavingForProject = true;
       navigate({ view: "editor", projectPath: p, temp: true, returnTo: target });
     })
       .catch((e) => {
@@ -1059,6 +1067,10 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
       unVolume();
       volume.dispose();
       unregisterClose();
+      // Left for good (Back, a route elsewhere, the window closing): the
+      // backend's held folder order goes too. Not for "Open as project",
+      // whose exit returns here and steps in that same order.
+      if (!leavingForProject) void ipc.forgetSiblingOrder().catch(() => {});
       void setWindowTitle("Taroting").catch(() => {});
       if (dev && devWin.__tarotingViewerDev === dev) delete devWin.__tarotingViewerDev;
     },

@@ -1,15 +1,17 @@
-// Image projects at the edges of the app: creating one (Home's "New image", a
-// photo opened from File Explorer or the viewer) and telling one apart.
+// Image projects at the edges of the app: creating one (Home's "New image
+// project" dialog, Home's "Open as" with pictures, a photo opened from File
+// Explorer or the viewer) and telling one apart.
 //
 // NOT at boot: open-media fetches it only when a photo is opened as a project,
-// and Home only through the lazy "New image" dialog. Keep it that way (no static
-// import from main, Home or open-media) — nothing on the home screen needs it.
-// It must still stay tiny and must NEVER import anything under src/image/:
-// both of those paths reach it before the image editor is wanted, and a single
-// such import would drag the whole image editor in with it. The image editor
-// itself is a separate lazy chunk that nothing prefetches.
+// and Home only through its lazy "New image project" and "Open as" dialogs.
+// Keep it that way (no static import from main, Home or open-media) — nothing
+// on the home screen needs it. It must still stay tiny and must NEVER import
+// anything under src/image/: every one of those paths reaches it before the
+// image editor is wanted, and a single such import would drag the whole image
+// editor in with it. The image editor itself is a separate lazy chunk that
+// nothing prefetches.
 
-import type { Clip, MediaInfo, MediaRef, ProjectFile } from "./types";
+import type { Clip, MediaInfo, MediaRef, ProjectFile, Track } from "./types";
 import { DEFAULT_EXPORT_PRESET } from "./types";
 import { clampImageCanvas, defaultAudio, defaultTransform, uid } from "./project";
 import { normalizeHexColor } from "./session";
@@ -21,7 +23,7 @@ export interface CanvasPreset {
   h: number;
 }
 
-/** The sizes "New image" offers before Custom. */
+/** The sizes "New image project" offers before Custom. */
 export const IMAGE_BLANK_PRESETS: CanvasPreset[] = [
   { label: "1920 × 1080 (16:9)", w: 1920, h: 1080 },
   { label: "1080 × 1080 (1:1)", w: 1080, h: 1080 },
@@ -77,38 +79,56 @@ export function createBlankImageProject(
 /** schema 3, kind "image", background "transparent", canvas = info.width ×
  *  info.height (integers, never rounded/capped), one layer: the photo at scale
  *  1, centred. Throws if info.kind !== "image" || info.generator || !info.width
- *  || !info.height.
+ *  || !info.height. The one-picture case of createPhotosImageProject. */
+export function createPhotoImageProject(name: string, info: MediaInfo): ProjectFile {
+  return createPhotosImageProject(name, [info]);
+}
+
+/** schema 3, kind "image", background "transparent", canvas = the FIRST
+ *  picture's size; one photo layer per picture, the first at the bottom and
+ *  each later one above it (Home's "Open as" hands them over in natural name
+ *  order). Every picture sits at its own pixel size, centred, scaled down only
+ *  when it is larger than the canvas: scale = min(1, W / w, H / h) — the rule
+ *  the image editor's addPhotoLayer applies to a picture added later. Throws
+ *  on an empty list or on any entry that is not a still with a size; the
+ *  caller drops those first and names them.
  *
  *  Built here rather than through the image editor's `addPhotoLayer` because
  *  this module must not import src/image/** (see the header). The shape is
- *  the same one that function makes: one video track named after the file,
- *  one clip pinned to 0..1 at speed 1. */
-export function createPhotoImageProject(name: string, info: MediaInfo): ProjectFile {
-  if (info.kind !== "image" || info.generator || !info.width || !info.height) {
-    throw new Error("an image project can only be made from a still image");
+ *  the same one that function makes: one video track per layer named after
+ *  its file, one clip pinned to 0..1 at speed 1, the TOP layer first in
+ *  `tracks` (the image editor's layer order). */
+export function createPhotosImageProject(name: string, infos: readonly MediaInfo[]): ProjectFile {
+  const first = infos[0];
+  if (!first) throw new Error("an image project needs at least one picture");
+  for (const info of infos) {
+    if (info.kind !== "image" || info.generator || !info.width || !info.height) {
+      throw new Error("an image project can only be made from a still image");
+    }
   }
-  const base = createBlankImageProject(name, info.width, info.height, "transparent");
-  const media: MediaRef = { id: uid(), ...info };
-  const clip: Clip = {
-    id: uid(),
-    mediaId: media.id,
-    timelineStart: 0,
-    srcIn: 0,
-    srcOut: 1,
-    speed: 1,
-    transform: defaultTransform(),
-    audio: defaultAudio(),
-  };
-  return {
-    ...base,
-    media: [media],
-    timeline: {
-      ...base.timeline,
-      tracks: [
-        { id: uid(), kind: "video", name: fileStem(info.path), muted: false, clips: [clip] },
-      ],
-    },
-  };
+  const base = createBlankImageProject(name, first.width!, first.height!, "transparent");
+  const W = base.timeline.width;
+  const H = base.timeline.height;
+  const media: MediaRef[] = [];
+  const tracks: Track[] = [];
+  for (const info of infos) {
+    const ref: MediaRef = { id: uid(), ...info };
+    const scale = Math.min(1, W / info.width!, H / info.height!);
+    const clip: Clip = {
+      id: uid(),
+      mediaId: ref.id,
+      timelineStart: 0,
+      srcIn: 0,
+      srcOut: 1,
+      speed: 1,
+      transform: { ...defaultTransform(), scale },
+      audio: defaultAudio(),
+    };
+    media.push(ref);
+    // Top first: each later picture goes in above the ones before it.
+    tracks.unshift({ id: uid(), kind: "video", name: fileStem(info.path), muted: false, clips: [clip] });
+  }
+  return { ...base, media, timeline: { ...base.timeline, tracks } };
 }
 
 /** The one test for "is this an image project". */

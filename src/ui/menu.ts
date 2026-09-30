@@ -5,6 +5,11 @@ import { blockShortcuts } from "../core/shortcuts";
 
 export interface MenuItem {
   label: string;
+  /** Trusted inline SVG markup (from an icons module, never user text) shown
+   *  before the label. */
+  icon?: string;
+  /** One muted line under the label (plain text, escaped when rendered). */
+  hint?: string;
   danger?: boolean;
   disabled?: boolean;
   /** Native tooltip — used to explain why a disabled item can't be chosen. */
@@ -141,11 +146,44 @@ function removeListeners(): void {
   releaseShortcuts = null;
 }
 
+/** A row with an icon and/or a hint: the icon, then the label over a muted
+ *  hint line. Only the icon goes in as markup (it is the app's own SVG, never
+ *  user text); the label and hint are text nodes, so neither can inject. A row
+ *  with neither keeps the plain one-text-node button every other menu uses.
+ *  Home's "Open as" dialog wears the same icon/label/hint classes, so the two
+ *  choices look the same in both places. */
+function renderRich(btn: HTMLButtonElement, item: MenuItem): void {
+  btn.classList.add("ctx-menu__item--rich");
+  if (item.icon) {
+    const ico = document.createElement("span");
+    ico.className = "ctx-menu__icon";
+    ico.setAttribute("aria-hidden", "true");
+    ico.innerHTML = item.icon;
+    btn.appendChild(ico);
+  }
+  const text = document.createElement("span");
+  text.className = "ctx-menu__text";
+  const label = document.createElement("span");
+  label.className = "ctx-menu__label";
+  label.textContent = item.label;
+  text.appendChild(label);
+  if (item.hint) {
+    const hint = document.createElement("span");
+    hint.className = "ctx-menu__hint";
+    hint.textContent = item.hint;
+    text.appendChild(hint);
+  }
+  btn.appendChild(text);
+}
+
 /** `flipAboveY`: for a menu anchored to a control, the anchor's top edge. When
  *  the menu does not fit below `y` it opens ABOVE that edge (as native menus
  *  do) instead of being clamped up over the control that opened it. Omitted,
- *  the menu is only clamped into the viewport — every point-anchored menu. */
-export function showMenu(x: number, y: number, menuItems: MenuItem[], flipAboveY?: number): void {
+ *  the menu is only clamped into the viewport — every point-anchored menu.
+ *  `activateFirst`: a menu button opened from the KEYBOARD (Enter/Space) starts
+ *  on its first enabled row, focused, so the next Enter chooses it — as a
+ *  native menu button does. A pointer open leaves nothing highlighted. */
+export function showMenu(x: number, y: number, menuItems: MenuItem[], flipAboveY?: number, activateFirst = false): void {
   const wasOpen = isOpen();
   // Read before the host is rebuilt below: emptying it drops focus to <body>,
   // so on a menu that replaces another menu there would be nothing left to read.
@@ -161,7 +199,8 @@ export function showMenu(x: number, y: number, menuItems: MenuItem[], flipAboveY
     btn.type = "button";
     btn.className = "ctx-menu__item";
     if (item.danger) btn.classList.add("ctx-menu__item--danger");
-    btn.textContent = item.label;
+    if (item.icon || item.hint) renderRich(btn, item);
+    else btn.textContent = item.label;
     if (item.title) btn.title = item.title;
     if (item.disabled) {
       btn.disabled = true;
@@ -186,6 +225,7 @@ export function showMenu(x: number, y: number, menuItems: MenuItem[], flipAboveY
   el.style.top = `${top}px`;
 
   if (!wasOpen) addListeners();
+  if (activateFirst) moveActive(1);
 }
 
 /**

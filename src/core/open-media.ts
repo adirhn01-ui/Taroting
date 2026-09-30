@@ -200,7 +200,8 @@ export async function openMediaAsProject(path: string): Promise<string> {
  *  canvas IS the photo, so one the probe could not size is refused in words rather than
  *  dropped onto a made-up canvas. The probe already refuses a 0x0 still, so this is the
  *  crafted-or-broken-file case. The ONE copy of the check — every way a photo becomes a
- *  project (this module, Home's "New image" dialog) asks it, so they cannot drift apart. */
+ *  project (this module, Home's "New image project" and "Open as" dialogs) asks it, so
+ *  they cannot drift apart. */
 export function stillSizeProblem(info: MediaInfo): string | null {
   const w = info.width ?? 0;
   const h = info.height ?? 0;

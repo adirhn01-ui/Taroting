@@ -1119,6 +1119,59 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
     }
   });
 
+  await test("export-dialog-closes-with-editor", async () => {
+    // The video export dialog lives on document.body. Export on an empty
+    // timeline (every bin-first project's first state) says so in a toast,
+    // never the failure view; and an Explorer open that replaces a (normal,
+    // saved) project's editor takes the open dialog with it — it used to stay
+    // over the next screen, still trapping the keyboard. (A TEMPORARY project
+    // refuses an Explorer open while a dialog is up, by design: its Keep
+    // prompt could not be asked — so this uses a library project.)
+    const t0 = performance.now();
+    let path = "";
+    try {
+      needFixtures();
+      path = await ipc.newProjectPath("Autotest export closes");
+      await ipc.saveProject(path, createProject("Autotest export closes"));
+      const prev = editorDev();
+      navigate({ view: "editor", projectPath: path });
+      const s = await waitEditor(prev, "an empty library project");
+      assert(!s.temp.get(), `precondition: the project opened as temporary (${s.path})`);
+      $<HTMLButtonElement>("#ed-export")!.click();
+      const folderIn = await until(() => $<HTMLInputElement>(".export-modal #ex-folder"), 2_000, () => "the export dialog's form");
+      // A folder already set, so only the empty-timeline check can stop the run.
+      folderIn.value = `${fixturesDir}\\..`;
+      folderIn.dispatchEvent(new Event("input"));
+      $<HTMLButtonElement>(".export-modal #ex-run")!.click();
+      const said = await until(
+        () =>
+          Array.from(document.querySelectorAll<HTMLElement>(".toast")).find(
+            (t) => rendered(t) && (t.textContent ?? "").includes("Add a clip to the timeline first."),
+          ),
+        2_000,
+        () => `the empty-timeline toast (dialog "${text(".export-modal #ex-body").slice(0, 120)}")`,
+      );
+      assert($(".export-modal .export-result") === null, "an empty timeline showed the export result/failure view");
+      assert(rendered($(".export-modal #ex-run")), "the export form is gone after the empty-timeline refusal");
+      assert(leaveBlockedReason() === null, "the refused export holds the session");
+
+      // The form is still up. An Explorer open replaces the editor with the viewer.
+      await setOpenWith("viewer");
+      const v = await openInViewer("clip2.mp4");
+      assert($(".export-modal") === null, "the export dialog outlived the editor that opened it");
+      assert($(".modal-backdrop") === null, `a dialog is over the viewer: "${text(".modal-backdrop .modal__header")}"`);
+      await waitCount("1 / 8");
+      // The keyboard is the viewer's again: → steps.
+      const ev = keydown("ArrowRight");
+      assert(ev.defaultPrevented, `ArrowRight was not claimed by the viewer after the export dialog closed — ${viewerState()}`);
+      await until(() => baseName(v.path()) !== "clip2.mp4" || null, 3_000, () => `→ to step past clip2.mp4 — ${viewerState()}`);
+      return `empty timeline → toast "${said.textContent?.trim()}", form kept; an Explorer open closed the export dialog with its editor and → steps the viewer — ${ms(t0)}`;
+    } finally {
+      await backHome();
+      if (path) await ipc.deleteProject(path).catch(() => {});
+    }
+  });
+
   await test("viewer-inert-behind-modal", async () => {
     const t0 = performance.now();
     try {

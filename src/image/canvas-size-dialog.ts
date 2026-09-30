@@ -1,7 +1,8 @@
-// The Canvas size dialog: width × height (integers 1-65535), keep aspect, and
-// the note that layers stay centred. Apply is one commit of `resizeCanvas`
-// (anchored at the centre, so every layer keeps its offset from it); the shell
-// refits the view when the canvas size changes.
+// The Resize canvas dialog: width × height (integers 1-65535), keep aspect, and
+// a note that it adds or trims space around the picture (layers keep their
+// size) and that scaling the picture lives in Export. Apply is one commit of
+// `resizeCanvas` (anchored at the centre, so every layer keeps its offset from
+// it); the shell refits the view when the canvas size changes.
 //
 // The app's modal pattern, whole: .modal-backdrop + .modal, trapTab released
 // on EVERY close path, Escape / backdrop / X cancel, focus seated on the
@@ -30,23 +31,15 @@ export function keptSide(changed: number, fromA: number, fromB: number): number 
   return Math.min(IMAGE_CANVAS_MAX_SIDE, Math.max(1, v));
 }
 
-let closeOpen: (() => void) | null = null;
+/** The dialog's title: named for what it does, the same words as the Canvas
+ *  menu row and the inspector button that open it. */
+export const CANVAS_SIZE_TITLE = "Resize canvas";
 
-/** Registers its own closer through `ctx.registerOverlay`. */
-export function openCanvasSizeDialog(ctx: ImageEditorCtx): void {
-  closeOpen?.();
-  const { session } = ctx;
-  const W0 = session.project.timeline.width;
-  const H0 = session.project.timeline.height;
-
-  const backdrop = document.createElement("div");
-  backdrop.className = "modal-backdrop";
-  // The export dialogs' form classes, the same width × height pair the New
-  // image dialog uses — one look for every "type a size" surface, and no
-  // second set of rules to drift from it.
-  backdrop.innerHTML = `
-    <div class="modal" role="dialog" aria-modal="true" aria-label="Canvas size">
-      <div class="modal__header"><span>Canvas size</span><button class="btn btn--ghost btn--icon btn--sm" data-act="cancel" title="Cancel" aria-label="Cancel">${icon("x", 14)}</button></div>
+/** The dialog's markup; `closeIcon` is the X glyph. Exported for the test. */
+export function canvasSizeMarkup(closeIcon: string): string {
+  return `
+    <div class="modal" role="dialog" aria-modal="true" aria-label="${CANVAS_SIZE_TITLE}">
+      <div class="modal__header"><span>${CANVAS_SIZE_TITLE}</span><button class="btn btn--ghost btn--icon btn--sm" data-act="cancel" title="Cancel" aria-label="Cancel">${closeIcon}</button></div>
       <div class="modal__body">
         <div class="export-form">
           <div class="export-row">
@@ -65,7 +58,7 @@ export function openCanvasSizeDialog(ctx: ImageEditorCtx): void {
               <input class="switch" id="imged-size-keep" type="checkbox" checked />
             </div>
           </div>
-          <div class="export-note">Layers stay centred.</div>
+          <div class="export-note">Adds or trims space around the picture — layers keep their size. To make the picture smaller, pick a size in Export.</div>
         </div>
       </div>
       <div class="modal__footer">
@@ -73,6 +66,23 @@ export function openCanvasSizeDialog(ctx: ImageEditorCtx): void {
         <button class="btn btn--primary" data-act="apply">Apply</button>
       </div>
     </div>`;
+}
+
+let closeOpen: (() => void) | null = null;
+
+/** Registers its own closer through `ctx.registerOverlay`. */
+export function openCanvasSizeDialog(ctx: ImageEditorCtx): void {
+  closeOpen?.();
+  const { session } = ctx;
+  const W0 = session.project.timeline.width;
+  const H0 = session.project.timeline.height;
+
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  // The export dialogs' form classes, the same width × height pair the New
+  // image dialog uses — one look for every "type a size" surface, and no
+  // second set of rules to drift from it.
+  backdrop.innerHTML = canvasSizeMarkup(icon("x", 14));
   document.body.appendChild(backdrop);
 
   const wIn = backdrop.querySelector<HTMLInputElement>("#imged-size-w")!;

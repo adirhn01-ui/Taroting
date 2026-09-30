@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { createBlankImageProject } from "../core/image-project";
 import type { MediaInfo, ProjectFile } from "../core/types";
-import { SIZE_LADDER, dropRefusal, exportSourceHint, stepSize } from "./image-editor";
+import { IMG_ICON_PATHS } from "./icons";
+import { SIZE_LADDER, canvasMenuButton, dropRefusal, exportSourceHint, stepSize } from "./image-editor";
 import { addPhotoLayer, layersOf } from "./layers";
 import { SIZE_MAX, SIZE_MIN } from "./tool-state";
 
@@ -103,5 +104,27 @@ describe("dropRefusal", () => {
     expect(dropRefusal("crop-layer", false, true)).toBe(CROP);
     expect(dropRefusal("crop-image", true, true)).toBe(CROP);
     expect(dropRefusal("idle", true, true)).toBe(DIALOG);
+  });
+});
+
+describe("the tool row's Canvas button", () => {
+  // The owner read the old "Image" button with the crop glyph as "crop the
+  // layer I selected"; it acts on the whole canvas, and now says so.
+  const html = canvasMenuButton();
+
+  it("is named Canvas and says what it acts on", () => {
+    expect(html).toMatch(/>Canvas<\/button>$/);
+    expect(html).toContain('title="Canvas: crop, resize, rotate or flip the whole picture"');
+    expect(html).not.toMatch(/>Image</);
+  });
+
+  it("wears the artboard glyph, never the crop one", () => {
+    expect(html).toContain(IMG_ICON_PATHS.canvas);
+    expect(html).not.toContain(IMG_ICON_PATHS.crop);
+  });
+
+  it("keeps the id and the menu role the shell and the E2E find it by", () => {
+    expect(html).toContain('id="imged-menu"');
+    expect(html).toContain('aria-haspopup="menu"');
   });
 });

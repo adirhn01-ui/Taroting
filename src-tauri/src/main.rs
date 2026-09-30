@@ -198,6 +198,7 @@ fn main() {
             media::thumbs::get_thumbnail,
             media::thumbs::ensure_filmstrip,
             media::siblings::list_siblings,
+            media::siblings::forget_sibling_order,
             media::playability::classify_playback,
             jobs::cancel_job,
             cache::cache_stats,

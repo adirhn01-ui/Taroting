@@ -45,10 +45,18 @@ Taroting launches in a fraction of a second, stays out of your way, and does the
 **Audio**
 - Volume, mute, fade in/out, normalize, detach/restore, waveforms
 
+**Image projects**
+- Start blank (**New project → Image project**) or from your pictures (**Open**, then choose Image project)
+- Pen with pressure, pencil, highlighter, eraser, lines, boxes, ellipses and arrows, and a ruler to draw along
+- Exposure, brightness, contrast, highlights, shadows, saturation, hue, warmth and tint, previewed live
+- Layers of photos, drawings, text and solid colour — move, scale, rotate, flip, crop and fade each one
+- The canvas has its own controls: crop, resize, rotate, flip, and a transparent, white, black or chosen-colour background
+- Export to PNG, JPEG or WebP, or copy the picture to the clipboard
+
 **OS integration**
 - `.trt` files open on double-click, straight into the project
 - Videos, photos and music gain **Open with → Taroting** in Explorer's right-click menu, and Taroting is listed in Windows Settings → Apps → Default apps. **Taroting never changes which app opens your files unless you choose it** there yourself — double-clicking a video, photo or song keeps opening whatever it opened before
-- A file opened with Taroting shows in a lightweight viewer (the arrows move through the folder in name order) or, if you prefer, opens straight into a temporary project — choose in Settings
+- A file opened with Taroting shows in a lightweight viewer (the arrows move through the folder in the same order as the File Explorer window you opened it from, or in name order when no Explorer window shows it) or, if you prefer, opens straight into a temporary project — choose in Settings
 - Single-instance: opening a file focuses the already-running app
 - Bin-first import — dropped media lands in the bin, then drag to the timeline or double-click to place at the playhead
 - Right-click menus on clips, media, and home-screen project cards

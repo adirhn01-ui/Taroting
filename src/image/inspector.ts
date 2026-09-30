@@ -1,7 +1,10 @@
 // The image editor's inspector (right-docked, the video inspector's markup and
 // classes): the selected layer's position, scale, rotation, flips, opacity and
 // crop, a photo's adjustments, the text/solid generator controls, a drawing's
-// stroke count — or, with nothing selected, the image's size and background.
+// stroke count — or, with nothing selected, the CANVAS: its size, the
+// whole-picture crop/rotate/flip (the tool row's Canvas menu, as buttons) and
+// its background. Layer controls and canvas controls never share a panel, so
+// "which one does this edit?" always has one answer.
 //
 // Live commit, as in the video inspector: continuous changes go through
 // session.replace() (no history), and ONE history entry lands on release via
@@ -44,8 +47,10 @@ import { toast } from "../ui/toast";
 import { ADJUST_IDENTITY, isIdentityAdjust } from "./adjust/plan";
 import { openCanvasSizeDialog } from "./canvas-size-dialog";
 import type { ImageEditorCtx } from "./context";
+import { startImageCrop } from "./crop-image";
 import { IMAGE_SCALE_GUARD, layerToCanvas, visibleBox } from "./geom";
 import { imgIcon } from "./icons";
+import { flipCanvas, rotateCanvas } from "./image-menu";
 import {
   eraseStrokes,
   findLayer,
@@ -101,6 +106,14 @@ export function parseCrop(
   const c = { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
   if (c.x < 0 || c.y < 0 || c.w < 1 || c.h < 1 || c.x + c.w > srcW || c.y + c.h > srcH) return null;
   return c.x === 0 && c.y === 0 && c.w === srcW && c.h === srcH ? undefined : c;
+}
+
+/** Whether two crops frame the same pixels (absent = the whole source). The
+ *  fields are judged on Enter AND when focus leaves them: the second of the
+ *  two, or a "12.4" typed over 12, finds nothing to write. */
+export function sameCrop(a: ClipCrop | undefined, b: ClipCrop | undefined): boolean {
+  if (!a || !b) return a === b;
+  return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
 }
 
 /** A new crop with the SOURCE pinned on the canvas: every canvas point of a
@@ -190,8 +203,6 @@ const ADJUST_ROWS: readonly { key: keyof ClipAdjust; label: string }[] = [
 
 const ADJUST_HINT = "Select a photo layer to adjust it.";
 
-/** "+17", "0", "−23" — a real minus, so the column lines up in mono. */
-const signed = (v: number): string => (v > 0 ? `+${v}` : v < 0 ? `−${-v}` : "0");
 /** At most two decimals, no trailing zeros ("12.5", not "12.50"). */
 const short = (v: number): string => String(Number(v.toFixed(2)));
 /** A number input's value as a number; an empty or half-typed field ("-",
@@ -309,16 +320,25 @@ export function createGestures(
 /* The panel                                                           */
 /* ------------------------------------------------------------------ */
 
+export interface InspectorOpts {
+  /** Enter the on-canvas crop of a layer (the select tool's crop mode, which
+   *  a double-click on the layer also opens). False when it was refused. */
+  cropLayer(trackId: string): boolean;
+}
+
 export function mountImageInspector(
   host: HTMLElement,
   ctx: ImageEditorCtx,
+  opts: InspectorOpts,
 ): {
   /** Close an open background picker, dropping the colour it is previewing
    *  (synchronous: the window is closing, and its save reads the store). */
   dropPreview(): void;
   dispose(): void;
 } {
-  host.classList.add("inspector");
+  // The second class scopes this panel's own rules (inspector.css) over the
+  // video inspector's sheet it reuses.
+  host.classList.add("inspector", "imged-inspector");
   const { session } = ctx;
 
   let disposed = false;
@@ -334,6 +354,8 @@ export function mountImageInspector(
   const gestures = createGestures(session, () => ctx.holdAutosave());
   const gesture = gestures.gesture;
   const flushGestures = gestures.flush;
+  /** The crop fields' commit while they hold typed, unjudged numbers. */
+  let typedCrop: (() => void) | null = null;
 
   /* -------- small builders -------- */
 
@@ -418,14 +440,15 @@ export function mountImageInspector(
     min: number;
     max: number;
     read: () => number;
-    format: (v: number) => string;
+    /** Shown after the number ("%", "°"); none for a plain amount. */
+    unit?: string;
     apply: (v: number) => void;
-    disabledHint?: string;
     label: string;
   }
 
-  /** Live-commit slider with a readout and a numeric twin (the video
-   *  inspector's `.insp-slider`). Integer steps. */
+  /** Live-commit slider whose value is shown ONCE, in its number field (the
+   *  video inspector's `.insp-slider` twin), which also takes a typed value.
+   *  Integer steps. */
   function slider(o: SliderOpts): HTMLElement {
     const wrap = el("div", "insp-slider");
     const range = el("input", "slider");
@@ -434,29 +457,23 @@ export function mountImageInspector(
     range.max = String(o.max);
     range.step = "1";
     range.setAttribute("aria-label", o.label);
-    const readout = el("div", "insp-slider__value mono");
     const num = el("input", "input insp-num insp-num--twin");
     num.type = "number";
     num.min = String(o.min);
     num.max = String(o.max);
     num.step = "1";
     num.setAttribute("aria-label", o.label);
-    wrap.append(range, readout, num);
+    // Always there, empty for a plain amount, so every row's number sits in
+    // the same column.
+    const unit = el("span", "imged-insp-unit", o.unit ?? "");
+    unit.setAttribute("aria-hidden", "true");
+    wrap.append(range, num, unit);
 
     const paint = (v: number): void => {
       range.value = String(v);
       num.value = String(v);
-      readout.textContent = o.format(v);
     };
 
-    if (o.disabledHint !== undefined) {
-      paint(0);
-      range.disabled = true;
-      num.disabled = true;
-      range.title = o.disabledHint;
-      num.title = o.disabledHint;
-      return wrap;
-    }
     watch(o.read, paint);
 
     const clampRange = (v: number): number => Math.min(Math.max(Math.round(v), o.min), o.max);
@@ -464,7 +481,6 @@ export function mountImageInspector(
     const onRange = (): void => {
       const v = clampRange(Number(range.value));
       num.value = String(v);
-      readout.textContent = o.format(v);
       g.write(() => o.apply(v));
     };
     const onNum = (): void => {
@@ -472,7 +488,6 @@ export function mountImageInspector(
       if (!Number.isFinite(raw)) return;
       const v = clampRange(raw);
       range.value = String(v);
-      readout.textContent = o.format(v);
       g.write(() => o.apply(v));
     };
     const done = (): void => {
@@ -681,7 +696,7 @@ export function mountImageInspector(
           min: 0,
           max: 100,
           read: () => Math.round((tf(id)?.opacity ?? 1) * 100),
-          format: (v) => `${v}%`,
+          unit: "%",
           apply: (v) => setTf(id, { opacity: v / 100 }),
         }),
       ),
@@ -694,6 +709,47 @@ export function mountImageInspector(
   function buildCrop(id: string): HTMLElement {
     const wrap = el("div", "insp-crop");
     wrap.appendChild(el("div", "insp-sublabel", "Crop"));
+
+    const setCrop = (crop: ClipCrop | undefined): void => {
+      const cur = findLayer(session.project, id);
+      if (!cur) return;
+      const { w, h } = dims(cur);
+      const { width: W, height: H } = session.project.timeline;
+      commit((p) => setLayerTransform(p, id, pinnedCrop(cur.transform, w, h, W, H, crop)));
+    };
+
+    // Crop on the canvas: the same mode a double-click on the layer opens,
+    // which was the only way in and too well hidden to be found.
+    const btns = el("div", "insp-row");
+    const cropBtn = button(
+      `${imgIcon("crop", 14)}Crop`,
+      "btn btn--sm",
+      () => {
+        // A typed edit still pending lands first, as a press outside would.
+        flushGestures();
+        if (opts.cropLayer(id)) return;
+        toast.info(
+          findLayer(session.project, id)?.hidden ? "Show this layer to crop it." : "This layer can't be cropped right now.",
+        );
+      },
+      "Crop this layer on the canvas (or double-click the layer)",
+    );
+    cropBtn.setAttribute("aria-label", "Crop layer");
+    btns.appendChild(cropBtn);
+    const reset = button("Reset", "btn btn--ghost btn--sm", () => setCrop(undefined), "Show the whole layer again");
+    reset.setAttribute("aria-label", "Reset crop");
+    watch(
+      () => findLayer(session.project, id)?.transform.crop === undefined,
+      (uncropped) => {
+        reset.disabled = uncropped;
+      },
+    );
+    btns.appendChild(reset);
+    wrap.appendChild(btns);
+
+    // The exact numbers, for precision. Judged as ONE rect when the user is
+    // done with them — Enter, or focus leaving the four fields — so a crop
+    // that needs two fields changed can be typed across both first.
     const grid = el("div", "insp-crop__grid");
     const inputs = (["X", "Y", "W", "H"] as const).map((label) => {
       const input = el("input", "input insp-num");
@@ -704,56 +760,91 @@ export function mountImageInspector(
       return input;
     });
     wrap.appendChild(grid);
+    const storedKey = (): string => {
+      const cur = findLayer(session.project, id);
+      if (!cur) return "";
+      const { w, h } = dims(cur);
+      const c = cur.transform.crop ?? { x: 0, y: 0, w, h };
+      return `${c.x},${c.y},${c.w},${c.h}`;
+    };
+    const fill = (v: string): void => {
+      const parts = v.split(",");
+      inputs.forEach((input, i) => {
+        input.value = parts[i] ?? "";
+      });
+    };
     // Refreshed only when the stored crop (or the source size) really
     // changes, so a half-typed crop survives unrelated edits elsewhere.
-    watch(
-      () => {
-        const cur = findLayer(session.project, id);
-        if (!cur) return "";
-        const { w, h } = dims(cur);
-        const c = cur.transform.crop ?? { x: 0, y: 0, w, h };
-        return `${c.x},${c.y},${c.w},${c.h}`;
-      },
-      (v) => {
-        const parts = v.split(",");
-        inputs.forEach((input, i) => {
-          input.value = parts[i] ?? "";
-        });
-      },
-    );
+    watch(storedKey, fill);
 
-    const setCrop = (crop: ClipCrop | undefined): void => {
+    const commitFields = (): void => {
+      if (typedCrop === commitFields) typedCrop = null;
       const cur = findLayer(session.project, id);
       if (!cur) return;
+      if (ctx.mode.get() !== "idle") {
+        // A crop began while these were being typed (the panel going inert
+        // takes focus out of them): an edit now would land under its baseline.
+        fill(storedKey());
+        return;
+      }
       const { w, h } = dims(cur);
-      const { width: W, height: H } = session.project.timeline;
-      commit((p) => setLayerTransform(p, id, pinnedCrop(cur.transform, w, h, W, H, crop)));
+      const [x, y, cw, ch] = inputs.map(numOf) as [number, number, number, number];
+      const crop = parseCrop(x, y, cw, ch, w, h);
+      if (crop === null) {
+        toast.error(`Crop must fit inside ${w}×${h}.`);
+        // Back to what the layer really has: a refused rect is never left
+        // showing as though it had been applied.
+        fill(storedKey());
+        return;
+      }
+      if (sameCrop(crop, cur.transform.crop)) {
+        // Nothing to record; a "12.4" typed over 12 reads 12 again.
+        fill(storedKey());
+        return;
+      }
+      setCrop(crop);
     };
-    const btns = el("div", "insp-row");
-    btns.appendChild(
-      button("Apply", "btn btn--sm", () => {
-        const cur = findLayer(session.project, id);
-        if (!cur) return;
-        const { w, h } = dims(cur);
-        const [x, y, cw, ch] = inputs.map(numOf) as [number, number, number, number];
-        const crop = parseCrop(x, y, cw, ch, w, h);
-        if (crop === null) {
-          toast.error(`Crop must fit inside ${w}×${h}.`);
+    for (const input of inputs) {
+      on(input, "input", () => {
+        typedCrop = commitFields;
+      });
+      on<KeyboardEvent>(input, "keydown", (e) => {
+        if (e.key === "Escape") {
+          // Cancel, as in every other deferred edit (rename, the crop modes,
+          // Resize canvas): the typed rect is dropped, never applied later by
+          // a press outside. The blur's focusout then finds the stored crop.
+          e.preventDefault();
+          typedCrop = null;
+          fill(storedKey());
+          input.blur();
           return;
         }
-        setCrop(crop);
-      }),
-    );
-    btns.appendChild(button("Clear", "btn btn--ghost btn--sm", () => setCrop(undefined)));
-    wrap.appendChild(btns);
+        if (e.key !== "Enter") return;
+        e.preventDefault();
+        commitFields();
+      });
+      on<FocusEvent>(input, "focusout", (e) => {
+        if (e.relatedTarget instanceof Node && grid.contains(e.relatedTarget)) return;
+        // The window being deactivated (alt-tab mid-edit) blurs the field with
+        // no relatedTarget while it stays the active element: the user is not
+        // done yet, so a half-typed rect is not judged. typedCrop stays set, so
+        // Enter, a real focus move or a press outside still judges it.
+        if (e.relatedTarget === null && (document.activeElement === input || !document.hasFocus())) return;
+        commitFields();
+      });
+    }
     return wrap;
   }
 
   function buildAdjustSection(l: Layer): HTMLElement {
     const s = section("Adjust");
-    const photo = l.kind === "photo";
+    // Only a photo has adjustments: any other layer gets the one-line note and
+    // no controls at all (nine greyed-out sliders only made the panel taller).
+    if (l.kind !== "photo") {
+      s.appendChild(el("div", "insp-note", ADJUST_HINT));
+      return s;
+    }
     const id = l.trackId;
-    if (!photo) s.appendChild(el("div", "insp-note", ADJUST_HINT));
 
     const current = (): ClipAdjust => findLayer(session.project, id)?.clip.adjust ?? ADJUST_IDENTITY;
     for (const row of ADJUST_ROWS) {
@@ -766,26 +857,23 @@ export function mountImageInspector(
             min: -range,
             max: range,
             read: () => current()[row.key],
-            format: row.key === "hue" ? (v) => `${signed(v)}°` : signed,
+            unit: row.key === "hue" ? "°" : undefined,
             apply: (v) =>
               session.replace(setLayerAdjust(session.project, id, { ...current(), [row.key]: v })),
-            disabledHint: photo ? undefined : ADJUST_HINT,
           }),
         ),
       );
     }
-    if (photo) {
-      const reset = button("Reset adjustments", "btn btn--ghost btn--sm insp-block", () =>
-        commit((p) => setLayerAdjust(p, id, undefined)),
-      );
-      watch(
-        () => isIdentityAdjust(findLayer(session.project, id)?.clip.adjust),
-        (v) => {
-          reset.disabled = v;
-        },
-      );
-      s.appendChild(reset);
-    }
+    const reset = button("Reset adjustments", "btn btn--ghost btn--sm insp-block", () =>
+      commit((p) => setLayerAdjust(p, id, undefined)),
+    );
+    watch(
+      () => isIdentityAdjust(findLayer(session.project, id)?.clip.adjust),
+      (v) => {
+        reset.disabled = v;
+      },
+    );
+    s.appendChild(reset);
     return s;
   }
 
@@ -819,7 +907,7 @@ export function mountImageInspector(
     return s;
   }
 
-  /* -------- nothing selected: the image itself -------- */
+  /* -------- nothing selected: the canvas -------- */
 
   let picker: ColorPickerHandle | null = null;
   let pickerLoading = false;
@@ -831,15 +919,24 @@ export function mountImageInspector(
     picker?.close();
   }
 
-  function buildImagePanel(): HTMLElement {
+  /** Two buttons side by side under one label, as the layer section's
+   *  rotate row: short visible words, the full action in the title. */
+  function pairField(label: string, a: HTMLButtonElement, b: HTMLButtonElement): HTMLElement {
+    const row = el("div", "insp-row");
+    row.append(a, b);
+    return field(label, row);
+  }
+
+  function buildCanvasPanel(): HTMLElement {
     const wrap = el("div", "insp-project");
     const header = el("div", "insp-header");
-    header.appendChild(el("div", "insp-header__name", "Image"));
+    header.appendChild(el("div", "insp-header__name", "Canvas"));
+    header.appendChild(el("div", "imged-insp-hint", "Select a layer to edit just that layer."));
     wrap.appendChild(header);
 
-    const canvas = section("Canvas");
+    const sizeSec = section("Size");
     const size = el("div", "insp-readout");
-    size.appendChild(el("span", undefined, "Size"));
+    size.appendChild(el("span", undefined, "Width × height"));
     const sizeVal = el("span", "mono");
     size.appendChild(sizeVal);
     watch(
@@ -848,9 +945,32 @@ export function mountImageInspector(
         sizeVal.textContent = v;
       },
     );
-    canvas.appendChild(size);
-    canvas.appendChild(button("Change size", "btn btn--sm insp-block", () => openCanvasSizeDialog(ctx)));
-    wrap.appendChild(canvas);
+    sizeSec.appendChild(size);
+    sizeSec.appendChild(button("Resize canvas", "btn btn--sm insp-block", () => openCanvasSizeDialog(ctx)));
+    wrap.appendChild(sizeSec);
+
+    // The tool row's Canvas menu, as buttons: each an action on the whole
+    // picture (one commit), never a toggle. The panel is inert during a crop,
+    // which is the menu's busy rule here.
+    const edit = section("Crop, rotate and flip");
+    edit.appendChild(
+      button(`${imgIcon("crop", 14)}Crop canvas`, "btn btn--sm insp-block", () => void startImageCrop(ctx)),
+    );
+    edit.appendChild(
+      pairField(
+        "Rotate",
+        button(`${imgIcon("rotateLeft", 14)}Left`, "btn btn--sm", () => rotateCanvas(ctx, -90), "Rotate canvas left"),
+        button(`${imgIcon("rotateRight", 14)}Right`, "btn btn--sm", () => rotateCanvas(ctx, 90), "Rotate canvas right"),
+      ),
+    );
+    edit.appendChild(
+      pairField(
+        "Flip",
+        button(`${imgIcon("flipH", 14)}Horizontal`, "btn btn--sm", () => flipCanvas(ctx, "h"), "Flip canvas horizontally"),
+        button(`${imgIcon("flipV", 14)}Vertical`, "btn btn--sm", () => flipCanvas(ctx, "v"), "Flip canvas vertically"),
+      ),
+    );
+    wrap.appendChild(edit);
 
     const bgSec = section("Background");
     const grid = el("div", "imged-insp-bg");
@@ -987,7 +1107,7 @@ export function mountImageInspector(
 
   function structKey(): string {
     const l = selected();
-    if (!l) return "image";
+    if (!l) return "canvas";
     const gen = l.kind === "text" || l.kind === "solid" ? `|${stampOf(l.media)}` : "";
     return `${l.trackId}|${l.kind}${gen}`;
   }
@@ -999,6 +1119,7 @@ export function mountImageInspector(
     for (const c of cleanup) c();
     cleanup = [];
     syncs = [];
+    typedCrop = null;
   }
 
   function rebuild(key: string): void {
@@ -1007,7 +1128,7 @@ export function mountImageInspector(
     builtKey = key;
     const l = selected();
     if (!l) {
-      host.appendChild(buildImagePanel());
+      host.appendChild(buildCanvasPanel());
       return;
     }
     host.appendChild(buildHeader(l));
@@ -1051,12 +1172,14 @@ export function mountImageInspector(
   // tools preventDefault their pointerdown, so focus never leaves the field
   // and its focusout commit would otherwise arrive after the tool's own step
   // (createGestures drops that late commit rather than corrupt history — this
-  // keeps the step instead). Capture phase, so it runs before the tool reads
-  // the project; one integer compare per press while nothing is pending.
+  // keeps the step instead). The crop fields' typed rect is judged here too.
+  // Capture phase, so it runs before the tool reads the project; two compares
+  // per press while nothing is pending.
   const onPressOutside = (e: PointerEvent): void => {
-    if (gestures.pending === 0) return;
+    if (gestures.pending === 0 && typedCrop === null) return;
     if (e.target instanceof Node && host.contains(e.target)) return;
     flushGestures();
+    typedCrop?.();
   };
   document.addEventListener("pointerdown", onPressOutside, true);
 
@@ -1097,7 +1220,7 @@ export function mountImageInspector(
       unsubMode();
       host.inert = false;
       host.replaceChildren();
-      host.classList.remove("inspector");
+      host.classList.remove("inspector", "imged-inspector");
     },
   };
 }

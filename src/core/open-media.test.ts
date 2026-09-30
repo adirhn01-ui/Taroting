@@ -396,8 +396,9 @@ describe("openMediaAsProject", () => {
 });
 
 describe("stillSizeProblem", () => {
-  // The one size check both ways in share (openMediaAsProject above, Home's
-  // "New image" dialog through its photoProblem) — pinned here, at its home.
+  // The one size check every way in shares (openMediaAsProject above, Home's
+  // "New image project" dialog through its photoProblem, and the "Open as"
+  // dialog) — pinned here, at its home.
   function still(over: Partial<MediaInfo>): MediaInfo {
     return {
       path: "D:\\Pictures\\harbour.jpg",

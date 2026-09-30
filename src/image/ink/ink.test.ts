@@ -580,6 +580,45 @@ describe("pen", () => {
     }
   });
 
+  it("ink wholly on the pasteboard keeps nothing: no stroke, no layer, no undo step", () => {
+    const h = harness(project());
+    // Left of the canvas (x < 0) all the way: clipped out of sight.
+    draw(h, ZIGZAG.map(([x, y]) => [x - 300, y] as [number, number]));
+    expect(h.events.commits).toBe(0);
+    expect(h.history).toHaveLength(0);
+    expect(h.store.get().timeline.tracks.map((t) => t.id)).toEqual(["t-photo"]);
+    expect(h.ctx.selection.get()).toBe("t-photo");
+    // the gesture still ends cleanly
+    expect(h.events.releases).toBe(1);
+    expect(h.lives[h.lives.length - 1]).toBe(null);
+    // control: the same zigzag crossing the left edge is kept whole
+    draw(h, ZIGZAG.map(([x, y]) => [x - 100, y] as [number, number]));
+    expect(h.events.commits).toBe(1);
+    const made = h.store.get().timeline.tracks[0]!.id;
+    const [st] = drawingStrokes(h.store.get(), made);
+    if (!st || !("p" in st)) throw new Error("no stroke");
+    expect(decodePoints(st.p)![0]).toBeCloseTo(-60, 3);
+    h.handle.dispose();
+  });
+
+  it("a mark just above the canvas counts its painted width (the pencil's full width)", () => {
+    // 6 css px = 8 canvas px wide: a pen paints 4 either side of y = -5 (so
+    // nothing reaches y = 0), a mouse pencil 6 (so it does).
+    const line: [number, number][] = [
+      [60, -5],
+      [160, -5],
+      [260, -5],
+    ];
+    const mouse = { pointerType: "mouse", pressure: 0.5 };
+    for (const [tool, kept] of [["pen", 0], ["pencil", 1]] as const) {
+      const h = harness(project(), tool);
+      h.ctx.tools.set({ ...h.ctx.tools.get(), sizes: { ...h.ctx.tools.get().sizes, pen: 6, pencil: 6 } });
+      draw(h, line, mouse);
+      expect(h.events.commits, tool).toBe(kept);
+      h.handle.dispose();
+    }
+  });
+
   it("never draws with a right click or the middle button", () => {
     const h = harness(project());
     draw(h, ZIGZAG, { button: 2, buttons: 2 });
@@ -629,6 +668,28 @@ describe("shapes", () => {
     expect(h.events.commits).toBe(0);
     expect(drawingStrokes(h.store.get(), "t-draw")).toEqual([]);
     expect(toasts).toEqual(["info: That shape reaches too far outside the layer to keep."]);
+    h.handle.dispose();
+  });
+
+  it("a shape wholly outside the canvas commits nothing and says nothing, even out of range", () => {
+    for (const t of [PLAIN, SLIVER]) {
+      const h = harness(project({ drawing: { transform: t, strokes: [] } }), "shape");
+      draw(h, [
+        [40, 400],
+        [220, 480],
+      ]);
+      expect(h.events.commits).toBe(0);
+      expect(drawingStrokes(h.store.get(), "t-draw")).toEqual([]);
+      h.handle.dispose();
+    }
+    expect(toasts).toEqual([]);
+    // control: the same drag starting inside the canvas is kept
+    const h = harness(project({ drawing: { transform: PLAIN, strokes: [] } }), "shape");
+    draw(h, [
+      [40, 300],
+      [220, 480],
+    ]);
+    expect(h.events.commits).toBe(1);
     h.handle.dispose();
   });
 
@@ -875,6 +936,9 @@ describe("the surface", () => {
     await Promise.resolve();
     const kids = h.stage.children.map((c) => c.className);
     expect(kids).toEqual(["imged-ink", "imged-ruler"]);
+    // a drag only moves the ruler: its tooltip says how a mouse turns it
+    const ruler = h.stage.children[1] as El & { title?: string };
+    expect(ruler.title).toBe("Drag to move · scroll to rotate (Shift: 15°)");
     h.ctx.tools.set({ ...h.ctx.tools.get(), tool: "select" });
     await Promise.resolve();
     expect(h.surface()).toBeUndefined();

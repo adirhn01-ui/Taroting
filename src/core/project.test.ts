@@ -115,6 +115,36 @@ describe("createProject / addMedia", () => {
     expectClean(p);
   });
 
+  it("keeps the FIRST visual's canvas when a batch lands on an empty timeline", () => {
+    // Import is bin-first: the timeline stays empty through the whole batch.
+    // Width, height and fps all differ between the two files, so a last-wins
+    // adoption fails every assertion.
+    let p = createProject("New");
+    p = addMedia(p, videoInfo()).project; // 1280x720 @ 30
+    const portrait: MediaInfo = {
+      ...videoInfo(),
+      path: "C:\\media\\phone.mp4",
+      fps: rat(60),
+      width: 1080,
+      height: 1920,
+    };
+    p = addMedia(p, portrait).project;
+    expect(p.timeline.width).toBe(1280);
+    expect(p.timeline.height).toBe(720);
+    expect(p.timeline.fps).toEqual(rat(30));
+    expect(p.media).toHaveLength(2);
+    expectClean(p);
+  });
+
+  // A guard for the fix above, not a pin of it: it passes with or without it.
+  it("an audio file already in the bin does not block the first visual's adoption", () => {
+    let p = createProject("New");
+    p = addMedia(p, audioInfo()).project;
+    p = addMedia(p, videoInfo()).project;
+    expect(p.timeline.width).toBe(1280);
+    expect(p.timeline.height).toBe(720);
+  });
+
   it("clamps adopted odd dimensions to an even, in-range canvas", () => {
     let p = createProject("New");
     const gifInfo: MediaInfo = {

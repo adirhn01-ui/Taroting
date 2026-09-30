@@ -112,13 +112,16 @@ describe("installPaste: something opened while the paste was being saved", () =>
     };
     const remove = installPaste(ctx as never, () => false);
     const png = new Blob([new Uint8Array([1])], { type: "image/png" });
-    const paste = () =>
+    let prevented = 0;
+    const paste = (type = "image/png", kind = "file") =>
       onPaste!({
         target: null,
-        preventDefault() {},
-        clipboardData: { items: [{ kind: "file", type: "image/png", getAsFile: () => png }] },
+        preventDefault() {
+          prevented++;
+        },
+        clipboardData: { items: [{ kind, type, getAsFile: () => png }] },
       });
-    return { commits, mode, remove, paste };
+    return { commits, mode, remove, paste, prevented: () => prevented };
   }
 
   const settle = async (): Promise<void> => {
@@ -165,6 +168,44 @@ describe("installPaste: something opened while the paste was being saved", () =>
     await settle();
     expect(t.commits).toEqual([]);
     expect(toasts.info).toEqual(["Close the dialog first, then paste the image again."]);
+    t.remove();
+  });
+
+  it("an image pasted while a crop, dialog, menu or picker is open says why, at once", async () => {
+    const t = rig();
+    t.mode.set("crop-image");
+    t.paste();
+    t.mode.set("idle");
+    modal = true;
+    t.paste();
+    modal = false;
+    const release = blockShortcuts();
+    try {
+      t.paste();
+    } finally {
+      release();
+    }
+    expect(saved.resolve).toBe(null);
+    expect(toasts.info).toEqual([
+      "Finish the crop first, then paste the image again.",
+      "Close the dialog first, then paste the image again.",
+      "Close the open menu or picker first, then paste the image again.",
+    ]);
+    expect(t.prevented()).toBe(3);
+    await settle();
+    expect(t.commits).toEqual([]);
+    t.remove();
+  });
+
+  it("text pasted in the same states stays untouched and silent", () => {
+    const t = rig();
+    t.mode.set("crop-layer");
+    t.paste("text/plain", "string");
+    t.mode.set("idle");
+    modal = true;
+    t.paste("text/plain", "string");
+    expect(toasts.info).toEqual([]);
+    expect(t.prevented()).toBe(0);
     t.remove();
   });
 

@@ -77,12 +77,23 @@ export function installPaste(ctx: ImageEditorCtx, isDisposed: () => boolean): ()
     // The §2.8 guards: a paste into a text field (a layer rename, a dialog's
     // number box) is that field's; nothing lands behind a modal or menu.
     if (isTypingTarget(document.activeElement) || isTypingTarget(e.target)) return;
-    if (document.querySelector(".modal-backdrop") || shortcutsBlocked()) return;
-    if (ctx.mode.get() !== "idle") return;
     const items = e.clipboardData?.items;
     if (!items) return;
     const i = firstImageItem(items);
     if (i < 0) return;
+    // An image refused now says why, as a drop does: a paste that silently
+    // does nothing reads as broken. A text paste above stays untouched.
+    const refused = addRefusal(
+      ctx.mode.get(),
+      document.querySelector(".modal-backdrop") !== null,
+      shortcutsBlocked(),
+      "paste the image again",
+    );
+    if (refused !== null) {
+      e.preventDefault();
+      toast.info(refused);
+      return;
+    }
     const file = items[i]!.getAsFile();
     if (!file) return;
     e.preventDefault();

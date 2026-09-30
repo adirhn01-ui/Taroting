@@ -203,6 +203,35 @@ fn refuse_overwriting_a_source(out_path: &str, media: &[MediaRef]) -> Result<()>
     refuse_overwriting_a_source_with(out_path, media, |p| std::fs::canonicalize(p).ok())
 }
 
+/// Refuse an export whose source file is gone, naming it. The relink dialog is
+/// offered only when a project opens, so a file moved or deleted after that
+/// reached ffmpeg, and the export failed as "ffmpeg exited with ..." with the
+/// real cause buried in the log.
+///
+/// `sources` is `BuiltExport::sources`: the files ffmpeg will actually open,
+/// not every media entry. A file only a muted clip uses is never opened, and
+/// that export works today, so it is not refused. Only `Ok(false)` is proof
+/// the file is gone; a volume that cannot answer (`Err`) is left to ffmpeg,
+/// which will open it or say why.
+fn refuse_missing_sources(sources: &[OsString]) -> Result<()> {
+    // One look per FILE, in argv order (so the file named is still the first
+    // one ffmpeg would open): a long edit of one clip opens it once per cut,
+    // and this runs on the IPC thread.
+    let mut seen = std::collections::HashSet::with_capacity(sources.len());
+    for src in sources {
+        if !seen.insert(src.as_os_str()) {
+            continue;
+        }
+        if matches!(std::path::Path::new(src).try_exists(), Ok(false)) {
+            return Err(AppError::BadInput(format!(
+                "{} is missing. Reopen the project to relink it, or replace it, then export.",
+                builder::display_name(&src.to_string_lossy())
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A path compared the way Windows names files: separators unified, ASCII case
 /// folded — `comparablePath` in `export-dialog.ts`, rule for rule. ASCII only,
 /// on purpose: NTFS folds with a far narrower table than full Unicode, so
@@ -506,6 +535,17 @@ pub fn export_failure_report(state: State<'_, LastExportFailure>) -> Option<Reda
 /* Export command                                                      */
 /* ------------------------------------------------------------------ */
 
+/// What `start_export` decides before anything touches the disk: the graph,
+/// then the two refusals — a destination that is one of the project's own
+/// sources, and a source file that is gone. One function, so the tests pin
+/// the refusals the real command makes rather than a copy of them.
+fn plan_export(spec: &ExportSpec, encoders: &hw::EncoderReport) -> Result<BuiltExport> {
+    let built = builder::build(spec, encoders)?;
+    refuse_overwriting_a_source(&spec.out_path, &spec.media)?;
+    refuse_missing_sources(&built.sources)?;
+    Ok(built)
+}
+
 #[tauri::command]
 pub fn start_export(
     app: AppHandle,
@@ -513,11 +553,10 @@ pub fn start_export(
     spec: ExportSpec,
 ) -> Result<JobId> {
     let (encoders, ffmpeg_version) = hw::detect(false);
-    let built = builder::build(&spec, &encoders)?;
-    let out_path = spec.out_path.clone();
     // Before anything touches the disk (the text/script temps below, the
     // `.part`, the publish rename).
-    refuse_overwriting_a_source(&out_path, &spec.media)?;
+    let built = plan_export(&spec, &encoders)?;
+    let out_path = spec.out_path.clone();
 
     let (mut final_args, temps) = finalize_args(&built, &out_path)?;
 
@@ -1195,6 +1234,156 @@ mod unit {
 
         refuse_overwriting_a_source(&out.to_string_lossy(), &[gen])
             .expect("a generator is not a file the export could overwrite");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* -------- (5) a source file that is gone -------- */
+
+    /// A project over real files: a video clip with sound, a MUTED clip on an
+    /// audio track, a Solid generator whose placeholder path names nothing on
+    /// disk, and a media entry no clip uses. Built by the real builder, so the
+    /// files checked are the ones ffmpeg would be handed.
+    fn spec_over(dir: &std::path::Path, voice_muted: bool) -> (ExportSpec, crate::hw::EncoderReport) {
+        use crate::export::model::*;
+        use crate::project::schema::*;
+        let audio = |muted: bool| ClipAudio {
+            volume: 1.0,
+            muted,
+            fade_in_sec: 0.0,
+            fade_out_sec: 0.0,
+            gain_offset_db: 0.0,
+            detached: false,
+        };
+        let clip = |id: &str, media_id: &str, start: f64, muted: bool| Clip {
+            id: id.into(),
+            media_id: media_id.into(),
+            timeline_start: start,
+            src_in: 0.0,
+            src_out: 2.0,
+            speed: 1.0,
+            transform: None,
+            audio: audio(muted),
+            keyframes: None,
+            adjust: None,
+        };
+        let track = |id: &str, kind: &str, clips: Vec<Clip>| Track {
+            id: id.into(),
+            kind: kind.into(),
+            name: id.into(),
+            muted: false,
+            clips,
+            hidden: None,
+        };
+        let mut holiday = source("m1", &dir.join("Holiday Clip.mp4"));
+        holiday.has_audio = true;
+        let mut voice = source("m2", &dir.join("Voice Memo.m4a"));
+        voice.kind = "audio".into();
+        voice.has_audio = true;
+        let mut title = source("m3", &dir.join("Title Card.png"));
+        title.generator = Some(Generator::Solid { color: "#123456".into() });
+        let unused = source("m4", &dir.join("Unused B-roll.mp4"));
+        let spec = ExportSpec {
+            media: vec![holiday, voice, title, unused],
+            timeline: Timeline {
+                fps: Rational { num: 30, den: 1 },
+                width: 1280,
+                height: 720,
+                tracks: vec![
+                    track("v1", "video", vec![clip("c1", "m1", 0.0, false), clip("c3", "m3", 2.0, false)]),
+                    track("a1", "audio", vec![clip("c2", "m2", 0.5, voice_muted)]),
+                ],
+                markers: vec![],
+            },
+            preset: ExportPreset {
+                format: "mp4".into(),
+                vcodec: "h264".into(),
+                resolution: ResolutionPreset::Named("original".into()),
+                fps: FpsPreset::Original("original".into()),
+                video_bitrate: BitratePreset::Auto(AutoTag::Auto),
+                audio_bitrate: BitratePreset::Auto(AutoTag::Auto),
+                use_hardware: false,
+            },
+            out_path: dir.join("Export final.mp4").to_string_lossy().into_owned(),
+        };
+        let encoders = crate::hw::EncoderReport {
+            h264: "libx264".into(),
+            hevc: "libx265".into(),
+            av1: "libsvtav1".into(),
+            detail: vec![],
+        };
+        (spec, encoders)
+    }
+
+    /// The pre-flight the real command runs (`plan_export`), not the helper
+    /// alone: dropping the check from `start_export`'s path fails these.
+    fn plan_over(dir: &std::path::Path, voice_muted: bool) -> Result<BuiltExport> {
+        let (spec, encoders) = spec_over(dir, voice_muted);
+        plan_export(&spec, &encoders)
+    }
+
+    fn refused_as_missing(dir: &std::path::Path, name: &str) {
+        let Err(err) = plan_over(dir, false) else { panic!("a missing source must be refused") };
+        assert!(matches!(err, AppError::BadInput(_)), "wrong variant: {err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!("{name} is missing. Reopen the project to relink it, or replace it, then export.")
+        );
+    }
+
+    /// A clip's file deleted after the project opened is refused before ffmpeg
+    /// runs, naming the file. Everything else about the project is fine, so
+    /// the refusal can only be about that one file.
+    #[test]
+    fn an_export_whose_source_is_gone_names_the_file() {
+        let dir = publish_dir("missing-src");
+        std::fs::write(dir.join("Holiday Clip.mp4"), b"footage").unwrap();
+        std::fs::write(dir.join("Voice Memo.m4a"), b"voice").unwrap();
+        std::fs::write(dir.join("Unused B-roll.mp4"), b"b-roll").unwrap();
+
+        // All there (the generator's placeholder path is not): exported.
+        plan_over(&dir, false).expect("every file ffmpeg opens is present");
+
+        std::fs::remove_file(dir.join("Holiday Clip.mp4")).unwrap();
+        refused_as_missing(&dir, "Holiday Clip.mp4");
+
+        // The voice memo gone too, with its clip still heard: the first file
+        // ffmpeg would open is the one named.
+        std::fs::remove_file(dir.join("Voice Memo.m4a")).unwrap();
+        refused_as_missing(&dir, "Holiday Clip.mp4");
+        std::fs::write(dir.join("Holiday Clip.mp4"), b"footage").unwrap();
+        refused_as_missing(&dir, "Voice Memo.m4a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Files ffmpeg never opens are never refused: the one only a muted clip
+    /// uses (that export works without it today), one no clip uses, and a
+    /// generator's placeholder path.
+    #[test]
+    fn a_missing_file_ffmpeg_never_opens_does_not_block_the_export() {
+        let dir = publish_dir("missing-unopened");
+        std::fs::write(dir.join("Holiday Clip.mp4"), b"footage").unwrap();
+        // "Voice Memo.m4a", "Unused B-roll.mp4" and "Title Card.png" never exist.
+        let built = plan_over(&dir, true).expect("nothing ffmpeg opens is missing");
+        let opened: Vec<String> = built
+            .sources
+            .iter()
+            .map(|s| builder::display_name(&s.to_string_lossy()))
+            .collect();
+        // The video, and the same file again for its sound: nothing else.
+        assert_eq!(opened, ["Holiday Clip.mp4", "Holiday Clip.mp4"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only `Ok(false)` proves a file is gone. A path the filesystem cannot be
+    /// asked about (a NUL in the name is the portable way to make `try_exists`
+    /// fail; an unreachable share behaves the same) is left to ffmpeg.
+    #[test]
+    fn a_source_that_cannot_be_checked_is_left_to_ffmpeg() {
+        let dir = publish_dir("missing-unknown");
+        let unreadable = dir.join("Rem\0ote Clip.mp4");
+        assert!(unreadable.try_exists().is_err(), "premise: the source cannot be checked");
+        refuse_missing_sources(&[unreadable.into_os_string()])
+            .expect("an unanswered check is not proof the file is gone");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,6 +11,9 @@ import type { Layer } from "../layers";
 /* ---------------- the recording double ---------------- */
 
 let log: string[] = [];
+/** every fill/draw on a context with the clips active at that moment:
+ *  `name|what|clip;clip` (each clip = the transform and rect it was set with) */
+let clipLog: string[] = [];
 let ctxSeq = 0;
 
 class RecCtx {
@@ -23,11 +26,18 @@ class RecCtx {
   textBaseline = "alphabetic";
   imageSmoothingEnabled = true;
   imageSmoothingQuality = "low";
+  private xf = "T(1,0,0,1,0,0)";
+  private pathRect = "";
+  private clips: readonly string[] = [];
+  private saved: (readonly string[])[] = [];
   constructor(readonly canvas: FakeCanvas) {
     this.name = canvas.name;
   }
   private rec(s: string): void {
     log.push(`${this.name}|${s}`);
+  }
+  private painted(what: string): void {
+    clipLog.push(`${this.name}|${what}|${this.clips.join(";")}`);
   }
   get globalAlpha(): number {
     return this.alpha;
@@ -44,26 +54,39 @@ class RecCtx {
     this.rec(`fillStyle=${typeof v === "string" ? v : "pattern"}`);
   }
   setTransform(...a: number[]): void {
-    this.rec(`T(${a.map((n) => +n.toFixed(6)).join(",")})`);
+    this.xf = `T(${a.map((n) => +n.toFixed(6)).join(",")})`;
+    this.rec(this.xf);
   }
   fillRect(x: number, y: number, w: number, h: number): void {
-    this.rec(`fillRect(${[x, y, w, h].map((n) => +n.toFixed(6)).join(",")})`);
+    const what = `fillRect(${[x, y, w, h].map((n) => +n.toFixed(6)).join(",")})`;
+    this.rec(what);
+    this.painted(what);
   }
   clearRect(): void {
     this.rec("clear");
   }
   drawImage(src: { name?: string }): void {
     this.rec(`draw:${src?.name ?? "?"}`);
+    this.painted(`draw:${src?.name ?? "?"}`);
   }
   fillText(t: string, x: number, y: number): void {
     this.rec(`text:${t}@${x},${y}`);
   }
-  save(): void {}
-  restore(): void {}
-  beginPath(): void {}
-  rect(): void {}
+  save(): void {
+    this.saved.push(this.clips);
+  }
+  restore(): void {
+    this.clips = this.saved.pop() ?? [];
+  }
+  beginPath(): void {
+    this.pathRect = "";
+  }
+  rect(x: number, y: number, w: number, h: number): void {
+    this.pathRect = `${this.xf}rect(${[x, y, w, h].map((n) => +n.toFixed(6)).join(",")})`;
+  }
   clip(): void {
-    this.rec("clip");
+    this.rec(`clip:${this.pathRect}`);
+    this.clips = [...this.clips, this.pathRect];
   }
   createPattern(): object {
     return {};
@@ -213,6 +236,7 @@ function mainLog(name: string): string[] {
 
 beforeEach(() => {
   log = [];
+  clipLog = [];
   strokeScratches.length = 0;
   layers = [];
   forceBlobType = null;
@@ -315,6 +339,62 @@ describe("renderComposite", () => {
     // M = V · L: zoom 2 about pan (5, 7) over scale 0.5 + (3, -2)
     expect(mainLog(target.name)).toContain("T(1,0,0,1,11,3)");
   });
+
+  // The canvas rect in the view: zoom 0.5 about pan (13, 7), a 641×361 canvas.
+  const CANVAS_CLIP = "T(0.5,0,0,0.5,13,7)rect(0,0,641,361)";
+
+  it("clips every layer to the canvas, after the underlay and background", () => {
+    // a solid hanging half off the canvas's left edge
+    layers = [solid("top", "#aa0001"), solid("off", "#dd0004", { transform: transform({ x: -20, y: 5 }) })];
+    const target = new FakeCanvas(400, 300);
+    renderComposite(target.getContext() as unknown as CanvasRenderingContext2D, doc("#0a0b0c"), noRes, { zoom: 0.5, panX: 13, panY: 7 }, { underlay: "white" });
+    const main = mainLog(target.name);
+    const iClip = main.indexOf(`clip:${CANVAS_CLIP}`);
+    expect(iClip).toBeGreaterThanOrEqual(0);
+    // underlay and background fill exactly this rectangle already, unclipped
+    expect(main.indexOf("fillStyle=#ffffff")).toBeLessThan(iClip);
+    expect(main.indexOf("fillStyle=#0a0b0c")).toBeLessThan(iClip);
+    expect(main.indexOf("fillStyle=#dd0004")).toBeGreaterThan(iClip);
+    // Each layer fills under the canvas clip AND its own crop, the off-canvas
+    // one included; the underlay and background under none.
+    const under = clipLog.filter((l) => l.startsWith(`${target.name}|fillRect(`)).map((l) => l.split("|")[2]);
+    expect(under).toEqual(["", "", `${CANVAS_CLIP};T(0.5,0,0,0.5,3,9.5)rect(0,0,40,30)`, `${CANVAS_CLIP};T(0.5,0,0,0.5,13,7)rect(0,0,40,30)`]);
+  });
+
+  it("clips a mark for a layer not created yet, and a live mark inside its layer, to the canvas", () => {
+    const d = drawing("draw", [[ink("#010101")]]);
+    layers = [solid("top", "#aa0001"), d];
+    const target = new FakeCanvas(400, 300);
+    const view = { zoom: 0.5, panX: 13, panY: 7 };
+    const onLayer: LiveInk = { trackId: "draw", above: null, paint: () => {} };
+    renderComposite(target.getContext() as unknown as CanvasRenderingContext2D, doc(), noRes, view, { underlay: "none", live: onLayer });
+    // the layer's scratch (strokes + live mark) lands on the target once, clipped
+    const layerDraws = clipLog.filter((l) => l.startsWith(`${target.name}|draw:`));
+    expect(layerDraws).toHaveLength(1);
+    expect(layerDraws[0]!.split("|")[2]).toBe(CANVAS_CLIP);
+
+    clipLog = [];
+    log = [];
+    let at = -1;
+    const pending: LiveInk = { trackId: null, above: null, paint: () => (at = log.length) };
+    renderComposite(target.getContext() as unknown as CanvasRenderingContext2D, doc(), noRes, view, { underlay: "none", live: pending });
+    expect(log.indexOf(`${target.name}|clip:${CANVAS_CLIP}`)).toBeGreaterThanOrEqual(0);
+    expect(log.indexOf(`${target.name}|clip:${CANVAS_CLIP}`)).toBeLessThan(at);
+    const pendingDraws = clipLog.filter((l) => l.startsWith(`${target.name}|draw:`));
+    // the drawing layer's scratch, then the pending mark's, both clipped
+    expect(pendingDraws.map((l) => l.split("|")[2])).toEqual([CANVAS_CLIP, CANVAS_CLIP]);
+  });
+
+  it("with a region, clips to the region AND the canvas", () => {
+    layers = [solid("s", "#aa0001", { transform: transform({ x: 600, y: 350 }) })];
+    const target = new FakeCanvas(400, 300);
+    renderComposite(target.getContext() as unknown as CanvasRenderingContext2D, doc(), noRes, { zoom: 0.5, panX: 13, panY: 7 }, {
+      underlay: "none",
+      region: { x: 500, y: 300, w: 200, h: 90 },
+    });
+    const fills = clipLog.filter((l) => l.startsWith(`${target.name}|fillRect(`)).map((l) => l.split("|")[2]);
+    expect(fills).toEqual([`T(0.5,0,0,0.5,13,7)rect(500,300,200,90);${CANVAS_CLIP};T(0.5,0,0,0.5,313,182)rect(0,0,40,30)`]);
+  });
 });
 
 describe("layerBox", () => {
@@ -381,6 +461,14 @@ describe("renderImageExport", () => {
     await renderImageExport(doc(), { format: "png", quality: 100, outW: 64, outH: 36 }, never(), () => {});
     const fills = log.filter((l) => l.includes("|fillStyle=")).map((l) => l.split("|")[1]);
     expect(fills).toEqual(["fillStyle=#dd0004", "fillStyle=#aa0001"]);
+  });
+
+  it("adds no canvas clip: the output IS the canvas, so the preview's clip changes nothing here", async () => {
+    layers = [solid("s", "#123456", { transform: transform({ x: -20, y: 5 }) })];
+    await renderImageExport(doc(), { format: "png", quality: 100, outW: 160, outH: 90 }, never(), () => {});
+    const fills = clipLog.filter((l) => l.includes("|fillRect(") && !l.includes("|fillRect(0,0,160,90)"));
+    // the layer's own crop clip only (160/641 and 90/361 per axis)
+    expect(fills.map((l) => l.split("|")[2])).toEqual([`T(${+(160 / 641).toFixed(6)},0,0,${+(90 / 361).toFixed(6)},${+((-20 * 160) / 641).toFixed(6)},${+((5 * 90) / 361).toFixed(6)})rect(0,0,40,30)`]);
   });
 
   it("exports a layer with a non-finite opacity at full opacity, as the preview shows it", async () => {

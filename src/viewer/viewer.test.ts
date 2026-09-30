@@ -10,6 +10,10 @@ import type { SiblingWindow } from "../core/ipc";
 
 const m = vi.hoisted(() => ({
   listSiblings: vi.fn(),
+  forgetSiblingOrder: vi.fn(),
+  navigate: vi.fn(),
+  /** The items of the last menu the viewer opened. */
+  menu: [] as { label: string; onSelect: () => void }[],
   keys: new Map<string, (e: { repeat: boolean }) => void>(),
 }));
 
@@ -28,7 +32,7 @@ vi.mock("../core/ipc", async (importOriginal) => {
   const real = await importOriginal<typeof import("../core/ipc")>();
   return {
     ...real,
-    ipc: { ...real.ipc, listSiblings: m.listSiblings },
+    ipc: { ...real.ipc, listSiblings: m.listSiblings, forgetSiblingOrder: m.forgetSiblingOrder },
     setWindowTitle: async () => {},
     revealInFolder: async () => {},
   };
@@ -59,11 +63,20 @@ vi.mock("../core/shortcuts", async (importOriginal) => ({
   },
 }));
 vi.mock("../core/app-close", () => ({ registerCloseTask: () => () => {} }));
-vi.mock("../ui/menu", () => ({ showMenu: () => {}, closeMenu: () => {} }));
+vi.mock("../ui/menu", () => ({
+  showMenu: (_x: number, _y: number, items: { label: string; onSelect: () => void }[]) => {
+    m.menu = items;
+  },
+  closeMenu: () => {},
+}));
 vi.mock("../ui/toast", () => ({ toast: { error: () => {}, info: () => {} } }));
-vi.mock("../core/nav", () => ({ navigate: () => {} }));
-vi.mock("../core/open-media", () => ({ openMediaAsProject: async () => "", runOnOpenChain: async () => {} }));
+vi.mock("../core/nav", () => ({ navigate: m.navigate }));
+vi.mock("../core/open-media", () => ({
+  openMediaAsProject: async () => "C:\\temp\\Quick view.trt",
+  runOnOpenChain: (task: () => Promise<void>) => task(),
+}));
 
+import { WINDOW_RADIUS } from "./stepper";
 import { mountViewer, type ViewerHandle } from "./viewer";
 
 /* ---------------- a fake DOM, just enough for the viewer ---------------- */
@@ -75,11 +88,13 @@ interface FakeEl {
   textContent: string;
   [k: string]: unknown;
   querySelector(sel: string): FakeEl;
+  fire(type: string): void;
 }
 
 function fakeEl(): FakeEl {
   const attrs = new Map<string, string>();
   const kids = new Map<string, FakeEl>();
+  const listeners = new Map<string, () => void>();
   const el: FakeEl = {
     hidden: false,
     disabled: false,
@@ -102,8 +117,10 @@ function fakeEl(): FakeEl {
     getAttribute: (k: string) => attrs.get(k) ?? null,
     hasAttribute: (k: string) => attrs.has(k),
     removeAttribute: (k: string) => void attrs.delete(k),
-    addEventListener: () => {},
+    addEventListener: (type: string, fn: () => void) => void listeners.set(type, fn),
     removeEventListener: () => {},
+    /** Run the listener the viewer added for `type` (the tests' click). */
+    fire: (type: string) => listeners.get(type)?.(),
     appendChild: (c: unknown) => c,
     remove: () => {},
     blur: () => {},
@@ -136,6 +153,9 @@ beforeEach(() => {
   created = [];
   calls = [];
   m.keys.clear();
+  m.menu = [];
+  m.navigate.mockReset();
+  m.forgetSiblingOrder.mockReset().mockResolvedValue(undefined);
   m.listSiblings.mockReset().mockImplementation(
     (path: string) => new Promise<SiblingWindow>((resolve) => calls.push({ path, resolve })),
   );
@@ -168,6 +188,12 @@ function mount(path: string): FakeEl {
   views.push(mountViewer(fakeEl() as unknown as HTMLElement, path));
   // The viewer's own root is the first element it creates.
   return created[0]!;
+}
+
+/** Dispose the one mounted viewer now (afterEach would, too late to assert). */
+function unmount(): void {
+  for (const v of views) v.dispose();
+  views = [];
 }
 
 async function flush(): Promise<void> {
@@ -224,9 +250,12 @@ describe("the folder listing", () => {
     expect(m.listSiblings).toHaveBeenCalledTimes(1);
 
     // A held → (repeat): two steps from the window's edge, so a refill starts.
+    // Only the opened file's listing asked Explorer for the order (fresh);
+    // the refill steps in the order that listing captured.
     m.keys.get("nextFile")!({ repeat: true });
     expect(m.listSiblings).toHaveBeenCalledTimes(2);
-    expect(calls[1]!.path).toBe(all[1]);
+    expect(m.listSiblings).toHaveBeenNthCalledWith(1, all[0], WINDOW_RADIUS, true);
+    expect(m.listSiblings).toHaveBeenNthCalledWith(2, all[1], WINDOW_RADIUS, false);
 
     // The key is released; the repeat dwell ends while the refill is in flight.
     await vi.advanceTimersByTimeAsync(150);
@@ -253,5 +282,58 @@ describe("the folder listing", () => {
     await flush();
     // The queued request names 002, but 003 is on screen: it is listed again.
     expect(m.listSiblings).toHaveBeenCalledTimes(3);
+  });
+});
+
+/* ---------------- Explorer's order ---------------- */
+
+describe("the folder order", () => {
+  // Every file the viewer is SENT to reads File Explorer's order afresh — the
+  // user may have re-sorted the folder since — and nothing else does: a
+  // settle, a refill or a step never asks Explorer again.
+  it("is read afresh for a file sent to the viewer, and only then", async () => {
+    vi.useFakeTimers();
+    const all = names(1, 10);
+    mount(all[0]!);
+    calls[0]!.resolve({ before: [], after: all.slice(1), index: 1, total: 10, family: "visual" });
+    await flush();
+    m.keys.get("nextFile")!({ repeat: false });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(m.listSiblings).toHaveBeenCalledTimes(2);
+    expect(m.listSiblings).toHaveBeenLastCalledWith(all[1], WINDOW_RADIUS, false);
+    calls[1]!.resolve({ before: all.slice(0, 1), after: all.slice(2), index: 2, total: 10, family: "visual" });
+    await flush();
+
+    // A second Explorer open while the viewer is up.
+    const other = "C:\\clips\\b.mp4";
+    views[0]!.show(other);
+    expect(m.listSiblings).toHaveBeenCalledTimes(3);
+    expect(m.listSiblings).toHaveBeenLastCalledWith(other, WINDOW_RADIUS, true);
+  });
+
+  it("is dropped when the viewer is left", async () => {
+    mount(`${F}a.jpg`);
+    calls[0]!.resolve({ before: [], after: [], index: 1, total: 1, family: "visual" });
+    await flush();
+    expect(m.forgetSiblingOrder).not.toHaveBeenCalled();
+    unmount();
+    expect(m.forgetSiblingOrder).toHaveBeenCalledTimes(1);
+  });
+
+  // "Open as project" leaves for an editor whose exit comes straight back to
+  // this file: stepping must resume in the same order even if Explorer has
+  // been closed meanwhile, so the order is kept for that round trip.
+  it("is kept across Open as project", async () => {
+    const root = mount(`${F}a.jpg`);
+    calls[0]!.resolve({ before: [], after: [`${F}b.jpg`], index: 1, total: 2, family: "visual" });
+    await flush();
+    root.querySelector("#vw-more").fire("click");
+    m.menu.find((i) => i.label === "Open as project")!.onSelect();
+    await flush();
+    expect(m.navigate).toHaveBeenCalledWith(
+      expect.objectContaining({ view: "editor", returnTo: `${F}a.jpg` }),
+    );
+    unmount();
+    expect(m.forgetSiblingOrder).not.toHaveBeenCalled();
   });
 });

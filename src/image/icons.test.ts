@@ -37,7 +37,7 @@ describe("imgIcon", () => {
   it("has a non-empty, distinct drawing for every locked name", () => {
     const locked: ImgIconName[] = [
       "select", "pen", "pencil", "marker", "eraser", "shapes", "ruler", "undo", "redo", "copy",
-      "eye", "eyeOff", "layers", "crop", "rotateLeft", "rotateRight", "flipH", "flipV", "fit",
+      "eye", "eyeOff", "layers", "crop", "canvas", "rotateLeft", "rotateRight", "flipH", "flipV", "fit",
       "drawing", "image", "text", "solid",
     ];
     expect(NAMES.sort()).toEqual([...locked].sort());

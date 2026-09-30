@@ -107,6 +107,10 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
   const test = async (name: string, fn: () => Promise<string> | string): Promise<void> => {
     results.push({ name, pass: false, detail: "…running" });
     await write(false);
+    // Every block starts with no toasts on screen: one an earlier block raised
+    // on purpose ("Still editing…", an export refusal) lives for seconds and
+    // would sit over whatever this block hit-tests next.
+    for (const t of Array.from(document.querySelectorAll(".toast"))) t.remove();
     try {
       const detail = await fn();
       results[results.length - 1] = { name, pass: true, detail };
@@ -3903,6 +3907,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     await (await import("./autotest-wave1")).runWave1Blocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-viewer")).runViewerBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-image")).runImageBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-home")).runHomeBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
   } catch (e) {
     results.push({ name: "setup", pass: false, detail: String(e) });
   }

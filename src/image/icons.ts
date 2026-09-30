@@ -21,6 +21,7 @@ export type ImgIconName =
   | "eyeOff"
   | "layers"
   | "crop"
+  | "canvas"
   | "rotateLeft"
   | "rotateRight"
   | "flipH"
@@ -52,14 +53,19 @@ export const IMG_ICON_PATHS: Readonly<Record<ImgIconName, string>> = {
     '<path d="M10.7 5.1A10 10 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-2.4 3.4"/><path d="M6.6 6.6C3.8 8.4 2 12 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/><path d="m2 2 20 20"/>',
   layers: '<path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5"/>',
   crop: '<path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/>',
+  // The whole picture as an artboard: a frame whose edges run past its
+  // corners. Deliberately NOT the crop glyph — the canvas controls crop,
+  // resize, turn and flip, and a crop icon read as "crop the selected layer".
+  canvas: '<path d="M3 7h18M3 17h18M7 3v18M17 3v18"/>',
   rotateLeft: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>',
   rotateRight: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
   flipH: '<path d="M12 3v18"/><path d="M8 7 3 17h5z"/><path d="m16 7 5 10h-5z"/>',
   flipV: '<path d="M3 12h18"/><path d="M7 8 17 3v5z"/><path d="m7 16 10 5v-5z"/>',
   fit: '<path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/><rect x="8" y="8" width="8" height="8" rx="1"/>',
   drawing: '<path d="M3 16c2-5 4-7 6-4s3 6 6 2 4-7 6-6"/>',
-  // The same picture as the Home "New image" icon (src/ui/icons.ts), so a
-  // photo layer and an image project read as one thing.
+  // The same picture as Home's 'Image project' choice (New project menu, Open
+  // as dialog; src/ui/icons.ts), so a photo layer and an image project read as
+  // one thing.
   image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 17-5-5-9 8"/>',
   text: '<path d="M4 7V5h16v2"/><path d="M12 5v14"/><path d="M9 19h6"/>',
   solid: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 14 14 4M4 20 20 4M10 20 20 10"/>',

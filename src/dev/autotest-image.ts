@@ -129,7 +129,10 @@ function describeEl(el: Element | null): string {
   if (!el) return "nothing";
   if (el.id) return `#${el.id}`;
   const cls = typeof el.className === "string" && el.className ? `.${el.className.split(/\s+/).join(".")}` : "";
-  return `${el.tagName.toLowerCase()}${cls}`;
+  // A toast in the way says which one, so a stray message can be traced.
+  const toast = el.closest(".toast");
+  const said = toast ? ` ("${(toast.textContent ?? "").trim().slice(0, 120)}")` : "";
+  return `${el.tagName.toLowerCase()}${cls}${said}`;
 }
 
 /** The element painted at the centre of `el`, and whether it is `el` (or inside it). */
@@ -933,6 +936,262 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
       }
     });
 
+    await test("image-canvas-vs-layer", async () => {
+      // Canvas controls and layer controls say which is which. The tool row's
+      // button reads "Canvas" and wears no crop glyph (the owner read the old
+      // "Image" + crop icon as "crop the layer I selected"); with nothing
+      // selected the inspector is headed "Canvas" and its Crop canvas opens
+      // the canvas crop, whose bar says so; the layer inspector's own Crop
+      // button opens the on-canvas LAYER crop (the double-click mode), whose
+      // bar says "Crop layer"; and every slider row shows its value once, in a
+      // number field wide enough for the row's widest number.
+      const t0 = performance.now();
+      const paths: string[] = [];
+      const cancelCrops = (): void => {
+        for (const b of Array.from(document.querySelectorAll<HTMLButtonElement>(".imged-cropbar button"))) {
+          if (b.textContent?.trim() === "Cancel" && rendered(b)) b.click();
+        }
+      };
+      try {
+        needFixtures();
+        const info = await probe(fx(GRID));
+        const dev = await mountImage(createPhotoImageProject("Autotest image canvas", info), "Autotest image canvas", paths);
+        const photo = await photoReady(dev);
+        const { IMG_ICON_PATHS } = await import("../image/icons");
+
+        // The tool row.
+        const menuBtn = $<HTMLButtonElement>("#imged-menu");
+        assert(rendered(menuBtn), "#imged-menu is not rendered");
+        const label = menuBtn!.textContent?.trim() ?? "";
+        assert(label === "Canvas", `the tool row's canvas button reads "${label}", not "Canvas"`);
+        const hitBtn = hitsItself(menuBtn!);
+        assert(hitBtn.ok, `the Canvas button's centre hits ${hitBtn.hit}`);
+        const cropDs = new Set(Array.from(IMG_ICON_PATHS.crop.matchAll(/ d="([^"]+)"/g), (m) => m[1]!));
+        const btnDs = Array.from(menuBtn!.querySelectorAll("svg path"), (p) => p.getAttribute("d") ?? "");
+        assert(btnDs.length > 0, "the Canvas button has no icon");
+        assert(!btnDs.some((d) => cropDs.has(d)), "the Canvas button still wears the crop icon");
+
+        // Nothing selected: the Canvas panel, and its canvas crop.
+        dev.selection.set(null);
+        const head = await until(
+          () => {
+            const h = $("#imged-inspector .insp-header__name");
+            return rendered(h) && h.textContent?.trim() === "Canvas" ? h : null;
+          },
+          2_000,
+          () => `the inspector headed "Canvas" with nothing selected (it reads "${text("#imged-inspector .insp-header__name")}")`,
+        );
+        assert(rendered($("#imged-inspector .imged-insp-hint")), "the Canvas panel's hint is not rendered");
+        const canvasCrop = Array.from(document.querySelectorAll<HTMLButtonElement>("#imged-inspector button")).find(
+          (b) => b.textContent?.trim() === "Crop canvas",
+        );
+        assert(rendered(canvasCrop ?? null), "the Canvas panel has no rendered Crop canvas button");
+        canvasCrop!.click();
+        assert(dev.mode.get() === "crop-image", `Crop canvas left the stage in mode ${dev.mode.get()}, not crop-image`);
+        const canvasLabel = $(".imged-crop .imged-cropbar__label");
+        assert(rendered(canvasLabel) && canvasLabel.textContent === "Crop canvas", `the canvas crop's bar label is ${describeEl(canvasLabel)} "${canvasLabel?.textContent ?? ""}"`);
+        cancelCrops();
+        await until(() => dev.mode.get() === "idle", 1_000, () => `the canvas crop to close (mode ${dev.mode.get()})`);
+
+        // The photo selected: one value per slider row.
+        dev.selection.set(photo.trackId);
+        const fieldFor = (name: string): HTMLElement | null =>
+          Array.from(document.querySelectorAll<HTMLElement>("#imged-inspector .insp-field")).find(
+            (f) => f.querySelector(":scope > label")?.textContent?.trim() === name,
+          ) ?? null;
+        await until(() => fieldFor("Opacity") && fieldFor("Hue"), 2_000, () => "the photo's Opacity and Adjust rows in the inspector");
+        assert(head.isConnected === false, "the Canvas header is still in the inspector with the photo selected");
+        const probeCtx = new OffscreenCanvas(1, 1).getContext("2d")!;
+        const rows = ["Opacity", "Exposure", "Brightness", "Contrast", "Highlights", "Shadows", "Saturation", "Warmth", "Tint", "Hue"];
+        let tightest = Infinity;
+        for (const name of rows) {
+          const f = fieldFor(name);
+          assert(f !== null, `no "${name}" row in the inspector`);
+          const vals = Array.from(f!.querySelectorAll(".insp-slider__value, .insp-slider input[type=number]")).filter(rendered);
+          assert(vals.length === 1, `the ${name} row shows ${vals.length} value elements (${vals.map(describeEl).join(", ")}), not exactly one`);
+          const num = vals[0] as HTMLInputElement;
+          assert(num instanceof HTMLInputElement && num.type === "number", `the ${name} row's one value is ${describeEl(num)}, not its number field`);
+          const cs = getComputedStyle(num);
+          probeCtx.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+          const room = num.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+          const widest = name === "Hue" ? ["-180", "180"] : name === "Opacity" ? ["100"] : ["-100", "100"];
+          const was = num.value;
+          try {
+            for (const s of widest) {
+              const need = probeCtx.measureText(s).width;
+              assert(need <= room, `the ${name} field has ${room.toFixed(1)} px for its text; "${s}" needs ${need.toFixed(1)} px`);
+              tightest = Math.min(tightest, room - need);
+              // Shown, not only measured: the field must not scroll it.
+              num.value = s;
+              assert(num.scrollWidth <= num.clientWidth, `the ${name} field scrolls "${s}" (scrollWidth ${num.scrollWidth} > ${num.clientWidth})`);
+            }
+          } finally {
+            num.value = was;
+          }
+        }
+
+        // The layer's own Crop button opens the on-canvas layer crop.
+        const cropBtn = $<HTMLButtonElement>('#imged-inspector button[aria-label="Crop layer"]');
+        assert(rendered(cropBtn), "the layer inspector has no rendered Crop button");
+        const reset = $<HTMLButtonElement>('#imged-inspector button[aria-label="Reset crop"]');
+        assert(rendered(reset) && reset.disabled, "the crop's Reset is missing or enabled on an uncropped photo");
+        const before = dev.session.project;
+        // From a DRAWING tool: the select overlay is display:none there, and a
+        // crop bar measured while hidden was parked off the stage.
+        dev.tools.set({ ...dev.tools.get(), tool: "pen" });
+        await sleep(0);
+        cropBtn!.click();
+        assert(dev.mode.get() === "crop-layer", `the Crop button left the stage in mode ${dev.mode.get()}, not crop-layer`);
+        assert(dev.tools.get().tool === "select", `the Crop button left the ${dev.tools.get().tool} tool on, not select`);
+        const layerBar = await until(
+          () => Array.from(document.querySelectorAll<HTMLElement>(".imged-select__cropbar")).find(rendered),
+          1_000,
+          () => "the layer crop's bar to render",
+        );
+        const layerLabel = layerBar.querySelector(".imged-cropbar__label");
+        assert(rendered(layerLabel) && layerLabel.textContent === "Crop layer", `the layer crop's bar label reads "${layerLabel?.textContent ?? ""}"`);
+        const barHit = hitsItself(layerBar);
+        assert(barHit.ok, `the layer crop's bar centre hits ${barHit.hit}`);
+        const stageBox = $("#imged-stage")!.getBoundingClientRect();
+        const barBox = layerBar.getBoundingClientRect();
+        assert(
+          barBox.left >= stageBox.left - 0.5 && barBox.right <= stageBox.right + 0.5 && barBox.top >= stageBox.top - 0.5 && barBox.bottom <= stageBox.bottom + 0.5,
+          `the layer crop's bar (${barBox.left.toFixed(0)},${barBox.top.toFixed(0)} ${barBox.width.toFixed(0)}×${barBox.height.toFixed(0)}) is not inside the stage (${stageBox.left.toFixed(0)},${stageBox.top.toFixed(0)} ${stageBox.width.toFixed(0)}×${stageBox.height.toFixed(0)})`,
+        );
+        cancelCrops();
+        await until(() => dev.mode.get() === "idle", 1_000, () => `the layer crop to close (mode ${dev.mode.get()})`);
+        assert(dev.session.project === before, "cancelling the untouched layer crop changed the project");
+        return `tool row "Canvas" (no crop glyph); nothing selected → "Canvas" panel, Crop canvas → crop-image with a "Crop canvas" bar; ${rows.length} slider rows × 1 value each, ≥${tightest.toFixed(1)} px spare for the widest number; Crop → crop-layer with a "Crop layer" bar — ${ms(t0)}`;
+      } finally {
+        cancelCrops();
+        await leave(paths);
+      }
+    });
+
+    await test("image-toolrow-narrow", async () => {
+      // The tool row at the narrowest window (960 px: the allowed minimum, and
+      // a Snap half-screen on a 1080p display) leaves the editor's main column
+      // 420 px (960 − 260 Layers − 280 inspector). Both groups need about
+      // 590 px with the Pen on, and the pixel eraser's hint needs more: the
+      // row must WRAP, so every control is still the one painted at its own
+      // centre and nothing slides under the inspector. Also: the Canvas button
+      // activated from the keyboard (a click with detail 0) opens its menu on
+      // the first row, and a pointer click does not.
+      const t0 = performance.now();
+      const paths: string[] = [];
+      let main: HTMLElement | null = null;
+      try {
+        const dev = await mountImage(
+          createBlankImageProject("Autotest image toolrow", 641, 361, "#ffffff"),
+          "Autotest image toolrow",
+          paths,
+        );
+        const menuBtn = $<HTMLButtonElement>("#imged-menu");
+        assert(rendered(menuBtn), "#imged-menu is not rendered");
+
+        // Keyboard vs pointer activation of the Canvas button.
+        const menuRows = (): HTMLElement[] =>
+          Array.from(document.querySelectorAll<HTMLElement>(".ctx-menu .ctx-menu__item")).filter(rendered);
+        menuBtn!.click();
+        await until(() => menuRows().length > 0, 1_000, () => "the Canvas menu to open from a keyboard-style click");
+        const first = menuRows()[0]!;
+        assert(
+          document.activeElement === first && first.textContent?.trim() === "Crop canvas",
+          `a keyboard open of the Canvas menu left focus on ${describeEl(document.activeElement)}, not its first row "Crop canvas"`,
+        );
+        closeMenu();
+        menuBtn!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 1 }));
+        await until(() => menuRows().length > 0, 1_000, () => "the Canvas menu to open from a pointer click");
+        const menuHost = $(".ctx-menu");
+        assert(
+          !(document.activeElement instanceof Node && menuHost?.contains(document.activeElement)),
+          `a pointer open of the Canvas menu focused ${describeEl(document.activeElement)}`,
+        );
+        closeMenu();
+
+        // Undo and Redo both live: a disabled .btn has pointer-events none,
+        // so a greyed one could never be the element hit at its centre. Two
+        // canvas turns, then one Undo through the button itself.
+        const { rotateCanvas } = await import("../image/image-menu");
+        rotateCanvas(dev.ctx, 90);
+        rotateCanvas(dev.ctx, 90);
+        // The buttons follow the session on a microtask: a click before that
+        // lands on a still-disabled Undo and does nothing.
+        await until(() => !$<HTMLButtonElement>("#imged-undo")!.disabled, 1_000, () => "Undo to enable after two canvas turns");
+        $<HTMLButtonElement>("#imged-undo")!.click();
+        await until(
+          () => !$<HTMLButtonElement>("#imged-undo")!.disabled && !$<HTMLButtonElement>("#imged-redo")!.disabled,
+          1_000,
+          () => `Undo and Redo both enabled (undo ${$<HTMLButtonElement>("#imged-undo")!.disabled ? "off" : "on"}, redo ${$<HTMLButtonElement>("#imged-redo")!.disabled ? "off" : "on"})`,
+        );
+
+        // Narrow the column to what a 960 px window leaves it.
+        main = $(".imged .editor__main");
+        const inspector = $("#imged-inspector");
+        assert(rendered(main) && rendered(inspector), "the editor's main column or inspector is not rendered");
+        main!.style.flex = "0 0 420px";
+        await frames(2);
+        const colW = main!.getBoundingClientRect().width;
+        assert(Math.abs(colW - 420) <= 1, `the main column is ${colW.toFixed(1)} px wide, not the 420 px it was set to`);
+
+        const check = async (what: string): Promise<string> => {
+          await frames(2);
+          const col = main!.getBoundingClientRect();
+          const insLeft = inspector!.getBoundingClientRect().left;
+          const tools = Array.from(
+            document.querySelectorAll<HTMLElement>("#imged-tools button, #imged-tools select"),
+          ).filter(rendered);
+          assert(tools.length > 0, `${what}: no rendered tool-row controls`);
+          const named = [$<HTMLElement>("#imged-undo"), menuBtn, tools[tools.length - 1]!];
+          const all = [
+            ...tools,
+            ...Array.from(document.querySelectorAll<HTMLElement>("#imged-viewctl button")).filter(rendered),
+          ];
+          for (const b of new Set([...named, ...all])) {
+            assert(rendered(b), `${what}: ${describeEl(b)} is not rendered`);
+            const hit = hitsItself(b!);
+            assert(hit.ok, `${what}: the centre of ${describeEl(b)} "${b!.textContent?.trim() ?? ""}" hits ${hit.hit}`);
+            const r = b!.getBoundingClientRect();
+            assert(
+              r.left >= col.left - 0.5 && r.right <= col.right + 0.5,
+              `${what}: ${describeEl(b)} spans ${r.left.toFixed(0)}-${r.right.toFixed(0)}, outside the column ${col.left.toFixed(0)}-${col.right.toFixed(0)}`,
+            );
+          }
+          const menuRight = menuBtn!.getBoundingClientRect().right;
+          assert(menuRight <= insLeft + 0.5, `${what}: the Canvas button ends at ${menuRight.toFixed(0)}, under the inspector (from ${insLeft.toFixed(0)})`);
+          // The narrow width is really exercised: the view controls wrapped
+          // below the tools rather than fitting beside them.
+          const toolsTop = $("#imged-tools")!.getBoundingClientRect().top;
+          const viewTop = $("#imged-viewctl")!.getBoundingClientRect().top;
+          assert(viewTop > toolsTop + 4, `${what}: the view controls (top ${viewTop.toFixed(0)}) did not wrap below the tools (top ${toolsTop.toFixed(0)})`);
+          return `${what} ${all.length} controls`;
+        };
+
+        dev.tools.set({ ...dev.tools.get(), tool: "pen" });
+        const pen = await check("Pen");
+
+        // The widest row: the pixel eraser with no drawing layer to cut shows
+        // its hint.
+        dev.tools.set({ ...dev.tools.get(), tool: "eraser", eraserMode: "pixel" });
+        const hint = await until(
+          () => Array.from(document.querySelectorAll<HTMLElement>("#imged-tools .imged-hint")).find(rendered),
+          1_000,
+          () => "the pixel eraser's hint to show on a project with no drawing",
+        );
+        const eraser = await check("pixel eraser");
+        const hr = hint.getBoundingClientRect();
+        const col = main!.getBoundingClientRect();
+        assert(hr.right <= col.right + 0.5, `the eraser hint ends at ${hr.right.toFixed(0)}, past the column (${col.right.toFixed(0)})`);
+        const hintHit = hitsItself(hint);
+        assert(hintHit.ok, `the eraser hint's centre hits ${hintHit.hit}`);
+        return `a 420 px column: ${pen}, ${eraser} each hit at their centres inside it, view controls on a second line; Canvas menu opens on its first row from the keyboard only — ${ms(t0)}`;
+      } finally {
+        if (main) main.style.flex = "";
+        closeMenu();
+        await leave(paths);
+      }
+    });
+
     await test("image-export-roundtrip", async () => {
       // Through the export dialog: a PNG at 100% and a JPEG at 50% are written
       // and read back (size by ffprobe, pixels by decode), the run holds the
@@ -1512,10 +1771,18 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
         const leaked = backfilled.filter((p) => imagePaths.has(norm(p)));
         assert(leaked.length === 0, `refresh_recent_thumbs was asked about image project(s): ${leaked.map(baseName).join(", ")}`);
 
-        const newBtn = $<HTMLButtonElement>("#btn-new-image");
-        assert(rendered(newBtn), "#btn-new-image is not rendered");
+        // New project → Image project (the separate New image button is gone).
+        assert($("#btn-new-image") === null, "#btn-new-image is still on Home");
+        const newBtn = $<HTMLButtonElement>("#btn-new");
+        assert(rendered(newBtn), "#btn-new is not rendered");
         newBtn!.click();
-        const body = await until(() => $(".nimg-modal .modal__body"), 3_000, () => "the New image dialog");
+        const imageRow = await until(
+          () => Array.from(document.querySelectorAll<HTMLButtonElement>(".ctx-menu__item")).find((b) => rendered(b) && b.textContent?.includes("Image project")) ?? null,
+          2_000,
+          () => "the New project menu's Image project row",
+        );
+        imageRow.click();
+        const body = await until(() => $(".nimg-modal .modal__body"), 3_000, () => "the New image project dialog");
         assert(rendered(body), "the New image dialog's body is not rendered");
         const overflow = `${body.scrollWidth} > ${body.clientWidth}`;
         assert(body.scrollWidth <= body.clientWidth, `the New image dialog overflows sideways (scrollWidth ${overflow})`);

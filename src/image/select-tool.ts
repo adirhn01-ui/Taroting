@@ -34,6 +34,7 @@ import { fontString } from "../editor/media/generators";
 import type { ImageEditorCtx } from "./context";
 import { IMAGE_SCALE_GUARD, canvasToLayer, hitLayer, layerCorners, layerToCanvas } from "./geom";
 import { findLayer, layersOf, setLayerTransform, type Layer } from "./layers";
+import { strokeHit } from "./ink/eraser";
 import { strokeBounds } from "./ink/paint";
 import { sameEdit } from "./same-edit";
 
@@ -56,6 +57,8 @@ export interface Box {
 
 /** Centre-snap catch radius in SCREEN (CSS) px — the video overlay's number. */
 export const SNAP_SCREEN_PX = 8;
+/** How near its ink (SCREEN css px) a press picks a drawing layer. */
+export const INK_HIT_CSS_PX = 6;
 /** Drag dead zone in client px (Manhattan), the video overlay's number. */
 export const MOVE_THRESHOLD_PX = 4;
 /** Smallest crop, in source px. The video editor's 8 px floor (CROP_MIN) is a
@@ -69,6 +72,11 @@ const clamp = (v: number, lo: number, hi: number): number => Math.min(Math.max(v
  *  distance at every zoom. */
 export function snapThreshold(zoom: number, dpr: number): number {
   return (SNAP_SCREEN_PX * dpr) / zoom;
+}
+
+/** INK_HIT_CSS_PX in CANVAS px at this zoom, the same conversion. */
+export function inkHitRadius(zoom: number, dpr: number): number {
+  return (INK_HIT_CSS_PX * (dpr > 0 ? dpr : 1)) / (zoom > 0 ? zoom : 1);
 }
 
 export function applyAffine(m: Affine, x: number, y: number): Vec2 {
@@ -311,8 +319,11 @@ function aabb(q: Vec2[]): Box {
 }
 
 /** Oriented hit test of one layer. A hidden layer is never hit. A transparent
- *  corner of a PNG still counts (the box is the layer, not its alpha). */
-function hits(l: Layer, W: number, H: number, px: number, py: number): boolean {
+ *  corner of a PNG still counts (the box is the layer, not its alpha). A
+ *  drawing is hit only within `r` canvas px of its ink (the stroke eraser's
+ *  own test), so a photo under an annotation's box stays reachable; the box
+ *  is only the cheap early reject. Runs once per press, never per move. */
+function hits(l: Layer, W: number, H: number, px: number, py: number, r: number): boolean {
   if (l.hidden) return false;
   const d = srcDims(l);
   if (!d) return false;
@@ -321,16 +332,30 @@ function hits(l: Layer, W: number, H: number, px: number, py: number): boolean {
     const b = drawingBounds(g.chunks);
     if (!b) return false;
     const p = canvasToLayer(l.transform, d.w, d.h, W, H, px, py);
-    return p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h;
+    const rl = r / (l.transform.scale > 0 ? l.transform.scale : 1);
+    if (p.x < b.x - rl || p.x > b.x + b.w + rl || p.y < b.y - rl || p.y > b.y + b.h + rl) return false;
+    for (const chunk of g.chunks) for (const s of chunk) if (strokeHit(s, p.x, p.y, p.x, p.y, rl)) return true;
+    return false;
   }
   return hitLayer(l.transform, d.w, d.h, W, H, px, py);
 }
 
 /** Topmost layer under a canvas point. */
-function hitTest(p: ProjectFile, px: number, py: number): string | null {
+function hitTest(p: ProjectFile, px: number, py: number, r: number): string | null {
   const { width: W, height: H } = p.timeline;
-  for (const l of layersOf(p)) if (hits(l, W, H, px, py)) return l.trackId;
+  for (const l of layersOf(p)) if (hits(l, W, H, px, py, r)) return l.trackId;
   return null;
+}
+
+/** What a press at a canvas point grabs. On the canvas: the topmost layer
+ *  there. Outside it (the grey pasteboard, where the preview is clipped away)
+ *  only the layer already selected, so its visible box still moves it;
+ *  anything else is an empty press, never content the user cannot see. */
+function pressTarget(p: ProjectFile, sel: string | null, px: number, py: number, r: number): string | null {
+  const { width: W, height: H } = p.timeline;
+  if (px >= 0 && py >= 0 && px <= W && py <= H) return hitTest(p, px, py, r);
+  const l = sel ? findLayer(p, sel) : undefined;
+  return l && hits(l, W, H, px, py, r) ? l.trackId : null;
 }
 
 const croppable = (l: Layer): boolean => l.kind === "photo" || l.kind === "text" || l.kind === "solid";
@@ -359,6 +384,12 @@ export function mountSelectTool(ctx: ImageEditorCtx): {
   /** Cancel an open per-layer crop now, synchronously (the window is closing:
    *  its save must not write a crop the user never applied). */
   revertCrop(): void;
+  /** Enter the on-canvas crop of `trackId` — the inspector's Crop button, the
+   *  same mode a double-click on the layer opens. Selects the layer and takes
+   *  up the select tool first (the crop chrome is the select tool's). False
+   *  when the layer cannot be cropped now: hidden, a drawing, gone, or the
+   *  stage already in a mode. */
+  cropLayer(trackId: string): boolean;
   dispose(): void;
 } {
   const { session, selection, view, tools, mode, stage, res } = ctx;
@@ -388,6 +419,10 @@ export function mountSelectTool(ctx: ImageEditorCtx): {
   const guideH = div("stage-overlay__guide stage-overlay__guide--h");
   // The canvas crop's bar (`imged-cropbar`) — one look for both crops.
   const bar = div("imged-cropbar imged-select__cropbar");
+  // Says what is being cropped: the canvas crop's bar says "Crop canvas".
+  const barLabel = document.createElement("span");
+  barLabel.className = "imged-cropbar__label";
+  barLabel.textContent = "Crop layer";
   const cancelBtn = document.createElement("button");
   cancelBtn.type = "button";
   cancelBtn.className = "btn btn--sm";
@@ -396,7 +431,7 @@ export function mountSelectTool(ctx: ImageEditorCtx): {
   applyBtn.type = "button";
   applyBtn.className = "btn btn--primary btn--sm";
   applyBtn.textContent = "Apply";
-  bar.append(cancelBtn, applyBtn);
+  bar.append(barLabel, cancelBtn, applyBtn);
   // z-order inside the overlay: ghost < ghost hit box < window < selbox < guides < bar
   overlay.append(ghostCanvas, ghostBox, win, selBox, guideV, guideH, bar);
   stage.appendChild(overlay);
@@ -602,7 +637,8 @@ export function mountSelectTool(ctx: ImageEditorCtx): {
       kind = "scale";
       e.preventDefault();
     } else {
-      trackId = hitTest(p, pt.x, pt.y);
+      const vs = view.store.get();
+      trackId = pressTarget(p, selection.get(), pt.x, pt.y, inkHitRadius(vs.zoom, vs.dpr));
       if (trackId !== selection.get()) selection.set(trackId);
       kind = "move";
     }
@@ -868,8 +904,9 @@ export function mountSelectTool(ctx: ImageEditorCtx): {
     paintGhost(cc.l, cc.m, cc.srcW, cc.srcH, sc);
   }
 
-  /** The full source at 40 %, drawn with the layer's own affine so it lines up
-   *  with the cropped layer the renderer draws underneath. Redrawn only when
+  /** The full source at 40 %, drawn with the layer's own affine, so the crop
+   *  window over it frames exactly the pixels Apply keeps (the composite skips
+   *  this layer while it is being cropped — see skipNow in the shell). Redrawn only when
    *  the view or the source→canvas mapping changes — a window-handle drag
    *  keeps the source pinned, so it redraws nothing while it moves. */
   function paintGhost(l: Layer, m: Affine, srcW: number, srcH: number, sc: Screen): void {
@@ -1007,7 +1044,8 @@ export function mountSelectTool(ctx: ImageEditorCtx): {
     if (disposed || crop || tools.get().tool !== "select" || mode.get() !== "idle") return;
     if (!accepts(e.target) || (e.target as HTMLElement).dataset?.handle) return;
     const pt = view.clientToCanvas(e.clientX, e.clientY);
-    const id = hitTest(session.project, pt.x, pt.y);
+    const vs = view.store.get();
+    const id = pressTarget(session.project, selection.get(), pt.x, pt.y, inkHitRadius(vs.zoom, vs.dpr));
     if (!id) return;
     const l = findLayer(session.project, id);
     if (!l || !croppable(l)) return;
@@ -1152,6 +1190,22 @@ export function mountSelectTool(ctx: ImageEditorCtx): {
   return {
     revertCrop(): void {
       if (!disposed) exitCrop("revert");
+    },
+    cropLayer(trackId: string): boolean {
+      if (disposed || crop || gesture || mode.get() !== "idle") return false;
+      const l = findLayer(session.project, trackId);
+      if (!l || l.hidden || !croppable(l) || !srcDims(l)) return false;
+      // Store notifications are batched to a microtask and carry only the
+      // final state, so neither switch below can reach the subscriptions that
+      // leave a crop (another layer, another tool) after enterCrop has begun.
+      if (tools.get().tool !== "select") tools.update((s) => ({ ...s, tool: "select" }));
+      if (selection.get() !== trackId) selection.set(trackId);
+      // Show the overlay NOW: under a drawing tool it is display:none, and the
+      // tool switch above only reaches paint() on a microtask — enterCrop
+      // would measure the crop bar at 0×0 and park it off the stage.
+      paint();
+      enterCrop(trackId);
+      return crop !== null;
     },
     dispose(): void {
       if (disposed) return;

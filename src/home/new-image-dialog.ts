@@ -1,7 +1,8 @@
-// Home's "New image" dialog: a blank canvas (a preset size or a custom one,
-// and a background) or a photo, created as an image project and opened.
+// Home's "New image project" dialog (New project → Image project): a blank
+// canvas (a preset size or a custom one, and a background) or a photo, created
+// as an image project and opened.
 //
-// Its own lazy chunk (Home imports it on the click), and it must NEVER import
+// Its own lazy chunk (Home imports it on that choice), and it must NEVER import
 // anything under src/image/: that would drag the image editor in with it.
 // Project creation goes through core/image-project.ts. The rows, segmented
 // control and number fields are the video export dialog's own classes, so the
@@ -167,9 +168,9 @@ export function openNewImageDialog(opts: {
   const backdrop = document.createElement("div");
   backdrop.className = "modal-backdrop nimg-backdrop";
   backdrop.innerHTML = `
-    <div class="modal nimg-modal" role="dialog" aria-modal="true" aria-label="New image">
+    <div class="modal nimg-modal" role="dialog" aria-modal="true" aria-label="New image project">
       <div class="modal__header">
-        <span>New image</span>
+        <span>New image project</span>
         <button class="btn btn--ghost btn--icon btn--sm" data-act="cancel" title="Close" aria-label="Close">${icon("x", 14)}</button>
       </div>
       <div class="modal__body">
@@ -409,7 +410,7 @@ export function openNewImageDialog(opts: {
         },
       });
     } catch (e) {
-      if (!gone()) toast.error("Couldn't open the color picker.", { detail: describeError(e), op: "New image" });
+      if (!gone()) toast.error("Couldn't open the color picker.", { detail: describeError(e), op: "New image project" });
     } finally {
       pickerLoading = false;
     }

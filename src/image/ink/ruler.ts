@@ -23,6 +23,8 @@ export const RULER_THICKNESS_CSS = 64;
 export const EDGE_CATCH_CSS = 24;
 export const SNAP_STEP_DEG = 15;
 export const SNAP_WITHIN_DEG = 1.5;
+/** The ruler's tooltip: a drag only moves it, so it says how a mouse turns it. */
+const RULER_TITLE = "Drag to move · scroll to rotate (Shift: 15°)";
 /** Minor ticks are 10 canvas px apart — thinned (×5, ×2, …) until they are at
  *  least this far apart on screen. */
 const TICK_CANVAS_PX = 10;
@@ -310,6 +312,7 @@ export function mountRuler(ctx: ImageEditorCtx, onShow?: (el: HTMLElement | null
     el.setAttribute("aria-label", "Ruler angle");
     el.setAttribute("aria-valuemin", "-179");
     el.setAttribute("aria-valuemax", "180");
+    el.title = RULER_TITLE;
     el.style.height = `${RULER_THICKNESS_CSS}px`;
     readout = document.createElement("span");
     readout.className = "imged-ruler__readout mono";

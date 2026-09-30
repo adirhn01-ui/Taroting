@@ -54,7 +54,7 @@ import { mountTheater } from "./preview/theater";
 import { collectCandidates, snapTime } from "./timeline/snap";
 import { laneLabels, laneLayout } from "./timeline/render";
 import { createLaneAutoScroll, type LaneAutoScroller } from "./timeline/interactions";
-import { trapTab } from "../ui/focus";
+import { focusFirst, trapTab } from "../ui/focus";
 import { createTempExits, createTempLeaveGate } from "../ui/temp-project";
 import { PREVIEW_MIN_H, clampPanelHeight, maxPanelHeight } from "./timeline/panel-size";
 import { TimelineController } from "./timeline/timeline";
@@ -63,6 +63,73 @@ import { TimelineController } from "./timeline/timeline";
  *  editor (a separate chunk) shares the one rule; re-exported for the callers
  *  and tests that know it from here. */
 export { exitDest };
+
+/**
+ * Why a file of `kind` can't replace the media of a clip on a `lane` layer, or
+ * null when it can. The rule every other placement path already applies (the
+ * bin drop's kindOk, placeAtPlayhead's isVisualMedia routing): sound goes on
+ * audio layers, pictures and video on video layers. A song on a video layer
+ * would preview as an empty frame and fail the export on its missing video
+ * stream; a picture on an audio layer would play silent.
+ */
+export function replaceMediaRefusal(lane: Track["kind"], kind: MediaInfo["kind"]): string | null {
+  if ((kind === "audio") === (lane === "audio")) return null;
+  return lane === "audio" ? "Choose a sound file for an audio layer." : "Choose a video or picture for a video layer.";
+}
+
+/**
+ * Confirm for deleting a non-empty layer. Reuses the app modal pattern +
+ * trapTab (as in home.ts / generators.ts). Returns its closer so the editor's
+ * dispose() takes it down with the screen that opened it.
+ *
+ * The action is undoable (Ctrl+Z), so the button is the primary one, not
+ * danger-red. Focus opens on Cancel and Enter activates whichever button has
+ * focus — there is no document-wide Enter-means-delete.
+ */
+export function confirmDeleteLayer(label: string, n: number, onConfirm: () => void): () => void {
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  backdrop.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true" aria-label="Delete layer ${escapeHtml(label)}">
+        <div class="modal__header">Delete layer ${escapeHtml(label)}</div>
+        <div class="modal__body">
+          <div class="modal__text">Delete layer ${escapeHtml(label)} and its ${n === 1 ? "clip" : `${n} clips`}? This can be undone with Ctrl+Z.</div>
+        </div>
+        <div class="modal__footer">
+          <button class="btn" data-act="cancel">Cancel</button>
+          <button class="btn btn--primary" data-act="confirm">Delete</button>
+        </div>
+      </div>`;
+  document.body.appendChild(backdrop);
+
+  const releaseTrap = trapTab(backdrop);
+  let closed = false;
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    releaseTrap();
+    document.removeEventListener("keydown", onKey, true);
+    backdrop.remove();
+  };
+  const confirm = (): void => {
+    close();
+    onConfirm();
+  };
+  function onKey(e: KeyboardEvent): void {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+    }
+  }
+  document.addEventListener("keydown", onKey, true);
+  backdrop.addEventListener("pointerdown", (e) => {
+    if (e.target === backdrop) close();
+  });
+  backdrop.querySelector('[data-act="cancel"]')!.addEventListener("click", close);
+  backdrop.querySelector('[data-act="confirm"]')!.addEventListener("click", confirm);
+  focusFirst(backdrop, '[data-act="cancel"]');
+  return close;
+}
 
 /**
  * Mount the editor for `route` into `root`.
@@ -459,6 +526,12 @@ export async function mountEditor(
       toast.error(`Couldn't read ${fileStem(path)}: ${describeError(e)}`);
       return;
     }
+    const lane = findClip(session.project, clip.id)?.track.kind;
+    const refusal = lane ? replaceMediaRefusal(lane, info.kind) : null;
+    if (refusal) {
+      toast.error(refusal);
+      return;
+    }
     commit((p) => {
       const added = addMedia(p, info);
       return updateClip(added.project, clip.id, (c) => ({
@@ -504,7 +577,9 @@ export async function mountEditor(
 
   // Right-click on a lane (no clip hit). One item "Delete layer VN" — disabled
   // for the sole video layer; empty layers delete instantly, non-empty ones ask
-  // to confirm first (undoable either way).
+  // to confirm first (undoable either way). The confirm lives on document.body,
+  // so dispose() closes it with the editor.
+  let closeDeleteLayer: () => void = () => {};
   function openLaneMenu(track: Track, clientX: number, clientY: number): void {
     const label = laneLabelOf(track);
     const isSoleVideo = track.kind === "video" && videoTracks(session.project).length < 2;
@@ -521,60 +596,11 @@ export async function mountEditor(
           if (n === 0) {
             deleteLayer(track.id, false);
           } else {
-            confirmDeleteLayer(label, n, () => deleteLayer(track.id, true));
+            closeDeleteLayer = confirmDeleteLayer(label, n, () => deleteLayer(track.id, true));
           }
         },
       },
     ]);
-  }
-
-  // Destructive confirm for deleting a non-empty layer. Reuses the app modal
-  // pattern + trapTab (as in home.ts / generators.ts).
-  function confirmDeleteLayer(label: string, n: number, onConfirm: () => void): void {
-    const backdrop = document.createElement("div");
-    backdrop.className = "modal-backdrop";
-    backdrop.innerHTML = `
-      <div class="modal" role="dialog" aria-modal="true" aria-label="Delete layer ${escapeHtml(label)}">
-        <div class="modal__header">Delete layer ${escapeHtml(label)}</div>
-        <div class="modal__body">
-          <div class="modal__text">Delete layer ${escapeHtml(label)} and its ${n === 1 ? "clip" : `${n} clips`}? This can be undone with Ctrl+Z.</div>
-        </div>
-        <div class="modal__footer">
-          <button class="btn" data-act="cancel">Cancel</button>
-          <button class="btn btn--danger" data-act="confirm">Delete</button>
-        </div>
-      </div>`;
-    document.body.appendChild(backdrop);
-
-    const releaseTrap = trapTab(backdrop);
-    let closed = false;
-    const close = (): void => {
-      if (closed) return;
-      closed = true;
-      releaseTrap();
-      document.removeEventListener("keydown", onKey, true);
-      backdrop.remove();
-    };
-    const confirm = (): void => {
-      close();
-      onConfirm();
-    };
-    function onKey(e: KeyboardEvent): void {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        close();
-      } else if (e.key === "Enter") {
-        e.preventDefault();
-        confirm();
-      }
-    }
-    document.addEventListener("keydown", onKey, true);
-    backdrop.addEventListener("pointerdown", (e) => {
-      if (e.target === backdrop) close();
-    });
-    backdrop.querySelector('[data-act="cancel"]')!.addEventListener("click", close);
-    backdrop.querySelector('[data-act="confirm"]')!.addEventListener("click", confirm);
-    requestAnimationFrame(() => backdrop.querySelector<HTMLButtonElement>('[data-act="confirm"]')!.focus());
   }
 
   /* ---------------- transport ---------------- */
@@ -1396,7 +1422,13 @@ export async function mountEditor(
 
   $("#ed-home").addEventListener("click", () => goHome());
   $("#ed-settings").addEventListener("click", () => goSettings());
-  $("#ed-export").addEventListener("click", () => openExportDialog({ session }));
+  // The export dialog lives on document.body, so dispose() closes it (a no-op
+  // while an export runs — the one state the leave block refuses anyway).
+  let closeExport: () => void = () => {};
+  const openExport = (): void => {
+    closeExport = openExportDialog({ session });
+  };
+  $("#ed-export").addEventListener("click", openExport);
   $("#ed-import").addEventListener("click", () => {
     void pickMediaFiles().then((files) => {
       if (files.length) void importPaths(files);
@@ -1496,14 +1528,14 @@ export async function mountEditor(
   //
   // A predicate, not detach()/attach(): dialogs are opened from files this
   // module doesn't own (export, generators, relink, inspector) and none of them
-  // expose a close callback to re-attach on, so an attach/detach pair would need
-  // a new seam in each — and would silently regress the moment someone adds a
-  // dialog. `.modal-backdrop` is the app-wide modal marker (every dialog in the
+  // report when they close (the closers some return only take them down, for
+  // dispose), so an attach/detach pair would need a new seam in each — and
+  // would silently regress the moment someone adds a dialog. `.modal-backdrop` is the app-wide modal marker (every dialog in the
   // tree builds one) and home.ts already guards its Esc handler exactly this
   // way. Cost is one querySelector per BOUND chord press, i.e. human-rate.
   // Every dialog in the app builds a `.modal-backdrop`, so this covers current
-  // and future modals with no per-dialog wiring — none of them expose a close
-  // callback to hook. Held by the manager rather than each handler so a
+  // and future modals with no per-dialog wiring — none of them reports its
+  // close to hook. Held by the manager rather than each handler so a
   // suppressed chord is not preventDefault()ed either: before this, pressing
   // Delete with the export dialog open silently deleted the selected clip
   // behind it, and Space started playback.
@@ -1540,7 +1572,7 @@ export async function mountEditor(
   bind("toggleSnap", () => snapBtn.click());
   bind("toggleLoop", () => loopBtn.click());
   bind("addMarker", addMarker);
-  bind("export", () => openExportDialog({ session }));
+  bind("export", openExport);
   bind("goHome", () => goHome());
   bind("fullscreen", () => theater.toggle());
   shortcuts.attach();
@@ -1582,6 +1614,8 @@ export async function mountEditor(
       closeMenu();
       closeRelink();
       closeGenerator();
+      closeExport();
+      closeDeleteLayer();
       shortcuts.detach();
       unsubSettings();
       unTick();

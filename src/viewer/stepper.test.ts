@@ -12,7 +12,7 @@ import {
 } from "./stepper";
 import type { StepState } from "./stepper";
 
-/** A stand-in for list_siblings: the files are already in natural order, and
+/** A stand-in for list_siblings: the files are already in stepping order, and
  *  the window is at most `radius` on each side of `path` (nearest LAST before,
  *  nearest FIRST after), exactly as the backend contract states. */
 function fakeWindow(files: string[], path: string, radius: number): SiblingWindow {

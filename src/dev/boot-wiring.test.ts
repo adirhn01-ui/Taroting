@@ -82,6 +82,17 @@ function checkBootWiring(src: string): string[] {
       problems.push("the startup cache trim runs on a launch that opened a file");
     }
   }
+  // The viewer's held folder order: kept only across a viewer → project →
+  // viewer round trip (an editor route with returnTo), dropped on the first
+  // route anywhere else — and never asked about on a plain launch.
+  const forgets = c.split("ipc.forgetSiblingOrder()").length - 1;
+  if (forgets !== 1) problems.push(`forgetSiblingOrder is called ${forgets} times in main.ts, expected once`);
+  if (!/if \(route\.view === "editor" && route\.returnTo !== undefined\) siblingOrderHeld = true;/.test(c)) {
+    problems.push("the held folder order is not kept for an editor opened from the viewer");
+  }
+  if (!/else if \(siblingOrderHeld\) \{\s*siblingOrderHeld = false;\s*void ipc\.forgetSiblingOrder\(\)/.test(c)) {
+    problems.push("the held folder order is not dropped (only) when one is held");
+  }
   return problems;
 }
 
@@ -169,6 +180,17 @@ describe("boot wiring (src/main.ts)", () => {
     expect(checkBootWiring(bad)).toEqual([
       "the startup cache trim is not gated on a good settings read",
       "the startup cache trim runs on a launch that opened a file",
+    ]);
+  });
+
+  it("rejects a held folder order dropped unconditionally, or never kept", () => {
+    const guard = "  else if (siblingOrderHeld) {";
+    expect(MAIN.split(guard).length - 1).toBe(1);
+    expect(checkBootWiring(MAIN.replace(guard, "  else {"))).toEqual(["the held folder order is not dropped (only) when one is held"]);
+    const keep = "if (route.view === \"editor\" && route.returnTo !== undefined) siblingOrderHeld = true;";
+    expect(MAIN.includes(keep)).toBe(true);
+    expect(checkBootWiring(MAIN.replace(keep, "if (route.view === \"editor\") siblingOrderHeld = true;"))).toEqual([
+      "the held folder order is not kept for an editor opened from the viewer",
     ]);
   });
 

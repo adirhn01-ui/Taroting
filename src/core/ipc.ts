@@ -162,9 +162,11 @@ export function codecHints(): CodecHints {
  *  src-tauri/src/media/siblings.rs. Bounded by `radius` on each side so a
  *  folder of thousands of photos never crosses the IPC boundary whole. */
 export interface SiblingWindow {
-  /** ascending natural order, nearest neighbour LAST, at most `radius` entries */
+  /** stepping order, nearest neighbour LAST, at most `radius` entries: the
+   *  view order held for the folder (File Explorer's, when one was read), then
+   *  natural name order for names that order does not rank */
   before: string[];
-  /** ascending natural order, nearest neighbour FIRST, at most `radius` entries */
+  /** the same order, nearest neighbour FIRST, at most `radius` entries */
   after: string[];
   /** 1-based position of `path` among the family's files; null when it is not listed
    *  (vanished, hidden, or renamed since it was opened) */
@@ -294,10 +296,19 @@ export const ipc = {
   classifyPlayback: (media: MediaRef, hints: CodecHints, forceProxyLarge: boolean) =>
     call<PlaybackClassInfo>("classify_playback", { media, hints, forceProxyLarge },
       () => ({ class: "direct", prepared: false })),
-  /** The folder neighbours of `path` in its own step family (see SiblingWindow). */
-  listSiblings: (path: string, radius: number) =>
-    call<SiblingWindow>("list_siblings", { path, radius },
+  /** The folder neighbours of `path` in its own step family (see SiblingWindow),
+   *  in the order the File Explorer window showing that folder lists them, or
+   *  natural name order when none does. `fresh`: try to read that order from
+   *  Explorer now (a file newly shown by navigation); when Explorer shows
+   *  nothing for the folder, the order already held for it is kept. Not fresh
+   *  (refills, settles): reuse the held order, so stepping never re-queries
+   *  Explorer and the order cannot change mid-session when Explorer closes. */
+  listSiblings: (path: string, radius: number, fresh: boolean) =>
+    call<SiblingWindow>("list_siblings", { path, radius, fresh },
       () => ({ before: [], after: [], index: 1, total: 1, family: "visual" })),
+  /** Drop the Explorer order held for the viewer's folder (the viewer is left
+   *  for good, not for a project that returns to it). */
+  forgetSiblingOrder: () => call<void>("forget_sibling_order", {}, () => undefined),
   ensureWaveform: (key: MediaKey, duration: number, hasAudio: boolean) =>
     call<WaveformResult>("ensure_waveform", { key, duration, hasAudio }),
   getThumbnail: (key: MediaKey, atSec: number) =>
@@ -499,15 +510,17 @@ export function mediaUrl(path: string): string {
 
 /* ---------------- dialogs ---------------- */
 
-/** Home's Open picker: a project or a media file, one filter. */
-export async function pickOpenFile(): Promise<string | null> {
-  if (!inTauri) return null;
+/** Home's Open picker: one project, or any number of media files (which Home
+ *  then asks to open as a video or an image project). One filter. */
+export async function pickOpenFiles(): Promise<string[]> {
+  if (!inTauri) return [];
   const { open } = await import("@tauri-apps/plugin-dialog");
   const result = await open({
-    multiple: false,
+    multiple: true,
     filters: [{ name: "Projects and media", extensions: ["trt", ...MEDIA_FILE_EXTENSIONS] }],
   });
-  return typeof result === "string" ? result : null;
+  if (result === null) return [];
+  return Array.isArray(result) ? result : [result];
 }
 
 export async function pickMediaFiles(): Promise<string[]> {

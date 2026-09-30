@@ -475,6 +475,17 @@ export function renderComposite(ctx: Ctx2D, doc: ProjectFile, res: RenderResourc
   }
   drawUnderlay(ctx, doc, view, opts.underlay);
   drawBackground(ctx, doc, view);
+  // Nothing outside the canvas is part of the image, so nothing outside it is
+  // shown: a layer (or ink) hanging past the edge is cut there, exactly as the
+  // export cuts it, and a cropped canvas shows only what it kept. Clips
+  // intersect, so this stays inside the region above. After the underlay and
+  // background on purpose: those fill exactly this rectangle already, and a
+  // clip edge on a fractional device pixel is anti-aliased — under it their
+  // edge pixels would be attenuated twice.
+  applyView(ctx, view);
+  ctx.beginPath();
+  ctx.rect(0, 0, doc.timeline.width, doc.timeline.height);
+  ctx.clip();
 
   const live = opts.live ?? null;
   const skip = opts.skip;

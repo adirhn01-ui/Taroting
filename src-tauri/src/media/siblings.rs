@@ -1,17 +1,23 @@
-//! A media file's neighbours in its own folder, in Explorer's natural name
-//! order, for the viewer's previous/next. Bounded by a radius on each side so a
-//! folder of thousands of photos never crosses the IPC boundary whole.
+//! A media file's neighbours in its own folder, for the viewer's
+//! previous/next: in the order the File Explorer window showing that folder
+//! lists it (explorer_order.rs), or Explorer's natural name order when no
+//! window does. Bounded by a radius on each side so a folder of thousands of
+//! photos never crosses the IPC boundary whole.
 //!
 //! One `read_dir` and one pass: two heaps of at most `radius` names each, never
-//! a sorted copy of the folder. Nothing is resident between calls — no cache,
-//! no watcher — so a viewer that is not open costs exactly nothing.
+//! a sorted copy of the folder. The one thing resident between calls is the
+//! view order of ONE folder (a name → rank map), held while the viewer is open
+//! so stepping never asks Explorer again and the order survives Explorer being
+//! closed; the viewer drops it when it is left. No watcher, no timer.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fs::DirEntry;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{AppError, Result};
+use crate::media::explorer_order::{self, folder_key, Ranks};
 use crate::media::extensions::{family_of_ext, step_family, StepFamily};
 use crate::project::store::{path_identity, PathIdentity};
 
@@ -19,7 +25,11 @@ use crate::project::store::{path_identity, PathIdentity};
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SiblingWindow {
+    /// The nearest `radius` files before the current one, in stepping order
+    /// (nearest LAST): the held view order of the folder, then natural name
+    /// order for names that order does not rank.
     pub before: Vec<String>,
+    /// The nearest `radius` files after it, in the same order (nearest FIRST).
     pub after: Vec<String>,
     pub index: Option<u32>,
     pub total: u32,
@@ -32,12 +42,106 @@ const MAX_RADIUS: u32 = 32;
 /// `radius` clamped to 1..=32. async + spawn_blocking.
 ///
 /// A folder scan is blocking I/O of unbounded length (a network share, a
-/// folder of ten thousand photos), so it never runs on the IPC thread.
+/// folder of ten thousand photos), and a fresh listing may wait on Explorer
+/// for up to explorer_order's `CAPTURE_TIMEOUT`, so it never runs on the IPC
+/// thread.
+///
+/// `fresh`: the viewer was just sent to this file (opened, or a second launch
+/// while it is up), so ask Explorer for the folder's order now; otherwise
+/// (stepping, refills) reuse the order held for the folder.
 #[tauri::command]
-pub async fn list_siblings(path: String, radius: u32) -> Result<SiblingWindow> {
-    tauri::async_runtime::spawn_blocking(move || list_sync(&path, radius))
-        .await
-        .map_err(|e| AppError::BadInput(format!("folder scan failed: {e}")))?
+pub async fn list_siblings(path: String, radius: u32, fresh: bool) -> Result<SiblingWindow> {
+    tauri::async_runtime::spawn_blocking(move || {
+        list_with(&path, radius, |file| {
+            ORDER.resolve(file, fresh, explorer_order::capture)
+        })
+    })
+    .await
+    .map_err(|e| AppError::BadInput(format!("folder scan failed: {e}")))?
+}
+
+/// The viewer is left for good: drop the held order.
+#[tauri::command]
+pub fn forget_sibling_order() {
+    ORDER.forget();
+}
+
+/// The one folder order held between listings.
+static ORDER: OrderCache = OrderCache::new();
+
+type Capture = fn(&Path) -> Option<Ranks>;
+
+struct OrderCache(Mutex<OrderState>);
+
+struct OrderState {
+    /// Bumped by every forget, so a capture that was already running when the
+    /// viewer was left does not put its folder back.
+    forgets: u64,
+    held: Option<Held>,
+}
+
+struct Held {
+    /// `folder_key` of the folder the order is for.
+    folder: String,
+    /// None: this folder steps in natural name order.
+    order: Option<Arc<Ranks>>,
+}
+
+impl OrderCache {
+    const fn new() -> Self {
+        OrderCache(Mutex::new(OrderState {
+            forgets: 0,
+            held: None,
+        }))
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, OrderState> {
+        // Nothing here can leave the state half-written; a poisoned lock is
+        // still a usable one.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The order to list `file`'s folder in. Fresh: capture now; a capture
+    /// replaces what is held, and no capture keeps the order already held for
+    /// this same folder (Explorer was closed since) or else holds name order
+    /// for it. Not fresh: the held order when it is this folder's, otherwise
+    /// as fresh. Never more than one folder, and the lock is never held
+    /// across the capture or the scan.
+    fn resolve(&self, file: &Path, fresh: bool, capture: Capture) -> Option<Arc<Ranks>> {
+        let folder = folder_key(file.parent()?.to_str()?);
+        let forgets = {
+            let st = self.state();
+            if !fresh {
+                if let Some(h) = st.held.as_ref().filter(|h| h.folder == folder) {
+                    return h.order.clone();
+                }
+            }
+            st.forgets
+        };
+        let captured = capture(file).map(Arc::new);
+        let mut st = self.state();
+        if st.forgets != forgets {
+            return captured;
+        }
+        let order = match captured {
+            Some(o) => Some(o),
+            None => match st.held.as_ref() {
+                Some(h) if h.folder == folder => return h.order.clone(),
+                _ => None,
+            },
+        };
+        st.held = Some(Held {
+            folder,
+            order: order.clone(),
+        });
+        order
+    }
+
+    fn forget(&self) {
+        let mut st = self.state();
+        st.forgets = st.forgets.wrapping_add(1);
+        st.held = None;
+    }
 }
 
 fn bad<T>(msg: &str) -> Result<T> {
@@ -72,7 +176,13 @@ fn is_file_namespace(path: &Path) -> bool {
     }
 }
 
-fn list_sync(path: &str, radius: u32) -> Result<SiblingWindow> {
+/// `order` is asked once the path has passed every check, with the file it
+/// names, for the view order of its folder (None: natural name order).
+fn list_with(
+    path: &str,
+    radius: u32,
+    order: impl FnOnce(&Path) -> Option<Arc<Ranks>>,
+) -> Result<SiblingWindow> {
     // Every refusal names what the caller sent, never a guess at what it
     // meant: the family, the folder and the file all come from `path` itself.
     if path.is_empty() {
@@ -104,11 +214,26 @@ fn list_sync(path: &str, radius: u32) -> Result<SiblingWindow> {
         return bad("the file has no folder");
     };
 
+    let order = order(current_path);
+    let rank_of = |name: &str| order.as_deref().and_then(|o| o.get(name).copied());
     let cap = radius.clamp(1, MAX_RADIUS) as usize;
     let current_wide = wide_of(current);
-    let current = Spelling {
-        name: current,
-        wide: &current_wide,
+    // A hand-typed spelling (`CLIP2.MP4` for `clip2.mp4`) still takes the
+    // rank Explorer gave the file on disk.
+    let current_rank = rank_of(current).or_else(|| {
+        let folded = current.to_lowercase();
+        order
+            .as_deref()?
+            .iter()
+            .find(|(n, _)| n.to_lowercase() == folded)
+            .map(|(_, r)| *r)
+    });
+    let current = Entry {
+        rank: current_rank,
+        spelling: Spelling {
+            name: current,
+            wide: &current_wide,
+        },
     };
 
     // `below` keeps the `cap` GREATEST names under the current one (a
@@ -145,16 +270,19 @@ fn list_sync(path: &str, radius: u32) -> Result<SiblingWindow> {
             continue;
         }
         total += 1;
-        if name == current.name {
+        if name == current.spelling.name {
             found = true;
             continue;
         }
         fill_wide(&mut buf, &name);
-        let this = Spelling {
-            name: &name,
-            wide: &buf,
+        let this = Entry {
+            rank: rank_of(&name),
+            spelling: Spelling {
+                name: &name,
+                wide: &buf,
+            },
         };
-        let logical = logical_cmp(this, current);
+        let logical = logical_cmp(this.spelling, current.spelling);
         // Natural order folds case, so `CLIP2.MP4` (a CLI launch, a hand-typed
         // path) ties with `clip2.mp4` on disk. Only the filesystem can say
         // whether that is the same file or a case-sensitive folder's twin —
@@ -167,12 +295,12 @@ fn list_sync(path: &str, radius: u32) -> Result<SiblingWindow> {
             continue;
         }
         // Distinct names always differ ordinally, so this is never Equal.
-        if logical.then_with(|| this.wide.cmp(current.wide)) == Ordering::Less {
+        if order_cmp(this, current) == Ordering::Less {
             count_below += 1;
             if below.len() >= cap {
                 let displaces = below
                     .peek()
-                    .is_some_and(|Reverse(k)| total_cmp(this, k.spelling()) == Ordering::Greater);
+                    .is_some_and(|Reverse(k)| order_cmp(this, k.entry()) == Ordering::Greater);
                 if !displaces {
                     continue;
                 }
@@ -183,7 +311,7 @@ fn list_sync(path: &str, radius: u32) -> Result<SiblingWindow> {
             if above.len() >= cap {
                 let displaces = above
                     .peek()
-                    .is_some_and(|k| total_cmp(this, k.spelling()) == Ordering::Less);
+                    .is_some_and(|k| order_cmp(this, k.entry()) == Ordering::Less);
                 if !displaces {
                     continue;
                 }
@@ -194,7 +322,8 @@ fn list_sync(path: &str, radius: u32) -> Result<SiblingWindow> {
     }
 
     // Both sides come out of the heaps' OWN sort, never `slice::sort`: the
-    // order is not transitive (see `total_cmp`), and the std slice sorts
+    // order is not transitive (see `total_cmp`; ranks do not change that for
+    // the unranked names), and the std slice sorts
     // detect that and panic — which `panic = "abort"` turns into the whole app
     // dying on a folder of `01`/`①`/`1a` names. The heap sort only ever asks
     // one pair at a time and cannot notice. `below` holds `Reverse` keys, so
@@ -277,33 +406,45 @@ struct Spelling<'a> {
     wide: &'a [u16],
 }
 
-/// An owned `Spelling`, as held in the heaps.
+/// A spelling and its place in the folder's view order, if it has one.
+#[derive(Clone, Copy)]
+struct Entry<'a> {
+    rank: Option<u32>,
+    spelling: Spelling<'a>,
+}
+
+/// An owned `Entry`, as held in the heaps.
 struct Key {
+    rank: Option<u32>,
     name: String,
     wide: Vec<u16>,
 }
 
 impl Key {
-    fn spelling(&self) -> Spelling<'_> {
-        Spelling {
-            name: &self.name,
-            wide: &self.wide,
+    fn entry(&self) -> Entry<'_> {
+        Entry {
+            rank: self.rank,
+            spelling: Spelling {
+                name: &self.name,
+                wide: &self.wide,
+            },
         }
     }
 }
 
-impl From<Spelling<'_>> for Key {
-    fn from(s: Spelling<'_>) -> Self {
+impl From<Entry<'_>> for Key {
+    fn from(e: Entry<'_>) -> Self {
         Key {
-            name: s.name.to_owned(),
-            wide: s.wide.to_vec(),
+            rank: e.rank,
+            name: e.spelling.name.to_owned(),
+            wide: e.spelling.wide.to_vec(),
         }
     }
 }
 
 impl Ord for Key {
     fn cmp(&self, other: &Self) -> Ordering {
-        total_cmp(self.spelling(), other.spelling())
+        order_cmp(self.entry(), other.entry())
     }
 }
 impl PartialOrd for Key {
@@ -330,7 +471,19 @@ fn wide_of(name: &str) -> Vec<u16> {
     v
 }
 
-/// The order the viewer steps in. Natural order alone ties distinct names —
+/// The order the viewer steps in: the folder's view order for every name it
+/// ranks, then every name it does not (a file created since the capture, one
+/// a filtered view hid) in `total_cmp` order after them all.
+fn order_cmp(a: Entry<'_>, b: Entry<'_>) -> Ordering {
+    match (a.rank, b.rank) {
+        (Some(x), Some(y)) => x.cmp(&y).then_with(|| total_cmp(a.spelling, b.spelling)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => total_cmp(a.spelling, b.spelling),
+    }
+}
+
+/// Name order. Natural order alone ties distinct names —
 /// it folds case, so `a.png` and `A.png` (both present in a case-sensitive
 /// folder) compare equal. The ordinal UTF-16 tie-break makes the order
 /// ANTISYMMETRIC (two distinct names are never Equal, and swapping them flips
@@ -424,6 +577,19 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Name order only: what every listing got before view orders existed.
+    fn list_sync(path: &str, radius: u32) -> Result<SiblingWindow> {
+        list_with(path, radius, |_| None)
+    }
+
+    fn ranks(names: &[&str]) -> Ranks {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.to_string(), i as u32))
+            .collect()
+    }
+
     /// A throwaway folder of empty files, removed before use and on drop (so a
     /// failed assertion does not strand it). Empty is deliberate: a 0-byte
     /// `.mp4` must still be listed — the viewer, not the scan, says it cannot
@@ -469,6 +635,151 @@ mod tests {
             Err(AppError::BadInput(m)) => m,
             other => panic!("{path:?}: expected BadInput, got {other:?}"),
         }
+    }
+
+    /// A folder in a view order that follows no name order (a sort by date or
+    /// size): the ranks run neither with names nor against them, so a scan
+    /// that ignored them, or merely flipped name order, lists the wrong
+    /// neighbours. The map also ranks what the scan must still drop (a
+    /// non-media name, an AppleDouble, a folder named like media, a hidden
+    /// file), interleaved with the files. Two files (`c6.png`, `c9.png`)
+    /// arrived after the capture: mid-range by name, they must come LAST, and
+    /// in name order between themselves.
+    #[test]
+    fn view_order_window() {
+        let s = Scratch::new("vieworder");
+        s.files(&[
+            "c1.png",
+            "c2.png",
+            "c3.png",
+            "c4.png",
+            "c5.png",
+            "c6.png",
+            "c9.png",
+            "c10.png",
+            "notes.txt",
+            "._c7.png",
+        ]);
+        std::fs::create_dir(s.0.join("c8.png")).unwrap();
+        let order = Arc::new(ranks(&[
+            "c4.png",
+            "notes.txt",
+            "c10.png",
+            "._c7.png",
+            "c1.png",
+            "c8.png",
+            "c5.png",
+            "h.png",
+            "c3.png",
+            "c2.png",
+        ]));
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .attributes(0x2)
+                .open(s.0.join("h.png"))
+                .unwrap();
+        }
+        let list = |current: &str, radius: u32| {
+            list_with(&s.path(current), radius, |_| Some(order.clone())).unwrap()
+        };
+
+        // Stepping order: c4 c10 c1 c5 c3 c2, then the newcomers c6 c9.
+        // (Name order: c1 c2 c3 c4 c5 c6 c9 c10.)
+        let w = list("c1.png", 2);
+        assert_eq!(names(&w.before), ["c4.png", "c10.png"]);
+        assert_eq!(names(&w.after), ["c5.png", "c3.png"]);
+        assert_eq!((w.index, w.total), (Some(3), 8));
+
+        let w = list("c4.png", 2);
+        assert!(w.before.is_empty());
+        assert_eq!(names(&w.after), ["c10.png", "c1.png"]);
+        assert_eq!((w.index, w.total), (Some(1), 8));
+
+        let w = list("c2.png", 2);
+        assert_eq!(names(&w.before), ["c5.png", "c3.png"]);
+        assert_eq!(names(&w.after), ["c6.png", "c9.png"]);
+        assert_eq!((w.index, w.total), (Some(6), 8));
+
+        let w = list("c9.png", 3);
+        assert_eq!(names(&w.before), ["c3.png", "c2.png", "c6.png"]);
+        assert!(w.after.is_empty());
+        assert_eq!((w.index, w.total), (Some(8), 8));
+
+        // A hand-typed spelling of a ranked file keeps that file's place.
+        #[cfg(windows)]
+        {
+            let w = list("C10.PNG", 1);
+            assert_eq!(names(&w.before), ["c4.png"]);
+            assert_eq!(names(&w.after), ["c1.png"]);
+            assert_eq!((w.index, w.total), (Some(2), 8));
+        }
+    }
+
+    const FOLDER_A: &str = r"C:\held\a\x.png";
+    const FOLDER_A_AGAIN: &str = r"c:\HELD\A\y.png";
+    const FOLDER_B: &str = r"C:\held\b\x.png";
+
+    fn order_a(_: &Path) -> Option<Ranks> {
+        Some(ranks(&["from a"]))
+    }
+    fn order_b(_: &Path) -> Option<Ranks> {
+        Some(ranks(&["from b"]))
+    }
+    fn nothing(_: &Path) -> Option<Ranks> {
+        None
+    }
+    fn never(p: &Path) -> Option<Ranks> {
+        panic!("captured {p:?} when the held order should have been used")
+    }
+    /// The one rank name in an order, or "names" for name order.
+    fn which(o: Option<Arc<Ranks>>) -> String {
+        o.map_or("names".into(), |r| r.keys().next().unwrap().clone())
+    }
+
+    #[test]
+    fn the_held_order_is_kept_replaced_and_forgotten() {
+        let c = OrderCache::new();
+        let get = |p: &str, fresh: bool, cap: Capture| which(c.resolve(Path::new(p), fresh, cap));
+
+        assert_eq!(get(FOLDER_A, true, order_a), "from a");
+        // Stepping reuses it without asking Explorer, in any spelling of the folder.
+        assert_eq!(get(FOLDER_A_AGAIN, false, never), "from a");
+        // Explorer closed, the viewer re-sent to a file of the same folder
+        // (back from "Open as project"): the order is kept, not lost.
+        assert_eq!(get(FOLDER_A, true, nothing), "from a");
+        // Another folder with no Explorer window: name order, held for IT.
+        assert_eq!(get(FOLDER_B, true, nothing), "names");
+        assert_eq!(get(FOLDER_B, false, never), "names");
+        // A step into another folder than the held one captures as if fresh,
+        // and replaces what was held: one folder at a time.
+        assert_eq!(get(FOLDER_A, false, order_a), "from a");
+        assert_eq!(get(FOLDER_B, false, order_b), "from b");
+        assert_eq!(get(FOLDER_A, false, nothing), "names");
+        // A fresh capture replaces the same folder's held order too.
+        assert_eq!(get(FOLDER_A, true, order_b), "from b");
+        assert_eq!(get(FOLDER_A, false, never), "from b");
+
+        c.forget();
+        assert_eq!(get(FOLDER_A, false, nothing), "names");
+    }
+
+    static RACED: OrderCache = OrderCache::new();
+    fn forgotten_meanwhile(_: &Path) -> Option<Ranks> {
+        RACED.forget();
+        Some(ranks(&["late"]))
+    }
+
+    /// The viewer was left while a capture was still running: that listing
+    /// gets its answer, but the folder is not held again afterwards.
+    #[test]
+    fn a_capture_that_outlives_the_viewer_holds_nothing() {
+        let got = RACED.resolve(Path::new(FOLDER_A), true, forgotten_meanwhile);
+        assert_eq!(which(got), "late");
+        assert!(RACED.state().held.is_none());
     }
 
     #[test]

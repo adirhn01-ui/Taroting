@@ -1,4 +1,5 @@
 pub mod exif;
+pub mod explorer_order;
 pub mod extensions;
 pub mod normalize;
 pub mod playability;

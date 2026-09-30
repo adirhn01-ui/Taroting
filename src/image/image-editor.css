@@ -34,17 +34,30 @@
 }
 
 /* ---------- tool row ----------
-   The video transport's row, under the stage instead of above a timeline. */
+   The video transport's row, under the stage instead of above a timeline.
+   It WRAPS when the column is too narrow for both groups (a 960 px window, a
+   Snap half-screen): the view controls drop to a second line as one block,
+   right-aligned, instead of being squeezed under or over the tools. The
+   stage's ResizeObserver refits the canvas to the height that is left. */
 .imged-toolrow {
   border-bottom: 0;
   border-top: 1px solid var(--border);
+  flex-wrap: wrap; /* .transport's gap spaces the lines too */
 }
 .imged-tools,
 .imged-viewctl {
   display: flex;
   align-items: center;
   gap: var(--sp-1);
+}
+/* A tools group wider than the whole column may still shrink (its toolbar
+   then wraps its own buttons); the view controls never do. */
+.imged-tools {
   min-width: 0;
+}
+.imged-viewctl {
+  flex: none;
+  margin-left: auto;
 }
 .imged-sep {
   flex: none;
@@ -62,7 +75,7 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* ---------- crop image ----------
+/* ---------- crop canvas ----------
    The video editor's crop chrome, shown: the window's huge box-shadow is the
    dim outside the crop, its handles are the stage-overlay handles. */
 .imged-crop .stage-overlay__veil,
@@ -86,4 +99,12 @@
   border-radius: var(--radius-m);
   box-shadow: var(--shadow-2);
   white-space: nowrap;
+}
+/* What the bar crops, said on the bar itself: "Crop canvas" here, "Crop layer"
+   on the select tool's per-layer crop (same class). */
+.imged-cropbar__label {
+  padding: 0 var(--sp-1);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  color: var(--text-2);
 }

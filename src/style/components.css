@@ -417,3 +417,38 @@
   cursor: default;
   pointer-events: none;
 }
+/* A row with an icon and a hint (menu.ts renderRich): an accent-tinted glyph
+   tile, then the label over one muted line. Plain rows never get these. Home's
+   "Open as" dialog reuses the icon/label/hint rules for its two choices. */
+.ctx-menu__item--rich {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-4) var(--sp-2) var(--sp-2);
+}
+.ctx-menu__icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-s);
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+}
+.ctx-menu__icon > svg {
+  pointer-events: none;
+}
+.ctx-menu__text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.ctx-menu__label {
+  font-weight: 600;
+}
+.ctx-menu__hint {
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}

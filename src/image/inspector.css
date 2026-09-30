@@ -25,3 +25,38 @@
 .imged-insp-swatch[hidden] {
   display: none;
 }
+
+/* "Select a layer to edit just that layer." under the Canvas header: says
+   plainly which of the two panels this is. */
+.imged-inspector .insp-header .imged-insp-hint {
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+
+/* ---------- one value per slider row ----------
+   The number field IS the readout (no mono twin beside it), so it must show
+   "-100", "100" and "180" whole at the app's font: no spin arrows (Chromium
+   reserves their width even while hidden; the slider and the arrow keys
+   already step), a slimmer padding and a wider box than the video
+   inspector's 52 px twin. Three classes deep, so it wins over editor
+   inspector.css's two-class rule whichever lazy chunk's sheet loads last. */
+.imged-inspector .insp-slider .insp-num--twin {
+  width: 60px;
+  padding: 0 var(--sp-2);
+  appearance: textfield;
+  font-variant-numeric: tabular-nums;
+}
+.imged-inspector .insp-slider .insp-num--twin::-webkit-inner-spin-button,
+.imged-inspector .insp-slider .insp-num--twin::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+/* The unit after the number ("%", "°"), tucked against it. Present (empty)
+   on rows without one too, so every number sits in the same column. */
+.imged-inspector .insp-slider .imged-insp-unit {
+  flex: none;
+  width: 1ch;
+  margin-left: calc(-1 * var(--sp-2));
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}

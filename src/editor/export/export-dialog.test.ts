@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ExportPreset } from "../../core/types";
 import { DEFAULT_EXPORT_PRESET } from "../../core/types";
+import { addAudioTrack, addMedia, createProject, insertClip, makeClip } from "../../core/project";
 import {
   createExportRunHold,
   EXPORT_RUNNING_REASON,
@@ -10,6 +11,7 @@ import {
   isProjectSource,
   joinPath,
   mergeExportPreset,
+  nothingToExport,
   overwriteOffer,
   RENAME_ATTEMPT_LIMIT,
   renameWithSuffix,
@@ -420,6 +422,35 @@ describe("whitelistCodec", () => {
         expect(resolveCodec(format, codec)).toBe(codec);
       }
     }
+  });
+});
+
+describe("nothingToExport", () => {
+  // Media in the bin but no clip placed: the state every bin-first import
+  // leaves a project in. The bin is deliberately non-empty, so a check that
+  // looked at media instead of clips fails here.
+  function binOnly() {
+    const p = createProject("Empty");
+    return addMedia(p, {
+      path: "C:\\media\\song.mp3",
+      size: 1,
+      mtimeMs: 1,
+      kind: "audio",
+      duration: 5,
+      hasAudio: true,
+    });
+  }
+  it("says what to do on a timeline with no clips, even with media in the bin", () => {
+    expect(nothingToExport(binOnly().project)).toBe("Add a clip to the timeline first.");
+  });
+  it("lets Export run once any layer holds a clip — not only the first one", () => {
+    // The clip sits on a SECOND (audio) track, the first video track stays
+    // empty, so a check reading tracks[0] alone fails here.
+    const { project, media } = binOnly();
+    const withTrack = addAudioTrack(project);
+    const p = insertClip(withTrack.project, withTrack.trackId, makeClip(media, 0));
+    expect(p.timeline.tracks[0]!.clips).toHaveLength(0);
+    expect(nothingToExport(p)).toBeNull();
   });
 });
 

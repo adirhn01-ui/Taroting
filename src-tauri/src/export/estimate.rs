@@ -4,6 +4,7 @@
 use serde::Serialize;
 
 use crate::error::Result;
+use crate::export::builder::GIF_MAX_FPS;
 use crate::export::model::{EstimateInput, ExportPreset};
 #[cfg(test)]
 use crate::export::model::ExportSpec;
@@ -38,8 +39,9 @@ fn estimate_core(
     let fps = preset.fps_value(timeline_fps).max(1.0);
 
     if preset.format == "gif" {
-        // gif ≈ W*H*fps*dur*0.13 bytes; fps capped at 30
-        let gfps = fps.min(30.0);
+        // gif ≈ W*H*fps*dur*0.13 bytes, at the rate the builder writes a GIF
+        // at: capped at the same `GIF_MAX_FPS`.
+        let gfps = fps.min(GIF_MAX_FPS);
         let bytes = (w as f64 * h as f64 * gfps * dur * 0.13).round() as u64;
         return SizeEstimate { bytes, exact: false };
     }
@@ -233,6 +235,44 @@ mod tests {
         assert!(!est.exact);
         // 1920*1080*30*2*0.13 = 16,174,080
         assert_eq!(est.bytes, 16_174_080);
+    }
+
+    /// The builder writes a GIF at no more than 30 fps whatever the timeline or
+    /// a crafted Custom rate says, so the estimate must price the same 30 —
+    /// and a rate under the cap must be priced as itself.
+    #[test]
+    fn a_gif_estimate_prices_the_rate_the_builder_writes() {
+        let gif_at = |timeline_fps: u32, fps: FpsPreset| {
+            let mut p = preset();
+            p.format = "gif".into();
+            p.fps = fps;
+            let mut spec = spec_with(p, 2.0);
+            spec.timeline.fps = Rational { num: timeline_fps, den: 1 };
+            estimate(&spec).bytes
+        };
+        // 1920*1080*30*2*0.13 = 16,174,080: a 60 fps timeline at "Original"
+        // and a Custom 48 are both written at 30.
+        assert_eq!(gif_at(60, FpsPreset::Original("original".into())), 16_174_080);
+        assert_eq!(gif_at(25, FpsPreset::Custom(48.0)), 16_174_080);
+        // Under the cap: 1920*1080*24*2*0.13 = 12,939,264, and the timeline's
+        // own 25 at "Original" is 13,478,400.
+        assert_eq!(gif_at(60, FpsPreset::Custom(24.0)), 12_939_264);
+        assert_eq!(gif_at(25, FpsPreset::Original("original".into())), 13_478_400);
+    }
+
+    /// A portrait project at a named preset is priced at the size the builder
+    /// writes: the preset is the width, not the height.
+    #[test]
+    fn a_portrait_estimate_prices_the_preset_as_the_width() {
+        let mut p = preset();
+        p.resolution = ResolutionPreset::Named("720p".into());
+        let mut spec = spec_with(p, 10.0);
+        spec.timeline.width = 1080;
+        spec.timeline.height = 1350;
+        // 720x900 (not 576x720): video 720*900*30*0.10*10 = 19,440,000 bits,
+        // audio 192*1000*10 = 1,920,000 bits, total /8 = 2,670,000.
+        assert_eq!(estimate(&spec).bytes, 2_670_000);
+        assert_eq!(estimate_size(&input_for(&spec)).bytes, 2_670_000);
     }
 
     /// The point of the reduced payload: the four scalars the dialog sends must

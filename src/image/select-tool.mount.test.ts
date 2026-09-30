@@ -3,7 +3,8 @@ import type { ProjectFile } from "../core/types";
 import { Store } from "../core/store";
 import { shortcutsBlocked } from "../core/shortcuts";
 import { createBlankImageProject } from "../core/image-project";
-import { addGeneratorLayer, findLayer } from "./layers";
+import { addDrawingLayer, addGeneratorLayer, appendStrokeTo, findLayer, layersOf, setLayerTransform } from "./layers";
+import { encodePoints } from "./strokes";
 import { createToolStore } from "./tool-state";
 
 // The select tool's event handling, mounted against a small fake DOM (vitest
@@ -183,10 +184,11 @@ function mount() {
   const canvas = new CanvasEl("canvas");
   stage.appendChild(canvas);
   const mode = new Store<"idle" | "crop-image" | "crop-layer">("idle");
+  const selection = new Store<string | null>(id);
   const ctx = {
     session,
     tools,
-    selection: new Store<string | null>(id),
+    selection,
     mode,
     stage,
     view: {
@@ -216,7 +218,7 @@ function mount() {
     win.fire("keydown", e);
     doc.fire("keydown", e);
   };
-  return { base: added.project, id, store, commits, mode, stage, canvas, overlay, bar, cancelBtn, x0, press, key, handle };
+  return { base: added.project, id, store, commits, mode, stage, canvas, overlay, bar, cancelBtn, x0, press, key, handle, tools, selection, view: ctx.view };
 }
 
 describe("select tool: a drag", () => {
@@ -240,6 +242,125 @@ describe("select tool: a drag", () => {
     win.fire("pointerup", { pointerId: 1 });
     expect(shortcutsBlocked()).toBe(false);
     expect(t.commits).toEqual([t.base]);
+    t.handle.dispose();
+  });
+});
+
+describe("select tool: a press on a drawing", () => {
+  // A drawing above the solid with two pen lines, 4 px wide, along the solid's
+  // top (y 140) and bottom (y 220): the ink's box covers the solid's middle,
+  // but no ink is there.
+  function annotated() {
+    const t = mount();
+    const d = addDrawingLayer(t.store.get(), { above: t.id });
+    const line = (y: number) =>
+      ({ t: "pen", c: "#112233", w: 4, o: 1, p: encodePoints(new Float32Array([230, y, 1, 410, y, 1])) }) as const;
+    t.store.set(appendStrokeTo(appendStrokeTo(d.project, d.trackId, line(140)), d.trackId, line(220)));
+    expect(layersOf(t.store.get()).map((l) => l.trackId)).toEqual([d.trackId, t.id]);
+    t.selection.set(d.trackId);
+    return { ...t, drawing: d.trackId };
+  }
+
+  it("inside the ink's box but away from the ink picks, and drags, the layer under it", () => {
+    const t = annotated();
+    t.press(t.canvas, 320, 180);
+    expect(t.selection.get()).toBe(t.id);
+    win.fire("pointermove", { pointerId: 1, clientX: 360, clientY: 180 });
+    win.fire("pointerup", { pointerId: 1 });
+    expect(t.x0()).toBe(40);
+    t.handle.dispose();
+  });
+
+  it("on the ink (within 6 screen px of its edge) picks the drawing", () => {
+    const t = annotated();
+    t.selection.set(t.id);
+    // 6 px from the centre line: 2 of half-width + 4 of reach
+    t.press(t.canvas, 320, 146);
+    win.fire("pointerup", { pointerId: 1 });
+    expect(t.selection.get()).toBe(t.drawing);
+    // 10 px away is past the reach: the solid under it
+    t.press(t.canvas, 320, 150);
+    win.fire("pointerup", { pointerId: 1 });
+    expect(t.selection.get()).toBe(t.id);
+    t.handle.dispose();
+  });
+
+  it("the reach is on-screen px: zoomed in 2x, 6 canvas px from the line is too far", () => {
+    const t = annotated();
+    t.selection.set(t.id);
+    (t.view.store as Store<{ zoom: number; panX: number; panY: number; dpr: number; stageW: number; stageH: number }>).set({
+      ...t.view.store.get(),
+      zoom: 2,
+    });
+    t.press(t.canvas, 320, 146);
+    win.fire("pointerup", { pointerId: 1 });
+    expect(t.selection.get()).toBe(t.id);
+    t.press(t.canvas, 320, 144.5);
+    win.fire("pointerup", { pointerId: 1 });
+    expect(t.selection.get()).toBe(t.drawing);
+    t.handle.dispose();
+  });
+
+  it("on a drawing scaled 2x the reach stays 6 screen px, not 6 layer px", () => {
+    const t = annotated();
+    // The top line lands at canvas y 180 + 2·(140 − 180) = 100, 4 px either side.
+    t.store.set(setLayerTransform(t.store.get(), t.drawing, { scale: 2 }));
+    t.selection.set(null);
+    t.press(t.canvas, 320, 109);
+    win.fire("pointerup", { pointerId: 1 });
+    expect(t.selection.get()).toBe(t.drawing);
+    t.press(t.canvas, 320, 113);
+    win.fire("pointerup", { pointerId: 1 });
+    expect(t.selection.get()).toBe(null);
+    t.handle.dispose();
+  });
+
+  it("a double-click there crops the photo-like layer under it, not nothing", () => {
+    const t = annotated();
+    t.stage.fire("dblclick", { target: t.canvas, clientX: 320, clientY: 180 });
+    expect(t.mode.get()).toBe("crop-layer");
+    expect(t.selection.get()).toBe(t.id);
+    t.handle.dispose();
+  });
+});
+
+describe("select tool: a press outside the canvas", () => {
+  // The solid moved to hang off the left edge: x −80..120 of a 640-wide
+  // canvas. The part left of 0 is clipped out of the preview.
+  function overhang() {
+    const t = mount();
+    t.store.set(setLayerTransform(t.store.get(), t.id, { x: -300 }));
+    return t;
+  }
+
+  it("grabs nothing the user cannot see: an empty press, and no drag", () => {
+    const t = overhang();
+    t.selection.set(null);
+    t.press(t.canvas, -40, 180);
+    expect(t.selection.get()).toBe(null);
+    win.fire("pointermove", { pointerId: 1, clientX: 0, clientY: 180 });
+    win.fire("pointerup", { pointerId: 1 });
+    expect(t.x0()).toBe(-300);
+    // a double-click there opens no crop either
+    t.stage.fire("dblclick", { target: t.canvas, clientX: -40, clientY: 180 });
+    expect(t.mode.get()).toBe("idle");
+    // control: the visible part, on the canvas, is the layer
+    t.press(t.canvas, 60, 180);
+    win.fire("pointerup", { pointerId: 1 });
+    expect(t.selection.get()).toBe(t.id);
+    t.handle.dispose();
+  });
+
+  it("the selected layer is still grabbed there, by its box", () => {
+    const t = overhang();
+    expect(t.selection.get()).toBe(t.id);
+    t.press(t.canvas, -40, 180);
+    win.fire("pointermove", { pointerId: 1, clientX: 0, clientY: 180 });
+    win.fire("pointerup", { pointerId: 1 });
+    expect(t.selection.get()).toBe(t.id);
+    expect(t.x0()).toBe(-260);
+    t.stage.fire("dblclick", { target: t.canvas, clientX: -40, clientY: 180 });
+    expect(t.mode.get()).toBe("crop-layer");
     t.handle.dispose();
   });
 });
@@ -372,6 +493,55 @@ describe("select tool: per-layer crop", () => {
     expect(t.store.get()).toBe(t.base);
     expect(t.commits).toEqual([]);
     expect(shortcutsBlocked()).toBe(false);
+    t.handle.dispose();
+  });
+});
+
+describe("select tool: the inspector's Crop button (cropLayer)", () => {
+  it("takes up the select tool, selects the layer and opens the same crop a double-click does", async () => {
+    const t = mount();
+    t.tools.set({ ...t.tools.get(), tool: "pen" });
+    t.selection.set(null);
+    await flush();
+    expect(t.overlay.style.display).toBe("none"); // hidden under the pen
+
+    expect(t.handle.cropLayer(t.id)).toBe(true);
+    expect(t.mode.get()).toBe("crop-layer");
+    expect(t.tools.get().tool).toBe("select");
+    expect(t.selection.get()).toBe(t.id);
+    // After the batched store notifications too: neither the tool switch nor
+    // the selection change reads as "leave the crop".
+    await flush();
+    expect(t.mode.get()).toBe("crop-layer");
+    expect(t.overlay.style.display).not.toBe("none");
+    expect(t.bar.style.display).toBe("flex");
+    expect(shortcutsBlocked()).toBe(true);
+    t.cancelBtn.fire("click", {});
+    expect(t.mode.get()).toBe("idle");
+    expect(t.commits).toEqual([]);
+    t.handle.dispose();
+  });
+
+  it("the bar says it crops the layer", () => {
+    const t = mount();
+    const label = t.bar.children[0]!;
+    expect(label.cls.has("imged-cropbar__label")).toBe(true);
+    expect(label.textContent).toBe("Crop layer");
+    t.handle.dispose();
+  });
+
+  it("refuses a hidden layer, and anything while the stage is in a mode", async () => {
+    const t = mount();
+    const { setLayerHidden } = await import("./layers");
+    t.store.set(setLayerHidden(t.store.get(), t.id, true));
+    expect(t.handle.cropLayer(t.id)).toBe(false);
+    expect(t.mode.get()).toBe("idle");
+    t.store.set(t.base);
+    t.mode.set("crop-image");
+    expect(t.handle.cropLayer(t.id)).toBe(false);
+    t.mode.set("idle");
+    expect(t.handle.cropLayer("no-such-layer")).toBe(false);
+    expect(t.handle.cropLayer(t.id)).toBe(true);
     t.handle.dispose();
   });
 });

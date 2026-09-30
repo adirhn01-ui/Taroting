@@ -2,8 +2,11 @@
    selects and spacing are the video transport's own; only the pieces that row
    never needed are defined here, each from tokens. */
 
+/* Wraps its own controls when the column is narrower than them (the pixel
+   eraser's hint is the widest case) rather than overflowing the row. */
 .imged-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--sp-1);
   min-width: 0;

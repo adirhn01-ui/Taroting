@@ -1,0 +1,58 @@
+/* ---------- "Open as" dialog (open-as-dialog.ts) ----------
+   Two large choices wearing the menu rows' icon tile, label and hint (the
+   ctx-menu__icon/__label/__hint rules in components.css), so "New project"'s
+   menu and this dialog read as the same question. Imported by the dialog
+   itself, so these rules ship with its lazy chunk and never at boot. */
+.openas-modal {
+  width: 440px;
+  max-width: calc(100vw - 48px);
+}
+.openas-options {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.openas-option {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: var(--sp-3);
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  background: var(--bg-raised);
+  color: var(--text-1);
+  font-size: var(--fs-13);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.openas-option:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+.openas-option:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+/* Why Image project is off: right under it, in the body's own muted ink. */
+.openas-reason {
+  margin-top: calc(var(--sp-1) * -1);
+  padding: 0 var(--sp-3);
+  font-size: var(--fs-12);
+  line-height: 1.5;
+  color: var(--text-2);
+}
+/* Busy: a choice is being made (the files are probed, then the project is
+   saved). Both choices are off; the one being made keeps full ink so it
+   reads as "working on this", not as refused. */
+.openas-modal[aria-busy="true"] {
+  cursor: progress;
+}
+.openas-modal[aria-busy="true"] .openas-option:disabled {
+  cursor: progress;
+}
+.openas-option[data-pending]:disabled {
+  opacity: 1;
+  border-color: var(--accent);
+}
