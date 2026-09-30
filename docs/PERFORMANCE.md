@@ -96,22 +96,40 @@ release exe, and the tables are filled by that run.
 
 | Metric | v0.8.1 | v0.9.0 | Verdict |
 |---|---|---|---|
-| Start → window (warm) | | | |
-| Idle RAM, home screen (app + WebView2) | | | |
-| Explorer launch → viewer on file, cold (title names the file) | — | | — |
-| Explorer launch → viewer on file, warm | — | | — |
-| Warm swap (second open while viewing) | — | | — |
+| Start → window (warm) | 38.4 ms | 31.0 ms | parity (median of 14 each; see note) |
+| Idle RAM, home screen (app + WebView2) | 360.7 MB | 363.6 MB | parity (+0.8%, median of 3) |
+| Explorer launch → viewer on file, cold (title names the file) | — | 248 ms | — |
+| Explorer launch → viewer on file, warm | — | 31.6 ms | — |
+| Warm swap (second open while viewing) | — | 31.1 ms | — |
 
 | Viewer state | RAM (app + WebView2) | 30 s idle CPU |
 |---|---|---|
-| Still shown | | |
-| Paused 1080p H.264 | | |
-| After 20 photos of 24–48 MP, +10 s | | — |
-| Home screen, for comparison | | |
+| Still shown | 374.0 MB | 0.05 s |
+| A 720p H.264 clip playing (it autoplays; not paused) | 460.8 MB | 1.71 s |
+| After 20 photos of 24 MP, +10 s | 385.5 MB (peak 406.1 MB) | — |
+| Home screen, for comparison | 363.6 MB | 0.17 s (0.8.1: 0.11 s) |
 
 | Cache | Before | After | Note |
 |---|---|---|---|
-| Preview cache size | | | |
+| Preview cache size | 0.06 MB | 0.06 MB | the clip plays direct; nothing prepared |
+
+Measured 2026-09-30 on the reference machine: the v0.8.1 portable from the
+release folder against the 0.9.0 release exe, one scripted session, launches
+interleaved 0.8.1 / 0.9.0 / 0.9.0 / 0.8.1. First launch of each binary: 119 ms
+and 127 ms (the 0.9.0 exe was new to Defender). Notes on the method:
+
+- "Window" is now a VISIBLE, non-minimized window of the process titled
+  "Taroting" (or naming the file), found by enumerating the process's
+  windows. `MainWindowTitle` alone can report the single-instance plugin's
+  hidden `com.taroting.app-siw` window, which exists before the real one.
+- The poll sleeps 20 ms and Windows timers tick at ~15.6 ms, so every
+  window-level time here lands on 31 or 46 ms: the start and warm numbers
+  mean "under ~50 ms", and a difference between them is not a real one. The
+  cold viewer launch (248 ms) is well above that floor.
+- Warm = an instance already on Home; the Explorer launch hands the file over
+  and exits. The 24 MP photos were generated for the run (testsrc2, 6000×4000
+  JPEG) and opened one after another into the running viewer the same way,
+  so they are loaded and replaced as a user flipping through them would.
 
 ## v0.9.0 — opening a file without Home first (A/B)
 
