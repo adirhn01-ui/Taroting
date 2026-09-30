@@ -1557,23 +1557,19 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
         assert(rendered($("#ed-keep")), "#ed-keep is not rendered beside the Temporary badge");
         const back = $<HTMLButtonElement>("#ed-home")!;
         assert(back.title === "Back to viewer", `#ed-home is titled "${back.title}", not "Back to viewer"`);
+        // Nothing was edited: Back asks nothing (the owner's hands-on report —
+        // it used to ask "Keep temporary project?" about an untouched photo).
+        assert(!dev.session.edited, "precondition: opening the photo as a project already marked it edited");
         back.click();
-        await until(() => $(".modal-backdrop [data-act='keep']"), 3_000, () => `the Keep/Discard dialog (${onScreen()})`);
-        assert(/Keep temporary project\?/.test(text(".modal-backdrop .modal__header")), `the dialog reads "${text(".modal-backdrop .modal__header")}"`);
-        await until(
-          () => document.activeElement === $(".modal-backdrop [data-act='keep']"),
-          1_000,
-          () => `focus on Keep (focus is on ${describeEl(document.activeElement)})`,
-        );
-        await answerDialog("discard");
         await until(
           () => $("#vw") && !$(".imged") && viewerDev() && baseName(viewerDev()!.path()) === "IMG_7.JPG",
           5_000,
-          () => `the viewer back on IMG_7.JPG (${onScreen()})`,
+          () => `the viewer back on IMG_7.JPG (${onScreen()}; dialog ${$(".modal-backdrop") ? `"${text(".modal-backdrop .modal__header")}"` : "none"})`,
         );
-        assert(currentSession.get() === null, "a session is still current after Discard");
-        await waitGone(tempPath, "Discard left the temporary image project on disk");
-        return `viewer → Open as project → image editor (current session, Temporary + Keep, "Back to viewer"); Back → Keep/Discard with Keep focused → Discard → viewer on IMG_7.JPG, scratch deleted — ${ms(t0)}`;
+        assert(currentSession.get() === null, "a session is still current after Back");
+        await waitGone(tempPath, "Back left the untouched temporary image project on disk");
+        assert(!$(".modal-backdrop"), `Back on an untouched temporary image project asked "${text(".modal-backdrop .modal__header")}"`);
+        return `viewer → Open as project → image editor (current session, Temporary + Keep, "Back to viewer"); untouched, so Back → no question → viewer on IMG_7.JPG, scratch deleted — ${ms(t0)}`;
       } finally {
         await leave(tempPath ? [tempPath] : []);
         if (settingsStore.get().openWith !== openWith) await updateSettings({ openWith }).catch(() => {});

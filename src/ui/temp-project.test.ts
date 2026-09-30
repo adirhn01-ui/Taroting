@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import { ipc } from "../core/ipc";
-import { createProject } from "../core/project";
+import { addMarkerAt, createProject } from "../core/project";
 import { ProjectSession } from "../core/session";
 import {
   createTempExits,
@@ -101,8 +101,12 @@ function deferDelete(): () => void {
 let sessions: ProjectSession[] = [];
 let order: string[] = [];
 
-function tempSession(): ProjectSession {
+/** A temporary session the user has EDITED (the case the prompt is for), or,
+ *  with `edited: false`, one nobody has touched — which leaves without a
+ *  question, as the window close already did. */
+function tempSession(opts: { edited?: boolean } = {}): ProjectSession {
   const s = new ProjectSession(TEMP_PATH, createProject(PROJECT_NAME), { temp: true });
+  if (opts.edited !== false) s.replace(addMarkerAt(s.project, 0.25).project);
   sessions.push(s);
   return s;
 }
@@ -139,6 +143,53 @@ afterEach(() => {
   sessions = [];
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+describe("createTempLeaveGateWith — an untouched temporary project", () => {
+  it("leaves without asking: the scratch file is discarded, then dest fires once", async () => {
+    const s = tempSession({ edited: false });
+    expect(s.edited).toBe(false);
+    const ask = vi.fn(async (): Promise<KeepChoice> => "keep");
+    const o = outcome();
+    createTempLeaveGateWith(s, ask).confirmLeave(o.dest, o.cancel);
+    await settle();
+    await settle();
+    expect(ask).not.toHaveBeenCalled();
+    expect(order).toEqual([`deleteProject:${TEMP_PATH}`]);
+    expect([o.dests, o.cancels]).toEqual([1, 0]);
+  });
+
+  it("an OS open or the window close (confirm) proceeds without asking", async () => {
+    const s = tempSession({ edited: false });
+    const ask = vi.fn(async (): Promise<KeepChoice> => "cancel");
+    await expect(createTempLeaveGateWith(s, ask).confirm()).resolves.toBe(true);
+    expect(ask).not.toHaveBeenCalled();
+    expect(order).toEqual([`deleteProject:${TEMP_PATH}`]);
+  });
+
+  it("a decoded-size fix-up the user did not make (edit: false) is still untouched", async () => {
+    const s = tempSession({ edited: false });
+    s.replace(addMarkerAt(s.project, 0.5).project, { edit: false });
+    const ask = vi.fn(async (): Promise<KeepChoice> => "cancel");
+    const o = outcome();
+    createTempLeaveGateWith(s, ask).confirmLeave(o.dest, o.cancel);
+    await settle();
+    await settle();
+    expect(ask).not.toHaveBeenCalled();
+    expect([o.dests, o.cancels]).toEqual([1, 0]);
+  });
+
+  it("one real edit brings the question back", async () => {
+    const s = tempSession({ edited: false });
+    s.replace(addMarkerAt(s.project, 0.75).project);
+    const ask = vi.fn(async (): Promise<KeepChoice> => "cancel");
+    const o = outcome();
+    createTempLeaveGateWith(s, ask).confirmLeave(o.dest, o.cancel);
+    await settle();
+    expect(ask).toHaveBeenCalledTimes(1);
+    expect(order).toEqual([]);
+    expect([o.dests, o.cancels]).toEqual([0, 1]);
+  });
 });
 
 describe("createTempLeaveGateWith — exactly one of dest / onCancel", () => {

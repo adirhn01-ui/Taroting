@@ -655,7 +655,16 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
         `#ed-home is titled "${back?.title ?? "(missing)"}", not "Back to viewer"`,
       );
       assert(!$("#vw"), "the viewer is still mounted under the editor");
+      // An EDITED temporary project asks on Back (an untouched one just goes:
+      // autotest-image's viewer block pins that side), with Keep focused.
+      session.commit((p) => addMarkerAt(p, 0.25).project);
       back!.click();
+      await until(() => $(".modal-backdrop [data-act='keep']"), 3_000, () => `the Keep/Discard dialog — ${viewerState()}`);
+      await until(
+        () => document.activeElement === $(".modal-backdrop [data-act='keep']") || null,
+        1_000,
+        () => `focus on Keep (focus is on ${document.activeElement?.tagName ?? "nothing"})`,
+      );
       await answerDialog("discard");
       await until(
         () => {
@@ -673,7 +682,7 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
       );
       assert(currentSession.get() === null, "a session is still current after Discard");
       await waitGone(tempPath, "Discard left the temp project on disk");
-      return `menu → temp project (Temporary, "Back to viewer") → Back → Discard → a NEW viewer on clip2.mp4; temp .trt deleted — ${ms(t0)}`;
+      return `menu → temp project (Temporary, "Back to viewer") → edit → Back → Keep/Discard (Keep focused) → Discard → a NEW viewer on clip2.mp4; temp .trt deleted — ${ms(t0)}`;
     } finally {
       await backHome();
       if (tempPath) await ipc.deleteProject(tempPath).catch(() => {});
@@ -820,7 +829,9 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
       const session = await waitEditor(prev, "an Explorer open in editor mode");
       tempPath = session.path;
       const editorRoot = $(".editor");
-      // A second Explorer open meets the temp project's leave gate.
+      // A second Explorer open meets the temp project's leave gate — which
+      // asks only about an EDITED project (an untouched one just goes).
+      session.commit((p) => addMarkerAt(p, 0.25).project);
       await ipc.debugPushOpenPath(fx("clip2.mp4"));
       await answerDialog("cancel");
       const toastEl = await until(

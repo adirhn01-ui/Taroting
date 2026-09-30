@@ -92,11 +92,13 @@ before.
 
 - **Keep** a temporary project at any time with the button next to its
   Temporary badge; it becomes an ordinary project in your library.
-- **Closing the window asks first when that would lose something:** an edited
-  temporary project offers Keep or Discard, a running export asks before
-  stopping, and a save that has not landed is never skipped silently. An
-  unedited temporary project just goes. If the window ever stops responding, a
-  second close a few seconds later still closes it.
+- **Leaving or closing asks first only when that would lose something:** an
+  edited temporary project offers Keep or Discard (on Back, on opening another
+  file from File Explorer, and on closing the window), a running export asks
+  before stopping, and a save that has not landed is never skipped silently. A
+  temporary project you never changed just goes, without a question. If the
+  window ever stops responding, a second close a few seconds later still
+  closes it.
 - Closing the window while cropping or previewing a colour no longer saves the
   crop or colour you never applied.
 

@@ -30,6 +30,17 @@ import { toast } from "../ui/toast";
 
 /* ---------------- pure pieces (exported for the tests) ---------------- */
 
+/** The Image project choice's hint. It names the file whose size the canvas
+ *  takes only when there is one to name: with a video, a song or too many
+ *  pictures among the files the choice is off, and the first file (in name
+ *  order) may not be a picture at all — naming it would promise a canvas
+ *  "the size of" a video. */
+export function imageProjectHint(paths: readonly string[], blocked: string | null): string {
+  if (paths.length === 1) return "Draw on, adjust and export a picture";
+  if (blocked !== null) return "Every picture a layer, on one canvas";
+  return `Every picture a layer, on a canvas the size of ${fileName(paths[0]!)}`;
+}
+
 export function openAsTitle(count: number): string {
   return count === 1 ? "Open 1 file as" : `Open ${count} files as`;
 }
@@ -144,14 +155,7 @@ export function openOpenAsDialog(opts: OpenAsOptions): () => void {
 
   const body = el("div", "modal__body openas-options");
   const videoBtn = option("video", "film", "Video project", "Clips, photos and music on a timeline");
-  const imageBtn = option(
-    "image",
-    "image",
-    "Image project",
-    count === 1
-      ? "Draw on, adjust and export a picture"
-      : `Every picture a layer, on a canvas the size of ${fileName(opts.paths[0]!)}`,
-  );
+  const imageBtn = option("image", "image", "Image project", imageProjectHint(opts.paths, blocked));
   body.append(videoBtn, imageBtn);
   if (blocked) {
     imageBtn.disabled = true;

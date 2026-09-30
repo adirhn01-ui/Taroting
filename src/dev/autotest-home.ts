@@ -194,6 +194,9 @@ export async function runHomeBlocks(ctx: HomeCtx): Promise<void> {
       dev!.open([ALPHA, VIDEO]);
       await waitDialog("a picture and a video");
       assert(opt("image").disabled, "Image project is enabled with a video among the files");
+      // The off choice never names the video as the canvas it would take.
+      const offHint = text(opt("image").querySelector(".ctx-menu__hint"));
+      assert(offHint === "Every picture a layer, on one canvas", `the disabled Image project hint reads "${offHint}"`);
       assert(!opt("video").disabled, "Video project is disabled");
       const reason = $(".openas-reason");
       assert(rendered(reason), "the reason is not rendered");

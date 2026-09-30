@@ -118,7 +118,7 @@ const doc = Object.assign(new Listeners(), {
 });
 vi.stubGlobal("document", doc);
 
-const { MAX_OPEN_AS_PICTURES, createImageProjectFrom, imageProjectBlocker, openAsTitle, openOpenAsDialog } =
+const { MAX_OPEN_AS_PICTURES, createImageProjectFrom, imageProjectBlocker, imageProjectHint, openAsTitle, openOpenAsDialog } =
   await import("./open-as-dialog");
 
 const backdrop = (): El | undefined => body.children.find((c) => c.className === "modal-backdrop");
@@ -251,6 +251,15 @@ describe("openOpenAsDialog", () => {
     open(["C:\\p\\Shot 2.png", "C:\\q\\shot 10.jpg"]);
     const hint = option("image").find((e) => e.className === "ctx-menu__hint")[0]!;
     expect(hint.textContent).toBe("Every picture a layer, on a canvas the size of Shot 2.png");
+  });
+
+  it("never names a video as the canvas when one is among the files (the choice is off)", () => {
+    // Name order puts the video first: the hint used to read "on a canvas the
+    // size of clip 1.mp4".
+    open(["C:\\p\\clip 1.mp4", "C:\\p\\photo 2.png"]);
+    const hint = option("image").find((e) => e.className === "ctx-menu__hint")[0]!;
+    expect(option("image").disabled).toBe(true);
+    expect(hint.textContent).toBe("Every picture a layer, on one canvas");
   });
 
   it("Video project calls back once, then closes the dialog when the work settles", async () => {
@@ -411,5 +420,17 @@ describe("createImageProjectFrom", () => {
     expect(await createImageProjectFrom(["C:\\p\\a.png"], () => true)).toBeNull();
     expect(m.saved).toEqual([]);
     expect(m.errors).toEqual([]);
+  });
+});
+
+describe("imageProjectHint", () => {
+  it("names the first picture only when Image project is available", () => {
+    const pics = ["C:\\p\\Beach 1.jpg", "C:\\p\\Beach 2.jpg"];
+    expect(imageProjectHint(pics, null)).toBe("Every picture a layer, on a canvas the size of Beach 1.jpg");
+    const mixed = ["C:\\p\\a clip.mp4", "C:\\p\\b photo.png"];
+    expect(imageProjectHint(mixed, imageProjectBlocker(mixed))).toBe("Every picture a layer, on one canvas");
+    expect(imageProjectHint(["C:\\p\\song.mp3"], imageProjectBlocker(["C:\\p\\song.mp3"]))).toBe(
+      "Draw on, adjust and export a picture",
+    );
   });
 });

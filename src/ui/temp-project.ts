@@ -125,9 +125,11 @@ export async function discardTempSession(session: ProjectSession): Promise<void>
 }
 
 export interface TempLeaveGate {
-  /** Busy → onCancel. Not temp, or already discarded → dest() now. Temp → askKeepTemp():keep → keepTempSession → dest;
-   *  discard → discardTempSession → dest; cancel, re-entrancy bail, or keep failure (toast)
-   *  → onCancel. EXACTLY ONE of dest/onCancel fires, on every path. */
+  /** Busy → onCancel. Not temp, or already discarded → dest() now. Temp and never
+   *  edited → discardTempSession → dest, without asking. Temp and edited →
+   *  askKeepTemp():keep → keepTempSession → dest; discard → discardTempSession →
+   *  dest; cancel, re-entrancy bail, or keep failure (toast) → onCancel. EXACTLY ONE
+   *  of dest/onCancel fires, on every path. */
   confirmLeave(dest: () => void, onCancel?: () => void): void;
   /** Same as a promise (for session.leaveGuard and the close gate): true = proceed. */
   confirm(): Promise<boolean>;
@@ -195,11 +197,19 @@ export function createTempLeaveGateWith(
     let proceed = false;
     try {
       let choice: KeepChoice;
-      try {
-        choice = await ask();
-      } catch {
-        // A prompt that could not even be shown is a cancel: stay, nothing lost.
-        choice = "cancel";
+      if (!session.edited) {
+        // Nothing of the user's is in it: no question, the scratch copy just
+        // goes — the rule the window close already follows (core/app-close
+        // decideClose). Back, Ctrl+W, the gear and an OS open used to ask
+        // even about a project nobody had touched.
+        choice = "discard";
+      } else {
+        try {
+          choice = await ask();
+        } catch {
+          // A prompt that could not even be shown is a cancel: stay, nothing lost.
+          choice = "cancel";
+        }
       }
       if (choice === "keep") {
         try {
