@@ -173,9 +173,13 @@ shows (a product decision); what the timing decides is the viewer-mode launch.
 
 | Measure | Launch | A median | B median | B − A | T | Verdict |
 |---|---|---|---|---|---|---|
-| M1 | Plain launch | | | | | |
-| M2 | 1080p H.264 `.mp4`, viewer mode | | | | | |
-| M2 | 12 MP `.jpg`, viewer mode | | | | | |
+| M1 | Plain launch | 43.3 ms | 44.2 ms | +0.9 ms | 10 ms | Unchanged |
+| M2 | 720p H.264 `.mp4` (30 s clip), viewer mode | 295.0 ms | 249.3 ms | −45.7 ms | 14.8 ms | Faster — ships |
+| M2 | 12 MP `.jpg`, viewer mode | — | — | — | — | Not measured in the 2026-09-29 run |
+
+Measured 2026-09-29 on the reference machine: N = 9 rounds of A B B A (18
+launches per binary per measure), owner settings restored byte for byte
+afterwards.
 
 | Measure | Launch (B only, by eye) | Editor without Home first? |
 |---|---|---|
@@ -184,5 +188,5 @@ shows (a product decision); what the timing decides is the viewer-mode launch.
 
 | Binary | First launch (incl. Defender scan) |
 |---|---|
-| A | |
-| B | |
+| A | 168 ms |
+| B | 120 ms |
