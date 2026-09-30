@@ -182,28 +182,57 @@ fn publish_export(part: &std::path::Path, final_path: &std::path::Path) -> std::
 /// call, two resolved paths are `Same` or `Different`, and either side that
 /// will not resolve is `Unknown`.
 ///
-/// `Unknown` refuses, except where the answer is already proven: a destination
-/// that does not exist cannot be any file the project reads (this is the normal
-/// export, and it resolves to `Unknown`, so refusing there would block every
-/// export), and neither can a source that is proven absent (it can't be the
-/// destination that does exist). `try_exists` rather than `exists`, because
-/// only `Ok(false)` is proof; a permission error is not. A refusal on
-/// `Unknown` says so ("couldn't check", e.g. an unreachable share) instead of
-/// claiming an overwrite nobody proved.
+/// `Unknown` is decided without the filesystem's word only where that is
+/// safe: a destination that does not exist cannot be any file the project
+/// reads (this is the normal export, and it resolves to `Unknown`, so refusing
+/// there would block every export), and neither can a source that is proven
+/// absent (it can't be the destination that does exist). `try_exists` rather
+/// than `exists`, because only `Ok(false)` is proof; a permission error is not.
+///
+/// A source that EXISTS but will not resolve — or any source against a
+/// destination that will not (`canonicalize` fails outright on volumes whose
+/// driver lacks `GetFinalPathNameByHandleW`: some RAM disks, VirtualBox shares,
+/// Dokan/FUSE drives) — falls back to the comparison the export dialog makes
+/// (`comparable_path`, the backend twin of `comparablePath`). Refusing it
+/// instead turned the dialog's Replace into a button that always failed on
+/// such a volume, where 0.8.1 replaced the file. Only a source that cannot be
+/// asked about at all (`try_exists` is `Err`) still refuses, and that refusal
+/// says so ("couldn't check", e.g. an unreachable share) instead of claiming
+/// an overwrite nobody proved.
 fn refuse_overwriting_a_source(out_path: &str, media: &[MediaRef]) -> Result<()> {
+    refuse_overwriting_a_source_with(out_path, media, |p| std::fs::canonicalize(p).ok())
+}
+
+/// A path compared the way Windows names files: separators unified, ASCII case
+/// folded — `comparablePath` in `export-dialog.ts`, rule for rule. ASCII only,
+/// on purpose: NTFS folds with a far narrower table than full Unicode, so
+/// "Straße" and "Straẞe" are two files there and must not read as one. The
+/// fallback for a path the filesystem would not resolve, never the first
+/// question.
+fn comparable_path(p: &std::path::Path) -> String {
+    p.to_string_lossy().replace('/', "\\").to_ascii_lowercase()
+}
+
+/// `refuse_overwriting_a_source` with the resolver injected, so a test can
+/// stand in for a volume `canonicalize` cannot resolve.
+fn refuse_overwriting_a_source_with(
+    out_path: &str,
+    media: &[MediaRef],
+    resolve: impl Fn(&std::path::Path) -> Option<std::path::PathBuf>,
+) -> Result<()> {
     let out = std::path::PathBuf::from(out_path);
     let part = std::path::PathBuf::from(format!("{out_path}.part"));
     for dest in [&out, &part] {
         if matches!(dest.try_exists(), Ok(false)) {
             continue;
         }
-        let real_dest = std::fs::canonicalize(dest).ok();
+        let real_dest = resolve(dest);
         for m in media.iter().filter(|m| m.generator.is_none()) {
             let src = std::path::Path::new(&m.path);
             let identity = if dest.as_path() == src {
                 PathIdentity::Same
             } else {
-                match (&real_dest, std::fs::canonicalize(src).ok()) {
+                match (&real_dest, resolve(src)) {
                     (Some(d), Some(s)) if *d == s => PathIdentity::Same,
                     (Some(_), Some(_)) => PathIdentity::Different,
                     _ => PathIdentity::Unknown,
@@ -217,13 +246,21 @@ fn refuse_overwriting_a_source(out_path: &str, media: &[MediaRef]) -> Result<()>
                     )));
                 }
                 PathIdentity::Different => {}
-                PathIdentity::Unknown if matches!(src.try_exists(), Ok(false)) => {}
-                PathIdentity::Unknown => {
-                    return Err(AppError::BadInput(format!(
-                        "Couldn't check whether this would overwrite {name}, which this project uses. \
-                         Choose another name."
-                    )));
-                }
+                PathIdentity::Unknown => match src.try_exists() {
+                    Ok(false) => {}
+                    Ok(true) if comparable_path(dest) == comparable_path(src) => {
+                        return Err(AppError::BadInput(format!(
+                            "This would overwrite {name}, which this project uses. Choose another name."
+                        )));
+                    }
+                    Ok(true) => {}
+                    Err(_) => {
+                        return Err(AppError::BadInput(format!(
+                            "Couldn't check whether this would overwrite {name}, which this project uses. \
+                             Choose another name."
+                        )));
+                    }
+                },
             }
         }
     }
@@ -1104,6 +1141,48 @@ mod unit {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A volume `canonicalize` cannot resolve (some RAM disks, VirtualBox
+    /// shares, Dokan/FUSE drives), stood in for by a resolver that never
+    /// answers. The files are real, so `try_exists` still says they are there.
+    /// Replacing an earlier export there was refused as "couldn't check" —
+    /// 0.8.1 replaced it — so the dialog's Replace always failed. The fallback
+    /// is the dialog's own comparison: an unrelated file may be replaced, and
+    /// the source itself, however it is spelled, is still refused as an
+    /// overwrite.
+    #[cfg(windows)]
+    #[test]
+    fn a_volume_that_will_not_resolve_falls_back_to_comparing_the_names() {
+        let dir = publish_dir("guard-unresolvable");
+        let src = dir.join("Holiday Clip.mp4");
+        let previous = dir.join("Holiday Clip export.mp4");
+        std::fs::write(&src, b"the original footage").unwrap();
+        std::fs::write(&previous, b"last week's export").unwrap();
+        let media = [source("m1", &src)];
+        let unresolvable = |_: &std::path::Path| None;
+
+        refuse_overwriting_a_source_with(&previous.to_string_lossy(), &media, unresolvable)
+            .expect("an unrelated existing file may be replaced on any volume");
+
+        let spellings = [
+            src.to_string_lossy().to_ascii_uppercase(),
+            // Upper case AND forward slashes, so neither `Path`'s own equality
+            // (which already treats both separators as one) nor folding case
+            // alone is what matches it.
+            src.to_string_lossy().to_ascii_uppercase().replace('\\', "/"),
+        ];
+        for spelling in spellings {
+            let err = refuse_overwriting_a_source_with(&spelling, &media, unresolvable)
+                .expect_err("the source itself must still be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("This would overwrite Holiday Clip.mp4,"),
+                "{spelling}: must claim the overwrite it found by name: {msg}"
+            );
+        }
+        assert_eq!(std::fs::read(&src).unwrap(), b"the original footage");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Generated media have no file; their `path` is a placeholder and never
     /// names anything on disk, so it is not compared at all.
     #[test]
@@ -1470,6 +1549,86 @@ mod e2e {
             generator: Some(Generator::Solid { color: color.into() }),
             no_autorotate: None,
         }
+    }
+
+    /* -------- (0) a video stream shorter than its clip -------- */
+
+    /// A full-length drop of a file whose audio outlasts its video: the clip's
+    /// `src_out` is the probed CONTAINER duration (1.5 s here), the video
+    /// stream ends at 1.0 s. The segment used to end with the stream
+    /// (`overlay=...:shortest=1`), so the export came out ~0.5 s short and the
+    /// white clip after it started at 1.0 s instead of 1.5 s — every later
+    /// segment early against its `adelay`-placed audio. It must hold the last
+    /// red frame to the end of its slot and keep the next clip on its
+    /// absolute time.
+    #[test]
+    fn e2e_a_video_stream_shorter_than_its_clip_keeps_later_clips_on_time() {
+        let dir = case_dir("short video stream");
+        let src = dir.join("short video.mp4");
+        ffmpeg_ok(&[
+            "-y",
+            "-f", "lavfi", "-i", "color=red:s=320x180:r=30:d=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1.5",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            src.to_str().unwrap(),
+        ]);
+        let info = probe::probe_sync(src.to_str().unwrap()).unwrap();
+        let video_end: f64 = probe_field(&src, "stream=duration").parse().unwrap();
+        assert!(
+            info.duration - video_end > 0.3,
+            "premise: the container ({}) outlasts the video stream ({video_end})",
+            info.duration
+        );
+        let media = MediaRef {
+            id: "m1".into(),
+            path: src.to_string_lossy().into_owned(),
+            size: info.size,
+            mtime_ms: info.mtime_ms,
+            kind: "video".into(),
+            duration: info.duration,
+            fps: Some(Rational { num: 30, den: 1 }),
+            width: Some(320),
+            height: Some(180),
+            container: info.container.clone(),
+            vcodec: info.vcodec.clone(),
+            acodec: info.acodec.clone(),
+            pix_fmt: info.pix_fmt.clone(),
+            bit_depth: Some(8),
+            has_audio: true,
+            audio_rate: info.audio_rate,
+            audio_channels: info.audio_channels,
+            generator: None,
+            no_autorotate: None,
+        };
+        let white = solid_media("white", "#ffffff");
+        let slot = info.duration;
+        let bottom = vtrack(
+            "vbot",
+            vec![clip_at("a", "m1", 0.0, 0.0, slot), clip_at("b", "white", slot, 0.0, 1.0)],
+        );
+        let tl = Timeline {
+            fps: Rational { num: 30, den: 1 }, width: 640, height: 360,
+            tracks: vec![bottom], markers: vec![],
+        };
+        let spec = ExportSpec {
+            media: vec![media, white], timeline: tl, preset: preset_640(30.0),
+            out_path: dir.join("held.mp4").to_string_lossy().into_owned(),
+        };
+        let out = encode(&spec, &dir, "held.mp4");
+
+        let exported: f64 = probe_field(&out, "stream=duration").parse().unwrap();
+        assert!(
+            (exported - (slot + 1.0)).abs() < 0.05,
+            "the video must be as long as the timeline: {exported} vs {}",
+            slot + 1.0
+        );
+        let centre = |t: f64| yavg(&out, t, 260, 120, 120, 120);
+        let held = centre(slot - 0.2);
+        let next = centre(slot + 0.2);
+        assert!(held < 120.0, "the last red frame must hold to the end of its slot: YAVG {held}");
+        assert!(next > 200.0, "the white clip must start on its own time: YAVG {next}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /* -------- (1) two-layer composite -------- */

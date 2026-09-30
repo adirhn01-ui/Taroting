@@ -35,6 +35,7 @@ import type { ImageEditorCtx } from "./context";
 import { IMAGE_SCALE_GUARD, canvasToLayer, hitLayer, layerCorners, layerToCanvas } from "./geom";
 import { findLayer, layersOf, setLayerTransform, type Layer } from "./layers";
 import { strokeBounds } from "./ink/paint";
+import { sameEdit } from "./same-edit";
 
 /* ------------------------------------------------------------------ */
 /* Pure geometry (exported for the unit tests)                          */
@@ -354,7 +355,12 @@ const menuOpen = (): boolean => {
   return m !== null && m.style.display === "block";
 };
 
-export function mountSelectTool(ctx: ImageEditorCtx): { dispose(): void } {
+export function mountSelectTool(ctx: ImageEditorCtx): {
+  /** Cancel an open per-layer crop now, synchronously (the window is closing:
+   *  its save must not write a crop the user never applied). */
+  revertCrop(): void;
+  dispose(): void;
+} {
   const { session, selection, view, tools, mode, stage, res } = ctx;
   let disposed = false;
 
@@ -721,7 +727,8 @@ export function mountSelectTool(ctx: ImageEditorCtx): { dispose(): void } {
   interface CropSession {
     trackId: string;
     before: ProjectFile;
-    /** the last project this mode wrote; anything else in the store is foreign */
+    /** the last project this mode wrote; anything else in the store is foreign
+     *  (a save's `modifiedAt` restamp is not: see same-edit.ts) */
     lastWritten: ProjectFile;
     unblock: () => void;
     release: () => void;
@@ -799,9 +806,10 @@ export function mountSelectTool(ctx: ImageEditorCtx): { dispose(): void } {
     if (!c) return;
     endCropGesture(false);
     crop = null;
-    const ours = session.project === c.lastWritten && !!findLayer(session.project, c.trackId);
-    if (ours && how === "commit") session.commitFrom(c.before);
-    else if (ours && how === "revert" && session.project !== c.before) {
+    const ours = sameEdit(session.project, c.lastWritten) && !!findLayer(session.project, c.trackId);
+    // (A restamp alone is no crop: it must not land as an empty undo step.)
+    if (ours && how === "commit" && !sameEdit(session.project, c.before)) session.commitFrom(c.before);
+    else if (ours && how === "revert" && !sameEdit(session.project, c.before)) {
       session.replace(c.before);
       ctx.requestRender();
     }
@@ -985,7 +993,7 @@ export function mountSelectTool(ctx: ImageEditorCtx): { dispose(): void } {
     listenWindow(false);
     uncapture(g.pointerId);
     const c = crop;
-    if (revert && c && session.project === c.lastWritten && findLayer(session.project, c.trackId)) {
+    if (revert && c && sameEdit(session.project, c.lastWritten) && findLayer(session.project, c.trackId)) {
       writeCrop(c, g.start, g.srcW, g.srcH);
     }
   }
@@ -1045,7 +1053,7 @@ export function mountSelectTool(ctx: ImageEditorCtx): { dispose(): void } {
     nudgeTimer = undefined;
     const before = nudgeBefore;
     nudgeBefore = null;
-    if (before && session.project === nudgeWritten) session.commitFrom(before);
+    if (before && nudgeWritten && sameEdit(session.project, nudgeWritten)) session.commitFrom(before);
     nudgeWritten = null;
   }
 
@@ -1069,7 +1077,7 @@ export function mountSelectTool(ctx: ImageEditorCtx): { dispose(): void } {
     if (!l || l.hidden) return;
     e.preventDefault();
     const step = e.shiftKey ? 10 : 1;
-    if (!nudgeBefore || session.project !== nudgeWritten) nudgeBefore = session.project;
+    if (!nudgeBefore || !nudgeWritten || !sameEdit(session.project, nudgeWritten)) nudgeBefore = session.project;
     const next = setLayerTransform(session.project, l.trackId, {
       x: l.transform.x + dx * step,
       y: l.transform.y + dy * step,
@@ -1118,13 +1126,14 @@ export function mountSelectTool(ctx: ImageEditorCtx): { dispose(): void } {
       schedulePaint();
     }),
     session.store.subscribe((p) => {
-      if (crop && p !== crop.lastWritten) {
+      if (crop && !sameEdit(p, crop.lastWritten)) {
         // Something else edited the project mid-crop (an inspector control, an
         // undo button): whatever it did already holds our crop. Step out
-        // without touching history.
+        // without touching history. A save's restamp (autosave, or the
+        // Temporary badge's Keep, which no hold defers) is not an edit.
         exitCrop("leave");
       }
-      if (nudgeBefore && p !== nudgeWritten) {
+      if (nudgeBefore && (!nudgeWritten || !sameEdit(p, nudgeWritten))) {
         window.clearTimeout(nudgeTimer);
         nudgeBefore = null;
         nudgeWritten = null;
@@ -1141,6 +1150,9 @@ export function mountSelectTool(ctx: ImageEditorCtx): { dispose(): void } {
   paint();
 
   return {
+    revertCrop(): void {
+      if (!disposed) exitCrop("revert");
+    },
     dispose(): void {
       if (disposed) return;
       // A drag in flight is reverted and an open crop cancelled (both went

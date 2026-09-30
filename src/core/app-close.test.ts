@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProjectSession } from "./session";
 
@@ -35,7 +38,14 @@ vi.mock("../ui/temp-project", () => ({
   createTempLeaveGate: m.createTempLeaveGate,
 }));
 
-import { decideClose, installCloseGate, registerCloseTask, runCloseFlow, type CloseDeps } from "./app-close";
+import {
+  decideClose,
+  installCloseGate,
+  registerBeforeClose,
+  registerCloseTask,
+  runCloseFlow,
+  type CloseDeps,
+} from "./app-close";
 
 type SaveState = "saved" | "dirty" | "saving" | "error";
 
@@ -99,6 +109,9 @@ async function flush(): Promise<void> {
 const unregs: (() => void)[] = [];
 function task(fn: () => void | Promise<void>): void {
   unregs.push(registerCloseTask(fn));
+}
+function before(fn: () => void): void {
+  unregs.push(registerBeforeClose(fn));
 }
 
 beforeEach(() => {
@@ -565,6 +578,117 @@ describe("registerCloseTask", () => {
     a();
     await runCloseFlow(deps(null));
     expect(n).toBe(1);
+  });
+});
+
+describe("registerBeforeClose", () => {
+  it("runs right after the ack, before the settle wait and the session is read", async () => {
+    before(() => {
+      m.log.push("before");
+    });
+    task(() => {
+      m.log.push("task");
+    });
+    expect(await runCloseFlow(deps(null))).toBe("closed");
+    expect(m.log).toEqual(["closeAck", "before", "settle", "session", "task", "settings", "destroy"]);
+  });
+
+  // What the task reverts is what the decision sees: an edited temp project
+  // whose only "edit" was a transient preview is discarded silently, never
+  // asked about — the ask would offer to keep a preview the user never applied.
+  it("the decision sees what the task left behind", async () => {
+    const guard = vi.fn(async () => false);
+    const s = fakeSession({ temp: true, edited: true, guard });
+    before(() => {
+      (s as unknown as { edited: boolean }).edited = false;
+    });
+    expect(await runCloseFlow(deps(s))).toBe("closed");
+    expect(guard).not.toHaveBeenCalled();
+    expect(m.discardTempSession).toHaveBeenCalledWith(s);
+  });
+
+  it("a throwing task is logged and does not stop the others or the close", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    let ran = 0;
+    before(() => {
+      throw new Error("boom");
+    });
+    before(() => {
+      ran++;
+    });
+    const d = deps(null);
+    expect(await runCloseFlow(d)).toBe("closed");
+    expect(ran).toBe(1);
+    expect(d.destroy).toHaveBeenCalledTimes(1);
+    expect(err).toHaveBeenCalledWith("A before-close task failed", expect.any(Error));
+    err.mockRestore();
+  });
+
+  it("unregister removes exactly its own registration, even of the same function", async () => {
+    let n = 0;
+    const fn = (): void => {
+      n++;
+    };
+    const a = registerBeforeClose(fn);
+    before(fn);
+    a();
+    await runCloseFlow(deps(null));
+    expect(n).toBe(1);
+    const b = registerBeforeClose(fn);
+    b();
+    await runCloseFlow(deps(null));
+    expect(n).toBe(2);
+  });
+
+  it("runs on every close request, a fresh one after a Stay included", async () => {
+    let n = 0;
+    before(() => {
+      n++;
+    });
+    const guard = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const d = deps(fakeSession({ temp: true, edited: true, guard }));
+    expect(await runCloseFlow(d)).toBe("stayed");
+    expect(n).toBe(1);
+    expect(await runCloseFlow(d)).toBe("closed");
+    expect(n).toBe(2);
+  });
+
+  // A repeat X while a flow runs is acked and ignored: it never settles or
+  // decides, so there is no "before the decision" for it to run ahead of.
+  it("does not run for a repeat request ignored while a flow is running", async () => {
+    let n = 0;
+    before(() => {
+      n++;
+    });
+    let release!: () => void;
+    const settled = new Promise<void>((r) => (release = r));
+    const d = deps(null, { settle: () => settled });
+    const first = runCloseFlow(d);
+    try {
+      await flush();
+      expect(await runCloseFlow(d)).toBe("stayed");
+      expect(n).toBe(1);
+    } finally {
+      // Released on every outcome: a flow left parked would hold the latch
+      // and turn every later test's request into an ignored repeat.
+      release();
+    }
+    expect(await first).toBe("closed");
+    expect(n).toBe(1);
+  });
+});
+
+// The dialogs behind a close (../ui/temp-project) stay out of the boot chunk:
+// app-close is imported by main.ts, so a static import here puts the Keep
+// question and "close anyway?" into every launch's parse, used or not.
+describe("app-close boot weight", () => {
+  it("imports ../ui/temp-project only lazily", () => {
+    const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "app-close.ts"), "utf8");
+    const staticImports = src
+      .split(/\r?\n/)
+      .filter((l) => /^\s*import\s(?!type\b)/.test(l) && l.includes("../ui/temp-project"));
+    expect(staticImports).toEqual([]);
+    expect(src).toContain('await import("../ui/temp-project")');
   });
 });
 

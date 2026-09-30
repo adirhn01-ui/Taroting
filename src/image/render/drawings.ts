@@ -23,7 +23,7 @@
 
 import type { ProjectFile, Stroke } from "../../core/types";
 import type { Layer } from "../layers";
-import { createScratch, paintStroke, strokeBounds, type Scratch } from "../ink/paint";
+import { createScratch, paintStroke, strokeBounds, type ReleasableScratch, type Scratch } from "../ink/paint";
 import { chunksOf, layerBox, layerMatrix } from "./composite";
 import type { ViewXf } from "./index";
 
@@ -129,7 +129,7 @@ export class DrawingRasters {
   private readonly rasters = new Map<string, Raster>();
   private stageW = 0;
   private stageH = 0;
-  private scratch: Scratch | null = null;
+  private scratch: ReleasableScratch | null = null;
   /** this frame's V·L, reused (a raster copies it into its own `m`) */
   private readonly cur: M6 = [1, 0, 0, 1, 0, 0];
   /** the warp's relative transform, reused */
@@ -228,8 +228,11 @@ export class DrawingRasters {
     }
   }
 
+  /** Give every canvas back: the rasters, their warps, and the stroke scratch
+   *  (grown to the largest pencil box drawn — up to the whole stage). */
   dispose(): void {
     this.invalidate();
+    this.scratch?.release();
     this.scratch = null;
   }
 
@@ -246,7 +249,11 @@ export class DrawingRasters {
   private free(r: Raster): void {
     clearTimeout(r.settleTimer);
     r.canvas.width = 0;
-    if (r.warp) r.warp.width = 0;
+    r.canvas.height = 0;
+    if (r.warp) {
+      r.warp.width = 0;
+      r.warp.height = 0;
+    }
     r.warp = null;
   }
 

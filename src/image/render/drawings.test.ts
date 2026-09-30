@@ -12,6 +12,7 @@ let paintCost = 0;
 let now = 0;
 
 const geom = vi.hoisted(() => ({ calls: 0 }));
+const scratch = vi.hoisted(() => ({ made: 0, released: 0 }));
 vi.mock("../geom", () => ({
   layerToCanvas: (t: ClipTransform) => {
     geom.calls++;
@@ -19,7 +20,15 @@ vi.mock("../geom", () => ({
   },
 }));
 vi.mock("../ink/paint", () => ({
-  createScratch: () => ({ get: () => null }),
+  createScratch: () => {
+    scratch.made++;
+    return {
+      get: () => null,
+      release: () => {
+        scratch.released++;
+      },
+    };
+  },
   paintStroke: (_ctx: unknown, s: Stroke) => {
     painted.push((s as { c: string }).c);
     now += paintCost;
@@ -105,6 +114,8 @@ beforeEach(() => {
   painted.length = 0;
   paintCost = 0;
   now = 0;
+  scratch.made = 0;
+  scratch.released = 0;
   vi.stubGlobal("OffscreenCanvas", FakeCanvas);
   vi.stubGlobal("performance", { now: () => now });
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -261,5 +272,21 @@ describe("DrawingRasters", () => {
     painted.length = 0;
     r.raster(doc, l, view);
     expect(painted).toEqual(["#01"]);
+  });
+
+  it("dispose gives back every canvas it holds: rasters, a warp mid-gesture, and the stroke scratch", () => {
+    const r = new DrawingRasters(() => {});
+    r.setStage(400, 300);
+    paintCost = 5; // heavy: the view change below warps instead of replaying
+    const heavy = layerOf([[s("#01"), s("#02")]]);
+    const raster = r.raster(doc, heavy, view) as unknown as FakeCanvas;
+    const warp = r.raster(doc, heavy, { zoom: 2, panX: 0, panY: 0 }) as unknown as FakeCanvas;
+    expect(warp).not.toBe(raster);
+    expect(scratch.made).toBe(1);
+
+    r.dispose();
+    expect([raster.width, raster.height]).toEqual([0, 0]);
+    expect([warp.width, warp.height]).toEqual([0, 0]);
+    expect(scratch.released).toBe(1);
   });
 });

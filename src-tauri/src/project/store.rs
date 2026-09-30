@@ -64,6 +64,38 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// A project as the pretty JSON every `.trt` writer here puts on disk,
+/// refused when it would be larger than `image_rules::MAX_TRT_BYTES` — the cap
+/// every READ enforces (`read_capped`). Writing past it saves a project the
+/// next open refuses, and the `.bak` recovery does not step in (it keys on a
+/// missing file, not an oversize one). Pretty-printing is what gets there: a
+/// compact file under the cap, or a drawing duplicated many times over, can
+/// re-serialize past it.
+///
+/// Every writer, not only the save: rename deletes the readable original once
+/// its copy is down, and a load-time repair would replace it.
+fn project_bytes(value: &Value) -> Result<Vec<u8>> {
+    project_bytes_within(value, image_rules::MAX_TRT_BYTES)
+}
+
+/// `project_bytes` against any cap, so the tests can prove the refusal
+/// without half a gigabyte of JSON.
+fn project_bytes_within(value: &Value, cap: u64) -> Result<Vec<u8>> {
+    const MB: u64 = 1024 * 1024;
+    let bytes = serde_json::to_vec_pretty(value)?;
+    if bytes.len() as u64 > cap {
+        let limit = if cap >= MB && cap % MB == 0 {
+            format!("{} MB", cap / MB)
+        } else {
+            format!("{cap} bytes")
+        };
+        return Err(AppError::BadInput(format!(
+            "refusing to save: the project would be larger than {limit}, which Taroting can't open"
+        )));
+    }
+    Ok(bytes)
+}
+
 /// The outcome of reading a JSON file that has a `.bak` sibling.
 ///
 /// The distinction that earns its keep is `Absent` vs `Unreadable`. "Nothing is
@@ -524,6 +556,18 @@ fn is_transposition(stored: (u32, u32), probed: (u32, u32)) -> bool {
 /// justification by years. If it ever needs bounding, bound it here — the
 /// candidate filter below is where the cheap wins already are.
 fn rotation_fixes(media: &[schema::MediaRef]) -> Vec<DimFix> {
+    rotation_fixes_with(media, |path| {
+        let info = crate::media::probe::probe_sync(path).ok()?;
+        Some((info.width?, info.height?))
+    })
+}
+
+/// `rotation_fixes` with the probe injected (the decoded size, or `None` when
+/// it fails), so the tests can pin which files it is ever asked about.
+fn rotation_fixes_with(
+    media: &[schema::MediaRef],
+    mut probe: impl FnMut(&str) -> Option<(u32, u32)>,
+) -> Vec<DimFix> {
     let mut fixes = Vec::new();
     for (index, m) in media.iter().enumerate() {
         // Only a video stream can carry the stream-level Display Matrix this
@@ -548,14 +592,15 @@ fn rotation_fixes(media: &[schema::MediaRef]) -> Vec<DimFix> {
         // Missing or changed on disk: already reported in `missing`, and the
         // relink path re-probes and self-heals once the user points at the
         // file. Unreadable (an exclusive lock, a codec ffprobe cannot open) is
-        // the same situation — leave the entry exactly as authored.
-        if !identity_intact(m) {
+        // the same situation — leave the entry exactly as authored. A cloud
+        // placeholder too, exactly as the still repair: ffprobe would download
+        // an online-only file whole, on the load the user is waiting on.
+        // Identity first — it reads metadata only — and nothing opens the file
+        // before the placeholder check has said it is local.
+        if !identity_intact(m) || is_cloud_placeholder(Path::new(&m.path)) {
             continue;
         }
-        let Ok(info) = crate::media::probe::probe_sync(&m.path) else {
-            continue;
-        };
-        let (Some(pw), Some(ph)) = (info.width, info.height) else {
+        let Some((pw, ph)) = probe(&m.path) else {
             continue;
         };
         if is_transposition((w, h), (pw, ph)) {
@@ -651,10 +696,23 @@ fn apply_dim_fixes(value: &mut Value, fixes: &[DimFix], canvas: Option<(u32, u32
 /// withholding the stamp until every candidate has been read, buys that rare
 /// case by making a project with one permanently-deleted clip re-probe all its
 /// OTHER clips on every open, for good: a lasting per-load cost traded against
-/// a one-off that announces itself.
+/// a one-off that announces itself. A cloud placeholder (an online-only
+/// OneDrive file) is left unread and stamped the same way: probing it would
+/// download it, and relink or a later re-import fixes it like the unplugged
+/// drive.
+///
+/// The crops of every transposed clip are clamped into its new box
+/// (`clamp_clip_crops`), as the still repair does: a crop authored against the
+/// stale landscape box can hang off the portrait one, and the preview clamps
+/// x/y while the export does not.
 fn repair_rotated_dimensions(path: &Path, value: &mut Value, typed: &ProjectFile, recovered: bool) {
     let fixes = rotation_fixes(&typed.media);
     apply_dim_fixes(value, &fixes, transposed_canvas(typed, &fixes));
+    for fix in &fixes {
+        if let Some(m) = typed.media.get(fix.index) {
+            clamp_clip_crops(value, &m.id, fix.to);
+        }
+    }
 
     // Persist even when nothing needed correcting. The version stamp is what
     // records that this project has BEEN through the re-probe, and without
@@ -681,7 +739,9 @@ fn persist_repair(path: &Path, value: &Value, recovered: bool) {
     if recovered {
         return;
     }
-    if let Ok(bytes) = serde_json::to_vec_pretty(value) {
+    // Past the load cap, skipped like any other failed write: the file on
+    // disk still opens, the repaired one would not.
+    if let Ok(bytes) = project_bytes(value) {
         let _ = atomic_write(path, &bytes);
     }
 }
@@ -1147,18 +1207,29 @@ fn first_clip_media(typed: &ProjectFile) -> Option<&schema::MediaRef> {
     })
 }
 
+/// The cache is looked up, never required: it only supplies the recents
+/// card's thumbnail, and main.rs runs without one when `%LOCALAPPDATA%` is
+/// unusable — a `State` parameter there failed EVERY save before its body ran.
 #[tauri::command]
-pub fn save_project(
-    cache: tauri::State<'_, std::sync::Arc<crate::cache::Cache>>,
-    path: String,
-    project: Value,
-) -> Result<SavedProject> {
-    save_project_at(&cache, path, project)
+pub fn save_project(app: tauri::AppHandle, path: String, project: Value) -> Result<SavedProject> {
+    use tauri::Manager;
+    let cache = app.try_state::<std::sync::Arc<crate::cache::Cache>>();
+    save_project_at(cache.as_deref().map(|c| &**c), path, project)
 }
 
 /// `save_project` minus the Tauri state wrapper, so the tests can drive the
 /// real save path (validation, write, recents) against a scratch cache.
-fn save_project_at(cache: &crate::cache::Cache, path: String, project: Value) -> Result<SavedProject> {
+fn save_project_at(cache: Option<&crate::cache::Cache>, path: String, project: Value) -> Result<SavedProject> {
+    save_project_within(cache, path, project, image_rules::MAX_TRT_BYTES)
+}
+
+/// `save_project_at` against any size cap (`project_bytes_within`).
+fn save_project_within(
+    cache: Option<&crate::cache::Cache>,
+    path: String,
+    project: Value,
+    cap: u64,
+) -> Result<SavedProject> {
     // Validate before writing — never persist something we can't read back.
     let typed: ProjectFile = ProjectFile::deserialize(&project)
         .map_err(|e| AppError::BadInput(format!("refusing to save invalid project: {e}")))?;
@@ -1176,10 +1247,10 @@ fn save_project_at(cache: &crate::cache::Cache, path: String, project: Value) ->
     image_rules::validate_image_project(&project, &typed).map_err(refuse)?;
     let image = recent_kind(&typed).is_some();
 
-    atomic_write(
-        Path::new(&path),
-        serde_json::to_vec_pretty(&project)?.as_slice(),
-    )?;
+    // Sized BEFORE the file is touched: a refusal leaves the previous save
+    // (and its `.bak`) exactly as they were.
+    let bytes = project_bytes_within(&project, cap)?;
+    atomic_write(Path::new(&path), &bytes)?;
 
     // Temp quick-view projects (autosaved to the temp dir) must never enter
     // recents. Pressing Back re-saves to a permanent Documents path, which does
@@ -1200,7 +1271,7 @@ fn save_project_at(cache: &crate::cache::Cache, path: String, project: Value) ->
                 }
                 .hash()
             })
-            .and_then(|h| crate::media::thumbs::any_thumb_for(cache, &h))
+            .and_then(|h| cache.and_then(|c| crate::media::thumbs::any_thumb_for(c, &h)))
             .map(|p| p.to_string_lossy().into_owned());
 
         upsert_recent(RecentItem {
@@ -1619,7 +1690,7 @@ pub fn rename_project(path: String, new_name: String) -> Result<String> {
     let new_path = free_path_in(dir, &base, Some(old))?;
 
     value["name"] = Value::String(new_name);
-    atomic_write(&new_path, serde_json::to_vec_pretty(&value)?.as_slice())?;
+    atomic_write(&new_path, &project_bytes(&value)?)?;
 
     // Clean up the old location only when it is PROVABLY a different file. A
     // case-only rename lands on the same file on Windows, so deleting "the old
@@ -1684,7 +1755,7 @@ pub fn duplicate_project(path: String, new_name: String, new_id: String) -> Resu
     let base = sanitize_filename(&new_name);
     // No exclusion: a duplicate must never overwrite its source.
     let new_path = free_path_in(dir, &base, None)?;
-    atomic_write(&new_path, serde_json::to_vec_pretty(&value)?.as_slice())?;
+    atomic_write(&new_path, &project_bytes(&value)?)?;
 
     let new_path_str = new_path.to_string_lossy().into_owned();
     let size_bytes = std::fs::metadata(&new_path).map(|m| m.len()).unwrap_or(0);
@@ -2056,6 +2127,72 @@ mod tests {
                 "a second re-probe would have transposed this — the schema gate leaked"
             );
             assert_eq!(again.project["media"][0]["height"], 360);
+        });
+    }
+
+    /// A transposed clip's crop is clamped into its NEW box, on disk too. The
+    /// crop fits the stale 640-wide box and hangs off the 360-wide one; only x
+    /// has to move (w, y and h already fit), so the row fails for one reason.
+    #[test]
+    fn the_rotation_repair_clamps_a_transposed_clip_s_crop() {
+        with_isolated("rot-crop", |dir| {
+            let file = rotated_video_fixture(dir);
+            let proj = dir.join("Cropped.trt");
+            write_pre_repair_project(
+                &proj,
+                serde_json::json!([pre_swap_media(&file, 640, 360)]),
+                (640, 360),
+            );
+            let mut v: Value = serde_json::from_slice(&std::fs::read(&proj).unwrap()).unwrap();
+            v["timeline"]["tracks"][0]["clips"][0]["transform"] =
+                cropped_clip("c1", "m1", Some([500, 10, 100, 50]))["transform"].clone();
+            write_json(&proj, &v);
+
+            let loaded = load_project(proj.to_string_lossy().into_owned()).unwrap();
+            assert_eq!(loaded.project["media"][0]["width"], 360, "fixture: the clip was transposed");
+            let want = serde_json::json!({ "x": 260, "y": 10, "w": 100, "h": 50 });
+            let crop = |p: &Value| p["timeline"]["tracks"][0]["clips"][0]["transform"]["crop"].clone();
+            assert_eq!(crop(&loaded.project), want);
+            let on_disk: Value = serde_json::from_slice(&std::fs::read(&proj).unwrap()).unwrap();
+            assert_eq!(crop(&on_disk), want);
+        });
+    }
+
+    /// An online-only file is never probed by the rotation repair: ffprobe
+    /// would download it on the load the user is waiting on. The local file
+    /// beside it, identical but for the offline bit, IS probed and repaired,
+    /// so the row cannot pass by nothing being probed at all.
+    #[cfg(windows)]
+    #[test]
+    fn the_rotation_repair_never_probes_a_cloud_placeholder() {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        with_isolated("rot-cloud", |dir| {
+            let local = dir.join("local.mp4");
+            std::fs::write(&local, b"bytes").unwrap();
+            let cloud = dir.join("cloud.mp4");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .attributes(FILE_ATTRIBUTE_OFFLINE)
+                .open(&cloud)
+                .and_then(|mut f| f.write_all(b"bytes"))
+                .unwrap();
+            assert!(is_cloud_placeholder(&cloud), "fixture: the offline bit must stick");
+            assert!(!is_cloud_placeholder(&local), "fixture: the control is local");
+
+            let mut second = pre_swap_media(&cloud, 640, 360);
+            second["id"] = Value::from("m2");
+            let media: Vec<schema::MediaRef> =
+                serde_json::from_value(serde_json::json!([pre_swap_media(&local, 640, 360), second]))
+                    .unwrap();
+            let mut asked = Vec::new();
+            let fixes = rotation_fixes_with(&media, |p| {
+                asked.push(p.to_string());
+                Some((360, 640))
+            });
+            assert_eq!(asked, [local.to_string_lossy().into_owned()]);
+            assert_eq!(fixes, [DimFix { index: 0, from: (640, 360), to: (360, 640) }]);
         });
     }
 
@@ -4426,7 +4563,7 @@ mod tests {
             let tracks = serde_json::json!([layer("t2", "Drawing 1", "d1")]);
             let refused = |name: &str, project: Value, want: &str| {
                 let path = dir.join(name);
-                match save_project_at(&cache, path.to_string_lossy().into_owned(), project) {
+                match save_project_at(Some(&cache), path.to_string_lossy().into_owned(), project) {
                     Err(AppError::BadInput(m)) => {
                         assert!(m.starts_with("refusing to save invalid project"), "{m}");
                         assert!(m.contains(want), "{name}: '{m}' lacks '{want}'");
@@ -4454,7 +4591,7 @@ mod tests {
             video3.as_object_mut().unwrap().remove("kind");
             refused("Video3.trt", video3, "only valid for an image project");
 
-            save_project_at(&cache, dir.join("Fine.trt").to_string_lossy().into_owned(), valid)
+            save_project_at(Some(&cache), dir.join("Fine.trt").to_string_lossy().into_owned(), valid)
                 .expect("the valid fixture saves");
         });
     }
@@ -4484,7 +4621,7 @@ mod tests {
                 serde_json::json!([layer("t1", "Photo", "ph"), layer("t2", "Drawing 1", "d1")]),
             );
             let path = dir.join("Card.trt").to_string_lossy().into_owned();
-            save_project_at(&cache, path.clone(), project.clone()).unwrap();
+            save_project_at(Some(&cache), path.clone(), project.clone()).unwrap();
             let card = recent(&path).unwrap();
             assert_eq!(
                 (card.kind.as_deref(), card.duration_sec, card.thumb.as_deref()),
@@ -4493,7 +4630,7 @@ mod tests {
 
             let rendered = thumbs.join("imgproj-p-3.jpg").to_string_lossy().into_owned();
             set_recent_thumb(&path, &rendered);
-            save_project_at(&cache, path.clone(), project).unwrap();
+            save_project_at(Some(&cache), path.clone(), project).unwrap();
             assert_eq!(recent(&path).unwrap().thumb.as_deref(), Some(rendered.as_str()));
 
             // The same media as a video project: the frame lookup and the
@@ -4507,10 +4644,107 @@ mod tests {
             video.as_object_mut().unwrap().remove("kind");
             video["timeline"]["tracks"][0]["clips"][0]["srcOut"] = 2.5.into();
             let vpath = dir.join("Cut.trt").to_string_lossy().into_owned();
-            save_project_at(&cache, vpath.clone(), video).unwrap();
+            save_project_at(Some(&cache), vpath.clone(), video).unwrap();
             let vcard = recent(&vpath).unwrap();
             assert_eq!((vcard.kind.as_deref(), vcard.duration_sec), (None, 2.5));
             assert!(vcard.thumb.as_deref().is_some_and(|t| t.contains(&key.hash())), "{:?}", vcard.thumb);
+        });
+    }
+
+    /// A save that would write a file larger than the load cap is refused
+    /// BEFORE the file is touched: the previous save stays byte-identical, no
+    /// `.bak` is rotated, and a new path gets neither a file nor a card. The
+    /// cap is shrunk to the fixture's own size so the boundary is exact — at
+    /// the cap it saves, one byte over it refuses.
+    #[test]
+    fn save_refuses_a_project_the_load_cap_would_refuse() {
+        with_isolated("save-cap", |dir| {
+            let cache = crate::cache::Cache::new_at(dir.join("cache"));
+            let project = minimal_project("Big");
+            let size = project_bytes(&project).unwrap().len() as u64;
+
+            let kept = dir.join("Kept.trt");
+            let kept_s = kept.to_string_lossy().into_owned();
+            save_project_within(Some(&cache), kept_s.clone(), project.clone(), size)
+                .expect("a project exactly at the cap saves");
+            let before = std::fs::read(&kept).unwrap();
+            assert!(!bak_path(&kept).exists(), "fixture: one save rotates nothing");
+
+            // One byte longer than the cap.
+            let mut grown = project.clone();
+            grown["name"] = Value::from("Bigg");
+            assert_eq!(project_bytes(&grown).unwrap().len() as u64, size + 1, "fixture");
+            let refused = |path: String, value: Value| {
+                match save_project_within(Some(&cache), path, value, size) {
+                    Err(AppError::BadInput(m)) => {
+                        assert!(m.starts_with("refusing to save: the project would be larger than"), "{m}")
+                    }
+                    other => panic!("expected a refusal, got {other:?}"),
+                }
+            };
+            refused(kept_s.clone(), grown.clone());
+            assert_eq!(std::fs::read(&kept).unwrap(), before, "the previous save was replaced");
+            assert!(!bak_path(&kept).exists(), "a refused save rotated the previous one aside");
+            assert_eq!(recent(&kept_s).unwrap().name, "Big");
+
+            let fresh = dir.join("Fresh.trt");
+            refused(fresh.to_string_lossy().into_owned(), grown);
+            assert!(!fresh.exists(), "a refused save was written");
+            assert!(recent(&fresh.to_string_lossy()).is_none(), "a refused save got a card");
+        });
+    }
+
+    /// The limit is named the way the load refusal names it, and the real
+    /// cap is the load cap.
+    #[test]
+    fn the_save_cap_is_named_like_the_load_cap() {
+        let big = serde_json::json!({ "pad": "x".repeat(64) });
+        match project_bytes_within(&big, 10) {
+            Err(AppError::BadInput(m)) => assert!(m.contains("larger than 10 bytes"), "{m}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let mb = 1024 * 1024;
+        let huge = serde_json::json!({ "pad": "x".repeat(mb as usize) });
+        match project_bytes_within(&huge, mb) {
+            Err(AppError::BadInput(m)) => assert!(m.contains("larger than 1 MB"), "{m}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(project_bytes(&big).is_ok(), "a small project is far under 512 MB");
+        assert_eq!(image_rules::MAX_TRT_BYTES, 512 * 1024 * 1024);
+    }
+
+    /// With no cache (main.rs runs without one when %LOCALAPPDATA% is
+    /// unusable) a save still writes and still gets its card, only without a
+    /// thumbnail. The same project against a cache holding a frame of its clip
+    /// gets one, so the missing thumb is the cache's absence and nothing else.
+    #[test]
+    fn a_save_without_the_cache_still_writes() {
+        with_isolated("save-nocache", |dir| {
+            let cache = crate::cache::Cache::new_at(dir.join("cache"));
+            let photo = photo_media(dir, "ph");
+            let key = crate::cache::MediaKey {
+                path: photo["path"].as_str().unwrap().into(),
+                size: photo["size"].as_u64().unwrap(),
+                mtime_ms: photo["mtimeMs"].as_u64().unwrap(),
+            };
+            let thumbs = cache.ensure_kind_dir(crate::cache::CacheKind::Thumbs).unwrap();
+            std::fs::write(thumbs.join(format!("{}_0.5.jpg", key.hash())), b"frame").unwrap();
+            let mut video = image_project(
+                "p-6",
+                serde_json::json!([photo]),
+                serde_json::json!([layer("t1", "Photo", "ph")]),
+            );
+            video["schema"] = 2.into();
+            video.as_object_mut().unwrap().remove("kind");
+
+            let bare = dir.join("Bare.trt").to_string_lossy().into_owned();
+            save_project_at(None, bare.clone(), video.clone()).expect("saves without a cache");
+            assert!(Path::new(&bare).is_file());
+            assert_eq!(recent(&bare).unwrap().thumb, None);
+
+            let cached = dir.join("Cached.trt").to_string_lossy().into_owned();
+            save_project_at(Some(&cache), cached.clone(), video).unwrap();
+            assert!(recent(&cached).unwrap().thumb.is_some(), "control: the cache has a frame");
         });
     }
 
@@ -4547,7 +4781,7 @@ mod tests {
                 serde_json::json!([layer("t2", "Drawing 1", "d1")]),
             );
             let src = dir.join("Card.trt").to_string_lossy().into_owned();
-            save_project_at(&cache, src.clone(), project).unwrap();
+            save_project_at(Some(&cache), src.clone(), project).unwrap();
             let thumbs = cache.ensure_kind_dir(crate::cache::CacheKind::Thumbs).unwrap();
             let card = thumbs.join("imgproj-p-6.jpg");
             std::fs::write(&card, b"rendered card of p-6").unwrap();

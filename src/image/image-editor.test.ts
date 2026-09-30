@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createBlankImageProject } from "../core/image-project";
 import type { MediaInfo, ProjectFile } from "../core/types";
-import { SIZE_LADDER, exportSourceHint, stepSize } from "./image-editor";
+import { SIZE_LADDER, dropRefusal, exportSourceHint, stepSize } from "./image-editor";
 import { addPhotoLayer, layersOf } from "./layers";
 import { SIZE_MAX, SIZE_MIN } from "./tool-state";
 
@@ -81,5 +81,27 @@ describe("exportSourceHint", () => {
 
   it("falls back to the project name with no photo", () => {
     expect(exportSourceHint(withPhotos())).toEqual({ stem: "Holiday card", ext: null });
+  });
+});
+
+describe("dropRefusal", () => {
+  const CROP = "Finish the crop first, then drop the images again.";
+  const DIALOG = "Close the dialog first, then drop the images again.";
+  const PICKER = "Close the open menu or picker first, then drop the images again.";
+
+  it("takes a drop only when nothing is open", () => {
+    expect(dropRefusal("idle", false, false)).toBeNull();
+  });
+
+  it("refuses behind an open picker or menu (they hold the keyboard, not a dialog)", () => {
+    // A colour picker survives the trip to File Explorer (it is not closed on
+    // blur), and a layer added under its preview would record that colour.
+    expect(dropRefusal("idle", false, true)).toBe(PICKER);
+  });
+
+  it("names the crop first, though a crop holds the keyboard too", () => {
+    expect(dropRefusal("crop-layer", false, true)).toBe(CROP);
+    expect(dropRefusal("crop-image", true, true)).toBe(CROP);
+    expect(dropRefusal("idle", true, true)).toBe(DIALOG);
   });
 });

@@ -54,6 +54,7 @@ import {
   setLayerTransform,
   type Layer,
 } from "./layers";
+import { sameEdit } from "./same-edit";
 import { forEachStroke, strokeCount } from "./strokes";
 
 /* ------------------------------------------------------------------ */
@@ -151,6 +152,22 @@ function bgNow(p: ProjectFile): string {
   return backgroundChoiceOf(bg) === "transparent" ? "transparent" : normalizeHexColor(bg, "");
 }
 
+/** The background the picker's closing commit lands on ("" = leave it).
+ *  `pick`: what the picker reports. `cancel` (Escape): the colour it opened
+ *  on. `drop-preview` (the window is closing): only the preview still in
+ *  flight goes — back to `base`, the project before it — while picks the
+ *  user already completed stay, since each is its own undo step. */
+export function pickerCloseTarget(
+  how: "pick" | "cancel" | "drop-preview",
+  hex: string,
+  openBg: string,
+  base: ProjectFile,
+): string {
+  if (how === "cancel") return openBg;
+  if (how === "drop-preview") return bgNow(base);
+  return normalizeHexColor(hex, "");
+}
+
 /** A background wants its own shelf, not the accent spread: paper whites,
  *  greys, black, and a few soft tints. */
 const BACKGROUND_PRESETS = [
@@ -231,7 +248,9 @@ export interface GestureSet {
  *  So a commit lands only while the project is still the one this gesture
  *  last wrote; otherwise it is dropped — at worst one undo step lost, never a
  *  value resurrected. A write after such an interruption re-bases on the
- *  project as it is now, for the same reason. */
+ *  project as it is now, for the same reason. "Still the one" ignores a
+ *  save's `modifiedAt` restamp (same-edit.ts): typed edits take no autosave
+ *  hold, so a save can land between two keystrokes. */
 export function createGestures(
   session: { readonly project: ProjectFile; commitFrom(before: ProjectFile): void },
   holdAutosave: () => () => void,
@@ -256,17 +275,18 @@ export function createGestures(
       },
       write(apply) {
         g.begin();
-        if (session.project !== written) before = session.project;
+        if (!sameEdit(session.project, written!)) before = session.project;
         apply();
         written = session.project;
       },
       commit() {
         const b = before;
-        const mine = session.project === written;
+        const mine = written !== null && sameEdit(session.project, written);
         before = null;
         written = null;
         pending.delete(g);
-        if (b && mine) session.commitFrom(b);
+        // A restamp alone is no edit: it must not land as an empty undo step.
+        if (b && mine && !sameEdit(session.project, b)) session.commitFrom(b);
         release?.();
         release = null;
       },
@@ -289,7 +309,15 @@ export function createGestures(
 /* The panel                                                           */
 /* ------------------------------------------------------------------ */
 
-export function mountImageInspector(host: HTMLElement, ctx: ImageEditorCtx): { dispose(): void } {
+export function mountImageInspector(
+  host: HTMLElement,
+  ctx: ImageEditorCtx,
+): {
+  /** Close an open background picker, dropping the colour it is previewing
+   *  (synchronous: the window is closing, and its save reads the store). */
+  dropPreview(): void;
+  dispose(): void;
+} {
   host.classList.add("inspector");
   const { session } = ctx;
 
@@ -796,6 +824,8 @@ export function mountImageInspector(host: HTMLElement, ctx: ImageEditorCtx): { d
   let picker: ColorPickerHandle | null = null;
   let pickerLoading = false;
   let unregisterPicker: (() => void) | null = null;
+  /** Closes the open picker dropping only its in-flight preview. */
+  let dropPickerPreview: (() => void) | null = null;
 
   function closePicker(): void {
     picker?.close();
@@ -884,6 +914,7 @@ export function mountImageInspector(host: HTMLElement, ctx: ImageEditorCtx): { d
     // listener), so a cancel restores transparent, not white.
     const openBg = bgNow(session.project);
     let cancelled = false;
+    let dropPreview = false;
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === "Escape") cancelled = true;
     };
@@ -907,8 +938,8 @@ export function mountImageInspector(host: HTMLElement, ctx: ImageEditorCtx): { d
             session.replace(setBackground(session.project, hex));
           },
           onCommit: (hex) => {
-            const target = cancelled ? openBg : normalizeHexColor(hex, "");
             const base = before ?? session.project;
+            const target = pickerCloseTarget(cancelled ? "cancel" : dropPreview ? "drop-preview" : "pick", hex, openBg, base);
             before = null;
             const cur = session.project;
             let next = cur;
@@ -925,7 +956,10 @@ export function mountImageInspector(host: HTMLElement, ctx: ImageEditorCtx): { d
           onClose: () => {
             closed = true;
             window.removeEventListener("keydown", onKey, true);
-            if (picker === handle) picker = null;
+            if (picker === handle) {
+              picker = null;
+              dropPickerPreview = null;
+            }
             unregisterPicker?.();
             unregisterPicker = null;
           },
@@ -937,6 +971,10 @@ export function mountImageInspector(host: HTMLElement, ctx: ImageEditorCtx): { d
         // the two were added in.
         window.addEventListener("keydown", onKey, true);
         picker = handle;
+        dropPickerPreview = () => {
+          dropPreview = true;
+          handle.close();
+        };
         unregisterPicker = ctx.registerOverlay(() => handle.close());
       })
       .catch((e: unknown) => {
@@ -1044,6 +1082,9 @@ export function mountImageInspector(host: HTMLElement, ctx: ImageEditorCtx): { d
   paintInert();
 
   return {
+    dropPreview(): void {
+      dropPickerPreview?.();
+    },
     dispose(): void {
       if (disposed) return;
       // First: clearBuild's flush and the picker's close both commit, and a

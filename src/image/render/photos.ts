@@ -23,6 +23,10 @@
 // usable size to begin with (a crafted file): then the decoded size is all
 // there is. `decodeStill` is exported so the E2E drift alarm drives the very
 // decode this module uses.
+//
+// SHARING. Pixels are keyed by the FILE (path + size + mtime), not the layer:
+// a duplicated layer is a new MediaRef over the same file and must not fetch,
+// hold and decode it again. Only the adjusted copy is per layer.
 
 import { mediaUrl } from "../../core/ipc";
 import type { ClipAdjust, MediaRef } from "../../core/types";
@@ -131,10 +135,14 @@ interface Adjusted {
   canvas: OffscreenCanvas;
 }
 
-interface Entry {
+/** One FILE's pixels, shared by every layer that shows it (a duplicated
+ *  layer gets a new MediaRef id but the same file): one fetch, one resident
+ *  blob, one set of decoded levels. */
+interface FileEntry {
+  /** keyOf(media); "" once dropped */
   key: string;
-  mediaId: string;
   state: "loading" | "ready" | "failed";
+  /** a failure, or "Shown at …" for a photo reduced to the canvas limits */
   message?: string;
   blob: Blob | null;
   /** size of the photo as decoded (the status report) */
@@ -142,12 +150,23 @@ interface Entry {
   /** largest level this photo can be decoded at (natural, or fitted to the
    *  canvas limits for a photo bigger than they allow) */
   full: { w: number; h: number } | null;
+  /** the size a whole, unreduced decode produced — what each layer's
+   *  recorded size is checked against (null on the working-level path) */
+  exact: { w: number; h: number } | null;
   levels: Level[];
   wantW: number;
   timer: number | undefined;
   decoding: number;
+  /** ids of the MediaRefs (layers) showing this file */
+  refs: Set<string>;
+}
+
+/** One layer's view of a file: its own adjusted copy (adjustments are per
+ *  layer) and the scale it last asked for. */
+interface LayerEntry {
+  file: FileEntry;
+  media: MediaRef;
   adjusted: Adjusted | null;
-  /** the scale most recently asked for, before the load finished */
   lastNeed: number;
 }
 
@@ -155,12 +174,19 @@ function keyOf(m: MediaRef): string {
   return `${m.path}|${m.size}|${m.mtimeMs}`;
 }
 
+/** A need as `workingWidth` reads it: a bad value means 1. */
+function needOf(n: number): number {
+  return Number.isFinite(n) && n > 0 ? n : 1;
+}
+
 /**
  * The photo half of `PreviewResources`. Knows nothing about drawings, the
  * stage or the DOM; `emit` is how it says "pixels changed, render again".
+ * Pixels are cached per FILE (path + size + mtime), adjusted copies per layer.
  */
 export class PhotoCache {
-  private readonly entries = new Map<string, Entry>();
+  private readonly files = new Map<string, FileEntry>();
+  private readonly layers = new Map<string, LayerEntry>();
   private readonly dimsListeners = new Set<(mediaId: string, w: number, h: number) => void>();
   private readonly dimsReported = new Set<string>();
   private disposed = false;
@@ -180,61 +206,86 @@ export class PhotoCache {
     natural?: { w: number; h: number };
   } {
     if (!media) return { state: "failed", message: "Layer not found" };
-    const e = this.entries.get(media.id);
-    if (!e || e.key !== keyOf(media)) return { state: "loading" };
+    const le = this.layers.get(media.id);
+    if (!le || le.file.key !== keyOf(media)) return { state: "loading" };
+    const fe = le.file;
     const out: { state: "loading" | "ready" | "failed"; message?: string; natural?: { w: number; h: number } } = {
-      state: e.state,
+      state: fe.state,
     };
-    if (e.message !== undefined) out.message = e.message;
-    if (e.natural) out.natural = { ...e.natural };
+    if (fe.message !== undefined) out.message = fe.message;
+    else if (fe.exact) {
+      // Drawn into the recorded box regardless (composite.ts); say so, so a
+      // runtime that changed its mind about orientation is visible. Per layer:
+      // it is THIS MediaRef's recorded size that disagrees.
+      const fit = stillFit(fe.exact, media);
+      if (fit === "transposed" || fit === "different") {
+        out.message = `Decodes at ${fe.exact.w} × ${fe.exact.h}, recorded as ${media.width} × ${media.height}`;
+      }
+    }
+    if (fe.natural) out.natural = { ...fe.natural };
     return out;
   }
 
   photo(l: Layer, needScale: number): CanvasImageSource | null {
     if (this.disposed || l.media.generator) return null;
-    let e = this.entries.get(l.media.id);
-    if (!e || e.key !== keyOf(l.media)) {
-      if (e) this.drop(e);
-      e = this.load(l.media, needScale);
+    let le = this.layers.get(l.media.id);
+    if (!le || le.file.key !== keyOf(l.media)) {
+      if (le) this.detach(l.media.id, le);
+      le = this.attach(l.media, needScale);
     }
-    e.lastNeed = needScale;
-    if (e.state !== "ready" || !e.full || e.levels.length === 0) return null;
+    le.media = l.media;
+    le.lastNeed = needScale;
+    const fe = le.file;
+    if (fe.state !== "ready" || !fe.full || fe.levels.length === 0) return null;
 
-    const want = workingWidth(e.full.w, needScale);
-    const level = pickLevel(e.levels, want);
+    const level = pickLevel(fe.levels, workingWidth(fe.full.w, needScale));
     // Sharper pixels are needed (zoomed in), or the level in hand is far
     // bigger than the stage can show (zoomed out): ask for the right one once
     // things are quiet. 1.25× headroom so a small zoom does not re-decode.
-    if (level.w < want || level.w > want * 2.5) {
-      this.requestLevel(e, Math.min(e.full.w, Math.ceil(want * 1.25)));
+    // Asked for the whole FILE — the sharpest any of its layers needs — so
+    // two layers of one photo at different scales never fight over it.
+    const want = workingWidth(fe.full.w, this.fileNeed(fe));
+    const top = pickLevel(fe.levels, want);
+    if (top.w < want || top.w > want * 2.5) {
+      this.requestLevel(fe, Math.min(fe.full.w, Math.ceil(want * 1.25)));
     }
 
     const adjust = l.clip.adjust;
     if (adjust === undefined || isIdentityAdjust(adjust)) return level.bmp;
-    return this.adjusted(e, level, adjust);
+    return this.adjusted(le, level, adjust);
   }
 
-  /** Forget cached pixels: one photo's (relink, a file that changed) or all. */
+  /** Forget cached pixels: one layer's (relink, a file that changed) or all.
+   *  A file other layers still show keeps its pixels — unless it FAILED: then
+   *  every layer lets go of it, so the next render fetches it again. Another
+   *  layer's hold would otherwise keep the failed record, and a relink or a
+   *  file restored in place (the Recycle Bin keeps its path, size and mtime)
+   *  would find it by the same key and join the old failure. */
   invalidate(mediaId?: string): void {
     if (mediaId === undefined) {
-      for (const e of this.entries.values()) this.drop(e);
-      this.entries.clear();
+      for (const le of this.layers.values()) freeAdjusted(le);
+      for (const fe of this.files.values()) this.drop(fe);
+      this.layers.clear();
+      this.files.clear();
       return;
     }
-    const e = this.entries.get(mediaId);
-    if (e) {
-      this.drop(e);
-      this.entries.delete(mediaId);
+    const le = this.layers.get(mediaId);
+    if (!le) return;
+    const fe = le.file;
+    if (fe.state !== "failed") {
+      this.detach(mediaId, le);
+      return;
+    }
+    for (const id of [...fe.refs]) {
+      const other = this.layers.get(id);
+      if (other && other.file === fe) this.detach(id, other);
     }
   }
 
   /** Drop entries whose media is gone from the project. */
   retain(ids: ReadonlySet<string>): void {
-    for (const [id, e] of this.entries) {
-      if (!ids.has(id)) {
-        this.drop(e);
-        this.entries.delete(id);
-      }
+    for (const [id, le] of this.layers) {
+      if (!ids.has(id)) this.detach(id, le);
     }
   }
 
@@ -246,60 +297,107 @@ export class PhotoCache {
 
   /* ---------------- internals ---------------- */
 
-  private drop(e: Entry): void {
-    clearTimeout(e.timer);
-    e.timer = undefined;
-    for (const lv of e.levels) lv.bmp.close();
-    e.levels = [];
-    if (e.adjusted) {
-      e.adjusted.canvas.width = 0;
-      e.adjusted = null;
+  private attach(media: MediaRef, needScale: number): LayerEntry {
+    const key = keyOf(media);
+    let fe = this.files.get(key);
+    const fresh = fe === undefined;
+    if (!fe) {
+      fe = {
+        key,
+        state: "loading",
+        blob: null,
+        natural: null,
+        full: null,
+        exact: null,
+        levels: [],
+        wantW: 0,
+        timer: undefined,
+        decoding: 0,
+        refs: new Set(),
+      };
+      this.files.set(key, fe);
     }
-    e.blob = null;
+    fe.refs.add(media.id);
+    const le: LayerEntry = { file: fe, media, adjusted: null, lastNeed: needScale };
+    this.layers.set(media.id, le);
+    if (fresh) void this.loadInto(fe, media);
+    else if (fe.state === "ready") {
+      // A layer joining pixels already decoded may need its size recorded
+      // too — not from inside the render pass that asked (the listener edits
+      // the project).
+      const f = fe;
+      queueMicrotask(() => {
+        if (this.live(f)) this.reportDims(f);
+      });
+    }
+    return le;
+  }
+
+  /** One layer lets go of its file; the file goes when no layer shows it. */
+  private detach(mediaId: string, le: LayerEntry): void {
+    freeAdjusted(le);
+    if (this.layers.get(mediaId) === le) this.layers.delete(mediaId);
+    const fe = le.file;
+    fe.refs.delete(mediaId);
+    if (fe.refs.size === 0) {
+      if (this.files.get(fe.key) === fe) this.files.delete(fe.key);
+      this.drop(fe);
+    }
+  }
+
+  /** The sharpest need among the layers showing a file. */
+  private fileNeed(fe: FileEntry): number {
+    let n = 0;
+    for (const id of fe.refs) {
+      const le = this.layers.get(id);
+      if (le) n = Math.max(n, needOf(le.lastNeed));
+    }
+    return n > 0 ? n : 1;
+  }
+
+  /** Record the decoded size for every layer of this file whose MediaRef has
+   *  none — once per MediaRef. */
+  private reportDims(fe: FileEntry): void {
+    const size = fe.natural;
+    if (!size) return;
+    for (const id of fe.refs) {
+      const le = this.layers.get(id);
+      if (!le || this.dimsReported.has(id) || stillFit(size, le.media) !== "unrecorded") continue;
+      this.dimsReported.add(id);
+      for (const fn of this.dimsListeners) fn(id, size.w, size.h);
+    }
+  }
+
+  private drop(fe: FileEntry): void {
+    clearTimeout(fe.timer);
+    fe.timer = undefined;
+    for (const lv of fe.levels) lv.bmp.close();
+    fe.levels = [];
+    fe.blob = null;
     // A decode still in flight sees the entry is no longer the live one and
     // closes what it made.
-    e.key = "";
+    fe.key = "";
   }
 
-  private live(e: Entry): boolean {
-    return !this.disposed && e.key !== "" && this.entries.get(e.mediaId) === e;
+  private live(fe: FileEntry): boolean {
+    return !this.disposed && fe.key !== "" && this.files.get(fe.key) === fe;
   }
 
-  private load(media: MediaRef, needScale: number): Entry {
-    const e: Entry = {
-      key: keyOf(media),
-      mediaId: media.id,
-      state: "loading",
-      blob: null,
-      natural: null,
-      full: null,
-      levels: [],
-      wantW: 0,
-      timer: undefined,
-      decoding: 0,
-      adjusted: null,
-      lastNeed: needScale,
-    };
-    this.entries.set(media.id, e);
-    void this.loadInto(e, media);
-    return e;
-  }
-
-  private fail(e: Entry, message: string): void {
-    if (!this.live(e)) return;
-    e.state = "failed";
-    e.message = message;
+  private fail(fe: FileEntry, message: string): void {
+    if (!this.live(fe)) return;
+    fe.state = "failed";
+    fe.message = message;
     this.emit();
   }
 
-  private async loadInto(e: Entry, media: MediaRef): Promise<void> {
+  private async loadInto(fe: FileEntry, media: MediaRef): Promise<void> {
     const blob = await fetchPhoto(media.path);
-    if (!this.live(e)) return;
+    if (!this.live(fe)) return;
     if (!blob) {
-      this.fail(e, "File not found — relink it");
+      this.fail(fe, "File not found — relink it");
       return;
     }
-    e.blob = blob;
+    fe.blob = blob;
 
     // The recorded size is known: decode straight at the level the stage
     // needs when that is smaller than the photo. Drift between the decoder
@@ -310,7 +408,7 @@ export class PhotoCache {
     const rw = media.width;
     const rh = media.height;
     if (validDim(rw) && validDim(rh)) {
-      const lw = Math.min(rw, Math.ceil(workingWidth(rw, e.lastNeed) * 1.25));
+      const lw = Math.min(rw, Math.ceil(workingWidth(rw, this.fileNeed(fe)) * 1.25));
       if (lw < rw) {
         const lh = Math.max(1, Math.round((lw * rh) / rw));
         let small: ImageBitmap | null = null;
@@ -320,20 +418,21 @@ export class PhotoCache {
           small = null; // take the full-decode path, with its own retries
         }
         if (small) {
-          if (!this.live(e)) {
+          if (!this.live(fe)) {
             small.close();
             return;
           }
           const fit = fitRenderLimits(rw, rh);
-          e.full = { w: fit.w, h: fit.h };
-          e.natural = { w: rw, h: rh };
-          if (fit.reduced) e.message = `Shown at ${fit.w} × ${fit.h}`;
-          e.levels = [{ w: small.width, h: small.height, bmp: small }];
-          e.state = "ready";
+          fe.full = { w: fit.w, h: fit.h };
+          fe.natural = { w: rw, h: rh };
+          if (fit.reduced) fe.message = `Shown at ${fit.w} × ${fit.h}`;
+          fe.levels = [{ w: small.width, h: small.height, bmp: small }];
+          this.reportDims(fe);
+          fe.state = "ready";
           this.emit();
           return;
         }
-        if (!this.live(e)) return;
+        if (!this.live(fe)) return;
       }
     }
 
@@ -358,87 +457,81 @@ export class PhotoCache {
       }
       if (!bmp) {
         const tooBig = validDim(w) && validDim(h) && fitRenderLimits(w, h).reduced;
-        this.fail(e, tooBig ? "This image is too large to open here." : "This image couldn't be read.");
+        this.fail(fe, tooBig ? "This image is too large to open here." : "This image couldn't be read.");
         return;
       }
     }
-    if (!this.live(e)) {
+    if (!this.live(fe)) {
       bmp.close();
       return;
     }
 
     const decoded = { w: bmp.width, h: bmp.height };
-    e.full = decoded;
-    e.natural = reduced && validDim(media.width) && validDim(media.height) ? { w: media.width, h: media.height } : decoded;
+    fe.full = decoded;
+    fe.natural = reduced && validDim(media.width) && validDim(media.height) ? { w: media.width, h: media.height } : decoded;
     if (!reduced) {
+      fe.exact = decoded;
       const fit = stillFit(decoded, media);
-      if (fit === "unrecorded") {
-        if (!this.dimsReported.has(media.id)) {
-          this.dimsReported.add(media.id);
-          for (const fn of this.dimsListeners) fn(media.id, decoded.w, decoded.h);
-        }
-      } else if (fit !== "match") {
-        // Drawn into the recorded box regardless (composite.ts); say so, so a
-        // runtime that changed its mind about orientation is visible.
-        e.message = `Decodes at ${decoded.w} × ${decoded.h}, recorded as ${media.width} × ${media.height}`;
-        if (import.meta.env.DEV) console.warn(`[image] still size drift (${fit}): ${e.message}`);
+      if (import.meta.env.DEV && fit !== "match" && fit !== "unrecorded") {
+        console.warn(`[image] still size drift (${fit}): decodes at ${decoded.w} × ${decoded.h}, recorded as ${media.width} × ${media.height}`);
       }
+      this.reportDims(fe);
     } else {
-      e.message = `Shown at ${decoded.w} × ${decoded.h}`;
+      fe.message = `Shown at ${decoded.w} × ${decoded.h}`;
     }
 
     // Keep the full decode only if the stage actually needs it; otherwise
     // derive the working level from it right away and let it go.
-    const want = workingWidth(decoded.w, e.lastNeed);
+    const want = workingWidth(decoded.w, this.fileNeed(fe));
     if (want < decoded.w / 1.25) {
       const lw = Math.min(decoded.w, Math.ceil(want * 1.25));
       const lh = Math.max(1, Math.round((lw * decoded.h) / decoded.w));
       try {
         const small = await createImageBitmap(bmp, { resizeWidth: lw, resizeHeight: lh, resizeQuality: "high" });
         bmp.close();
-        if (!this.live(e)) {
+        if (!this.live(fe)) {
           small.close();
           return;
         }
-        e.levels = [{ w: small.width, h: small.height, bmp: small }];
+        fe.levels = [{ w: small.width, h: small.height, bmp: small }];
       } catch {
-        if (!this.live(e)) {
+        if (!this.live(fe)) {
           bmp.close();
           return;
         }
-        e.levels = [{ w: decoded.w, h: decoded.h, bmp }];
+        fe.levels = [{ w: decoded.w, h: decoded.h, bmp }];
       }
     } else {
-      e.levels = [{ w: decoded.w, h: decoded.h, bmp }];
+      fe.levels = [{ w: decoded.w, h: decoded.h, bmp }];
     }
-    e.state = "ready";
+    fe.state = "ready";
     this.emit();
   }
 
-  private requestLevel(e: Entry, w: number): void {
-    if (e.wantW === w && (e.timer !== undefined || e.decoding === w)) return;
-    e.wantW = w;
-    clearTimeout(e.timer);
-    e.timer = setTimeout(() => {
-      e.timer = undefined;
-      void this.decodeLevel(e, w);
+  private requestLevel(fe: FileEntry, w: number): void {
+    if (fe.wantW === w && (fe.timer !== undefined || fe.decoding === w)) return;
+    fe.wantW = w;
+    clearTimeout(fe.timer);
+    fe.timer = setTimeout(() => {
+      fe.timer = undefined;
+      void this.decodeLevel(fe, w);
     }, LEVEL_DEBOUNCE_MS);
   }
 
-  private async decodeLevel(e: Entry, w: number): Promise<void> {
-    if (!this.live(e) || !e.blob || !e.full) return;
-    if (e.levels.some((lv) => lv.w === w)) return;
-    const h = Math.max(1, Math.round((w * e.full.h) / e.full.w));
-    e.decoding = w;
+  private async decodeLevel(fe: FileEntry, w: number): Promise<void> {
+    if (!this.live(fe) || !fe.blob || !fe.full) return;
+    if (fe.levels.some((lv) => lv.w === w)) return;
+    const h = Math.max(1, Math.round((w * fe.full.h) / fe.full.w));
+    fe.decoding = w;
     let bmp: ImageBitmap;
     try {
-      bmp = await decodeStill(e.blob, { w, h });
+      bmp = await decodeStill(fe.blob, { w, h });
     } catch {
-      if (e.decoding === w) e.decoding = 0;
+      if (fe.decoding === w) fe.decoding = 0;
       return; // keep showing what we have
     }
-    if (e.decoding === w) e.decoding = 0;
-    if (!this.live(e)) {
+    if (fe.decoding === w) fe.decoding = 0;
+    if (!this.live(fe)) {
       bmp.close();
       return;
     }
@@ -446,19 +539,19 @@ export class PhotoCache {
     // Keep the new level and the closest other one (smooth zoom back), but
     // never a level far bigger than what is wanted — that is the full decode
     // a fitted stage does not need.
-    const others = e.levels
-      .filter((lv) => lv.w <= e.wantW * 2.5)
-      .sort((a, b) => Math.abs(Math.log(a.w / e.wantW)) - Math.abs(Math.log(b.w / e.wantW)));
+    const others = fe.levels
+      .filter((lv) => lv.w <= fe.wantW * 2.5)
+      .sort((a, b) => Math.abs(Math.log(a.w / fe.wantW)) - Math.abs(Math.log(b.w / fe.wantW)));
     const keep = [level, ...others.slice(0, MAX_LEVELS - 1)];
-    for (const lv of e.levels) if (!keep.includes(lv)) lv.bmp.close();
-    e.levels = keep;
+    for (const lv of fe.levels) if (!keep.includes(lv)) lv.bmp.close();
+    fe.levels = keep;
     // An adjusted copy made from a level just closed keeps its own pixels and
     // is still shown until the new level has been adjusted (see adjusted()).
     this.emit();
   }
 
-  private adjusted(e: Entry, level: Level, adjust: ClipAdjust): CanvasImageSource {
-    const a = e.adjusted;
+  private adjusted(le: LayerEntry, level: Level, adjust: ClipAdjust): CanvasImageSource {
+    const a = le.adjusted;
     if (a && a.level.bmp === level.bmp && a.adjust === adjust) return a.canvas;
     if (this.adjustSpent) {
       // One re-adjust per render pass: show the last adjusted pixels (or the
@@ -480,8 +573,15 @@ export class PhotoCache {
     c.globalCompositeOperation = "source-over";
     adjustInStrips(c, level.w, level.h, adjust);
     if (a && a.canvas !== canvas) a.canvas.width = 0;
-    e.adjusted = { level, adjust, canvas };
+    le.adjusted = { level, adjust, canvas };
     return canvas;
+  }
+}
+
+function freeAdjusted(le: LayerEntry): void {
+  if (le.adjusted) {
+    le.adjusted.canvas.width = 0;
+    le.adjusted = null;
   }
 }
 

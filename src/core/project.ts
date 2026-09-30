@@ -662,6 +662,12 @@ export function setProjectCanvas(p: ProjectFile, width: number, height: number):
  *  into the covering max: max(projW/fitW, projH/fitH) / fit. The visible extents
  *  are the crop clamped to the frame (matching computeTransformInto), with W/H
  *  swapped under 90/270 rotation. Result is clamped to [MIN_SCALE, MAX_SCALE]. */
+/** The smallest crop side any renderer shows, in source px — the same value as
+ *  CROP_MIN in src/editor/preview/canvas-math.ts and the export builder's
+ *  floor (a test pins them equal). Copied rather than imported so this module
+ *  never pulls the editor chunk onto the boot path. */
+export const VISIBLE_CROP_MIN = 8;
+
 export function fitFillScale(
   mediaW: number,
   mediaH: number,
@@ -674,9 +680,15 @@ export function fitFillScale(
   const srcW = Math.max(1, mediaW);
   const srcH = Math.max(1, mediaH);
   const c = crop ?? { x: 0, y: 0, w: srcW, h: srcH };
-  // visible cropped extents, matching transforms.ts computeTransformInto
-  const cropW = Math.max(1, Math.min(c.w, srcW - c.x));
-  const cropH = Math.max(1, Math.min(c.h, srcH - c.y));
+  // visible cropped extents, matching transforms.ts computeTransformInto (and
+  // the export builder): each side at least VISIBLE_CROP_MIN, the origin
+  // clamped into the frame first, then w/h shrink to what is left.
+  const floorW = Math.min(VISIBLE_CROP_MIN, srcW);
+  const floorH = Math.min(VISIBLE_CROP_MIN, srcH);
+  const cropX = Math.min(Math.max(c.x, 0), srcW - floorW);
+  const cropY = Math.min(Math.max(c.y, 0), srcH - floorH);
+  const cropW = Math.max(Math.min(c.w, srcW - cropX), floorW);
+  const cropH = Math.max(Math.min(c.h, srcH - cropY), floorH);
   const rotated = rotate === 90 || rotate === 270;
   const fitW = rotated ? cropH : cropW;
   const fitH = rotated ? cropW : cropH;

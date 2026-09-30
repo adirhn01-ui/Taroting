@@ -148,7 +148,7 @@ vi.mock("../adjust/plan", () => ({
 
 import { RENDER_MAX_AREA, RENDER_MAX_SIDE } from "../../core/types";
 import { fillChecker } from "./checker";
-import { layerBox, renderComposite } from "./composite";
+import { layerBox, releaseRenderScratch, renderComposite } from "./composite";
 import type { LiveInk, RenderResources } from "./index";
 import { encodeQuality, maxRenderSize, outputSize, renderImageExport, renderThumbnail, thumbnailSize } from "./export";
 
@@ -408,6 +408,30 @@ describe("renderImageExport", () => {
     expect(releases).toEqual([`${strokeScratches[0]}|release`]);
     // given back BEFORE the encoder needs its own buffer
     expect(log.indexOf(releases[0]!)).toBeLessThan(log.findIndex((l) => l.endsWith("|encode")));
+  });
+
+  it("gives the preview's shared pencil scratch back on release, and makes a fresh one after", () => {
+    // Module state: whatever an earlier test left is let go of first.
+    releaseRenderScratch();
+    log = [];
+    strokeScratches.length = 0;
+    layers = [drawing("d", [[ink("#010101")]])];
+    const stage = new FakeCanvas(300, 200);
+    const paint = (): void =>
+      renderComposite(stage.getContext() as unknown as CanvasRenderingContext2D, doc(), noRes, { zoom: 1, panX: 0, panY: 0 }, { underlay: "none" });
+    paint();
+    const preview = strokeScratches[0]!;
+    expect(preview).toBeDefined();
+    expect(log.filter((l) => l.endsWith("|release"))).toEqual([]);
+
+    releaseRenderScratch();
+    expect(log.filter((l) => l.endsWith("|release"))).toEqual([`${preview}|release`]);
+
+    // the next editor mount paints with a new one, never the released one
+    strokeScratches.length = 0;
+    paint();
+    expect(strokeScratches).toHaveLength(1);
+    expect(strokeScratches[0]).not.toBe(preview);
   });
 
   it("flattens a transparent JPEG onto white FIRST, then the layers", async () => {

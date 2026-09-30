@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::cache::{Cache, CacheKind, MediaKey};
 use crate::error::Result;
@@ -169,21 +169,36 @@ fn prepared_target(d: &Decision) -> Option<(CacheKind, &'static str)> {
 /// Pure CPU plus at most one stat: no job, no ffmpeg, so it is registered
 /// sync. A hit refreshes that file's LRU stamp exactly as `plan_playback`'s
 /// own lookup would — the caller asks because it is about to play it.
+///
+/// The cache is looked up, never required: main.rs runs without one when
+/// `%LOCALAPPDATA%` is unusable, and a `State` parameter failed this command
+/// before its body ran — so the viewer refused even an MP4 that plays as-is.
+/// No cache simply means nothing is prepared.
 #[tauri::command]
 pub fn classify_playback(
-    cache: State<'_, Arc<Cache>>,
+    app: AppHandle,
     media: MediaRef,
     hints: CodecHints,
     force_proxy_large: bool,
 ) -> PlaybackClassInfo {
-    let class = classify(&media, hints, force_proxy_large);
-    let prepared = prepared_target(&decide(&media, hints, force_proxy_large))
-        .map(|(kind, suffix)| {
-            cache
-                .existing_file(kind, &media_key(&media).hash(), suffix)
-                .is_some()
-        })
-        .unwrap_or(false);
+    let cache = app.try_state::<Arc<Cache>>();
+    classify_info(cache.as_deref().map(|c| &**c), &media, hints, force_proxy_large)
+}
+
+/// `classify_playback` minus the Tauri handle, so the tests can drive it with
+/// and without a cache.
+fn classify_info(
+    cache: Option<&Cache>,
+    media: &MediaRef,
+    hints: CodecHints,
+    force_proxy_large: bool,
+) -> PlaybackClassInfo {
+    let class = classify(media, hints, force_proxy_large);
+    let prepared = prepared_target(&decide(media, hints, force_proxy_large))
+        .zip(cache)
+        .is_some_and(|((kind, suffix), cache)| {
+            cache.existing_file(kind, &media_key(media).hash(), suffix).is_some()
+        });
     PlaybackClassInfo { class, prepared }
 }
 
@@ -373,11 +388,15 @@ fn ensure_prepared(
     })
 }
 
+/// The cache is looked up, never required (see `classify_playback`). With
+/// none there is nowhere to prepare into, so the original is handed over as
+/// it is: a file the webview can play still plays, and one it cannot fails
+/// in the player like any undecodable file, instead of the command failing
+/// before it runs.
 #[tauri::command]
 pub fn plan_playback(
     app: AppHandle,
     jobs: State<'_, Arc<Jobs>>,
-    cache: State<'_, Arc<Cache>>,
     inflight: State<'_, Inflight>,
     media: MediaRef,
     hints: CodecHints,
@@ -387,6 +406,11 @@ pub fn plan_playback(
     // Where the output lives comes from `prepared_target` alone, the table
     // `classify_playback` reads; each arm below only picks the recipe.
     let Some((cache_kind, suffix)) = prepared_target(&decision) else {
+        return Ok(PlaybackPlan::Direct {
+            path: media.path.clone(),
+        });
+    };
+    let Some(cache) = app.try_state::<Arc<Cache>>() else {
         return Ok(PlaybackPlan::Direct {
             path: media.path.clone(),
         });
@@ -739,6 +763,31 @@ mod tests {
         assert_eq!(h2.id, second, "the caller gets the NEW job's own handle");
         // And the slot now names the successor, which is live: joined.
         assert_eq!(inflight.claim(&jobs, &out, alloc(JobKind::Proxy)).err(), Some(second));
+    }
+
+    /// No cache at all (main.rs runs without one when %LOCALAPPDATA% is
+    /// unusable): the class is still answered and nothing is prepared. The
+    /// same media against a cache holding its remux IS prepared, so the
+    /// `false` is the cache's absence and nothing else.
+    #[test]
+    fn classify_answers_without_a_cache() {
+        let dir = std::env::temp_dir().join(format!("taroting-classify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Cache::new_at(dir.join("cache"));
+        let mut m = media("video", r"C:\v\a.mkv");
+        m.container = Some("matroska,webm".into());
+        m.vcodec = Some("h264".into());
+        m.acodec = Some("aac".into());
+        m.pix_fmt = Some("yuv420p".into());
+        let (kind, suffix) = prepared_target(&decide(&m, NO_HINTS, false)).expect("fixture: a remux");
+        cache.ensure_kind_dir(kind).unwrap();
+        std::fs::write(cache.file_path(kind, &media_key(&m).hash(), suffix), b"remuxed").unwrap();
+
+        let bare = classify_info(None, &m, NO_HINTS, false);
+        assert_eq!((bare.class, bare.prepared), (PlaybackClass::ContainerOnly, false));
+        let cached = classify_info(Some(&cache), &m, NO_HINTS, false);
+        assert_eq!((cached.class, cached.prepared), (PlaybackClass::ContainerOnly, true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The canceled job's closure still runs `release` with its OWN id; that

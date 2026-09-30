@@ -99,11 +99,29 @@ export function sanitizeImagePreset(raw: unknown): ImageExportPreset | null {
   return { format, quality, size };
 }
 
+/** Does a custom W×H still have the canvas's shape? Either side may have been
+ *  the one typed (the other was rounded from it), so it is checked both ways,
+ *  a pixel of rounding allowed. */
+export function customSizeFits(size: { w: number; h: number }, canvasW: number, canvasH: number): boolean {
+  if (!(canvasW > 0 && canvasH > 0 && Number.isFinite(canvasW) && Number.isFinite(canvasH))) return false;
+  return (
+    Math.abs(lockedSide(size.w, canvasW, canvasH) - size.h) <= 1 || Math.abs(lockedSide(size.h, canvasH, canvasW) - size.w) <= 1
+  );
+}
+
 /** The preset the dialog opens on: the project's last one, else one that
- *  follows the source photo's format (a JPEG stays a JPEG). */
+ *  follows the source photo's format (a JPEG stays a JPEG). A remembered
+ *  custom size is kept only while the canvas still has its shape — a rotate,
+ *  crop or canvas resize since then would stretch the picture into it, so the
+ *  size falls back to 100%. */
 export function defaultImagePreset(project: ProjectFile, hint: ExportSourceHint): ImageExportPreset {
   const saved = sanitizeImagePreset(project.image?.export);
-  if (saved) return saved;
+  if (saved) {
+    if (typeof saved.size === "object" && !customSizeFits(saved.size, project.timeline.width, project.timeline.height)) {
+      return { ...saved, size: 100 };
+    }
+    return saved;
+  }
   if (hint.ext === "jpg") return { format: "jpeg", quality: DEFAULT_QUALITY, size: 100 };
   if (hint.ext === "webp") return { format: "webp", quality: DEFAULT_QUALITY, size: 100 };
   return { format: "png", quality: DEFAULT_QUALITY, size: 100 };

@@ -82,6 +82,42 @@ describe("computeTransform", () => {
   });
 });
 
+/* The crop a crafted .trt can carry past clampCrop: the preview must draw what
+ * the export builder hands ffmpeg. Every row below is a row of builder.rs's
+ * own tests (`a_crop_side_under_the_preview_floor_exports_at_the_floor`,
+ * `a_crop_hanging_off_the_media_is_clamped_inside_it`, same 1280x720 canvas),
+ * read back in source px the way export-parity.test.ts does. */
+describe("computeTransform: a crop past clampCrop previews as it exports", () => {
+  const canvas = { width: 1280, height: 720 };
+  const src = (crop: { x: number; y: number; w: number; h: number }, media: { width: number; height: number }) => {
+    const c = computeTransform({ ...defaultTransform(), crop }, media, canvas);
+    return {
+      w: Math.round(c.cropW / c.k),
+      h: Math.round(c.cropH / c.k),
+      x: Math.round(-c.offX / c.k) + 0,
+      y: Math.round(-c.offY / c.k) + 0,
+    };
+  };
+
+  it("a side under 8 px previews at the 8 px floor, not as a sliver", () => {
+    const hd = { width: 1920, height: 1080 };
+    expect(src({ x: 100, y: 60, w: 1, h: 1 }, hd)).toEqual({ w: 8, h: 8, x: 100, y: 60 });
+    expect(src({ x: 100, y: 60, w: 1, h: 500 }, hd)).toEqual({ w: 8, h: 500, x: 100, y: 60 });
+    expect(src({ x: 100, y: 60, w: 700, h: 1 }, hd)).toEqual({ w: 700, h: 8, x: 100, y: 60 });
+    // a 5x3 media cannot hold an 8 px side: the floor stops at its size,
+    // which is the whole frame
+    expect(src({ x: 2, y: 1, w: 1, h: 1 }, { width: 5, height: 3 })).toEqual({ w: 5, h: 3, x: 0, y: 0 });
+  });
+
+  it("a crop hanging off the media is drawn clamped inside it", () => {
+    const portrait = { width: 1080, height: 1920 };
+    expect(src({ x: 1200, y: 100, w: 500, h: 800 }, portrait)).toEqual({ w: 8, h: 800, x: 1072, y: 100 });
+    expect(src({ x: 100, y: 2000, w: 300, h: 400 }, portrait)).toEqual({ w: 300, h: 8, x: 100, y: 1912 });
+    // an in-frame origin with an overhanging size keeps its origin and shrinks
+    expect(src({ x: 100, y: 0, w: 1080, h: 1920 }, portrait)).toEqual({ w: 980, h: 1920, x: 100, y: 0 });
+  });
+});
+
 /* applyIntrinsicScale — the generated-media path. The suite runs in the "node"
  * environment (no DOM), and the function only ever writes three style strings,
  * so a bare { style: {} } stands in for the element. */
@@ -131,5 +167,20 @@ describe("applyIntrinsicScale", () => {
     applyIntrinsicScale(asEl(el), c, 1920, 1080, 0.25);
     expect(c.k).toBe(1);
     expect(el.style.transform).toBe("translate(0px, 0px) scale(0.25)");
+  });
+});
+
+describe("one crop floor everywhere", () => {
+  it("Fit/Fill uses the preview's CROP_MIN", async () => {
+    const { VISIBLE_CROP_MIN, fitFillScale } = await import("../../core/project");
+    const { CROP_MIN } = await import("./canvas-math");
+    expect(VISIBLE_CROP_MIN).toBe(CROP_MIN);
+    // A 1 px wide crop on 64x36 media fits as the 8 px the preview draws. On a
+    // 16x36 canvas, fill = (16/8) / (36/36) = 2; the old 1 px floor gave
+    // 16 / 1 = 16 → clamped to MAX_SCALE 4, so the two floors differ.
+    expect(fitFillScale(64, 36, { x: 10, y: 0, w: 1, h: 36 }, 16, 36, "fill")).toBeCloseTo(2, 9);
+    // The origin is clamped into the frame first: a crop starting past the
+    // right edge is the last 8 px, not a 1 px sliver.
+    expect(fitFillScale(64, 36, { x: 70, y: 0, w: 1, h: 36 }, 16, 36, "fill")).toBeCloseTo(2, 9);
   });
 });

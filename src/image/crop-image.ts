@@ -147,6 +147,13 @@ export function dragCrop(
 
 let active: (() => void) | null = null;
 
+/** Cancel the open whole-image crop, if any (the window is closing). It has
+ *  written nothing to the project yet — Apply is its only write — so this only
+ *  takes the frame down; nothing is reverted. */
+export function cancelImageCrop(): void {
+  active?.();
+}
+
 /** The shared context menu is showing (ui/menu.ts keeps one host and toggles
  *  its display) — the same predicate select-tool.ts uses. */
 const menuOpen = (): boolean => {

@@ -409,6 +409,11 @@ impl Placement {
     }
 }
 
+/// The smallest crop side, in source px: `CROP_MIN` in
+/// `src/editor/preview/canvas-math.ts`, the floor the preview's crop gesture
+/// and `clampCrop` enforce.
+const CROP_MIN: f64 = 8.0;
+
 /// Compute per-clip crop rect + scaled display size + overlay position, using
 /// the identical fit math as the preview transform.
 ///
@@ -457,10 +462,29 @@ fn placement(clip: &Clip, media: &MediaRef, canvas: (u32, u32), out: (u32, u32))
     let src_w = media.width.unwrap_or(canvas_w).max(1) as f64;
     let src_h = media.height.unwrap_or(canvas_h).max(1) as f64;
 
-    // crop defaults to the full frame; clamp like the preview does.
-    let (crop_x, crop_y, raw_cw, raw_ch) = crop_rect.unwrap_or((0.0, 0.0, src_w, src_h));
-    let crop_w = raw_cw.min(src_w - crop_x).max(1.0);
-    let crop_h = raw_ch.min(src_h - crop_y).max(1.0);
+    // crop defaults to the full frame; clamp it INTO the source.
+    //
+    // The floor is the preview's `CROP_MIN` (canvas-math.ts), capped at the
+    // source size for a tiny media. It used to be 1 px, and a 1 px side on any
+    // 4:2:0 source rounds to 0 on the chroma grid: ffmpeg aborts the export
+    // ("Invalid too big or non positive size"). Typed into the inspector or
+    // read from a crafted `.trt`, nothing upstream stopped it.
+    //
+    // x/y are clamped first, so a crop that starts past the edge (a legacy
+    // project whose portrait repair swapped the media's width and height
+    // under an old crop) keeps at least the floor inside the frame instead of
+    // reaching ffmpeg as an out-of-range origin; then w/h shrink to what is
+    // left, the preview's own `min(w, src - x)`. A rect `clampCrop` already
+    // accepted comes through unchanged. `min`/`max` rather than `clamp`: the
+    // values are unvalidated `.trt` fields, `clamp` panics on a NaN bound and
+    // release is `panic = "abort"`; `NaN.max(0.0)` is simply 0.
+    let (raw_x, raw_y, raw_cw, raw_ch) = crop_rect.unwrap_or((0.0, 0.0, src_w, src_h));
+    let floor_w = CROP_MIN.min(src_w);
+    let floor_h = CROP_MIN.min(src_h);
+    let crop_x = raw_x.max(0.0).min(src_w - floor_w);
+    let crop_y = raw_y.max(0.0).min(src_h - floor_h);
+    let crop_w = raw_cw.min(src_w - crop_x).max(floor_w);
+    let crop_h = raw_ch.min(src_h - crop_y).max(floor_h);
 
     // fit the cropped (and possibly rotated) region into the canvas
     let rotated = rotate == 90 || rotate == 270;
@@ -1181,6 +1205,28 @@ x=0:y=0:boxw={w}:boxh={h}:text_align=L+M:line_spacing={line_spacing}:expansion=n
                             None,
                         );
 
+                        // A recording's video stream can end before the clip
+                        // does: a new clip's `src_out` is the CONTAINER
+                        // duration, and that often runs past the last video
+                        // frame (audio outlasting it). `shortest=1` then ended
+                        // the segment with the stream, short of `clip_dur`, and
+                        // every later segment slid earlier against its
+                        // `adelay`-placed audio and the `enable`-gated upper
+                        // tracks — tens of ms a clip, adding up. Hold the last
+                        // frame instead (what the preview's `<video>` shows), so
+                        // the black base alone sets the segment length. A still
+                        // (`-loop 1 -t`) and a generator (trimmed to the slot)
+                        // already fill it exactly; their graph is unchanged.
+                        let chain_label = match &vseg.input {
+                            ClipInput::File(_) if m.kind != "image" => {
+                                fc.push_str(&format!(
+                                    "{chain_label}tpad=stop_mode=clone:stop_duration={clip_dur:.6}[p{n}];"
+                                ));
+                                format!("[p{n}]")
+                            }
+                            _ => chain_label,
+                        };
+
                         // black base for this segment, overlay clip onto it.
                         fc.push_str(&format!(
                             "color=black:s={w}x{h}:r={fps}:d={clip_dur:.6}[b{n}];"
@@ -1813,6 +1859,97 @@ mod tests {
         let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
         assert!(b.filter_complex.contains("color=black:s=1920x1080:r=30:d=1.000000"), "{}", b.filter_complex);
         assert!(b.filter_complex.contains("concat=n=3:v=1:a=0"), "{}", b.filter_complex);
+    }
+
+    /// A recording's segment holds its last frame to the end of the slot
+    /// (`tpad` before the `shortest=1` overlay), so a video stream shorter
+    /// than its clip cannot end the segment early. A still and a generator
+    /// already fill the slot exactly and keep their graph as it was. The
+    /// real-ffmpeg half is `e2e_a_video_stream_shorter_than_its_clip_keeps_later_clips_on_time`.
+    #[test]
+    fn only_a_recording_segment_is_padded_to_its_slot() {
+        let m = media("m1", r"C:\v.mp4", 1920, 1080, false);
+        let mut still = media("m2", r"C:\p.png", 640, 480, false);
+        still.kind = "image".into();
+        still.container = Some("png_pipe".into());
+        let solid = gen_media("m3", Generator::Solid { color: "#123456".into() }, 300, 200);
+        let c1 = clip("c1", "m1", 0.0, 1.0, 3.5);
+        let c2 = clip("c2", "m2", 2.5, 0.0, 2.0);
+        let c3 = clip("c3", "m3", 4.5, 0.0, 1.0);
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c1, c2, c3])]);
+        let b = build(&spec(vec![m, still, solid], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        let fc = &b.filter_complex;
+        assert_eq!(fc.matches("tpad=").count(), 1, "only the recording is padded: {fc}");
+        let i = fc.find("tpad=stop_mode=clone:stop_duration=2.500000[p").unwrap_or_else(|| panic!("{fc}"));
+        let label_end = fc[i..].find("];").unwrap() + i + 1;
+        let label = &fc[fc[..label_end].rfind('[').unwrap()..label_end];
+        assert!(fc.contains(&format!("{label}overlay=0:0:shortest=1")), "the padded chain feeds the overlay: {fc}");
+    }
+
+    fn cropped(crop: (f64, f64, f64, f64), media_wh: (u32, u32)) -> Placement {
+        let m = media("m1", r"C:\v.mp4", media_wh.0, media_wh.1, false);
+        let mut c = clip("c1", "m1", 0.0, 0.0, 1.0);
+        c.transform = Some(ClipTransform {
+            crop: Some(ClipCrop { x: crop.0, y: crop.1, w: crop.2, h: crop.3 }),
+            rotate: 0, flip_h: false, flip_v: false,
+            scale: 1.0, x: 0.0, y: 0.0, opacity: 1.0,
+        });
+        placement(&c, &m, (1280, 720), (1280, 720))
+    }
+
+    /// A 1 px side rounds to 0 on a 4:2:0 source's chroma grid and ffmpeg
+    /// aborts the export. The floor is the preview's CROP_MIN (8), and never
+    /// more than the media itself has.
+    #[test]
+    fn a_crop_side_under_the_preview_floor_exports_at_the_floor() {
+        // (w, h, x, y) as `crop=` receives them; media 1920x1080, x != y.
+        assert_eq!(cropped((100.0, 60.0, 1.0, 1.0), (1920, 1080)).crop, Some((8, 8, 100, 60)));
+        assert_eq!(cropped((100.0, 60.0, 1.0, 500.0), (1920, 1080)).crop, Some((8, 500, 100, 60)));
+        assert_eq!(cropped((100.0, 60.0, 700.0, 1.0), (1920, 1080)).crop, Some((700, 8, 100, 60)));
+        // A 5x3 media cannot hold an 8 px side: the floor stops at its size,
+        // which is the whole frame, so no crop is emitted at all.
+        let tiny = cropped((2.0, 1.0, 1.0, 1.0), (5, 3));
+        assert_eq!(tiny.crop, None);
+        assert_eq!((tiny.post_crop_w, tiny.post_crop_h), (5, 3));
+
+        // And the string ffmpeg is handed.
+        let m = media("m1", r"C:\v.mp4", 1920, 1080, false);
+        let mut c = clip("c1", "m1", 0.0, 0.0, 1.0);
+        c.transform = Some(ClipTransform {
+            crop: Some(ClipCrop { x: 100.0, y: 60.0, w: 1.0, h: 400.0 }),
+            rotate: 0, flip_h: false, flip_v: false,
+            scale: 1.0, x: 0.0, y: 0.0, opacity: 1.0,
+        });
+        let tl = timeline(1280, 720, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+        let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        assert!(b.filter_complex.contains(",crop=8:400:100:60"), "{}", b.filter_complex);
+        assert!(!b.filter_complex.contains("crop=1:"), "{}", b.filter_complex);
+    }
+
+    /// A crop that starts past the media's edge — a legacy project whose
+    /// portrait repair swapped 1920x1080 to 1080x1920 under a crop at x=1200,
+    /// or a crafted file — is clamped INTO the frame, like its size already
+    /// was, instead of reaching ffmpeg as an out-of-range origin.
+    #[test]
+    fn a_crop_hanging_off_the_media_is_clamped_inside_it() {
+        let (w, h) = (1080, 1920);
+        let fits = |c: Option<(i64, i64, i64, i64)>| {
+            let (cw, ch, cx, cy) = c.expect("still a crop");
+            assert!(cx >= 0 && cy >= 0 && cx + cw <= w && cy + ch <= h, "{c:?} leaves {w}x{h}");
+            assert!(cw >= 8 && ch >= 8, "{c:?} under the floor");
+        };
+        let off_right = cropped((1200.0, 100.0, 500.0, 800.0), (w as u32, h as u32)).crop;
+        assert_eq!(off_right, Some((8, 800, 1072, 100)));
+        fits(off_right);
+        let off_bottom = cropped((100.0, 2000.0, 300.0, 400.0), (w as u32, h as u32)).crop;
+        assert_eq!(off_bottom, Some((300, 8, 100, 1912)));
+        fits(off_bottom);
+        // A negative (or unreadable) origin is the frame's own corner.
+        assert_eq!(cropped((-50.0, -20.0, 300.0, 400.0), (w as u32, h as u32)).crop, Some((300, 400, 0, 0)));
+        assert_eq!(cropped((f64::NAN, 30.0, 300.0, 400.0), (w as u32, h as u32)).crop, Some((300, 400, 0, 30)));
+        // An in-frame origin with an overhanging size keeps its origin and
+        // shrinks, exactly as the preview draws it (`min(w, src - x)`).
+        assert_eq!(cropped((100.0, 0.0, 1080.0, 1920.0), (w as u32, h as u32)).crop, Some((980, 1920, 100, 0)));
     }
 
     /// EVERY DIMENSION HERE IS DELIBERATELY UNEQUAL TO EVERY OTHER.

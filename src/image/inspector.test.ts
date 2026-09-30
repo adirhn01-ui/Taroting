@@ -16,6 +16,7 @@ const {
   createGestures,
   fitScale,
   parseCrop,
+  pickerCloseTarget,
   pinnedCrop,
   scaleFromPercent,
 } = await import("./inspector");
@@ -266,6 +267,48 @@ describe("gestures: live edit → one undo step", () => {
     expect(holds).toEqual({ taken: 1, released: 1 });
   });
 
+  // A save puts `{...p, modifiedAt}` in the store: new object, same edit.
+  // Typed edits take no autosave hold, so one lands mid-typing.
+  const restamp = (p: ProjectFile): ProjectFile => ({ ...p, modifiedAt: "2026-09-29T12:00:00.000Z" }) as ProjectFile;
+
+  it("a save's restamp between the write and the commit still lands the step", () => {
+    const { s, set } = rig();
+    const g = set.gesture();
+    g.write(() => (s.project = P1));
+    s.project = restamp(P1);
+    g.commit();
+    expect(s.pushed).toEqual([P0]);
+  });
+
+  it("a restamp between two writes does not re-base onto the half-typed value", () => {
+    // Typed "1", the save landed, typed "5": undo must reach P0, not "1".
+    const { s, set } = rig();
+    const g = set.gesture();
+    g.write(() => (s.project = P1));
+    s.project = restamp(P1);
+    g.write(() => (s.project = P2));
+    g.commit();
+    expect(s.pushed).toEqual([P0]);
+  });
+
+  it("a write that changed nothing, then a restamp, lands no empty step", () => {
+    const { s, set } = rig();
+    const g = set.gesture();
+    g.write(() => {});
+    s.project = restamp(P0);
+    g.commit();
+    expect(s.pushed).toEqual([]);
+  });
+
+  it("a rename in between is still someone else's edit", () => {
+    const { s, set } = rig();
+    const g = set.gesture();
+    g.write(() => (s.project = P1));
+    s.project = { ...P1, name: "Renamed" } as ProjectFile;
+    g.commit();
+    expect(s.pushed).toEqual([]);
+  });
+
   it("flush commits every pending gesture", () => {
     const { s, set } = rig();
     const a = set.gesture();
@@ -275,5 +318,23 @@ describe("gestures: live edit → one undo step", () => {
     set.flush();
     expect(set.pending).toBe(0);
     expect(s.pushed).toEqual([P0]); // b wrote nothing, so it adds no step
+  });
+});
+
+describe("pickerCloseTarget", () => {
+  // Three different colours, so each answer can only come from one input.
+  const base = setBackground(createBlankImageProject("t", 64, 64, "#ffffff"), "#112233");
+  const preview = "#abcdef";
+  const openBg = "#445566";
+
+  it("a pick lands on what the picker reports, Escape on what it opened on", () => {
+    expect(pickerCloseTarget("pick", preview, openBg, base)).toBe(preview);
+    expect(pickerCloseTarget("cancel", preview, openBg, base)).toBe(openBg);
+  });
+
+  it("closing the window drops only the preview in flight, back to the project before it", () => {
+    expect(pickerCloseTarget("drop-preview", preview, openBg, base)).toBe("#112233");
+    const clear = setBackground(base, "transparent");
+    expect(pickerCloseTarget("drop-preview", preview, openBg, clear)).toBe("transparent");
   });
 });

@@ -130,7 +130,7 @@ fn main() {
         // (if any) is argv[1..]. The emit carries no payload the frontend trusts:
         // it drains the queue via `take_pending_open_paths`, so a launch during
         // the boot window (before the listener attaches) is still delivered.
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             if let Some(win) = app.get_webview_window("main") {
                 if autotest_mode() {
                     // Under the E2E harness a second launch must not yank the
@@ -144,12 +144,10 @@ fn main() {
                     let _ = win.unminimize();
                 }
             }
-            if let Some(path) = argv
-                .iter()
-                .skip(1)
-                .find(|a| std::path::Path::new(a).is_file())
-            {
-                app.state::<os::OpenPathQueue>().push_if_file(path);
+            // Resolved against the SECOND launch's working directory and
+            // queued absolute: a relative name is that launch's, not ours.
+            if let Some(path) = os::forwarded_file_arg(&argv, &cwd) {
+                app.state::<os::OpenPathQueue>().push_if_file(&path);
                 let _ = app.emit("open-path", ());
             }
         }))

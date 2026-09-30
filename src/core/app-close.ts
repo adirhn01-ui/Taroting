@@ -12,7 +12,11 @@
 import { ipc, onCloseRequested } from "./ipc";
 import { TEARDOWN_WAIT_MS, isTempProjectPath } from "./open-media";
 import { settingsWritesSettled, type ProjectSession } from "./session";
-import { askCloseAnyway, createTempLeaveGate, discardTempSession } from "../ui/temp-project";
+// ../ui/temp-project (the Keep question, "close anyway?", the scratch-file
+// discard) is imported where it is used, never at the top: this module is in
+// the boot chunk, and those dialogs are needed only once a close actually
+// asks or discards. The editors import it statically, so it is normally
+// already loaded by then.
 
 export type CloseDecision = "destroy" | "flush" | "discard" | "prompt" | "export";
 
@@ -78,6 +82,38 @@ function within(p: Promise<unknown>, ms: number): Promise<boolean> {
 }
 
 /* ------------------------------------------------------------------ */
+/* Before-close tasks                                                  */
+/* ------------------------------------------------------------------ */
+
+const beforeTasks = new Set<() => void>();
+
+/** Work that must run BEFORE the close flow decides anything: revert transient previews
+ *  that must never be saved (an unapplied crop, a colour being previewed). Synchronous;
+ *  each task is try/caught; runs once per close request, right after the close ack and
+ *  before the settle wait and the decision. Returns the unregister function. */
+export function registerBeforeClose(task: () => void): () => void {
+  // Wrapped for the same reason as registerCloseTask: each unregister removes
+  // exactly its own registration.
+  const entry = (): void => task();
+  beforeTasks.add(entry);
+  return () => {
+    beforeTasks.delete(entry);
+  };
+}
+
+function runBeforeClose(): void {
+  // A snapshot: a task that unregisters itself (or another) mid-run changes
+  // nothing about this run. A throwing one is only logged — the flow goes on.
+  for (const task of [...beforeTasks]) {
+    try {
+      task();
+    } catch (e) {
+      console.error("A before-close task failed", e);
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Close tasks                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -124,6 +160,9 @@ async function runCloseTasks(): Promise<void> {
  *  must never be the thing that makes X do nothing. */
 async function closeAnyway(message: string): Promise<boolean> {
   try {
+    // Inside the try: a dialog chunk that fails to load is a prompt that
+    // cannot be shown, and closes like one.
+    const { askCloseAnyway } = await import("../ui/temp-project");
     return await askCloseAnyway(message);
   } catch (e) {
     console.error("The close prompt could not be shown", e);
@@ -149,7 +188,12 @@ async function confirmForSession(s: ProjectSession): Promise<boolean> {
       // deletes, Cancel (or a gate already busy with a prompt the user opened
       // from Back) stays. A temp session always has one; the fallback is the
       // same gate, so a missing guard can never mean a silent loss.
-      const confirm = s.leaveGuard ?? (() => createTempLeaveGate(s).confirm());
+      const confirm =
+        s.leaveGuard ??
+        (async () => {
+          const { createTempLeaveGate } = await import("../ui/temp-project");
+          return createTempLeaveGate(s).confirm();
+        });
       // The one wait in the flow with no cap: the question, then a Keep's
       // write. See the repeat-X rule in runCloseFlow.
       inUncappedWait = true;
@@ -169,6 +213,7 @@ async function confirmForSession(s: ProjectSession): Promise<boolean> {
       if (!(await isTempProjectPath(s.path))) return flushForClose(s);
       // Unedited temp: nothing of the user's is in it, so no question (owner
       // decision) — the scratch file just goes now instead of at next start.
+      const { discardTempSession } = await import("../ui/temp-project");
       await discardTempSession(s);
       return true;
     case "flush":
@@ -233,6 +278,10 @@ export async function runCloseFlow(deps: CloseDeps): Promise<"closed" | "stayed"
   ackClose();
   running = true;
   try {
+    // Transient previews (an unapplied crop, a colour being tried) go back
+    // before anything below can read the project: they must never be saved,
+    // kept or counted as an edit.
+    runBeforeClose();
     let proceed: boolean;
     try {
       // A screen still closing (an editor mid final save after Back) finishes

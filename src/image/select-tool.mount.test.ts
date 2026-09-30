@@ -259,6 +259,19 @@ describe("select tool: nudge", () => {
     t.handle.dispose();
   });
 
+  it("a save's restamp mid-run keeps the run's undo step", async () => {
+    // Ctrl+S (or the Temporary badge's Keep) while an arrow is held.
+    const t = mount();
+    t.key("ArrowRight", t.stage);
+    t.store.set({ ...t.store.get(), modifiedAt: "2026-09-29T12:00:00.000Z" });
+    await flush();
+    t.key("ArrowRight", t.stage);
+    doc.fire("keyup", { key: "ArrowRight" });
+    expect(t.x0()).toBe(2);
+    expect(t.commits).toEqual([t.base]);
+    t.handle.dispose();
+  });
+
   it("leaves arrows on a focused range input or anything in the inspector alone", () => {
     const t = mount();
     const range = new El("input");
@@ -293,8 +306,10 @@ describe("select tool: per-layer crop", () => {
     t.cancelBtn.fire("click", {});
     expect(t.mode.get()).toBe("idle");
     expect(t.commits).toEqual([]);
-    // Control: Enter with nothing focused applies.
+    // Control: Enter with nothing focused applies (a real crop: an untouched
+    // one lands no step, as ProjectSession.commitFrom would not either).
     const u = crop();
+    dragIn(u);
     u.key("Enter", u.stage);
     expect(u.mode.get()).toBe("idle");
     expect(u.commits).toEqual([u.base]);
@@ -312,6 +327,51 @@ describe("select tool: per-layer crop", () => {
     expect(win.count("pointermove")).toBe(0);
     t.press(t.overlay, 5, 5);
     expect(t.mode.get()).toBe("idle");
+    t.handle.dispose();
+  });
+
+  /** Drag the crop window's south-east handle 20×10 canvas px inward. */
+  function dragIn(t: ReturnType<typeof crop>) {
+    const se = t.stage.find((e) => e.dataset.crophandle === "se")!;
+    t.press(se, 420, 230);
+    win.fire("pointermove", { pointerId: 1, clientX: 400, clientY: 220 });
+    win.fire("pointerup", { pointerId: 1 });
+    const l = findLayer(t.store.get(), t.id)!;
+    expect(l.transform.crop).toBeDefined(); // the drag really wrote a crop
+    return t.store.get();
+  }
+
+  it("a save's restamp mid-crop is not someone else's edit: Apply is still one step", async () => {
+    // Autosave, Ctrl+S, or Keep on the Temporary badge (no hold defers those).
+    const t = crop();
+    const cropped = dragIn(t);
+    t.store.set({ ...cropped, modifiedAt: "2026-09-29T12:00:00.000Z" });
+    await flush();
+    expect(t.mode.get()).toBe("crop-layer");
+    t.key("Enter", t.stage);
+    expect(t.mode.get()).toBe("idle");
+    expect(t.commits).toEqual([t.base]);
+    t.handle.dispose();
+  });
+
+  it("a crop left untouched through a restamp applies as no step", async () => {
+    const t = crop();
+    t.store.set({ ...t.store.get(), modifiedAt: "2026-09-29T12:00:00.000Z" });
+    await flush();
+    t.key("Enter", t.stage);
+    expect(t.mode.get()).toBe("idle");
+    expect(t.commits).toEqual([]);
+    t.handle.dispose();
+  });
+
+  it("revertCrop (the window is closing) puts the layer back at once, with no step", () => {
+    const t = crop();
+    dragIn(t);
+    t.handle.revertCrop();
+    // Synchronous: the close flow's save reads the store right after.
+    expect(t.store.get()).toBe(t.base);
+    expect(t.commits).toEqual([]);
+    expect(shortcutsBlocked()).toBe(false);
     t.handle.dispose();
   });
 });

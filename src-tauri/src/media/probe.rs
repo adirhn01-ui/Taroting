@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, Result};
 use crate::jobs::ffmpeg;
-use crate::media::exif;
+use crate::media::{exif, extensions};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct Rational {
@@ -217,7 +217,9 @@ pub(crate) fn is_image2_family(container: &str) -> bool {
 /// - A still is ONLY what an image2-family demuxer opened. The old "one frame
 ///   and no audio" promotion also caught AVIF/HEIC (demuxed by mov), ico and a
 ///   one-frame apng or mp4, all of which then failed export on `-loop 1`. A
-///   one-frame mp4 is now simply a one-frame video.
+///   one-frame mp4 is now simply a one-frame video. (An AVIF/HEIC wearing a
+///   picture's NAME is a video here too; `probe_sync` refuses it by name —
+///   `refuse_disguised_picture` — since classifying never sees the path.)
 /// - A visual stream reporting a zero side is refused. An animated WebP probes
 ///   "successfully" at 0x0 and cannot be decoded at all; admitting it created
 ///   a clip that no preview or export could ever draw.
@@ -252,6 +254,36 @@ fn classify(parsed: &FfProbeOut) -> Result<&'static str> {
     } else {
         return Err(AppError::Ffmpeg("no decodable streams".into()));
     })
+}
+
+/// Refuse a file NAMED as a picture that no image2-family demuxer opened.
+///
+/// The extension table keeps real `.avif`/`.heic`/`.ico` files out, but a
+/// name is not a format: browsers routinely save an AVIF served from a CDN as
+/// `photo.jpg`. ffprobe sniffs the `ftyp` box and hands it to the mov demuxer,
+/// `classify` rightly calls that a video, and the file became a video project
+/// holding an 8 ms clip of a 0 s "recording" — not the image project the name
+/// promised, while the viewer showed it fine as an `<img>`. Said plainly
+/// instead, before any further probe work is spent on it.
+///
+/// Two containers are exempt because they ARE what the name says and the app
+/// handles them as their own kind: an animated PNG (`apng`, a real `.png`
+/// that opens as a video) and a GIF under a picture name (kind "gif"). A PNG
+/// or JPEG merely misnamed as the other still reaches an image2-family
+/// demuxer and stays a still.
+fn refuse_disguised_picture(
+    family: Option<extensions::Family>,
+    container: Option<&str>,
+) -> Result<()> {
+    let named_as_picture = family == Some(extensions::Family::Image);
+    let opened_as_picture = container
+        .is_some_and(|c| is_image2_family(c) || c.contains("apng") || c.contains("gif"));
+    if named_as_picture && !opened_as_picture {
+        return Err(AppError::BadInput(
+            "This file's name says it's a picture, but it's stored in a format Taroting can't open.".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The rotation ffmpeg applies to the first decoded frame of `path`, from the
@@ -395,6 +427,11 @@ pub fn probe_sync(path: &str) -> Result<MediaInfo> {
         other => other,
     })?;
     let container = parsed.format.as_ref().and_then(|f| f.format_name.clone());
+    let family = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(extensions::family_of_ext);
+    refuse_disguised_picture(family, container.as_deref())?;
 
     let video = parsed
         .streams
@@ -733,6 +770,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A file named as a picture is refused unless a picture demuxer opened it.
+    /// The containers are ffprobe's own `format_name`s, as measured.
+    #[test]
+    fn a_picture_name_on_another_format_is_refused() {
+        use extensions::Family;
+        let refused = |family, container| match refuse_disguised_picture(family, container) {
+            Err(AppError::BadInput(msg)) => {
+                assert_eq!(
+                    msg,
+                    "This file's name says it's a picture, but it's stored in a format Taroting can't open."
+                );
+                true
+            }
+            Err(other) => panic!("wrong variant: {other:?}"),
+            Ok(()) => false,
+        };
+        let mov = Some("mov,mp4,m4a,3gp,3g2,mj2");
+        // An AVIF/HEIC saved as .jpg, and an ico renamed .png.
+        assert!(refused(Some(Family::Image), mov));
+        assert!(refused(Some(Family::Image), Some("ico")));
+        assert!(refused(Some(Family::Image), None));
+        // A PNG misnamed .jpg still reaches a picture demuxer: a still.
+        assert!(!refused(Some(Family::Image), Some("png_pipe")));
+        assert!(!refused(Some(Family::Image), Some("image2")));
+        // An animated PNG and a GIF are what their names say.
+        assert!(!refused(Some(Family::Image), Some("apng")));
+        assert!(!refused(Some(Family::Image), Some("gif")));
+        // Only a PICTURE name is held to it: a one-frame .mp4 stays a video.
+        assert!(!refused(Some(Family::Video), mov));
+        assert!(!refused(None, mov));
+    }
+
+    /// End to end with a real AVIF saved under a `.jpg` name: refused, where
+    /// it used to come back as a zero-length "video".
+    #[test]
+    fn an_avif_named_jpg_is_refused_by_the_probe() {
+        let dir = std::env::temp_dir().join("taroting disguised picture test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let avif = dir.join("photo.avif");
+        let out = ffmpeg::run(
+            "ffmpeg",
+            &[
+                "-y",
+                "-f", "lavfi", "-i", "color=red:s=64x48",
+                "-frames:v", "1",
+                "-c:v", "libaom-av1", "-still-picture", "1",
+                avif.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let named_jpg = dir.join("photo.jpg");
+        std::fs::copy(&avif, &named_jpg).unwrap();
+
+        match probe_sync(named_jpg.to_str().unwrap()) {
+            Err(AppError::BadInput(msg)) => assert!(msg.contains("stored in a format"), "{msg}"),
+            other => panic!("expected a refusal, got {:?}", other.map(|i| i.kind)),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A real one-frame mp4, end to end: a video, not a still.

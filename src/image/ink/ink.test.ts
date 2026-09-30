@@ -154,6 +154,15 @@ vi.mock("./paint", async (orig) => {
   };
 });
 
+/** Every toast the module shows, as "kind: message". */
+const toasts = vi.hoisted(() => [] as string[]);
+vi.mock("../../ui/toast", () => ({
+  toast: {
+    info: (m: string) => void toasts.push(`info: ${m}`),
+    error: (m: string) => void toasts.push(`error: ${m}`),
+  },
+}));
+
 // Imported after the mocks.
 const { mountInk } = await import("./ink");
 
@@ -585,6 +594,52 @@ describe("pen", () => {
     draw(h, ZIGZAG);
     draw(h, ZIGZAG.map(([x, y]) => [x, y + 100] as [number, number]), { pointerType: "touch", pointerId: 7 });
     expect(h.events.commits).toBe(1);
+    h.handle.dispose();
+  });
+});
+
+describe("shapes", () => {
+  // A drawing layer scaled down to a sliver: the loader refuses any shape end
+  // past ±1e7 layer px, and here a canvas offset of a few hundred px is
+  // divided by 1e-6. A plain drag lands far outside that; so does a tap.
+  const SLIVER: ClipTransform = { rotate: 0, flipH: false, flipV: false, scale: 1e-6, x: 0, y: 0, opacity: 1 };
+  const PLAIN: ClipTransform = { ...SLIVER, scale: 1 };
+  beforeEach(() => {
+    toasts.length = 0;
+  });
+
+  it("control: a drag on a plain drawing layer commits one arrow, silently", () => {
+    const h = harness(project({ drawing: { transform: PLAIN, strokes: [] } }), "shape");
+    draw(h, [
+      [40, 40],
+      [220, 90],
+    ]);
+    expect(h.events.commits).toBe(1);
+    expect(drawingStrokes(h.store.get(), "t-draw").map((s) => s.t)).toEqual(["arrow"]);
+    expect(toasts).toEqual([]);
+    h.handle.dispose();
+  });
+
+  it("a drag whose ends land out of the loader's range commits nothing, and says why", () => {
+    const h = harness(project({ drawing: { transform: SLIVER, strokes: [] } }), "shape");
+    draw(h, [
+      [40, 40],
+      [220, 90],
+    ]);
+    expect(h.events.commits).toBe(0);
+    expect(drawingStrokes(h.store.get(), "t-draw")).toEqual([]);
+    expect(toasts).toEqual(["info: That shape reaches too far outside the layer to keep."]);
+    h.handle.dispose();
+  });
+
+  it("a flick too short to be a shape stays silent there, out of range or not", () => {
+    const h = harness(project({ drawing: { transform: SLIVER, strokes: [] } }), "shape");
+    draw(h, [
+      [40, 40],
+      [40.5, 40.3],
+    ]);
+    expect(h.events.commits).toBe(0);
+    expect(toasts).toEqual([]);
     h.handle.dispose();
   });
 });

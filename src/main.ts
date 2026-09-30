@@ -58,7 +58,9 @@ if (!import.meta.env.DEV) {
 
 // Boot: a plain launch paints the home screen immediately; a launch with a
 // file opens that file first (core/boot). The editor is a separate chunk,
-// prefetched on idle so opening a project is instant without slowing startup.
+// prefetched on idle the first time Home is up, so opening a project is
+// instant without slowing startup — and a launch that opens a file in the
+// viewer never fetches it unless the user goes on to Home.
 // The viewer is a separate chunk too, and deliberately NOT prefetched: it is
 // only ever reached from File Explorer or Home's Open, and a user who never
 // goes there must not pay for it.
@@ -93,6 +95,9 @@ const teardowns = createTeardowns((e) =>
  *  instead of remounting (ViewerHandle.show). */
 let activeViewer: import("./viewer/viewer").ViewerHandle | null = null;
 
+/** The idle editor prefetch has been asked for (once per app lifetime). */
+let editorWarmed = false;
+
 async function go(route: Route): Promise<void> {
   const token = ++navToken;
   const prev = dispose;
@@ -119,6 +124,13 @@ async function go(route: Route): Promise<void> {
   if (route.view === "home") {
     const view = mountHome(app);
     dispose = () => view.dispose();
+    // Warm the editor chunk once Home is up — the one screen that leads
+    // straight into a project. Not on a launch that opened a file: the viewer
+    // never uses it, and it must not compete with that file's first paint.
+    if (!editorWarmed) {
+      editorWarmed = true;
+      requestIdleCallback?.(() => void import("./editor/editor"));
+    }
   } else if (route.view === "settings") {
     const { mountSettings } = await import("./settings/settings");
     if (token !== navToken) return;
@@ -310,9 +322,27 @@ void (async () => {
   };
   // Attach the wake-up listener first, then drain once. A second launch during
   // the boot window pushed its path into the queue; this initial drain picks it
-  // up even if its wake-up event fired before the listener was ready.
-  void onOpenPath(() => void drainOpenPaths());
+  // up even if its wake-up event fired before the listener was ready. AWAITED:
+  // the listener registers only after a dynamic import, so a drain sent beside
+  // it could be answered first, and a wake-up in between went to nobody — the
+  // path then sat queued until some later open. A listener that cannot attach
+  // still leaves this drain.
+  await onOpenPath(() => void drainOpenPaths()).catch(() => {});
   await drainOpenPaths();
+  // One cache trim per plain launch, idle, with Home up. Trims otherwise run
+  // only when a job finishes, so a proxy that landed after its editor closed
+  // kept the cache over its cap until some later job did. Not on a launch that
+  // opened a file: its first screen is still preparing that file (the probe,
+  // then the playback plan that marks its cache entry used) while the main
+  // thread idles, so a trim then could evict the very remux or proxy it is
+  // about to reuse — that launch is left to the job-done trims. Not after a
+  // failed settings read either: the limit on hand is then the default, not
+  // one the user chose, and trimming to it could empty a cache they sized up.
+  if (load.ok && launch === null) {
+    requestIdleCallback?.(
+      () => void ipc.enforceCacheLimit(settingsStore.get().cacheLimitMB, []).catch(() => {}),
+    );
+  }
 })();
 
 // Dev-only in-app E2E harness (activated via TAROTING_AUTOTEST=1).
@@ -335,8 +365,3 @@ if (import.meta.env.DEV) {
     }
   })();
 }
-
-// Warm the editor chunk once the first screen is up.
-requestIdleCallback?.(() => {
-  void import("./editor/editor");
-});

@@ -29,6 +29,25 @@ export function firstImageItem(items: ArrayLike<{ kind: string; type: string }>)
   return -1;
 }
 
+/** Why an image cannot be added right now, or null to take it: the one rule
+ *  behind a paste and a drop from File Explorer, each re-checked after its
+ *  awaits (image-editor's `dropRefusal` words it for a drop). In this order: a
+ *  crop also holds the keyboard, and its message is the one that tells the
+ *  user what to finish. An open picker or menu holds the keyboard too, and a
+ *  layer added under a colour picker's preview would record that unpicked
+ *  colour as the undo step before it. `retry` ends every message. */
+export function addRefusal(
+  mode: "idle" | "crop-image" | "crop-layer",
+  modal: boolean,
+  blocked: boolean,
+  retry: string,
+): string | null {
+  if (mode !== "idle") return `Finish the crop first, then ${retry}.`;
+  if (modal) return `Close the dialog first, then ${retry}.`;
+  if (blocked) return `Close the open menu or picker first, then ${retry}.`;
+  return null;
+}
+
 /** PNG bytes for a pasted image: as-is when it already is one, otherwise
  *  decoded and re-encoded (a JPEG from a browser, a BMP from an old app). */
 async function asPng(file: Blob): Promise<Blob> {
@@ -82,6 +101,20 @@ export function installPaste(ctx: ImageEditorCtx, isDisposed: () => boolean): ()
       if (isDisposed()) return;
       const info = await ipc.probeMedia(path);
       if (isDisposed()) return;
+      // Whatever opened while this was saved and probed: a crop (a commit now
+      // would land inside it), a dialog, or a menu or picker (under a colour
+      // preview, the paste would record that colour as its undo step). The
+      // file is already in Pasted images, so nothing is lost.
+      const refused = addRefusal(
+        ctx.mode.get(),
+        document.querySelector(".modal-backdrop") !== null,
+        shortcutsBlocked(),
+        "paste the image again",
+      );
+      if (refused !== null) {
+        toast.info(refused);
+        return;
+      }
       // The drop's own guard, applied here too: a probe that is not a still
       // (an animated or mis-typed payload) would otherwise reach
       // addPhotoLayer and surface as its raw refusal.

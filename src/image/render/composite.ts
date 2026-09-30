@@ -20,7 +20,7 @@ import { normalizeHexColor } from "../../core/session";
 import type { ClipTransform, Generator, ProjectFile, Stroke } from "../../core/types";
 import { layerToCanvas } from "../geom";
 import { layersOf, type Layer } from "../layers";
-import { createScratch, paintStroke, type Scratch } from "../ink/paint";
+import { createScratch, paintStroke, type ReleasableScratch, type Scratch } from "../ink/paint";
 import { fillChecker } from "./checker";
 import type { Ctx2D, LiveInk, RenderOpts, RenderResources, Underlay, ViewXf } from "./index";
 
@@ -116,7 +116,7 @@ export function opacityOf(l: Layer): number {
 /* ------------------------------------------------------------------ */
 
 let layerCanvas: OffscreenCanvas | null = null;
-let strokeScratch: Scratch | null = null;
+let strokeScratch: ReleasableScratch | null = null;
 
 /** The preview's ONE reused layer scratch (group opacity and live ink need a
  *  layer of their own before it is composited), cleared, at least w×h. Only
@@ -157,6 +157,9 @@ export function releaseRenderScratch(): void {
     layerCanvas.height = 0;
   }
   layerCanvas = null;
+  // Its backing store too, not just the reference: a pencil stroke grows it
+  // to the stroke's box, and it would otherwise wait for a collection.
+  strokeScratch?.release();
   strokeScratch = null;
 }
 

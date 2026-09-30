@@ -14,6 +14,7 @@
 
 import type { ClipTransform } from "../../core/types";
 import { defaultTransform } from "../../core/project";
+import { CROP_MIN } from "./canvas-math";
 
 export interface LayerBoxes {
   pos: HTMLElement;
@@ -62,9 +63,19 @@ export function computeTransformInto(
   const scale = overrides?.scale ?? t.scale;
   const opacity = overrides?.opacity ?? t.opacity;
 
+  // The export builder's crop, step for step (`placement` in builder.rs), so
+  // a crafted .trt previews exactly as it exports: each side at least
+  // CROP_MIN source px, never more than the media has; the origin clamped into
+  // the frame first so that floor stays inside it, then w/h shrink to what is
+  // left. A crop `clampCrop` accepted comes through unchanged. (`sanitizeCrop`
+  // has already refused a non-finite or negative field on load.)
   const crop = t.crop ?? { x: 0, y: 0, w: srcW, h: srcH };
-  const cropW = Math.max(1, Math.min(crop.w, srcW - crop.x));
-  const cropH = Math.max(1, Math.min(crop.h, srcH - crop.y));
+  const floorW = Math.min(CROP_MIN, srcW);
+  const floorH = Math.min(CROP_MIN, srcH);
+  const cropX = Math.min(Math.max(crop.x, 0), srcW - floorW);
+  const cropY = Math.min(Math.max(crop.y, 0), srcH - floorH);
+  const cropW = Math.max(Math.min(crop.w, srcW - cropX), floorW);
+  const cropH = Math.max(Math.min(crop.h, srcH - cropY), floorH);
 
   // fit the cropped (and possibly rotated) region into the project canvas
   const rotated = t.rotate === 90 || t.rotate === 270;
@@ -82,8 +93,8 @@ export function computeTransformInto(
   out.cropH = cropH * k;
   out.mediaW = srcW * k;
   out.mediaH = srcH * k;
-  out.offX = 0 - crop.x * k;
-  out.offY = 0 - crop.y * k;
+  out.offX = 0 - cropX * k;
+  out.offY = 0 - cropY * k;
   out.opacity = opacity;
   out.k = k;
 }

@@ -12,6 +12,22 @@ import type { ShapeKind, Stroke } from "../../core/types";
  *  from the shaft. `strokeBounds` (paint.ts) pads by exactly this. */
 export const ARROW_HEAD_WIDTHS = 4;
 export const ARROW_HEAD_DEG = 28;
+/** Furthest a shape's end may sit from its layer's origin, in layer px — the
+ *  loader's `validPair` (strokes.ts) and the save-time `MAX_SHAPE_COORD`
+ *  (image_rules.rs) refuse anything beyond it, so a shape past it must never be
+ *  committed: one such arrow would make every later save fail. Reachable by an
+ *  ordinary drag on a drawing layer scaled down to a sliver (the offset is
+ *  divided by the scale). */
+export const SHAPE_MAX_COORD = 1e7;
+
+/** Both ends finite and within ±SHAPE_MAX_COORD — what the loader accepts. */
+export function shapeEndsInRange(a: Pt, b: Pt): boolean {
+  for (const v of [a[0], a[1], b[0], b[1]]) {
+    if (!Number.isFinite(v) || Math.abs(v) > SHAPE_MAX_COORD) return false;
+  }
+  return true;
+}
+
 /** Segments approximating an ellipse for hit testing. 48 keeps the chord error
  *  under 0.3% of the radius — far inside any eraser's reach. */
 const ELLIPSE_HIT_SEGMENTS = 48;
@@ -151,16 +167,20 @@ export function shapePolylines(s: ShapeStroke): number[][] {
  * The committed shape, or null when the drag was too small to be a shape (a
  * click, or a flick shorter than `minLen` in the stroke's own units): a stray
  * tap must not leave a dot-sized rectangle behind. A line or arrow needs
- * length; a rectangle or ellipse needs both a width and a height.
+ * length; a rectangle or ellipse needs both a width and a height. Null too
+ * when an end is out of the loader's range (`shapeEndsInRange`).
  */
 export function shapeStroke(kind: ShapeKind, c: string, w: number, a: Pt, b: Pt, minLen: number): Stroke | null {
-  if (!(w > 0) || ![a[0], a[1], b[0], b[1]].every(Number.isFinite)) return null;
+  if (!(w > 0) || !shapeEndsInRange(a, b) || !shapeLongEnough(kind, a, b, minLen)) return null;
+  return { t: kind, c, w, a: [a[0], a[1]], b: [b[0], b[1]] };
+}
+
+/** A drag big enough to be a shape: a line or arrow needs `minLen` of length,
+ *  a rectangle or ellipse needs it in both width and height. False for a
+ *  click, a shorter flick, or an end that is not a number. */
+export function shapeLongEnough(kind: ShapeKind, a: Pt, b: Pt, minLen: number): boolean {
   const dx = Math.abs(b[0] - a[0]);
   const dy = Math.abs(b[1] - a[1]);
-  if (kind === "line" || kind === "arrow") {
-    if (Math.hypot(dx, dy) < minLen) return null;
-  } else if (dx < minLen || dy < minLen) {
-    return null;
-  }
-  return { t: kind, c, w, a: [a[0], a[1]], b: [b[0], b[1]] };
+  if (kind === "line" || kind === "arrow") return Math.hypot(dx, dy) >= minLen;
+  return dx >= minLen && dy >= minLen;
 }

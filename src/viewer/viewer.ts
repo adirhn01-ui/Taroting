@@ -450,8 +450,11 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   function paintNav(): void {
     const text = st ? counterText(st) : "";
     if (countEl.textContent !== text) countEl.textContent = text;
-    // A folder of one: nothing to step to, so nothing to show.
-    const single = st !== null && st.total <= 1;
+    // Nothing to step to either way: nothing to show. Asked of canStep, the
+    // same question the keyboard asks — not of the count, which leaves out a
+    // hidden or deleted file on screen: that file with one visible neighbour
+    // counts 1, yet ←/→ still step to the neighbour, and the mouse must too.
+    const single = st !== null && !canStep(st, -1) && !canStep(st, 1);
     if (prevBtn.hidden !== single) prevBtn.hidden = single;
     if (nextBtn.hidden !== single) nextBtn.hidden = single;
     setDisabled(prevBtn, busy || st === null || !canStep(st, -1));
@@ -526,7 +529,14 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
         paintNav();
         if (wantAnnounce && p === cur) announce();
         applyPending(p === cur);
-        if (q) refresh(q.p, q.wantAnnounce);
+        // A queued request for the very file this answer was listed around
+        // (a settle that fired while an early refill was in flight) would read
+        // the whole folder again only to name the position: the answer is at
+        // most one dwell old, so announce from it instead. `p === cur` is asked
+        // AFTER applyPending, which may have stepped on.
+        if (q && q.p === p && p === cur) {
+          if (q.wantAnnounce) announce();
+        } else if (q) refresh(q.p, q.wantAnnounce);
       },
       () => {
         if (disposed || my !== listGen) return;

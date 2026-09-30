@@ -153,6 +153,9 @@ describe("PhotoCache", () => {
     cache.photo(photoLayer(bare, undefined, "t2"), 1);
     await flush();
     expect(dims).toEqual(["bare:64x36"]);
+    // the file is shared, but the drift is a property of each MediaRef's own recorded size
+    expect(cache.status(bare).message).toBeUndefined();
+    expect(cache.status(recorded).message).toBe("Decodes at 64 × 36, recorded as 36 × 64");
   });
 
   it("decodes a recorded photo STRAIGHT at the working level for a zoomed-out stage", async () => {
@@ -223,5 +226,121 @@ describe("PhotoCache", () => {
     const bmp = cache.photo(photoLayer(m), 1) as unknown as FakeBitmap;
     cache.dispose();
     expect(bmp.closed).toBe(true);
+  });
+});
+
+describe("PhotoCache: one decode per FILE, not per layer", () => {
+  const fetches = (): number => (globalThis.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
+  // Two MediaRefs over one file, as `duplicateLayer` makes them: new id, same path/size/mtime.
+  const a = (): MediaRef => media({ id: "dup-a" });
+  const b = (): MediaRef => media({ id: "dup-b" });
+
+  it("a duplicated layer shares the original's fetch, blob and decoded level", async () => {
+    const cache = new PhotoCache(() => {});
+    cache.photo(photoLayer(a(), undefined, "ta"), 0.25);
+    cache.photo(photoLayer(b(), undefined, "tb"), 0.25);
+    await flush();
+    expect(fetches()).toBe(1);
+    expect(decodes).toEqual([{ w: 125, h: 63, from: "blob" }]);
+    const pa = cache.photo(photoLayer(a(), undefined, "ta"), 0.25);
+    expect(pa).toBeInstanceOf(FakeBitmap);
+    expect(cache.photo(photoLayer(b(), undefined, "tb"), 0.25)).toBe(pa);
+    expect(cache.status(b())).toEqual({ state: "ready", natural: { w: 400, h: 200 } });
+  });
+
+  it("adjusted copies stay per layer, and letting one layer go keeps the other's pixels", async () => {
+    const adj: ClipAdjust = { exposure: 0, brightness: 30, contrast: 0, highlights: 0, shadows: 0, saturation: 0, hue: 0, warmth: 0, tint: 0 };
+    const cache = new PhotoCache(() => {});
+    cache.photo(photoLayer(a(), adj, "ta"), 1);
+    cache.photo(photoLayer(b(), undefined, "tb"), 1);
+    await flush();
+    const pa = cache.photo(photoLayer(a(), adj, "ta"), 1) as unknown as FakeCanvas;
+    const pb = cache.photo(photoLayer(b(), undefined, "tb"), 1) as unknown as FakeBitmap;
+    expect(pa).toBeInstanceOf(FakeCanvas);
+    expect(pb).toBeInstanceOf(FakeBitmap);
+
+    // the adjusted layer is deleted: its copy goes, the shared decode stays
+    cache.retain(new Set(["dup-b"]));
+    expect(pa.width).toBe(0);
+    expect(pb.closed).toBe(false);
+    expect(cache.photo(photoLayer(b(), undefined, "tb"), 1)).toBe(pb);
+    // a relink of one layer drops only that layer's hold
+    cache.photo(photoLayer(a(), undefined, "ta"), 1);
+    cache.invalidate("dup-a");
+    expect(pb.closed).toBe(false);
+    expect(fetches()).toBe(1);
+
+    // the last layer showing the file goes: so does the file
+    cache.retain(new Set());
+    expect(pb.closed).toBe(true);
+  });
+
+  it("a FAILED file shared by two layers is fetched again after one layer's relink", async () => {
+    // Both layers open while the file is missing; the user restores it in
+    // place (same path, size and mtime) and relinks one row.
+    fileOk = false;
+    const cache = new PhotoCache(() => {});
+    cache.photo(photoLayer(a(), undefined, "ta"), 1);
+    cache.photo(photoLayer(b(), undefined, "tb"), 1);
+    await flush();
+    expect(fetches()).toBe(1);
+    expect(cache.status(a()).state).toBe("failed");
+    expect(cache.status(b()).state).toBe("failed");
+
+    fileOk = true;
+    cache.invalidate("dup-a");
+    cache.photo(photoLayer(a(), undefined, "ta"), 1);
+    cache.photo(photoLayer(b(), undefined, "tb"), 1);
+    await flush();
+    expect(fetches()).toBe(2);
+    expect(cache.status(a())).toEqual({ state: "ready", natural: { w: 400, h: 200 } });
+    expect(cache.status(b())).toEqual({ state: "ready", natural: { w: 400, h: 200 } });
+    // one record again, shared: a third render fetches nothing
+    cache.photo(photoLayer(a(), undefined, "ta"), 1);
+    cache.photo(photoLayer(b(), undefined, "tb"), 1);
+    await flush();
+    expect(fetches()).toBe(2);
+  });
+
+  it("two layers of one photo at different scales settle on one level instead of fighting over it", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const cache = new PhotoCache(() => {});
+      const pass = (): void => {
+        cache.photo(photoLayer(a(), undefined, "ta"), 0.25);
+        cache.photo(photoLayer(b(), undefined, "tb"), 1);
+      };
+      pass();
+      await flush();
+      // loaded for the sharpest of the two (100%): one whole decode
+      expect(decodes).toEqual([{ w: undefined, h: undefined, from: "blob" }]);
+      for (let i = 0; i < 4; i++) {
+        pass();
+        vi.advanceTimersByTime(1000);
+        await flush();
+      }
+      expect(decodes.length).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a duplicate with no recorded size joining a decoded file still gets its size recorded, once", async () => {
+    const dims: string[] = [];
+    const cache = new PhotoCache(() => {});
+    cache.onMediaDims((id, w, h) => dims.push(`${id}:${w}x${h}`));
+    cache.photo(photoLayer(a(), undefined, "ta"), 1);
+    await flush();
+    expect(dims).toEqual([]);
+
+    const bare = media({ id: "dup-bare", width: undefined, height: undefined });
+    cache.photo(photoLayer(bare, undefined, "tb"), 1);
+    expect(dims).toEqual([]); // never from inside the render pass
+    await flush();
+    expect(dims).toEqual(["dup-bare:400x200"]);
+    cache.photo(photoLayer(bare, undefined, "tb"), 1);
+    await flush();
+    expect(dims).toEqual(["dup-bare:400x200"]);
+    expect(fetches()).toBe(1);
   });
 });

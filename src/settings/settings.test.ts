@@ -1,7 +1,23 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ipc } from "../core/ipc";
+import { settingsStore } from "../core/session";
 import { ACTION_MODES, DEFAULT_SHORTCUTS } from "../core/types";
 import type { ActionId } from "../core/types";
-import { ACTION_LABELS, ACTION_ORDER, LIVE_MODES, colorRow, liveConflicts } from "./settings";
+import { ACTION_LABELS, ACTION_ORDER, LIVE_MODES, changeCacheLimit, colorRow, liveConflicts } from "./settings";
+
+// The real store, a fake disk write: updateSettings paints the store the way
+// the real one does (synchronously on a verified session) and never reaches IPC.
+const writes = vi.hoisted(() => [] as unknown[]);
+vi.mock("../core/session", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../core/session")>();
+  return {
+    ...real,
+    updateSettings: async (patch: Record<string, unknown>) => {
+      writes.push(patch);
+      real.settingsStore.set({ ...real.settingsStore.get(), ...patch });
+    },
+  };
+});
 
 describe("ACTION_ORDER", () => {
   it("lists every ActionId exactly once", () => {
@@ -96,5 +112,38 @@ describe("colorRow", () => {
       expect(html).toContain(`, ${HEX}"`);
       expect(html).toContain(`id="settings-color-${role}"`);
     }
+  });
+});
+
+describe("changeCacheLimit", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    writes.length = 0;
+  });
+
+  it("lowering the limit saves it and trims the cache to it now, keeping nothing", async () => {
+    settingsStore.set({ ...settingsStore.get(), cacheLimitMB: 10240 });
+    const trim = vi.spyOn(ipc, "enforceCacheLimit").mockResolvedValue(0);
+    const done = changeCacheLimit(2048);
+    expect(done).not.toBeNull();
+    await done;
+    expect(writes).toEqual([{ cacheLimitMB: 2048 }]);
+    expect(trim).toHaveBeenCalledTimes(1);
+    expect(trim).toHaveBeenCalledWith(2048, []);
+  });
+
+  it("raising it (or setting the same value) saves it and trims nothing", () => {
+    settingsStore.set({ ...settingsStore.get(), cacheLimitMB: 2048 });
+    const trim = vi.spyOn(ipc, "enforceCacheLimit").mockResolvedValue(0);
+    expect(changeCacheLimit(5120)).toBeNull();
+    expect(changeCacheLimit(5120)).toBeNull();
+    expect(writes).toEqual([{ cacheLimitMB: 5120 }, { cacheLimitMB: 5120 }]);
+    expect(trim).not.toHaveBeenCalled();
+  });
+
+  it("a trim that fails still settles, so the usage figure repaints", async () => {
+    settingsStore.set({ ...settingsStore.get(), cacheLimitMB: 5120 });
+    vi.spyOn(ipc, "enforceCacheLimit").mockRejectedValue(new Error("no backend"));
+    await expect(changeCacheLimit(1024)).resolves.toBeUndefined();
   });
 });

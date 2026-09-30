@@ -5,6 +5,7 @@ import { isProjectSource } from "../editor/export/export-dialog";
 import {
   defaultFileName,
   defaultFolder,
+  customSizeFits,
   defaultImagePreset,
   exportSources,
   extForImageFormat,
@@ -75,6 +76,30 @@ describe("image export dialog helpers", () => {
   it("prefers the project's last preset over the source's format", () => {
     const p = project({ image: { background: "#000000", export: { format: "webp", quality: 71, size: 25 } } });
     expect(defaultImagePreset(p, { stem: "IMG_0042", ext: "jpg" })).toEqual({ format: "webp", quality: 71, size: 25 });
+  });
+
+  it("keeps a remembered custom size only while the canvas still has its shape", () => {
+    const saved = { format: "jpeg" as const, quality: 80, size: { w: 1920, h: 1080 } };
+    const at = (width: number, height: number) =>
+      defaultImagePreset(project({ image: { background: "transparent", export: saved }, timeline: { fps: { num: 30, den: 1 }, width, height, tracks: [] } }), {
+        stem: "IMG_0042",
+        ext: "jpg",
+      });
+    // the landscape canvas it was chosen on (3840×2160): kept as it is
+    expect(at(3840, 2160)).toEqual(saved);
+    // rotated to portrait, or cropped square: 100%, never a stretched 1920×1080
+    expect(at(2160, 3840)).toEqual({ format: "jpeg", quality: 80, size: 100 });
+    expect(at(2000, 2000)).toEqual({ format: "jpeg", quality: 80, size: 100 });
+    // a pixel of rounding either way is still the same shape
+    expect(at(3841, 2161)).toEqual(saved);
+  });
+
+  it("a custom size fits when either side was the one typed", () => {
+    // typed h = 2 on a 10×1000 canvas → w = round(0.02), clamped to 1; re-deriving
+    // h from that w gives 100, so only the h→w direction recognises the pair
+    expect(customSizeFits({ w: 1, h: 2 }, 10, 1000)).toBe(true);
+    expect(customSizeFits({ w: 1, h: 300 }, 10, 1000)).toBe(false);
+    expect(customSizeFits({ w: 100, h: 50 }, 0, 1000)).toBe(false);
   });
 
   it("whitelists a crafted persisted preset", () => {

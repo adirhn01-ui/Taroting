@@ -34,6 +34,7 @@ import type { ClipTransform, InkKind, ProjectFile, ShapeKind, Stroke } from "../
 import { defaultTransform } from "../../core/project";
 import { isTypingTarget, shortcutsBlocked } from "../../core/shortcuts";
 import { normalizeHexColor } from "../../core/session";
+import { toast } from "../../ui/toast";
 import type { ImageEditorCtx } from "../context";
 import { canvasToLayer } from "../geom";
 import { addDrawingLayer, appendStrokeTo, drawingTarget, eraseStrokes, findLayer, layersOf } from "../layers";
@@ -54,7 +55,7 @@ import {
 import "./ink.css";
 import { createScratch, paintLiveMark, paintLiveShape } from "./paint";
 import { mountRuler } from "./ruler";
-import { constrainShape, shapeStroke, type Pt } from "./shapes";
+import { constrainShape, shapeEndsInRange, shapeLongEnough, shapeStroke, type Pt } from "./shapes";
 
 const INK_TOOLS: ReadonlySet<ToolId> = new Set<ToolId>(["pen", "pencil", "marker", "eraser", "shape"]);
 /** The marker's fixed opacity; the pencil's is 0.3 + 0.7 × mean pressure. */
@@ -443,21 +444,30 @@ export function mountInk(ctx: ImageEditorCtx): { dispose(): void } {
 
   const finishShape = (gs: ShapeGesture): void => {
     const k = canvasPerCss(gs.dpr, gs.zoom);
+    let tooFar = false;
     commitMark((p, t) => {
       const W = p.timeline.width;
       const H = p.timeline.height;
       const la = canvasToLayer(t.t, t.srcW, t.srcH, W, H, gs.a[0], gs.a[1]);
       const lb = canvasToLayer(t.t, t.srcW, t.srcH, W, H, gs.b[0], gs.b[1]);
+      const a: Pt = [la.x, la.y];
+      const b: Pt = [lb.x, lb.y];
       const scale = t.t.scale > 0 ? t.t.scale : 1;
-      return shapeStroke(
-        gs.shape,
-        gs.color,
-        widthFor(gs.sizeCss, gs.dpr, gs.zoom, scale),
-        [la.x, la.y],
-        [lb.x, lb.y],
-        (SHAPE_MIN_CSS * k) / scale,
-      );
+      const minLen = (SHAPE_MIN_CSS * k) / scale;
+      // Length first: a stray tap is no shape wherever it lands, and says
+      // nothing.
+      if (!shapeLongEnough(gs.shape, a, b, minLen)) return null;
+      // A real drag whose ends the loader would refuse (a drawing layer scaled
+      // down to a sliver divides the offset by its scale): not kept, and said
+      // so — a shape that silently vanishes reads as broken.
+      if (!shapeEndsInRange(a, b)) {
+        tooFar = true;
+        return null;
+      }
+      return shapeStroke(gs.shape, gs.color, widthFor(gs.sizeCss, gs.dpr, gs.zoom, scale), a, b, minLen);
     });
+    // Outside the commit: the mutator stays free of side effects.
+    if (tooFar) toast.info("That shape reaches too far outside the layer to keep.");
   };
 
   /**

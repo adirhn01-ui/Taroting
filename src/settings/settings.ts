@@ -303,6 +303,24 @@ function persist(patch: Partial<Settings>): void {
   });
 }
 
+/**
+ * Set the cache limit. A LOWER limit also trims the cache to it now: trims
+ * otherwise run only when some job finishes, so the cache stayed over the
+ * new cap until then. Nothing is kept — Settings replaced whatever screen was
+ * using the cache, so nothing on screen is reading from it. Returns the trim
+ * (to repaint the usage figure once it lands), or null when none was needed.
+ */
+export function changeCacheLimit(next: number): Promise<void> | null {
+  // Read before persist(): it updates the store at once.
+  const prev = settingsStore.get().cacheLimitMB;
+  persist({ cacheLimitMB: next });
+  if (!(next < prev)) return null;
+  return ipc.enforceCacheLimit(next, []).then(
+    () => {},
+    () => {},
+  );
+}
+
 export function mountSettings(root: HTMLElement): { dispose(): void } {
   root.innerHTML = `
     <div class="settings">
@@ -775,7 +793,8 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       .querySelector<HTMLSelectElement>("#settings-cache-limit")
       ?.addEventListener("change", (e) => {
         const v = Number((e.target as HTMLSelectElement).value);
-        persist({ cacheLimitMB: v });
+        const trim = changeCacheLimit(v);
+        if (trim) void trim.then(() => loadCacheStats());
       });
 
     // Clear cache (two-step confirm)

@@ -18,7 +18,7 @@
 
 import "../editor/editor.css";
 import "./image-editor.css";
-import { registerCloseTask } from "../core/app-close";
+import { registerBeforeClose, registerCloseTask } from "../core/app-close";
 import { escapeHtml, fileExt, fileStem } from "../core/format";
 import { describeError, ipc, onDragDrop } from "../core/ipc";
 import type { LoadedProject } from "../core/ipc";
@@ -37,6 +37,7 @@ import { createTempExits, createTempLeaveGate } from "../ui/temp-project";
 import { toast } from "../ui/toast";
 import type { ImageEditorCtx } from "./context";
 import { copyImage } from "./copy";
+import { cancelImageCrop } from "./crop-image";
 import { openImageExportDialog } from "./export-dialog";
 import type { ExportSourceHint } from "./export-dialog";
 import { imgIcon } from "./icons";
@@ -45,7 +46,7 @@ import { mountInk } from "./ink/ink";
 import { mountImageInspector } from "./inspector";
 import { addPhotoLayer, findLayer, layersOf, removeLayer, validateImageProject } from "./layers";
 import { mountLayersPanel } from "./layers-panel";
-import { installPaste } from "./paste";
+import { addRefusal, installPaste } from "./paste";
 import { PreviewResources, renderComposite } from "./render";
 import type { LiveInk } from "./render";
 import { renderThumbnail } from "./render/export";
@@ -96,6 +97,16 @@ export function exportSourceHint(p: ProjectFile): ExportSourceHint {
     };
   }
   return { stem: p.name, ext: null };
+}
+
+/** Why a drop from File Explorer is refused right now, or null to take it.
+ *  In this order: a crop also holds the keyboard, and its message is the one
+ *  that tells the user what to finish. A drag from Explorer presses nothing in
+ *  this window, so a colour picker (never closed on blur) is still open when
+ *  the drop lands — and a layer added under its preview would record that
+ *  unpicked colour as the undo step before it. */
+export function dropRefusal(mode: "idle" | "crop-image" | "crop-layer", modal: boolean, blocked: boolean): string | null {
+  return addRefusal(mode, modal, blocked, "drop the images again");
 }
 
 /** The pixel-bearing parts of a project: a change to anything else (the
@@ -739,9 +750,25 @@ function mount(
   };
   mountChild(mountLayersPanel($("#imged-layers"), ctx));
   mountChild(mountToolbar($("#imged-tools"), ctx));
-  mountChild(mountImageInspector($("#imged-inspector"), ctx));
-  mountChild(mountSelectTool(ctx));
+  const inspector = mountImageInspector($("#imged-inspector"), ctx);
+  mountChild(inspector);
+  const selectTool = mountSelectTool(ctx);
+  mountChild(selectTool);
   mountChild(mountInk(ctx));
+
+  // The window close never reaches dispose() either, and its save writes the
+  // live store: an unapplied layer crop or a colour being previewed would be
+  // saved as though the user had chosen it. Reverted first, synchronously,
+  // before the close flow reads the save state. Nothing is disposed — the user
+  // can still cancel the close and carry on.
+  undo.push(
+    registerBeforeClose(() => {
+      if (disposed) return;
+      selectTool.revertCrop();
+      cancelImageCrop();
+      inspector.dropPreview();
+    }),
+  );
 
   /* ---------------- shortcuts ---------------- */
 
@@ -862,6 +889,16 @@ function mount(
       try {
         const info = await ipc.probeMedia(path);
         if (disposed) return;
+        // The drop's own refusal again, for whatever opened while the probe
+        // ran: a crop (a commit now would land inside it — select-tool keeps
+        // the unapplied crop, with no step of its own), a dialog, or a menu or
+        // picker (under a colour preview, the layer would record that colour
+        // as its undo step).
+        const refused = dropRefusal(mode.get(), modalOpen(), shortcutsBlocked());
+        if (refused !== null) {
+          toast.info(refused);
+          return;
+        }
         if (!isStillInfo(info)) {
           other++;
           continue;
@@ -892,12 +929,9 @@ function mount(
       dropOverlay.classList.remove("active");
       // Refused, but said out loud: a drop that silently does nothing reads
       // as broken.
-      if (mode.get() !== "idle") {
-        toast.info("Finish the crop first, then drop the images again.");
-        return;
-      }
-      if (modalOpen()) {
-        toast.info("Close the dialog first, then drop the images again.");
+      const refused = dropRefusal(mode.get(), modalOpen(), shortcutsBlocked());
+      if (refused !== null) {
+        toast.info(refused);
         return;
       }
       void addPhotos(paths);

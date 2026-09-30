@@ -2,7 +2,7 @@
 //! uninstall entry. All zero-cost when unused; no new crates.
 
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::error::{AppError, Result};
@@ -85,9 +85,45 @@ pub fn capture_launch_arg(queue: &OpenPathQueue) {
 /// An undecodable name is passed over HERE rather than dropped by the queue:
 /// the queue would refuse it anyway (see `push_os_if_file`), and stopping at it
 /// would lose a decodable file further along the same command line.
+///
+/// Returned ABSOLUTE (`launch_path_in`): a command-line launch can name a file
+/// relative to its working directory, and the queued path leaves this process
+/// for a frontend where nothing resolves it — the viewer's folder listing
+/// refuses a relative path, and a temporary project would store one.
 pub fn first_file_arg(args: impl Iterator<Item = OsString>) -> Option<OsString> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    first_file_arg_in(args, &cwd)
+}
+
+/// `first_file_arg` against an explicit working directory, so the tests never
+/// have to move the process's own.
+fn first_file_arg_in(args: impl Iterator<Item = OsString>, cwd: &Path) -> Option<OsString> {
     args.skip(1)
-        .find(|a| a.to_str().is_some() && Path::new(a).is_file())
+        .filter_map(|a| launch_path_in(cwd, &a))
+        .find(|p| p.to_str().is_some() && p.is_file())
+        .map(PathBuf::into_os_string)
+}
+
+/// The file a forwarded SECOND launch names: `first_file_arg`'s rule against
+/// the working directory of the launch that sent it (the single-instance
+/// callback's `cwd`), never this process's — a relative name tested here
+/// found nothing, or a same-named file in the wrong folder. Absolute, like
+/// every queued path.
+pub fn forwarded_file_arg(argv: &[String], cwd: &str) -> Option<String> {
+    let cwd = Path::new(cwd);
+    argv.iter()
+        .skip(1)
+        .filter_map(|a| launch_path_in(cwd, OsStr::new(a)))
+        .find(|p| p.is_file())
+        .and_then(|p| p.to_str().map(str::to_owned))
+}
+
+/// `arg` as an absolute path, a relative one taken against `cwd` (an absolute
+/// `arg` replaces `cwd` whole). `std::path::absolute`, never `canonicalize`:
+/// the latter answers with a `\\?\` verbatim path, which the viewer's folder
+/// listing refuses as surely as a relative one, and it touches the disk.
+fn launch_path_in(cwd: &Path, arg: &OsStr) -> Option<PathBuf> {
+    std::path::absolute(cwd.join(arg)).ok()
 }
 
 /// Whether the FIRST queued path is a file the frontend opens on its own —
@@ -421,6 +457,52 @@ mod tests {
         let alone = vec![os("taroting.exe"), weird];
         assert_eq!(first_file_arg(alone.into_iter()), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative launch argument resolves against the LAUNCH's working
+    /// directory and is returned absolute; an absolute one is returned as it
+    /// is whatever the working directory. The relative row's cwd is a temp
+    /// dir, never the test process's own, so the bare name cannot resolve by
+    /// accident — and it is asserted not to.
+    #[test]
+    fn launch_arguments_come_back_absolute() {
+        let dir = temp_dir("argv-relative");
+        let file = dir.join("clip.mp4");
+        std::fs::write(&file, b"x").unwrap();
+        let other = temp_dir("argv-elsewhere");
+        assert!(!Path::new("clip.mp4").is_file(), "fixture: the bare name must not resolve here");
+
+        let relative = vec![os("taroting.exe"), os("clip.mp4")];
+        assert_eq!(first_file_arg_in(relative.into_iter(), &dir), Some(file.clone().into_os_string()));
+        let absolute = vec![os("taroting.exe"), file.clone().into_os_string()];
+        assert_eq!(first_file_arg_in(absolute.into_iter(), &other), Some(file.clone().into_os_string()));
+        // Against a directory that does not hold it, the bare name is no file.
+        let elsewhere = vec![os("taroting.exe"), os("clip.mp4")];
+        assert_eq!(first_file_arg_in(elsewhere.into_iter(), &other), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// The forwarded second launch: its relative name is found in ITS working
+    /// directory, not this process's, and queued absolute; a name that exists
+    /// only in some other folder is not opened from there.
+    #[test]
+    fn a_forwarded_launch_resolves_against_its_own_directory() {
+        let dir = temp_dir("fwd-relative");
+        let file = dir.join("clip.mp4");
+        std::fs::write(&file, b"x").unwrap();
+        let other = temp_dir("fwd-elsewhere");
+        let (dir_s, other_s) = (dir.to_str().unwrap(), other.to_str().unwrap());
+        let file_s = file.to_str().unwrap().to_string();
+        let argv = |a: &str| vec!["taroting.exe".to_string(), a.to_string()];
+        assert!(!Path::new("clip.mp4").is_file(), "fixture: the bare name must not resolve here");
+
+        assert_eq!(forwarded_file_arg(&argv("clip.mp4"), dir_s), Some(file_s.clone()));
+        assert_eq!(forwarded_file_arg(&argv(&file_s), other_s), Some(file_s.clone()));
+        assert_eq!(forwarded_file_arg(&argv("clip.mp4"), other_s), None);
+        assert_eq!(forwarded_file_arg(&["taroting.exe".to_string()], dir_s), None, "argv[0] only");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     fn queue_of(paths: &[&str]) -> OpenPathQueue {

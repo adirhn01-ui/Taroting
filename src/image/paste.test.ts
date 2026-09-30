@@ -1,5 +1,46 @@
-import { describe, expect, it } from "vitest";
-import { firstImageItem } from "./paste";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createBlankImageProject } from "../core/image-project";
+import { Store } from "../core/store";
+import type { MediaInfo, ProjectFile } from "../core/types";
+
+// The paste's own flow, with the disk, the probe and the toasts faked: what is
+// under test is which of them it waits for and what it re-checks after.
+const saved = vi.hoisted(() => ({ resolve: null as null | ((v: { path: string }) => void) }));
+const toasts = vi.hoisted(() => ({ info: [] as string[], error: [] as string[] }));
+vi.mock("./save", () => ({
+  saveBlob: () =>
+    new Promise<{ path: string }>((r) => {
+      saved.resolve = r;
+    }),
+}));
+vi.mock("../core/ipc", () => ({
+  describeError: (e: unknown) => String(e),
+  ipc: {
+    probeMedia: async (path: string): Promise<MediaInfo> => ({
+      path,
+      size: 1,
+      mtimeMs: 1,
+      kind: "image",
+      duration: 0,
+      width: 320,
+      height: 180,
+      hasAudio: false,
+      oriented: true,
+    }),
+  },
+}));
+vi.mock("../ui/toast", () => ({
+  toast: {
+    info: (m: string) => void toasts.info.push(m),
+    error: (m: string) => void toasts.error.push(m),
+  },
+}));
+vi.mock("../editor/media/relink", () => ({
+  isStillInfo: (i: MediaInfo) => i.kind === "image",
+}));
+
+const { firstImageItem, installPaste } = await import("./paste");
+const { blockShortcuts } = await import("../core/shortcuts");
 
 const item = (kind: string, type: string): { kind: string; type: string } => ({ kind, type });
 
@@ -25,5 +66,115 @@ describe("firstImageItem", () => {
   it("reads an array-like, as a DataTransferItemList is", () => {
     const list = { length: 2, 0: item("string", "text/plain"), 1: item("file", "image/bmp") };
     expect(firstImageItem(list)).toBe(1);
+  });
+});
+
+describe("installPaste: something opened while the paste was being saved", () => {
+  type Handler = (e: unknown) => void;
+  let onPaste: Handler | null = null;
+  /** a dialog's backdrop is on the page */
+  let modal = false;
+
+  beforeEach(() => {
+    onPaste = null;
+    modal = false;
+    saved.resolve = null;
+    toasts.info = [];
+    toasts.error = [];
+    vi.stubGlobal("HTMLElement", class {});
+    vi.stubGlobal("document", {
+      activeElement: null,
+      querySelector: (sel: string) => (modal && sel === ".modal-backdrop" ? {} : null),
+      addEventListener: (t: string, fn: Handler) => {
+        if (t === "paste") onPaste = fn;
+      },
+      removeEventListener: () => {},
+    });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  function rig() {
+    const store = new Store<ProjectFile>(createBlankImageProject("Card", 640, 360, "#ffffff"));
+    const commits: ProjectFile[] = [];
+    const mode = new Store<"idle" | "crop-image" | "crop-layer">("idle");
+    const ctx = {
+      session: {
+        get project() {
+          return store.get();
+        },
+        commit(fn: (p: ProjectFile) => ProjectFile) {
+          commits.push(store.get());
+          store.set(fn(store.get()));
+        },
+      },
+      selection: new Store<string | null>(null),
+      mode,
+    };
+    const remove = installPaste(ctx as never, () => false);
+    const png = new Blob([new Uint8Array([1])], { type: "image/png" });
+    const paste = () =>
+      onPaste!({
+        target: null,
+        preventDefault() {},
+        clipboardData: { items: [{ kind: "file", type: "image/png", getAsFile: () => png }] },
+      });
+    return { commits, mode, remove, paste };
+  }
+
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+  };
+
+  it("lands nothing inside the crop, and says why", async () => {
+    const t = rig();
+    t.paste();
+    await settle();
+    // Still saving; the user double-clicks a layer to crop it.
+    t.mode.set("crop-layer");
+    saved.resolve!({ path: "C:/Pasted images/Pasted 1.png" });
+    await settle();
+    expect(t.commits).toEqual([]);
+    expect(toasts.info).toEqual(["Finish the crop first, then paste the image again."]);
+    t.remove();
+  });
+
+  it("lands nothing under a picker or menu opened meanwhile, and says why", async () => {
+    const t = rig();
+    t.paste();
+    await settle();
+    // Still saving; the user opens the background picker and previews a
+    // colour. The picker holds a shortcut block, not a dialog.
+    const release = blockShortcuts();
+    try {
+      saved.resolve!({ path: "C:/Pasted images/Pasted 1.png" });
+      await settle();
+    } finally {
+      release();
+    }
+    expect(t.commits).toEqual([]);
+    expect(toasts.info).toEqual(["Close the open menu or picker first, then paste the image again."]);
+    t.remove();
+  });
+
+  it("lands nothing behind a dialog opened meanwhile, and says why", async () => {
+    const t = rig();
+    t.paste();
+    await settle();
+    modal = true;
+    saved.resolve!({ path: "C:/Pasted images/Pasted 1.png" });
+    await settle();
+    expect(t.commits).toEqual([]);
+    expect(toasts.info).toEqual(["Close the dialog first, then paste the image again."]);
+    t.remove();
+  });
+
+  it("control: with nothing opened, the same paste lands as one step", async () => {
+    const t = rig();
+    t.paste();
+    await settle();
+    saved.resolve!({ path: "C:/Pasted images/Pasted 1.png" });
+    await settle();
+    expect(t.commits.length).toBe(1);
+    t.remove();
   });
 });
