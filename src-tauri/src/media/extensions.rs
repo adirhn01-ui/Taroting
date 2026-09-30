@@ -3,8 +3,9 @@
 //! about what counts as media: what the picker offers, what drop and
 //! open-with accept, and what the viewer steps through in a folder.
 //!
-//! Parsed once, on the first lookup — which is the first `list_siblings`,
-//! never app start: nothing on the boot path asks what a file is.
+//! Parsed once, on the first lookup: the first `list_siblings`, or
+//! `os::queued_known_launch` when a launch carries a file. A plain launch
+//! never parses it.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;

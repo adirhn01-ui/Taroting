@@ -42,14 +42,8 @@
       {
         "ext": ["trt"],
         "name": "Taroting Project",
-        "description": "Taroting video project",
+        "description": "Taroting project",
         "role": "Editor"
-      },
-      {
-        "ext": ["mp4", "mov", "mkv", "avi", "webm", "gif", "mp3", "wav", "flac", "aac"],
-        "name": "Media file",
-        "description": "Media file openable in Taroting",
-        "role": "Viewer"
       }
     ],
     "windows": {

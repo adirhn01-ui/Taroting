@@ -2,6 +2,7 @@ import "./style/tokens.css";
 import "./style/base.css";
 import "./style/components.css";
 import { installCloseGate, runCloseFlow, type CloseDeps } from "./core/app-close";
+import { beginBoot, hasLaunchHint } from "./core/boot";
 import { fileExt, fileName } from "./core/format";
 import { describeError, destroyWindow, inTauri, ipc, onOpenPath } from "./core/ipc";
 import { navigate, setNavigator, type Route } from "./core/nav";
@@ -55,7 +56,8 @@ if (!import.meta.env.DEV) {
   );
 }
 
-// Boot: paint the home screen immediately. The editor is a separate chunk,
+// Boot: a plain launch paints the home screen immediately; a launch with a
+// file opens that file first (core/boot). The editor is a separate chunk,
 // prefetched on idle so opening a project is instant without slowing startup.
 // The viewer is a separate chunk too, and deliberately NOT prefetched: it is
 // only ever reached from File Explorer or Home's Open, and a user who never
@@ -157,8 +159,18 @@ async function go(route: Route): Promise<void> {
   }
 }
 
-setNavigator((route) => void go(route));
-void go({ view: "home" });
+// A plain launch paints Home right here, synchronously, as it always has. A
+// launch from File Explorer with a media file or a .trt (the Rust-side hint)
+// mounts nothing yet: the first file opens once the settings are in, below,
+// with Home as the bounded fallback (core/boot).
+const launch = beginBoot(hasLaunchHint(window), {
+  setNavigator,
+  go,
+  navCount: () => navToken,
+  routeFirst: (path) => runOnOpenChain(() => routeOpenPath(path)),
+  enqueue: enqueueOpen,
+  reportError: (e) => toast.error(describeError(e)),
+});
 
 // OS file-open routing (File Explorer "Open with", a second launch). A ".trt"
 // opens that project. A media file goes where Settings → Opening files says:
@@ -283,6 +295,9 @@ void (async () => {
   // Until then — the first moments of a launch — X closes natively, which is
   // safe: nothing can be open yet that a close would lose.
   installCloseGate(closeDeps);
+  // A launch file opens first, in place of Home. Its own drain is atomic too,
+  // so the one below then sees only paths that arrived after it.
+  if (launch) await launch.openQueued(() => ipc.takePendingOpenPaths());
   // Atomically drain the server-side open-path queue and route each path. Safe
   // to call repeatedly: the drain returns every queued path to exactly one
   // caller, so the wake-up handler and the startup drain never double-open.
@@ -321,7 +336,7 @@ if (import.meta.env.DEV) {
   })();
 }
 
-// Warm the editor chunk once the home screen has painted.
+// Warm the editor chunk once the first screen is up.
 requestIdleCallback?.(() => {
   void import("./editor/editor");
 });

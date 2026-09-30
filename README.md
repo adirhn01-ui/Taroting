@@ -46,7 +46,9 @@ Taroting launches in a fraction of a second, stays out of your way, and does the
 - Volume, mute, fade in/out, normalize, detach/restore, waveforms
 
 **OS integration**
-- `.trt` files open on double-click; media files opened from Explorer show in a lightweight viewer (the arrows move through the folder in name order) or, if you prefer, open straight into a temporary project — choose in Settings
+- `.trt` files open on double-click, straight into the project
+- Videos, photos and music gain **Open with → Taroting** in Explorer's right-click menu, and Taroting is listed in Windows Settings → Apps → Default apps. **Taroting never changes which app opens your files unless you choose it** there yourself — double-clicking a video, photo or song keeps opening whatever it opened before
+- A file opened with Taroting shows in a lightweight viewer (the arrows move through the folder in name order) or, if you prefer, opens straight into a temporary project — choose in Settings
 - Single-instance: opening a file focuses the already-running app
 - Bin-first import — dropped media lands in the bin, then drag to the timeline or double-click to place at the playhead
 - Right-click menus on clips, media, and home-screen project cards
@@ -64,7 +66,7 @@ Taroting launches in a fraction of a second, stays out of your way, and does the
 Grab the latest build from the [**Releases**](../../releases) page. Two ways to run it:
 
 - **Portable ZIP** — unzip the `Taroting-vX.Y-portable` folder anywhere and double-click `Taroting.exe`. Nothing is installed; keep `ffmpeg.exe` and `ffprobe.exe` alongside it (they do all media processing). Delete the folder to remove it.
-- **Installer** (`Taroting_X.Y.Z_x64-setup.exe`) — installs per-user (no admin rights), adds a Start-menu entry, and registers file associations so `.trt` projects and media files open with Taroting.
+- **Installer** (`Taroting_X.Y.Z_x64-setup.exe`) — installs per-user (no admin rights), adds a Start-menu entry, makes `.trt` projects open with Taroting, and offers Taroting under **Open with** (and in Default apps) for video, image and audio files — without changing which app currently opens them.
 
 The app is not code-signed yet, so Windows SmartScreen may warn on first launch — choose **More info → Run anyway**.
 
@@ -115,7 +117,7 @@ For the in-app end-to-end harness, launch dev with `TAROTING_AUTOTEST=1`. It bui
 | Settings | `%APPDATA%\Taroting` |
 | Cache | `%LOCALAPPDATA%\Taroting\cache` (safe to clear from Settings) |
 
-Uninstalling (from Settings, or via the installer's uninstaller) removes the app and its file associations, and offers a **Delete the application data** checkbox — tick it to also clear your settings and cache, leave it to keep them for a future install. Either way it **keeps your projects** in `Documents\Taroting`. Nothing else is left on the system — no registry cruft beyond the file associations it created, no background services.
+Uninstalling (from Settings, or via the installer's uninstaller) removes the app, the `.trt` association, its **Open with** entries and its Default apps listing, and offers a **Delete the application data** checkbox — tick it to also clear your settings and cache, leave it to keep them for a future install. Either way it **keeps your projects** in `Documents\Taroting`. Nothing else is left on the system — every registry entry it created is removed, apart from one small key that remembers the install folder (ticking **Delete the application data** removes that too); other apps' entries are left exactly as they were, and there are no background services. If you had chosen Taroting as the default for a file type, Windows simply asks which app to use the next time you open one.
 
 Installing a new version over an old one keeps your settings, recent projects and cache.
 

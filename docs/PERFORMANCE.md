@@ -112,3 +112,77 @@ release exe, and the tables are filled by that run.
 | Cache | Before | After | Note |
 |---|---|---|---|
 | Preview cache size | | | |
+
+## v0.9.0 — opening a file without Home first (A/B)
+
+From v0.9.0, a file opened from Explorer (a video, photo, song or `.trt`)
+goes straight to where it belongs — the viewer, or the editor — instead of
+mounting the home screen first and navigating away from it. A plain launch
+takes exactly the old path. Both claims are checked, not assumed: this is an
+A/B of two builds of the same release, not a release-over-release row. A
+`.trt` launch and an editor-mode file launch skip Home whatever the timing
+shows (a product decision); what the timing decides is the viewer-mode launch.
+
+- **Binaries**: A = the release exe built just before the change, B = the
+  release exe with it. Each sits in its own folder with `ffmpeg.exe` and
+  `ffprobe.exe` beside it. Same machine, same session, same files.
+- **Pre-flight** (the run refuses to start otherwise): no `taroting.exe` is
+  running from ANY path. An installed copy shares the single-instance
+  identity, so a test launch would be handed to that window — timing nothing
+  and disturbing whatever is open there. `%APPDATA%\Taroting\settings.json`
+  and the recents file are backed up first and restored at the end, verified
+  byte for byte. Viewer mode is `"openWith": "viewer"` in settings.json,
+  editor mode `"openWith": "editor"` (UTF-8, no BOM); A and B read the key
+  identically.
+- **Timing**: a stopwatch started immediately before `Start-Process -PassThru`,
+  then `MainWindowTitle` polled every 25 ms until the stop condition below.
+  - **M1 — plain launch**: no argument; stop at the first non-empty title.
+  - **M2 — viewer-mode file launch**: `-ArgumentList '"<file>"'`; stop when the
+    title CONTAINS the file's name. Two files: a 1080p H.264 `.mp4` and a
+    12 MP `.jpg`.
+  - The title stops the clock before the first decoded frame; what is timed is
+    start-up plus the route to the file's screen.
+- **M3 — editor-mode launches, by eye (not timed)**: in the same session, with
+  B only, launch the same `.mp4` in editor mode (a temporary project) and a
+  `.trt` (a copy made for the run, never a real project). Pass: the editor
+  appears without Home showing first. A is the build from before the change
+  and still shows Home first on these launches — that is the difference being
+  checked, not a failure of A.
+- **Order**: each iteration runs A, B, B, A (ABBA, so drift over the session
+  falls on both), N = 9 iterations per timed measure (M1, M2). Each launch is closed by its
+  tracked PID, and the next one waits (at most 10 s) until no
+  `msedgewebview2.exe` whose command line holds `com.taroting.app` remains.
+  Each binary's very first launch includes the Defender scan and is recorded
+  separately, never in the medians. Editor-mode runs leave temporary projects
+  behind; at the end the temporary-projects folder is empty, or holds only
+  the last editor-mode run's file. Every launch clears that folder, so
+  anything in it before the run was scratch the next launch would have
+  removed anyway.
+- **Decision** (tolerance T = max(10 ms, 5% of A's median)):
+  - M1: |median B − median A| ≤ T. The change is not reached on a plain
+    launch, so a miss can only be noise — rerun M1 with N = 15.
+  - M2: median B ≤ median A + T. B is expected to be faster (no home
+    screen, no recents or thumbnail work competing with the open).
+  - A miss on M2 reverts the no-Home-first opening for viewer-mode launches;
+    editor-mode and `.trt` launches skip Home regardless. The fix that finds
+    the file in the launch arguments (an install path with a space in it) is
+    kept either way.
+  - M3 must pass by eye; a miss there is a defect to fix, not a revert.
+    Whether the home screen still flashes up first on a viewer-mode launch
+    is judged by eye too; the title cannot show it.
+
+| Measure | Launch | A median | B median | B − A | T | Verdict |
+|---|---|---|---|---|---|---|
+| M1 | Plain launch | | | | | |
+| M2 | 1080p H.264 `.mp4`, viewer mode | | | | | |
+| M2 | 12 MP `.jpg`, viewer mode | | | | | |
+
+| Measure | Launch (B only, by eye) | Editor without Home first? |
+|---|---|---|
+| M3 | 1080p H.264 `.mp4`, editor mode | |
+| M3 | `.trt` | |
+
+| Binary | First launch (incl. Defender scan) |
+|---|---|
+| A | |
+| B | |

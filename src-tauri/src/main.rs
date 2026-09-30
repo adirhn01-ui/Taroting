@@ -47,6 +47,23 @@ fn autotest_flag_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
         .build()
 }
 
+/// A launch that carries a file the app opens on its own (media or `.trt`,
+/// `os::queued_known_launch`): stamp a flag before any frontend script runs,
+/// so the boot (src/core/boot.ts) opens that file first instead of painting
+/// Home and then replacing it.
+///
+/// The script is a CONSTANT. It says only "a known file is queued"; the path
+/// itself still reaches the frontend through `take_pending_open_paths`, so no
+/// file name or extension is ever spliced into script text. Registered only
+/// for such a launch — a plain launch never sees this plugin, runs no script,
+/// defines no flag, and boots exactly as before. Same shape as
+/// `autotest_flag_plugin`: no commands, no setup hook, so no capability entry.
+fn launch_hint_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("taroting-launch-file")
+        .js_init_script("window.__tarotingLaunchFile = true;")
+        .build()
+}
+
 /// **The one part of the autotest concealment that could plausibly affect
 /// rendering.** Parking the window outside every monitor can make Chromium's
 /// native occlusion tracker classify it as fully occluded, and an occluded
@@ -85,10 +102,13 @@ fn conceal_autotest_window<R: tauri::Runtime>(win: &tauri::WebviewWindow<R>) {
 
 fn main() {
     // Server-side open-path queue. Capture a double-click launch argument
-    // (argv[1]) into it before anything else, so the frontend can drain it once
-    // the settings are ready. The same queue also receives second-launch paths.
+    // (the first file on the command line) into it before anything else, so
+    // the frontend can drain it once the settings are ready.
+    // The same queue also receives second-launch paths.
     let open_paths = os::OpenPathQueue::default();
     os::capture_launch_arg(&open_paths);
+    // Read now, while the queue is still ours: `.manage()` below moves it.
+    let launch_file = os::queued_known_launch(&open_paths);
 
     // A blocked or missing %LOCALAPPDATA% must NOT abort before a window
     // exists — that is a double-click that does nothing, forever, with no
@@ -222,6 +242,11 @@ fn main() {
     // at all in a normal or shipped run, so it is zero code and zero cost there.
     if autotest_mode() {
         builder = builder.plugin(autotest_flag_plugin());
+    }
+    // A launch with a known file: the `window.__tarotingLaunchFile` script.
+    // Absent on every plain launch, so Home-first boot is untouched there.
+    if launch_file {
+        builder = builder.plugin(launch_hint_plugin());
     }
 
     if let Some(cache) = cache {

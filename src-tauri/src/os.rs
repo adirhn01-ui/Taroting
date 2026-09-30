@@ -1,7 +1,7 @@
 //! OS integration: first-launch file-open capture and the app-triggered
 //! uninstall entry. All zero-cost when unused; no new crates.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -55,10 +55,9 @@ impl OpenPathQueue {
     }
 }
 
-/// Called from `main()` before the frontend boots. Records argv[1] into the
-/// open-path queue iff it is an existing file. Second-instance launches are
-/// handled by the single-instance plugin's callback, which pushes into the same
-/// queue.
+/// Called from `main()` before the frontend boots. Records the launch's file
+/// argument into the open-path queue. Second-instance launches are handled by
+/// the single-instance plugin's callback, which pushes into the same queue.
 ///
 /// `args_os`, never `args`: `std::env::args()` is documented to PANIC on an
 /// argument that is not valid Unicode. This runs before any window exists,
@@ -66,9 +65,55 @@ impl OpenPathQueue {
 /// passes as undecodable UTF-16 would kill the process outright, with nothing
 /// on screen to explain it.
 pub fn capture_launch_arg(queue: &OpenPathQueue) {
-    if let Some(arg) = std::env::args_os().nth(1) {
+    if let Some(arg) = first_file_arg(std::env::args_os()) {
         queue.push_os_if_file(&arg);
     }
+}
+
+/// The first argument after argv[0] that is an existing, losslessly-decodable
+/// file — the single-instance callback's `skip(1)` + `is_file` rule, so a
+/// first launch and a forwarded second launch pick the same file out of the
+/// same command line, plus the queue's own decodability gate (the callback's
+/// argv arrives already decoded, so it has nothing to pass over).
+///
+/// Not `nth(1)`: a shell verb written with an UNQUOTED exe path
+/// (`C:\Users\John Smith\…\taroting.exe "%1"`) is split at the space by the
+/// argv parser, the exe's own tail lands in argv[1], and the file in argv[2].
+/// `nth(1)` then tested the tail, found no file, and a double-clicked `.trt`
+/// opened Home instead of the project on every profile path with a space.
+///
+/// An undecodable name is passed over HERE rather than dropped by the queue:
+/// the queue would refuse it anyway (see `push_os_if_file`), and stopping at it
+/// would lose a decodable file further along the same command line.
+pub fn first_file_arg(args: impl Iterator<Item = OsString>) -> Option<OsString> {
+    args.skip(1)
+        .find(|a| a.to_str().is_some() && Path::new(a).is_file())
+}
+
+/// Whether the FIRST queued path is a file the frontend opens on its own —
+/// media (the shared extension table) or a `.trt` project. It decides one
+/// thing: whether the webview boots straight into that file instead of
+/// mounting Home first (`window.__tarotingLaunchFile`, main.rs).
+///
+/// PEEKS, never drains: the frontend's `take_pending_open_paths` is still the
+/// queue's only consumer. An empty queue (every plain launch) answers before
+/// any lookup, and `.trt` is checked before the media table, so neither pays
+/// for the table's one-time parse. A poisoned lock answers `false`: no hint is
+/// simply today's boot, Home first.
+pub fn queued_known_launch(queue: &OpenPathQueue) -> bool {
+    let Ok(q) = queue.0.lock() else { return false };
+    let Some(first) = q.first() else { return false };
+    let ext = file_ext(first);
+    ext.eq_ignore_ascii_case("trt") || crate::media::extensions::family_of_ext(ext).is_some()
+}
+
+/// The frontend's `fileExt` (src/core/format.ts): the text after the LAST dot
+/// of the last path segment, `/` or `\`. Not `Path::extension`, which reads a
+/// bare `.trt` as a stem with no extension — the two sides would then disagree
+/// about a file the frontend routes as a project. Case is left to the caller.
+fn file_ext(path: &str) -> &str {
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    name.rfind('.').map_or("", |i| &name[i + 1..])
 }
 
 /// Atomically drain every queued open-path. The frontend calls this once at
@@ -307,6 +352,118 @@ mod tests {
             "an undecodable path must be dropped, never lossily rewritten"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ---- launch argument ---- */
+
+    fn os(s: &str) -> OsString {
+        OsString::from(s)
+    }
+
+    /// The argv an UNQUOTED shell verb produces on a profile path with a space:
+    /// the exe path split in two, the file third. `nth(1)` would test
+    /// "Smith\…\taroting.exe" and find nothing. The file is REAL (a temp file),
+    /// so the `is_file` rule is what picks it, not its position; the fixture
+    /// asserts argv[1] is not a file, so the row cannot pass by argv[1] being
+    /// found instead.
+    #[test]
+    fn first_file_arg_finds_the_file_past_a_split_exe_path() {
+        let dir = temp_dir("argv-space");
+        let file = dir.join("holiday clip.mp4");
+        std::fs::write(&file, b"x").unwrap();
+        let tail = r"Smith\AppData\Local\Taroting\taroting.exe";
+        assert!(!Path::new(tail).is_file(), "fixture: the exe tail must not resolve");
+
+        let argv = vec![os(r"C:\Users\John"), os(tail), file.clone().into_os_string()];
+        assert_eq!(first_file_arg(argv.into_iter()), Some(file.into_os_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No argument, an argv[0] that IS a file (the running exe always is —
+    /// it must never be "opened"), switches, a missing path and a directory:
+    /// none of them is a launch file.
+    #[test]
+    fn first_file_arg_ignores_argv0_and_non_files() {
+        let dir = temp_dir("argv-none");
+        let exe = dir.join("taroting.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+
+        assert_eq!(first_file_arg(std::iter::empty()), None, "no argv at all");
+        assert_eq!(first_file_arg(vec![exe.clone().into_os_string()].into_iter()), None);
+        let argv = vec![
+            exe.into_os_string(),
+            os("--flag"),
+            dir.join("missing.trt").into_os_string(),
+            dir.clone().into_os_string(),
+        ];
+        assert_eq!(first_file_arg(argv.into_iter()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An existing file with an undecodable name is passed OVER, and the
+    /// decodable file after it is the one returned. Stopping at the first file
+    /// instead would hand the queue a name it refuses, and the launch would
+    /// open Home with a real file sitting on its command line.
+    #[cfg(windows)]
+    #[test]
+    fn first_file_arg_passes_over_an_undecodable_file() {
+        let dir = temp_dir("argv-wtf8");
+        let mut weird = dir.clone().into_os_string();
+        weird.push(std::path::MAIN_SEPARATOR_STR);
+        weird.push(undecodable_name("weird"));
+        std::fs::write(&weird, b"{}").unwrap();
+        assert!(Path::new(&weird).is_file() && weird.to_str().is_none(), "fixture");
+        let good = dir.join("fine.trt");
+        std::fs::write(&good, b"{}").unwrap();
+
+        let argv = vec![os("taroting.exe"), weird.clone(), good.clone().into_os_string()];
+        assert_eq!(first_file_arg(argv.into_iter()), Some(good.into_os_string()));
+        let alone = vec![os("taroting.exe"), weird];
+        assert_eq!(first_file_arg(alone.into_iter()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn queue_of(paths: &[&str]) -> OpenPathQueue {
+        OpenPathQueue(Mutex::new(paths.iter().map(|p| p.to_string()).collect()))
+    }
+
+    /// Only the FIRST path decides, case-insensitively, media or `.trt`. Each
+    /// row pairs a first path with a second of the OPPOSITE verdict, so reading
+    /// any entry but `[0]` flips it. The bare `.trt` row is the one
+    /// `Path::extension` would get wrong (it has no stem); the "trt.txt" row
+    /// catches a substring match. Nothing is drained.
+    #[test]
+    fn queued_known_launch_peeks_the_first_path() {
+        let rows: [(&[&str], bool, &str); 9] = [
+            (&[r"C:\v\CLIP.MP4", r"C:\n\notes.txt"], true, "upper-case media"),
+            (&[r"C:\p\Cut.Trt", r"C:\n\notes.txt"], true, "a project, any case"),
+            (&[r"C:\p\.trt", r"C:\n\notes.txt"], true, "a bare .trt, like fileExt"),
+            (&[r"D:/a/photo.webp"], true, "forward slashes"),
+            (&[r"C:\n\notes.txt", r"C:\v\clip.mp4"], false, "unknown first, media second"),
+            (&[r"C:\n\trt.txt"], false, "trt only in the stem"),
+            (&[r"C:\n\README"], false, "no extension"),
+            (&[r"C:\dot.mp4\README"], false, "the dot is in a folder, not the name"),
+            (&[], false, "empty queue"),
+        ];
+        for (paths, want, why) in rows {
+            let q = queue_of(paths);
+            assert_eq!(queued_known_launch(&q), want, "{why}");
+            assert_eq!(q.0.lock().unwrap().len(), paths.len(), "{why}: peeked, never drained");
+        }
+    }
+
+    /// No hint beats a crash: a poisoned queue boots Home, today's path.
+    #[test]
+    fn queued_known_launch_is_false_on_a_poisoned_queue() {
+        let q = std::sync::Arc::new(queue_of(&[r"C:\v\clip.mp4"]));
+        let q2 = q.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = q2.0.lock().unwrap();
+            panic!("poison the queue");
+        })
+        .join();
+        assert!(q.0.is_poisoned(), "fixture must be poisoned");
+        assert!(!queued_known_launch(&q));
     }
 
     /* ---- close escape hatch ---- */
