@@ -15,6 +15,7 @@
 //
 // Each block ends on Home with every project it created deleted.
 
+import { CRASH_TITLES, showCrashNotes } from "../core/crash-notes";
 import { ipc } from "../core/ipc";
 import { navigate } from "../core/nav";
 import { isTempProjectPath } from "../core/open-media";
@@ -319,6 +320,49 @@ export async function runHomeBlocks(ctx: HomeCtx): Promise<void> {
         await ipc.deleteProject(p).catch(() => {});
         if (thumb) await ipc.deleteProject(thumb).catch(() => {});
       }
+    }
+  });
+
+  // The crash note's whole path except the dying: a synthetic note goes
+  // through the panic hook's own writer (debug_write_crash_note — no real
+  // panic), take_crash_notes hands it over exactly once, and boot's
+  // showCrashNotes paints it as an error toast on top of the screen. Under
+  // autotest the note lives in the run's scratch root (paths::app_local_dir),
+  // never in the owner's %LOCALAPPDATA%\Taroting.
+  await test("crash-note-roundtrip", async () => {
+    // A path with an account name in it, as a real panic message can carry:
+    // the note keeps it verbatim (it is the user's own file on their own disk);
+    // redaction happens in the detail pane, on display and copy.
+    const message = "crash-note E2E 7f3a: could not seek C:\\Users\\Someone\\x.mp4 to frame 4021";
+    let shown: HTMLElement | undefined;
+    try {
+      await ipc.debugWriteCrashNote("panic", message);
+      const first = await ipc.takeCrashNotes();
+      assert(first.length === 1, `the first take returned ${first.length} notes (${first.map((n) => n.kind).join(", ") || "none"}), not 1`);
+      const note = first[0]!;
+      assert(note.kind === "panic", `the note's kind is "${note.kind}", not panic`);
+      assert(note.detail.includes(message), `the detail does not carry the message: ${JSON.stringify(note.detail.slice(0, 200))}`);
+      assert(/^kind: panic$/m.test(note.detail), "the detail has no `kind: panic` line");
+      assert(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(note.at ?? ""), `the note's time is ${JSON.stringify(note.at)}`);
+      const second = await ipc.takeCrashNotes();
+      assert(second.length === 0, `a second take returned ${second.length} notes — the note would show on every launch`);
+
+      const before = new Set($$(".toast"));
+      showCrashNotes(first);
+      shown = await waitFor(
+        () => $$<HTMLElement>(".toast.toast--error").find((t) => !before.has(t)),
+        1_000,
+        "the crash toast",
+      );
+      const title = CRASH_TITLES.panic;
+      assert(text(shown).startsWith(title), `the toast reads "${text(shown)}"`);
+      assert(rendered(shown), "the crash toast has no rendered box");
+      assert(hitsItself(shown), `the crash toast is not what paints at its centre (${onScreen()})`);
+      const details = shown.querySelector<HTMLButtonElement>("button");
+      assert(rendered(details) && text(details) === "Details", "the crash toast has no rendered Details button");
+      return `one panic note (at ${note.at}), then none; toast "${title}" painted on top with Details`;
+    } finally {
+      shown?.remove();
     }
   });
 }

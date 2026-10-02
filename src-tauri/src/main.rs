@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod cache;
+mod crash;
 mod debug;
 mod diagnostics;
 mod error;
@@ -101,6 +102,11 @@ fn conceal_autotest_window<R: tauri::Runtime>(win: &tauri::WebviewWindow<R>) {
 }
 
 fn main() {
+    // FIRST: a panic or a native fault from here on leaves a local note that
+    // the next launch shows once (crash.rs). One path computed, two callbacks
+    // registered; nothing else happens until something breaks.
+    crash::install();
+
     // Server-side open-path queue. Capture a double-click launch argument
     // (the first file on the command line) into it before anything else, so
     // the frontend can drain it once the settings are ready.
@@ -171,10 +177,13 @@ fn main() {
                 let _ = std::fs::remove_dir_all(debug::autotest_root());
             }
             project::store::cleanup_temp_projects();
-            if autotest_mode() {
-                if let Some(win) = app.get_webview_window("main") {
+            if let Some(win) = app.get_webview_window("main") {
+                if autotest_mode() {
                     conceal_autotest_window(&win);
                 }
+                // Reload a page whose process died (with a notice), restart
+                // the app if the whole WebView2 engine did (crash.rs).
+                crash::watch_webview(&win);
             }
             Ok(())
         })
@@ -183,6 +192,8 @@ fn main() {
         .manage(media::playability::Inflight::default())
         .manage(export::LastExportFailure::default())
         .manage(os::CloseWatch::default())
+        // This run's page reloads, until the reloaded page asks for them.
+        .manage(crash::Notes::default())
         // An empty map until an image save begins: no thread, no timer.
         .manage(Arc::new(image_save::ImageSaves::default()))
         .on_window_event(|window, event| {
@@ -224,9 +235,11 @@ fn main() {
             export::start_export,
             export::export_failure_report,
             diagnostics::save_diagnostic_report,
+            crash::take_crash_notes,
             debug::debug_info,
             debug::debug_write_report,
             debug::debug_push_open_path,
+            debug::debug_write_crash_note,
             os::take_pending_open_paths,
             os::uninstall_app,
             os::close_ack,

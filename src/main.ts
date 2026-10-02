@@ -3,6 +3,7 @@ import "./style/base.css";
 import "./style/components.css";
 import { installCloseGate, runCloseFlow, type CloseDeps } from "./core/app-close";
 import { beginBoot, hasLaunchHint } from "./core/boot";
+import { showCrashNotes } from "./core/crash-notes";
 import { fileExt, fileName } from "./core/format";
 import { describeError, destroyWindow, inTauri, ipc, onOpenPath } from "./core/ipc";
 import { navigate, setNavigator, type Route } from "./core/nav";
@@ -344,6 +345,10 @@ void (async () => {
   // still leaves this drain.
   await onOpenPath(() => void drainOpenPaths()).catch(() => {});
   await drainOpenPaths();
+  // The previous run's crash note (once), and any page reload of this run
+  // (src-tauri/src/crash.rs). After the first screen is up and the queue is
+  // drained, never awaited: a launch with nothing to show pays one small IPC.
+  void ipc.takeCrashNotes().then(showCrashNotes).catch(() => {});
   // One cache trim per plain launch, idle, with Home up. Trims otherwise run
   // only when a job finishes, so a proxy that landed after its editor closed
   // kept the cache over its cap until some later job did. Not on a launch that

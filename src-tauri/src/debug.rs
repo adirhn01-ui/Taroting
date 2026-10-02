@@ -83,6 +83,20 @@ pub fn debug_push_open_path(
     Ok(())
 }
 
+/// Write a crash note as if `kind` ("panic" | "fault" | "engine") had just
+/// ended the app, through the panic hook's own builder and writer — no real
+/// panic — so the E2E can drive `take_crash_notes` and the boot toast. Only
+/// under the autotest harness, where the note's folder is the run's scratch
+/// root (`paths::app_local_dir`), never the owner's %LOCALAPPDATA%\Taroting.
+#[tauri::command]
+pub fn debug_write_crash_note(kind: String, message: String) -> Result<()> {
+    dev_only()?;
+    if !autotest_mode() {
+        return Err(AppError::BadInput("crash notes are written only under the autotest harness".into()));
+    }
+    crate::crash::write_synthetic_note(&kind, &message)
+}
+
 /// Queue `path` through the real producer gate (`push_if_file`) and report
 /// whether it was taken. A missing file or a directory is dropped silently, as
 /// the single-instance path drops it, so there is nothing to wake anyone for.

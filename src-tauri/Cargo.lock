@@ -3311,6 +3311,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "thiserror 2.0.19",
+ "webview2-com",
  "windows",
  "windows-sys 0.59.0",
  "xxhash-rust",

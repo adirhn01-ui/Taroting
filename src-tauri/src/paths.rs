@@ -53,6 +53,18 @@ pub fn cache_dir() -> Result<PathBuf> {
     Ok(env_dir("LOCALAPPDATA")?.join("Taroting").join("cache"))
 }
 
+/// %LOCALAPPDATA%\Taroting — the app's local root. Holds the crash note
+/// (`crash.rs`: last-crash.txt, written as the process dies, shown once on the
+/// next launch). Redirected under autotest like every owner-data location: an
+/// E2E run that writes a synthetic note must never leave one for the owner's
+/// next launch to show.
+pub fn app_local_dir() -> Result<PathBuf> {
+    if let Some(dir) = autotest_redirect("localappdata") {
+        return Ok(dir);
+    }
+    Ok(env_dir("LOCALAPPDATA")?.join("Taroting"))
+}
+
 /// %LOCALAPPDATA%\Taroting\tmp-projects — scratch projects for the quick-view
 /// (open-with) flow. Files here are never in recents and are wiped when the
 /// primary instance starts; choosing Keep in the editor's keep/discard prompt

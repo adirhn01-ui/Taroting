@@ -231,6 +231,25 @@ export type ImageSaveDest =
   | { kind: "projectThumb"; projectPath: string; projectId: string }
   | { kind: "pasted"; projectName: string };
 
+/** Something that went wrong badly enough to end the app or its page — a
+ *  mirror of `CrashNote` in src-tauri/src/crash.rs (camelCase on the wire).
+ *
+ *  - `panic` / `fault`: the previous run ended (a Rust panic, or a native
+ *    fault such as an access violation inside a DLL), read from the note it
+ *    wrote as it died — shown once, then kept on disk as last-crash.seen.txt.
+ *  - `engine`: the WebView2 engine itself stopped and Taroting restarted.
+ *  - `page`: THIS run's page process stopped and was reloaded (in memory only).
+ *
+ *  `detail` is the whole note text. It can carry file paths (a panic message
+ *  may name the file being opened), so it is only ever shown through the
+ *  redacting detail pane (`toast.error` → Details), never copied raw. */
+export interface CrashNote {
+  kind: "panic" | "fault" | "engine" | "page";
+  /** UTC "YYYY-MM-DDTHH:MM:SSZ" from the note, when it has one. */
+  at: string | null;
+  detail: string;
+}
+
 /** Standalone (rather than an arrow inside `ipc`) so `ipc.getSettings` can be
  *  expressed in terms of it without the object literal referencing itself. */
 async function readSettings(): Promise<SettingsRead> {
@@ -376,6 +395,10 @@ export const ipc = {
   /** Write a diagnostic report next to the user's projects; returns the path. */
   saveDiagnosticReport: (content: string) =>
     call<string>("save_diagnostic_report", { content }),
+  /** The crash notes waiting to be shown: the previous run's (once — the
+   *  backend marks it seen as it returns it) and any page reloads of this run.
+   *  [] on a launch after a clean exit, and outside the desktop app. */
+  takeCrashNotes: () => call<CrashNote[]>("take_crash_notes", undefined, () => []),
 
   /* dev-only (hard error in release builds) */
   debugInfo: () =>
@@ -384,6 +407,10 @@ export const ipc = {
   /** Queue `path` exactly as a second launch would and emit "open-path", so the
    *  E2E drives the real open routing with no second process and no window. */
   debugPushOpenPath: (path: string) => call<void>("debug_push_open_path", { path }),
+  /** Autotest only: write a synthetic crash note through the panic hook's own
+   *  writer (no real panic), for the round trip through `takeCrashNotes`. */
+  debugWriteCrashNote: (kind: "panic" | "fault" | "engine", message: string) =>
+    call<void>("debug_write_crash_note", { kind, message }),
   /** tells the Rust close escape hatch (os::CloseWatch) that the webview
    *  answered this close request, so a later X is not treated as a hang */
   closeAck: () => call<void>("close_ack", undefined, () => undefined),

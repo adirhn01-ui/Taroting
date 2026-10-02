@@ -82,6 +82,15 @@ function checkBootWiring(src: string): string[] {
       problems.push("the startup cache trim runs on a launch that opened a file");
     }
   }
+  // Crash notes are asked for once, after the first screen and the drain, and
+  // never awaited: nothing on the boot path may wait on them.
+  const crash = "ipc.takeCrashNotes()";
+  const crashes = c.split(crash).length - 1;
+  if (crashes !== 1) problems.push(`takeCrashNotes is called ${crashes} times in main.ts, expected once`);
+  else {
+    if (c.indexOf(crash) < c.indexOf("await drainOpenPaths()")) problems.push("the crash notes are taken before the drain");
+    if (!c.includes(`void ${crash}.then(showCrashNotes)`)) problems.push("the crash notes are awaited or not shown");
+  }
   // The viewer's held folder order: kept only across a viewer → project →
   // viewer round trip (an editor route with returnTo), dropped on the first
   // route anywhere else — and never asked about on a plain launch.
@@ -192,6 +201,17 @@ describe("boot wiring (src/main.ts)", () => {
     expect(checkBootWiring(MAIN.replace(keep, "if (route.view === \"editor\") siblingOrderHeld = true;"))).toEqual([
       "the held folder order is not kept for an editor opened from the viewer",
     ]);
+  });
+
+  it("rejects crash notes taken before the drain, or awaited", () => {
+    const line = "  void ipc.takeCrashNotes().then(showCrashNotes).catch(() => {});";
+    expect(MAIN.split(line).length - 1).toBe(1);
+    const listen = "  await onOpenPath(";
+    const early = MAIN.replace(line, "").replace(listen, `${line}\n${listen}`);
+    expect(checkBootWiring(early)).toEqual(["the crash notes are taken before the drain"]);
+    const awaited = MAIN.replace(line, "  await ipc.takeCrashNotes().then(showCrashNotes).catch(() => {});");
+    expect(checkBootWiring(awaited)).toEqual(["the crash notes are awaited or not shown"]);
+    expect(checkBootWiring(MAIN.replace(line, ""))).toEqual(["takeCrashNotes is called 0 times in main.ts, expected once"]);
   });
 
   it("ignores a commented-out call", () => {
