@@ -25,7 +25,7 @@ fn bpp(vcodec: &str) -> f64 {
     }
 }
 
-/// Estimate from the four scalars the answer actually depends on. This is the
+/// Estimate from the scalars the answer actually depends on. This is the
 /// whole implementation; both entry points below funnel into it.
 fn estimate_core(
     duration_sec: f64,
@@ -33,6 +33,7 @@ fn estimate_core(
     timeline_h: u32,
     timeline_fps: f64,
     preset: &ExportPreset,
+    has_audio: bool,
 ) -> SizeEstimate {
     let dur = duration_sec.max(0.0);
     let (w, h) = preset.output_dims(timeline_w, timeline_h);
@@ -48,20 +49,28 @@ fn estimate_core(
 
     // Determine whether video bitrate is custom (exact) or auto.
     let video_custom = preset.video_bitrate.kbps();
-    let audio_custom = preset.audio_bitrate.kbps();
+    // The audio stream's rate: custom when set, else the auto figure — and 0
+    // when there is no audio stream at all. A project with nothing audible is
+    // exported with `-an`, and pricing 192 kbps of audio it never writes made
+    // the "exact" custom-bitrate estimate wrong by that much.
+    let ak = if has_audio {
+        preset
+            .audio_bitrate
+            .kbps()
+            .unwrap_or_else(|| auto_audio_kbps(&preset.format))
+    } else {
+        0
+    };
 
     if let Some(vk) = video_custom {
-        // custom-bitrate mode: exact. If audio is also custom use it; else
-        // fall back to the auto audio figure but still report exact since the
-        // dominant term (video) is exact.
-        let ak = audio_custom.unwrap_or_else(|| auto_audio_kbps(&preset.format));
+        // custom-bitrate mode: exact. An auto audio rate still reports exact,
+        // since the dominant term (video) is exact.
         let bytes = ((vk + ak) as f64 * 1000.0 / 8.0 * dur).round() as u64;
         return SizeEstimate { bytes, exact: true };
     }
 
     // auto (quality) mode: bits-per-pixel heuristic
     let video_bits = w as f64 * h as f64 * fps * bpp(&preset.vcodec) * dur;
-    let ak = audio_custom.unwrap_or_else(|| auto_audio_kbps(&preset.format));
     let audio_bits = ak as f64 * 1000.0 * dur;
     let bytes = ((video_bits + audio_bits) / 8.0).round() as u64;
     SizeEstimate { bytes, exact: false }
@@ -75,7 +84,8 @@ fn auto_audio_kbps(format: &str) -> u64 {
     }
 }
 
-/// The estimate as the frontend asks for it: four scalars and the preset.
+/// The estimate as the frontend asks for it: four scalars, the preset and
+/// whether there is audio.
 pub fn estimate_size(input: &EstimateInput) -> SizeEstimate {
     estimate_core(
         input.duration_sec,
@@ -83,6 +93,7 @@ pub fn estimate_size(input: &EstimateInput) -> SizeEstimate {
         input.height,
         input.fps,
         &input.preset,
+        input.has_audio,
     )
 }
 
@@ -101,7 +112,22 @@ pub fn estimate(spec: &ExportSpec) -> SizeEstimate {
         spec.timeline.height,
         spec.timeline.fps.num as f64 / spec.timeline.fps.den.max(1) as f64,
         &spec.preset,
+        spec_has_audio(spec),
     )
+}
+
+/// Whether the builder writes an audio stream for `spec`: some clip, on any
+/// track, is audible by the builder's own rule (`clip_audible`).
+#[cfg(test)]
+fn spec_has_audio(spec: &ExportSpec) -> bool {
+    spec.timeline.tracks.iter().any(|track| {
+        track.clips.iter().any(|clip| {
+            spec.media
+                .iter()
+                .find(|m| m.id == clip.media_id)
+                .is_some_and(|media| crate::export::builder::clip_audible(clip, media, track))
+        })
+    })
 }
 
 #[tauri::command]
@@ -190,6 +216,7 @@ mod tests {
             height: spec.timeline.height,
             fps: spec.timeline.fps.num as f64 / spec.timeline.fps.den.max(1) as f64,
             preset: spec.preset.clone(),
+            has_audio: spec_has_audio(spec),
         }
     }
 
@@ -320,6 +347,40 @@ mod tests {
         assert_eq!(full.bytes, expected.round() as u64);
     }
 
+    /// No audible clip, no audio term — in both branches, through both entry
+    /// points. 1000 kbps of custom video with an auto audio rate is 1192 kbps
+    /// with audio and 1000 without: over 10 s, 1,490,000 vs 1,250,000 bytes.
+    /// The auto branch drops the same 192 kbps: 8,016,000 vs 7,776,000. The
+    /// full-spec path decides by the builder's rule, here a muted clip.
+    #[test]
+    fn a_silent_export_is_priced_without_audio() {
+        let mut custom = preset();
+        custom.video_bitrate = BitratePreset::Kbps(1000);
+        for (p, with, without) in [(custom, 1_490_000, 1_250_000), (preset(), 8_016_000, 7_776_000)] {
+            let mut spec = spec_with(p, 10.0);
+            assert_eq!(estimate(&spec).bytes, with);
+            let mut input = input_for(&spec);
+            assert!(input.has_audio);
+            input.has_audio = false;
+            assert_eq!(estimate_size(&input).bytes, without);
+
+            spec.timeline.tracks[0].clips[0].audio.muted = true;
+            assert_eq!(estimate(&spec).bytes, without, "a muted clip is not audible");
+            assert!(!input_for(&spec).has_audio);
+        }
+        // The flag arrives as `hasAudio`.
+        let json = r#"{
+            "durationSec": 10.0, "width": 1920, "height": 1080, "fps": 30.0, "hasAudio": false,
+            "preset": {
+                "format": "mp4", "vcodec": "h264", "resolution": "original",
+                "fps": "original", "videoBitrate": 1000, "audioBitrate": "auto",
+                "useHardware": false
+            }
+        }"#;
+        let input: EstimateInput = serde_json::from_str(json).unwrap();
+        assert_eq!(estimate_size(&input).bytes, 1_250_000);
+    }
+
     /// Guard the wire contract: the payload the dialog builds must deserialize,
     /// and it must stay small. If a project field ever creeps back into this
     /// type, this fails long before anyone notices the UI-thread stall.
@@ -334,6 +395,8 @@ mod tests {
             }
         }"#;
         let input: EstimateInput = serde_json::from_str(json).unwrap();
+        // No `hasAudio` (an older caller): priced with audio, as it always was.
+        assert!(input.has_audio);
         assert_eq!(estimate_size(&input).bytes, 8_016_000);
         assert!(serde_json::to_string(&input).unwrap().len() < 256);
     }

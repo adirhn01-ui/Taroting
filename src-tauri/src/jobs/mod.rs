@@ -1,15 +1,16 @@
 //! Background job system. Every long-running ffmpeg invocation flows through
-//! here: queued into a lane (export=1, background=2, thumb=1 workers),
-//! progress parsed from `-progress pipe:1` and emitted as throttled events,
-//! cancellation kills the process and removes partial output.
+//! here: queued into a lane (export=1, transcode=1, background=2, thumb=1
+//! workers), progress parsed from `-progress pipe:1` and emitted as throttled
+//! events, cancellation kills the process and removes partial output.
 
 pub mod ffmpeg;
 pub mod progress;
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
-use std::process::{Child, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -28,13 +29,21 @@ pub enum JobKind {
     Remux,
     Proxy,
     Waveform,
-    Filmstrip,
     Export,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
+    /// Seconds-long work: remuxes, waveforms.
     Background,
+    /// Full re-encodes (proxies): minutes each on a slow CPU. Their own single
+    /// worker, so a backlog of them — and they keep running after the editor
+    /// that asked for them closes — never holds up a remux or a waveform
+    /// queued behind it on `Background`.
+    // Proxies move here with `media::playability`'s routing; until they do,
+    // nothing submits to it. Drop this allow then.
+    #[allow(dead_code)]
+    Transcode,
     Thumb,
     Export,
 }
@@ -89,6 +98,7 @@ pub struct Jobs {
     next_id: AtomicU64,
     registry: Arc<Mutex<HashMap<JobId, JobHandle>>>,
     background_tx: mpsc::Sender<Work>,
+    transcode_tx: mpsc::Sender<Work>,
     thumb_tx: mpsc::Sender<Work>,
     export_tx: mpsc::Sender<Work>,
 }
@@ -118,6 +128,7 @@ impl Default for Jobs {
             next_id: AtomicU64::new(1),
             registry: Arc::new(Mutex::new(HashMap::new())),
             background_tx: spawn_workers(2, "bg"),
+            transcode_tx: spawn_workers(1, "transcode"),
             thumb_tx: spawn_workers(1, "thumb"),
             export_tx: spawn_workers(1, "export"),
         }
@@ -141,6 +152,7 @@ impl Jobs {
     pub fn submit(&self, lane: Lane, work: Work) {
         let tx = match lane {
             Lane::Background => &self.background_tx,
+            Lane::Transcode => &self.transcode_tx,
             Lane::Thumb => &self.thumb_tx,
             Lane::Export => &self.export_tx,
         };
@@ -279,28 +291,56 @@ impl JobFailure {
     }
 }
 
+/// `BELOW_NORMAL_PRIORITY_CLASS`: see `job_command`.
+#[cfg(windows)]
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+
+/// The ffmpeg a job runs: `args`, stdout/stderr piped for the progress parser
+/// and the log tail, run in `cwd` when one is given (a relative name in
+/// `args` — a drawtext `textfile=` — then resolves there).
+///
+/// Below normal priority, and only here: exports, proxies and remuxes are
+/// long and nobody is waiting on any single frame of them, while the window
+/// beside them is — on a two- or four-core PC an encode at normal priority
+/// competes on equal terms with the renderer, and playback and the progress
+/// bar stutter. The thumbnail, waveform, normalize and encoder-probe children
+/// keep `ffmpeg::command`'s normal priority: someone is waiting on each.
+fn job_command(args: &[OsString], cwd: Option<&Path>) -> Result<Command> {
+    let mut cmd = ffmpeg::command("ffmpeg")?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // `creation_flags` replaces, so the no-console flag is restated.
+        cmd.creation_flags(ffmpeg::CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+    }
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    Ok(cmd)
+}
+
 /// Run ffmpeg on the CURRENT thread (call from a lane worker), streaming
 /// throttled progress events. The caller finishes the job afterwards with
 /// `complete_job` / `fail_job`. `handle.set_output` should point at the file
-/// ffmpeg writes so cancellation can clean it up.
+/// ffmpeg writes so cancellation can clean it up. `cwd` is the folder ffmpeg
+/// runs in (`None`: the app's own).
 pub fn execute_ffmpeg(
     app: &AppHandle,
     handle: &JobHandle,
-    args: Vec<std::ffi::OsString>,
+    args: Vec<OsString>,
     total_secs: Option<f64>,
+    cwd: Option<&Path>,
 ) -> std::result::Result<(), JobFailure> {
     if handle.is_canceled() {
         return Err(JobFailure::new("canceled"));
     }
 
-    let mut cmd = ffmpeg::command("ffmpeg").map_err(|e| JobFailure::new(e.to_string()))?;
-    cmd.args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
-
-    let mut child = cmd
-        .spawn()
+    let mut cmd = job_command(&args, cwd).map_err(|e| JobFailure::new(e.to_string()))?;
+    let mut child = ffmpeg::spawn_owned(&mut cmd)
         .map_err(|e| JobFailure::new(format!("failed to start ffmpeg: {e}")))?;
 
     let stdout = child.stdout.take();
@@ -317,20 +357,36 @@ pub fn execute_ffmpeg(
         return Err(JobFailure::new("canceled"));
     }
 
-    // stderr tail collector
+    // stderr tail collector. `thread::Builder`, not the plain spawn: that one
+    // panics when the OS refuses a thread, and under `panic = "abort"` a
+    // refused thread would end the app instead of failing one job.
     let tail = Arc::new(Mutex::new(Vec::<String>::new()));
     let tail_writer = Arc::clone(&tail);
-    let stderr_thread = std::thread::spawn(move || {
-        if let Some(stderr) = stderr {
-            for line in BufReader::new(stderr).lines().map_while(|l| l.ok()) {
-                let mut t = tail_writer.lock().unwrap();
-                if t.len() >= STDERR_TAIL {
-                    t.remove(0);
+    let reader = std::thread::Builder::new()
+        .name("ffmpeg-stderr".into())
+        .spawn(move || {
+            if let Some(stderr) = stderr {
+                for line in BufReader::new(stderr).lines().map_while(|l| l.ok()) {
+                    let mut t = tail_writer.lock().unwrap();
+                    if t.len() >= STDERR_TAIL {
+                        t.remove(0);
+                    }
+                    t.push(line);
                 }
-                t.push(line);
             }
+        });
+    let stderr_thread = match reader {
+        Ok(t) => t,
+        Err(_) => {
+            // Nobody would read its stderr, so ffmpeg would block on a full
+            // pipe; stop it rather than leave it hanging on the lane.
+            if let Some(mut c) = handle.take_child() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            return Err(JobFailure::new("could not start a worker thread"));
         }
-    });
+    };
 
     // stdout progress parser (this thread)
     if let Some(stdout) = stdout {
@@ -398,22 +454,64 @@ pub fn execute_ffmpeg(
     Ok(())
 }
 
+/// How long `run_blocking_on_lane` waits for work once it has STARTED.
+const LANE_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Run quick, bounded work on a lane and wait for its result (used for
 /// thumbnails where the caller needs the path synchronously).
+///
+/// The timeout counts from the moment a worker picks the work up, not from
+/// the submit: on a one-worker lane every request queued behind others used
+/// to have their run time charged to its own deadline, so one slow file made
+/// the whole queue behind it time out. The wait for a worker is unbounded;
+/// what bounds it is that every piece of work on the lane is bounded itself.
+///
+/// `work` receives `abandoned`, set when the caller has given up on it. The
+/// work is then still running (or about to start its expensive part), and
+/// nobody will read its result: check the flag before each costly step —
+/// above all before starting ffmpeg — and return early when it is set.
 pub fn run_blocking_on_lane<T: Send + 'static>(
     jobs: &Jobs,
     lane: Lane,
-    work: impl FnOnce() -> Result<T> + Send + 'static,
+    work: impl FnOnce(Arc<AtomicBool>) -> Result<T> + Send + 'static,
 ) -> Result<T> {
+    run_blocking_on_lane_within(jobs, lane, LANE_RESULT_TIMEOUT, work)
+}
+
+/// `run_blocking_on_lane` with the timeout as a parameter, so a test can
+/// exercise both outcomes in milliseconds.
+fn run_blocking_on_lane_within<T: Send + 'static>(
+    jobs: &Jobs,
+    lane: Lane,
+    timeout: Duration,
+    work: impl FnOnce(Arc<AtomicBool>) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&abandoned);
+    let (started_tx, started_rx) = mpsc::channel::<()>();
     let (tx, rx) = mpsc::channel();
     jobs.submit(
         lane,
         Box::new(move || {
-            let _ = tx.send(work());
+            let _ = started_tx.send(());
+            let _ = tx.send(work(flag));
         }),
     );
-    rx.recv_timeout(Duration::from_secs(30))
-        .map_err(|_| AppError::Ffmpeg("job timed out".into()))?
+    // Both senders live in the boxed work, so a lane that drops it unrun (only
+    // at shutdown) ends both waits with an error instead of hanging them.
+    started_rx
+        .recv()
+        .map_err(|_| AppError::Ffmpeg("job was dropped before it started".into()))?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            abandoned.store(true, Ordering::Relaxed);
+            Err(AppError::Ffmpeg("job timed out".into()))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(AppError::Ffmpeg("job stopped without a result".into()))
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -526,5 +624,144 @@ mod tests {
         assert!(!tmp_for(&dead).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two transcodes waiting on the test: the lane's ONE worker runs the first
+    /// and holds the second back, and a Background job still completes while
+    /// both wait. Routed onto Background's two workers instead, the pair would
+    /// occupy both, the second would start at once, and the Background job
+    /// would wait behind them — which is why this takes two, not one.
+    #[test]
+    fn a_transcode_backlog_never_holds_up_background_work() {
+        use std::sync::RwLock;
+        let jobs = Jobs::default();
+        let gate = Arc::new(RwLock::new(()));
+        let hold = gate.write().unwrap();
+        let (started_tx, started_rx) = mpsc::channel::<u32>();
+        for n in 0..2u32 {
+            let gate = Arc::clone(&gate);
+            let started = started_tx.clone();
+            jobs.submit(
+                Lane::Transcode,
+                Box::new(move || {
+                    let _ = started.send(n);
+                    // Blocks until the test lets go of the write lock.
+                    drop(gate.read());
+                }),
+            );
+        }
+        let first = started_rx.recv_timeout(Duration::from_secs(5));
+        let second_early = started_rx.recv_timeout(Duration::from_millis(300));
+        let (bg_tx, bg_rx) = mpsc::channel();
+        jobs.submit(Lane::Background, Box::new(move || {
+            let _ = bg_tx.send(());
+        }));
+        let background = bg_rx.recv_timeout(Duration::from_secs(5));
+        drop(hold);
+
+        assert_eq!(first, Ok(0));
+        assert!(second_early.is_err(), "Transcode must have exactly one worker");
+        assert!(background.is_ok(), "a Background job must not wait behind transcodes");
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(5)), Ok(1));
+    }
+
+    /// The lane's timeout starts when a worker picks the work up. Queued
+    /// behind 700 ms of other work, a 50 ms job under a 300 ms timeout
+    /// succeeds; counted from the submit it timed out before it even began.
+    /// And work nobody gave up on never sees `abandoned`.
+    #[test]
+    fn the_lane_timeout_starts_when_the_work_does() {
+        let jobs = Jobs::default();
+        jobs.submit(Lane::Thumb, Box::new(|| std::thread::sleep(Duration::from_millis(700))));
+        let result = run_blocking_on_lane_within(&jobs, Lane::Thumb, Duration::from_millis(300), |abandoned| {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(abandoned.load(Ordering::Relaxed))
+        });
+        assert!(matches!(result, Ok(false)), "{result:?}");
+    }
+
+    /// Work that overruns the timeout: the caller gets "timed out", and the
+    /// work — still running, its result now unwanted — finds `abandoned` set
+    /// the next time it looks, which is its cue to skip the ffmpeg it was
+    /// about to start.
+    #[test]
+    fn an_overrun_is_abandoned_and_the_work_can_tell() {
+        let jobs = Jobs::default();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let result: Result<()> = run_blocking_on_lane_within(&jobs, Lane::Thumb, Duration::from_millis(100), move |abandoned| {
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = seen_tx.send(abandoned.load(Ordering::Relaxed));
+            Ok(())
+        });
+        assert!(matches!(&result, Err(AppError::Ffmpeg(m)) if m.contains("timed out")), "{result:?}");
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+    }
+
+    /// A job's ffmpeg runs below normal priority, in the folder it was given:
+    /// a RELATIVE input that exists only there decodes. A child of a
+    /// below-normal parent is below normal by inheritance — as it is whenever
+    /// this suite itself runs at low priority — which would hide a missing
+    /// flag, so the spawn happens with this process at normal priority,
+    /// restored straight after.
+    #[cfg(windows)]
+    #[test]
+    fn a_job_runs_below_normal_priority_in_the_folder_it_is_given() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetPriorityClass, SetPriorityClass,
+            BELOW_NORMAL_PRIORITY_CLASS as OS_BELOW_NORMAL, NORMAL_PRIORITY_CLASS,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "taroting jobs cwd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tone = dir.join("tone.wav");
+        let made = ffmpeg::run(
+            "ffmpeg",
+            &["-y", "-f", "lavfi", "-i", "sine=duration=1", tone.to_str().unwrap()],
+        )
+        .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+
+        let args: Vec<OsString> = ["-hide_banner", "-loglevel", "error", "-re", "-i", "tone.wav", "-f", "null", "-"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let mut cmd = job_command(&args, Some(&dir)).unwrap();
+        // SAFETY: the pseudo-handle of this process; plain FFI.
+        let me = unsafe { GetCurrentProcess() };
+        let was = unsafe { GetPriorityClass(me) };
+        unsafe { SetPriorityClass(me, NORMAL_PRIORITY_CLASS) };
+        let spawned = ffmpeg::spawn_owned(&mut cmd);
+        unsafe { SetPriorityClass(me, was) };
+        let child = spawned.unwrap();
+        // SAFETY: the live child's own handle, borrowed for the call.
+        let class = unsafe { GetPriorityClass(child.as_raw_handle()) };
+        let out = child.wait_with_output().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(class, OS_BELOW_NORMAL, "a job's ffmpeg must run below normal priority");
+        assert!(
+            out.status.success(),
+            "the relative input must resolve in the given folder: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The plain thread spawn panics when the OS refuses a thread, and under
+    /// `panic = "abort"` that ends the app. Every thread the sidecar helpers
+    /// start goes through `thread::Builder`, whose refusal is an error the
+    /// caller handles; pinned over the code before each test module.
+    #[test]
+    fn no_sidecar_helper_can_abort_on_a_refused_thread() {
+        for (file, code) in [("jobs/mod.rs", include_str!("mod.rs")), ("jobs/ffmpeg.rs", include_str!("ffmpeg.rs"))] {
+            let production: String = code.split("#[cfg(test)]").next().unwrap().split_whitespace().collect();
+            assert!(!production.contains("thread::spawn("), "{file} starts a thread that can panic");
+            assert!(production.contains("thread::Builder::new()"), "{file}: the pin no longer sees its threads");
+        }
     }
 }

@@ -1278,6 +1278,8 @@ export class ProjectSession {
   private inFlight: Promise<void> | null = null;
   private pendingSave = false;
   private disposed = false;
+  /** Backing field for `discarded`: set by discard() only, never by dispose(). */
+  private _discarded = false;
   /** Consecutive failed writes, and the interval ticks left before the next
    *  retry. Both reset by any successful write. See SAVE_RETRY_MAX_TICKS. */
   private failedSaves = 0;
@@ -1336,6 +1338,14 @@ export class ProjectSession {
    *  and replace() unless called with { edit: false }. Never reset. Drives the close prompt. */
   get edited(): boolean {
     return this._edited;
+  }
+
+  /** True once discard() ran: the session was abandoned and its file is about
+   *  to be deleted, so nothing will ever reopen it. A plain dispose() (Back,
+   *  Keep, any ordinary leave) leaves it false — the project lives on and the
+   *  next open wants whatever its media were still preparing. */
+  get discarded(): boolean {
+    return this._discarded;
   }
 
   get project(): ProjectFile {
@@ -1579,6 +1589,7 @@ export class ProjectSession {
     this.clearDebounce();
     window.clearInterval(this.intervalTimer);
     this.disposed = true;
+    this._discarded = true;
   }
 }
 

@@ -8,17 +8,16 @@
 // adjust it, draw it, close it — so the peak is the output + ONE source + one
 // layer scratch, never every photo at once.
 
-import type { ImageExportFormat, ImageExportPreset, ProjectFile } from "../../core/types";
+import type { ImageExportFormat, ImageExportPreset, MediaRef, ProjectFile } from "../../core/types";
 import { RENDER_MAX_AREA, RENDER_MAX_SIDE, WEBP_MAX_SIDE } from "../../core/types";
 import { buildAdjustPlan, isIdentityAdjust } from "../adjust/plan";
 import { createScratch, type ReleasableScratch } from "../ink/paint";
-import { layersOf, type Layer } from "../layers";
+import { layersOf, opacityOf, type Layer } from "../layers";
 import {
   clearTarget,
   drawBackground,
   drawLayer,
   drawUnderlay,
-  opacityOf,
   openDrawingLayer,
   type ScaledView,
 } from "./composite";
@@ -32,6 +31,23 @@ export interface ExportRenderOpts {
   /** integers ≥1, ≤ RENDER limits, WebP ≤ WEBP_MAX_SIDE */
   outW: number;
   outH: number;
+}
+
+/** Photo files the caller already holds in memory, looked up before a render
+ *  reads one through the asset protocol. */
+export interface RenderSources {
+  /** The compressed file behind a photo layer, or null to read it from disk.
+   *  The open editor passes `(m) => res.blobFor(m)` (PreviewResources): its
+   *  photos are already in memory, and reading each again is a copy through
+   *  the asset handler for nothing. */
+  blobFor?: (m: MediaRef) => Blob | null;
+}
+
+/** `renderThumbnail`'s options. */
+export interface ThumbnailOpts extends RenderSources {
+  /** Stops the render: it rejects with an AbortError and encodes nothing
+   *  (a newer render of the same card has taken over). */
+  signal?: AbortSignal;
 }
 
 /** MIME type per export format — also what `blob.type` must come back as. */
@@ -97,15 +113,17 @@ export function yieldToUi(): Promise<void> {
 /** One photo layer's pixels, prepared for export: decoded at the density the
  *  output needs, adjusted in yielding strips. Caller closes it. Null only
  *  when the file is missing and `skipMissing` says to draw the rest anyway
- *  (a Home thumbnail); an export or a copy names the file and fails. */
+ *  (a Home thumbnail); an export or a copy names the file and fails. The file
+ *  comes from `blobFor` when the caller holds it, else from disk. */
 async function preparePhoto(
   l: Layer,
   needScale: number,
   signal: AbortSignal,
   onStrip: (ratio: number) => void,
   skipMissing: boolean,
+  blobFor: RenderSources["blobFor"],
 ): Promise<{ source: CanvasImageSource; release(): void } | null> {
-  const blob = await fetchPhoto(l.media.path);
+  const blob = blobFor?.(l.media) ?? (await fetchPhoto(l.media.path));
   if (signal.aborted) throw abortError();
   if (!blob) {
     if (skipMissing) return null;
@@ -204,14 +222,16 @@ async function preparePhoto(
 
 /** Full-resolution render on the main thread (OffscreenCanvas), strip-wise
  *  adjustments with a yield between strips, then convertToBlob. Rejects on
- *  abort; verifies blob.type. */
+ *  abort; verifies blob.type. `sources.blobFor` hands over photo files the
+ *  caller already holds; any it does not hold are read from disk. */
 export function renderImageExport(
   doc: ProjectFile,
   opts: ExportRenderOpts,
   signal: AbortSignal,
   onProgress: (ratio: number) => void,
+  sources?: RenderSources,
 ): Promise<Blob> {
-  return render(doc, opts, signal, onProgress, false);
+  return render(doc, opts, signal, onProgress, false, sources?.blobFor);
 }
 
 async function render(
@@ -220,6 +240,7 @@ async function render(
   signal: AbortSignal,
   onProgress: (ratio: number) => void,
   skipMissing: boolean,
+  blobFor: RenderSources["blobFor"],
 ): Promise<Blob> {
   const outW = Math.round(opts.outW);
   const outH = Math.round(opts.outH);
@@ -261,7 +282,7 @@ async function render(
       const g = l.media.generator;
       if (g === undefined) {
         const k = Number.isFinite(l.transform.scale) && l.transform.scale > 0 ? l.transform.scale : 1;
-        const prepared = await preparePhoto(l, k * Math.max(view.zoom, view.zoomY ?? view.zoom), signal, (r) => report(i, r), skipMissing);
+        const prepared = await preparePhoto(l, k * Math.max(view.zoom, view.zoomY ?? view.zoom), signal, (r) => report(i, r), skipMissing, blobFor);
         if (prepared === null) {
           report(i + 1, 0);
           continue;
@@ -333,8 +354,10 @@ export function thumbnailSize(w: number, h: number): { w: number; h: number } {
 /** ≤320 px JPEG q0.85 for the Home card, composited over white where the
  *  image is transparent (the same flattening a JPEG export gets). A photo
  *  whose file is missing is left out rather than failing the whole card: one
- *  offline photo must not blank a project's thumbnail. */
-export function renderThumbnail(doc: ProjectFile): Promise<Blob> {
+ *  offline photo must not blank a project's thumbnail. `opts.signal` stops it
+ *  (rejecting with an AbortError); `opts.blobFor` as for `renderImageExport`. */
+export function renderThumbnail(doc: ProjectFile, opts?: ThumbnailOpts): Promise<Blob> {
   const { w, h } = thumbnailSize(doc.timeline.width, doc.timeline.height);
-  return render(doc, { format: "jpeg", quality: 85, outW: w, outH: h }, new AbortController().signal, () => {}, true);
+  const signal = opts?.signal ?? new AbortController().signal;
+  return render(doc, { format: "jpeg", quality: 85, outW: w, outH: h }, signal, () => {}, true, opts?.blobFor);
 }

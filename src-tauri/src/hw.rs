@@ -73,27 +73,26 @@ fn probe_encoder(enc: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let status = cmd
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=duration=0.5:size=640x360:rate=30",
-            "-frames:v",
-            "15",
-            "-c:v",
-            enc,
-            "-f",
-            "null",
-            "-",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .status();
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=duration=0.5:size=640x360:rate=30",
+        "-frames:v",
+        "15",
+        "-c:v",
+        enc,
+        "-f",
+        "null",
+        "-",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .stdin(Stdio::null());
+    let status = ffmpeg::spawn_owned(&mut cmd).and_then(|mut child| child.wait());
     matches!(status, Ok(s) if s.success())
 }
 

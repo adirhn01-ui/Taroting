@@ -63,6 +63,10 @@ export interface EstimateInput {
   /** Timeline frame rate as a plain number. */
   fps: number;
   preset: ExportPreset;
+  /** Whether any clip will actually be heard in the export. Optional on the
+   *  wire: the backend reads a missing value as true, which is the estimate
+   *  every build before this field made. */
+  hasAudio?: boolean;
 }
 
 /** Detect (or re-detect, when force) available ffmpeg encoders. */

@@ -6,5 +6,6 @@ pub mod playability;
 pub mod prepare;
 pub mod probe;
 pub mod siblings;
+pub mod source;
 pub mod thumbs;
 pub mod waveform;

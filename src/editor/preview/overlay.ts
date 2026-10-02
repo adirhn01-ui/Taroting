@@ -21,6 +21,7 @@ import type { Scheduler } from "../playback/scheduler";
 import type { PlaybackEngine } from "../playback/engine";
 import type { ProjectSession } from "../../core/session";
 import type { Stage } from "./preview";
+import { cssFont } from "../media/generators";
 import {
   type Axis,
   type PoseState,
@@ -44,6 +45,35 @@ export interface OverlayCtx {
   session: ProjectSession;
   selection: Store<string | null>;
   refresh(): void;
+  /** Called once each time a move, scale or crop drag stops being live
+   *  (`CanvasOverlay.gestureActive` turns false) — committed by its pointerup,
+   *  or reverted by Escape, a cancelled pointer, `cancelGesture` or dispose.
+   *  It runs AFTER the drag's final project state is in place, with
+   *  `gestureActive()` already false. A committed drag notifies no store
+   *  subscriber on its way out (commitFrom records history only; the live
+   *  edits were all replace()d), so a panel that skipped its rebuilds while
+   *  the drag ran must rebuild here. */
+  onGestureEnd?(): void;
+}
+
+/** What `mountCanvasOverlay` hands back. */
+export interface CanvasOverlay {
+  /** True while a move, scale or crop drag is editing the project: from the
+   *  moment it arms (a move or scale press past the dead-zone; a crop press at
+   *  once) until it is committed or reverted. A press still inside the
+   *  dead-zone is a selection, not a drag, and reads false. Every live edit
+   *  goes through session.replace(), one per pointermove, so a store
+   *  subscriber can read this to skip per-move work and rebuild once on
+   *  `OverlayCtx.onGestureEnd`. */
+  gestureActive(): boolean;
+  /** Drop any drag in flight — revert its uncommitted edits, release its
+   *  pointer, hide the snap guides — exactly as Escape does, but WITHOUT
+   *  touching the selection or leaving crop mode: the caller is taking the
+   *  canvas away (entering theater), not asking to deselect. A press still
+   *  inside the dead-zone is dropped too, so a later move cannot arm it.
+   *  Idempotent; a no-op when nothing is in flight. */
+  cancelGesture(): void;
+  dispose(): void;
 }
 
 const CORNER_HANDLES: WindowHandle[] = ["nw", "ne", "se", "sw"];
@@ -238,7 +268,7 @@ function buildChrome(host: HTMLElement): Chrome {
 /* Mount                                                                */
 /* ------------------------------------------------------------------ */
 
-export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
+export function mountCanvasOverlay(ctx: OverlayCtx): CanvasOverlay {
   const { stage, scheduler, engine, session, selection } = ctx;
   const chrome = buildChrome(stage.canvas);
   const { overlay } = chrome;
@@ -557,6 +587,8 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     // Release inside the dead-zone: never armed, nothing mutated → pure select,
     // no history entry. Only commit when the gesture actually edited the project.
     if (g.armed && g.before) session.commitFrom(g.before);
+    // Only a drag that was live has anything to end (see OverlayCtx).
+    if (g.armed) ctx.onGestureEnd?.();
   }
 
   /**
@@ -596,9 +628,14 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     // swallows nothing but Escape and the arrows, so a global shortcut CAN
     // delete the clip mid-drag — and restoring the whole snapshot would
     // resurrect what that delete just removed.
-    if (!findClip(session.project, g.clipId)) return;
-    session.replace(g.before);
-    ctx.refresh();
+    if (findClip(session.project, g.clipId)) {
+      session.replace(g.before);
+      ctx.refresh();
+    }
+    // Last, so the listener sees the reverted project. Also when the revert was
+    // skipped: the drag is over all the same, and the delete that removed its
+    // clip landed while a panel may have been skipping its rebuilds.
+    ctx.onGestureEnd?.();
   }
 
   /** Auto-key or static position write, then live-replace (no history). The
@@ -772,10 +809,11 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
         const g = media.generator;
         el.style.color = g.color;
         el.style.whiteSpace = "pre";
-        el.style.lineHeight = "1.25";
-        const style = g.italic ? "italic" : "normal";
-        const weight = g.bold ? "bold" : "normal";
-        el.style.font = `${style} ${weight} ${g.sizePx}px ${g.fontFamily}`;
+        // ONE write, line height inside the shorthand. `font` resets
+        // line-height to `normal`, so the separate lineHeight written before it
+        // used to be wiped — Segoe UI then spaced its lines ~6% wider than the
+        // 1.25 the media box and the export are measured at.
+        el.style.font = cssFont(g);
         el.textContent = g.text;
       }
     } else if (media.kind === "image") {
@@ -874,9 +912,11 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     // exitCrop() when the clip (or its media) has vanished from the project
     // underneath crop mode; rolling the whole project back to `before` in that
     // case would resurrect what was just deleted.
-    if (!cropClipId || !findClip(session.project, cropClipId)) return;
-    session.replace(g.before);
-    ctx.refresh();
+    if (cropClipId && findClip(session.project, cropClipId)) {
+      session.replace(g.before);
+      ctx.refresh();
+    }
+    ctx.onGestureEnd?.(); // as in cancelGesture: after the revert, either way
   }
 
   function cropContext(): {
@@ -1012,6 +1052,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
     cropGesture = null;
     try { overlay.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
     session.commitFrom(g.before);
+    ctx.onGestureEnd?.();
   }
 
   /** Apply a new crop pose (crop + scale + x/y). When the clip has SCALE
@@ -1117,6 +1158,16 @@ export function mountCanvasOverlay(ctx: OverlayCtx): { dispose(): void } {
   render();
 
   return {
+    // A move/scale gesture is a drag only once armed; a crop gesture edits
+    // from its first move and has no dead-zone, so it counts from the press.
+    gestureActive: (): boolean => (gesture !== null && gesture.armed) || cropGesture !== null,
+    cancelGesture: (): void => {
+      // The mount's own two cancels, as dispose calls them: only one can be
+      // live, the other is a no-op. Neither touches the selection, and neither
+      // leaves crop mode.
+      cancelGesture();
+      cancelCropGesture();
+    },
     dispose(): void {
       // A gesture can still be in flight when the overlay goes away — the
       // project closed, a navigation, an OS open-path arriving mid-drag. Its

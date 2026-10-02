@@ -14,7 +14,7 @@ import { DEFAULT_SETTINGS } from "../../core/types";
 import type { MediaRef, ProjectFile } from "../../core/types";
 import type { PlaybackEngine } from "../playback/engine";
 import type { Scheduler } from "../playback/scheduler";
-import { mountCanvasOverlay } from "./overlay";
+import { mountCanvasOverlay, type CanvasOverlay } from "./overlay";
 import type { Stage } from "./preview";
 
 /*
@@ -113,13 +113,31 @@ const pxOf = (v: string | undefined): number => {
   return Number.isFinite(n) ? n : 0;
 };
 
+/** An element style with the one CSSOM rule the crop ghost depends on: the
+ *  `font` shorthand resets line-height — to the value written inside it
+ *  ("64px/1.25 …"), or to `normal` when it carries none. A plain record would
+ *  keep a lineHeight written BEFORE the font, which no browser does. */
+function cssStyle(): Record<string, string> {
+  const style: Record<string, string> = {};
+  let font = "";
+  Object.defineProperty(style, "font", {
+    enumerable: true,
+    get: () => font,
+    set: (v: string) => {
+      font = v;
+      style.lineHeight = /\/(\S+)/.exec(v)?.[1] ?? "normal";
+    },
+  });
+  return style;
+}
+
 function makeEl(tagName: string): FakeEl {
   const el: FakeEl = {
     tagName,
     className: "",
     tabIndex: 0,
     dataset: {},
-    style: {},
+    style: cssStyle(),
     textContent: "",
     children: [],
     parent: null,
@@ -210,9 +228,19 @@ interface Harness {
   engineTime: { value: number };
   paused: () => number;
   refreshes: () => number;
+  /** the overlay handle mountCanvasOverlay returned */
+  handle: CanvasOverlay;
+  /** one entry per onGestureEnd call: what the listener could see at that moment */
+  ends: GestureEnd[];
   dispose(): void;
   /** the clip as it stands in the project right now */
   clip(): { transform: NonNullable<ReturnType<typeof clipTransform>> };
+}
+
+interface GestureEnd {
+  active: boolean;
+  project: ProjectFile;
+  canUndo: boolean;
 }
 
 function clipTransform(p: ProjectFile, clipId: string) {
@@ -287,7 +315,8 @@ function mount(): Harness {
     onTick: () => () => {},
   } as unknown as PlaybackEngine;
 
-  const handle = mountCanvasOverlay({
+  const ends: GestureEnd[] = [];
+  const handle: CanvasOverlay = mountCanvasOverlay({
     stage,
     scheduler,
     engine,
@@ -295,6 +324,9 @@ function mount(): Harness {
     selection,
     refresh: () => {
       refreshes++;
+    },
+    onGestureEnd: () => {
+      ends.push({ active: handle.gestureActive(), project: session.project, canUndo: session.history.canUndo });
     },
   });
 
@@ -308,6 +340,8 @@ function mount(): Harness {
     engineTime,
     paused: () => pauses,
     refreshes: () => refreshes,
+    handle,
+    ends,
     dispose: () => handle.dispose(),
     clip: () => ({ transform: clipTransform(session.project, clipId) }),
   };
@@ -676,5 +710,212 @@ describe("disposing the overlay mid-gesture", () => {
 
     expect(h.session.project).toBe(before);
     expect(h.session.history.canUndo).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* gestureActive / onGestureEnd                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * What a store subscriber (the inspector) needs to skip a rebuild per
+ * pointermove and still end up right: a flag that is true exactly while a drag
+ * is editing, and one call when it stops — AFTER the last edit is in place,
+ * because a committed drag notifies no subscriber on its way out (commitFrom
+ * writes history only). Each `ends` entry records what the listener could see
+ * at that moment.
+ */
+describe("gestureActive and onGestureEnd", () => {
+  it("a press that never leaves the dead-zone is a selection, not a drag", () => {
+    const h = mount();
+    pointer(h, "pointerdown", toClientX(CENTER_PROJ_X), toClientY(CENTER_PROJ_Y));
+    pointer(h, "pointermove", toClientX(CENTER_PROJ_X) + 2, toClientY(CENTER_PROJ_Y) + 1);
+    expect(h.handle.gestureActive()).toBe(false);
+
+    pointer(h, "pointerup", toClientX(CENTER_PROJ_X) + 2, toClientY(CENTER_PROJ_Y) + 1);
+
+    expect(h.selection.get()).toBe(h.clipId); // it did select
+    expect(h.ends).toEqual([]); // nothing was live, so nothing ends
+  });
+
+  it("a move drag is live from arming to its pointerup, and ends once, after the commit", () => {
+    const h = mount();
+    expect(h.handle.gestureActive()).toBe(false);
+    pointer(h, "pointerdown", toClientX(CENTER_PROJ_X), toClientY(CENTER_PROJ_Y));
+    expect(h.handle.gestureActive()).toBe(false); // pending, inside the dead-zone
+    pointer(h, "pointermove", toClientX(CENTER_PROJ_X + 60), toClientY(CENTER_PROJ_Y + 36));
+    expect(h.handle.gestureActive()).toBe(true);
+    pointer(h, "pointermove", toClientX(CENTER_PROJ_X + 70), toClientY(CENTER_PROJ_Y + 40));
+    expect(h.handle.gestureActive()).toBe(true);
+    expect(h.ends).toEqual([]); // not per move
+
+    pointer(h, "pointerup", toClientX(CENTER_PROJ_X + 70), toClientY(CENTER_PROJ_Y + 40));
+
+    expect(h.handle.gestureActive()).toBe(false);
+    expect(h.ends).toHaveLength(1);
+    expect(h.ends[0]!.active).toBe(false);
+    expect(h.ends[0]!.canUndo).toBe(true); // the commit had already landed
+    expect(h.ends[0]!.project).toBe(h.session.project);
+    expect(h.clip().transform.x).toBe(START_X + 70);
+  });
+
+  it("a corner-handle scale is live too", () => {
+    const h = mount();
+    h.selection.set(h.clipId);
+    const handle = findByData(h.overlay, "handle", "se");
+    pointer(h, "pointerdown", toClientX(CENTER_PROJ_X + 432), toClientY(CENTER_PROJ_Y + 270), handle);
+    pointer(h, "pointermove", toClientX(CENTER_PROJ_X + 600), toClientY(CENTER_PROJ_Y + 375), handle);
+    expect(h.handle.gestureActive()).toBe(true);
+
+    pointer(h, "pointerup", toClientX(CENTER_PROJ_X + 600), toClientY(CENTER_PROJ_Y + 375), handle);
+
+    expect(h.handle.gestureActive()).toBe(false);
+    expect(h.ends).toHaveLength(1);
+  });
+
+  it("Escape ends it once, and the listener already sees the reverted project", () => {
+    const h = mount();
+    const before = h.session.project;
+    dragTo(h, CENTER_PROJ_X + 60, CENTER_PROJ_Y + 36);
+
+    key(h, "Escape");
+
+    expect(h.ends).toEqual([{ active: false, project: before, canUndo: false }]);
+  });
+
+  it("a cancelled pointer and a dispose each end it once, after the revert", () => {
+    const a = mount();
+    const beforeA = a.session.project;
+    dragTo(a, CENTER_PROJ_X + 60, CENTER_PROJ_Y + 36);
+    pointer(a, "pointercancel", toClientX(CENTER_PROJ_X + 60), toClientY(CENTER_PROJ_Y + 36));
+    expect(a.ends).toEqual([{ active: false, project: beforeA, canUndo: false }]);
+
+    const b = mount();
+    const beforeB = b.session.project;
+    dragTo(b, CENTER_PROJ_X + 60, CENTER_PROJ_Y + 36);
+    b.dispose();
+    expect(b.ends).toEqual([{ active: false, project: beforeB, canUndo: false }]);
+  });
+
+  it("a crop drag is live from its press (it has no dead-zone) to its pointerup", () => {
+    const h = mount();
+    h.overlay.fire("dblclick", {
+      clientX: toClientX(CENTER_PROJ_X),
+      clientY: toClientY(CENTER_PROJ_Y),
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    expect(h.handle.gestureActive()).toBe(false); // crop MODE is not a drag
+    const crophandle = findByData(h.overlay, "crophandle", "e");
+    const x = toClientX(CENTER_PROJ_X + 432);
+    const y = toClientY(CENTER_PROJ_Y);
+    pointer(h, "pointerdown", x, y, crophandle);
+    expect(h.handle.gestureActive()).toBe(true);
+    pointer(h, "pointermove", x - 24, y, crophandle);
+    expect(h.handle.gestureActive()).toBe(true);
+
+    pointer(h, "pointerup", x - 24, y, crophandle);
+
+    expect(h.handle.gestureActive()).toBe(false);
+    expect(h.ends).toHaveLength(1);
+    expect(h.ends[0]!.canUndo).toBe(true);
+    expect(h.ends[0]!.project).toBe(h.session.project);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* cancelGesture from outside (theater entry)                           */
+/* ------------------------------------------------------------------ */
+
+describe("CanvasOverlay.cancelGesture", () => {
+  it("reverts a live drag like Escape, keeps the selection, and leaves nothing to resume", () => {
+    const h = mount();
+    const before = h.session.project;
+    dragTo(h, CENTER_PROJ_X + 60, CENTER_PROJ_Y + 36);
+    expect(h.clip().transform.x).toBe(START_X + 60);
+
+    h.handle.cancelGesture();
+
+    expect(h.session.project).toBe(before);
+    expect(h.session.history.canUndo).toBe(false);
+    expect(h.selection.get()).toBe(h.clipId);
+    expect(h.overlay.captured.size).toBe(0);
+    expect(h.handle.gestureActive()).toBe(false);
+    expect(h.ends).toEqual([{ active: false, project: before, canUndo: false }]);
+
+    // The button is still down (theater took the canvas mid-drag).
+    pointer(h, "pointermove", toClientX(CENTER_PROJ_X + 300), toClientY(CENTER_PROJ_Y - 120));
+    pointer(h, "pointerup", toClientX(CENTER_PROJ_X + 300), toClientY(CENTER_PROJ_Y - 120));
+    expect(h.session.project).toBe(before);
+    expect(h.ends).toHaveLength(1);
+  });
+
+  it("drops a press still inside the dead-zone, so a later move cannot arm it", () => {
+    const h = mount();
+    const before = h.session.project;
+    pointer(h, "pointerdown", toClientX(CENTER_PROJ_X), toClientY(CENTER_PROJ_Y));
+
+    h.handle.cancelGesture();
+    pointer(h, "pointermove", toClientX(CENTER_PROJ_X + 60), toClientY(CENTER_PROJ_Y + 36));
+
+    expect(h.session.project).toBe(before);
+    expect(h.clip().transform.x).toBe(START_X);
+    expect(h.overlay.captured.size).toBe(0);
+    expect(h.ends).toEqual([]);
+  });
+
+  it("reverts a crop drag and leaves crop mode open", () => {
+    const h = mount();
+    const before = h.session.project;
+    startCropDrag(h);
+    expect(h.clip().transform.crop!.w).toBeLessThan(MEDIA_W);
+    const veil = h.overlay.children.find((c) => c.className.includes("__veil"))!;
+    expect(veil.style.display).toBe("block");
+
+    h.handle.cancelGesture();
+
+    expect(h.session.project).toBe(before);
+    expect(h.clip().transform.crop).toBeUndefined();
+    expect(h.session.history.canUndo).toBe(false);
+    expect(veil.style.display).toBe("block"); // still cropping, just not dragging
+    expect(h.selection.get()).toBe(h.clipId);
+    expect(h.ends).toEqual([{ active: false, project: before, canUndo: false }]);
+  });
+
+  it("is a no-op at rest — unlike Escape, it never clears the selection", () => {
+    const h = mount();
+    h.selection.set(h.clipId);
+    const before = h.session.project;
+
+    h.handle.cancelGesture();
+    h.handle.cancelGesture();
+
+    expect(h.selection.get()).toBe(h.clipId);
+    expect(h.session.project).toBe(before);
+    expect(h.ends).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* The crop ghost's text                                                */
+/* ------------------------------------------------------------------ */
+
+describe("the crop ghost of a text layer", () => {
+  it("keeps the 1.25 line height the media box and the export are measured at", () => {
+    const h = mount();
+    h.overlay.fire("dblclick", {
+      clientX: toClientX(CENTER_PROJ_X),
+      clientY: toClientY(CENTER_PROJ_Y),
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    });
+    const ghost = h.overlay.children.find((c) => c.className.includes("stage-overlay__ghost"))!;
+    const text = ghost.children.find((c) => c.className === "stage-overlay__ghost-media")!;
+
+    // The fixture's generator: Segoe UI, 64 px, neither bold nor italic. A
+    // lineHeight written BEFORE the font shorthand is wiped back to normal.
+    expect(text.style.font).toBe("normal normal 64px/1.25 Segoe UI");
+    expect(text.style.lineHeight).toBe("1.25");
+    expect(text.textContent).toBe("cancel me");
   });
 });

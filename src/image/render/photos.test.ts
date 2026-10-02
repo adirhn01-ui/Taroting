@@ -120,6 +120,49 @@ describe("stillFit", () => {
   });
 });
 
+describe("PhotoCache.blobFor", () => {
+  it("hands over the file it loaded, for any MediaRef of that file, and only once it is ready", async () => {
+    const file = new Blob([new Uint8Array(11)]);
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, blob: async () => file })));
+    // The decode is held back, so the file is fetched (the blob is in hand)
+    // while the entry is still loading.
+    let decoded!: (b: FakeBitmap) => void;
+    vi.stubGlobal("createImageBitmap", vi.fn(() => new Promise<FakeBitmap>((r) => (decoded = r))));
+    const cache = new PhotoCache(() => {});
+    const m = media();
+    expect(cache.blobFor(m)).toBeNull(); // never asked for
+
+    cache.photo(photoLayer(m), 1);
+    await flush();
+    expect(cache.status(m).state).toBe("loading");
+    expect(cache.blobFor(m)).toBeNull(); // fetched, not yet ready
+
+    decoded(new FakeBitmap(400, 200));
+    await flush();
+    expect(cache.status(m).state).toBe("ready");
+    expect(cache.blobFor(m)).toBe(file);
+    // A duplicated layer is a new MediaRef over the same file: the same blob.
+    expect(cache.blobFor({ ...m, id: "m2" })).toBe(file);
+    // The same path changed on disk since is a different file.
+    expect(cache.blobFor({ ...m, mtimeMs: m.mtimeMs + 1 })).toBeNull();
+    expect(cache.blobFor({ ...m, size: m.size + 1 })).toBeNull();
+
+    cache.dispose();
+    expect(cache.blobFor(m)).toBeNull();
+  });
+
+  it("has nothing for a file it could not decode, so the caller reads it itself", async () => {
+    // Fetched fine (so the entry holds a blob), then the decode fails.
+    vi.stubGlobal("createImageBitmap", vi.fn(async () => Promise.reject(new DOMException("bad", "InvalidStateError"))));
+    const cache = new PhotoCache(() => {});
+    const m = media({ width: undefined, height: undefined });
+    cache.photo(photoLayer(m), 1);
+    await flush();
+    expect(cache.status(m)).toEqual({ state: "failed", message: "This image couldn't be read." });
+    expect(cache.blobFor(m)).toBeNull();
+  });
+});
+
 describe("PhotoCache", () => {
   it("a missing file (an empty 404) fails the layer with a relink hint", async () => {
     fileOk = false;

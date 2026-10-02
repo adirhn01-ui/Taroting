@@ -27,9 +27,9 @@ pub struct MediaKey {
 ///
 /// **Bump this whenever any recipe changes.** That means `prepare::proxy_args`,
 /// `remux_args`, `audio_remux_args`, `gif_proxy_args`, `thumbs`' `THUMB_WIDTH`
-/// or its scale/quality flags, `filmstrip_args`, and the waveform format
-/// (`SAMPLE_RATE`, `PAIRS_PER_SEC`, the `TPK1` layout) — anything whose output
-/// bytes would differ for an unchanged input file.
+/// or its scale/quality flags, and the waveform format (`SAMPLE_RATE`,
+/// `PAIRS_PER_SEC`, the `TPK1` layout) — anything whose output bytes would
+/// differ for an unchanged input file.
 ///
 /// Without it the key covered only the SOURCE: `{path, size, mtime}` says
 /// nothing about how the derived file was produced, so a build that widened
@@ -204,9 +204,13 @@ impl Cache {
     }
 
     /// Write out any stamps still coalesced in memory. Poison-tolerant because
-    /// this also runs from `Drop`: with `panic = "abort"`, a panicking shutdown
-    /// path would take the whole process down over a last-use timestamp.
-    fn flush(&self) {
+    /// it runs on the way out (`Drop`, and the app's exit paths): with
+    /// `panic = "abort"`, a panicking shutdown path would take the whole
+    /// process down over a last-use timestamp.
+    ///
+    /// `pub(crate)` for those exit paths, which must call it themselves — see
+    /// the `Drop` impl for why teardown alone never does.
+    pub(crate) fn flush(&self) {
         let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
         if index.dirty {
             self.save_index(&mut index);
@@ -222,11 +226,6 @@ impl Cache {
 
     /// Absolute path an entry (a single file) should live at.
     pub fn file_path(&self, kind: CacheKind, hash: &str, suffix: &str) -> PathBuf {
-        self.root.join(kind.dir_name()).join(format!("{hash}{suffix}"))
-    }
-
-    /// Absolute path for a per-source directory (filmstrips).
-    pub fn dir_path(&self, kind: CacheKind, hash: &str, suffix: &str) -> PathBuf {
         self.root.join(kind.dir_name()).join(format!("{hash}{suffix}"))
     }
 
@@ -371,9 +370,13 @@ impl Cache {
 }
 
 impl Drop for Cache {
-    /// Best-effort flush on a clean shutdown. A hard kill skips this, which is
-    /// exactly why `mark_used` also flushes on an interval rather than relying
-    /// on teardown.
+    /// Best-effort flush when a `Cache` is dropped — in practice only in tests
+    /// and by any owner that drops one. The app's own cache is NEVER dropped:
+    /// it is Tauri managed state, Tauri's `App::run` ends in
+    /// `std::process::exit`, and the uninstall path exits the process too, so
+    /// no destructor of managed state runs. Stamps still coalesced at exit
+    /// reach the disk only if an exit path calls `flush` itself; a hard kill
+    /// skips everything, which is why `mark_used` also flushes on an interval.
     fn drop(&mut self) {
         self.flush();
     }
@@ -587,6 +590,28 @@ mod tests {
         assert!(flushed.entries.contains_key("proxy/cccc.mp4"));
 
         drop(cache);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The app's cache is never dropped (its process ends in `exit`), so the
+    /// exit paths flush it by hand. A stamp still coalesced in memory reaches
+    /// the disk through `flush` alone — the cache is then leaked, exactly as
+    /// the app leaks it, and its `Drop` never runs.
+    #[test]
+    fn an_explicit_flush_persists_coalesced_stamps_without_a_drop() {
+        let (root, cache, [a, b, _]) = seeded_cache("explicit-flush");
+        cache.mark_used(&a);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        cache.mark_used(&b);
+        assert!(
+            !read_index(&root).entries.contains_key("proxy/bbbb.mp4"),
+            "the second mark must still be coalesced in memory"
+        );
+        cache.flush();
+        let on_disk = read_index(&root);
+        std::mem::forget(cache);
+        assert!(on_disk.entries.contains_key("proxy/aaaa.mp4"));
+        assert!(on_disk.entries.contains_key("proxy/bbbb.mp4"), "flush must write the pending stamp");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -44,6 +44,16 @@ pub struct EstimateInput {
     /// Timeline frame rate, already reduced to `num / den`.
     pub fps: f64,
     pub preset: ExportPreset,
+    /// Whether the export will carry an audio stream: some clip is audible
+    /// (the builder's `clip_audible`). A project with none is written with
+    /// `-an`, so its estimate has no audio term. Absent means true — the
+    /// estimate every caller got before the field existed.
+    #[serde(default = "audio_unless_told_otherwise")]
+    pub has_audio: bool,
+}
+
+fn audio_unless_told_otherwise() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

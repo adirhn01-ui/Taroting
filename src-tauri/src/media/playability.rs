@@ -353,7 +353,7 @@ fn ensure_prepared(
         Lane::Background,
         Box::new(move || {
             job_handle.set_output(tmp_path.clone());
-            let result = jobs::execute_ffmpeg(&app, &job_handle, args, total);
+            let result = jobs::execute_ffmpeg(&app, &job_handle, args, total, None);
             inflight_arc.release(&final_for_job, job_handle.id);
             match result {
                 Ok(()) => {
@@ -452,9 +452,9 @@ mod tests {
     use super::*;
 
     /// The webview reads these by their camelCase names (src/core/ipc.ts
-    /// `PlaybackPlan`, `WaveformResult`, `FilmstripResult`). Pinned on the
-    /// WIRE: no Rust type check can see a field the JS side reads as
-    /// `undefined`, and that is exactly how every editor job went unheard.
+    /// `PlaybackPlan`, `WaveformResult`). Pinned on the WIRE: no Rust type
+    /// check can see a field the JS side reads as `undefined`, and that is
+    /// exactly how every editor job went unheard.
     #[test]
     fn job_results_reach_the_webview_in_camel_case() {
         use serde_json::json;
@@ -469,20 +469,6 @@ mod tests {
                 output: "w".into()
             })),
             json!({ "state": "pending", "jobId": 8, "output": "w" })
-        );
-        assert_eq!(
-            wire(serde_json::to_value(crate::media::thumbs::FilmstripResult::Pending {
-                job_id: 9,
-                dir: "d".into()
-            })),
-            json!({ "state": "pending", "jobId": 9, "dir": "d" })
-        );
-        assert_eq!(
-            wire(serde_json::to_value(crate::media::thumbs::FilmstripResult::Ready {
-                dir: "d".into(),
-                frame_count: 3
-            })),
-            json!({ "state": "ready", "dir": "d", "frameCount": 3 })
         );
     }
 

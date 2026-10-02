@@ -906,7 +906,7 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
       // session then closes through Discard (reordered from the spec's a-b-c-d
       // to save a mount; (b) also proves Cancel left the gate usable). Built
       // in place rather than pushed: (a) already pins the Explorer route, and
-      // an EMPTY scratch project mounts with no probe, filmstrip or waveform.
+      // an EMPTY scratch project mounts with no probe, thumbnail or waveform.
       // It is opened exactly the way routeOpenPath opens a .trt that lives in
       // the temp dir.
       {
@@ -1010,8 +1010,8 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
 
       // A job exists once one of its progress events has arrived — and only
       // then does #ex-cancel do anything (it is a no-op until startExport has
-      // answered with a job id). The temp editor's own filmstrip and waveform
-      // jobs report too, hence the kind filter.
+      // answered with a job id). The temp editor's own playback-preparation
+      // and waveform jobs report too, hence the kind filter.
       unlisten = await onJobEvents({
         onProgress: (e) => {
           if (e.kind !== "export") return;

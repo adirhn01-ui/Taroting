@@ -61,17 +61,17 @@ pub fn parse_max_volume(stderr: &str) -> Option<f64> {
 }
 
 fn scan_sync(path: &str, src_in: f64, src_out: f64) -> Result<NormalizeResult> {
-    let out = ffmpeg::command("ffmpeg")?
-        .args([
-            "-hide_banner",
-            "-ss", &format!("{src_in:.3}"),
-            "-to", &format!("{src_out:.3}"),
-            "-i", path,
-            "-map", "a:0",
-            "-af", "volumedetect",
-            "-f", "null", "-",
-        ])
-        .output()?;
+    let mut cmd = ffmpeg::command("ffmpeg")?;
+    cmd.args([
+        "-hide_banner",
+        "-ss", &format!("{src_in:.3}"),
+        "-to", &format!("{src_out:.3}"),
+        "-i", path,
+        "-map", "a:0",
+        "-af", "volumedetect",
+        "-f", "null", "-",
+    ]);
+    let out = ffmpeg::output_owned(&mut cmd)?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
         return Err(AppError::Ffmpeg(format!(

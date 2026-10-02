@@ -321,3 +321,171 @@ describe("untrack", () => {
     expect(notifications).toBe(0);
   });
 });
+
+/**
+ * `retrack(id, fileChanged)` — a relink onto a different file.
+ *
+ * The re-ensure a retrack runs only ever ADDS display data. So a relink onto a
+ * file with no audio never asked for a waveform and the OLD file's peaks went on
+ * being drawn on every clip for the session; a relinked file whose thumbnail
+ * failed kept the old picture. The fixture's old file has audio and the new one
+ * has none, and the new file's thumbnail never answers, so nothing the
+ * re-ensure does can stand in for the drop.
+ */
+describe("retrack after a relink", () => {
+  const OLD_WAVE: WaveformData = { pairsPerSec: 200, mins: new Int8Array([-9, -4]), maxs: new Int8Array([7, 3]) };
+  const KEEP_WAVE: WaveformData = { pairsPerSec: 100, mins: new Int8Array([-2]), maxs: new Int8Array([5]) };
+  const OLD_WITH_AUDIO: MediaRef = { ...OLD_FILE, hasAudio: true };
+  const NEW_SILENT: MediaRef = { ...NEW_FILE, hasAudio: false };
+
+  /** Both media ready, both with a waveform and a thumbnail of their own. */
+  async function seeded(): Promise<{ media: MediaManager; relinkTo: (m: MediaRef) => void }> {
+    vi.spyOn(ipc, "planPlayback").mockImplementation(async (m) => ({ mode: "direct" as const, path: m.path }));
+    vi.spyOn(ipc, "ensureWaveform").mockReturnValue(new Promise(() => {}));
+    // The first two thumbnails answer (the old file's and the bystander's);
+    // the relinked file's never does.
+    vi.spyOn(ipc, "getThumbnail")
+      .mockResolvedValueOnce("C:\\cache\\thumbs\\take-1.jpg")
+      .mockResolvedValueOnce("C:\\cache\\thumbs\\b-roll.jpg")
+      .mockReturnValue(new Promise<string>(() => {}));
+    let project = projectWith(OLD_WITH_AUDIO, BYSTANDER);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project);
+    await settle();
+    media.waveforms.update(() => ({ "m-relink": OLD_WAVE, "m-keep": KEEP_WAVE }));
+    return {
+      media,
+      relinkTo: (m) => {
+        project = projectWith(m, BYSTANDER);
+      },
+    };
+  }
+
+  it("drops the old file's waveform and thumbnail when the file changed", async () => {
+    const { media, relinkTo } = await seeded();
+    expect(media.thumbs.get()["m-relink"]).toBe("C:\\cache\\thumbs\\take-1.jpg");
+
+    relinkTo(NEW_SILENT);
+    media.retrack("m-relink", true);
+    await settle();
+
+    expect("m-relink" in media.waveforms.get()).toBe(false);
+    expect("m-relink" in media.thumbs.get()).toBe(false);
+    // The bystander keeps its own, and the relinked media is re-planned.
+    expect(media.waveforms.get()["m-keep"]).toBe(KEEP_WAVE);
+    expect(media.thumbs.get()["m-keep"]).toBe("C:\\cache\\thumbs\\b-roll.jpg");
+    expect(media.status.get()["m-relink"]).toEqual({
+      state: "ready",
+      url: NEW_SILENT.path,
+      sourcePath: NEW_SILENT.path,
+    });
+  });
+
+  it("keeps them by default — the same file asked about again must not flash", async () => {
+    const { media } = await seeded();
+    const waves = media.waveforms.get();
+    const thumbs = media.thumbs.get();
+
+    media.retrack("m-relink");
+    await settle();
+
+    expect(media.waveforms.get()).toBe(waves);
+    expect(media.thumbs.get()).toBe(thumbs);
+  });
+});
+
+/**
+ * `markFailed` — the preview's own <video> saying it cannot play what the
+ * manager published as ready. Every fixture keeps a second, healthy media so a
+ * stamp that landed on the wrong entry (or cleared the map) shows.
+ */
+describe("markFailed", () => {
+  function directPlans(): void {
+    vi.spyOn(ipc, "planPlayback").mockImplementation(async (m) => ({ mode: "direct" as const, path: m.path }));
+    silentThumbnails();
+  }
+
+  it("stamps a ready media failed, and only that media", async () => {
+    directPlans();
+    const project = projectWith(OLD_FILE, BYSTANDER);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project);
+    await settle();
+
+    media.markFailed("m-relink", "This file couldn't be played in the preview");
+
+    expect(media.status.get()["m-relink"]).toEqual({
+      state: "failed",
+      message: "This file couldn't be played in the preview",
+    });
+    expect(media.status.get()["m-keep"]).toEqual({ state: "ready", url: BYSTANDER.path, sourcePath: BYSTANDER.path });
+  });
+
+  it("sticks: a plan already in flight cannot paint 'ready' back over it", async () => {
+    // The shape of the bug this API exists for: the backend answers Direct for
+    // a path that is not there, and that answer lands after the failure.
+    const plan = deferred<PlaybackPlan>();
+    vi.spyOn(ipc, "planPlayback").mockReturnValue(plan.promise);
+    silentThumbnails();
+    const project = projectWith(OLD_FILE);
+    const media = new MediaManager(() => project);
+    void media.ensure(OLD_FILE);
+    await settle();
+
+    media.markFailed("m-relink", "File not found");
+    plan.resolve({ mode: "direct", path: OLD_FILE.path });
+    await settle();
+
+    expect(media.status.get()["m-relink"]).toEqual({ state: "failed", message: "File not found" });
+  });
+
+  it("is cleared by a retrack, which plans the media afresh", async () => {
+    directPlans();
+    let project = projectWith(OLD_FILE);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project);
+    await settle();
+    media.markFailed("m-relink", "File not found");
+
+    project = projectWith(NEW_FILE);
+    media.retrack("m-relink", true);
+    await settle();
+
+    expect(media.status.get()["m-relink"]).toEqual({ state: "ready", url: NEW_FILE.path, sourcePath: NEW_FILE.path });
+  });
+
+  it("leaves media it does not track alone: never ensured, or removed since", async () => {
+    directPlans();
+    const project = projectWith(OLD_FILE, BYSTANDER);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project);
+    await settle();
+    media.untrack("m-relink");
+    await settle();
+    const before = media.status.get();
+    let notifications = 0;
+    media.status.subscribe(() => notifications++);
+
+    media.markFailed("m-relink", "late error from a removed clip");
+    media.markFailed("m-never-imported", "error for an id nobody ensured");
+    await settle();
+
+    // Not "failed" — absent, and nobody re-rendered for it.
+    expect(media.status.get()).toBe(before);
+    expect(notifications).toBe(0);
+  });
+
+  it("does nothing once the manager is disposed", async () => {
+    directPlans();
+    const project = projectWith(OLD_FILE);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project);
+    await settle();
+    const before = media.status.get();
+    media.dispose();
+
+    media.markFailed("m-relink", "error during teardown");
+
+    expect(media.status.get()).toBe(before);
+  });
+});

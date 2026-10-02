@@ -1565,6 +1565,35 @@ pub fn cleanup_temp_projects() {
     }
 }
 
+/// The `.trt` files in the temp-projects dir right now, as absolute paths.
+/// A missing or unreadable dir is simply none.
+fn orphan_temp_projects() -> Vec<String> {
+    let Ok(dir) = paths::temp_projects_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|x| x.eq_ignore_ascii_case("trt")) && p.is_file()
+        })
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Temporary projects the startup sweep left in place — the ones a crash,
+/// a logoff or a forced close orphaned — for Home to offer back. The folder
+/// is normally empty, so this is one `read_dir`, off the UI thread.
+#[tauri::command]
+pub async fn list_orphan_temp_projects() -> Result<Vec<String>> {
+    tauri::async_runtime::spawn_blocking(orphan_temp_projects)
+        .await
+        .map_err(|e| AppError::Io(std::io::Error::other(format!("could not list temporary projects: {e}"))))
+}
+
 /// Whether two paths name the same file on disk.
 ///
 /// `Unknown` is not a shrug. It is the state where the filesystem could not be
@@ -3741,6 +3770,37 @@ mod tests {
             // Idempotent: a second run on the now-empty dir is a clean no-op.
             cleanup_temp_projects();
             assert!(keep.exists());
+        });
+    }
+
+    /// The orphan listing names exactly the `.trt` files in the temp dir, by
+    /// absolute path: not their `.bak`, not a folder named like a project, not
+    /// a project in Documents — and a temp dir that does not exist yet is an
+    /// empty list, not an error.
+    #[test]
+    fn orphan_temp_projects_lists_only_temp_trt_files() {
+        with_isolated("temp-orphans", |_dir| {
+            assert!(!paths::temp_projects_dir().unwrap().exists());
+            assert!(orphan_temp_projects().is_empty(), "a missing dir lists nothing");
+
+            let a = temp_project_path(Some("Clip".into())).unwrap();
+            std::fs::write(&a, b"{}").unwrap();
+            std::fs::write(format!("{a}.bak"), b"{}").unwrap();
+            let b = temp_project_path(Some("Photo".into())).unwrap();
+            std::fs::write(&b, b"{}").unwrap();
+            let upper = paths::temp_projects_dir().unwrap().join("Loud.TRT");
+            std::fs::write(&upper, b"{}").unwrap();
+            std::fs::create_dir(paths::temp_projects_dir().unwrap().join("Folder.trt")).unwrap();
+            let perm_dir = paths::default_projects_dir().unwrap();
+            paths::ensure_dir(&perm_dir).unwrap();
+            std::fs::write(perm_dir.join("Kept.trt"), b"{}").unwrap();
+
+            let mut listed = orphan_temp_projects();
+            listed.sort();
+            let mut want = vec![a, b, upper.to_string_lossy().into_owned()];
+            want.sort();
+            assert_eq!(listed, want);
+            assert!(listed.iter().all(|p| Path::new(p).is_absolute()));
         });
     }
 

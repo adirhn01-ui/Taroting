@@ -1,27 +1,26 @@
-//! Thumbnails (single frames, thumb lane, synchronous-ish) and filmstrips
-//! (sparse frame sequences for timeline clips, background lane).
+//! Thumbnails: single frames, made on the thumb lane, synchronous-ish.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::State;
 
 use crate::cache::{Cache, CacheKind, MediaKey};
 use crate::error::{AppError, Result};
-use crate::jobs::{self, JobId, JobKind, Jobs, Lane};
+use crate::jobs::{self, Jobs, Lane};
 
 const THUMB_WIDTH: u32 = 320;
 
 /// Whether `src` is a still the WebView draws unturned whatever orientation
 /// tag it may carry (a WebP, a TIFF, a PNG whose image data comes before any
-/// eXIf — measured) — so a thumbnail or filmstrip of it must be decoded with
+/// eXIf — measured) — so a thumbnail of it must be decoded with
 /// `-noautorotate`, or a tagged one would show the photo turned while the
 /// preview and the export show it as coded. On an untagged one the flag
 /// changes nothing: the thumbnail is byte-identical either way (measured).
 ///
-/// These jobs hold only a path, so they ask `exif::read_flag` — the same
+/// The thumbnail job holds only a path, so it asks `exif::read_flag` — the same
 /// per-file rule the probe applied when it stored the export's answer
 /// (`MediaRef.noAutorotate`) for the same file, so the thumbnail is turned
 /// exactly as the export is. Chunk and segment headers only, and only ever
@@ -93,11 +92,17 @@ pub fn ensure_thumb(cache: &Cache, jobs: &Jobs, key: &MediaKey, at_sec: f64) -> 
     let src = PathBuf::from(&key.path);
 
     let dst_for_job = dst.clone();
-    jobs::run_blocking_on_lane(jobs, Lane::Thumb, move || {
+    jobs::run_blocking_on_lane(jobs, Lane::Thumb, move |abandoned| {
         let args = thumbnail_args(&src, &dst_for_job, at_sec);
-        let out = jobs::ffmpeg::command("ffmpeg")?
-            .args(&args)
-            .output()?;
+        // The caller has given up (reading the orientation above can be slow
+        // on a dead network share): nobody wants this frame any more, so no
+        // ffmpeg is spent on it.
+        if abandoned.load(Ordering::Relaxed) {
+            return Err(AppError::Ffmpeg("thumbnail abandoned".into()));
+        }
+        let mut cmd = jobs::ffmpeg::command("ffmpeg")?;
+        cmd.args(&args);
+        let out = jobs::ffmpeg::output_owned(&mut cmd)?;
         if !out.status.success() {
             return Err(AppError::Ffmpeg(format!(
                 "thumbnail failed: {}",
@@ -120,114 +125,6 @@ pub fn get_thumbnail(
     ensure_thumb(&cache, &jobs, &key, at_sec).map(|p| p.to_string_lossy().into_owned())
 }
 
-/* ------------------------------------------------------------------ */
-/* Filmstrips                                                          */
-/* ------------------------------------------------------------------ */
-
-/// Field names: see `PlaybackPlan` (media/playability.rs).
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "state")]
-pub enum FilmstripResult {
-    Ready { dir: String, frame_count: u32 },
-    Pending { job_id: JobId, dir: String },
-}
-
-fn filmstrip_args(src: &Path, dir: &Path, interval_sec: f64, height_px: u32) -> Vec<OsString> {
-    let mut args: Vec<OsString> = Vec::new();
-    for a in [
-        "-y", "-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1",
-    ] {
-        args.push(a.into());
-    }
-    push_input(&mut args, src);
-    args.push("-vf".into());
-    args.push(format!("fps=1/{interval_sec},scale=-2:{height_px}").into());
-    for a in ["-q:v", "6"] {
-        args.push(a.into());
-    }
-    args.push(dir.join("%05d.jpg").into());
-    args
-}
-
-fn count_frames(dir: &Path) -> u32 {
-    std::fs::read_dir(dir)
-        .map(|r| {
-            r.flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == "jpg"))
-                .count() as u32
-        })
-        .unwrap_or(0)
-}
-
-#[tauri::command]
-pub fn ensure_filmstrip(
-    app: AppHandle,
-    jobs: State<'_, Arc<Jobs>>,
-    cache: State<'_, Arc<Cache>>,
-    key: MediaKey,
-    duration: f64,
-    interval_sec: f64,
-    height_px: u32,
-) -> Result<FilmstripResult> {
-    let interval_sec = interval_sec.max(0.1);
-    let hash = key.hash();
-    let suffix = format!("_h{height_px}_i{}", (interval_sec * 1000.0) as u64);
-    let dir = cache.dir_path(CacheKind::Filmstrip, &hash, &suffix);
-    let marker = dir.join(".complete");
-
-    if marker.is_file() {
-        cache.mark_used(&dir);
-        return Ok(FilmstripResult::Ready {
-            dir: dir.to_string_lossy().into_owned(),
-            frame_count: count_frames(&dir),
-        });
-    }
-
-    cache.ensure_kind_dir(CacheKind::Filmstrip)?;
-    std::fs::create_dir_all(&dir)?;
-
-    let handle = jobs.allocate(JobKind::Filmstrip);
-    let job_id = handle.id;
-    let app_clone = app.clone();
-    let jobs_arc = Arc::clone(&jobs);
-    let cache_arc = Arc::clone(&cache);
-    let src = PathBuf::from(&key.path);
-    let dir_clone = dir.clone();
-
-    jobs.submit(
-        Lane::Background,
-        Box::new(move || {
-            // whole directory is the "partial output" on cancel/fail
-            handle.set_output(dir_clone.clone());
-            let args = filmstrip_args(&src, &dir_clone, interval_sec, height_px);
-            let total = if duration > 0.0 { Some(duration) } else { None };
-            match jobs::execute_ffmpeg(&app_clone, &handle, args, total) {
-                Ok(()) => {
-                    let _ = std::fs::write(dir_clone.join(".complete"), b"");
-                    cache_arc.mark_used(&dir_clone);
-                    jobs::complete_job(
-                        &app_clone,
-                        &jobs_arc,
-                        &handle,
-                        serde_json::json!({
-                            "dir": dir_clone.to_string_lossy(),
-                            "frameCount": count_frames(&dir_clone),
-                        }),
-                    );
-                }
-                Err(failure) => {
-                    jobs::fail_job(&app_clone, &jobs_arc, &handle, failure.message, failure.log_tail);
-                }
-            }
-        }),
-    );
-
-    Ok(FilmstripResult::Pending {
-        job_id,
-        dir: dir.to_string_lossy().into_owned(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,7 +134,7 @@ mod tests {
         args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
-    /// Both jobs' argv, whole, decided per FILE: a WebP turned by its EXIF,
+    /// The thumbnail argv, whole, decided per FILE: a WebP turned by its EXIF,
     /// an untagged WebP, a PNG with the same orientation in an eXIf AFTER its
     /// image data and an untagged PNG get `-noautorotate` right before their
     /// `-i`; the same PNG eXIf BEFORE the image data, a JPEG with that EXIF, a
@@ -285,7 +182,6 @@ mod tests {
         std::fs::write(&avi, b"RIFF\x24\0\0\0AVI LIST").unwrap();
 
         let dst = dir.join("thumb.jpg");
-        let strip = dir.join("strip");
         let rows = [
             (&webp, true),
             (&late, true),
@@ -308,15 +204,6 @@ mod tests {
                 .chain([dst.to_string_lossy().into_owned()])
                 .collect();
             assert_eq!(s(&thumbnail_args(file, &dst, 0.0)), want_thumb, "{src}");
-            let want_strip: Vec<String> =
-                ["-y", "-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1"]
-                    .iter()
-                    .chain(flag)
-                    .chain(&["-i", src.as_str(), "-vf", "fps=1/1,scale=-2:48", "-q:v", "6"])
-                    .map(|a| a.to_string())
-                    .chain([strip.join("%05d.jpg").to_string_lossy().into_owned()])
-                    .collect();
-            assert_eq!(s(&filmstrip_args(file, &strip, 1.0, 48)), want_strip, "{src}");
         }
 
         for (file, landscape) in [(&webp, true), (&late, true), (&early, false), (&jpg, false)] {

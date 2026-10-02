@@ -1105,9 +1105,9 @@ function sanitizeFps(fps: Rational): Rational {
 }
 
 /** Media metadata is re-derived by `probe_media` on relink, but `duration`
- *  reaches ffmpeg directly as the `duration` argument of the waveform and
- *  filmstrip jobs, where a non-finite value serialises to JSON `null` and the
- *  `f64` parameter rejects it. */
+ *  reaches ffmpeg directly as the `duration` argument of the waveform job,
+ *  where a non-finite value serialises to JSON `null` and the `f64` parameter
+ *  rejects it. */
 function sanitizeMediaRef(m: MediaRef): MediaRef {
   const duration = finMin(m.duration, 0, 0);
   return duration === m.duration ? m : { ...m, duration };

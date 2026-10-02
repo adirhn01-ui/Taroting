@@ -19,6 +19,7 @@
 // clamping from the theme system: do not reintroduce it.
 
 import "./generators.css";
+import { textLabel } from "../../core/media-name";
 import { addGeneratedMedia } from "../../core/project";
 import type { ProjectSession } from "../../core/session";
 import { IMAGE_CANVAS_MAX_SIDE, type FontFamily, type Generator } from "../../core/types";
@@ -84,11 +85,28 @@ const evenUp = (v: number): number => Math.max(2, Math.ceil(v / 2) * 2);
 /** Round to the nearest even integer, clamped to the canvas range. */
 const evenDim = (v: number): number => clamp(Math.round(v / 2) * 2, MIN_DIM, MAX_DIM);
 
-/** The CSS `font` shorthand the preview / stage use: "{italic} {bold} {px} {family}". */
+/** The font for a CANVAS context: "{italic} {bold} {px} {family}". `ctx.font`
+ *  has no line height, so this one carries none — a DOM element wants
+ *  `cssFont`. */
 export function fontString(g: Extract<Generator, { type: "text" }>): string {
   const style = g.italic ? "italic" : "normal";
   const weight = g.bold ? "bold" : "normal";
   return `${style} ${weight} ${g.sizePx}px ${g.fontFamily}`;
+}
+
+/**
+ * The CSS `font` shorthand for a DOM element showing a text generator:
+ * "{italic} {bold} {px}/1.25 {family}". The one font for every such element —
+ * the dialog preview, the crop ghost, the stage layer — because the line height
+ * has to travel INSIDE the shorthand: setting `font` resets line-height to
+ * `normal`, so a lineHeight written before it is silently wiped, and Segoe UI's
+ * `normal` (~1.33) then spaces lines wider than the 1.25 the media box and the
+ * export's drawtext are measured at.
+ */
+export function cssFont(g: Extract<Generator, { type: "text" }>): string {
+  const style = g.italic ? "italic" : "normal";
+  const weight = g.bold ? "bold" : "normal";
+  return `${style} ${weight} ${g.sizePx}px/${LINE_HEIGHT} ${g.fontFamily}`;
 }
 
 // One reused offscreen canvas context for text measurement.
@@ -123,12 +141,10 @@ export function measureText(g: Extract<Generator, { type: "text" }>): { width: n
   return { width, height };
 }
 
-/** First ~24 chars of the text, single line, ellipsised — used as the bin label. */
-export function textLabel(text: string): string {
-  const single = text.replace(/\s+/g, " ").trim();
-  const short = single.length > 24 ? single.slice(0, 24) + "…" : single;
-  return `Text — ${short || "Title"}`;
-}
+// The label rule lives with the other media names (core/media-name.ts), so the
+// timeline and the inspector can name a text clip without importing this
+// dialog module; re-exported for the callers that always found it here.
+export { textLabel };
 
 /* ------------------------------------------------------------------ */
 /* Modal shell                                                         */
@@ -293,10 +309,9 @@ function openTextDialog(ctx: GeneratorDialogCtx | GeneratorCreate): () => void {
     const g = currentGen();
     // Render at a bounded font size so the preview row stays readable.
     const shownPx = Math.min(g.sizePx, 48);
-    previewText.style.font = fontString({ ...g, sizePx: shownPx });
+    previewText.style.font = cssFont({ ...g, sizePx: shownPx });
     previewText.style.color = g.color;
     previewText.style.whiteSpace = "pre";
-    previewText.style.lineHeight = String(LINE_HEIGHT);
     previewText.textContent = g.text || " ";
   };
 

@@ -22,8 +22,10 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # natural file-name order for the viewer's folder stepping (StrCmpLogicalW in
 # src/media/siblings.rs), and the crash note a native fault leaves behind
 # (src/crash.rs: an unhandled-exception filter that writes with plain Win32
-# file calls). Windows-only by construction; the seams are per-platform and
-# other platforms get their own. Features are compile-time only: no new
+# file calls), and the job object that ends every ffmpeg/ffprobe child with
+# the app (src/jobs/ffmpeg.rs; Threading carries the job's limit struct and
+# the process wait). Windows-only by construction; the seams are per-platform
+# and other platforms get their own. Features are compile-time only: no new
 # crate, nothing in Cargo.lock.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -33,9 +35,11 @@ windows-sys = { version = "0.59", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_Diagnostics_Debug",
   "Win32_System_IO",
+  "Win32_System_JobObjects",
   "Win32_System_Kernel",
   "Win32_System_LibraryLoader",
   "Win32_System_SystemInformation",
+  "Win32_System_Threading",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell",

@@ -19,7 +19,7 @@ import { fontString } from "../../editor/media/generators";
 import { normalizeHexColor } from "../../core/session";
 import type { ClipTransform, Generator, ProjectFile, Stroke } from "../../core/types";
 import { layerToCanvas } from "../geom";
-import { layersOf, type Layer } from "../layers";
+import { layersOf, opacityOf, type Layer } from "../layers";
 import { createScratch, paintStroke, type ReleasableScratch, type Scratch } from "../ink/paint";
 import { fillChecker } from "./checker";
 import type { Ctx2D, LiveInk, RenderOpts, RenderResources, Underlay, ViewXf } from "./index";
@@ -101,14 +101,6 @@ export function layerBox(l: Layer, src?: CanvasImageSource | null): { readonly w
 
 function matrixOf(doc: ProjectFile, l: Layer, box: { w: number; h: number }): Affine {
   return layerMatrix(l.transform, box.w, box.h, doc.timeline.width, doc.timeline.height);
-}
-
-/** A layer's effective opacity, clamped to 0..1; a non-finite value (a
- *  crafted file) counts as 1. Preview and export both filter with this, so
- *  they can never disagree about which layers exist. */
-export function opacityOf(l: Layer): number {
-  const o = l.transform.opacity;
-  return Number.isFinite(o) ? Math.min(Math.max(o, 0), 1) : 1;
 }
 
 /* ------------------------------------------------------------------ */

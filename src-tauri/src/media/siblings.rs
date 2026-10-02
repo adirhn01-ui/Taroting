@@ -19,6 +19,9 @@ use std::sync::{Arc, Mutex};
 use crate::error::{AppError, Result};
 use crate::media::explorer_order::{self, folder_key, Ranks};
 use crate::media::extensions::{family_of_ext, step_family, StepFamily};
+use crate::media::source::is_device_path;
+#[cfg(windows)]
+use crate::media::source::is_file_namespace;
 use crate::project::store::{path_identity, PathIdentity};
 
 /// Mirrors `SiblingWindow` in src/core/ipc.ts, field for field.
@@ -146,34 +149,6 @@ impl OrderCache {
 
 fn bad<T>(msg: &str) -> Result<T> {
     Err(AppError::BadInput(msg.into()))
-}
-
-/// `\\.\` names a device (a volume, a pipe, COM1), not a file. Rust's own
-/// prefix parser accepts either separator there, so `//./` is the same thing
-/// in disguise and is refused the same way.
-fn is_device_path(path: &str) -> bool {
-    path.chars()
-        .take(4)
-        .map(|c| if c == '/' { '\\' } else { c })
-        .eq(r"\\.\".chars())
-}
-
-/// Whether an absolute path lives on a drive or a share — the only places a
-/// media file does. `\\?\` is a door into the whole object namespace, not
-/// just into files: `\\?\pipe\` lists the machine's named pipes and
-/// `\\?\GLOBALROOT\` reaches raw devices, and the viewer has no business
-/// scanning either. So the prefix is allow-listed (`C:\`, `\\server\share\`
-/// and their `\\?\` spellings) rather than the bad ones deny-listed.
-#[cfg(windows)]
-fn is_file_namespace(path: &Path) -> bool {
-    use std::path::{Component, Prefix};
-    match path.components().next() {
-        Some(Component::Prefix(p)) => matches!(
-            p.kind(),
-            Prefix::Disk(_) | Prefix::UNC(..) | Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..)
-        ),
-        _ => false,
-    }
 }
 
 /// `order` is asked once the path has passed every check, with the file it

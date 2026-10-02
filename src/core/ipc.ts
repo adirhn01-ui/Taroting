@@ -138,10 +138,6 @@ export type WaveformResult =
   | { state: "pending"; jobId: number; output: string }
   | { state: "none" };
 
-export type FilmstripResult =
-  | { state: "ready"; dir: string; frameCount: number }
-  | { state: "pending"; jobId: number; dir: string };
-
 export interface CodecHints {
   hevc: boolean;
   av1: boolean;
@@ -291,6 +287,12 @@ export const ipc = {
   tempProjectPath: (name?: string) =>
     call<string>("temp_project_path", { name: name ?? null }),
   tempProjectsDir: () => call<string>("temp_projects_dir", undefined, () => ""),
+  /** Temporary projects the startup sweep kept: ones a crash, a logoff or a
+   *  forced close left behind before their keep-or-discard question was ever
+   *  asked. Absolute `.trt` paths in tmp-projects; [] when there are none (the
+   *  normal case) and outside the desktop app. */
+  listOrphanTempProjects: () =>
+    call<string[]>("list_orphan_temp_projects", undefined, () => []),
   renameProject: (path: string, newName: string) =>
     call<string>("rename_project", { path, newName }),
   duplicateProject: (path: string, newName: string, newId: string) =>
@@ -338,8 +340,6 @@ export const ipc = {
       srcIn,
       srcOut,
     }),
-  ensureFilmstrip: (key: MediaKey, duration: number, intervalSec: number, heightPx: number) =>
-    call<FilmstripResult>("ensure_filmstrip", { key, duration, intervalSec, heightPx }),
   cancelJob: (id: number) => call<boolean>("cancel_job", { id }),
   cacheStats: () =>
     call<{ totalBytes: number; byKind: Record<string, number> }>("cache_stats"),

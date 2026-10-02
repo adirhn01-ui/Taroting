@@ -110,6 +110,27 @@ export function findLayer(p: ProjectFile, trackId: string): Layer | undefined {
   return layersOf(p).find((l) => l.trackId === trackId);
 }
 
+/** A layer's effective opacity, clamped to 0..1; a non-finite value (a
+ *  crafted file) counts as 1. Preview and export both filter with this, so
+ *  they can never disagree about which layers exist. Lives here rather than in
+ *  the compositor so the layer rules (which layer ink may target, which strokes
+ *  an eraser can reach) read the same number without importing the renderer,
+ *  which itself imports this module. */
+export function opacityOf(l: Layer): number {
+  const o = l.transform.opacity;
+  return Number.isFinite(o) ? Math.min(Math.max(o, 0), 1) : 1;
+}
+
+/** The layer that should be selected once `trackId` is removed: the one below
+ *  it (it moves up into the freed row), else the one above, else none. Null
+ *  for an id that is not a layer. Read BEFORE the removal is committed. */
+export function nextSelectionAfterRemove(p: ProjectFile, trackId: string): string | null {
+  const ls = layersOf(p);
+  const i = ls.findIndex((l) => l.trackId === trackId);
+  if (i < 0) return null;
+  return (ls[i + 1] ?? ls[i - 1])?.trackId ?? null;
+}
+
 /* ------------------------------------------------------------------ */
 /* Shared plumbing                                                     */
 /* ------------------------------------------------------------------ */

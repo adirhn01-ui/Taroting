@@ -269,6 +269,12 @@ export interface ProjectFile {
   export: ExportPreset;
   /** image projects only */
   image?: ImageMeta;
+  /** A TEMPORARY project the user has edited (mirrors schema.rs
+   *  `temp_edited`). Set on the first save after a real edit, dropped on
+   *  Keep, never present on a permanent file. Lets the startup sweep keep an
+   *  edited orphan (a crash skipped the keep/discard prompt) for Home to offer
+   *  back, while untouched ones are still cleared. */
+  tempEdited?: true;
 }
 
 export type ImageExportFormat = "png" | "jpeg" | "webp";

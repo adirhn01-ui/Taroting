@@ -3056,3 +3056,53 @@ describe("ProjectSession debounceMs and holdAutosave", () => {
     expect(written).toEqual(["saved NaN", "saved -1", "saved Infinity"]);
   });
 });
+
+/**
+ * `discarded` — the one thing a disposed session could not tell its owner.
+ *
+ * `discard()` and `dispose()` both end in the same private `disposed` flag, so
+ * the editor tearing a session down had no way to know whether the project
+ * lives on (Back, Keep: its media's proxies are wanted by the next open) or is
+ * about to be deleted (Discard: nothing will ever reopen it, and a transcode
+ * left running for it is pure waste). Each case below goes through the path
+ * the other does not, so a getter that read `disposed` fails one of them.
+ */
+describe("ProjectSession.discarded", () => {
+  beforeEach(() => {
+    installGlobalStubs();
+    settingsStore.set(DEFAULT_SETTINGS);
+    vi.useFakeTimers(fakeTimerOptions());
+    vi.spyOn(ipc, "saveProject").mockImplementation(async (_path, project) => ({
+      modifiedAt: project.modifiedAt,
+    }));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("is false on a live session", () => {
+    const s = new ProjectSession(PROJECT_PATH, createProject("live"), { temp: true });
+    expect(s.discarded).toBe(false);
+    s.discard();
+  });
+
+  it("turns true on discard, and stays true through the dispose that follows", async () => {
+    const s = new ProjectSession(PROJECT_PATH, createProject("thrown away"), { temp: true });
+    s.commit((p) => ({ ...p, name: "edited, then discarded" }));
+    s.discard();
+    expect(s.discarded).toBe(true);
+    // The editor's own teardown still runs dispose() after a Discard.
+    await s.dispose();
+    expect(s.discarded).toBe(true);
+  });
+
+  it("stays false when the session is only disposed — the project lives on", async () => {
+    const s = new ProjectSession(PROJECT_PATH, createProject("kept"), { temp: true });
+    s.commit((p) => ({ ...p, name: "edited, then kept" }));
+    await s.dispose();
+    expect(s.discarded).toBe(false);
+  });
+});

@@ -37,7 +37,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { addGeneratedMedia, createProject } from "../../core/project";
 import type { Generator } from "../../core/types";
-import { measureText, openGeneratorDialog, textLabel } from "./generators";
+import { cssFont, fontString, measureText, openGeneratorDialog, textLabel } from "./generators";
 
 /** The caps this path used to be subjected to, kept only so the cases below can
  *  say "and this is comfortably past the number that used to trigger a shrink".
@@ -319,5 +319,57 @@ describe("the generator dialogs' onClose", () => {
     doc.fire("keydown", { key: "Escape" });
     expect(b.removed).toBe(true);
     expect(() => closer()).not.toThrow();
+  });
+});
+
+// The two font strings. A canvas context has no line height, so `fontString`
+// (ctx.font: the measurement above, the image compositor) must stay exactly as
+// it was; a DOM element needs the 1.25 INSIDE the shorthand, because setting
+// `font` resets line-height and wipes a lineHeight written before it. Every
+// field differs from the defaults, so a dropped or swapped one shows.
+describe("cssFont and fontString", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const g = {
+    type: "text" as const,
+    text: "Two\nlines",
+    fontFamily: "Times New Roman" as const,
+    sizePx: 72,
+    color: "#ff0000",
+    bold: true,
+    italic: true,
+  };
+
+  it("cssFont carries the 1.25 line height inside the shorthand", () => {
+    expect(cssFont(g)).toBe("italic bold 72px/1.25 Times New Roman");
+    expect(cssFont({ ...g, bold: false, italic: false, sizePx: 9 })).toBe("normal normal 9px/1.25 Times New Roman");
+  });
+
+  it("fontString is unchanged: no line height for a canvas context", () => {
+    expect(fontString(g)).toBe("italic bold 72px Times New Roman");
+  });
+
+  it("the Add text preview is styled with cssFont, at its bounded size", () => {
+    const { backdrop } = fakeDocument();
+    openGeneratorDialog("text", { session: { project: createProject("t") } as never, media: {} as never });
+    const find = (el: FakeEl, pred: (e: FakeEl) => boolean): FakeEl | null => {
+      if (pred(el)) return el;
+      for (const c of el.children) {
+        const hit = find(c, pred);
+        if (hit) return hit;
+      }
+      return null;
+    };
+    const body = backdrop().querySelector(".gen-body");
+    const select = find(body, (e) => e.tag === "select")!;
+    const previewText = find(body, (e) => e.className === "gen-preview__text")!;
+    // The fake <select> keeps no value of its own; pick a family the way the
+    // user would, which re-renders the preview.
+    select.value = "Georgia";
+    select.fire("change");
+    // 96 px asked for, shown at the preview's 48 px cap.
+    expect(previewText.style.font).toBe("normal normal 48px/1.25 Georgia");
   });
 });

@@ -255,6 +255,20 @@ export class PhotoCache {
     return this.adjusted(le, level, adjust);
   }
 
+  /** The compressed file this cache already holds for `m` — so an export, a
+   *  copy or a Home thumbnail can skip reading it through the asset protocol
+   *  again. Null for anything but a loaded file: one still loading has no blob
+   *  yet, and a FAILED entry is no answer either — null sends the caller to
+   *  read the file itself, so a file restored since the failure is found
+   *  instead of being reported missing on the cache's stale say-so. Keyed by
+   *  the file (path + size + mtime), like everything here, so another layer of
+   *  the same photo gets the same blob. */
+  blobFor(m: MediaRef): Blob | null {
+    if (this.disposed) return null;
+    const fe = this.files.get(keyOf(m));
+    return fe !== undefined && fe.state === "ready" ? fe.blob : null;
+  }
+
   /** Forget cached pixels: one layer's (relink, a file that changed) or all.
    *  A file other layers still show keeps its pixels — unless it FAILED: then
    *  every layer lets go of it, so the next render fetches it again. Another

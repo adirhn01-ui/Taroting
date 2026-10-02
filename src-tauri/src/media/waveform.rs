@@ -92,7 +92,7 @@ fn extract(
     .stderr(Stdio::null())
     .stdin(Stdio::null());
 
-    let mut child = cmd.spawn()?;
+    let mut child = jobs::ffmpeg::spawn_owned(&mut cmd)?;
     let mut stdout = child.stdout.take().expect("piped stdout");
 
     let mut pairs: Vec<(i8, i8)> = Vec::with_capacity(pairs_capacity_hint(duration) + 16);
@@ -381,7 +381,7 @@ mod tests {
         // Whitespace-free, so the check survives a reformat and any line endings.
         let body: String = code[body_start..body_start + end].split_whitespace().collect();
         let guard = "ifhandle.is_canceled(){returnErr(AppError::Ffmpeg(\"canceled\".into()));}";
-        let spawn = body.find("cmd.spawn()").expect("spawns ffmpeg");
+        let spawn = body.find("spawn_owned(&mutcmd)").expect("spawns ffmpeg");
         let first = body.find(guard).expect("a guard exists");
         assert!(first < spawn, "a canceled queued job must not start ffmpeg");
         let wait = body.find("child.wait()?").expect("waits for ffmpeg");

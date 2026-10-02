@@ -9,7 +9,7 @@
 // reachable through the lazily loaded image chunk, and it allocates no canvas
 // or bitmap at import time.
 
-import type { ProjectFile } from "../../core/types";
+import type { MediaRef, ProjectFile } from "../../core/types";
 import { layersOf, type Layer } from "../layers";
 import { pickCheckerPalette } from "./checker";
 import { releaseRenderScratch } from "./composite";
@@ -80,6 +80,12 @@ export class PreviewResources implements RenderResources {
   drawingRaster(l: Layer, view: ViewXf): CanvasImageSource | null {
     this.queuePrune();
     return this.drawings.raster(this.getDoc(), l, view);
+  }
+
+  /** The photo file already held for `m`, or null (see `PhotoCache.blobFor`):
+   *  the `blobFor` an export, a copy or a thumbnail render takes. */
+  blobFor(m: MediaRef): Blob | null {
+    return this.photos.blobFor(m);
   }
 
   /** tell the cache the current zoom/stage so it picks working sizes (debounced re-decode) */

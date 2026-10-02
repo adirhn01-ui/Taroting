@@ -17,6 +17,8 @@ import {
   flipImage,
   layersOf,
   moveLayer,
+  nextSelectionAfterRemove,
+  opacityOf,
   removeLayer,
   renameLayer,
   resizeCanvas,
@@ -182,6 +184,37 @@ describe("removing, moving, hiding, renaming, duplicating", () => {
     expect(ids(moveLayer(p, a!, 99))).toEqual(["b", "c", "a"]);
     expect(ids(moveLayer(p, c!, -5))).toEqual(["c", "a", "b"]);
     clean(moveLayer(p, a!, 2));
+  });
+
+  it("nextSelectionAfterRemove: the layer below takes the row, else the one above", () => {
+    // Four layers, so the middle, top and bottom cases each land on a
+    // DIFFERENT survivor: with three, top and bottom would both give the
+    // middle one, and an above-first rule would still pass the middle case.
+    let p = blank();
+    for (const n of ["d", "c", "b", "a"]) p = addPhotoLayer(p, photo(10, 10, `C:\\x\\${n}.png`)).project;
+    expect(ids(p)).toEqual(["a", "b", "c", "d"]);
+    const id = (n: string): string => layersOf(p).find((l) => l.name === n)!.trackId;
+
+    expect(nextSelectionAfterRemove(p, id("c"))).toBe(id("d")); // middle → below
+    expect(nextSelectionAfterRemove(p, id("a"))).toBe(id("b")); // top → below
+    expect(nextSelectionAfterRemove(p, id("d"))).toBe(id("c")); // bottom → above
+    // Read before the commit: the project itself is untouched.
+    expect(ids(p)).toEqual(["a", "b", "c", "d"]);
+
+    const only = addPhotoLayer(blank(), photo()).project;
+    expect(nextSelectionAfterRemove(only, layersOf(only)[0]!.trackId)).toBeNull();
+    expect(nextSelectionAfterRemove(p, "nope")).toBeNull();
+  });
+
+  it("opacityOf clamps to 0..1 and reads a non-finite opacity as fully opaque", () => {
+    const { p, photoId } = posed();
+    const l = findLayer(p, photoId)!;
+    const at = (opacity: number): number => opacityOf({ ...l, transform: { ...l.transform, opacity } });
+    expect(at(0.35)).toBe(0.35);
+    expect(at(1.7)).toBe(1);
+    expect(at(-0.2)).toBe(0);
+    expect(at(Number.NaN)).toBe(1);
+    expect(at(Number.POSITIVE_INFINITY)).toBe(1);
   });
 
   it("hidden is written as true and DELETED when shown again, never false", () => {

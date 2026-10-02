@@ -33,6 +33,7 @@ import {
   duplicateLayer,
   layersOf,
   moveLayer,
+  nextSelectionAfterRemove,
   removeLayer,
   renameLayer,
   setLayerHidden,
@@ -483,13 +484,12 @@ export function mountLayersPanel(host: HTMLElement, ctx: ImageEditorCtx): { disp
   }
 
   function remove(trackId: string): void {
-    const at = layerAt(trackId);
-    if (!at) return;
-    const ls = layersOf(session.project);
+    if (!layerAt(trackId)) return;
     // The row that takes its place stays selected: the one below, else above.
-    const next = ls[at.index + 1] ?? ls[at.index - 1] ?? null;
+    // The shared rule, so the Delete key (image-editor.ts) picks the same row.
+    const next = nextSelectionAfterRemove(session.project, trackId);
     session.commit((p) => removeLayer(p, trackId));
-    if (selection.get() === trackId) selection.set(next ? next.trackId : null);
+    if (selection.get() === trackId) selection.set(next);
     ctx.requestRender();
   }
 

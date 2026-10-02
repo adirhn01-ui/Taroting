@@ -204,6 +204,9 @@ export class MediaManager {
   private generations = new Map<string, number>();
   private unlisten: (() => void) | null = null;
   private disposed = false;
+  /** Set by `dispose({ cancelPlayback: true })`: the project is gone for good,
+   *  so its playback preparation is canceled too (see `dispose`). */
+  private cancelPlayback = false;
   /** Pending coalesced cache enforcement (see CACHE_ENFORCE_COALESCE_MS). */
   private cacheTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -284,7 +287,8 @@ export class MediaManager {
     }
     // CANCELED UNDER US. A live manager never cancels a job it is listening
     // to: every cancel it issues happens in or after `dispose`, which
-    // unlistens first, and only ever for a waveform. So this
+    // unlistens first (a waveform always; a playback job only when the
+    // project was discarded — see `dispose`). So this
     // is SOMEONE ELSE'S cancel of a job we joined — the backend hands every
     // consumer of one output path the same job, and a closing editor (or a
     // viewer stepping past a file) cancels the one it started even when we
@@ -330,8 +334,17 @@ export class MediaManager {
 
   /** Forget a media item's tracking and re-ensure it against the current
    *  project (e.g. after a relink changed its path/size/mtime → new cache
-   *  keys). Safe no-op if the media no longer exists. */
-  retrack(mediaId: string): void {
+   *  keys). Safe no-op if the media no longer exists.
+   *
+   *  `fileChanged`: the media now points at a DIFFERENT file (a relink), so the
+   *  waveform and thumbnail published for the old one are dropped before the
+   *  re-ensure. Without it they stay for the whole session — the re-ensure only
+   *  ever ADDS: a relinked file with no audio asks for no waveform, so the old
+   *  file's peaks went on being drawn on every clip, and a thumbnail that fails
+   *  for the new file left the old picture in the bin. False (the default) is
+   *  the same file asked about again — a foreign cancel's re-plan — where the
+   *  display data is still right and dropping it would only flash it away. */
+  retrack(mediaId: string, fileChanged = false): void {
     this.tracked.delete(mediaId);
     // Cut it loose from the jobs the OLD file started, or their eventual
     // outcome lands on the relinked media — most visibly a "failed" stamp from
@@ -344,8 +357,40 @@ export class MediaManager {
     // there is nothing to drop — it would register the old job AFTER this ran,
     // and the fresh state would be overwritten by a job the old file started.
     this.bumpGeneration(mediaId);
+    if (fileChanged) {
+      // After the bump, so an old-file answer still in flight cannot put back
+      // what this just took away. `withoutKey` hands back the same map when
+      // there was nothing to drop, so nobody is notified for nothing.
+      this.waveforms.update((w) => withoutKey(w, mediaId));
+      this.thumbs.update((t) => withoutKey(t, mediaId));
+    }
     const m = this.getProject().media.find((x) => x.id === mediaId);
     if (m) void this.ensure(m);
+  }
+
+  /**
+   * Stamp a media entry as failed from OUTSIDE the manager — the preview's own
+   * <video> reporting that it cannot play what the manager said was ready (a
+   * missing or undecodable file the backend classified as directly playable).
+   *
+   * Only the CURRENT identity is stamped. A disposed manager, or an id it does
+   * not track (never ensured, or removed from the bin since), is left alone:
+   * stamping one would resurrect a status for media nothing can render. The
+   * caller still owes its own staleness check — an error from an element that
+   * was showing the file BEFORE a relink describes a file the media no longer
+   * points at; the scheduler compares the element's URL with the ready state's.
+   *
+   * The stamp sticks until the media is retracked (a relink) or removed: the
+   * generation is bumped, so an answer already in flight for this identity — a
+   * plan that would say "ready" for a path that is not there, or a thumbnail —
+   * is dropped instead of painting over the failure. A job already REGISTERED
+   * for the id is not cut loose; the intended callers stamp media that is
+   * ready, and a ready media has no playback job left to finish.
+   */
+  markFailed(mediaId: string, message: string): void {
+    if (this.disposed || !this.tracked.has(mediaId)) return;
+    this.bumpGeneration(mediaId);
+    this.patchStatus(mediaId, { state: "failed", message });
   }
 
   /**
@@ -413,8 +458,13 @@ export class MediaManager {
       const plan = await ipc.planPlayback(media, codecHints(), settingsStore.get().proxyMedia);
       // Answered after dispose: a pending job is deliberately LEFT RUNNING,
       // not canceled — see `cancelOrphan` for why playback preparation outlives
-      // the editor that asked for it.
-      if (this.disposed) return;
+      // the editor that asked for it — unless the project was discarded, when
+      // nothing will ever rejoin it. It is registered nowhere, so this is the
+      // only chance to stop it.
+      if (this.disposed) {
+        if (this.cancelPlayback && plan.mode === "pending") this.cancelOrphan(plan.jobId);
+        return;
+      }
       // The one that was actually reachable, if only just: a relink cuts the
       // media loose from its old jobs, but a plan still in flight has not
       // registered one yet, so without this it registers the OLD job after the
@@ -477,7 +527,7 @@ export class MediaManager {
   }
 
   /**
-   * Cancel a WAVEFORM job nobody here will ever read.
+   * Cancel a job nobody here will ever read — as a rule, a WAVEFORM job.
    *
    * Only waveforms, deliberately. A closed editor's waveform scans are pure
    * display, a few seconds of decode each, and cheap to redo — letting them run
@@ -495,6 +545,13 @@ export class MediaManager {
    * Two callers: `dispose` for every waveform job this manager registered, and
    * `requestWaveform` for an answer that arrived after dispose — that job was
    * started for us and is registered nowhere, so without this it escapes.
+   *
+   * The one exception to "only waveforms" is a DISCARDED project
+   * (`dispose({ cancelPlayback: true })`): its temporary file is deleted, no
+   * open will ever rejoin its remuxes or proxies, and stepping through a folder
+   * of such files would otherwise queue one transcode per file behind the one
+   * the user is looking at. Then `dispose` cancels every job it holds and
+   * `ensure` cancels a pending plan that answers late.
    *
    * A successor that had ALREADY joined the job hears it canceled and asks
    * again (`targetFailed`); the backend never hands a canceled job to a fresh
@@ -578,8 +635,20 @@ export class MediaManager {
     void ipc.enforceCacheLimit(settingsStore.get().cacheLimitMB, keep).catch(() => {});
   }
 
-  dispose(): void {
+  /**
+   * Stop listening and let go of this project's work.
+   *
+   * `cancelPlayback`: the project will never be opened again (a discarded
+   * temporary project), so its playback preparation is canceled along with its
+   * waveforms — here for every job it holds, and in `ensure` for a plan that
+   * answers late. Left unset, remuxes and proxies run on into the cache for the
+   * next open (see `cancelOrphan`). Another consumer riding on a canceled job
+   * hears the cancel and plans again (`targetFailed`), so canceling a shared
+   * job cannot strand it.
+   */
+  dispose(opts?: { cancelPlayback?: boolean }): void {
     this.disposed = true;
+    if (opts?.cancelPlayback === true) this.cancelPlayback = true;
     this.unlisten?.();
     this.unlisten = null;
     // A coalesced trim must not be lost just because the editor closed inside
@@ -594,9 +663,12 @@ export class MediaManager {
     // Waveform scans only; remuxes and proxies run on into the cache for the
     // next open to rejoin or find (see `cancelOrphan`). A job id never mixes
     // lanes (the two write different outputs), but the test is per waiter all
-    // the same: a job any playback waiter rides on is never canceled.
+    // the same: a job any playback waiter rides on is never canceled — unless
+    // the project was discarded, when everything goes.
     for (const [id, entry] of this.jobs) {
-      if (Array.isArray(entry) ? entry.every(isWaveform) : isWaveform(entry)) this.cancelOrphan(id);
+      if (this.cancelPlayback || (Array.isArray(entry) ? entry.every(isWaveform) : isWaveform(entry))) {
+        this.cancelOrphan(id);
+      }
     }
     this.jobs.clear();
   }

@@ -142,7 +142,13 @@ class FakeBitmap {
 
 let layers: Layer[] = [];
 
-vi.mock("../layers", () => ({ layersOf: () => layers }));
+// layersOf is the fixture; opacityOf is the REAL rule (it moved from the
+// compositor into the layer model), so the opacity cases below still test the
+// one function preview and export share rather than a copy of it.
+vi.mock("../layers", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../layers")>()),
+  layersOf: () => layers,
+}));
 // L = scale about the origin, then translate by (x, y): enough to see which
 // transform a layer was drawn with.
 vi.mock("../geom", () => ({
@@ -699,6 +705,79 @@ describe("renderImageExport", () => {
     const fills = log.filter((l) => l.includes("|fillStyle=")).map((l) => l.split("|")[1]);
     expect(fills).toEqual(["fillStyle=#ffffff", "fillStyle=#123456"]);
     expect(encoded).toEqual([{ type: "image/jpeg", quality: 0.85 }]);
+  });
+
+  it("takes a photo the caller already holds instead of reading it again", async () => {
+    const fetch = vi.fn(async () => ({ ok: true, blob: async () => new Blob([new Uint8Array(9)]) }));
+    vi.stubGlobal("fetch", fetch);
+    const decoded: unknown[] = [];
+    vi.stubGlobal(
+      "createImageBitmap",
+      vi.fn(async (b: unknown) => {
+        decoded.push(b);
+        return new FakeBitmap(64, 36);
+      }),
+    );
+    const held = new Blob([new Uint8Array(5)]);
+    const m = mediaRef("m-ph", { width: 64, height: 36 });
+    layers = [layer("ph", m)];
+    const asked: MediaRef[] = [];
+    await renderImageExport(doc("transparent", 64, 36), { format: "png", quality: 100, outW: 64, outH: 36 }, never(), () => {}, {
+      blobFor: (x) => {
+        asked.push(x);
+        return held;
+      },
+    });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(asked).toEqual([m]);
+    expect(decoded).toHaveLength(1);
+    expect(decoded[0]).toBe(held);
+    expect(log.some((l) => l.endsWith("draw:bmp64x36"))).toBe(true);
+  });
+
+  it("reads a photo the caller does not hold from disk", async () => {
+    const onDisk = new Blob([new Uint8Array(9)]);
+    const fetch = vi.fn(async () => ({ ok: true, blob: async () => onDisk }));
+    vi.stubGlobal("fetch", fetch);
+    const decoded: unknown[] = [];
+    vi.stubGlobal(
+      "createImageBitmap",
+      vi.fn(async (b: unknown) => {
+        decoded.push(b);
+        return new FakeBitmap(64, 36);
+      }),
+    );
+    layers = [layer("ph", mediaRef("m-ph", { width: 64, height: 36 }))];
+    await renderImageExport(doc("transparent", 64, 36), { format: "png", quality: 100, outW: 64, outH: 36 }, never(), () => {}, {
+      blobFor: () => null,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(decoded[0]).toBe(onDisk);
+  });
+
+  it("a Home thumbnail takes held photos too: one the editor has open still shows when the disk read fails", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, blob: async () => new Blob([]) })));
+    vi.stubGlobal("createImageBitmap", vi.fn(async () => new FakeBitmap(40, 30)));
+    layers = [layer("ph", mediaRef("m-ph"))];
+    await renderThumbnail(doc(), { blobFor: () => new Blob([new Uint8Array(5)]) });
+    expect(log.some((l) => l.endsWith("draw:bmp40x30"))).toBe(true);
+  });
+
+  it("a Home thumbnail stops on its signal: it rejects as aborted and encodes nothing", async () => {
+    // Aborted mid-render, the way a newer render of the same card takes over:
+    // while the photo is being read.
+    const ac = new AbortController();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        ac.abort();
+        return { ok: true, blob: async () => new Blob([new Uint8Array(9)]) };
+      }),
+    );
+    vi.stubGlobal("createImageBitmap", vi.fn(async () => new FakeBitmap(40, 30)));
+    layers = [layer("ph", mediaRef("m-ph"))];
+    await expect(renderThumbnail(doc(), { signal: ac.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(encoded).toEqual([]);
   });
 
   it("names a missing photo instead of exporting without it", async () => {

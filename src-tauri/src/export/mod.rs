@@ -587,7 +587,7 @@ pub fn start_export(
             // cleanup on cancel/failure targets the .part file
             handle.set_output(part_path.clone());
 
-            let result = jobs::execute_ffmpeg(&app_clone, &handle, final_args, Some(total));
+            let result = jobs::execute_ffmpeg(&app_clone, &handle, final_args, Some(total), None);
 
             // always remove temp files (filter script + textfiles) whatever the
             // outcome: success, failure, or cancel.

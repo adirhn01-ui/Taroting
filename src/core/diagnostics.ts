@@ -38,6 +38,11 @@ export interface DiagnosticErrorEntry {
   op: string;
   message: string;
   detail?: string;
+  /** Whole file paths the message or detail names (a media file, a cache
+   *  file), so the redactor can be told about them up front: a path the
+   *  redactor already knows is replaced whole, while one it has to FIND in free
+   *  text can be cut short at a space and leave part of a name behind. */
+  paths?: string[];
 }
 
 /** What the backend reports about the last failed ffmpeg run. */

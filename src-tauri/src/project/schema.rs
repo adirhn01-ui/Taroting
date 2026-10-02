@@ -110,6 +110,16 @@ pub(crate) fn image_kind_or_none<'de, D: serde::Deserializer<'de>>(
     Ok((Value::deserialize(d)? == Value::from("image")).then(|| "image".to_string()))
 }
 
+/// `tempEdited` as written by the app: exactly `true`, else false. Lenient for
+/// the same reason as `image_kind_or_none` — a hand-edited or damaged value
+/// must not make the whole project unreadable; it only means "not known to be
+/// edited", which at worst lets the startup sweep clear an orphan sooner.
+pub(crate) fn true_or_false<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<bool, D::Error> {
+    Ok(Value::deserialize(d)? == Value::Bool(true))
+}
+
 /// The strokes of a drawing that have the typed shape, skipping any that do
 /// not — never failing. `load_project` parses a project only to CHECK it and
 /// hands the raw JSON on, so one damaged stroke must not make the whole image
@@ -430,6 +440,17 @@ pub struct ProjectFile {
     /// `background` and `export` on read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<Value>,
+    /// A TEMPORARY project (tmp-projects) the user has edited. Set by the
+    /// frontend on the first save after a real edit and dropped when the user
+    /// keeps the project, so it never reaches a permanent file. The startup
+    /// sweep keeps an edited orphan (a crash or logoff skipped the
+    /// keep/discard prompt) for Home to offer back, and clears untouched ones.
+    #[serde(
+        default,
+        deserialize_with = "true_or_false",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub temp_edited: bool,
 }
 
 /// A project migrated to `CURRENT_SCHEMA`, plus the version it arrived as.
@@ -510,6 +531,36 @@ pub fn migrate(mut value: Value) -> Result<Migrated> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tempEdited` crosses the wire as `"tempEdited": true` or not at all, and
+    /// only a literal `true` counts: a damaged value reads as false instead of
+    /// failing the whole load.
+    #[test]
+    fn temp_edited_is_written_only_when_set_and_read_leniently() {
+        let base = serde_json::json!({
+            "schema": 2, "app": "taroting", "id": "p", "name": "n",
+            "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-02T00:00:00Z",
+            "media": [], "timeline": {"fps": {"num": 30, "den": 1}, "width": 640, "height": 360, "tracks": [], "markers": []},
+            "export": {}
+        });
+        let read = |v: Value| serde_json::from_value::<ProjectFile>(v).map(|p| p.temp_edited);
+        assert!(!read(base.clone()).unwrap(), "absent");
+        for (value, want) in [
+            (Value::Bool(true), true),
+            (Value::Bool(false), false),
+            (Value::from("true"), false),
+            (Value::from(1), false),
+            (Value::Null, false),
+        ] {
+            let mut v = base.clone();
+            v["tempEdited"] = value.clone();
+            assert_eq!(read(v).unwrap(), want, "tempEdited = {value}");
+        }
+        let mut edited: ProjectFile = serde_json::from_value(base.clone()).unwrap();
+        assert!(serde_json::to_value(&edited).unwrap().get("tempEdited").is_none(), "false is omitted");
+        edited.temp_edited = true;
+        assert_eq!(serde_json::to_value(&edited).unwrap()["tempEdited"], Value::Bool(true));
+    }
 
     #[test]
     fn round_trips_and_tolerates_unknown_fields() {

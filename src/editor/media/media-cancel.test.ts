@@ -111,6 +111,59 @@ describe("MediaManager cancel at dispose", () => {
     expect(cancel.mock.calls.map((c) => c[0])).toEqual([78]);
   });
 
+  it("cancels its playback jobs too when the project was discarded", async () => {
+    // A discarded temporary project is deleted right after this dispose: no
+    // open will ever rejoin its proxies, so they go with the waveforms.
+    vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
+    vi.spyOn(ipc, "planPlayback").mockImplementation(
+      async (m) => ({ mode: "pending", jobId: m.id === "a" ? 41 : 42, output: "o" }) as PlaybackPlan,
+    );
+    vi.spyOn(ipc, "ensureWaveform").mockImplementation(
+      async (k) => ({ state: "pending", jobId: k.path.includes("a.mov") ? 51 : 52, output: "w" }) as WaveformResult,
+    );
+    const cancel = vi.spyOn(ipc, "cancelJob").mockResolvedValue(true);
+    const p = projectOf(media("a"), media("b"));
+    const m = new MediaManager(() => p);
+    m.ensureAll(p);
+    await settle();
+    m.dispose({ cancelPlayback: true });
+    expect(cancel.mock.calls.map((c) => c[0]).sort()).toEqual([41, 42, 51, 52]);
+  });
+
+  it("an explicit cancelPlayback: false is the ordinary dispose", async () => {
+    vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
+    vi.spyOn(ipc, "planPlayback").mockResolvedValue({ mode: "pending", jobId: 41, output: "o" });
+    vi.spyOn(ipc, "ensureWaveform").mockResolvedValue({ state: "pending", jobId: 51, output: "w" });
+    const cancel = vi.spyOn(ipc, "cancelJob").mockResolvedValue(true);
+    const p = projectOf(media("a"));
+    const m = new MediaManager(() => p);
+    m.ensureAll(p);
+    await settle();
+    m.dispose({ cancelPlayback: false });
+    expect(cancel.mock.calls.map((c) => c[0])).toEqual([51]);
+  });
+
+  it("after a discarding dispose, cancels a pending plan that answers late — but not a direct one", async () => {
+    vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
+    let ra!: (v: PlaybackPlan) => void;
+    let rb!: (v: PlaybackPlan) => void;
+    vi.spyOn(ipc, "planPlayback").mockImplementation((m) => new Promise((r) => (m.id === "a" ? (ra = r) : (rb = r))));
+    vi.spyOn(ipc, "ensureWaveform").mockResolvedValue({ state: "none" });
+    const cancel = vi.spyOn(ipc, "cancelJob").mockResolvedValue(true);
+    const p = projectOf(media("a"), media("b"));
+    const m = new MediaManager(() => p);
+    m.ensureAll(p);
+    await settle();
+    m.dispose({ cancelPlayback: true });
+    expect(cancel).not.toHaveBeenCalled();
+    ra({ mode: "pending", jobId: 77, output: "o" });
+    rb({ mode: "direct", path: "D:\\b.mov" });
+    await settle();
+    // The pending one was started for this project and is registered nowhere:
+    // this is the only chance to stop it. A direct play has no job at all.
+    expect(cancel.mock.calls.map((c) => c[0])).toEqual([77]);
+  });
+
   it("cancels nothing for a direct plan after dispose, and swallows a rejecting cancel", async () => {
     vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
     let rp!: (v: PlaybackPlan) => void;

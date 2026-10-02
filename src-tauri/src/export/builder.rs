@@ -632,7 +632,7 @@ fn media_for<'a>(media: &'a [MediaRef], id: &str) -> Option<&'a MediaRef> {
 
 /// A clip contributes audio iff its media has audio AND it isn't muted,
 /// detached, or on a muted track.
-fn clip_audible(clip: &Clip, media: &MediaRef, track: &Track) -> bool {
+pub(crate) fn clip_audible(clip: &Clip, media: &MediaRef, track: &Track) -> bool {
     media.has_audio && !clip.audio.muted && !clip.audio.detached && !track.muted
 }
 
