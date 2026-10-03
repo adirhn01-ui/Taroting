@@ -985,6 +985,13 @@ mod page {
                 }
             }
             if let Some(webview) = sender {
+                // The page that set the window's title (the viewer's file name,
+                // a project's name) died without its teardown, and the reloaded
+                // page starts on Home, which never sets one: put the app's own
+                // name back so the title bar does not name a file no longer open.
+                if let Some(win) = self.app.get_webview_window("main") {
+                    let _ = win.set_title(&self.app.package_info().name);
+                }
                 // SAFETY: COM call on the UI thread that raised the event.
                 if let Err(e) = unsafe { webview.Reload() } {
                     eprintln!("Taroting: page reload failed ({e})");
