@@ -12,6 +12,7 @@ import {
   ghostResize,
   invApply,
   SCALE_MAX,
+  SCALE_MIN,
   snapToCenter,
   windowHandleDrag,
 } from "./canvas-math";
@@ -404,5 +405,87 @@ describe("display rect matches computeTransform", () => {
       expect(dr.cx).toBeCloseTo(PROJ_W / 2 + pose.x, 6);
       expect(dr.cy).toBeCloseTo(PROJ_H / 2 + pose.y, 6);
     });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Op 1 at the limits — the fixed edge never moves                      */
+/* ------------------------------------------------------------------ */
+
+/* Every case above drags a modest 24x18 on a mid crop, where nothing clamps —
+ * which is exactly where the over-drag bug could not show. These fling each
+ * handle far OUT past the frame and far ACROSS its opposite edge, on all 16
+ * axes, from croppedPose(): margins left 200 / top 150 / right 520 / bottom 230,
+ * four different numbers, so an edge that moves in the wrong axis or the wrong
+ * direction cannot land on a value the test expects.
+ *
+ * The rule under test, in source space: the edge(s) the handle drives stop at
+ * the frame (outward) or CROP_MIN short of their fixed partner (across); every
+ * other edge is untouched. Which source edges a SCREEN handle drives depends on
+ * the axis, so it is read through invApply — itself pinned against hand-computed
+ * matrices in "axisMatrix" above, not derived from the function under test. */
+describe("op1 windowHandleDrag — over-drag leaves the opposite edge fixed (16-axis matrix)", () => {
+  const handles: WindowHandle[] = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
+  const DX: Record<WindowHandle, number> = { nw: -1, n: 0, ne: 1, e: 1, se: 1, s: 0, sw: -1, w: -1 };
+  const DY: Record<WindowHandle, number> = { nw: -1, n: -1, ne: -1, e: 0, se: 1, s: 1, sw: 1, w: 0 };
+  // Far past anything: 5000 project px is several frames wide at any k here.
+  const FAR = 5000;
+  const start = croppedPose();
+  const L0 = start.crop.x;
+  const T0 = start.crop.y;
+  const R0 = start.crop.x + start.crop.w;
+  const B0 = start.crop.y + start.crop.h;
+  // The fixture's whole point is four different margins; keep it honest.
+  expect(new Set([L0, T0, SRC_W - R0, SRC_H - B0]).size).toBe(4);
+
+  for (const axis of allAxes()) {
+    for (const handle of handles) {
+      for (const way of ["out", "across"] as const) {
+        const tag = `${way}: rotate=${axis.rotate} fh=${axis.flipH} fv=${axis.flipV} h=${handle}`;
+        it(tag, () => {
+          const k = kOf(start, axis);
+          const sign = way === "out" ? 1 : -1;
+          const delta = { x: DX[handle] * FAR * sign, y: DY[handle] * FAR * sign };
+          const next = windowHandleDrag(start, SRC_W, SRC_H, PROJ_W, PROJ_H, axis, delta, handle, k);
+          const L = next.crop.x;
+          const T = next.crop.y;
+          const R = next.crop.x + next.crop.w;
+          const B = next.crop.y + next.crop.h;
+
+          const srcDir = invApply(axis, { x: DX[handle], y: DY[handle] });
+          // Expected edges, by which source edge this handle drives.
+          let eL = L0, eR = R0, eT = T0, eB = B0;
+          if (srcDir.x < -0.5) eL = way === "out" ? 0 : R0 - CROP_MIN;
+          else if (srcDir.x > 0.5) eR = way === "out" ? SRC_W : L0 + CROP_MIN;
+          if (srcDir.y < -0.5) eT = way === "out" ? 0 : B0 - CROP_MIN;
+          else if (srcDir.y > 0.5) eB = way === "out" ? SRC_H : T0 + CROP_MIN;
+
+          expect(L, `left ${tag}`).toBeCloseTo(eL, 6);
+          expect(R, `right ${tag}`).toBeCloseTo(eR, 6);
+          expect(T, `top ${tag}`).toBeCloseTo(eT, 6);
+          expect(B, `bottom ${tag}`).toBeCloseTo(eB, 6);
+
+          // Ghost pinned — wherever canvas-math's scale clamp leaves it able to
+          // be. scale' = k / fit(crop') keeps the ghost's size; when that falls
+          // outside [SCALE_MIN, SCALE_MAX] the clamp wins and the ghost cannot
+          // stay put (a corner dragged across collapses BOTH extents to
+          // CROP_MIN, so fit is enormous). That limit is separate from the
+          // over-drag rule, so it is gated rather than hidden — and the gate
+          // is pinned to exactly the corner-across rows, so it cannot quietly
+          // excuse any other.
+          const wanted = k / fit(next.crop.w, next.crop.h, axis.rotate, PROJ_W, PROJ_H);
+          const clampFires = wanted < SCALE_MIN || wanted > SCALE_MAX;
+          const cornerAcross = DX[handle] !== 0 && DY[handle] !== 0 && way === "across";
+          expect(clampFires, `scale clamp ${tag}`).toBe(cornerAcross);
+          if (clampFires) return;
+          const before = ghostScreenRect(start, axis);
+          const after = ghostScreenRect(next, axis);
+          expect(after.cx, `ghost cx ${tag}`).toBeCloseTo(before.cx, 4);
+          expect(after.cy, `ghost cy ${tag}`).toBeCloseTo(before.cy, 4);
+          expect(after.w, `ghost w ${tag}`).toBeCloseTo(before.w, 4);
+          expect(after.h, `ghost h ${tag}`).toBeCloseTo(before.h, 4);
+        });
+      }
+    }
   }
 });

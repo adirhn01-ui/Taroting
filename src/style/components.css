@@ -405,17 +405,22 @@
   cursor: pointer;
   white-space: nowrap;
 }
-.ctx-menu__item:hover,
+.ctx-menu__item:not(:disabled):hover,
 .ctx-menu__item--active {
   background: var(--bg-hover);
 }
 .ctx-menu__item--danger {
   color: var(--danger);
 }
+/* A disabled row stays hit-testable on purpose: its `title` is the only place
+ * the menu says WHY it can't be chosen ("Finish the crop first."), and
+ * `pointer-events: none` suppressed the native tooltip along with the hover.
+ * Nothing else changes — a disabled <button> fires no click, menu.ts binds no
+ * pointerenter on it, and the hover rule above skips it, so it never lights
+ * up. */
 .ctx-menu__item:disabled {
   opacity: 0.45;
   cursor: default;
-  pointer-events: none;
 }
 /* A row with an icon and a hint (menu.ts renderRich): an accent-tinted glyph
    tile, then the label over one muted line. Plain rows never get these. Home's

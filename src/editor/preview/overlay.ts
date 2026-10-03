@@ -45,6 +45,14 @@ export interface OverlayCtx {
   session: ProjectSession;
   selection: Store<string | null>;
   refresh(): void;
+  /** The URL the stage actually PLAYS for a video — the proxy or remux when
+   *  the media manager made one, the original file when it plays as-is — or
+   *  null while no playback plan is ready. The crop ghost decodes from this,
+   *  exactly as the scheduler's urlFor does, because the original of a proxied
+   *  source (ProRes, 10-bit, HEVC without the extension, AVI/xvid, GIF) is the
+   *  very file the WebView cannot decode: a ghost built from it stayed blank.
+   *  Absent or null falls back to the original file. */
+  playbackUrl?(media: MediaRef): string | null;
   /** Called once each time a move, scale or crop drag stops being live
    *  (`CanvasOverlay.gestureActive` turns false) — committed by its pointerup,
    *  or reverted by Escape, a cancelled pointer, `cancelGesture` or dispose.
@@ -97,6 +105,21 @@ const MOVE_THRESHOLD_PX = 4;
  *  gesture still works because our listeners live on the overlay element. */
 function capture(el: HTMLElement, pointerId: number): void {
   try { el.setPointerCapture(pointerId); } catch { /* synthetic pointer */ }
+}
+
+/** Whether a pointer event reports the primary button (bit 0 of `buttons`)
+ *  held. */
+function primaryHeld(e: PointerEvent): boolean {
+  return (e.buttons & 1) !== 0;
+}
+
+/** True when a move proves the drag's button is already up. Judged only for a
+ *  gesture whose pointerdown reported the button held: a real pointer always
+ *  does, while a synthesized one (the in-app E2E builds its events with
+ *  `button` but no `buttons`) reports 0 throughout and cannot be judged at
+ *  all — so it must not read as released on its first move. */
+function primaryReleased(heldAtDown: boolean, e: PointerEvent): boolean {
+  return heldAtDown && !primaryHeld(e);
 }
 
 /** Resolved pose of a clip at a timeline time, honoring keyframes. Everything in
@@ -476,6 +499,9 @@ export function mountCanvasOverlay(ctx: OverlayCtx): CanvasOverlay {
     /** The pointer that owns the gesture. Kept so an end that is NOT a pointerup
      *  (Escape, dispose) can still release the capture the pointerdown took. */
     pointerId: number;
+    /** Whether the pointerdown reported the primary button held (see
+     *  primaryReleased). */
+    heldAtDown: boolean;
     // scale
     downDist?: number;
     centerProj?: { x: number; y: number };
@@ -506,6 +532,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): CanvasOverlay {
         startPose: pose,
         keySrcTime: sourceTime(sel.clip, engine.time - sel.clip.timelineStart),
         pointerId: e.pointerId,
+        heldAtDown: primaryHeld(e),
         downDist: Math.hypot(p.x - center.x, p.y - center.y),
         centerProj: center,
       };
@@ -533,6 +560,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): CanvasOverlay {
       startPose: pose,
       keySrcTime: sourceTime(found.clip, engine.time - found.clip.timelineStart),
       pointerId: e.pointerId,
+      heldAtDown: primaryHeld(e),
     };
     capture(overlay, e.pointerId);
     // do NOT preventDefault: dblclick needs the native pointer sequence
@@ -541,6 +569,11 @@ export function mountCanvasOverlay(ctx: OverlayCtx): CanvasOverlay {
   function onPointerMove(e: PointerEvent): void {
     if (mode === "crop") return onCropPointerMove(e);
     if (!gesture) return;
+    // The button came up somewhere this overlay never heard about — the
+    // pointerup went to a surface that took the canvas away (theater), or was
+    // swallowed by the OS. A move with nothing held is not a drag: revert, as
+    // a lost pointer always is, instead of editing on with no button down.
+    if (primaryReleased(gesture.heldAtDown, e)) { cancelGesture(); return; }
     // Dead-zone: stay a pure selection until the pointer leaves the threshold.
     // Distance is measured in CLIENT px from the down point; deltas applied below
     // still reference startProj, so arming does not move the gesture's origin.
@@ -825,9 +858,13 @@ export function mountCanvasOverlay(ctx: OverlayCtx): CanvasOverlay {
       el = img;
     } else {
       // video: one transient extra decoder, seeked to the current source time.
-      // Uses the original file URL (a paused ghost frame doesn't need the proxy).
+      // It decodes what the stage plays (see OverlayCtx.playbackUrl), never
+      // simply the original: for a proxied source the original is the file the
+      // WebView cannot decode at all, and for a forced 4K proxy it would open a
+      // full-resolution decoder just to show one paused frame. Only while no
+      // plan is ready does it fall back to the original file.
       const v = document.createElement("video");
-      v.src = mediaUrl(media.path);
+      v.src = ctx.playbackUrl?.(media) ?? mediaUrl(media.path);
       v.muted = true;
       v.playsInline = true;
       v.preload = "auto";
@@ -877,6 +914,9 @@ export function mountCanvasOverlay(ctx: OverlayCtx): CanvasOverlay {
     /** The pointer that owns the gesture. Kept so an exit that is NOT a
      *  pointerup (Escape) can still release the capture the pointerdown took. */
     pointerId: number;
+    /** Whether the pointerdown reported the primary button held (see
+     *  primaryReleased). */
+    heldAtDown: boolean;
   }
   let cropGesture: CropGesture | null = null;
 
@@ -963,6 +1003,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): CanvasOverlay {
         startScaleKfs: cc.startScaleKfs, startEffScale: cc.startEffScale,
         keySrcTime: cc.keySrcTime,
         pointerId: e.pointerId,
+        heldAtDown: primaryHeld(e),
       };
       capture(overlay, e.pointerId);
       e.preventDefault();
@@ -1000,6 +1041,7 @@ export function mountCanvasOverlay(ctx: OverlayCtx): CanvasOverlay {
         startScaleKfs: cc.startScaleKfs, startEffScale: cc.startEffScale,
         keySrcTime: cc.keySrcTime,
         pointerId: e.pointerId,
+        heldAtDown: primaryHeld(e),
       };
       capture(overlay, e.pointerId);
       e.preventDefault();
@@ -1020,6 +1062,8 @@ export function mountCanvasOverlay(ctx: OverlayCtx): CanvasOverlay {
   function onCropPointerMove(e: PointerEvent): void {
     if (!cropGesture) return;
     const g = cropGesture;
+    // As in onPointerMove: a released button means the drag already ended.
+    if (primaryReleased(g.heldAtDown, e)) { cancelCropGesture(); return; }
     const s = S();
     const screenDelta = {
       x: (e.clientX - g.startClient.x) / s,
@@ -1127,14 +1171,24 @@ export function mountCanvasOverlay(ctx: OverlayCtx): CanvasOverlay {
   // interruption happened to leave it. Same ruling as the timeline's
   // cancelGesture; the user re-does the drag they lost, they do not discover a
   // half-drag committed behind an alt-tab.
-  // A cancelled pointer is the OS withdrawing the gesture, not the user
-  // finishing it — routing it to the commit path landed the clip wherever the
-  // interruption happened to leave it. Same ruling as the timeline's
-  // cancelGesture; the user re-does the drag they lost, they do not discover a
-  // half-drag committed behind an alt-tab.
+  // Losing the capture mid-drag is the same withdrawal: the pointer's later
+  // events, its release included, now go elsewhere, so the gesture could only
+  // ever end by the released-button check on some stray move. Revert now.
+  // Every end path drops its gesture BEFORE releasing the capture, so the
+  // lostpointercapture that release (and the implicit one after a pointerup)
+  // fires finds nothing left to cancel.
   overlay.addEventListener("pointercancel", () => {
     if (mode === "crop") cancelCropGesture();
     else cancelGesture();
+  });
+  overlay.addEventListener("lostpointercapture", (e: PointerEvent) => {
+    // Only the pointer that owns the drag: a capture some other pointer held
+    // ending says nothing about this gesture.
+    if (mode === "crop") {
+      if (cropGesture?.pointerId === e.pointerId) cancelCropGesture();
+    } else if (gesture?.pointerId === e.pointerId) {
+      cancelGesture();
+    }
   });
   overlay.addEventListener("dblclick", onDblClick);
   overlay.addEventListener("keydown", onKeyDown);

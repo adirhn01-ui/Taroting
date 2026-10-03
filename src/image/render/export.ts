@@ -6,7 +6,8 @@
 // It draws with the compositor's own primitives (render/composite.ts), one
 // layer at a time: decode that layer's photo at the density the output needs,
 // adjust it, draw it, close it — so the peak is the output + ONE source + one
-// layer scratch, never every photo at once.
+// layer scratch, never every photo at once. A drawing layer's scratch covers
+// only the box its strokes reach (see `openDrawingLayer`), not the output.
 
 import type { ImageExportFormat, ImageExportPreset, MediaRef, ProjectFile } from "../../core/types";
 import { RENDER_MAX_AREA, RENDER_MAX_SIDE, WEBP_MAX_SIDE } from "../../core/types";
@@ -256,8 +257,11 @@ async function render(
   const H = doc.timeline.height;
   const view: ScaledView = { zoom: outW / W, zoomY: outH / H, panX: 0, panY: 0 };
   const canvas = new OffscreenCanvas(outW, outH);
-  /** this run's own drawing-layer scratch, made on the first drawing layer */
-  let scratch: OffscreenCanvas | null = null;
+  /** this run's own drawing-layer scratch, made for the first drawing layer
+   *  with ink to paint; `openDrawingLayer` grows it to each layer's stroke box.
+   *  Typed through the initializer: it is assigned inside a callback, which
+   *  the compiler's narrowing does not follow. */
+  let scratch = null as OffscreenCanvas | null;
   /** this run's own pencil scratch (see `openDrawingLayer`), likewise */
   let ink: ReleasableScratch | null = null;
   try {
@@ -294,9 +298,8 @@ async function render(
           prepared.release();
         }
       } else if (g.type === "drawing") {
-        scratch ??= new OffscreenCanvas(outW, outH);
         ink ??= createScratch();
-        const layer = openDrawingLayer(ctx, doc, l, view, scratch, ink);
+        const layer = openDrawingLayer(ctx, doc, l, view, () => (scratch ??= new OffscreenCanvas(1, 1)), ink);
         if (layer) {
           for (let c = 0; c < layer.chunkCount; c++) {
             layer.paint(c, c + 1);
@@ -313,8 +316,8 @@ async function render(
       report(i + 1, 0);
       if (signal.aborted) throw abortError();
     }
-    // The drawing scratches can be output-sized; give them back before the
-    // encoder needs its own buffer.
+    // The drawing scratches can still be large (a drawing across the whole
+    // output); give them back before the encoder needs its own buffer.
     if (scratch) {
       scratch.width = 0;
       scratch = null;

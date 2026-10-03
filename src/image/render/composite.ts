@@ -20,7 +20,7 @@ import { normalizeHexColor } from "../../core/session";
 import type { ClipTransform, Generator, ProjectFile, Stroke } from "../../core/types";
 import { layerToCanvas } from "../geom";
 import { layersOf, opacityOf, type Layer } from "../layers";
-import { createScratch, paintStroke, type ReleasableScratch, type Scratch } from "../ink/paint";
+import { createScratch, paintStroke, strokeBounds, type ReleasableScratch, type Scratch } from "../ink/paint";
 import { fillChecker } from "./checker";
 import type { Ctx2D, LiveInk, RenderOpts, RenderResources, Underlay, ViewXf } from "./index";
 
@@ -266,6 +266,16 @@ export function chunksOf(l: Layer): readonly Stroke[][] {
   return g?.type === "drawing" && Array.isArray(g.chunks) ? g.chunks : [];
 }
 
+/** Does any chunk hold a stroke? A handful of length reads, never a walk of
+ *  the strokes themselves. */
+function hasStrokes(chunks: readonly Stroke[][]): boolean {
+  for (let c = 0; c < chunks.length; c++) {
+    const chunk = chunks[c];
+    if (Array.isArray(chunk) && chunk.length > 0) return true;
+  }
+  return false;
+}
+
 /** Composite the layer scratch's w×h into ctx at `alpha`. */
 function compositeScratch(ctx: Ctx2D, scratch: OffscreenCanvasRenderingContext2D, w: number, h: number, alpha: number): void {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -358,7 +368,12 @@ function drawDrawingLayer(
   live: LiveInk | null,
   hidden: boolean,
 ): void {
+  // Asked first, even for an empty layer: that is how the raster of a layer
+  // erased clean is given back (it answers null for one with no strokes).
   const raster = hidden ? null : res.drawingRaster(l, view);
+  // Nothing to draw and no mark in progress on it: no scratch to clear and
+  // composite (a full-target pass per frame per empty layer otherwise).
+  if (!raster && !live && !hasStrokes(chunksOf(l))) return;
   const tw = ctx.canvas.width;
   const th = ctx.canvas.height;
   if (raster && !live) {
@@ -395,43 +410,123 @@ function drawDrawingLayer(
   compositeScratch(ctx, scratch, tw, th, alpha);
 }
 
+/** The integer target-pixel box everything a drawing layer can paint lands
+ *  in under V · L: the union of its strokes' bounds (layer px, half-widths
+ *  included), mapped through the matrix, one pixel of antialiasing margin
+ *  added, cut to the W×H target. Erase strokes only take pixels away inside
+ *  what the ink already covers, so they never widen it. Null when nothing of
+ *  the layer reaches the target. Corners are mapped inline with the exact
+ *  matrix `applyLayerTransform` sets, so the box and the painting agree. */
+function drawingDeviceBox(
+  chunks: readonly Stroke[][],
+  view: ViewXf,
+  m: Affine,
+  W: number,
+  H: number,
+): { x: number; y: number; w: number; h: number } | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let c = 0; c < chunks.length; c++) {
+    const chunk = chunks[c];
+    if (!Array.isArray(chunk)) continue;
+    for (let i = 0; i < chunk.length; i++) {
+      const s = chunk[i]!;
+      if (s.t === "erase") continue;
+      const b = strokeBounds(s);
+      if (!(b.w > 0) && !(b.h > 0)) continue; // nothing decodable: paints nothing
+      if (b.x < minX) minX = b.x;
+      if (b.y < minY) minY = b.y;
+      if (b.x + b.w > maxX) maxX = b.x + b.w;
+      if (b.y + b.h > maxY) maxY = b.y + b.h;
+    }
+  }
+  if (!(maxX >= minX) || !(maxY >= minY)) return null;
+  const zx = view.zoom;
+  const zy = zoomYOf(view);
+  const a = zx * m[0];
+  const b = zy * m[1];
+  const cc = zx * m[2];
+  const d = zy * m[3];
+  const e = zx * m[4] + view.panX;
+  const f = zy * m[5] + view.panY;
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  for (let k = 0; k < 4; k++) {
+    const u = k & 1 ? maxX : minX;
+    const v = k & 2 ? maxY : minY;
+    const x = a * u + cc * v + e;
+    const y = b * u + d * v + f;
+    if (x < x0) x0 = x;
+    if (x > x1) x1 = x;
+    if (y < y0) y0 = y;
+    if (y > y1) y1 = y;
+  }
+  const bx = Math.max(0, Math.floor(x0) - 1);
+  const by = Math.max(0, Math.floor(y0) - 1);
+  const ex = Math.min(W, Math.ceil(x1) + 1);
+  const ey = Math.min(H, Math.ceil(y1) + 1);
+  // NaN (a degenerate matrix) fails these too.
+  if (!(ex > bx) || !(ey > by)) return null;
+  return { x: bx, y: by, w: ex - bx, h: ey - by };
+}
+
 /** The exporter's drawing path: the same stroke painting and single
  *  group-opacity composite as `drawLayer`, opened so the strokes can be
  *  painted one chunk at a time with a yield between chunks. `own` is the
- *  export run's OWN output-sized scratch — never the preview's, which a stage
- *  render during one of those yields (the user still drawing while Copy image
- *  renders, a resize behind the export dialog) would clear under it.
- *  `inkScratch` is the run's own pencil scratch too: the painter clips it to
- *  the target, which in export is the whole output, so a pencil stroke across
- *  a 48 MP canvas grows it to ~192 MB — the run must be able to give that back
- *  when it ends, which the preview's shared one never does. Null
- *  when the layer draws nothing (opacity 0) or no scratch could be made. */
+ *  export run's OWN scratch — never the preview's, which a stage render during
+ *  one of those yields (the user still drawing while Copy image renders, a
+ *  resize behind the export dialog) would clear under it. It is asked for
+ *  only once the layer turns out to have something to paint.
+ *
+ *  The scratch covers only the box the layer's strokes can reach
+ *  (`drawingDeviceBox`), not the whole output: a small doodle on an
+ *  8000 × 6000 export needs a doodle-sized scratch, not another 192 MB. It is
+ *  painted with V · L shifted by the box's (whole-pixel) corner, so every
+ *  stroke lands on the same pixel grid it would on an output-sized scratch,
+ *  and composited back at that corner. `own` only ever grows (one run, many
+ *  drawing layers); only the box is cleared and composited, so whatever an
+ *  earlier, larger layer left outside it is never read. `inkScratch` is the
+ *  run's own pencil scratch too: the painter clips it to the target — here the
+ *  layer's scratch, so it is bounded by the same box — and the run gives it
+ *  back when it ends, which the preview's shared one never does. Null when the
+ *  layer draws nothing (opacity 0, no ink, or all of it off the output) or no
+ *  scratch could be made. */
 export function openDrawingLayer(
   ctx: Ctx2D,
   doc: ProjectFile,
   l: Layer,
   view: ViewXf,
-  own: OffscreenCanvas,
+  own: () => OffscreenCanvas,
   inkScratch: Scratch,
 ): { chunkCount: number; paint(fromChunk: number, toChunk: number): void; close(): void } | null {
   const alpha = opacityOf(l);
   if (alpha <= 0) return null;
-  const tw = ctx.canvas.width;
-  const th = ctx.canvas.height;
-  if (own.width < tw) own.width = tw;
-  if (own.height < th) own.height = th;
-  const scratch = clearedScratch(own, tw, th);
-  if (!scratch) return null;
   const m = matrixOf(doc, l, layerBox(l));
   const chunks = chunksOf(l);
+  const box = drawingDeviceBox(chunks, view, m, ctx.canvas.width, ctx.canvas.height);
+  if (!box) return null;
+  const { x, y, w, h } = box;
+  const canvas = own();
+  if (canvas.width < w) canvas.width = w;
+  if (canvas.height < h) canvas.height = h;
+  const scratch = clearedScratch(canvas, w, h);
+  if (!scratch) return null;
+  const shifted: ViewXf = { ...view, panX: view.panX - x, panY: view.panY - y };
   return {
     chunkCount: chunks.length,
     paint(fromChunk, toChunk) {
-      applyLayerTransform(scratch, view, m);
+      applyLayerTransform(scratch, shifted, m);
       paintDrawingStrokes(scratch, chunks, fromChunk, toChunk, inkScratch);
     },
     close() {
-      compositeScratch(ctx, scratch, tw, th, alpha);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = alpha;
+      ctx.drawImage(scratch.canvas, 0, 0, w, h, x, y, w, h);
+      ctx.globalAlpha = 1;
     },
   };
 }

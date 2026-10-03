@@ -893,8 +893,12 @@ export function attachInteractions(tl: TimelineController): () => void {
       const factor = Math.pow(1.0015, -e.deltaY);
       tl.zoomAt(x, factor);
     } else {
-      const px = e.shiftKey ? e.deltaY * 3 : e.deltaY;
-      tl.panBy(px);
+      // WebView2 delivers Shift+wheel as a HORIZONTAL wheel (deltaX, deltaY 0),
+      // and a trackpad's sideways swipe is horizontal too. Reading deltaY alone
+      // made both do nothing; a vertical notch still wins when both are set.
+      const d = e.deltaY !== 0 ? e.deltaY : e.deltaX;
+      if (!d) return;
+      tl.panBy(e.shiftKey ? d * 3 : d);
     }
   };
 

@@ -516,6 +516,32 @@ pub fn write_synthetic_note(kind: &str, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// The display engine could not be created at startup: the window has no
+/// page, and main.rs is about to say so in a native box and end the process.
+/// An "engine" note whose `restarted:` line says no, so the next launch's page
+/// reads it as "the display engine stopped, so Taroting closed"
+/// (`ENGINE_NOT_RESTARTED` in src/core/crash-notes.ts) — the true account —
+/// and its detail carries the one thing known about the cause: whether a
+/// WebView2 runtime was found, and which version.
+pub fn write_startup_failure_note(runtime: &str) {
+    if let Some(dir) = note_dir() {
+        write_note(&dir, &startup_failure_note_text(UtcTime::now(), runtime));
+    }
+}
+
+fn startup_failure_note_text(at: Option<UtcTime>, runtime: &str) -> String {
+    note_text(
+        "engine",
+        at,
+        &[
+            ("process", "engine"),
+            ("reason", "could not be created at startup"),
+            ("runtime", truncate_chars(runtime, MAX_MESSAGE_CHARS)),
+            ("restarted", "no (the display engine could not start)"),
+        ],
+    )
+}
+
 /// The previous run's note (once) and this run's page reloads.
 #[tauri::command]
 pub async fn take_crash_notes(notes: tauri::State<'_, Notes>) -> Result<Vec<CrashNote>> {
@@ -1033,6 +1059,28 @@ mod tests {
     #[test]
     fn a_synthetic_note_refuses_an_unknown_kind() {
         assert!(matches!(write_synthetic_note("page", "x"), Err(AppError::BadInput(_))));
+    }
+
+    /// The startup-failure note must come back as an ENGINE note whose
+    /// `restarted:` line starts a line with "no" — the frontend picks its
+    /// "so Taroting closed" title with `/^restarted: no\b/m`, and anything
+    /// else would tell the user the app restarted when it did not. The
+    /// runtime line carries the one diagnostic there is.
+    #[test]
+    fn a_startup_failure_note_reads_as_an_engine_that_did_not_restart() {
+        let dir = scratch("startup");
+        write_note(&dir, &startup_failure_note_text(Some(AT), "not found (WebView2 error)"));
+        let note = take_file_note(&dir).expect("the note");
+        assert_eq!(note.kind, "engine");
+        assert_eq!(note.at.as_deref(), Some("2026-09-30T21:04:17Z"));
+        assert!(
+            note.detail.lines().any(|l| l.starts_with("restarted: no ")),
+            "no `restarted: no` line in {:?}",
+            note.detail
+        );
+        assert!(note.detail.contains("\nruntime: not found (WebView2 error)\n"), "{}", note.detail);
+        assert!(note.detail.contains("\nreason: could not be created at startup\n"), "{}", note.detail);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /* ---- recovery decisions ---- */

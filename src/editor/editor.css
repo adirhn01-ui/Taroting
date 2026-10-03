@@ -310,13 +310,14 @@ html[data-rescue-chrome] #ed-settings:focus-visible {
  * shown by timeline.ts ONLY while the lanes actually overflow — a project whose
  * lanes all fit never renders any of this chrome.
  *
- * Above .tl-drop-guide (z 5) so it stays grabbable during an external drag. */
+ * Above .tl-drop-guide (--z-tl-drop-guide) so it stays grabbable during an
+ * external drag — see the z-index scale in tokens.css. */
 .tl-vscroll {
   position: absolute;
   right: 0;
   bottom: 0;
   width: 11px;
-  z-index: 6;
+  z-index: var(--z-tl-vscroll);
   display: none;
   touch-action: none;
   background: transparent;
@@ -567,7 +568,7 @@ html[data-rescue-chrome] #ed-settings:focus-visible {
 .tl-drop-guide {
   position: absolute;
   inset: 0;
-  z-index: 5;
+  z-index: var(--z-tl-drop-guide); /* see z-index scale in tokens.css */
   pointer-events: none;
   display: none;
 }

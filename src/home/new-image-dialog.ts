@@ -209,7 +209,7 @@ export function openNewImageDialog(opts: {
       </div>
       <div class="modal__footer">
         <button class="btn nimg-from-photo" data-act="photo" title="Start from a photo on your disk">${icon("image", 14)}From a photo</button>
-        <button class="btn" data-act="cancel">Cancel</button>
+        <button class="btn" data-act="cancel" id="nimg-cancel">Cancel</button>
         <button class="btn btn--primary" data-act="create">Create</button>
       </div>
     </div>`;
@@ -226,6 +226,7 @@ export function openNewImageDialog(opts: {
   const colourSwatch = $<HTMLElement>(".nimg-swatch--colour");
   const createBtn = $<HTMLButtonElement>('[data-act="create"]');
   const photoBtn = $<HTMLButtonElement>('[data-act="photo"]');
+  const cancelBtn = $<HTMLButtonElement>("#nimg-cancel");
   sizeSel.value = sizeChoice;
 
   let closed = false;
@@ -419,10 +420,21 @@ export function openNewImageDialog(opts: {
   /* -------- create -------- */
 
   /** Runs one creation at a time, with both actions disabled while it does:
-   *  a double click on Create must never make two projects. */
+   *  a double click on Create must never make two projects.
+   *
+   *  Focus moves to the footer Cancel BEFORE paint() disables the actions:
+   *  disabling the focused button drops focus to <body>, and the Tab trap only
+   *  hears keys from inside the dialog, so after a cancelled photo pick (the
+   *  usual way here), a refusal or a failed save Tab walked Home behind the
+   *  backdrop. Cancel is never disabled. Once the task settles with the dialog
+   *  still up, focus goes back to where it was (the button pressed, or the
+   *  size field Enter was typed in) if it is still parked on Cancel or was
+   *  lost; one the user moved on purpose stays where they put it. */
   async function run(task: () => Promise<void>): Promise<void> {
     if (busy || closed) return;
     busy = true;
+    const before = document.activeElement;
+    cancelBtn.focus();
     paint();
     try {
       await task();
@@ -430,7 +442,15 @@ export function openNewImageDialog(opts: {
       if (!gone()) toast.error(describeError(e));
     } finally {
       busy = false;
-      if (!closed) paint();
+      if (!closed) {
+        paint();
+        const now = document.activeElement;
+        if (now === cancelBtn || now === null || !backdrop.contains(now)) {
+          const back = before !== null && backdrop.contains(before) ? (before as HTMLElement) : null;
+          if (back && !(back as HTMLButtonElement).disabled) back.focus();
+          else focusFirst(backdrop, '[data-act="create"]');
+        }
+      }
     }
   }
 
@@ -446,6 +466,9 @@ export function openNewImageDialog(opts: {
   }
 
   function create(): Promise<void> {
+    // Nothing valid to create (Enter in a half-typed size field): nothing to
+    // run, and focus stays in the field being typed in.
+    if (!resolveCanvasSize(sizeChoice, wIn.value, hIn.value)) return Promise.resolve();
     return run(async () => {
       const dims = resolveCanvasSize(sizeChoice, wIn.value, hIn.value);
       if (!dims) return;
@@ -475,7 +498,7 @@ export function openNewImageDialog(opts: {
       // The picker's filter can be typed around; the family is applied here
       // too, as it is on every other way in, before anything reads the file.
       if (mediaFamilyOf(fileExt(photo)) !== "image") {
-        toast.error("Pick a still image.");
+        toast.refuse("Pick a still image.");
         return;
       }
       let info: MediaInfo;
@@ -488,7 +511,7 @@ export function openNewImageDialog(opts: {
       if (gone()) return;
       const problem = photoProblem(info);
       if (problem) {
-        toast.error(problem);
+        toast.refuse(problem);
         return;
       }
       const projectPath = await ipc.newProjectPath(stem);

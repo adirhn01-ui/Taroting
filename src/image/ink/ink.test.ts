@@ -43,7 +43,10 @@ vi.mock("../geom", () => ({
  *  does for a layer that is not a drawing. */
 const appendRefuses = vi.hoisted(() => ({ on: false }));
 
-vi.mock("../layers", () => {
+vi.mock("../layers", async (importOriginal) => {
+  // The opacity rule is the REAL one: it is the layer model's, and the eraser
+  // must read the same number the renderer does.
+  const { opacityOf } = await importOriginal<typeof import("../layers")>();
   type P = ProjectFile;
   const layersOf = (p: P) =>
     p.timeline.tracks
@@ -69,6 +72,7 @@ vi.mock("../layers", () => {
   return {
     layersOf,
     findLayer,
+    opacityOf,
     drawingTarget: (p: P, sel: string | null) => {
       const ls = layersOf(p);
       const at = sel === null ? -1 : ls.findIndex((l) => l.trackId === sel);
@@ -882,6 +886,38 @@ describe("stroke eraser", () => {
   });
 });
 
+describe("stroke eraser on a 0% layer", () => {
+  // The same horizontal stroke as above, on the same rotated layer — only its
+  // opacity differs between the cases, so each case fails for one reason.
+  async function at(opacity: number) {
+    const { encodePoints } = await import("../strokes");
+    const s = { t: "pen", c: "#112233", w: 4, o: 1, p: encodePoints(new Float32Array([20, 50, 1, 180, 50, 1])) } as Stroke;
+    const h = harness(project({ drawing: { transform: { ...ROTATED, opacity }, strokes: [s] } }), "eraser");
+    const mid = ref.toCanvas(ROTATED, 200, 100, W, H, 100, 50);
+    draw(h, [
+      [mid.x - 30, mid.y],
+      [mid.x + 30, mid.y],
+    ]);
+    return { h, s };
+  }
+
+  it("cannot take strokes nobody can see: nothing removed, no preview, no undo step", async () => {
+    const { h, s } = await at(0);
+    expect(drawingStrokes(h.store.get(), "t-draw")).toEqual([s]);
+    expect(h.events.replaces).toBe(0);
+    expect(h.history).toHaveLength(0);
+    expect(h.isEdited()).toBe(false);
+    h.handle.dispose();
+  });
+
+  it("control: the faintest visible opacity still erases", async () => {
+    const { h } = await at(0.05);
+    expect(drawingStrokes(h.store.get(), "t-draw")).toEqual([]);
+    expect(h.history).toHaveLength(1);
+    h.handle.dispose();
+  });
+});
+
 describe("pixel eraser", () => {
   it("previews through the live mark on its layer, then commits ONE erase stroke", () => {
     const h = harness(project({ drawing: { transform: ROTATED, strokes: [] } }), "eraser");
@@ -993,6 +1029,46 @@ describe("the surface", () => {
     // no delta at all is not the ruler's
     expect(wheel({}).prevented).toBe(false);
     h.handle.dispose();
+  });
+
+  it("a move reads the stage first and writes the brush circle once, last — on every way out", async () => {
+    for (const tool of ["pen", "eraser", "shape"] as const) {
+      const h = harness(project({ drawing: { transform: ROTATED, strokes: [] } }), tool);
+      const surf = h.surface()!;
+      const cur = surf.children.find((c) => c.className === "imged-ink__cursor")!;
+      const order: string[] = [];
+      const read = h.ctx.view.clientToCanvas;
+      h.ctx.view.clientToCanvas = (x: number, y: number) => {
+        order.push("read");
+        return read(x, y);
+      };
+      const style = cur.style;
+      Object.defineProperty(style, "transform", {
+        configurable: true,
+        get: () => "",
+        set: () => void order.push("write"),
+      });
+      const mouse = { pointerType: "mouse" };
+      surf.fire("pointerdown", ptr("pointerdown", 40, 40, mouse));
+      for (const [x, y] of [
+        [70, 90],
+        [100, 40],
+      ] as const) {
+        order.length = 0;
+        surf.fire("pointermove", ptr("pointermove", x, y, mouse));
+        expect(order[order.length - 1], tool).toBe("write");
+        expect(order.indexOf("write"), tool).toBe(order.length - 1);
+        expect(order.length, tool).toBeGreaterThan(1);
+      }
+      // A pan taking the pointer over cancels the mark: the circle still
+      // follows the pointer, after the cancel.
+      h.ctx.view.panning = true;
+      order.length = 0;
+      surf.fire("pointermove", ptr("pointermove", 130, 90, mouse));
+      expect(order, tool).toEqual(["write"]);
+      expect(h.history, tool).toHaveLength(0);
+      h.handle.dispose();
+    }
   });
 
   it("the brush circle resizes on [ / ] while the pointer rests, around the same centre", async () => {

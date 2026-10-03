@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { JobEventHandlers, JobFailed, PlaybackPlan, WaveformResult } from "../../core/ipc";
+import type { JobDone, JobEventHandlers, JobFailed, PlaybackPlan, WaveformResult } from "../../core/ipc";
 import { ipc } from "../../core/ipc";
 import { createProject } from "../../core/project";
 import type { MediaRef, ProjectFile } from "../../core/types";
-import { MediaManager } from "./media";
+import { MediaManager, ORPHAN_KEEP } from "./media";
 
 /**
  * WHAT THIS FILE IS ABOUT: which preparation jobs a MediaManager cancels, and
@@ -252,5 +252,242 @@ describe("MediaManager when another consumer cancels a joined job", () => {
     // dead 51.
     m.dispose();
     expect(cancel.mock.calls.map((c) => c[0])).toEqual([53]);
+  });
+});
+
+/**
+ * A job's terminal event can reach the manager BEFORE the answer that names
+ * the job: Tauri events and invoke answers travel separate channels, so a short
+ * remux, or a job the plan joined as it finished, reports first. Dropped, the
+ * media sat on "Preparing" (or without a waveform) for the whole session.
+ *
+ * Fixtures: the done event's output path differs from the path the plan
+ * answer predicted, so "ready" can only have come from the replayed event;
+ * playback and waveform job ids never coincide; each test fires its event
+ * strictly before resolving the answer.
+ */
+describe("MediaManager when a job's end arrives before the plan names it", () => {
+  function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
+    let resolve!: (v: T) => void;
+    const promise = new Promise<T>((res) => {
+      resolve = res;
+    });
+    return { promise, resolve };
+  }
+
+  function done(id: number, path: string): JobDone {
+    return { id, kind: "remux", output: { path } };
+  }
+
+  async function started(plan: Promise<PlaybackPlan>, ...extra: Promise<PlaybackPlan>[]) {
+    vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
+    vi.spyOn(ipc, "enforceCacheLimit").mockResolvedValue(0);
+    const spy = vi.spyOn(ipc, "planPlayback").mockReturnValueOnce(plan);
+    for (const p of extra) spy.mockReturnValueOnce(p);
+    const p = projectOf(media("a", false));
+    const m = new MediaManager(() => p);
+    await m.init();
+    m.ensureAll(p);
+    await settle();
+    return { m, plan: spy };
+  }
+
+  it("reaches ready from a done that beat the pending answer", async () => {
+    const answer = deferred<PlaybackPlan>();
+    const { m } = await started(answer.promise);
+    handlers.onDone!(done(41, "C:\\cache\\remux\\a-final.mp4"));
+    answer.resolve({ mode: "pending", jobId: 41, output: "C:\\cache\\remux\\a-predicted.mp4" });
+    await settle();
+    expect(m.status.get()["a"]).toEqual({
+      state: "ready",
+      url: "C:\\cache\\remux\\a-final.mp4",
+      sourcePath: "C:\\cache\\remux\\a-final.mp4",
+    });
+    m.dispose();
+  });
+
+  it("reaches failed from a failure that beat the pending answer", async () => {
+    const answer = deferred<PlaybackPlan>();
+    const { m, plan } = await started(answer.promise);
+    handlers.onFailed!(failed(41, false));
+    answer.resolve({ mode: "pending", jobId: 41, output: "C:\\cache\\remux\\a.mp4" });
+    await settle();
+    expect(m.status.get()["a"]).toEqual({ state: "failed", message: "moov atom not found" });
+    expect(plan).toHaveBeenCalledTimes(1);
+    m.dispose();
+  });
+
+  it("re-plans after a foreign cancel that beat the pending answer", async () => {
+    const answer = deferred<PlaybackPlan>();
+    const fresh = Promise.resolve<PlaybackPlan>({ mode: "ready", path: "C:\\cache\\remux\\a-again.mp4" });
+    const { m, plan } = await started(answer.promise, fresh);
+    handlers.onFailed!(failed(41, true));
+    answer.resolve({ mode: "pending", jobId: 41, output: "C:\\cache\\remux\\a.mp4" });
+    await settle();
+    expect(plan).toHaveBeenCalledTimes(2);
+    expect(m.status.get()["a"]).toEqual({
+      state: "ready",
+      url: "C:\\cache\\remux\\a-again.mp4",
+      sourcePath: "C:\\cache\\remux\\a-again.mp4",
+    });
+    m.dispose();
+  });
+
+  it("does not take another job's early end for its own", async () => {
+    const answer = deferred<PlaybackPlan>();
+    const { m } = await started(answer.promise);
+    handlers.onDone!(done(77, "C:\\cache\\remux\\someone-else.mp4"));
+    answer.resolve({ mode: "pending", jobId: 41, output: "C:\\cache\\remux\\a.mp4" });
+    await settle();
+    expect(m.status.get()["a"]).toEqual({ state: "preparing", ratio: null, jobId: 41 });
+    m.dispose();
+  });
+
+  it("keeps only a bounded number of early events", async () => {
+    // ORPHAN_KEEP unrelated ends after ours push it out: the ring must not
+    // grow without limit on a long session's foreign traffic.
+    const answer = deferred<PlaybackPlan>();
+    const { m } = await started(answer.promise);
+    handlers.onDone!(done(41, "C:\\cache\\remux\\a-final.mp4"));
+    for (let id = 100; id < 100 + ORPHAN_KEEP; id++) {
+      handlers.onDone!(done(id, `C:\\cache\\remux\\other-${id}.mp4`));
+    }
+    answer.resolve({ mode: "pending", jobId: 41, output: "C:\\cache\\remux\\a.mp4" });
+    await settle();
+    expect(m.status.get()["a"]).toEqual({ state: "preparing", ratio: null, jobId: 41 });
+    m.dispose();
+  });
+
+  it("loads the waveform from a done that beat the waveform answer", async () => {
+    // A real TPK1 body: 2 pairs at 50 pairs/s.
+    const pk = new Uint8Array([0x54, 0x50, 0x4b, 0x31, 50, 0, 0, 0, 2, 0, 0, 0, 0xf6, 0x08, 0xfd, 0x03]);
+    const fetched: string[] = [];
+    vi.stubGlobal("fetch", (url: string) => {
+      fetched.push(url);
+      return Promise.resolve(new Response(pk));
+    });
+    vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
+    vi.spyOn(ipc, "enforceCacheLimit").mockResolvedValue(0);
+    vi.spyOn(ipc, "planPlayback").mockResolvedValue({ mode: "direct", path: "D:\\a.mov" });
+    const answer = deferred<WaveformResult>();
+    vi.spyOn(ipc, "ensureWaveform").mockReturnValue(answer.promise);
+    const p = projectOf(media("a"));
+    const m = new MediaManager(() => p);
+    await m.init();
+    m.ensureAll(p);
+    await settle();
+
+    handlers.onDone!({ id: 52, kind: "waveform", output: { path: "C:\\cache\\peaks\\a-final.pk" } });
+    answer.resolve({ state: "pending", jobId: 52, output: "C:\\cache\\peaks\\a-predicted.pk" });
+    await settle();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(fetched).toEqual(["C:\\cache\\peaks\\a-final.pk"]);
+    const wf = m.waveforms.get()["a"];
+    expect(wf?.pairsPerSec).toBe(50);
+    expect(Array.from(wf!.mins)).toEqual([-10, -3]);
+    expect(Array.from(wf!.maxs)).toEqual([8, 3]);
+    m.dispose();
+  });
+
+  it("replays one early end to BOTH entries that share the job", async () => {
+    // The same file imported twice: two ids, one identity, so the backend
+    // hands both plans the same job. Its end lands before either answer, and
+    // the answers land one after the other. Taking the event out of the ring
+    // on the first claim left the second entry on "Preparing".
+    const first: MediaRef = { ...media("a", false), path: "D:\\shared\\clip.mov", size: 900, mtimeMs: 7 };
+    const second: MediaRef = { ...first, id: "b" };
+    const answerA = deferred<PlaybackPlan>();
+    const answerB = deferred<PlaybackPlan>();
+    vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
+    vi.spyOn(ipc, "enforceCacheLimit").mockResolvedValue(0);
+    vi.spyOn(ipc, "planPlayback").mockReturnValueOnce(answerA.promise).mockReturnValueOnce(answerB.promise);
+    const p = projectOf(first, second);
+    const m = new MediaManager(() => p);
+    await m.init();
+    m.ensureAll(p);
+    await settle();
+
+    handlers.onDone!(done(41, "C:\\cache\\remux\\clip-final.mp4"));
+    answerA.resolve({ mode: "pending", jobId: 41, output: "C:\\cache\\remux\\clip.mp4" });
+    await settle();
+    answerB.resolve({ mode: "pending", jobId: 41, output: "C:\\cache\\remux\\clip.mp4" });
+    await settle();
+
+    const ready = { state: "ready", url: "C:\\cache\\remux\\clip-final.mp4", sourcePath: "C:\\cache\\remux\\clip-final.mp4" };
+    expect(m.status.get()["a"]).toEqual(ready);
+    expect(m.status.get()["b"]).toEqual(ready);
+    m.dispose();
+  });
+
+  it("gives a shared job's end to the second entry when it lands between the answers", async () => {
+    // The same file imported twice again, but this time the first answer is
+    // already registered when the end arrives, so the end MATCHES a waiter.
+    // Keeping only unmatched ends resolved the first entry and forgot the
+    // event, and the second answer then waited on "Preparing" for good.
+    const first: MediaRef = { ...media("a", false), path: "D:\\shared\\take.mov", size: 1200, mtimeMs: 9 };
+    const second: MediaRef = { ...first, id: "b" };
+    const answerA = deferred<PlaybackPlan>();
+    const answerB = deferred<PlaybackPlan>();
+    vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
+    vi.spyOn(ipc, "enforceCacheLimit").mockResolvedValue(0);
+    vi.spyOn(ipc, "planPlayback").mockReturnValueOnce(answerA.promise).mockReturnValueOnce(answerB.promise);
+    const p = projectOf(first, second);
+    const m = new MediaManager(() => p);
+    await m.init();
+    m.ensureAll(p);
+    await settle();
+
+    answerA.resolve({ mode: "pending", jobId: 41, output: "C:\\cache\\remux\\take.mp4" });
+    await settle();
+    expect(m.status.get()["a"]).toEqual({ state: "preparing", ratio: null, jobId: 41 });
+    handlers.onDone!(done(41, "C:\\cache\\remux\\take-final.mp4"));
+    answerB.resolve({ mode: "pending", jobId: 41, output: "C:\\cache\\remux\\take.mp4" });
+    await settle();
+
+    const ready = { state: "ready", url: "C:\\cache\\remux\\take-final.mp4", sourcePath: "C:\\cache\\remux\\take-final.mp4" };
+    expect(m.status.get()["a"]).toEqual(ready);
+    expect(m.status.get()["b"]).toEqual(ready);
+    m.dispose();
+  });
+
+  it("spends one ring slot per job, however many answers claim it", async () => {
+    // c's end arrives first, then a's; a's answer claims 41; then exactly
+    // enough unrelated ends to fill the ring to ORPHAN_KEEP. If the claim put
+    // 41 in a second time, the ring would overflow by one and evict c's end.
+    const a = media("a", false);
+    const c: MediaRef = { ...media("c", false), path: "E:\\other\\c.mkv", size: 77, mtimeMs: 13 };
+    const answerA = deferred<PlaybackPlan>();
+    const answerC = deferred<PlaybackPlan>();
+    vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
+    vi.spyOn(ipc, "enforceCacheLimit").mockResolvedValue(0);
+    vi.spyOn(ipc, "planPlayback").mockReturnValueOnce(answerA.promise).mockReturnValueOnce(answerC.promise);
+    const p = projectOf(a, c);
+    const m = new MediaManager(() => p);
+    await m.init();
+    m.ensureAll(p);
+    await settle();
+
+    handlers.onDone!(done(60, "C:\\cache\\remux\\c-final.mp4"));
+    handlers.onDone!(done(41, "C:\\cache\\remux\\a-final.mp4"));
+    answerA.resolve({ mode: "pending", jobId: 41, output: "C:\\cache\\remux\\a.mp4" });
+    await settle();
+    for (let id = 200; id < 200 + ORPHAN_KEEP - 2; id++) {
+      handlers.onDone!(done(id, `C:\\cache\\remux\\other-${id}.mp4`));
+    }
+    answerC.resolve({ mode: "pending", jobId: 60, output: "C:\\cache\\remux\\c.mp4" });
+    await settle();
+
+    expect(m.status.get()["a"]).toEqual({
+      state: "ready",
+      url: "C:\\cache\\remux\\a-final.mp4",
+      sourcePath: "C:\\cache\\remux\\a-final.mp4",
+    });
+    expect(m.status.get()["c"]).toEqual({
+      state: "ready",
+      url: "C:\\cache\\remux\\c-final.mp4",
+      sourcePath: "C:\\cache\\remux\\c-final.mp4",
+    });
+    m.dispose();
   });
 });

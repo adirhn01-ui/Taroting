@@ -3,6 +3,7 @@ import {
   MAX_REPORT_CHARS,
   buildReport,
   createRedactor,
+  redactEntryText,
   redactProjectShape,
   sweepUsernames,
   type ReportContext,
@@ -627,5 +628,196 @@ describe("buildReport", () => {
   it("is pure — the same context always builds the same text", () => {
     const ctx = baseCtx({ operation: "Export", project: makeProject(), settings: makeSettings() });
     expect(buildReport(ctx)).toBe(buildReport(ctx));
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Paths the redactor finds on its own, and paths an entry names.      */
+/*                                                                      */
+/* Fixture names are chosen so the part BEFORE every space differs     */
+/* from the part after it ("Client" / "Work", "Secret" / "Project",    */
+/* "harbour" / "night", "John" / "Smith"): a match cut at a space      */
+/* leaves a fragment no assertion can mistake for the other half.      */
+/* ------------------------------------------------------------------ */
+
+const SPACED_CLIP = "D:\\Client Work\\Secret Project\\harbour night.mov";
+
+describe("free-text paths the redactor was never told about", () => {
+  it("consumes spaced FOLDERS whole — a separator after them proves where they end", () => {
+    const r = createRedactor();
+    expect(r.text("could not read D:\\Client Work\\Secret Project\\clip.mp4 (locked)")).toBe(
+      "could not read <file 1.mp4> (locked)",
+    );
+  });
+
+  it("still cuts a spaced FILE name it never knew at the space (the residual paths close)", () => {
+    const r = createRedactor();
+    // Nothing marks where a spaced file name ends inside a sentence. Pinned
+    // whole, so a change in either direction is a deliberate one.
+    expect(r.text(`could not read ${SPACED_CLIP} (locked)`)).toBe("could not read <file 1> night.mov (locked)");
+  });
+
+  it("tokenises a UNC path", () => {
+    const r = createRedactor();
+    expect(r.text("cannot open \\\\nas-01\\footage\\Client Work\\reel.mp4: access denied")).toBe(
+      "cannot open <file 1.mp4>: access denied",
+    );
+  });
+
+  it("tokenises the \\\\?\\ long-path form through its drive", () => {
+    const r = createRedactor();
+    expect(r.text("missing \\\\?\\C:\\Client Work\\reel.mp4 now")).toBe("missing \\\\?\\<file 1.mp4> now");
+  });
+
+  it("removes a spaced account name inside a path, surname included", () => {
+    const r = createRedactor();
+    const out = r.text("open C:\\Users\\John Smith\\Videos\\harbour.mp4 failed");
+    expect(out).toBe("open <file 1.mp4> failed");
+  });
+
+  it("removes a spaced account name that is the LAST segment of a path", () => {
+    const r = createRedactor();
+    const out = r.text("profile C:\\Users\\John Smith is read-only");
+    expect(out).not.toContain("John");
+    expect(out).not.toContain("Smith");
+    // The sweep cannot tell where a spaced account name ends either, so the
+    // rest of the line goes with it: over-redaction, the safe direction.
+    expect(out).toBe("profile <file 1>");
+  });
+
+  it("does not let a folder run swallow the rest of an ffmpeg line past a colon", () => {
+    const r = createRedactor();
+    const line = "Input #0, mov, from 'C:\\x\\a.mp4': Stream #0:0 h264 (avc1 / 0x31637661)";
+    expect(r.text(line)).toBe("Input #0, mov, from '<file 1.mp4>': Stream #0:0 h264 (avc1 / 0x31637661)");
+  });
+
+  it("stays linear on long separator-free and prefix-dense lines", () => {
+    const r = createRedactor();
+    const t0 = Date.now();
+    expect(r.text(`C:\\${"a".repeat(10_000)} tail`)).toBe("<file 1> tail");
+    const dense = r.text(`${"C:\\x ".repeat(3_000)}end`);
+    expect(dense.endsWith("end")).toBe(true);
+    expect(Date.now() - t0).toBeLessThan(1_000);
+  });
+
+  it("gives a path found in free text and the same path registered whole one token", () => {
+    // The free-text pass sees paths AFTER the profile sweep; the token must
+    // not depend on which of the two shapes reached the redactor first.
+    const r = createRedactor();
+    expect(r.text("read C:\\Users\\adirh\\clips\\boat.mp4")).toBe("read <file 1.mp4>");
+    expect(r.path("C:\\Users\\adirh\\clips\\boat.mp4")).toBe("<file 1.mp4>");
+  });
+});
+
+describe("redactEntryText", () => {
+  it("replaces a known spaced path whole, and the bare stem the message carries", () => {
+    const r = createRedactor([SPACED_CLIP]);
+    expect(
+      redactEntryText(r, `Couldn't import harbour night: cannot read ${SPACED_CLIP}`, [SPACED_CLIP]),
+    ).toBe("Couldn't import <file 1.mov>: cannot read <file 1.mov>");
+  });
+
+  it("replaces whole words only — a stem never bites into a longer word", () => {
+    const exportPath = "D:\\Renders\\export.mp4";
+    const r = createRedactor([exportPath]);
+    expect(redactEntryText(r, "Couldn't import export: it was exported before", [exportPath])).toBe(
+      "Couldn't import <file 1.mp4>: it was exported before",
+    );
+  });
+
+  it("never rewrites a token, even when a stem is a word a token contains", () => {
+    const named = "C:\\x\\file.mp4";
+    const r = createRedactor([named]);
+    expect(redactEntryText(r, "Couldn't read file: C:\\y\\other.mov", [named])).toBe(
+      "Couldn't read <file 1.mp4>: <file 2.mov>",
+    );
+    // Nor a placeholder the backend's own scrubber wrote into export text.
+    const temp = "C:\\x\\temp.mp4";
+    const r2 = createRedactor([temp]);
+    expect(redactEntryText(r2, "temp missing under <temp>\\taroting-text-0.txt", [temp])).toBe(
+      "<file 1.mp4> missing under <temp>\\taroting-text-0.txt",
+    );
+  });
+
+  it("replaces an entry's spaced path whole even when the redactor was not seeded with it", () => {
+    const r = createRedactor();
+    expect(redactEntryText(r, `cannot read ${SPACED_CLIP} (locked)`, [SPACED_CLIP])).toBe(
+      "cannot read <file 1.mov> (locked)",
+    );
+  });
+
+  it("leaves a one- or two-character stem alone but still replaces the file name", () => {
+    const short = "C:\\x\\ab.mp4";
+    const r = createRedactor([short]);
+    expect(redactEntryText(r, "ab.mp4 failed, ab retried", [short])).toBe("<file 1.mp4> failed, ab retried");
+  });
+
+  it("is exactly r.text when the entry names no paths", () => {
+    const line = `could not read ${VIDEO_PATH}`;
+    expect(redactEntryText(createRedactor(), line, undefined)).toBe(createRedactor().text(line));
+  });
+});
+
+describe("buildReport and the paths recent errors name", () => {
+  const at = Date.parse("2026-07-28T08:59:00.000Z");
+
+  it("with no project open, keeps every part of a spaced path out of the report", () => {
+    const text = buildReport(
+      baseCtx({
+        recentErrors: [
+          { at, op: "Import", message: `Couldn't import harbour night: cannot read ${SPACED_CLIP}`, paths: [SPACED_CLIP] },
+        ],
+      }),
+    );
+    for (const part of ["Client", "Work", "Secret", "Project", "harbour", "night"]) {
+      expect(text).not.toContain(part);
+    }
+    expect(text).toContain("Couldn't import <file 1.mov>: cannot read <file 1.mov>");
+  });
+
+  // Pins the seeding from `recent`, which only shows ACROSS entries: entry 1
+  // names the clip in prose and lists no paths, only entry 2 lists it. Without
+  // the seed the redactor first meets the clip in entry 1's free text and stops
+  // at the space: "<file 1> night.mov".
+  it("seeds from every listed error's paths, so an earlier entry naming one in prose goes whole", () => {
+    const text = buildReport(
+      baseCtx({
+        recentErrors: [
+          { at, op: "Import", message: `failed on ${SPACED_CLIP} today` },
+          { at, op: "Import", message: "again", paths: [SPACED_CLIP] },
+        ],
+      }),
+    );
+    for (const part of ["Client", "Work", "Secret", "Project", "harbour", "night"]) {
+      expect(text).not.toContain(part);
+    }
+    expect(text).toContain("failed on <file 1.mov> today");
+  });
+
+  it("numbers the project media first and the errors' paths after them", () => {
+    const text = buildReport(
+      baseCtx({
+        project: makeProject(),
+        recentErrors: [{ at, op: "Import", message: `cannot read ${SPACED_CLIP}`, paths: [SPACED_CLIP] }],
+      }),
+    );
+    expect(text).toContain("<file 1.mp4>  video");
+    expect(text).not.toContain("<file 1.mov>");
+    expect(text).toMatch(/cannot read <file \d+\.mov>/);
+    expect(text).not.toContain("Client");
+  });
+
+  it("keeps a stem that is an ordinary word in every OTHER entry", () => {
+    const exportPath = "D:\\Renders\\export.mp4";
+    const text = buildReport(
+      baseCtx({
+        recentErrors: [
+          { at, op: "Import", message: "Couldn't import export: denied", paths: [exportPath] },
+          { at, op: "Export", message: "export failed: encoder busy" },
+        ],
+      }),
+    );
+    expect(text).toContain("Couldn't import <file 1.mp4>: denied");
+    expect(text).toContain("export failed: encoder busy");
   });
 });

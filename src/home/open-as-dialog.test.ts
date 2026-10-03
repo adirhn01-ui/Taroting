@@ -9,6 +9,7 @@ const m = vi.hoisted(() => ({
   probe: new Map<string, MediaInfo | Error>(),
   saved: [] as Array<{ path: string; project: ProjectFile }>,
   errors: [] as string[],
+  refusals: [] as string[],
   releases: 0,
 }));
 vi.mock("../core/ipc", () => ({
@@ -23,7 +24,13 @@ vi.mock("../core/ipc", () => ({
   },
   describeError: (e: unknown) => (e instanceof Error ? e.message : String(e)),
 }));
-vi.mock("../ui/toast", () => ({ toast: { error: (s: string) => void m.errors.push(s), info: () => {} } }));
+vi.mock("../ui/toast", () => ({
+  toast: {
+    error: (s: string) => void m.errors.push(s),
+    info: () => {},
+    refuse: (s: string) => void m.refusals.push(s),
+  },
+}));
 vi.mock("../ui/focus", () => ({ trapTab: () => () => void m.releases++ }));
 vi.mock("../ui/icons", () => ({ icon: (n: string) => `<svg data-i="${n}"></svg>` }));
 vi.mock("../core/open-media", () => ({
@@ -170,6 +177,7 @@ beforeEach(() => {
   m.probe.clear();
   m.saved = [];
   m.errors = [];
+  m.refusals = [];
   m.releases = 0;
 });
 
@@ -402,7 +410,10 @@ describe("createImageProjectFrom", () => {
     m.probe.set("C:\\p\\ok.jpg", still("C:\\p\\ok.jpg", 30, 20));
     const out = await createImageProjectFrom(["C:\\p\\bad.png", "C:\\p\\anim.webp", "C:\\p\\ok.jpg"], () => false);
     expect(out).toBe("C:\\Docs\\Taroting\\ok.trt");
-    expect(m.errors).toEqual(["Couldn't open bad: corrupt", "anim is not a still picture, so it was left out."]);
+    // A failed probe is a failure (recorded in Diagnostics); a file that is not
+    // a still is a refusal (never recorded).
+    expect(m.errors).toEqual(["Couldn't open bad: corrupt"]);
+    expect(m.refusals).toEqual(["anim is not a still picture, so it was left out."]);
     const p = m.saved[0]!.project;
     expect([p.timeline.width, p.timeline.height]).toEqual([30, 20]);
     expect(p.media.map((x) => x.path)).toEqual(["C:\\p\\ok.jpg"]);
@@ -412,7 +423,10 @@ describe("createImageProjectFrom", () => {
     m.probe.set("C:\\p\\a.png", still("C:\\p\\a.png", 0, 0));
     expect(await createImageProjectFrom(["C:\\p\\a.png", "C:\\p\\missing.png"], () => false)).toBeNull();
     expect(m.saved).toEqual([]);
-    expect(m.errors.at(-1)).toBe("None of the pictures could be opened, so no project was made.");
+    // The size refusal and the summary are refusals; only the missing file's
+    // probe failure is recorded, once.
+    expect(m.errors).toEqual(["Couldn't open missing: no such file"]);
+    expect(m.refusals).toEqual(["Couldn't read the size of x.", "None of the pictures could be opened, so no project was made."]);
   });
 
   it("makes nothing, silently, for a Home that has gone away", async () => {
@@ -420,6 +434,7 @@ describe("createImageProjectFrom", () => {
     expect(await createImageProjectFrom(["C:\\p\\a.png"], () => true)).toBeNull();
     expect(m.saved).toEqual([]);
     expect(m.errors).toEqual([]);
+    expect(m.refusals).toEqual([]);
   });
 });
 

@@ -196,6 +196,21 @@ export class PlaybackEngine {
   }
 
   setPreviewSpeed(speed: number): void {
+    // While playing, `t` is the last tick's snapshot, 10-16 ms old. Anchoring
+    // and re-activating at it hard-seeked the master element backwards (the
+    // same stale-time seek refresh() guards against, see catchUpTime): a
+    // dropped frame and an audio glitch on every speed change. Catch the
+    // playhead up first — to the master's own position when it is only
+    // elapsed time ahead, or to the wall clock when no video is the clock.
+    // Both are read BEFORE the speed changes: virtualNow() extrapolates at the
+    // speed the transport has actually been running at.
+    if (this.playing_) {
+      const vnow = this.virtualNow();
+      const master = this.scheduler.masterClockTime();
+      const adopt = catchUpTime(master, this.t, vnow, this.boundary);
+      if (adopt !== null) this.t = adopt;
+      else if (master === null && vnow < this.boundary - BOUNDARY_EPS) this.t = vnow;
+    }
     this.previewSpeed_ = speed;
     this.scheduler.previewSpeed = speed;
     // re-anchor so the virtual clock doesn't jump
@@ -291,7 +306,12 @@ export class PlaybackEngine {
       }
 
       this.scheduler.animate(this.t);
-      this.scheduler.preload(this.t);
+      // Slaved video layers are held to the clock every playing tick, not only
+      // when activate() runs (see Scheduler.syncSlaves).
+      this.scheduler.syncSlaves(this.t);
+      // While looping, the last clip also preloads the first one, so the
+      // restart plays from a warm element instead of a cold load.
+      this.scheduler.preload(this.t, this.loop ? dur : null);
       this.emit();
       this.raf = requestAnimationFrame(tick);
     };

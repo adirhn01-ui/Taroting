@@ -5,14 +5,17 @@
 //! A small index tracks last-use for LRU eviction against the user's cap.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
+use std::fs::DirEntry;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::paths;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,10 +105,23 @@ const ALL_KINDS: [CacheKind; 5] = [
 ];
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    unix_ms(Some(SystemTime::now()))
+}
+
+fn unix_ms(t: Option<SystemTime>) -> u64 {
+    t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// A half-written file rather than a cache entry: a derive job's
+/// `<hash><suffix>.<id>.tmp` (`playability::job_tmp_suffix`) or a project
+/// card's `<card>.jpg.part` (`image_save`). Both are renamed over their final
+/// name when the write completes, so one that is still here either belongs to
+/// a writer that is running right now or was orphaned by a run that died.
+fn is_partial_name(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.ends_with(".tmp") || name.ends_with(".part")
 }
 
 /* ------------------------------------------------------------------ */
@@ -153,30 +169,70 @@ fn read_index(root: &Path) -> Index {
         .unwrap_or_default()
 }
 
+/// One top-level entry of a kind directory, as a trim's listing saw it. Its
+/// type, size and mtime come from the directory read itself (on Windows
+/// `FindNextFileW` hands them over with the name), so listing a cache of
+/// thousands of thumbnails costs no extra stat per file.
+struct Listed {
+    path: PathBuf,
+    rel: String,
+    is_dir: bool,
+    is_partial: bool,
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+/// What became of one eviction candidate.
+enum Evicted {
+    /// Deleted by this trim.
+    Removed,
+    /// Already gone (another hand removed it): it no longer counts against the
+    /// cap, but this trim freed nothing.
+    Gone,
+    /// Left in place: used or rewritten since the listing, or not removable.
+    Kept,
+}
+
 pub struct Cache {
     root: PathBuf,
     index: Mutex<Index>,
+    /// Held for the whole of a trim (`enforce_limit`, and so `clear`). Two
+    /// trims planned from the same listing over-evict: both see the cache over
+    /// its cap, one removes the oldest entry, the other's removal of that same
+    /// entry finds nothing, and it goes on to remove the next one as well. The
+    /// commands run off the UI thread, which is what lets a Clear cache meet a
+    /// job-burst trim at all; the second one waits — never skips — and plans
+    /// from what the first left. Lock order is this, THEN `index`; never the
+    /// reverse.
+    trim: Mutex<()>,
+    /// When this process's cache came up. A partial file older than this was
+    /// left behind by an earlier run; one at or after it belongs to a writer of
+    /// THIS run, because its creation, and so its mtime, cannot predate the
+    /// process.
+    started: SystemTime,
 }
 
 impl Cache {
     pub fn new() -> Result<Self> {
         let root = paths::cache_dir()?;
         std::fs::create_dir_all(&root)?;
+        Ok(Self::with_root(root))
+    }
+
+    fn with_root(root: PathBuf) -> Self {
         let index = read_index(&root);
-        Ok(Cache {
+        Cache {
             root,
             index: Mutex::new(index),
-        })
+            trim: Mutex::new(()),
+            started: SystemTime::now(),
+        }
     }
 
     #[cfg(test)]
     pub fn new_at(root: PathBuf) -> Self {
         std::fs::create_dir_all(&root).unwrap();
-        let index = read_index(&root);
-        Cache {
-            root,
-            index: Mutex::new(index),
-        }
+        Self::with_root(root)
     }
 
     pub fn root(&self) -> &Path {
@@ -236,26 +292,41 @@ impl Cache {
     /// serialize + blocking write held under the mutex.
     pub fn mark_used(&self, path: &Path) {
         let rel = self.rel(path);
-        let now = now_ms();
         let mut index = self.index.lock().unwrap();
+        self.stamp(&mut index, rel);
+    }
+
+    /// `mark_used`'s body, for a caller already holding the index lock.
+    fn stamp(&self, index: &mut Index, rel: String) {
+        let now = now_ms();
         index.entries.insert(rel, now);
         index.dirty = true;
         // `last_flush_ms` starts at 0, so the first touch of a run persists
         // immediately and the rest of that burst rides along with it.
         if now.saturating_sub(index.last_flush_ms) >= FLUSH_INTERVAL_MS {
-            self.save_index(&mut index);
+            self.save_index(index);
         }
     }
 
     /// An existing, ready file for this key (refreshes LRU when found).
+    ///
+    /// The existence check and the stamp happen under ONE hold of the index
+    /// lock, and a trim deletes a file only under that same lock after checking
+    /// its stamp is the one it planned with (`evict`). So once this answers
+    /// with a path — `plan_playback`'s Ready, a cached thumbnail — no trim
+    /// running beside it can delete that file: either the trim removed it
+    /// first and this answers None, or this stamped it first and the trim
+    /// leaves it. Checked and stamped separately, a trim could fall between
+    /// the two and hand back a path to a file it had just deleted.
     pub fn existing_file(&self, kind: CacheKind, hash: &str, suffix: &str) -> Option<PathBuf> {
         let p = self.file_path(kind, hash, suffix);
-        if p.is_file() {
-            self.mark_used(&p);
-            Some(p)
-        } else {
-            None
+        let rel = self.rel(&p);
+        let mut index = self.index.lock().unwrap();
+        if !p.is_file() {
+            return None;
         }
+        self.stamp(&mut index, rel);
+        Some(p)
     }
 
     pub fn ensure_kind_dir(&self, kind: CacheKind) -> Result<PathBuf> {
@@ -265,14 +336,6 @@ impl Cache {
     }
 
     /* -------------------------- size + eviction ------------------- */
-
-    fn entry_size(path: &Path) -> u64 {
-        if path.is_dir() {
-            walk_size(path)
-        } else {
-            path.metadata().map(|m| m.len()).unwrap_or(0)
-        }
-    }
 
     pub fn stats(&self) -> CacheStats {
         let mut total = 0u64;
@@ -289,84 +352,225 @@ impl Cache {
         }
     }
 
-    /// Delete least-recently-used entries until total size ≤ cap.
-    /// Entries whose file name starts with a hash in `keep` are protected.
-    pub fn enforce_limit(&self, cap_bytes: u64, keep: &HashSet<String>) -> u64 {
-        let mut entries: Vec<(PathBuf, u64, u64)> = Vec::new(); // path, lastUsed, size
-        {
-            let index = self.index.lock().unwrap();
-            for kind in ALL_KINDS {
-                let dir = self.root.join(kind.dir_name());
-                let Ok(read) = std::fs::read_dir(&dir) else {
-                    continue;
+    /// Every top-level entry of every kind directory, sized. Takes no lock: a
+    /// directory walk is the slow part of a trim (seconds for a large cache on
+    /// a spinning disk), and holding the index across it would stall every
+    /// cache hit — every thumbnail, waveform and playback plan — behind it.
+    fn list_entries(&self) -> Vec<Listed> {
+        let mut out = Vec::new();
+        for kind in ALL_KINDS {
+            let Ok(read) = std::fs::read_dir(self.root.join(kind.dir_name())) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+                let meta = entry.metadata().ok();
+                let size = if is_dir {
+                    walk_size(&path)
+                } else {
+                    meta.as_ref().map_or(0, |m| m.len())
                 };
-                for entry in read.flatten() {
-                    let path = entry.path();
-                    let rel = self.rel(&path);
-                    let last = index.entries.get(&rel).copied().unwrap_or_else(|| {
-                        path.metadata()
-                            .and_then(|m| m.modified())
-                            .ok()
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0)
-                    });
-                    entries.push((path, last, 0));
-                }
+                out.push(Listed {
+                    rel: self.rel(&path),
+                    is_dir,
+                    is_partial: !is_dir && is_partial_name(&entry.file_name()),
+                    size,
+                    modified: meta.and_then(|m| m.modified().ok()),
+                    path,
+                });
             }
         }
-        for e in &mut entries {
-            e.2 = Self::entry_size(&e.0);
-        }
-        let mut total: u64 = entries.iter().map(|e| e.2).sum();
+        out
+    }
+
+    /// Delete least-recently-used entries until total size ≤ cap.
+    /// Entries whose file name starts with a hash in `keep` are protected.
+    ///
+    /// Runs off the UI thread (see the commands below), so cache hits and job
+    /// completions carry on while it walks. It therefore plans from a SNAPSHOT
+    /// of the last-use stamps and re-checks each candidate under the index lock
+    /// just before deleting it (`evict`): anything used or rewritten since the
+    /// snapshot stays. A partial file written by this run is never a candidate
+    /// at all — it is a job or a card save still writing (`started`).
+    pub fn enforce_limit(&self, cap_bytes: u64, keep: &HashSet<String>) -> u64 {
+        self.enforce_limit_with(cap_bytes, keep, || {})
+    }
+
+    /// `enforce_limit` with a hook between planning and deleting, so a test can
+    /// play the part of a cache hit landing while a trim walks.
+    fn enforce_limit_with(
+        &self,
+        cap_bytes: u64,
+        keep: &HashSet<String>,
+        after_plan: impl FnOnce(),
+    ) -> u64 {
+        let _trim = self.trim.lock().unwrap_or_else(|e| e.into_inner());
+        let began = SystemTime::now();
+        let planned: HashMap<String, u64> = self.index.lock().unwrap().entries.clone();
+        let mut entries = self.list_entries();
+        let mut total: u64 = entries.iter().map(|e| e.size).sum();
         if total <= cap_bytes {
             return 0;
         }
 
-        entries.sort_by_key(|e| e.1); // oldest first
+        // Oldest first. An entry the index has never seen (left by an older
+        // build, or written by a job whose stamp has not landed yet) is dated
+        // by its mtime.
+        entries.sort_by_key(|e| {
+            planned
+                .get(&e.rel)
+                .copied()
+                .unwrap_or_else(|| unix_ms(e.modified))
+        });
+        after_plan();
+
         let mut freed = 0u64;
-        // Collect the evicted entries and write the index ONCE at the end —
-        // a per-file serialize + blocking write under the mutex is needless.
-        let mut removed: Vec<String> = Vec::new();
-        for (path, _, size) in entries {
+        let mut index_changed = false;
+        for e in &entries {
             if total <= cap_bytes {
                 break;
             }
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string());
+            let name = e.path.file_name().map(|n| n.to_string_lossy());
             let protected = name
                 .as_deref()
-                .map(|n| keep.iter().any(|h| n.starts_with(h.as_str())))
-                .unwrap_or(false);
-            if protected {
+                .is_some_and(|n| keep.iter().any(|h| n.starts_with(h.as_str())));
+            // A partial this run is writing: a waveform's `.pk.N.tmp` is a Rust
+            // file opened with delete sharing, so deleting it would succeed and
+            // fail the job at its rename. One with no readable mtime cannot be
+            // told apart from that, so it stays too.
+            let live_partial = e.is_partial && e.modified.is_none_or(|m| m >= self.started);
+            if protected || live_partial {
                 continue;
             }
-            let ok = if path.is_dir() {
-                std::fs::remove_dir_all(&path).is_ok()
-            } else {
-                std::fs::remove_file(&path).is_ok()
-            };
-            if ok {
-                total = total.saturating_sub(size);
-                freed += size;
-                removed.push(self.rel(&path));
+            match self.evict(e, planned.get(&e.rel).copied(), began) {
+                Evicted::Removed => {
+                    total = total.saturating_sub(e.size);
+                    freed += e.size;
+                    index_changed = true;
+                }
+                Evicted::Gone => {
+                    total = total.saturating_sub(e.size);
+                    index_changed = true;
+                }
+                Evicted::Kept => {}
             }
         }
-        if !removed.is_empty() {
+        if index_changed {
+            // ONE write for the whole trim. Eviction is the one moment the
+            // persisted stamps really matter, so it also lands whatever
+            // `mark_used` still had coalesced.
             let mut index = self.index.lock().unwrap();
-            for rel in &removed {
-                index.entries.remove(rel);
-            }
-            // Eviction is the one moment the persisted stamps really matter, so
-            // this write also lands whatever `mark_used` still had coalesced.
             self.save_index(&mut index);
         }
         freed
+    }
+
+    /// Delete one planned candidate unless it changed since the plan.
+    ///
+    /// The check and a FILE's deletion share one hold of the index lock, the
+    /// lock `existing_file` checks and stamps under — so the two can never
+    /// interleave (see there). The hold covers a single `remove_file`, never a
+    /// walk. A directory's removal IS a walk, so for one the lock is dropped
+    /// first; directories are only the legacy filmstrip entries, which nothing
+    /// marks used any more.
+    fn evict(&self, e: &Listed, planned_stamp: Option<u64>, began: SystemTime) -> Evicted {
+        let mut index = self.index.lock().unwrap();
+        if index.entries.get(&e.rel).copied() != planned_stamp {
+            // Used since the plan (or first used since it): fresh, not a victim.
+            return Evicted::Kept;
+        }
+        if planned_stamp.is_none() {
+            // Unindexed, so the plan dated it by mtime. One written since the
+            // trim began is live. Read fresh rather than compared with the
+            // listing's copy: NTFS keeps a directory's timestamps in its
+            // parent's index lazily, so the two can disagree for an entry
+            // nothing has touched — and a disagreement would keep it forever.
+            match std::fs::symlink_metadata(&e.path) {
+                Ok(m) if m.modified().map_or(true, |t| t >= began) => return Evicted::Kept,
+                Ok(_) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => return Evicted::Gone,
+                Err(_) => return Evicted::Kept,
+            }
+        }
+        let removed = if e.is_dir {
+            drop(index);
+            let r = std::fs::remove_dir_all(&e.path);
+            index = self.index.lock().unwrap();
+            r
+        } else {
+            std::fs::remove_file(&e.path)
+        };
+        match removed {
+            Ok(()) => {
+                index.entries.remove(&e.rel);
+                index.dirty = true;
+                Evicted::Removed
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                index.entries.remove(&e.rel);
+                index.dirty = true;
+                Evicted::Gone
+            }
+            Err(_) => Evicted::Kept,
+        }
     }
 
     /// Remove everything except entries protected by `keep` hashes.
     pub fn clear(&self, keep: &HashSet<String>) -> u64 {
         self.enforce_limit(0, keep)
     }
+
+    /// Delete partial files an earlier run left behind: a derive job or card
+    /// save that was killed with the app (or crashed it) never reached its
+    /// rename. Left alone they hold disk until LRU eviction reaches them, and
+    /// job ids restart at 1 every launch, so a new job could be handed the very
+    /// file name of a stale one. Only top-level files of the kind directories,
+    /// and only those older than this process (`started`): one written by this
+    /// run belongs to a job that may still be writing.
+    ///
+    /// Must run only in the PRIMARY instance. `Cache::new` also runs in a
+    /// second launch that is about to hand its file over and exit — and in
+    /// that process every partial of the live instance looks "older than this
+    /// process". Returns how many files went.
+    pub(crate) fn sweep_stale_partials(&self) -> usize {
+        let mut removed = 0;
+        for kind in ALL_KINDS {
+            let Ok(read) = std::fs::read_dir(self.root.join(kind.dir_name())) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                if stale_partial(&entry, self.started) && std::fs::remove_file(entry.path()).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+}
+
+/// `sweep_stale_partials` on a thread of its own, so app startup never waits
+/// on a directory listing. Safe to race with this run's first jobs: their
+/// partials are newer than `started` and the sweep leaves them alone. A thread
+/// the OS refuses only means no sweep this launch — never a panic, which with
+/// `panic = "abort"` would end the app.
+pub(crate) fn sweep_stale_partials_in_background(cache: &Arc<Cache>) {
+    let cache = Arc::clone(cache);
+    let _ = std::thread::Builder::new()
+        .name("cache-sweep".into())
+        .spawn(move || {
+            cache.sweep_stale_partials();
+        });
+}
+
+fn stale_partial(entry: &DirEntry, started: SystemTime) -> bool {
+    entry.file_type().is_ok_and(|t| t.is_file())
+        && is_partial_name(&entry.file_name())
+        && entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|m| m < started)
 }
 
 impl Drop for Cache {
@@ -382,20 +586,22 @@ impl Drop for Cache {
     }
 }
 
+/// Total bytes under `dir`. Each entry's type and size come from the directory
+/// read (`DirEntry::file_type`/`metadata`), not from a second and third stat
+/// per file by path.
 fn walk_size(dir: &Path) -> u64 {
-    let mut total = 0;
     let Ok(read) = std::fs::read_dir(dir) else {
         return 0;
     };
-    for entry in read.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            total += walk_size(&path);
-        } else {
-            total += path.metadata().map(|m| m.len()).unwrap_or(0);
-        }
-    }
-    total
+    read.flatten()
+        .map(|entry| {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                walk_size(&entry.path())
+            } else {
+                entry.metadata().map_or(0, |m| m.len())
+            }
+        })
+        .sum()
 }
 
 /* ------------------------------------------------------------------ */
@@ -409,28 +615,41 @@ pub struct CacheStats {
     pub by_kind: HashMap<String, u64>,
 }
 
-#[tauri::command]
-pub fn cache_stats(cache: tauri::State<'_, std::sync::Arc<Cache>>) -> CacheStats {
-    cache.stats()
+/// Each command walks (and two of them delete across) the whole cache: seconds
+/// for gigabytes on a spinning disk. A plain command runs on the WebView's UI
+/// thread, so none of that work runs there. The trim's own locking (`trim`,
+/// and `evict`'s re-check) is what makes running it beside cache hits safe.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| AppError::Io(std::io::Error::other(format!("the cache task stopped unexpectedly: {e}"))))
 }
 
 #[tauri::command]
-pub fn clear_cache(
-    cache: tauri::State<'_, std::sync::Arc<Cache>>,
+pub async fn cache_stats(cache: tauri::State<'_, Arc<Cache>>) -> Result<CacheStats> {
+    let cache = Arc::clone(&cache);
+    blocking(move || cache.stats()).await
+}
+
+#[tauri::command]
+pub async fn clear_cache(
+    cache: tauri::State<'_, Arc<Cache>>,
     keep_active: Vec<MediaKey>,
-) -> u64 {
+) -> Result<u64> {
+    let cache = Arc::clone(&cache);
     let keep: HashSet<String> = keep_active.iter().map(MediaKey::hash).collect();
-    cache.clear(&keep)
+    blocking(move || cache.clear(&keep)).await
 }
 
 #[tauri::command]
-pub fn enforce_cache_limit(
-    cache: tauri::State<'_, std::sync::Arc<Cache>>,
+pub async fn enforce_cache_limit(
+    cache: tauri::State<'_, Arc<Cache>>,
     cap_mb: u64,
     keep_active: Vec<MediaKey>,
-) -> u64 {
+) -> Result<u64> {
+    let cache = Arc::clone(&cache);
     let keep: HashSet<String> = keep_active.iter().map(MediaKey::hash).collect();
-    cache.enforce_limit(cap_mb.saturating_mul(1024 * 1024), &keep)
+    blocking(move || cache.enforce_limit(cap_mb.saturating_mul(1024 * 1024), &keep)).await
 }
 
 #[cfg(test)]
@@ -641,6 +860,207 @@ mod tests {
         );
 
         drop(reloaded);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn set_mtime(path: &Path, when: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    /// A trim walks off the UI thread now, so cache hits land while it runs.
+    /// Whatever is used or rewritten after it planned must survive it: here a
+    /// Clear cache (cap 0) meets a playback plan answering Ready for `a` (its
+    /// stamp moves) and a rewrite of the unindexed `d` (its mtime moves).
+    /// Planned from a snapshot alone, it would delete both.
+    #[test]
+    fn a_trim_leaves_what_was_used_or_rewritten_after_it_planned() {
+        let (root, cache, [a, b, c]) = seeded_cache("replan");
+        cache.mark_used(&a);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        cache.mark_used(&b);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        cache.mark_used(&c);
+        // Never stamped (an older build's file): dated by its mtime, oldest.
+        let d = cache.file_path(CacheKind::Proxy, "dddd", ".mp4");
+        std::fs::write(&d, vec![0u8; 1000]).unwrap();
+        set_mtime(&d, SystemTime::now() - HOUR);
+
+        let freed = cache.enforce_limit_with(0, &HashSet::new(), || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert!(
+                cache.existing_file(CacheKind::Proxy, "aaaa", ".mp4").is_some(),
+                "the index lock must be free while the trim is between plan and delete"
+            );
+            set_mtime(&d, SystemTime::now());
+        });
+
+        assert!(a.exists(), "an entry answered as ready during the trim was deleted");
+        assert!(d.exists(), "an entry rewritten during the trim was deleted");
+        assert!(!b.exists() && !c.exists(), "untouched entries must still go");
+        assert_eq!(freed, 2000);
+        let entries = cache.index.lock().unwrap().entries.clone();
+        assert!(entries.contains_key("proxy/aaaa.mp4"));
+        assert!(!entries.contains_key("proxy/bbbb.mp4") && !entries.contains_key("proxy/cccc.mp4"));
+
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An entry that vanished between the plan and its deletion (another trim,
+    /// a user emptying the folder) no longer counts against the cap. Treated
+    /// as a failed delete instead, the trim kept its total and went on to
+    /// remove one entry too many — the newest one, here.
+    #[test]
+    fn an_entry_already_gone_counts_as_freed_space_not_as_a_failure() {
+        let (root, cache, [a, b, c]) = seeded_cache("gone");
+        cache.mark_used(&a);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        cache.mark_used(&b);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        cache.mark_used(&c);
+
+        // 3000 bytes against a 1000-byte cap: a and b must go, c must stay.
+        let freed = cache.enforce_limit_with(1000, &HashSet::new(), || {
+            std::fs::remove_file(&a).unwrap();
+        });
+
+        assert!(c.exists(), "the trim over-evicted after finding its oldest entry gone");
+        assert!(!b.exists());
+        assert_eq!(freed, 1000, "only what this trim deleted counts as freed");
+        assert!(
+            !cache.index.lock().unwrap().entries.contains_key("proxy/aaaa.mp4"),
+            "a vanished entry's stamp must not linger in the index"
+        );
+
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A Clear cache that arrives while a job-burst trim is walking waits for
+    /// it and then runs whole — it is never skipped, and the two never plan
+    /// from one listing. Without the trim lock the clear returns at once.
+    #[test]
+    fn a_clear_waits_for_a_trim_in_flight_then_runs() {
+        let (root, cache, files) = seeded_cache("serial");
+        let cache = Arc::new(cache);
+        let in_flight = cache.trim.lock().unwrap();
+
+        let clearing = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || cache.clear(&HashSet::new()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(!clearing.is_finished(), "the clear ran beside a trim in flight");
+        assert!(files.iter().all(|f| f.exists()));
+
+        drop(in_flight);
+        assert_eq!(clearing.join().unwrap(), 3000, "the clear must run once the trim ends");
+        assert!(files.iter().all(|f| !f.exists()));
+
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A legacy filmstrip entry is a DIRECTORY of frames. The listing types it
+    /// from the directory read itself, sizes it whole and removes it whole.
+    /// Typed as a file, it would count as 0 bytes and never be reclaimed.
+    #[test]
+    fn a_filmstrip_directory_is_sized_and_evicted_whole() {
+        let (root, cache, [a, b, c]) = seeded_cache("filmstrip");
+        let strip = cache.ensure_kind_dir(CacheKind::Filmstrip).unwrap().join("ffff");
+        std::fs::create_dir_all(&strip).unwrap();
+        for i in 0..3 {
+            std::fs::write(strip.join(format!("{i:04}.jpg")), vec![0u8; 400]).unwrap();
+        }
+        // The frames' directory is older than every proxy's last use.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cache.mark_used(&a);
+        cache.mark_used(&b);
+        cache.mark_used(&c);
+
+        let stats = cache.stats();
+        assert_eq!(stats.by_kind["filmstrip"], 1200);
+        assert_eq!(stats.by_kind["proxy"], 3000);
+        assert_eq!(stats.total_bytes, 4200);
+
+        // 4200 against 3000: removing the strip alone is exactly enough.
+        assert_eq!(cache.enforce_limit(3000, &HashSet::new()), 1200);
+        assert!(!strip.exists(), "the strip must be removed with its frames");
+        assert!(a.exists() && b.exists() && c.exists());
+
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Partial files: one an earlier run orphaned goes at startup, one this run
+    /// is still writing is left by the sweep AND by a Clear cache. The fresh
+    /// one is a waveform's `.pk.N.tmp` — a Rust file that would really be
+    /// deletable mid-write — and a stale-dated DIRECTORY with a partial's name
+    /// is not a partial file and stays.
+    #[test]
+    fn stale_partials_are_swept_and_live_ones_are_never_evicted() {
+        let (root, cache, [a, _, _]) = seeded_cache("partials");
+        let old = cache.started - HOUR;
+
+        let stale_job = cache.file_path(CacheKind::Proxy, "aaaa", ".mp4.3.tmp");
+        std::fs::write(&stale_job, vec![0u8; 700]).unwrap();
+        set_mtime(&stale_job, old);
+        let thumbs = cache.ensure_kind_dir(CacheKind::Thumbs).unwrap();
+        let stale_card = thumbs.join("imgproj-1-2.jpg.part");
+        std::fs::write(&stale_card, vec![0u8; 300]).unwrap();
+        set_mtime(&stale_card, old);
+        // File times can lag the precise clock by a timer tick: wait past it so
+        // the live fixture really is newer than the cache.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let waveforms = cache.ensure_kind_dir(CacheKind::Waveform).unwrap();
+        let live_job = waveforms.join("bbbb.pk.3.tmp");
+        std::fs::write(&live_job, vec![0u8; 500]).unwrap();
+        let odd_dir = cache.ensure_kind_dir(CacheKind::Filmstrip).unwrap().join("eeee.tmp");
+        std::fs::create_dir_all(&odd_dir).unwrap();
+        let odd_mtime = std::fs::metadata(&odd_dir).unwrap().modified().unwrap();
+        assert!(odd_mtime >= cache.started, "fixture: the dir is newer than the cache");
+
+        assert_eq!(cache.sweep_stale_partials(), 2);
+        assert!(!stale_job.exists() && !stale_card.exists());
+        assert!(live_job.exists(), "the sweep deleted a partial this run is writing");
+        assert!(a.exists() && odd_dir.exists());
+        // Idempotent: nothing stale is left for a second pass.
+        assert_eq!(cache.sweep_stale_partials(), 0);
+
+        // A Clear cache takes every real entry and still not the live partial.
+        cache.clear(&HashSet::new());
+        assert!(!a.exists());
+        assert!(live_job.exists(), "a Clear cache deleted a partial this run is writing");
+
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A stale partial is still a candidate for an ordinary trim (dated by its
+    /// mtime), so a run whose startup sweep could not remove one still ages it
+    /// out.
+    #[test]
+    fn a_stale_partial_is_still_evicted_by_a_trim() {
+        let (root, cache, [a, b, c]) = seeded_cache("stale-trim");
+        cache.mark_used(&a);
+        cache.mark_used(&b);
+        cache.mark_used(&c);
+        let stale = cache.file_path(CacheKind::Proxy, "aaaa", ".mp4.9.tmp");
+        std::fs::write(&stale, vec![0u8; 1000]).unwrap();
+        set_mtime(&stale, cache.started - HOUR);
+
+        assert_eq!(cache.enforce_limit(3000, &HashSet::new()), 1000);
+        assert!(!stale.exists());
+        assert!(a.exists() && b.exists() && c.exists());
+
+        drop(cache);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

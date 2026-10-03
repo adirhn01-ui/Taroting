@@ -1,5 +1,6 @@
-// Framework-less context menu. One reused host div on document.body; a single
-// menu is open at a time. No editor imports — usable from anywhere.
+// Framework-less context menu. One reused host div on document.body (or on the
+// element holding fullscreen — see ensureHost); a single menu is open at a
+// time. No editor imports — usable from anywhere.
 
 import { blockShortcuts } from "../core/shortcuts";
 
@@ -25,14 +26,31 @@ let activeIndex = -1;
  *  remembers the control the user actually came from. */
 let openerFocus: HTMLElement | null = null;
 
+/**
+ * The host, attached where the menu will be SEEN: inside the element holding
+ * fullscreen when there is one, else on <body>. Element fullscreen puts that
+ * element in the top layer, above everything else whatever its z-index, so a
+ * menu on <body> opened from the fullscreen viewer was open, focused and
+ * invisible. Inside it --z-menu applies locally and still clears the chrome.
+ *
+ * Checked on EVERY open, not only the first: the host can be left inside an
+ * element that has since left fullscreen — or left the document, when the
+ * router clears the screen it lived in — and a cached host that is no longer
+ * where it should be would stay wrong forever. This file inlines the
+ * placement rule (errors.ts `overlayParent` is the same one line) rather than
+ * import the error surfaces into a menu: an open menu closes on the resize a
+ * fullscreen change causes, so it never needs carrying across one.
+ */
 function ensureHost(): HTMLDivElement {
-  if (host) return host;
-  const el = document.createElement("div");
-  el.className = "ctx-menu";
-  el.setAttribute("role", "menu");
-  document.body.appendChild(el);
-  host = el;
-  return el;
+  const target = document.fullscreenElement ?? document.body;
+  if (host && host.isConnected && host.parentNode === target) return host;
+  if (!host) {
+    host = document.createElement("div");
+    host.className = "ctx-menu";
+    host.setAttribute("role", "menu");
+  }
+  target.appendChild(host);
+  return host;
 }
 
 function isOpen(): boolean {
@@ -233,9 +251,10 @@ export function showMenu(x: number, y: number, menuItems: MenuItem[], flipAboveY
  * document-level listeners, and `items` — whose `onSelect` closures capture the
  * screen that opened them.
  *
- * This is also the teardown a screen must call from its own dispose(). The host
- * div lives on document.body, which a route change never touches: clearing the
- * app root leaves an open menu on screen, still listening, its items still
+ * This is also the teardown a screen must call from its own dispose(). Outside
+ * fullscreen the host div lives on document.body, which a route change never
+ * touches: clearing the app root leaves an open menu on screen, still
+ * listening, its items still
  * pointing at callbacks on the screen the user just left. The next pointerdown
  * anywhere dismisses it, so it is a nuisance rather than a hazard — but it is
  * the same shape as an orphaned dialog and has the same one-line fix.

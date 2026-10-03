@@ -24,15 +24,18 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # (src/crash.rs: an unhandled-exception filter that writes with plain Win32
 # file calls), and the job object that ends every ffmpeg/ffprobe child with
 # the app (src/jobs/ffmpeg.rs; Threading carries the job's limit struct and
-# the process wait). Windows-only by construction; the seams are per-platform
-# and other platforms get their own. Features are compile-time only: no new
-# crate, nothing in Cargo.lock.
+# the process wait), and a second launch handing its file to the running
+# instance (src/os.rs: DataExchange carries WM_COPYDATA's struct, the same
+# message tauri-plugin-single-instance receives). Windows-only by
+# construction; the seams are per-platform and other platforms get their own.
+# Features are compile-time only: no new crate, nothing in Cargo.lock.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_Security",
   "Win32_Storage_FileSystem",
+  "Win32_System_DataExchange",
   "Win32_System_Diagnostics_Debug",
   "Win32_System_IO",
   "Win32_System_JobObjects",

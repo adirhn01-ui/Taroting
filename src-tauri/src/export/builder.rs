@@ -19,22 +19,23 @@
 use std::ffi::OsString;
 
 use crate::error::{AppError, Result};
-use crate::export::model::{BitratePreset, Container, ExportSpec};
+use crate::export::model::{format_rate, BitratePreset, Container, ExportSpec, FpsPreset, ResolutionPreset};
 use crate::hw::EncoderReport;
+use crate::media::source::INPUT_PROTOCOL_ARGS;
 use crate::project::schema::{
     Clip, Generator, Keyframe, MediaRef, Track,
 };
 
 /// Result of building an export. `start_export` decides whether to splice the
 /// filtergraph inline (`-filter_complex <str>`) or into a script file
-/// (`-filter_complex_script <path>`): the `FILTER_PLACEHOLDER` OsString in
-/// `args` marks where the filter value goes, and the preceding flag is already
+/// (`-/filter_complex <path>`): the `FILTER_PLACEHOLDER` OsString in `args`
+/// marks where the filter value goes, and the preceding flag is already
 /// `-filter_complex`. The caller rewrites both when using script mode.
 ///
 /// `text_payloads` carries the contents of each drawtext `textfile`. `build`
 /// stays pure: it embeds an opaque placeholder (`TEXT_PLACEHOLDER_PREFIX{i}…`)
-/// in the filtergraph where the escaped textfile path belongs; `start_export`
-/// materialises each payload to `%TEMP%` and substitutes the escaped real path
+/// in the filtergraph where the escaped textfile name belongs; `start_export`
+/// materialises each payload to `%TEMP%` and substitutes the escaped name
 /// before deciding inline-vs-script filter mode.
 pub struct BuiltExport {
     pub args: Vec<OsString>,
@@ -42,15 +43,44 @@ pub struct BuiltExport {
     pub duration_sec: f64,
     /// (placeholder, file-content) pairs for drawtext textfiles.
     pub text_payloads: Vec<(String, String)>,
-    /// The file behind every `-i`, in argv order: exactly the files ffmpeg
-    /// will open (a generator opens none, a muted clip's audio is never
-    /// added). `start_export` checks these are still on disk.
+    /// The file behind every media `-i`, in argv order: exactly the files
+    /// ffmpeg will open (a generator opens none, a muted clip's audio is never
+    /// added). `start_export` checks these are still on disk. A GIF's palette
+    /// is not one of them: the export writes it itself, in its first pass.
     pub sources: Vec<OsString>,
+    /// The video encoder `args` names (`-c:v`), or `None` for a GIF, which
+    /// has no video codec to choose. `start_export` reads it to know whether
+    /// a failed export ran on a hardware encoder.
+    pub encoder: Option<String>,
+    /// A GIF's first pass, `None` for every other format. See `PalettePass`.
+    pub palette_pass: Option<PalettePass>,
+}
+
+/// The first of a GIF's two ffmpeg runs: the same inputs and the same video
+/// graph, ending in `palettegen`, writing the palette to `PALETTE_PLACEHOLDER`.
+/// The main `args` are the second run, which reads that palette back as its
+/// LAST input and maps it through `paletteuse`.
+///
+/// Two runs rather than one `split` because a `split` feeding both
+/// `palettegen` and `paletteuse` holds every frame of the export in memory:
+/// `palettegen` emits only at end of stream, so `paletteuse` cannot take a
+/// single frame until then, and the split queues all of them (about 1 MB a
+/// frame at 640x360, 250 MB a second at 1080p30). Two runs decode twice and
+/// hold nothing; the GIF itself is byte-for-byte the same (measured with the
+/// bundled 8.1.1).
+pub struct PalettePass {
+    pub args: Vec<OsString>,
+    pub filter_complex: String,
 }
 
 /// Sentinel argv entry replaced by `start_export` with either the inline
 /// filter string or the script path.
 pub const FILTER_PLACEHOLDER: &str = "\u{0}TAROTING_FILTER\u{0}";
+
+/// Sentinel argv entry for a GIF's palette file: the first pass's output and
+/// the second pass's last input. `start_export` replaces it with the file name
+/// it chose.
+pub const PALETTE_PLACEHOLDER: &str = "\u{0}TAROTING_PALETTE\u{0}";
 
 /// Placeholder pattern for a drawtext textfile path. `build` embeds
 /// `\u{0}TAROTING_TEXT_{i}\u{0}` (escaped-quoted) into the graph; `start_export`
@@ -116,7 +146,32 @@ fn round_even(v: f64) -> i64 {
 /* Font mapping + filter-path escaping                                 */
 /* ------------------------------------------------------------------ */
 
-/// Map a (family, bold, italic) request to a concrete C:\Windows\Fonts file.
+/// The Windows fonts folder: `%SystemRoot%\Fonts`, else `%WINDIR%\Fonts`, else
+/// `C:\Windows\Fonts`. Windows is not always installed on C: or in a folder
+/// called Windows, and a hardcoded `C:\Windows\Fonts` refused every export
+/// containing text on such a machine ("font file not found"). Read once: the
+/// variables do not change while the app runs.
+pub(crate) fn fonts_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| fonts_dir_from(std::env::var_os("SystemRoot"), std::env::var_os("WINDIR")))
+}
+
+/// `fonts_dir`'s rule with the two variables passed in, so a test can name a
+/// Windows that lives somewhere else without touching the process environment.
+fn fonts_dir_from(
+    system_root: Option<std::ffi::OsString>,
+    windir: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    [system_root, windir]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+        .join("Fonts")
+}
+
+/// Map a (family, bold, italic) request to a concrete file in `fonts_dir()`.
 /// Impact has only a regular face, so bold/italic requests fall back to it.
 fn font_file(family: &str, bold: bool, italic: bool) -> Option<&'static str> {
     let faces: [&'static str; 4] = match family {
@@ -134,7 +189,8 @@ fn font_file(family: &str, bold: bool, italic: bool) -> Option<&'static str> {
 
 /// Full path to a mapped font file.
 pub fn font_path(family: &str, bold: bool, italic: bool) -> Option<String> {
-    font_file(family, bold, italic).map(|f| format!(r"C:\Windows\Fonts\{f}.ttf"))
+    font_file(family, bold, italic)
+        .map(|f| fonts_dir().join(format!("{f}.ttf")).to_string_lossy().into_owned())
 }
 
 /// FreeType's line height as a fraction of font size, per whitelisted family.
@@ -618,12 +674,46 @@ enum ClipInput {
 struct VideoSeg {
     input: ClipInput,
     clip: Clip,
+    /// How many output frames this segment spans (see `Segment`).
+    frames: u64,
 }
 
-/// A gap (pure black) or a clip segment on a video track.
+/// A gap (pure black) or a clip segment on the bottom video track, sized in
+/// whole OUTPUT FRAMES.
+///
+/// `concat` appends whole segments, so a segment whose length is not a whole
+/// number of frames is rounded UP by its black base (`color` emits frames
+/// while their time is under `d`) and every later segment starts late by
+/// the remainder — +17 ms per boundary on average at 30 fps, adding up clip
+/// after clip, while the audio (`adelay`) and the upper tracks (`enable`)
+/// stay on exact times. So the boundaries are placed on the frame grid by
+/// their ABSOLUTE time: a segment spans `round(end*fps) - round(start*fps)`
+/// frames, each boundary is at most half a frame from its true time, and the
+/// error never accumulates. The whole track is `round(duration*fps)` frames.
 enum Segment {
-    Gap(f64),
+    Gap(u64),
     Clip(VideoSeg),
+}
+
+/// The output frame a timeline time falls on: `round(t * num / den)`, on the
+/// exact rational the graph runs at. Negative (crafted) times are frame 0.
+fn frame_at(t: f64, (num, den): (u64, u64)) -> u64 {
+    let f = (t * num as f64 / den.max(1) as f64).round();
+    if f.is_finite() && f > 0.0 {
+        f as u64
+    } else {
+        0
+    }
+}
+
+/// The `d=` of a source that must emit exactly `frames` frames at `rate`.
+///
+/// `color` (like every lavfi source) emits a frame while its time is under
+/// `d`, i.e. `ceil(d * fps)` frames. Half a frame short of the last boundary
+/// lands that count on `frames` with half a frame of margin either side, so
+/// the six printed decimals can never tip it to one more or one fewer.
+fn frames_duration(frames: u64, (num, den): (u64, u64)) -> f64 {
+    (frames as f64 - 0.5).max(0.5) * den.max(1) as f64 / num.max(1) as f64
 }
 
 fn media_for<'a>(media: &'a [MediaRef], id: &str) -> Option<&'a MediaRef> {
@@ -729,12 +819,27 @@ fn register_clip_input(
         flags.push("-to".into());
         flags.push(format!("{:.6}", clip.src_out).into());
     }
-    flags.push("-i".into());
+    push_file_input(&mut flags);
     inputs.push(InputEntry {
         flags,
         source: InputSource::File(OsString::from(&media.path)),
     });
     Ok(ClipInput::File(idx))
+}
+
+/// End an input's flags with `-protocol_whitelist file -i`, so the path that
+/// follows can only ever be opened as a file.
+///
+/// Every media path comes out of a `.trt`, which is the file people share,
+/// and the bundled ffmpeg has its network protocols built in: handed
+/// `https://host/x.mp4` as an input, an export would simply connect to it.
+/// `plan_export` refuses anything that is not a full path to a file first;
+/// this is the second layer, so a path that slipped past that check still
+/// cannot reach the network. Every `-i` this builder emits is a file (the
+/// lavfi sources live inside the filtergraph), so every one gets it.
+fn push_file_input(flags: &mut Vec<OsString>) {
+    flags.extend(INPUT_PROTOCOL_ARGS.iter().map(OsString::from));
+    flags.push("-i".into());
 }
 
 /* ------------------------------------------------------------------ */
@@ -779,6 +884,97 @@ fn atempo_factors(speed: f64) -> Vec<f64> {
     }
     factors.push(remaining);
     factors
+}
+
+/* ------------------------------------------------------------------ */
+/* Preset numbers                                                      */
+/* ------------------------------------------------------------------ */
+
+// The preset's numbers arrive from a `.trt`, which anyone can hand-edit, and
+// nothing in serde bounds them. None of them can inject anything (they are
+// formatted numbers), but out of range they turn an export into an endless
+// encode, a frame no machine can allocate, or a raw ffmpeg error. The bounds
+// are the dialog's own, so the backend never refuses a value the UI accepts:
+// a custom rate of 1-240 fps, bitrates from 100 (video) and 32 (audio) kbps.
+// The upper bitrate and size bounds are far above anything an encoder
+// accepts, so they refuse only what could never have exported.
+
+/// The largest side an export may have. 16384 rather than 8192: a 4320p
+/// export of a portrait canvas is already 7680 tall, and a tall or wide
+/// canvas at that preset legitimately goes past 8192.
+const MAX_SIDE: u32 = 16_384;
+/// The fastest custom output rate (the dialog's own cap).
+const MAX_CUSTOM_FPS: f64 = 240.0;
+/// The fastest "Original" rate: a timeline rate comes from the project, and
+/// no camera the editor imports from records anywhere near this.
+const MAX_ORIGINAL_FPS: f64 = 1000.0;
+const MAX_KBPS: u64 = 500_000;
+
+/// The export resolution, refused when a side is outside 2..=16384.
+fn checked_output_dims(spec: &ExportSpec) -> Result<(u32, u32)> {
+    if let ResolutionPreset::Custom { w, h } = spec.preset.resolution {
+        if !(2..=MAX_SIDE).contains(&w) || !(2..=MAX_SIDE).contains(&h) {
+            return Err(AppError::BadInput(format!(
+                "This project asks for an export size of {w}x{h}. \
+                 Choose a resolution between 2 and {MAX_SIDE} pixels on each side."
+            )));
+        }
+    }
+    // A named preset or "Original" follows the canvas, which a crafted file
+    // can make any size, so the size that will actually be encoded is
+    // checked too.
+    let (w, h) = spec.preset.output_dims(spec.timeline.width, spec.timeline.height);
+    if w > MAX_SIDE || h > MAX_SIDE {
+        return Err(AppError::BadInput(format!(
+            "This export would be {w}x{h}, larger than {MAX_SIDE} pixels on a side. \
+             Choose a smaller resolution."
+        )));
+    }
+    Ok((w, h))
+}
+
+/// The output rate as an exact rational, refused when it is not a real rate:
+/// a custom rate outside 1..=240 fps, or an "Original" rate of zero or above
+/// 1000 fps. ("0/1000" reached ffmpeg as a raw error, and 1e6 fps was an
+/// export that never ends.)
+fn checked_output_rate(spec: &ExportSpec) -> Result<(u64, u64)> {
+    match spec.preset.fps {
+        FpsPreset::Custom(f) => {
+            if !f.is_finite() || !(1.0..=MAX_CUSTOM_FPS).contains(&f) {
+                return Err(AppError::BadInput(format!(
+                    "This project asks for a frame rate of {f} fps. \
+                     Choose a frame rate between 1 and {MAX_CUSTOM_FPS} fps."
+                )));
+            }
+        }
+        FpsPreset::Original(_) => {
+            let r = spec.timeline.fps;
+            let fps = f64::from(r.num) / f64::from(r.den.max(1));
+            if r.num == 0 || fps > MAX_ORIGINAL_FPS {
+                return Err(AppError::BadInput(format!(
+                    "This project's frame rate ({}/{}) can't be exported. \
+                     Choose a frame rate in the export settings.",
+                    r.num, r.den
+                )));
+            }
+        }
+    }
+    Ok(spec.preset.output_rate(&spec.timeline))
+}
+
+/// A custom bitrate outside the dialog's range is refused, naming which one.
+fn check_bitrates(spec: &ExportSpec) -> Result<()> {
+    let check = |preset: BitratePreset, min: u64, which: &str| -> Result<()> {
+        match preset.kbps() {
+            Some(k) if !(min..=MAX_KBPS).contains(&k) => Err(AppError::BadInput(format!(
+                "This project asks for a {which} bitrate of {k} kbps. \
+                 Choose one between {min} and {MAX_KBPS} kbps."
+            ))),
+            _ => Ok(()),
+        }
+    };
+    check(spec.preset.video_bitrate, 100, "video")?;
+    check(spec.preset.audio_bitrate, 32, "audio")
 }
 
 /* ------------------------------------------------------------------ */
@@ -872,9 +1068,10 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     // The EXPORT resolution, which equals the project canvas only for the
     // "Original" preset. Both spaces travel from here into `placement`, which
     // is where mixing them up used to mis-place off-centre clips.
-    let (out_w, out_h) = preset.output_dims(spec.timeline.width, spec.timeline.height);
+    let (out_w, out_h) = checked_output_dims(spec)?;
+    check_bitrates(spec)?;
     let canvas = (spec.timeline.width, spec.timeline.height);
-    let mut fps_str = preset.output_fps(&spec.timeline);
+    let mut rate = checked_output_rate(spec)?;
     // A GIF frame delay is whole centiseconds, so above 50 fps some frames get
     // 1 cs (a 60 fps graph alternates 2 cs and 1 cs frames, measured), and
     // browsers play any delay of 1 cs or less as 10 cs: a 60 fps phone clip
@@ -884,8 +1081,9 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     // here, where every GIF passes. The size estimate caps GIF at it too.
     let timeline_fps = spec.timeline.fps.num as f64 / spec.timeline.fps.den.max(1) as f64;
     if is_gif && preset.fps_value(timeline_fps) > GIF_MAX_FPS {
-        fps_str = format!("{GIF_MAX_FPS}");
+        rate = (GIF_MAX_FPS as u64, 1);
     }
+    let fps_str = format_rate(rate);
     let duration_sec = spec.timeline.duration();
 
     // Video tracks are a contiguous prefix; tracks[0] is TOPMOST, the last
@@ -903,27 +1101,43 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     /* ---- bottom track → segment list (owns concat + tail-pad) ---- */
     let bottom = video_tracks.last().copied();
     let mut segments: Vec<Segment> = Vec::new();
+    // Total output frames: what the whole video is, whatever the tracks hold.
+    let total_frames = frame_at(duration_sec, rate);
     if let Some(bt) = bottom {
         let mut vclips: Vec<&Clip> = bt.clips.iter().collect();
         vclips.sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
-        let mut cursor = 0.0_f64;
+        // The frame the next segment starts on. Boundaries are absolute
+        // (see `Segment`): a clip spans from its own start frame (or from
+        // where an overlapping predecessor ended) to `round(end * fps)`.
+        let mut cursor = 0u64;
         for clip in vclips {
             let media = media_for(&spec.media, &clip.media_id).ok_or_else(|| {
                 AppError::BadInput(format!("clip references unknown media {}", clip.media_id))
             })?;
-            let gap = clip.timeline_start - cursor;
-            if gap > 0.0005 {
-                segments.push(Segment::Gap(gap));
+            let start = frame_at(clip.timeline_start, rate);
+            if start > cursor {
+                segments.push(Segment::Gap(start - cursor));
+                cursor = start;
+            }
+            let end = frame_at(clip.end(), rate);
+            if end <= cursor {
+                // Shorter than half a frame once on the grid (or hidden under
+                // an overlapping predecessor): it owns no frame of the output,
+                // so ffmpeg is not asked to open it at all.
+                continue;
             }
             let input = register_clip_input(&mut inputs, clip, media)?;
-            segments.push(Segment::Clip(VideoSeg { input, clip: clip.clone() }));
-            cursor = clip.end();
+            segments.push(Segment::Clip(VideoSeg {
+                input,
+                clip: clip.clone(),
+                frames: end - cursor,
+            }));
+            cursor = end;
         }
         // tail-pad to the full timeline duration when the bottom track's
         // content ends early.
-        let tail = duration_sec - cursor;
-        if tail > 0.0005 {
-            segments.push(Segment::Gap(tail));
+        if total_frames > cursor {
+            segments.push(Segment::Gap(total_frames - cursor));
         }
     }
 
@@ -957,8 +1171,11 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     }
 
     /* ---- audio inputs (track order, then start) ---- */
+    // None for a GIF, which has no audio stream: an input nothing maps is
+    // still opened and demuxed, and a GIF runs its inputs twice.
     let mut audio_inputs: Vec<AudioInput> = Vec::new();
-    for track in &spec.timeline.tracks {
+    let audio_tracks: &[Track] = if is_gif { &[] } else { &spec.timeline.tracks };
+    for track in audio_tracks {
         let mut clips: Vec<&Clip> = track.clips.iter().collect();
         clips.sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
         for clip in clips {
@@ -975,7 +1192,7 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
             flags.push(format!("{:.6}", clip.src_in).into());
             flags.push("-to".into());
             flags.push(format!("{:.6}", clip.src_out).into());
-            flags.push("-i".into());
+            push_file_input(&mut flags);
             inputs.push(InputEntry {
                 flags,
                 source: InputSource::File(OsString::from(&media.path)),
@@ -988,7 +1205,7 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
         }
     }
 
-    let want_audio = !is_gif && !audio_inputs.is_empty();
+    let want_audio = !audio_inputs.is_empty();
 
     /* ---- build filtergraph ---- */
     let mut fc = String::new();
@@ -997,6 +1214,7 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
         h: out_h,
         canvas,
         fps: &fps_str,
+        rate,
         text_payloads: &mut text_payloads,
         stage_n: 0,
     };
@@ -1005,7 +1223,7 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     // stay byte-identical). With overlays the concat writes an intermediate
     // label that overlay stages thread up to the final [vout].
     let base_out = if has_overlays { None } else { Some("[vout]") };
-    let mut prev = gen.build_bottom(&mut fc, &segments, &spec.media, duration_sec, base_out);
+    let mut prev = gen.build_bottom(&mut fc, &segments, &spec.media, total_frames, base_out);
 
     // Apply higher layers bottom->top, threading the composite label. The last
     // overlay stage writes [vout].
@@ -1026,18 +1244,10 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
         fc.pop();
     }
 
-    if is_gif {
-        fc.push_str(";[vout]split[g1][g2];[g1]palettegen=stats_mode=diff[pal];[g2][pal]paletteuse=dither=bayer:bayer_scale=4[gifout]");
-    }
-
-    if want_audio {
-        build_audio_graph(&mut fc, &audio_inputs, duration_sec);
-    }
-
     /* ---- assemble argv ---- */
-    let mut args: Vec<OsString> = Vec::new();
+    let mut head: Vec<OsString> = Vec::new();
     for a in ["-y", "-hide_banner", "-nostats", "-loglevel", "error", "-progress", "pipe:1"] {
-        args.push(a.into());
+        head.push(a.into());
     }
     let sources: Vec<OsString> = inputs
         .iter()
@@ -1045,37 +1255,69 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
             InputSource::File(p) => p.clone(),
         })
         .collect();
+    // The palette, when there is one, is read back as the input AFTER every
+    // media input, so no media input's index moves.
+    let palette_index = inputs.len();
     for entry in inputs {
-        args.extend(entry.flags);
+        head.extend(entry.flags);
         match entry.source {
-            InputSource::File(p) => args.push(p),
+            InputSource::File(p) => head.push(p),
         }
     }
 
+    if is_gif {
+        // Pass 1 ends the video graph in `palettegen` and writes its one
+        // frame as a PNG; pass 2 reads that PNG back and maps the same graph
+        // through `paletteuse`. See `PalettePass` for why there is no `split`.
+        let pass1_fc = format!("{fc};[vout]palettegen=stats_mode=diff[pal]");
+        let mut pass1 = head.clone();
+        pass1.push("-filter_complex".into());
+        pass1.push(FILTER_PLACEHOLDER.into());
+        push(&mut pass1, &["-map", "[pal]", "-frames:v", "1", "-update", "1", "-c:v", "png", "-f", "image2"]);
+        pass1.push(PALETTE_PLACEHOLDER.into());
+
+        fc.push_str(&format!(
+            ";[vout][{palette_index}:v]paletteuse=dither=bayer:bayer_scale=4[gifout]"
+        ));
+        let mut args = head;
+        push_file_input(&mut args);
+        args.push(PALETTE_PLACEHOLDER.into());
+        args.push("-filter_complex".into());
+        args.push(FILTER_PLACEHOLDER.into());
+        push(&mut args, &["-map", "[gifout]"]);
+        // gif has no audio, and the palette pipeline handles colour: no codec.
+        push_container(&mut args, container);
+        args.push(OsString::from(&spec.out_path));
+
+        return Ok(BuiltExport {
+            args,
+            filter_complex: fc,
+            duration_sec,
+            text_payloads,
+            sources,
+            encoder: None,
+            palette_pass: Some(PalettePass { args: pass1, filter_complex: pass1_fc }),
+        });
+    }
+
+    if want_audio {
+        build_audio_graph(&mut fc, &audio_inputs, duration_sec);
+    }
+
+    let mut args = head;
     args.push("-filter_complex".into());
     args.push(FILTER_PLACEHOLDER.into());
-
-    if is_gif {
+    args.push("-map".into());
+    args.push("[vout]".into());
+    if want_audio {
         args.push("-map".into());
-        args.push("[gifout]".into());
-    } else {
-        args.push("-map".into());
-        args.push("[vout]".into());
-        if want_audio {
-            args.push("-map".into());
-            args.push("[aout]".into());
-        }
+        args.push("[aout]".into());
     }
 
-    if is_gif {
-        // palette pipeline handles color
-    } else {
-        push_video_codec(&mut args, spec, container, encoders);
-    }
+    let encoder = chosen_encoder(spec, encoders, (out_w, out_h));
+    push_video_codec(&mut args, spec, container, &encoder);
 
-    if is_gif {
-        // gif has no audio
-    } else if want_audio {
+    if want_audio {
         push_audio_codec(&mut args, spec, container);
         args.push("-ar".into());
         args.push("48000".into());
@@ -1092,6 +1334,8 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
         duration_sec,
         text_payloads,
         sources,
+        encoder: Some(encoder),
+        palette_pass: None,
     })
 }
 
@@ -1107,6 +1351,8 @@ struct GraphGen<'a> {
     /// authored in. Equal to `w`/`h` only when exporting at "Original".
     canvas: (u32, u32),
     fps: &'a str,
+    /// The exact rational `fps` spells: frame counts are computed from it.
+    rate: (u64, u64),
     text_payloads: &'a mut Vec<(String, String)>,
     /// monotonically increasing suffix for unique stage labels
     stage_n: usize,
@@ -1117,6 +1363,24 @@ impl<'a> GraphGen<'a> {
         let n = self.stage_n;
         self.stage_n += 1;
         n
+    }
+
+    /// Whether this file clip delivers frames faster than the export rate:
+    /// a moving (not still) source with a probed rate whose rate times the
+    /// clip's speed is above the output's. Compared on the exact output
+    /// rational. No probed rate means no claim, so the clip keeps the one
+    /// trailing `fps` it always had.
+    fn drops_frames(&self, media: &MediaRef, speed: f64) -> bool {
+        if media.kind == "image" || media.generator.is_some() || !speed.is_finite() || speed <= 0.0 {
+            return false;
+        }
+        let Some(r) = media.fps else { return false };
+        if r.num == 0 {
+            return false;
+        }
+        let incoming = f64::from(r.num) / f64::from(r.den.max(1)) * speed;
+        let out = self.rate.0 as f64 / self.rate.1.max(1) as f64;
+        incoming > out + 1e-6
     }
 
     /// Emit the lavfi source chain for a generator, producing frames of the
@@ -1189,23 +1453,24 @@ x=0:y=0:boxw={w}:boxh={h}:text_align=L+M:line_spacing={line_spacing}:expansion=n
         fc: &mut String,
         segments: &[Segment],
         media: &[MediaRef],
-        duration_sec: f64,
+        total_frames: u64,
         final_label: Option<&str>,
     ) -> String {
-        let (w, h, fps) = (self.w, self.h, self.fps);
+        let (w, h, fps, rate) = (self.w, self.h, self.fps, self.rate);
         let mut labels: Vec<String> = Vec::new();
 
         if segments.is_empty() {
-            let d = duration_sec.max(0.04);
+            let d = frames_duration(total_frames.max(1), rate);
             let n = self.next_n();
             fc.push_str(&format!("color=black:s={w}x{h}:r={fps}:d={d:.6}[s{n}];"));
             labels.push(format!("[s{n}]"));
         } else {
             for seg in segments {
                 match seg {
-                    Segment::Gap(g) => {
+                    Segment::Gap(frames) => {
+                        let d = frames_duration(*frames, rate);
                         let n = self.next_n();
-                        fc.push_str(&format!("color=black:s={w}x{h}:r={fps}:d={g:.6}[s{n}];"));
+                        fc.push_str(&format!("color=black:s={w}x{h}:r={fps}:d={d:.6}[s{n}];"));
                         labels.push(format!("[s{n}]"));
                     }
                     Segment::Clip(vseg) => {
@@ -1225,38 +1490,40 @@ x=0:y=0:boxw={w}:boxh={h}:text_align=L+M:line_spacing={line_spacing}:expansion=n
                             fc,
                             &vseg.input,
                             clip,
+                            m,
                             &p,
                             clip_dur,
                             &chain_label,
                             None,
                         );
 
+                        // The black base alone sets the segment's length
+                        // (`shortest=1` ends the segment with whichever input
+                        // ends first), so every clip's frames are held past
+                        // their own end by up to the segment's length.
+                        //
                         // A recording's video stream can end before the clip
                         // does: a new clip's `src_out` is the CONTAINER
                         // duration, and that often runs past the last video
-                        // frame (audio outlasting it). `shortest=1` then ended
-                        // the segment with the stream, short of `clip_dur`, and
-                        // every later segment slid earlier against its
+                        // frame (audio outlasting it). And the segment is now
+                        // whole frames (see `Segment`), so it can be up to
+                        // half a frame longer than the clip itself — which a
+                        // still (`-loop 1 -t`) or a generator (trimmed to the
+                        // slot) would end short of just the same. Without the
+                        // pad any of them ended the segment early and every
+                        // later segment slid earlier against its
                         // `adelay`-placed audio and the `enable`-gated upper
-                        // tracks — tens of ms a clip, adding up. Hold the last
-                        // frame instead (what the preview's `<video>` shows), so
-                        // the black base alone sets the segment length. A still
-                        // (`-loop 1 -t`) and a generator (trimmed to the slot)
-                        // already fill it exactly; their graph is unchanged.
-                        let chain_label = match &vseg.input {
-                            ClipInput::File(_) if m.kind != "image" => {
-                                fc.push_str(&format!(
-                                    "{chain_label}tpad=stop_mode=clone:stop_duration={clip_dur:.6}[p{n}];"
-                                ));
-                                format!("[p{n}]")
-                            }
-                            _ => chain_label,
-                        };
+                        // tracks. Holding the last frame is what the
+                        // preview's `<video>` shows.
+                        let seg_dur = vseg.frames as f64 * rate.1 as f64 / rate.0.max(1) as f64;
+                        fc.push_str(&format!(
+                            "{chain_label}tpad=stop_mode=clone:stop_duration={seg_dur:.6}[p{n}];"
+                        ));
+                        let chain_label = format!("[p{n}]");
 
                         // black base for this segment, overlay clip onto it.
-                        fc.push_str(&format!(
-                            "color=black:s={w}x{h}:r={fps}:d={clip_dur:.6}[b{n}];"
-                        ));
+                        let d = frames_duration(vseg.frames, rate);
+                        fc.push_str(&format!("color=black:s={w}x{h}:r={fps}:d={d:.6}[b{n}];"));
                         let (ox, oy) = self.overlay_xy(clip, &p, "t");
                         fc.push_str(&format!(
                             "[b{n}]{chain_label}overlay={ox}:{oy}:shortest=1[s{n}];"
@@ -1312,6 +1579,7 @@ x=0:y=0:boxw={w}:boxh={h}:text_align=L+M:line_spacing={line_spacing}:expansion=n
             fc,
             input,
             clip,
+            media,
             &p,
             clip_dur,
             &chain_label,
@@ -1329,8 +1597,9 @@ enable='gte(t,{start:.6})*lt(t,{end:.6})'{out};"
 
     /// Emit the full per-clip filter chain into `[out_label]`.
     ///
-    /// Order: source/input → setpts speed → crop → [opacity alphamerge] →
-    /// flips → transpose → scale (animated or static) → setsar=1 → fps →
+    /// Order: source/input → setpts speed → [early fps, see `drops_frames`] →
+    /// crop → [opacity alphamerge] → flips → transpose → scale (animated or
+    /// static) → setsar=1 → fps →
     /// [static opacity colorchannelmixer] → [setpts timeline shift].
     ///
     /// `scale` sits AFTER the transpose, so every size it is given is in
@@ -1348,6 +1617,7 @@ enable='gte(t,{start:.6})*lt(t,{end:.6})'{out};"
         fc: &mut String,
         input: &ClipInput,
         clip: &Clip,
+        media: &MediaRef,
         p: &Placement,
         clip_dur: f64,
         out_label: &str,
@@ -1360,6 +1630,18 @@ enable='gte(t,{start:.6})*lt(t,{end:.6})'{out};"
         match input {
             ClipInput::File(i) => {
                 chain.push_str(&format!("[{i}:v]setpts=(PTS-STARTPTS)/{:.6}", clip.speed));
+                // A clip that arrives faster than the export runs (a 60 fps
+                // recording in a 30 fps or GIF export, a clip at speed 2)
+                // drops frames at the trailing `fps`. Dropping them HERE,
+                // right after the speed is applied, spares crop, flips,
+                // transpose and scale the work on frames nobody will see; the
+                // frames kept are the same, so the output is too. Only then:
+                // for a still, a slowed or a slower clip an early `fps` would
+                // DUPLICATE frames first and make the per-frame filters pay
+                // for the copies, so those keep the trailing one alone.
+                if self.drops_frames(media, clip.speed) {
+                    chain.push_str(&format!(",fps={fps}"));
+                }
             }
             ClipInput::Generated(gen) => {
                 // generated media trim to clip_dur locally; speed still applies.
@@ -1564,7 +1846,11 @@ fn build_audio_graph(fc: &mut String, audio: &[AudioInput], total_dur: f64) {
             ));
         }
         let d = ai.delay_ms.max(0);
-        chain.push_str(&format!(",adelay={d}|{d}[a{n}];"));
+        // `all=1` delays EVERY channel. The old `adelay={d}|{d}` named two
+        // delays, and adelay leaves any channel past the last one named
+        // undelayed: a 5.1 clip placed later on the timeline played its
+        // centre (the dialogue) and surround channels from timeline zero.
+        chain.push_str(&format!(",adelay=delays={d}:all=1[a{n}];"));
         fc.push_str(&chain);
         labels.push(format!("[a{n}]"));
     }
@@ -1583,15 +1869,26 @@ fn build_audio_graph(fc: &mut String, audio: &[AudioInput], total_dur: f64) {
 /* Codec / quality / container flag builders                           */
 /* ------------------------------------------------------------------ */
 
-fn chosen_encoder(spec: &ExportSpec, encoders: &EncoderReport) -> String {
+/// The widest (or tallest) frame the H.264 hardware encoders take. NVENC,
+/// QSV and AMF all top out at 4096 px for H.264, so an 8K (4320p) export with
+/// the shipped defaults (H.264, hardware on) failed after the user had waited
+/// for it, where libx264 encodes it fine.
+const HW_H264_MAX_SIDE: u32 = 4096;
+
+fn chosen_encoder(spec: &ExportSpec, encoders: &EncoderReport, (w, h): (u32, u32)) -> String {
     let codec = spec.preset.vcodec.as_str();
     if spec.preset.use_hardware {
-        match codec {
+        let enc = match codec {
             "h264" => encoders.h264.clone(),
             "hevc" => encoders.hevc.clone(),
             "av1" => encoders.av1.clone(),
             _ => "libx264".into(),
+        };
+        let hw_h264 = matches!(enc.as_str(), "h264_nvenc" | "h264_qsv" | "h264_amf");
+        if hw_h264 && (w > HW_H264_MAX_SIDE || h > HW_H264_MAX_SIDE) {
+            return "libx264".into();
         }
+        enc
     } else {
         software_lib(codec).into()
     }
@@ -1614,10 +1911,9 @@ fn push_video_codec(
     args: &mut Vec<OsString>,
     spec: &ExportSpec,
     container: Container,
-    encoders: &EncoderReport,
+    enc: &str,
 ) {
-    let enc = chosen_encoder(spec, encoders);
-    push(args, &["-c:v", &enc]);
+    push(args, &["-c:v", enc]);
 
     // HEVC in an ISOBMFF container must be tagged `hvc1`, not the `hev1` both
     // the mp4 and mov muxers pick by default (measured with the bundled 8.1.1:
@@ -1650,13 +1946,13 @@ fn push_video_codec(
                 "-b:v",
                 &format!("{k}k"),
                 "-maxrate",
-                &format!("{}k", k * 2),
+                &format!("{}k", k.saturating_mul(2)),
                 "-bufsize",
-                &format!("{}k", k * 4),
+                &format!("{}k", k.saturating_mul(4)),
             ],
         );
     } else {
-        push_quality(args, &enc);
+        push_quality(args, enc);
     }
 
     push(args, &["-pix_fmt", "yuv420p"]);
@@ -1883,17 +2179,91 @@ mod tests {
         let c2 = clip("c2", "m1", 3.0, 0.0, 2.0);
         let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c1, c2])]);
         let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
-        assert!(b.filter_complex.contains("color=black:s=1920x1080:r=30:d=1.000000"), "{}", b.filter_complex);
+        // The 1 s gap is 30 frames, and a 30-frame base is written half a
+        // frame short of 1 s so `color` emits exactly 30 (see `frames_duration`).
+        assert!(b.filter_complex.contains("color=black:s=1920x1080:r=30:d=0.983333"), "{}", b.filter_complex);
         assert!(b.filter_complex.contains("concat=n=3:v=1:a=0"), "{}", b.filter_complex);
     }
 
-    /// A recording's segment holds its last frame to the end of the slot
-    /// (`tpad` before the `shortest=1` overlay), so a video stream shorter
-    /// than its clip cannot end the segment early. A still and a generator
-    /// already fill the slot exactly and keep their graph as it was. The
-    /// real-ffmpeg half is `e2e_a_video_stream_shorter_than_its_clip_keeps_later_clips_on_time`.
+    /// The `d=` of every black base on the bottom track, in graph order.
+    fn base_durations(fc: &str) -> Vec<f64> {
+        fc.split("color=black:s=")
+            .skip(1)
+            .map(|rest| {
+                let d = rest.split(":d=").nth(1).unwrap();
+                d[..d.find('[').unwrap()].parse::<f64>().unwrap()
+            })
+            .collect()
+    }
+
+    /// Bottom-track segments are whole frames placed by their ABSOLUTE
+    /// boundaries. Three back-to-back clips whose lengths are not frame
+    /// multiples (1.01 s, 0.77 s, 1.234 s at 30 fps) behind a 0.4 s gap and
+    /// ahead of a tail gap to a 4 s timeline: each segment must emit
+    /// `round(end*30) - round(start*30)` frames — 12, 30, 23, 37, 18 — summing
+    /// to `round(4*30) = 120`. The old per-segment `d=<exact length>` rounded
+    /// every segment up (12, 31, 24, 38, 18 = 123 frames, the last clip
+    /// starting 67 ms late), which is what this pins.
     #[test]
-    fn only_a_recording_segment_is_padded_to_its_slot() {
+    fn bottom_segments_are_whole_frames_on_absolute_boundaries() {
+        let m = media("m1", r"C:\v.mp4", 1920, 1080, false);
+        let solid = gen_media("s", Generator::Solid { color: "#336699".into() }, 300, 200);
+        let c1 = clip("c1", "m1", 0.4, 2.0, 3.01);
+        let c2 = clip("c2", "s", 1.41, 0.0, 0.77);
+        let c3 = clip("c3", "m1", 2.18, 0.0, 1.234);
+        // A video track above, whose clip sets the timeline's 4 s length.
+        let top = vtrack_id("top", vec![clip("t", "s", 3.5, 0.0, 0.5)]);
+        let tl = timeline(1280, 720, Rational { num: 30, den: 1 },
+                          vec![top, vtrack_id("bot", vec![c1, c2, c3])]);
+        let b = build(&spec(vec![m, solid], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        let frames: Vec<u64> = base_durations(&b.filter_complex)
+            .iter()
+            .map(|d| (d * 30.0).ceil() as u64)
+            .collect();
+        assert_eq!(frames, [12, 30, 23, 37, 18], "{}", b.filter_complex);
+        assert_eq!(frames.iter().sum::<u64>(), 120);
+    }
+
+    /// The same rule on an NTSC rate, computed from the exact 30000/1001 the
+    /// graph runs at: a 10 s clip starting at 100.0 s spans frames 2997..3297
+    /// (300 frames), and the 100 s gap before it 2997 frames.
+    #[test]
+    fn segment_frames_come_from_the_exact_ntsc_rational() {
+        let m = media("m1", r"C:\v.mp4", 1920, 1080, false);
+        let c = clip("c1", "m1", 100.0, 0.0, 10.0);
+        let tl = timeline(1920, 1080, Rational { num: 30000, den: 1001 }, vec![vtrack(vec![c])]);
+        let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        let frames: Vec<u64> = base_durations(&b.filter_complex)
+            .iter()
+            .map(|d| (d * 30000.0 / 1001.0).ceil() as u64)
+            .collect();
+        assert_eq!(frames, [2997, 300], "{}", b.filter_complex);
+    }
+
+    /// A clip that rounds to no frame at all on the grid owns no frame of
+    /// the output, so ffmpeg is not even asked to open it.
+    #[test]
+    fn a_clip_shorter_than_half_a_frame_is_not_opened() {
+        let m = media("m1", r"C:\v.mp4", 1920, 1080, false);
+        let tiny = media("m2", r"C:\tiny.mp4", 1920, 1080, false);
+        let c1 = clip("c1", "m1", 0.0, 0.0, 1.0);
+        let c2 = clip("c2", "m2", 1.0, 0.0, 0.01);
+        let c3 = clip("c3", "m1", 1.01, 0.0, 1.0);
+        let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c1, c2, c3])]);
+        let b = build(&spec(vec![m, tiny], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        assert!(!argstr(&b).contains(&r"C:\tiny.mp4".to_string()), "{:?}", argstr(&b));
+        assert!(b.filter_complex.contains("concat=n=2:v=1:a=0"), "{}", b.filter_complex);
+    }
+
+    /// Every segment holds its clip's last frame to the end of the slot
+    /// (`tpad` before the `shortest=1` overlay), so neither a video stream
+    /// shorter than its clip nor a still or generator that ends up to half a
+    /// frame short of its whole-frame slot can end the segment early. The pad
+    /// is the segment's own length (2.5 s is 75 frames here). The real-ffmpeg
+    /// halves are `e2e_a_video_stream_shorter_than_its_clip_keeps_later_clips_on_time`
+    /// and `real_ffmpeg_places_every_clip_on_its_absolute_frame`.
+    #[test]
+    fn every_bottom_segment_is_padded_to_its_slot() {
         let m = media("m1", r"C:\v.mp4", 1920, 1080, false);
         let mut still = media("m2", r"C:\p.png", 640, 480, false);
         still.kind = "image".into();
@@ -1905,11 +2275,19 @@ mod tests {
         let tl = timeline(1920, 1080, Rational { num: 30, den: 1 }, vec![vtrack(vec![c1, c2, c3])]);
         let b = build(&spec(vec![m, still, solid], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
         let fc = &b.filter_complex;
-        assert_eq!(fc.matches("tpad=").count(), 1, "only the recording is padded: {fc}");
-        let i = fc.find("tpad=stop_mode=clone:stop_duration=2.500000[p").unwrap_or_else(|| panic!("{fc}"));
-        let label_end = fc[i..].find("];").unwrap() + i + 1;
-        let label = &fc[fc[..label_end].rfind('[').unwrap()..label_end];
-        assert!(fc.contains(&format!("{label}overlay=0:0:shortest=1")), "the padded chain feeds the overlay: {fc}");
+        assert_eq!(fc.matches("tpad=").count(), 3, "every clip is padded: {fc}");
+        for pad in ["2.500000", "2.000000", "1.000000"] {
+            let i = fc
+                .find(&format!("tpad=stop_mode=clone:stop_duration={pad}[p"))
+                .unwrap_or_else(|| panic!("no {pad} pad: {fc}"));
+            let label_end = fc[i..].find("];").unwrap() + i + 1;
+            let label = &fc[fc[..label_end].rfind('[').unwrap()..label_end];
+            let at = fc
+                .find(&format!("{label}overlay="))
+                .unwrap_or_else(|| panic!("the padded chain {label} must feed an overlay: {fc}"));
+            let stage = &fc[at..at + fc[at..].find(';').unwrap()];
+            assert!(stage.ends_with(&format!("shortest=1{}", &label.replace("[p", "[s"))), "{stage}");
+        }
     }
 
     fn cropped(crop: (f64, f64, f64, f64), media_wh: (u32, u32)) -> Placement {
@@ -2509,11 +2887,23 @@ mod tests {
     }
 
     /// A solid-white `w x h` H.264 fixture, created once and reused.
+    ///
+    /// Shared by several tests that run in parallel, and by other `cargo
+    /// test` processes on the same machine. So: one creator at a time in this
+    /// process (the lock), a part file named by process (no two writers ever
+    /// share one), the final name appearing only by rename, and an existing
+    /// file that does not probe (a run killed mid-write, before renames were
+    /// used) regenerated instead of trusted forever.
     fn white_source(w: u32, h: u32) -> std::path::PathBuf {
+        static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one_at_a_time = CREATE.lock().unwrap_or_else(|e| e.into_inner());
         // the space is deliberate: argv quoting is part of what is under test
         let p = geom_dir().join(format!("white {w}x{h}.mp4"));
+        if p.exists() && crate::media::probe::probe_sync(&p.to_string_lossy()).is_err() {
+            let _ = std::fs::remove_file(&p);
+        }
         if !p.exists() {
-            let tmp = geom_dir().join(format!("white {w}x{h}.part.mp4"));
+            let tmp = geom_dir().join(format!("white {w}x{h}.{}.part.mp4", std::process::id()));
             let out = crate::jobs::ffmpeg::command("ffmpeg")
                 .unwrap()
                 .args([
@@ -2688,7 +3078,7 @@ mod tests {
         assert!(fc.contains("volume=0.9976"), "{fc}");
         assert!(fc.contains("afade=t=in:st=0:d=0.5000"), "{fc}");
         assert!(fc.contains("afade=t=out:st=2.0000:d=1.0000"), "{fc}");
-        assert!(fc.contains("adelay=1500|1500"), "{fc}");
+        assert!(fc.contains("adelay=delays=1500:all=1[a0]"), "{fc}");
         assert!(fc.contains("amix=inputs=2:duration=first:normalize=0[aout]"), "{fc}");
         assert!(fc.contains("anullsrc=r=48000:cl=stereo"), "{fc}");
         let a = argstr(&b);
@@ -2852,8 +3242,8 @@ mod tests {
             let a = argstr(&b);
             let i = a.iter().position(|s| s == r"C:\pics\still.png").unwrap();
             assert_eq!(
-                &a[i - 5..i],
-                ["-loop", "1", "-t", "3.000000", "-i"],
+                &a[i - 7..i],
+                ["-loop", "1", "-t", "3.000000", "-protocol_whitelist", "file", "-i"],
                 "{container}: {a:?}"
             );
             assert!(!a.contains(&"-ss".to_string()), "{container}: {a:?}");
@@ -2901,9 +3291,9 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{container}/{vcodec}/{flag:?}: {e}"));
             let a = argstr(&b);
             let i = a.iter().position(|s| s == r"C:\pics\still.webp").unwrap();
-            let tail = ["-loop", "1", "-t", "3.000000", "-i"];
-            assert_eq!(&a[i - 5..i], tail, "{container}/{vcodec}/{flag:?}: {a:?}");
-            assert_eq!(a[i - 6] == "-noautorotate", raw, "{container}/{vcodec}/{flag:?}: {a:?}");
+            let tail = ["-loop", "1", "-t", "3.000000", "-protocol_whitelist", "file", "-i"];
+            assert_eq!(&a[i - 7..i], tail, "{container}/{vcodec}/{flag:?}: {a:?}");
+            assert_eq!(a[i - 8] == "-noautorotate", raw, "{container}/{vcodec}/{flag:?}: {a:?}");
             let count = a.iter().filter(|s| *s == "-noautorotate").count();
             assert_eq!(count, usize::from(raw), "{container}/{vcodec}/{flag:?}: only the still's input, once: {a:?}");
         }
@@ -3069,7 +3459,11 @@ mod tests {
                 }
                 None => assert!(!a.contains(&"-c:a".to_string()), "{format}: {a:?}"),
             }
-            assert_eq!(b.filter_complex.contains("palettegen"), gif, "{format}");
+            assert_eq!(
+                b.palette_pass.as_ref().is_some_and(|p| p.filter_complex.contains("palettegen")),
+                gif,
+                "{format}"
+            );
             assert_eq!(a.contains(&"[gifout]".to_string()), gif, "{format}: {a:?}");
             assert_eq!(
                 a.windows(2).any(|w| w[0] == "-tag:v" && w[1] == "hvc1"),
@@ -3100,7 +3494,8 @@ mod tests {
         assert!(b.filter_complex.contains("setpts=(PTS-STARTPTS)/2.000000"), "{}", b.filter_complex);
         // …and the black base it is overlaid onto is the TIMELINE length, so a
         // short input would leave the tail of the segment empty.
-        assert!(b.filter_complex.contains("d=2.000000"), "{}", b.filter_complex);
+        // (60 frames, so its d= is half a frame short of 2 s: see `frames_duration`)
+        assert!(b.filter_complex.contains("color=black:s=1920x1080:r=30:d=1.983333"), "{}", b.filter_complex);
         assert!((b.duration_sec - 2.0).abs() < 1e-9);
     }
 
@@ -3131,7 +3526,7 @@ mod tests {
                     "{what} at speed {speed}: {} != {slot}", b.duration_sec
                 );
                 assert!(
-                    b.filter_complex.contains(&format!("d={slot:.6}")),
+                    b.filter_complex.contains(&format!("color=black:s=1920x1080:r=30:d={:.6}", slot - 1.0 / 60.0)),
                     "{what} at speed {speed} must cover a {slot:.6}s slot: {}",
                     b.filter_complex
                 );
@@ -3189,18 +3584,52 @@ mod tests {
         assert!(r.is_err());
     }
 
+    /// A GIF is two runs and NO `split`: a split feeding `paletteuse` from
+    /// the same stream that feeds `palettegen` queues every frame of the
+    /// export until end of stream. Pass 1 ends in `palettegen` and writes the
+    /// palette; pass 2 reads it back as its LAST input (after the media, so
+    /// no media index moves) and maps the graph through `paletteuse`. Both
+    /// passes share the media inputs and the video graph exactly. The audio
+    /// of an audible clip is not even opened: a GIF has no audio stream.
     #[test]
-    fn gif_graph_has_palette() {
+    fn a_gif_is_two_passes_with_no_split_feeding_paletteuse() {
         let m = media("m1", r"C:\v.mp4", 640, 360, true);
         let c = clip("c1", "m1", 0.0, 0.0, 1.0);
         let tl = timeline(640, 360, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
         let b = build(&spec(vec![m], tl, preset("gif", "h264"), r"C:\o.gif"), &enc()).unwrap();
-        assert!(b.filter_complex.contains("palettegen=stats_mode=diff"));
-        assert!(b.filter_complex.contains("paletteuse=dither=bayer:bayer_scale=4"));
+        let pass1 = b.palette_pass.as_ref().expect("a GIF has a palette pass");
+        for fc in [&b.filter_complex, &pass1.filter_complex] {
+            // (A clip with an opacity keyframe splits its OWN frames for the
+            // alpha mask; that one is consumed frame by frame. This clip has
+            // none, so any split here would be the palette one.)
+            assert!(!fc.contains("split"), "nothing may buffer the export: {fc}");
+        }
+        assert!(pass1.filter_complex.ends_with(";[vout]palettegen=stats_mode=diff[pal]"), "{}", pass1.filter_complex);
+        assert!(!pass1.filter_complex.contains("paletteuse"));
+        assert!(b.filter_complex.ends_with(";[vout][1:v]paletteuse=dither=bayer:bayer_scale=4[gifout]"), "{}", b.filter_complex);
+        assert!(!b.filter_complex.contains("palettegen"));
+        // The same video graph in both.
+        let video = |fc: &str| fc[..fc.rfind(";[vout]").unwrap()].to_string();
+        assert_eq!(video(&b.filter_complex), video(&pass1.filter_complex));
+
         let a = argstr(&b);
+        let p1: Vec<String> = pass1.args.iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        // Pass 1 writes one PNG frame to the palette placeholder.
+        assert_eq!(
+            &p1[p1.len() - 11..],
+            ["-map", "[pal]", "-frames:v", "1", "-update", "1", "-c:v", "png", "-f", "image2", PALETTE_PLACEHOLDER]
+        );
+        // Pass 2: the media input, then the palette as input 1, behind the whitelist.
+        let i = a.iter().position(|s| s == PALETTE_PLACEHOLDER).unwrap();
+        assert_eq!(&a[i - 3..i], ["-protocol_whitelist", "file", "-i"]);
+        assert_eq!(a.iter().filter(|s| *s == "-i").count(), 2, "{a:?}");
+        assert_eq!(p1.iter().filter(|s| *s == "-i").count(), 1, "{p1:?}");
         assert!(a.windows(2).any(|w| w[0] == "-map" && w[1] == "[gifout]"));
         assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "gif"));
+        assert_eq!(a.last().unwrap(), r"C:\o.gif");
         assert!(!a.windows(2).any(|w| w[0] == "-c:a"));
+        assert_eq!(b.encoder, None);
+        assert_eq!(b.sources, [OsString::from(r"C:\v.mp4")], "the palette is not a source to check");
     }
 
     /// Every frame rate the graph names: each `fps=` filter and each `r=` of a
@@ -3335,7 +3764,7 @@ mod tests {
         let b = build(&spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
         let fc = &b.filter_complex;
         // clip segment + tail-pad black to 5s → concat n=2, a 3s black tail.
-        assert!(fc.contains("color=black:s=1920x1080:r=30:d=3.000000"), "{fc}");
+        assert!(fc.contains("color=black:s=1920x1080:r=30:d=2.983333"), "{fc}");
         assert!(fc.contains("concat=n=2:v=1:a=0"), "{fc}");
     }
 
@@ -3620,17 +4049,9 @@ mod tests {
         let drawing = || {
             gen_media(
                 "d1",
-                Generator::Drawing {
-                    chunks: vec![vec![Stroke {
-                        t: "pen".into(),
-                        c: Some("#1a2b3c".into()),
-                        w: 4.0,
-                        o: Some(1.0),
-                        p: Some("AAAAAAAAAAAAAAAA".into()),
-                        a: None,
-                        b: None,
-                    }]],
-                },
+                // The typed model keeps only the stroke count; the exporter
+                // refuses on the variant alone, so one stroke is enough.
+                Generator::Drawing { strokes: 1 },
                 641,
                 361,
             )
@@ -3742,7 +4163,9 @@ mod tests {
         let b = build(&spec(vec![gm], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
         let fc = &b.filter_complex;
         // fontfile escaped: drive colon → \: and backslashes → forward slashes.
-        assert!(fc.contains(r"fontfile='C\:/Windows/Fonts/georgia.ttf'"), "{fc}");
+        let font = escape_filter_value(&fonts_dir().join("georgia.ttf").to_string_lossy());
+        assert!(font.contains(r"\:/"), "premise: a drive colon to escape: {font}");
+        assert!(fc.contains(&format!("fontfile={font}:")), "{fc}");
         assert!(fc.contains("expansion=none"), "{fc}");
         assert!(fc.contains("fontcolor=0xffffff"), "{fc}");
         // textfile placeholder present + payload carries the raw text.
@@ -3754,7 +4177,28 @@ mod tests {
     #[test]
     fn impact_bold_falls_back_to_regular() {
         assert_eq!(font_file("Impact", true, true), Some("impact"));
-        assert_eq!(font_path("Impact", true, false).as_deref(), Some(r"C:\Windows\Fonts\impact.ttf"));
+        assert_eq!(
+            font_path("Impact", true, false).map(std::path::PathBuf::from),
+            Some(fonts_dir().join("impact.ttf"))
+        );
+    }
+
+    /// The fonts folder follows Windows wherever it is installed. Each row
+    /// names a different folder, so a rule that skipped a variable, read
+    /// them in the wrong order or kept the hardcoded C: answers wrong.
+    #[test]
+    fn the_fonts_folder_follows_where_windows_is_installed() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        let p = std::path::PathBuf::from;
+        assert_eq!(fonts_dir_from(os(r"D:\WinNT"), os(r"E:\Other")), p(r"D:\WinNT\Fonts"));
+        assert_eq!(fonts_dir_from(None, os(r"E:\Other")), p(r"E:\Other\Fonts"));
+        assert_eq!(fonts_dir_from(os(""), os(r"E:\Other")), p(r"E:\Other\Fonts"), "an empty SystemRoot is no answer");
+        assert_eq!(fonts_dir_from(None, None), p(r"C:\Windows\Fonts"));
+        // And the font a text clip exports with is looked for there.
+        assert!(
+            std::path::Path::new(&font_path("Arial", false, false).unwrap()).starts_with(fonts_dir()),
+            "font_path must build on fonts_dir"
+        );
     }
 
     #[test]
@@ -4721,5 +5165,377 @@ mod tests {
         assert!(!a.contains(&"-c:v".to_string()), "{a:?}");
         assert!(!a.contains(&"h264_nvenc".to_string()), "{a:?}");
         assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "gif"), "{a:?}");
+    }
+
+    /* -------- every file input is opened as a file, and only as one -------- */
+
+    /// Every `-i` the builder emits is preceded by `-protocol_whitelist file`:
+    /// a video clip, a still, an audible clip's second input and a clip on an
+    /// upper track. Media paths come from a shareable `.trt`, and the bundled
+    /// ffmpeg has its network protocols built in, so one `-i` without the
+    /// whitelist is one URL the export would connect to. Counted, so dropping
+    /// it from any one input kind fails here.
+    #[test]
+    fn every_file_input_is_behind_the_file_only_whitelist() {
+        let v = media("m1", r"C:\clips\a.mp4", 1918, 1078, true);
+        let mut still = media("m2", r"C:\pics\b.png", 640, 480, false);
+        still.kind = "image".into();
+        still.container = Some("png_pipe".into());
+        let mut voice = media("m3", r"C:\sound\c.m4a", 0, 0, true);
+        voice.kind = "audio".into();
+        let tl = timeline(
+            1280,
+            720,
+            Rational { num: 30, den: 1 },
+            vec![
+                vtrack_id("top", vec![clip("t", "m2", 0.5, 0.0, 1.0)]),
+                vtrack_id("bot", vec![clip("b", "m1", 0.0, 0.0, 2.0)]),
+                Track {
+                    id: "a".into(), kind: "audio".into(), name: "A".into(),
+                    muted: false, clips: vec![clip("v", "m3", 0.25, 0.0, 1.0)], hidden: None,
+                },
+            ],
+        );
+        let b = build(&spec(vec![v, still, voice], tl, preset("mp4", "h264"), r"C:\o.mp4"), &enc()).unwrap();
+        let a = argstr(&b);
+        let inputs: Vec<usize> = a.iter().enumerate().filter(|(_, s)| *s == "-i").map(|(i, _)| i).collect();
+        // the video, the still, the video's own audio, the voice memo
+        assert_eq!(inputs.len(), 4, "{a:?}");
+        for i in inputs {
+            assert_eq!(&a[i - 2..i], INPUT_PROTOCOL_ARGS, "input {} is not behind the whitelist: {a:?}", a[i + 1]);
+        }
+    }
+
+    /* -------- preset numbers from a crafted project -------- */
+
+    /// The preset numbers a crafted `.trt` can carry are refused by name,
+    /// before anything is spawned; each row changes ONE field of a project
+    /// that otherwise builds, and the last rows are the dialog's own limits,
+    /// which must still build.
+    #[test]
+    fn out_of_range_preset_numbers_are_refused_by_name() {
+        let base = || {
+            let m = media("m1", r"C:\v.mp4", 1918, 1078, true);
+            let c = clip("c1", "m1", 0.0, 0.0, 2.0);
+            let tl = timeline(1280, 720, Rational { num: 30, den: 1 }, vec![vtrack(vec![c])]);
+            spec(vec![m], tl, preset("mp4", "h264"), r"C:\o.mp4")
+        };
+        let refused = |s: ExportSpec, needle: &str| match build(&s, &enc()) {
+            Err(AppError::BadInput(m)) => assert!(m.contains(needle), "wanted {needle:?} in: {m}"),
+            Err(e) => panic!("wrong variant for {needle}: {e:?}"),
+            Ok(_) => panic!("must be refused: {needle}"),
+        };
+        let with = |f: &dyn Fn(&mut ExportSpec)| {
+            let mut s = base();
+            f(&mut s);
+            s
+        };
+        build(&base(), &enc()).expect("premise: the base project builds");
+
+        for fps in [0.0, 0.0004, 0.5, 240.5, 1e6, f64::NAN, f64::INFINITY, -30.0] {
+            refused(with(&|s| s.preset.fps = FpsPreset::Custom(fps)), "frame rate");
+        }
+        refused(with(&|s| s.timeline.fps = Rational { num: 0, den: 1 }), "frame rate");
+        refused(with(&|s| s.timeline.fps = Rational { num: 4_000_000, den: 1 }), "frame rate");
+        for (w, h) in [(1, 720), (1280, 0), (16_386, 720), (1280, 20_000)] {
+            refused(with(&|s| s.preset.resolution = ResolutionPreset::Custom { w, h }), "export size");
+        }
+        // A canvas no camera makes, under "Original": the size that would be
+        // encoded is what is checked.
+        refused(with(&|s| { s.timeline.width = 40_000; s.timeline.height = 720; }), "larger than 16384");
+        for k in [0, 99, 500_001, u64::MAX] {
+            refused(with(&|s| s.preset.video_bitrate = BitratePreset::Kbps(k)), "video bitrate");
+        }
+        for k in [0, 31, 500_001, u64::MAX] {
+            refused(with(&|s| s.preset.audio_bitrate = BitratePreset::Kbps(k)), "audio bitrate");
+        }
+
+        // The dialog's own limits build.
+        for fps in [1.0, 23.976, 240.0] {
+            build(&with(&|s| s.preset.fps = FpsPreset::Custom(fps)), &enc()).unwrap_or_else(|e| panic!("{fps}: {e}"));
+        }
+        build(&with(&|s| s.preset.resolution = ResolutionPreset::Custom { w: 16_384, h: 2 }), &enc()).unwrap();
+        let b = build(
+            &with(&|s| {
+                s.preset.video_bitrate = BitratePreset::Kbps(500_000);
+                s.preset.audio_bitrate = BitratePreset::Kbps(32);
+            }),
+            &enc(),
+        )
+        .unwrap();
+        let a = argstr(&b);
+        assert!(a.windows(2).any(|w| w[0] == "-bufsize" && w[1] == "2000000k"), "{a:?}");
+        // A 4320p portrait export is taller than 8192 and is legitimate.
+        build(
+            &with(&|s| {
+                s.timeline.width = 1080;
+                s.timeline.height = 2400;
+                s.preset.resolution = ResolutionPreset::Named("4320p".into());
+            }),
+            &enc(),
+        )
+        .expect("4320x9600 is inside the bound");
+    }
+
+    /* -------- dropping frames before the per-frame filters -------- */
+
+    /// The early `fps=` goes right after the speed head exactly when the
+    /// clip delivers frames faster than the export runs, and never otherwise.
+    /// Each row is one clip on its own; `true` rows must carry TWO `fps=`
+    /// (the early one and the trailing one, which always stays).
+    #[test]
+    fn an_early_fps_is_emitted_only_where_frames_would_be_dropped() {
+        let rows: [(&str, &str, (u32, u32), f64, Option<f64>, bool); 7] = [
+            ("60 fps clip, 30 fps export", "mp4", (60, 1), 1.0, Some(30.0), true),
+            ("60 fps clip, GIF capped at 30", "gif", (60, 1), 1.0, None, true),
+            ("30 fps clip at speed 2", "mp4", (30, 1), 2.0, Some(30.0), true),
+            ("60 fps slow-motion at 0.25", "mp4", (60, 1), 0.25, Some(30.0), false),
+            ("24 fps clip, 30 fps export", "mp4", (24, 1), 1.0, Some(30.0), false),
+            ("29.97 clip, 30 fps export", "mp4", (30000, 1001), 1.0, Some(30.0), false),
+            ("60 fps clip, 60 fps export", "mp4", (60, 1), 1.0, Some(60.0), false),
+        ];
+        for (name, format, (num, den), speed, out_fps, early) in rows {
+            let mut m = media("m1", r"C:\v.mp4", 1918, 1078, false);
+            m.fps = Some(Rational { num, den });
+            let mut c = clip("c1", "m1", 0.0, 0.0, 2.0);
+            c.speed = speed;
+            let tl = timeline(1280, 720, Rational { num: 60, den: 1 }, vec![vtrack(vec![c])]);
+            let mut p = preset(format, "h264");
+            if let Some(f) = out_fps {
+                p.fps = FpsPreset::Custom(f);
+            }
+            let b = build(&spec(vec![m], tl, p, r"C:\o.mp4"), &enc()).unwrap();
+            let chain = b.filter_complex.split(';').find(|s| s.starts_with("[0:v]")).unwrap().to_string();
+            assert_eq!(chain.matches(",fps=").count(), if early { 2 } else { 1 }, "{name}: {chain}");
+            if early {
+                let speed_head = format!("[0:v]setpts=(PTS-STARTPTS)/{speed:.6},fps=");
+                assert!(chain.starts_with(&speed_head), "{name}: the early fps comes first: {chain}");
+            }
+        }
+        // A still never gets one, whatever its declared rate.
+        let mut still = media("m1", r"C:\p.png", 640, 480, false);
+        still.kind = "image".into();
+        still.container = Some("png_pipe".into());
+        still.fps = Some(Rational { num: 25, den: 1 });
+        let tl = timeline(1280, 720, Rational { num: 30, den: 1 }, vec![vtrack(vec![clip("c1", "m1", 0.0, 0.0, 2.0)])]);
+        let mut p = preset("mp4", "h264");
+        p.fps = FpsPreset::Custom(10.0);
+        let b = build(&spec(vec![still], tl, p, r"C:\o.mp4"), &enc()).unwrap();
+        assert_eq!(b.filter_complex.matches(",fps=").count(), 1, "{}", b.filter_complex);
+    }
+
+    /* -------- H.264 hardware encoders stop at 4096 px -------- */
+
+    /// Above 4096 px on either side the H.264 hardware encoders cannot
+    /// encode, so libx264 takes the export; at 4096 the hardware encoder is
+    /// kept, and HEVC hardware (whose limit is higher) is not touched. The
+    /// same hardware report throughout, so each row differs in one thing.
+    #[test]
+    fn an_h264_hardware_export_wider_than_4096_falls_back_to_libx264() {
+        let built_at = |vcodec: &str, w: u32, h: u32, r: &EncoderReport| {
+            let mut p = hw_preset("mp4", vcodec);
+            p.resolution = ResolutionPreset::Custom { w, h };
+            built_with(p, r)
+        };
+        for hw in ["h264_nvenc", "h264_qsv", "h264_amf"] {
+            let r = report(hw, "hevc_nvenc", "av1_nvenc");
+            assert_eq!(built_at("h264", 4096, 2304, &r).encoder.as_deref(), Some(hw), "{hw} at 4096");
+            assert_eq!(built_at("h264", 4098, 2306, &r).encoder.as_deref(), Some("libx264"), "{hw} wide");
+            assert_eq!(built_at("h264", 2160, 4320, &r).encoder.as_deref(), Some("libx264"), "{hw} tall");
+            let a = argstr(&built_at("h264", 7680, 4320, &r));
+            assert!(a.windows(2).any(|w| w[0] == "-c:v" && w[1] == "libx264"), "{a:?}");
+            assert!(a.windows(2).any(|w| w[0] == "-crf" && w[1] == "20"), "libx264's own quality args: {a:?}");
+        }
+        let r = report("h264_nvenc", "hevc_nvenc", "av1_nvenc");
+        assert_eq!(built_at("hevc", 7680, 4320, &r).encoder.as_deref(), Some("hevc_nvenc"));
+    }
+
+    /* -------- real ffmpeg: surround audio and frame placement -------- */
+
+    /// A private directory for one real-ffmpeg test, emptied first.
+    fn case_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("taroting builder case {tag} {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn ffmpeg_ok(args: &[&str]) {
+        let out = crate::jobs::ffmpeg::command("ffmpeg").unwrap().args(args).output().unwrap();
+        assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Peak level (dB) of the exported audio between `from` and `to` seconds.
+    fn max_volume(path: &std::path::Path, from: f64, to: f64) -> f64 {
+        let out = crate::jobs::ffmpeg::command("ffmpeg")
+            .unwrap()
+            .args(["-hide_banner", "-nostats", "-i"])
+            .arg(path)
+            .args(["-vn", "-af", &format!("atrim={from}:{to},volumedetect"), "-f", "null", "-"])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        let line = err.lines().find(|l| l.contains("max_volume:")).unwrap_or_else(|| panic!("{err}"));
+        let v = line.split("max_volume:").nth(1).unwrap().trim().trim_end_matches(" dB");
+        if v == "-inf" { -200.0 } else { v.parse().unwrap() }
+    }
+
+    /// A 5.1 clip placed at 1.0 s with its tone ONLY in the centre channel
+    /// (dialogue's channel). Before the clip starts the export must be
+    /// silent. With `adelay={d}|{d}` only FL/FR are delayed, so wherever the
+    /// chain still carries six channels the centre plays from zero.
+    ///
+    /// Measured with the bundled 8.1.1: the graph AS BUILT does not show the
+    /// defect, because the input's `-ss/-to` makes ffmpeg insert a trim whose
+    /// format negotiation downmixes to the stereo `amix` base BEFORE
+    /// `adelay`. That is an accident of negotiation, not a guarantee, so the
+    /// same argv is also run with the input seek removed — the six channels
+    /// then reach `adelay`, and the old two-delay form is loud here
+    /// (-6 dB, against -91 dB with `all=1`).
+    #[test]
+    fn real_ffmpeg_delays_every_channel_of_a_surround_clip() {
+        let dir = case_dir("surround");
+        let src = dir.join("centre only 5.1.m4a");
+        ffmpeg_ok(&[
+            "-y", "-hide_banner", "-f", "lavfi",
+            "-i", "aevalsrc=0|0|0.5*sin(440*2*PI*t)|0|0|0:c=5.1:s=48000:d=2",
+            "-c:a", "aac", src.to_str().unwrap(),
+        ]);
+        let mut m = media("m1", &src.to_string_lossy(), 0, 0, true);
+        m.kind = "audio".into();
+        m.fps = None;
+        m.audio_channels = Some(6);
+        let audio = Track {
+            id: "a".into(), kind: "audio".into(), name: "A".into(),
+            muted: false, clips: vec![clip("c1", "m1", 1.0, 0.0, 2.0)], hidden: None,
+        };
+        let tl = timeline(320, 180, Rational { num: 30, den: 1 }, vec![audio]);
+        let out = dir.join("surround out.mp4");
+        let mut b = build(&spec(vec![m], tl, preset("mp4", "h264"), &out.to_string_lossy()), &enc()).unwrap();
+        encode_built(&b, &out);
+        let during = max_volume(&out, 1.3, 2.7);
+        assert!(during > -30.0, "premise: the centre tone reaches the export: {during} dB");
+        let before = max_volume(&out, 0.0, 0.85);
+        assert!(before < -60.0, "nothing may play before the clip starts: {before} dB");
+
+        // The same argv with the input's `-ss 0 -to 2` taken out (the clip
+        // covers the whole file, so the content is unchanged).
+        let seek = b.args.iter().position(|a| a == "-ss").expect("the audio input seeks");
+        assert_eq!(b.args[seek + 2], "-to");
+        b.args.drain(seek..seek + 4);
+        let unseeked = dir.join("surround unseeked.mp4");
+        encode_built(&b, &unseeked);
+        let during = max_volume(&unseeked, 1.3, 2.7);
+        assert!(during > -30.0, "unseeked: premise: the centre tone reaches the export: {during} dB");
+        let before = max_volume(&unseeked, 0.0, 0.85);
+        assert!(before < -60.0, "unseeked: the centre channel must be delayed too: {before} dB");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Three back-to-back clips of non-frame-aligned lengths (1.01, 0.77 and
+    /// 1.234 s at 30 fps) behind a 0.4 s gap, ending in a tail gap to 4 s,
+    /// two of them real FILES (the `-ss/-to` path and its `tpad`) and one a
+    /// generator. Each is a different colour, so every decoded frame says
+    /// whose it is: each clip's first frame must be frame `round(start*30)`
+    /// (12, 42, 65) and the file must hold `round(4*30) = 120` frames. The
+    /// old per-segment rounding put them at 12, 43 and 67 and wrote 123.
+    #[test]
+    fn real_ffmpeg_places_every_clip_on_its_absolute_frame() {
+        let dir = case_dir("frame grid");
+        let solid_file = |name: &str, colour: &str| {
+            let p = dir.join(name);
+            ffmpeg_ok(&[
+                "-y", "-hide_banner", "-f", "lavfi", "-i", &format!("color={colour}:s=160x90:r=30:d=3"),
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", p.to_str().unwrap(),
+            ]);
+            p
+        };
+        let red = solid_file("red clip.mp4", "red");
+        let blue = solid_file("blue clip.mp4", "blue");
+        let mut mr = media("r", &red.to_string_lossy(), 160, 90, false);
+        let mut mb = media("b", &blue.to_string_lossy(), 160, 90, false);
+        mr.duration = 3.0;
+        mb.duration = 3.0;
+        let green = gen_media("g", Generator::Solid { color: "#00ff00".into() }, 160, 90);
+        // A silent audio-track clip sets the 4 s timeline end without adding
+        // video to the bottom track.
+        let mut quiet = media("q", &red.to_string_lossy(), 160, 90, false);
+        quiet.kind = "audio".into();
+        let audio = Track {
+            id: "a".into(), kind: "audio".into(), name: "A".into(),
+            muted: false, clips: vec![clip("q1", "q", 3.0, 0.0, 1.0)], hidden: None,
+        };
+        let bottom = vtrack(vec![
+            clip("c1", "r", 0.4, 0.5, 1.51),
+            clip("c2", "g", 1.41, 0.0, 0.77),
+            clip("c3", "b", 2.18, 0.2, 1.434),
+        ]);
+        let tl = timeline(160, 90, Rational { num: 30, den: 1 }, vec![bottom, audio]);
+        let out = dir.join("grid out.mp4");
+        let b = build(&spec(vec![mr, mb, green, quiet], tl, preset("mp4", "h264"), &out.to_string_lossy()), &enc())
+            .unwrap();
+        encode_built(&b, &out);
+
+        let raw = crate::jobs::ffmpeg::command("ffmpeg")
+            .unwrap()
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&out)
+            .args(["-vf", "scale=4:4", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output()
+            .unwrap()
+            .stdout;
+        let frame = 4 * 4 * 3;
+        assert_eq!(raw.len() % frame, 0);
+        let colours: Vec<char> = raw
+            .chunks(frame)
+            .map(|f| {
+                let (r, g, b) = (f[15] as u32, f[16] as u32, f[17] as u32);
+                match (r > 128, g > 128, b > 128) {
+                    (true, false, false) => 'r',
+                    (false, true, false) => 'g',
+                    (false, false, true) => 'b',
+                    (false, false, false) => 'k',
+                    _ => '?',
+                }
+            })
+            .collect();
+        let seq: String = colours.iter().collect();
+        assert_eq!(colours.len(), 120, "frame count: {seq}");
+        let first = |c: char| colours.iter().position(|&x| x == c).unwrap_or_else(|| panic!("no {c}: {seq}"));
+        assert_eq!((first('r'), first('g'), first('b')), (12, 42, 65), "{seq}");
+        // And nothing bleeds: the tail after the blue clip's frame 102 is black.
+        assert!(colours[102..].iter().all(|&c| c == 'k'), "{seq}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The early `fps=` drops the same frames the trailing one would: a
+    /// 60 fps clip exported at 30 fps comes out at exactly 30 frames a second
+    /// of timeline (2 s, 60 frames), with the early filter in the graph.
+    #[test]
+    fn real_ffmpeg_early_fps_keeps_the_frame_count() {
+        let dir = case_dir("early fps");
+        let src = dir.join("sixty.mp4");
+        ffmpeg_ok(&[
+            "-y", "-hide_banner", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=60:d=3",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", src.to_str().unwrap(),
+        ]);
+        let mut m = media("m1", &src.to_string_lossy(), 320, 180, false);
+        m.fps = Some(Rational { num: 60, den: 1 });
+        m.duration = 3.0;
+        let tl = timeline(320, 180, Rational { num: 60, den: 1 }, vec![vtrack(vec![clip("c1", "m1", 0.0, 0.5, 2.5)])]);
+        let mut p = preset("mp4", "h264");
+        p.fps = FpsPreset::Custom(30.0);
+        let out = dir.join("thirty.mp4");
+        let b = build(&spec(vec![m], tl, p, &out.to_string_lossy()), &enc()).unwrap();
+        assert!(b.filter_complex.contains("/1.000000,fps=30,"), "premise: the early fps is in the graph: {}", b.filter_complex);
+        encode_built(&b, &out);
+        let probe = crate::jobs::ffmpeg::run(
+            "ffprobe",
+            &["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames",
+              "-of", "default=nw=1:nk=1", out.to_str().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "60");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -64,6 +64,13 @@ impl OpenPathQueue {
 /// under `panic = "abort"` — so a double-clicked file whose name the shell
 /// passes as undecodable UTF-16 would kill the process outright, with nothing
 /// on screen to explain it.
+///
+/// A SECOND launch never gets here: `forward_to_running` hands it over first,
+/// on the same `args_os` rule (`forward_payload`). The single-instance plugin's
+/// own forward still calls `std::env::args()` and would abort on such a name,
+/// but it now runs only for a launch that slips into the milliseconds between
+/// that pre-check and the plugin's own check — and that abort is the second
+/// launch's alone; the running app never sees it.
 pub fn capture_launch_arg(queue: &OpenPathQueue) {
     if let Some(arg) = first_file_arg(std::env::args_os()) {
         queue.push_os_if_file(&arg);
@@ -177,8 +184,8 @@ pub fn take_pending_open_paths(
 /// left to ask. The installer writes no `QuietUninstallString` for the same
 /// reason; there is nothing quiet to run.
 #[tauri::command]
-pub async fn uninstall_app() -> Result<()> {
-    tauri::async_runtime::spawn_blocking(run_uninstaller)
+pub async fn uninstall_app(app: tauri::AppHandle) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || run_uninstaller(&app))
         .await
         .map_err(|e| AppError::BadInput(format!("uninstall task failed: {e}")))?
 }
@@ -197,7 +204,8 @@ pub async fn uninstall_app() -> Result<()> {
 /// other process this app starts.
 ///
 /// Runs on the blocking pool, off the webview's thread, because of the sleep.
-fn run_uninstaller() -> Result<()> {
+fn run_uninstaller(app: &tauri::AppHandle) -> Result<()> {
+    use tauri::Manager;
     let exe = std::env::current_exe()?;
     let uninstaller = exe
         .parent()
@@ -213,12 +221,386 @@ fn run_uninstaller() -> Result<()> {
     }
     cmd.spawn().map_err(AppError::Io)?;
 
+    // `exit(0)` below skips every destructor and the run loop's Exit event, so
+    // the cache index's coalesced last-use stamps are written HERE or never.
+    // Before the beat, so the write is done well before the wizard can reach
+    // the "delete the application data" step. A disabled cache is not managed.
+    if let Some(cache) = app.try_state::<std::sync::Arc<crate::cache::Cache>>() {
+        cache.flush();
+    }
+
     // uninstall.exe self-copies to %TEMP% and re-execs from there before it can
-    // delete $INSTDIR; give it that beat before we let go of our own exe.
-    // exit(0) skips Drop but we hold no external resources needing it, and the
+    // delete $INSTDIR; give it that beat before we let go of our own exe. The
     // spawned child is not ours to reap — it outlives us on purpose.
     std::thread::sleep(std::time::Duration::from_millis(300));
     std::process::exit(0);
+}
+
+/* ------------------------------------------------------------------ */
+/* Second launches                                                     */
+/* ------------------------------------------------------------------ */
+
+/// The bundle identifier `tauri.conf.json` declares. tauri-plugin-single-instance
+/// (2.4.3, its `semver` feature off) names its mutex, its hidden event window's
+/// class and that window's title after it: `<id>-sim`, `<id>-sic`, `<id>-siw`.
+/// The forwarding below must use exactly those names, so a test pins this
+/// constant against the config file and the plugin's feature list.
+pub const APP_IDENTIFIER: &str = "com.taroting.app";
+
+/// `dwData` of the plugin's WM_COPYDATA. Its window procedure ignores any
+/// other tag, so a payload sent under a different one is silently dropped.
+#[cfg_attr(not(windows), allow(dead_code))]
+const FORWARD_TAG: usize = 1542;
+
+/// How long a second launch waits for the running instance's event window
+/// when the instance's mutex already exists. The plugin creates the mutex and
+/// then the window a few calls later, so a launch landing between the two used
+/// to find "an instance, but no window" and start a second full instance (its
+/// setup sweep could delete the first one's live quick-view files).
+pub const WINDOW_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long a second launch waits for the running instance to take its
+/// message. WM_COPYDATA is handled only when the instance's UI thread pumps,
+/// so during a busy spell the launch has to wait — the file is delivered once
+/// the thread is free. The plugin's own `SendMessageW` waited FOREVER: an
+/// instance that never got free again collected one hung process per
+/// double-click, for good. This bound ends them.
+///
+/// Long on purpose. A send that times out is WITHDRAWN, not left queued
+/// (measured: `a_busy_instance_gets_the_file_once_it_is_free`), so a short
+/// limit would drop the file of every double-click made during an ordinary
+/// few-second busy spell. Repeats of one double-click that all land when the
+/// thread frees up are folded into one open by [`RecentForward`].
+pub const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What became of an attempt to hand this launch to a running instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forward {
+    /// No other instance to hand over to: this process runs as the app.
+    Stay,
+    /// The running instance took the message.
+    Delivered,
+    /// The running instance is alive but did not take the message within
+    /// [`SEND_TIMEOUT`]; the message was withdrawn. The launch still ends:
+    /// a second full instance beside a wedged one would be worse than one
+    /// double-click that did nothing.
+    Unanswered,
+    /// The instance's window went away while we waited: it is closing. This
+    /// process runs as the app instead of handing its file to a dying one.
+    Gone,
+}
+
+impl Forward {
+    /// True when the process should end here: the launch was handed over,
+    /// or the instance is alive but would not take it.
+    pub fn ends_launch(self) -> bool {
+        matches!(self, Forward::Delivered | Forward::Unanswered)
+    }
+}
+
+/// The plugin's three object names for one identifier, as NUL-terminated
+/// UTF-16. A parameter rather than constants so the tests run against names
+/// of their own and never touch a Taroting the owner has open.
+pub struct InstanceNames {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    mutex: Vec<u16>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    class: Vec<u16>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    window: Vec<u16>,
+}
+
+impl InstanceNames {
+    pub fn of(id: &str) -> Self {
+        let wide = |suffix: &str| -> Vec<u16> {
+            format!("{id}-{suffix}").encode_utf16().chain(std::iter::once(0)).collect()
+        };
+        InstanceNames { mutex: wide("sim"), class: wide("sic"), window: wide("siw") }
+    }
+}
+
+/// The message a second launch sends: the plugin's own wire format,
+/// `"{cwd}|{argv0}|{file}\0"` as UTF-8, which its window procedure reads back
+/// with a lossy `CStr` conversion and a split on `|` (no Windows path can
+/// contain one). The running instance's callback then picks the file with
+/// [`forwarded_file_arg`].
+///
+/// Built from `args_os`, never `args`. The plugin's own forward calls
+/// `std::env::args()`, which PANICS on an argument that is not valid Unicode —
+/// an abort under `panic = "abort"`, before the running window was even
+/// focused. Here the file is chosen exactly as a first launch chooses it
+/// ([`first_file_arg_in`]: absolute, existing, losslessly decodable), so an
+/// undecodable name is passed over rather than mangled into a file that does
+/// not exist, and a relative name no longer depends on the receiver joining it
+/// to a working directory that might itself be undecodable (that is sent
+/// empty, as the plugin does).
+pub fn forward_payload(cwd: &Path, args: impl Iterator<Item = OsString>) -> Vec<u8> {
+    let mut args = args;
+    let argv0 = args.next().map(|a| a.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut text = format!("{}|{argv0}", cwd.to_str().unwrap_or_default());
+    // `first_file_arg_in` skips argv[0] itself; it has already been taken.
+    let rest = std::iter::once(OsString::new()).chain(args);
+    if let Some(file) = first_file_arg_in(rest, cwd) {
+        if let Some(file) = file.to_str() {
+            text.push('|');
+            text.push_str(file);
+        }
+    }
+    text.push('\0');
+    text.into_bytes()
+}
+
+/// [`forward_payload`] for this process's own command line.
+pub fn launch_payload() -> Vec<u8> {
+    forward_payload(&std::env::current_dir().unwrap_or_default(), std::env::args_os())
+}
+
+/// `main()`, before anything else: if an instance is already running, hand
+/// this launch to it. Runs BEFORE the single-instance plugin, which would
+/// otherwise do the forwarding itself with the three flaws described on
+/// [`WINDOW_WAIT`], [`SEND_TIMEOUT`] and [`forward_payload`].
+///
+/// A plain first launch pays one `OpenMutexW` that finds nothing; `payload` is
+/// built only when there is somewhere to send it. The plugin still runs
+/// afterwards and still owns the mutex, the window and the receiving side. A
+/// launch that slips in after this check (no mutex yet) and before the
+/// plugin's (mutex AND window up) still takes the plugin's own forward: a
+/// window of milliseconds, against the whole life of the app before.
+pub fn forward_to_running(
+    names: &InstanceNames,
+    payload: impl FnOnce() -> Vec<u8>,
+    wait: std::time::Duration,
+    timeout: std::time::Duration,
+) -> Forward {
+    #[cfg(windows)]
+    {
+        if !win::mutex_exists(names) {
+            return Forward::Stay;
+        }
+        match win::wait_for_window(names, |_| true, wait) {
+            Some(hwnd) => win::send(hwnd, &payload(), timeout),
+            None => Forward::Stay,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (names, payload, wait, timeout);
+        Forward::Stay
+    }
+}
+
+/// `.setup()`, first thing: did the plugin make THIS process the instance?
+///
+/// The plugin starts a second full instance when its `CreateMutexW` reports
+/// "already exists" but the first instance's window is not up yet. The
+/// pre-check in `main()` waits for that window, but a launch can still reach
+/// the plugin inside the gap. So: if an instance window belongs to `own_pid`,
+/// the plugin made us the instance and nothing changes (one `FindWindowExW`,
+/// no wait). Otherwise wait for ANOTHER process's window and hand over to it
+/// before this process sweeps temp projects or writes anything. `Stay` when
+/// none appears — the old behaviour, a second instance.
+///
+/// Enumerated, not a single `FindWindowW`: while a closing instance's window
+/// and a fresh one's briefly coexist, the first match could be either.
+pub fn forward_if_not_primary(
+    names: &InstanceNames,
+    own_pid: u32,
+    payload: impl FnOnce() -> Vec<u8>,
+    wait: std::time::Duration,
+    timeout: std::time::Duration,
+) -> Forward {
+    #[cfg(windows)]
+    {
+        if win::find_window(names, |pid| pid == own_pid).is_some() {
+            return Forward::Stay;
+        }
+        match win::wait_for_window(names, |pid| pid != own_pid, wait) {
+            Some(hwnd) => win::send(hwnd, &payload(), timeout),
+            None => Forward::Stay,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (names, own_pid, payload, wait, timeout);
+        Forward::Stay
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HWND};
+    use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
+    use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowExW, GetWindowThreadProcessId, IsWindow, SendMessageTimeoutW, SMTO_NORMAL,
+        WM_COPYDATA,
+    };
+
+    use super::{Forward, InstanceNames, FORWARD_TAG};
+
+    const POLL: Duration = Duration::from_millis(10);
+
+    /// Whether some process holds the instance mutex. Opened for SYNCHRONIZE
+    /// only and closed at once: a handle kept here would keep the mutex alive
+    /// after the instance that owns it has gone.
+    pub(super) fn mutex_exists(names: &InstanceNames) -> bool {
+        // SAFETY: a NUL-terminated name; the handle is closed before return.
+        unsafe {
+            let h = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, names.mutex.as_ptr());
+            if h.is_null() {
+                return false;
+            }
+            CloseHandle(h);
+            true
+        }
+    }
+
+    /// The first top-level instance window whose owning process `want`s.
+    pub(super) fn find_window(names: &InstanceNames, want: impl Fn(u32) -> bool) -> Option<HWND> {
+        let mut after: HWND = std::ptr::null_mut();
+        loop {
+            // SAFETY: NUL-terminated names; `after` is null or a window this
+            // loop was just handed, which is all FindWindowExW asks of it.
+            let hwnd = unsafe {
+                FindWindowExW(std::ptr::null_mut(), after, names.class.as_ptr(), names.window.as_ptr())
+            };
+            if hwnd.is_null() {
+                return None;
+            }
+            let mut pid = 0u32;
+            // SAFETY: a window handle and a writable u32.
+            unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+            if want(pid) {
+                return Some(hwnd);
+            }
+            after = hwnd;
+        }
+    }
+
+    /// [`find_window`], polled until `wait` has passed.
+    pub(super) fn wait_for_window(
+        names: &InstanceNames,
+        want: impl Fn(u32) -> bool,
+        wait: Duration,
+    ) -> Option<HWND> {
+        let start = Instant::now();
+        loop {
+            if let Some(hwnd) = find_window(names, &want) {
+                return Some(hwnd);
+            }
+            if start.elapsed() >= wait {
+                return None;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Send `payload` as the plugin's WM_COPYDATA, waiting at most `timeout`.
+    /// SMTO_NORMAL, deliberately not SMTO_ABORTIFHUNG: that flag gives up at
+    /// once on a thread that has been busy for five seconds, and a busy
+    /// instance should still get the file once it is free.
+    ///
+    /// Delivered only when the window procedure ANSWERED 1, as the plugin's
+    /// does for every WM_COPYDATA. A send also "succeeds", answering 0, when
+    /// the receiving thread ends with the message unhandled (measured:
+    /// `an_instance_that_closes_while_we_wait_is_gone`), and that file was
+    /// handed to nobody.
+    pub(super) fn send(hwnd: HWND, payload: &[u8], timeout: Duration) -> Forward {
+        let cds = COPYDATASTRUCT {
+            dwData: FORWARD_TAG,
+            cbData: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+            lpData: payload.as_ptr() as *mut _,
+        };
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        let mut answer = 0usize;
+        // SAFETY: `cds` and the bytes it points at outlive the call, which
+        // is the whole of WM_COPYDATA's contract with the sender.
+        let sent = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                WM_COPYDATA,
+                0,
+                &cds as *const COPYDATASTRUCT as isize,
+                SMTO_NORMAL,
+                millis,
+                &mut answer,
+            )
+        };
+        if sent != 0 && answer != 0 {
+            return Forward::Delivered;
+        }
+        // SAFETY: IsWindow accepts any value and never faults.
+        if unsafe { IsWindow(hwnd) } != 0 {
+            Forward::Unanswered
+        } else {
+            Forward::Gone
+        }
+    }
+}
+
+/// The last path a second launch forwarded, and when — so a burst of the same
+/// double-click opens the file once. While the UI thread is busy for a few
+/// seconds, every double-click's launch waits on it (see [`SEND_TIMEOUT`]),
+/// and once it is free it handles them all within milliseconds; without this
+/// each one became another open of the same file. Seeded with the launch's own file, so an
+/// impatient second double-click on the file that is still starting the app
+/// does not open it twice either.
+#[derive(Default)]
+pub struct RecentForward(Mutex<Option<(String, std::time::Instant)>>);
+
+/// The same path again within this long is a repeat.
+pub const REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl RecentForward {
+    /// Remember `path` (the launch's own file) as arriving at `now`.
+    pub fn seeded(path: Option<String>, now: std::time::Instant) -> Self {
+        RecentForward(Mutex::new(path.map(|p| (p, now))))
+    }
+
+    /// True when `path` arrives less than [`REPEAT_WINDOW`] after the same
+    /// path did. Every call is remembered, so a steady stream of repeats stays
+    /// a repeat. Poison-tolerant: it runs inside the plugin's window
+    /// procedure, where a panic aborts the app.
+    pub fn is_repeat(&self, path: &str, now: std::time::Instant) -> bool {
+        let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let repeat = matches!(&*last, Some((p, t))
+            if p == path && now.saturating_duration_since(*t) < REPEAT_WINDOW);
+        *last = Some((path.to_owned(), now));
+        repeat
+    }
+}
+
+/// The first queued path, without draining: the launch's own file, read in
+/// `main()` to seed [`RecentForward`].
+pub fn first_queued(queue: &OpenPathQueue) -> Option<String> {
+    queue.0.lock().ok()?.first().cloned()
+}
+
+/// A plain native error box, for the one failure that leaves no page to show
+/// anything in (the display engine could not start, main.rs). Blocks until
+/// the user dismisses it.
+pub fn show_error(title: &str, text: &str) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND,
+        };
+        let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+        let (title, text) = (wide(title), wide(text));
+        // SAFETY: NUL-terminated strings that outlive the call; no owner window.
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    eprintln!("{title}: {text}");
 }
 
 /* ------------------------------------------------------------------ */
@@ -546,6 +928,398 @@ mod tests {
         .join();
         assert!(q.0.is_poisoned(), "fixture must be poisoned");
         assert!(!queued_known_launch(&q));
+    }
+
+    /* ---- second launches ---- */
+
+    /// The forwarding talks to tauri-plugin-single-instance by NAME, so the
+    /// names must be the plugin's: the identifier from tauri.conf.json, and no
+    /// `semver` feature (it appends a version to every name). That feature
+    /// pulls in the semver crate, so the lock file's entry for the plugin
+    /// shows it. The version pin makes an upgrade stop here, where its names
+    /// and wire format get re-checked against its source.
+    #[test]
+    fn the_instance_names_are_the_plugins() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json parses");
+        assert_eq!(conf["identifier"], APP_IDENTIFIER);
+
+        let lock = include_str!("../Cargo.lock");
+        let entry = lock
+            .split("[[package]]")
+            .find(|p| p.contains("name = \"tauri-plugin-single-instance\""))
+            .expect("the plugin is in Cargo.lock");
+        assert!(
+            entry.contains("version = \"2.4.3\""),
+            "the plugin changed version: re-check its names and WM_COPYDATA format, then move this pin"
+        );
+        assert!(!entry.contains("\"semver"), "the semver feature is on: every name has a version suffix");
+
+        let names = InstanceNames::of(APP_IDENTIFIER);
+        let text = |w: &[u16]| String::from_utf16(w).unwrap();
+        assert_eq!(text(&names.mutex), "com.taroting.app-sim\0");
+        assert_eq!(text(&names.class), "com.taroting.app-sic\0");
+        assert_eq!(text(&names.window), "com.taroting.app-siw\0");
+    }
+
+    /// What the plugin's window procedure does with the bytes (its WM_COPYDATA
+    /// arm): a lossy C string, split on `|`, the first part the working
+    /// directory and the rest argv.
+    fn plugin_parse(bytes: &[u8]) -> (String, Vec<String>) {
+        let text = std::ffi::CStr::from_bytes_until_nul(bytes)
+            .expect("NUL-terminated")
+            .to_string_lossy()
+            .into_owned();
+        let mut parts = text.split('|');
+        let cwd = parts.next().unwrap_or_default().to_string();
+        (cwd, parts.map(str::to_string).collect())
+    }
+
+    /// argv[1] is an EXISTING file whose name is not valid Unicode (where the
+    /// plugin's `std::env::args()` aborts the process), argv[2] a relative
+    /// name of a real file. The payload passes over the first, sends the
+    /// second absolute, and the receiver's own parsing plus
+    /// `forwarded_file_arg` — run against a DIFFERENT directory — recover it.
+    #[cfg(windows)]
+    #[test]
+    fn the_payload_passes_over_an_undecodable_name_and_reaches_the_receiver() {
+        let dir = temp_dir("payload");
+        let mut weird = dir.clone().into_os_string();
+        weird.push(std::path::MAIN_SEPARATOR_STR);
+        weird.push(undecodable_name("weird"));
+        std::fs::write(&weird, b"{}").unwrap();
+        assert!(Path::new(&weird).is_file() && weird.to_str().is_none(), "fixture");
+        let file = dir.join("clip two.mp4");
+        std::fs::write(&file, b"x").unwrap();
+        let file_s = file.to_str().unwrap().to_string();
+        let exe = r"C:\Program Files\Taroting\taroting.exe";
+
+        let bytes = forward_payload(&dir, vec![os(exe), weird, os("clip two.mp4")].into_iter());
+        assert_eq!(bytes.last(), Some(&0), "the receiver reads up to a NUL");
+        let (cwd, argv) = plugin_parse(&bytes);
+        assert_eq!(cwd, dir.to_str().unwrap());
+        assert_eq!(argv, vec![exe.to_string(), file_s.clone()]);
+
+        let other = temp_dir("payload-elsewhere");
+        assert_eq!(forwarded_file_arg(&argv, other.to_str().unwrap()), Some(file_s));
+
+        // No file at all: still a message (the running window is focused).
+        let bytes = forward_payload(&dir, vec![os(exe)].into_iter());
+        assert_eq!(plugin_parse(&bytes), (dir.to_str().unwrap().to_string(), vec![exe.to_string()]));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// A stand-in for a running Taroting: the plugin's mutex, and its hidden
+    /// event window on a thread of its own, recording every WM_COPYDATA. Its
+    /// names are the test's own (never the real identifier, which an owner's
+    /// open Taroting answers to), the window is never shown, and the thread
+    /// is ended when the stand-in is dropped.
+    #[cfg(windows)]
+    mod stand_in {
+        use std::sync::mpsc::{channel, Receiver, Sender};
+        use std::thread::JoinHandle;
+        use std::time::Duration;
+
+        use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
+        use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+            GetWindowLongPtrW, PeekMessageW, PostThreadMessageW, RegisterClassExW, SetWindowLongPtrW,
+            TranslateMessage, CREATESTRUCTW, GWLP_USERDATA, MSG, WM_COPYDATA, WM_NCCREATE,
+            WM_NCDESTROY, WM_QUIT, PM_NOREMOVE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        };
+
+        type Got = Sender<(usize, Vec<u8>)>;
+
+        /// When the window comes up after the mutex, how long the thread is
+        /// busy before it pumps messages, and whether it then ends without
+        /// ever pumping (its window dies with it).
+        #[derive(Clone, Copy, Default)]
+        pub struct Plan {
+            pub window_after: Duration,
+            pub busy_for: Duration,
+            pub end_unpumped: bool,
+        }
+
+        pub struct StandIn {
+            thread_id: u32,
+            join: Option<JoinHandle<()>>,
+            pub got: Receiver<(usize, Vec<u8>)>,
+            window_up: Receiver<()>,
+        }
+
+        impl StandIn {
+            /// Block until the window exists.
+            pub fn wait_for_window(&self) {
+                self.window_up.recv_timeout(Duration::from_secs(5)).expect("the window came up");
+            }
+        }
+
+        impl Drop for StandIn {
+            fn drop(&mut self) {
+                // SAFETY: posting to a thread id; harmless if it has ended.
+                unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) };
+                if let Some(join) = self.join.take() {
+                    let _ = join.join();
+                }
+            }
+        }
+
+        pub fn id(tag: &str) -> String {
+            format!("taroting-test-{}-{tag}", std::process::id())
+        }
+
+        fn wide(s: String) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        /// Returns once the mutex exists (the window may still be coming).
+        pub fn start(id: &str, plan: Plan) -> StandIn {
+            let (mutex_tx, mutex_rx) = channel();
+            let (window_tx, window_up) = channel();
+            let (got_tx, got) = channel::<(usize, Vec<u8>)>();
+            let id = id.to_owned();
+            let join = std::thread::spawn(move || {
+                let (mutex_name, class, title) =
+                    (wide(format!("{id}-sim")), wide(format!("{id}-sic")), wide(format!("{id}-siw")));
+                // SAFETY: plain Win32 calls with NUL-terminated names; the
+                // sender box is freed in WM_NCDESTROY (or leaked with a window
+                // the system destroys at thread exit, harmless in a test).
+                unsafe {
+                    // Give the thread its message queue NOW, so the WM_QUIT
+                    // a drop posts is queued even while the thread is still
+                    // asleep before its window exists.
+                    let mut msg: MSG = std::mem::zeroed();
+                    PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+                    let mutex = CreateMutexW(std::ptr::null(), 1, mutex_name.as_ptr());
+                    assert!(!mutex.is_null(), "stand-in mutex");
+                    let _ = mutex_tx.send(GetCurrentThreadId());
+                    std::thread::sleep(plan.window_after);
+                    let hinstance = GetModuleHandleW(std::ptr::null());
+                    let mut wc: WNDCLASSEXW = std::mem::zeroed();
+                    wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
+                    wc.lpfnWndProc = Some(proc);
+                    wc.hInstance = hinstance;
+                    wc.lpszClassName = class.as_ptr();
+                    RegisterClassExW(&wc);
+                    let sender = Box::into_raw(Box::new(got_tx));
+                    let hwnd = CreateWindowExW(
+                        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                        class.as_ptr(),
+                        title.as_ptr(),
+                        WS_POPUP,
+                        0,
+                        0,
+                        0,
+                        0,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        hinstance,
+                        sender as *const std::ffi::c_void,
+                    );
+                    assert!(!hwnd.is_null(), "stand-in window");
+                    let _ = window_tx.send(());
+                    std::thread::sleep(plan.busy_for);
+                    if !plan.end_unpumped {
+                        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                            TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                        DestroyWindow(hwnd);
+                    }
+                    CloseHandle(mutex);
+                }
+            });
+            let thread_id = mutex_rx.recv_timeout(Duration::from_secs(5)).expect("the mutex came up");
+            StandIn { thread_id, join: Some(join), got, window_up }
+        }
+
+        unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+            match msg {
+                WM_NCCREATE => {
+                    let create = &*(lparam as *const CREATESTRUCTW);
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
+                WM_COPYDATA => {
+                    let cds = &*(lparam as *const COPYDATASTRUCT);
+                    let bytes = std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize).to_vec();
+                    let got = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Got;
+                    if !got.is_null() {
+                        let _ = (*got).send((cds.dwData, bytes));
+                    }
+                    1
+                }
+                WM_NCDESTROY => {
+                    let got = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Got;
+                    if !got.is_null() {
+                        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                        drop(Box::from_raw(got));
+                    }
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
+                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    const PAYLOAD: &[u8] = b"C:\\work|C:\\Taroting\\taroting.exe|C:\\work\\clip.mp4\0";
+
+    /// A plain first launch: no mutex, so the answer is immediate and the
+    /// payload (which touches the disk) is never even built.
+    #[cfg(windows)]
+    #[test]
+    fn with_no_instance_running_a_launch_stays_at_once() {
+        let names = InstanceNames::of(&stand_in::id("none"));
+        let built = std::cell::Cell::new(false);
+        let start = Instant::now();
+        let got = forward_to_running(&names, || { built.set(true); PAYLOAD.to_vec() }, WINDOW_WAIT, SEND_TIMEOUT);
+        assert_eq!(got, Forward::Stay);
+        assert!(start.elapsed() < WINDOW_WAIT, "no mutex must not wait for a window");
+        assert!(!built.get(), "the payload was built for nobody");
+    }
+
+    /// The running instance receives the message byte for byte, under the
+    /// tag its window procedure accepts.
+    #[cfg(windows)]
+    #[test]
+    fn a_running_instance_receives_the_plugins_message() {
+        let id = stand_in::id("running");
+        let primary = stand_in::start(&id, stand_in::Plan::default());
+        primary.wait_for_window();
+        let got = forward_to_running(&InstanceNames::of(&id), || PAYLOAD.to_vec(), WINDOW_WAIT, SEND_TIMEOUT);
+        assert_eq!(got, Forward::Delivered);
+        assert_eq!(primary.got.recv_timeout(ms(2_000)).unwrap(), (1542, PAYLOAD.to_vec()));
+    }
+
+    /// The race the plugin loses: the mutex exists, the window does not yet.
+    /// The window comes up 80 ms later — inside [`WINDOW_WAIT`] — and the
+    /// launch is handed over instead of starting a second instance. A check
+    /// that looks once (no wait) answers `Stay` here.
+    #[cfg(windows)]
+    #[test]
+    fn a_window_that_comes_up_after_the_mutex_is_waited_for() {
+        let id = stand_in::id("late-window");
+        let plan = stand_in::Plan { window_after: ms(80), ..Default::default() };
+        let primary = stand_in::start(&id, plan);
+        let got = forward_to_running(&InstanceNames::of(&id), || PAYLOAD.to_vec(), WINDOW_WAIT, SEND_TIMEOUT);
+        assert_eq!(got, Forward::Delivered);
+        assert_eq!(primary.got.recv_timeout(ms(2_000)).unwrap().1, PAYLOAD.to_vec());
+    }
+
+    /// A mutex whose window never comes (within the wait): the launch stops
+    /// waiting and stays, the old behaviour, instead of hanging.
+    #[cfg(windows)]
+    #[test]
+    fn a_mutex_without_a_window_is_waited_for_only_briefly() {
+        let id = stand_in::id("no-window");
+        let plan = stand_in::Plan { window_after: ms(1_500), ..Default::default() };
+        let _primary = stand_in::start(&id, plan);
+        let start = Instant::now();
+        let got = forward_to_running(&InstanceNames::of(&id), || PAYLOAD.to_vec(), ms(100), SEND_TIMEOUT);
+        assert_eq!(got, Forward::Stay);
+        let took = start.elapsed();
+        assert!(took >= ms(100) && took < ms(1_000), "waited {took:?}");
+    }
+
+    /// The running instance's UI thread is busy for 600 ms. A launch whose
+    /// limit runs out first (100 ms) is told `Unanswered` at its limit, not
+    /// held for the whole spell — and its message is WITHDRAWN: it never
+    /// arrives, which is why [`SEND_TIMEOUT`] is long. A launch with time to
+    /// spare waits the spell out and is delivered, exactly once.
+    #[cfg(windows)]
+    #[test]
+    fn a_busy_instance_gets_the_file_once_it_is_free() {
+        let id = stand_in::id("busy");
+        let plan = stand_in::Plan { busy_for: ms(600), ..Default::default() };
+        let primary = stand_in::start(&id, plan);
+        primary.wait_for_window();
+        let names = InstanceNames::of(&id);
+
+        let start = Instant::now();
+        let early = b"early|C:\\Taroting\\taroting.exe\0".to_vec();
+        let got = forward_to_running(&names, || early.clone(), WINDOW_WAIT, ms(100));
+        let took = start.elapsed();
+        assert_eq!(got, Forward::Unanswered);
+        assert!(took >= ms(100) && took < ms(450), "the launch waited {took:?}");
+
+        let got = forward_to_running(&names, || PAYLOAD.to_vec(), WINDOW_WAIT, ms(3_000));
+        assert_eq!(got, Forward::Delivered);
+        assert!(start.elapsed() >= ms(400), "delivered before the thread was free?");
+        assert_eq!(primary.got.recv_timeout(ms(2_000)).unwrap(), (1542, PAYLOAD.to_vec()));
+        std::thread::sleep(ms(100));
+        assert!(primary.got.try_recv().is_err(), "the withdrawn message arrived after all");
+    }
+
+    /// The instance's thread ends (its window with it) while the launch is
+    /// waiting on it: `Gone`, well before the send limit, so the launch runs
+    /// as the app rather than ending with its file handed to nobody.
+    #[cfg(windows)]
+    #[test]
+    fn an_instance_that_closes_while_we_wait_is_gone() {
+        let id = stand_in::id("closing");
+        let plan = stand_in::Plan { busy_for: ms(150), end_unpumped: true, ..Default::default() };
+        let primary = stand_in::start(&id, plan);
+        primary.wait_for_window();
+        let start = Instant::now();
+        let got = forward_to_running(&InstanceNames::of(&id), || PAYLOAD.to_vec(), WINDOW_WAIT, ms(3_000));
+        assert_eq!(got, Forward::Gone);
+        assert!(start.elapsed() < ms(2_500), "waited {:?}", start.elapsed());
+    }
+
+    /// The setup-time check. The stand-in's window belongs to THIS process,
+    /// so with our real pid it is our own window — the plugin made us the
+    /// instance: `Stay` at once, nothing built or sent. With a pid that is
+    /// not ours (as for a launch that lost the race), the same window is
+    /// another instance's, and the launch is handed to it.
+    #[cfg(windows)]
+    #[test]
+    fn the_setup_check_keeps_the_instance_and_hands_a_racer_over() {
+        let id = stand_in::id("setup");
+        let primary = stand_in::start(&id, stand_in::Plan::default());
+        primary.wait_for_window();
+        let names = InstanceNames::of(&id);
+
+        let built = std::cell::Cell::new(false);
+        let start = Instant::now();
+        let own = forward_if_not_primary(
+            &names,
+            std::process::id(),
+            || { built.set(true); PAYLOAD.to_vec() },
+            WINDOW_WAIT,
+            SEND_TIMEOUT,
+        );
+        assert_eq!(own, Forward::Stay);
+        assert!(start.elapsed() < ms(100) && !built.get(), "the instance itself must not wait or send");
+        assert!(primary.got.try_recv().is_err(), "nothing was sent");
+
+        let not_ours = std::process::id().wrapping_add(4);
+        let racer = forward_if_not_primary(&names, not_ours, || PAYLOAD.to_vec(), WINDOW_WAIT, SEND_TIMEOUT);
+        assert_eq!(racer, Forward::Delivered);
+        assert_eq!(primary.got.recv_timeout(ms(2_000)).unwrap().1, PAYLOAD.to_vec());
+    }
+
+    /// The burst rule. Seeded with the launch's own file; the same path
+    /// within 2 s is a repeat, at 2 s it is not; a different path is never a
+    /// repeat and becomes the one remembered; repeats keep the window sliding.
+    #[test]
+    fn the_same_forwarded_file_within_two_seconds_is_a_repeat() {
+        let t0 = Instant::now();
+        let a = r"C:\v\clip.mp4";
+        let b = r"C:\v\other.mp4";
+        let recent = RecentForward::seeded(Some(a.to_string()), t0);
+        assert!(recent.is_repeat(a, t0 + ms(1_900)), "the launch file again, 1.9 s later");
+        assert!(recent.is_repeat(a, t0 + ms(3_800)), "1.9 s after that repeat: still sliding");
+        assert!(!recent.is_repeat(a, t0 + ms(5_800)), "2.0 s after the last one: a new open");
+        assert!(!recent.is_repeat(b, t0 + ms(5_801)), "another file is never a repeat");
+        assert!(!recent.is_repeat(a, t0 + ms(5_802)), "and it replaced the remembered one");
+
+        let fresh = RecentForward::seeded(None, t0);
+        assert!(!fresh.is_repeat(a, t0), "a plain launch remembers nothing");
     }
 
     /* ---- close escape hatch ---- */

@@ -3,7 +3,20 @@ import { ipc } from "../core/ipc";
 import { settingsStore } from "../core/session";
 import { ACTION_MODES, DEFAULT_SHORTCUTS } from "../core/types";
 import type { ActionId } from "../core/types";
-import { ACTION_LABELS, ACTION_ORDER, LIVE_MODES, changeCacheLimit, colorRow, liveConflicts } from "./settings";
+import {
+  ACTION_LABELS,
+  ACTION_ORDER,
+  LIVE_MODES,
+  cacheLimitLabel,
+  changeCacheLimit,
+  clearCacheButton,
+  colorRow,
+  liveConflicts,
+  resetShortcutsButton,
+  selectHtml,
+  shortcutsAtDefaults,
+  uninstallRefusal,
+} from "./settings";
 
 // The real store, a fake disk write: updateSettings paints the store the way
 // the real one does (synchronously on a verified session) and never reaches IPC.
@@ -145,5 +158,80 @@ describe("changeCacheLimit", () => {
     settingsStore.set({ ...settingsStore.get(), cacheLimitMB: 5120 });
     vi.spyOn(ipc, "enforceCacheLimit").mockRejectedValue(new Error("no backend"));
     await expect(changeCacheLimit(1024)).resolves.toBeUndefined();
+  });
+});
+
+describe("selectHtml", () => {
+  const CACHE = [1024, 2048, 5120, 10240, 20480];
+  const selected = (html: string) => [...html.matchAll(/<option value="([^"]*)"\s*selected>([^<]*)</g)].map((x) => [x[1], x[2]]);
+  const values = (html: string) => [...html.matchAll(/<option value="([^"]*)"/g)].map((x) => Number(x[1]));
+
+  it("shows an off-list cache limit as itself, in order, instead of the first option", () => {
+    const html = selectHtml("c", 3000, CACHE, cacheLimitLabel);
+    // Exactly one selected option, and it is the real value — not "1 GB".
+    expect(selected(html)).toEqual([["3000", "2.9 GB"]]);
+    expect(values(html)).toEqual([1024, 2048, 3000, 5120, 10240, 20480]);
+  });
+
+  it("shows an off-list autosave interval as itself", () => {
+    const html = selectHtml("a", 7, [1, 3, 5, 10, 30], (n) => `${n}s`);
+    expect(selected(html)).toEqual([["7", "7s"]]);
+    expect(values(html)).toEqual([1, 3, 5, 7, 10, 30]);
+  });
+
+  it("adds nothing for a value that is on the list", () => {
+    const html = selectHtml("c", 5120, CACHE, cacheLimitLabel);
+    expect(selected(html)).toEqual([["5120", "5 GB"]]);
+    expect(values(html)).toEqual(CACHE);
+  });
+
+  it("labels a sub-gigabyte limit in megabytes", () => {
+    expect(cacheLimitLabel(500)).toBe("500 MB");
+    expect(cacheLimitLabel(2048)).toBe("2 GB");
+  });
+});
+
+describe("shortcutsAtDefaults", () => {
+  it("is true for the defaults, however a chord is spelled", () => {
+    expect(shortcutsAtDefaults({ ...DEFAULT_SHORTCUTS })).toBe(true);
+    expect(shortcutsAtDefaults({ ...DEFAULT_SHORTCUTS, undo: "ctrl+z" })).toBe(true);
+  });
+
+  it("is false for a rebound action, and for one emptied because its default was taken", () => {
+    expect(shortcutsAtDefaults({ ...DEFAULT_SHORTCUTS, split: "Ctrl+K" })).toBe(false);
+    expect(shortcutsAtDefaults({ ...DEFAULT_SHORTCUTS, stop: "" })).toBe(false);
+  });
+});
+
+describe("two-step confirm buttons", () => {
+  it("Clear cache asks again without destructive red: the cache regenerates", () => {
+    expect(clearCacheButton(false)).toContain(">Clear cache<");
+    expect(clearCacheButton(true)).toContain(">Really clear?<");
+    expect(clearCacheButton(true)).not.toContain("btn--danger");
+    expect(clearCacheButton(true)).toContain("btn--primary");
+  });
+
+  it("Reset to defaults arms, never in red, and is disabled with nothing to reset", () => {
+    expect(resetShortcutsButton(false, false)).toContain(">Reset to defaults<");
+    expect(resetShortcutsButton(true, false)).toContain(">Really reset?<");
+    expect(resetShortcutsButton(true, false)).not.toContain("btn--danger");
+    expect(resetShortcutsButton(false, true)).toMatch(/\sdisabled>/);
+    // Already at the defaults: never shows as armed.
+    expect(resetShortcutsButton(true, true)).toContain(">Reset to defaults<");
+    expect(resetShortcutsButton(false, false)).not.toMatch(/\sdisabled>/);
+  });
+});
+
+describe("uninstallRefusal", () => {
+  it("turns the backend's 'not installed' into how to remove a portable copy", () => {
+    expect(uninstallRefusal({ code: "bad_input", message: "not installed" })).toBe(
+      "This is a portable copy. To remove it, delete its folder.",
+    );
+  });
+
+  it("leaves every other failure an error — the same code, or the same words under another code", () => {
+    expect(uninstallRefusal({ code: "bad_input", message: "uninstall task failed: x" })).toBeNull();
+    expect(uninstallRefusal({ code: "io", message: "not installed" })).toBeNull();
+    expect(uninstallRefusal(new Error("not installed"))).toBeNull();
   });
 });

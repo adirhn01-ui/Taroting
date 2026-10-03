@@ -107,13 +107,18 @@ export function pointsOf(s: Extract<Stroke, { p: string }>): Float32Array {
 export function appendStroke(chunks: readonly Stroke[][], s: Stroke): Stroke[][] {
   const n = chunks.length;
   const last = n > 0 ? chunks[n - 1]! : null;
+  let out: Stroke[][];
   if (last !== null && last.length < STROKE_CHUNK) {
-    const out = chunks.slice(0, n - 1);
+    out = chunks.slice(0, n - 1);
     out.push(sealed([...last, s]));
-    return out;
+  } else {
+    out = chunks.slice();
+    out.push(sealed([s]));
   }
-  const out = chunks.slice();
-  out.push(sealed([s]));
+  // Carry the running totals forward (one stroke more) rather than leave the
+  // next budget check to rescan the whole drawing.
+  const prev = totalsMemo.get(chunks);
+  if (prev) totalsMemo.set(out, { strokes: prev.strokes + 1, points: prev.points + pointsIn(s) });
   return out;
 }
 
@@ -124,6 +129,8 @@ export function appendStroke(chunks: readonly Stroke[][], s: Stroke): Stroke[][]
 export function removeStrokes(chunks: readonly Stroke[][], doomed: ReadonlySet<Stroke>): Stroke[][] {
   if (doomed.size === 0) return chunks as Stroke[][];
   let out: Stroke[][] | null = null;
+  let goneStrokes = 0;
+  let gonePoints = 0;
   for (let c = 0; c < chunks.length; c++) {
     const chunk = chunks[c]!;
     let hit = false;
@@ -138,10 +145,21 @@ export function removeStrokes(chunks: readonly Stroke[][], doomed: ReadonlySet<S
       continue;
     }
     out ??= chunks.slice(0, c);
-    const kept = chunk.filter((s) => !doomed.has(s));
+    const kept: Stroke[] = [];
+    for (const s of chunk) {
+      if (!doomed.has(s)) {
+        kept.push(s);
+        continue;
+      }
+      goneStrokes++;
+      gonePoints += pointsIn(s);
+    }
     if (kept.length > 0) out.push(sealed(kept));
   }
-  return out ?? (chunks as Stroke[][]);
+  if (out === null) return chunks as Stroke[][];
+  const prev = totalsMemo.get(chunks);
+  if (prev) totalsMemo.set(out, { strokes: prev.strokes - goneStrokes, points: prev.points - gonePoints });
+  return out;
 }
 
 /** In a dev build, freeze each chunk this module creates, so a caller that
@@ -150,6 +168,43 @@ export function removeStrokes(chunks: readonly Stroke[][], doomed: ReadonlySet<S
  *  pays nothing. */
 function sealed(chunk: Stroke[]): Stroke[] {
   return import.meta.env.DEV ? (Object.freeze(chunk) as Stroke[]) : chunk;
+}
+
+/** Strokes and points in one drawing: the two numbers the save check
+ *  (`image_rules.rs`) sums over every drawing MediaRef and holds to
+ *  MAX_TOTAL_STROKES / MAX_TOTAL_POINTS. */
+export interface StrokeTotals {
+  readonly strokes: number;
+  readonly points: number;
+}
+
+/** Totals per chunks array. Chunk arrays are immutable snapshots, so an
+ *  entry never goes stale; `appendStroke` and `removeStrokes` derive the new
+ *  array's entry from the old one, so a stroke commit never rescans. */
+const totalsMemo = new WeakMap<object, StrokeTotals>();
+
+/** Points a stroke holds as the save check counts them: an ink or erase
+ *  stroke's encoded points, none for a shape. */
+function pointsIn(s: Stroke): number {
+  return "p" in s ? pointCountOf(s.p) : 0;
+}
+
+/** `chunks`' totals: memoized by array identity, counted once for an array
+ *  with no known parent (a loaded drawing), then carried forward by every
+ *  append and erase. */
+export function strokeTotals(chunks: readonly Stroke[][]): StrokeTotals {
+  let t = totalsMemo.get(chunks);
+  if (t === undefined) {
+    let strokes = 0;
+    let points = 0;
+    for (const chunk of chunks) {
+      strokes += chunk.length;
+      for (const s of chunk) points += pointsIn(s);
+    }
+    t = { strokes, points };
+    totalsMemo.set(chunks, t);
+  }
+  return t;
 }
 
 /** Total strokes across every chunk. */

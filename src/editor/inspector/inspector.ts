@@ -11,7 +11,7 @@
 // panel shows a Project-canvas editor instead of the empty state.
 
 import "./inspector.css";
-import { formatDuration, escapeHtml, fileStem } from "../../core/format";
+import { formatDuration, escapeHtml } from "../../core/format";
 import { ipc } from "../../core/ipc";
 import { EPS_KF, evalKfs } from "../../core/anim";
 import {
@@ -33,6 +33,7 @@ import {
 } from "../../core/project";
 import type { ProjectSession } from "../../core/session";
 import type { Store } from "../../core/store";
+import { mediaDisplayName } from "../../core/media-name";
 import { clipDuration, fpsValue, sourceTime } from "../../core/time";
 import type {
   AnimProp,
@@ -41,6 +42,7 @@ import type {
   ClipTransform,
   MediaRef,
   ProjectFile,
+  Timeline,
 } from "../../core/types";
 import type { PlaybackEngine } from "../playback/engine";
 import type { MediaManager } from "../media/media";
@@ -53,6 +55,27 @@ export interface InspectorCtx {
   engine: PlaybackEngine;
   selection: Store<string | null>;
   refresh(): void;
+  /** True while the canvas overlay has a move, scale or crop drag live
+   *  (`CanvasOverlay.gestureActive`). Each of its pointermoves replace()s the
+   *  project, and the dragged clip is the selected one, so without this the
+   *  panel would be torn down and rebuilt once per pointermove. While it reads
+   *  true, store-driven rebuilds are skipped; the overlay's `onGestureEnd` then
+   *  calls `overlayGestureEnded()` on the handle to catch up once.
+   *
+   *  Read ONLY from the store subscriber, never while mounting: the editor
+   *  mounts this panel before the overlay exists, so the accessor closes over
+   *  a binding that is not initialised yet during the first render. */
+  overlayGestureActive?: () => boolean;
+}
+
+/** What `mountInspector` hands back. */
+export interface InspectorHandle {
+  /** The canvas overlay's drag ended (wire to `OverlayCtx.onGestureEnd`).
+   *  Rebuilds once if a store-driven rebuild was skipped while it ran — a
+   *  committed drag notifies no store subscriber on its way out, so without
+   *  this the panel would keep showing the values from before the drag. */
+  overlayGestureEnded(): void;
+  dispose(): void;
 }
 
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
@@ -150,7 +173,7 @@ function evalProp(clip: Clip, prop: AnimProp, staticVal: number, s: number): num
 export function mountInspector(
   host: HTMLElement,
   ctx: InspectorCtx,
-): { dispose(): void } {
+): InspectorHandle {
   host.classList.add("inspector");
 
   // While a slider drag is in flight we update numbers in place instead of
@@ -158,6 +181,34 @@ export function mountInspector(
   let dragging = false;
   // Cleanup for listeners attached during the current build.
   let cleanup: (() => void)[] = [];
+  // True while rebuild() blurs the field that had focus, so the commits that
+  // blur sets off cannot start a second rebuild from inside the first.
+  let blurring = false;
+  // A store-driven rebuild was skipped because the canvas overlay was dragging.
+  let overlayPending = false;
+  // The timeline and media list the panel on screen was built from. Every
+  // control reads only those two (plus the selection and the playhead, which
+  // have their own triggers), so a store change that keeps both — autosave's
+  // modifiedAt stamp, the export preset — has nothing new to show, and
+  // rebuilding for it would throw away the field the user is in the middle of.
+  // Cleared by the panel's own live edits, the one way its controls come to
+  // show something other than what it was built from. (A notification it
+  // skips changes nothing on screen, so the build still describes what is
+  // shown; a later return to that same state has nothing to rebuild.)
+  let builtTimeline: Timeline | null = null;
+  let builtMedia: MediaRef[] | null = null;
+  const invalidateBuilt = (): void => {
+    builtTimeline = null;
+    builtMedia = null;
+  };
+  // Normalize scans in flight, by clip id: the inputs the scan was asked about
+  // (to tell whether its answer still applies) and the button now showing it
+  // (a rebuild replaces the button, and the scan must re-enable the live one).
+  const normalizing = new Map<
+    string,
+    { path: string; srcIn: number; srcOut: number; btn: HTMLButtonElement }
+  >();
+  let disposed = false;
 
   function clearBuild(): void {
     for (const c of cleanup) c();
@@ -202,21 +253,63 @@ export function mountInspector(
 
   /** Options common to the live-commit input builders. `replaceMutation`, when
    *  present, overrides the default updateClip(patch) live path — used for
-   *  keyframe auto-keying. `disabled` greys the control out (with a hint). */
+   *  keyframe auto-keying, keyed at `src`: the clip's source time at the
+   *  playhead, resolved once per gesture (see keyGesture). `disabled` greys
+   *  the control out (with a hint). */
   interface LiveOpts {
     patch: (v: number) => Partial<Clip>;
-    replaceMutation?: (v: number) => (p: ProjectFile) => ProjectFile;
+    replaceMutation?: (v: number, src: number) => (p: ProjectFile) => ProjectFile;
     disabled?: boolean;
     disabledHint?: string;
   }
 
-  function applyLive(clipId: string, v: number, opts: LiveOpts): void {
+  /** Where an auto-keying gesture writes its keyframe, decided when the
+   *  gesture's first edit arrives. `src` is null when the playhead is off the
+   *  clip (nothing may be keyed there); `stale` says the panel no longer
+   *  describes the moment being edited and must rebuild when the gesture ends. */
+  interface KeyGesture {
+    src: number | null;
+    stale: boolean;
+  }
+
+  /**
+   * Resolve an auto-keying gesture's source time.
+   *
+   * The panel is built once and NOT rebuilt while playing (no per-frame DOM
+   * churn) or while one of its controls is held, so a source time captured at
+   * build is wrong by however far the playhead has travelled since — the key
+   * used to land wherever the playhead had been when the panel was built.
+   * Reading the playhead on every input instead would scatter one keyframe per
+   * input event along a moving playhead. So: once per gesture, at its first
+   * edit rather than on focus, so tabbing through the panel never stops
+   * playback. Playback is paused first, so the frame on screen is the frame
+   * being keyed and the playhead holds still for the rest of the gesture. The
+   * caller has already set `dragging`, which keeps the pause's own tick from
+   * rebuilding the control under the pointer.
+   */
+  function keyGesture(clipId: string): KeyGesture {
+    const wasPlaying = ctx.engine.playing;
+    if (wasPlaying) ctx.engine.pause();
+    const cur = resolve(ctx.session.project, clipId);
+    const ph = playhead();
+    const src = cur && playheadInClip(cur.clip, ph) ? playheadSource(cur.clip, ph) : null;
+    return { src, stale: wasPlaying || src === null };
+  }
+
+  /** Apply one live value. `src` is the gesture's key time (read by the
+   *  auto-key path only). Returns false when nothing was written: an auto-key
+   *  whose playhead is off the clip leaves the project untouched rather than
+   *  drop a stray keyframe outside it. */
+  function applyLive(clipId: string, v: number, opts: LiveOpts, src: number | null): boolean {
     if (opts.replaceMutation) {
-      ctx.session.replace(opts.replaceMutation(v)(ctx.session.project));
+      if (src === null) return false;
+      ctx.session.replace(opts.replaceMutation(v, src)(ctx.session.project));
     } else {
       ctx.session.replace(updateClip(ctx.session.project, clipId, opts.patch(v)));
     }
+    invalidateBuilt();
     ctx.refresh();
+    return true;
   }
 
   /** Live-commit slider with a numeric twin: replace() on input, commitFrom() on
@@ -272,16 +365,39 @@ export function mountInspector(
     const clampRange = (v: number): number => Math.min(Math.max(v, opts.min), opts.max);
 
     let before: ProjectFile | null = null;
+    // The auto-key target of the gesture in flight; null until its first edit.
+    let key: KeyGesture | null = null;
+    // The value last written to the project — what every part of the control
+    // shows once the gesture ends, whatever is left in the number field.
+    let last = opts.value;
     const begin = (): void => {
       dragging = true;
       if (!before) before = ctx.session.project;
     };
+    const apply = (v: number): void => {
+      let src: number | null = null;
+      if (opts.replaceMutation) {
+        key ??= keyGesture(clipId);
+        src = key.src;
+      }
+      if (applyLive(clipId, v, opts, src)) last = v;
+    };
     const commit = (): void => {
+      const gesture = key;
+      key = null;
       if (before) {
         ctx.session.commitFrom(before);
         before = null;
       }
       dragging = false;
+      // Settle all three views on the applied value: a typed 5 in a 0..1 field
+      // applied 1, and an emptied field applied nothing at all.
+      input.value = String(last);
+      num.value = fmtNum(last);
+      readout.textContent = opts.format(last);
+      // Last, with the gesture fully closed: the rebuild blurs this control,
+      // and the commit that blur runs must find nothing left to do.
+      if (gesture?.stale && !blurring) rebuild();
     };
     const onSlider = (): void => {
       // begin() here, not only on focusin/pointerdown: a range input fires
@@ -292,16 +408,25 @@ export function mountInspector(
       const v = clampRange(Number(input.value));
       num.value = fmtNum(v);
       readout.textContent = opts.format(v);
-      applyLive(clipId, v, opts);
+      apply(v);
     };
     const onNum = (): void => {
+      // An emptied field reads "", and so does one holding only "-" or "1e"
+      // (a number input's value is "" while its text is not a number) — and
+      // Number("") is 0, which used to be applied live. Wait for a number.
+      if (num.value === "") return;
       const raw = Number(num.value);
       if (!Number.isFinite(raw)) return;
       begin(); // same reason as onSlider
       const v = clampRange(raw);
+      // Show the clamp at once when the value is over the top: more digits can
+      // only make it larger, so this never fights the typing. Under the bottom
+      // waits for the commit — "0" on its way to "0.5" is a prefix below a 0.1
+      // minimum, and rewriting it would break the number mid-word.
+      if (raw > opts.max) num.value = fmtNum(v);
       input.value = String(v);
       readout.textContent = opts.format(v);
-      applyLive(clipId, v, opts);
+      apply(v);
     };
     input.addEventListener("pointerdown", begin);
     input.addEventListener("focusin", begin);
@@ -341,12 +466,16 @@ export function mountInspector(
       value: number;
       step?: number;
       clamp: (v: number) => number;
+      /** How a value is written into the field. The default trims float tails
+       *  (0.30000000000000004 → 0.3) to at most three decimals. */
+      format?: (v: number) => string;
     },
   ): HTMLInputElement {
     const input = el("input", "input insp-num");
     input.type = "number";
     if (opts.step !== undefined) input.step = String(opts.step);
-    input.value = String(opts.value);
+    const fmt = opts.format ?? ((v: number): string => String(Number(v.toFixed(3))));
+    input.value = fmt(opts.value);
 
     if (opts.disabled) {
       input.disabled = true;
@@ -355,25 +484,39 @@ export function mountInspector(
     }
 
     let before: ProjectFile | null = null;
+    let key: KeyGesture | null = null; // as in slider()
+    let last = opts.value; // as in slider()
     const begin = (): void => {
       dragging = true;
       if (!before) before = ctx.session.project;
     };
     const onInput = (): void => {
+      // As in slider(): "" (empty, "-", "1e") must not apply Number("") = 0.
+      if (input.value === "") return;
       const raw = Number(input.value);
       if (!Number.isFinite(raw)) return;
       begin(); // re-capture the baseline if a commit already consumed it
       const v = opts.clamp(raw);
-      applyLive(clipId, v, opts);
+      let src: number | null = null;
+      if (opts.replaceMutation) {
+        key ??= keyGesture(clipId);
+        src = key.src;
+      }
+      if (applyLive(clipId, v, opts, src)) last = v;
     };
     const commit = (): void => {
-      const v = opts.clamp(Number(input.value) || 0);
-      input.value = String(v);
+      const gesture = key;
+      key = null;
+      // The field shows what the project holds: the clamped value that was
+      // applied or, for a field left empty or invalid, the value it had
+      // before — never a 0 that nothing applied.
+      input.value = fmt(last);
       if (before) {
         ctx.session.commitFrom(before);
         before = null;
       }
       dragging = false;
+      if (gesture?.stale && !blurring) rebuild(); // as in slider()
     };
     input.addEventListener("focusin", begin);
     input.addEventListener("input", onInput);
@@ -546,7 +689,7 @@ export function mountInspector(
     // Mirror the sliders' disabled rule: an animated group can only be edited
     // while the playhead sits over the clip (otherwise we'd drop a stray kf).
     if ((posAnimated && !inClip) || (touchScale && scaleAnimated && !inClip)) {
-      toast.error("Move the playhead over the clip to edit its animation.");
+      toast.refuse("Move the playhead over the clip to edit its animation.");
       return;
     }
 
@@ -648,7 +791,7 @@ export function mountInspector(
         disabledHint: hint,
         patch: (v) => ({ transform: { ...(currentTransform(clipId) ?? tf), scale: v } }),
         replaceMutation: scaleAnimated
-          ? (v) => (p) => setKeyframe(p, clipId, "scale", src, v)
+          ? (v, keySrc) => (p) => setKeyframe(p, clipId, "scale", keySrc, v)
           : undefined,
       }),
     );
@@ -663,14 +806,14 @@ export function mountInspector(
     // versa) so the arrays stay paired.
     const posReplace =
       (axis: "x" | "y") =>
-      (v: number) =>
+      (v: number, keySrc: number) =>
       (p: ProjectFile): ProjectFile => {
         const c = resolve(p, clipId);
         if (!c) return p;
         const t2 = c.clip.transform ?? defaultTransform();
-        const curX = axis === "x" ? v : evalProp(c.clip, "x", t2.x, src);
-        const curY = axis === "y" ? v : evalProp(c.clip, "y", t2.y, src);
-        return setPositionKeyframes(p, clipId, src, curX, curY);
+        const curX = axis === "x" ? v : evalProp(c.clip, "x", t2.x, keySrc);
+        const curY = axis === "y" ? v : evalProp(c.clip, "y", t2.y, keySrc);
+        return setPositionKeyframes(p, clipId, keySrc, curX, curY);
       };
     posRow.appendChild(
       field(
@@ -678,6 +821,7 @@ export function mountInspector(
         numberInput(clipId, {
           value: posX,
           clamp: (v) => Math.round(v),
+          format: (v) => String(Math.round(v)),
           disabled: posAnimated && !inClip,
           disabledHint: hint,
           patch: (v) => ({ transform: { ...(currentTransform(clipId) ?? tf), x: v } }),
@@ -691,6 +835,7 @@ export function mountInspector(
         numberInput(clipId, {
           value: posY,
           clamp: (v) => Math.round(v),
+          format: (v) => String(Math.round(v)),
           disabled: posAnimated && !inClip,
           disabledHint: hint,
           patch: (v) => ({ transform: { ...(currentTransform(clipId) ?? tf), y: v } }),
@@ -745,7 +890,7 @@ export function mountInspector(
         disabledHint: hint,
         patch: (v) => ({ transform: { ...(currentTransform(clipId) ?? tf), opacity: v } }),
         replaceMutation: opacityAnimated
-          ? (v) => (p) => setKeyframe(p, clipId, "opacity", src, v)
+          ? (v, keySrc) => (p) => setKeyframe(p, clipId, "opacity", keySrc, v)
           : undefined,
       }),
     );
@@ -817,7 +962,7 @@ export function mountInspector(
         if (
           !(x >= 0 && w > 0 && x + w <= mediaW && y >= 0 && h > 0 && y + h <= mediaH)
         ) {
-          toast.error(`Crop must fit inside ${mediaW}×${mediaH}.`);
+          toast.refuse(`Crop must fit inside ${mediaW}×${mediaH}.`);
           return;
         }
         const cur = currentTransform(clipId) ?? defaultTransform();
@@ -920,16 +1065,40 @@ export function mountInspector(
     gainRow.innerHTML = `<span>Gain offset</span><span class="mono">${a.gainOffsetDb >= 0 ? "+" : ""}${a.gainOffsetDb.toFixed(1)} dB</span>`;
     s.appendChild(gainRow);
 
-    // Normalize
-    const normBtn = button("Normalize", "btn btn--sm insp-block", () => {
+    // Normalize. The scan outlives this build — the panel rebuilds under it
+    // (a trim, an undo, reselecting the clip) — so whether one is running is
+    // kept per clip at inspector scope: a rebuilt button keeps saying
+    // Analyzing instead of offering a second scan of the same range. Its
+    // answer is applied only if the clip still plays the range it measured.
+    const running = normalizing.get(clipId);
+    const normBtn = button(running ? "Analyzing" : "Normalize", "btn btn--sm insp-block", () => {
+      if (normalizing.has(clipId)) return;
+      const job = { path: t.media.path, srcIn: t.clip.srcIn, srcOut: t.clip.srcOut, btn: normBtn };
+      normalizing.set(clipId, job);
       normBtn.disabled = true;
       normBtn.textContent = "Analyzing";
       ipc
-        .normalizeScan(t.media.path, t.clip.srcIn, t.clip.srcOut)
+        .normalizeScan(job.path, job.srcIn, job.srcOut)
         .then((r) => {
+          // The editor closed while the scan ran: its session and engine are
+          // gone, and nobody is looking at this clip any more.
+          if (disposed) return;
+          const cur = resolve(ctx.session.project, clipId);
+          if (
+            !cur ||
+            cur.media.path !== job.path ||
+            cur.clip.srcIn !== job.srcIn ||
+            cur.clip.srcOut !== job.srcOut
+          ) {
+            // Trimmed or relinked meanwhile: the peak was measured on a range
+            // this clip no longer plays, so its gain would be a guess. (A
+            // deleted clip has nobody to tell.)
+            if (cur) toast.info("The clip changed during analysis — run Normalize again.");
+            return;
+          }
           commit((p) =>
             updateClip(p, clipId, {
-              audio: { ...currentAudio(clipId, a), gainOffsetDb: r.suggestedGainDb },
+              audio: { ...cur.clip.audio, gainOffsetDb: r.suggestedGainDb },
             }),
           );
           toast.info(
@@ -937,15 +1106,22 @@ export function mountInspector(
           );
         })
         .catch((e: unknown) => {
+          if (disposed) return;
           toast.error(
             `Normalize failed: ${e && typeof e === "object" && "message" in e ? String((e as { message: unknown }).message) : String(e)}`,
           );
         })
         .finally(() => {
-          normBtn.disabled = false;
-          normBtn.textContent = "Normalize";
+          normalizing.delete(clipId);
+          if (disposed) return;
+          job.btn.disabled = false;
+          job.btn.textContent = "Normalize";
         });
     });
+    if (running) {
+      normBtn.disabled = true;
+      running.btn = normBtn;
+    }
     s.appendChild(normBtn);
 
     // Video-track extras: detach / remove
@@ -1049,6 +1225,14 @@ export function mountInspector(
     s.appendChild(field("Size", sel));
 
     const onCustom = (): void => {
+      // An emptied field (or one holding "-" / "1e", which a number input
+      // reads as "") is not a size: Number("") is 0 and would commit the
+      // minimum canvas. Put back what the project holds instead.
+      if (wI.value.trim() === "" || hI.value.trim() === "") {
+        wI.value = String(w);
+        hI.value = String(h);
+        return;
+      }
       const nw = Number(wI.value);
       const nh = Number(hI.value);
       if (!Number.isFinite(nw) || !Number.isFinite(nh)) return;
@@ -1086,11 +1270,33 @@ export function mountInspector(
   /* -------- top-level rebuild -------- */
 
   function rebuild(): void {
+    // Let the field being edited finish FIRST. Every trigger of a rebuild — a
+    // timeline or canvas click selecting another clip, a paused ruler seek —
+    // lands before focus has moved, and removing a focused element fires no
+    // blur and no change: a typed generator text, size or colour, a solid's or
+    // the canvas's size was simply thrown away, and a number field's live
+    // edits were left in the project with no history entry of their own.
+    // blur() runs the field's change and blur handlers synchronously, so they
+    // commit with the ids they captured — before clearBuild() detaches them.
+    // (The crop fields are staged behind their Apply button by design.)
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && host.contains(active)) {
+      blurring = true;
+      try {
+        active.blur();
+      } finally {
+        blurring = false;
+      }
+    }
+    overlayPending = false;
     clearBuild();
     host.innerHTML = "";
 
+    const project = ctx.session.project;
+    builtTimeline = project.timeline;
+    builtMedia = project.media;
     const sel = ctx.selection.get();
-    const t = resolve(ctx.session.project, sel);
+    const t = resolve(project, sel);
     if (!t) {
       host.appendChild(buildProjectPanel());
       return;
@@ -1098,7 +1304,7 @@ export function mountInspector(
 
     // Header
     const header = el("div", "insp-header");
-    header.appendChild(el("div", "insp-header__name", escapeHtml(fileStem(t.media.path))));
+    header.appendChild(el("div", "insp-header__name", escapeHtml(mediaDisplayName(t.media))));
     const meta = el("div", "insp-header__meta");
     meta.appendChild(el("span", "badge", escapeHtml(t.media.kind)));
     meta.appendChild(el("span", "insp-header__dur mono", formatDuration(clipDuration(t.clip))));
@@ -1126,10 +1332,17 @@ export function mountInspector(
   /* -------- reactivity -------- */
 
   const unsubSel = ctx.selection.subscribe(() => rebuild());
-  const unsubSession = ctx.session.store.subscribe(() => {
+  const unsubSession = ctx.session.store.subscribe((p) => {
     // Rebuild on project changes (e.g. the selected clip was deleted → empty
-    // state), but never tear down the DOM mid-drag.
+    // state), but never tear down the DOM mid-drag — ours, or the canvas
+    // overlay's, which replace()s the selected clip once per pointermove and
+    // would otherwise rebuild the whole panel each time.
     if (dragging) return;
+    if (ctx.overlayGestureActive?.()) {
+      overlayPending = true;
+      return;
+    }
+    if (p.timeline === builtTimeline && p.media === builtMedia) return;
     rebuild();
   });
   // While PAUSED (scrub/seek/step), rebuild as the playhead moves so a selected
@@ -1138,7 +1351,9 @@ export function mountInspector(
   // The rebuild is also a no-op when nothing/no-video-clip is selected.
   let lastTickT = -1;
   const unsubTick = ctx.engine.onTick((time, playing) => {
-    if (playing || dragging) return;
+    // `blurring`: a commit run by rebuild()'s blur refreshes the engine, which
+    // ticks synchronously — and the rebuild in progress already covers it.
+    if (playing || dragging || blurring) return;
     if (time === lastTickT) return;
     lastTickT = time;
     const cur = resolve(ctx.session.project, ctx.selection.get());
@@ -1149,7 +1364,20 @@ export function mountInspector(
   rebuild();
 
   return {
+    overlayGestureEnded(): void {
+      if (!overlayPending || disposed) return;
+      overlayPending = false;
+      // As in the store subscriber, a control of our own being held wins. The
+      // panel is then behind the drag's result, so forget what it was built
+      // from: the next store change after the hold rebuilds, whatever it is.
+      if (dragging) {
+        invalidateBuilt();
+        return;
+      }
+      rebuild();
+    },
     dispose(): void {
+      disposed = true;
       unsubSel();
       unsubSession();
       unsubTick();

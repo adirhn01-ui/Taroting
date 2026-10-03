@@ -87,9 +87,10 @@ export function createPhotoImageProject(name: string, info: MediaInfo): ProjectF
 /** schema 3, kind "image", background "transparent", canvas = the FIRST
  *  picture's size; one photo layer per picture, the first at the bottom and
  *  each later one above it (Home's "Open as" hands them over in natural name
- *  order). Every picture sits at its own pixel size, centred, scaled down only
- *  when it is larger than the canvas: scale = min(1, W / w, H / h) — the rule
- *  the image editor's addPhotoLayer applies to a picture added later. Throws
+ *  order). Every picture sits at its own pixel size, centred (on whole pixels),
+ *  scaled down only when it is larger than the canvas: scale = min(1, W / w,
+ *  H / h) — the rule the image editor's addPhotoLayer applies to a picture
+ *  added later. Throws
  *  on an empty list or on any entry that is not a still with a size; the
  *  caller drops those first and names them.
  *
@@ -114,6 +115,10 @@ export function createPhotosImageProject(name: string, infos: readonly MediaInfo
   for (const info of infos) {
     const ref: MediaRef = { id: uid(), ...info };
     const scale = Math.min(1, W / info.width!, H / info.height!);
+    // At 100%, centred on whole pixels: a picture whose side has the other
+    // parity from the canvas's would start half a pixel in and export soft.
+    const x = scale === 1 ? wholePixelNudge(W, info.width!) : 0;
+    const y = scale === 1 ? wholePixelNudge(H, info.height!) : 0;
     const clip: Clip = {
       id: uid(),
       mediaId: ref.id,
@@ -121,7 +126,7 @@ export function createPhotosImageProject(name: string, infos: readonly MediaInfo
       srcIn: 0,
       srcOut: 1,
       speed: 1,
-      transform: { ...defaultTransform(), scale },
+      transform: { ...defaultTransform(), scale, x, y },
       audio: defaultAudio(),
     };
     media.push(ref);
@@ -129,6 +134,16 @@ export function createPhotosImageProject(name: string, infos: readonly MediaInfo
     tracks.unshift({ id: uid(), kind: "video", name: fileStem(info.path), muted: false, clips: [clip] });
   }
   return { ...base, media, timeline: { ...base.timeline, tracks } };
+}
+
+/** The centre offset (0 or ½) that puts an upright, uncropped layer `side`
+ *  px long, drawn at 100%, onto whole pixels of a canvas `canvas` px long:
+ *  its edge sits at (canvas − side) / 2 + offset. The image editor's
+ *  `alignToPixels` (src/image/layers.ts) gives the same number for this case;
+ *  it is repeated here because this module must not import src/image/**. */
+function wholePixelNudge(canvas: number, side: number): number {
+  const edge = (canvas - side) / 2;
+  return Math.round(edge) - edge;
 }
 
 /** The one test for "is this an image project". */

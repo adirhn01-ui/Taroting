@@ -13,6 +13,7 @@ import { mediaUrl } from "../../core/ipc";
 import { KfCursor } from "../../core/anim";
 import { clipEnd, sourceTime, timelineTime } from "../../core/time";
 import type { Clip, Generator, MediaRef, ProjectFile, Track } from "../../core/types";
+import { cssFont } from "../media/generators";
 import type { MediaManager } from "../media/media";
 import { setOverlay, type LayerSet, type Stage } from "../preview/preview";
 import {
@@ -24,10 +25,44 @@ import {
 
 const PRELOAD_AHEAD_SEC = 1.5;
 
-// drift thresholds for slaved (non-master) video layers, matching the audio
-// graph's proven values: <=40ms ignore, 40-120ms ±2% nudge, >120ms hard reseek.
-const NUDGE_SEC = 0.04;
-const HARD_RESYNC_SEC = 0.12;
+// Drift thresholds for every element slaved to a clock it does not own — the
+// non-master video layers here and the audio-track voices in audio-graph.ts:
+// <=40ms ignore, 40-120ms ±2% nudge, >120ms hard reseek. One copy, shared
+// through slaveRate below, so the two mixers cannot drift apart.
+export const NUDGE_SEC = 0.04;
+export const HARD_RESYNC_SEC = 0.12;
+
+/** The most a slave's hard seek aims ahead of its target, in source seconds. */
+const SEEK_LEAD_MAX = 0.5;
+
+/**
+ * The three-band drift decision for a slaved element: the playbackRate it should
+ * run at, or null when it is too far off to nudge back and must be re-seeked
+ * (and then run at `rate`). `drift` is element position minus where it should
+ * be, in source seconds; `rate` is its intended rate (clip speed x preview speed).
+ *
+ * A ±2% nudge is inaudible and invisible, and it is only ever a temporary state:
+ * the caller re-asks every tick, and once the drift is back inside NUDGE_SEC the
+ * answer is the base rate again. A nudge applied once and never revisited is
+ * what let a slaved layer overshoot its correction and run off the other way.
+ */
+export function slaveRate(drift: number, rate: number): number | null {
+  const off = Math.abs(drift);
+  if (off > HARD_RESYNC_SEC) return null;
+  if (off > NUDGE_SEC) return rate * (drift > 0 ? 0.98 : 1.02);
+  return rate;
+}
+
+/** What a pooled preview <video> reports to the media manager when it cannot
+ *  play a file the manager said was ready. The overlay shows it after
+ *  "Preview unavailable: " and the bin shows it as the Failed tooltip, so it
+ *  has to read well in both places. */
+const PLAYBACK_FAILED = "This file couldn't be played";
+
+/** MediaError.MEDIA_ERR_ABORTED: the load was abandoned (the src was
+ *  re-pointed, or the element was torn down), which says nothing about the
+ *  file. Spelled out because the node test environment has no MediaError. */
+const MEDIA_ERR_ABORTED = 1;
 
 export type Segment =
   | { type: "video"; clip: Clip; media: MediaRef; ready: boolean }
@@ -67,6 +102,9 @@ interface Overrides { x?: number; y?: number; scale?: number; opacity?: number }
 
 class LayerScheduler {
   private slotSrc: Record<Slot, string | null> = { A: null, B: null };
+  /** Which media each slot's src was assigned for — the preload slot's too, so
+   *  an error from a preloaded file is attributed to the right entry. */
+  private slotMedia: Record<Slot, string | null> = { A: null, B: null };
   private activeSlot: Slot = "A";
   private shown: "A" | "B" | "image" | "gen" | "none" = "none";
   /** the active VIDEO clip (null for image/gen/gap/end) — drives the clock. */
@@ -75,6 +113,23 @@ class LayerScheduler {
   private stillClip: Clip | null = null;
   private stillMedia: MediaRef | null = null;
   private lastGenKey: string | null = null;
+
+  /**
+   * How far ahead of "where it should be now" a slave's hard seek aims, in
+   * source seconds. A seek is not instant: the element's clock stands still
+   * while it decodes to the target and the engine's runs on, so it lands
+   * behind by the seek's latency x its rate. Past the 120 ms band (a 65 ms
+   * seek at 2x preview — ordinary for long-GOP H.264/HEVC) that landing asks
+   * for another seek, which lands just as far behind, on every settled tick,
+   * forever. Learned from the first settled reading after each hard seek;
+   * belongs to one clip's file, so it starts at 0 for each.
+   */
+  private seekLead = 0;
+  /** The lead a hard seek still in flight was aimed with; null when the next
+   *  settled reading is not the landing of one of ours. */
+  private seekAimed: number | null = null;
+  private leadClipId: string | null = null;
+  private leadUrl: string | null = null;
 
   // per-prop keyframe cursors (amortized O(1) monotone playback)
   private curX = new KfCursor();
@@ -94,17 +149,68 @@ class LayerScheduler {
      *  A play() promise that resolves after the intent flipped to paused — or
      *  after this element stopped being the shown active slot — must pause back. */
     private desiredPlaying: () => boolean,
-  ) {}
+  ) {
+    this.listen(set);
+  }
 
-  setLayerSet(set: LayerSet): void {
+  /** Rebind to a layer set; true when it was a different one. */
+  setLayerSet(set: LayerSet): boolean {
+    if (set === this.set) return false;
+    this.unlisten(this.set);
     this.set = set;
-  }
-  setTrack(getTrack: () => Track): void {
-    this.getTrack = getTrack;
+    this.listen(set);
+    return true;
   }
 
+  /* ---------------- element errors ---------------- */
+
+  // One idle listener per pooled <video>: nothing runs until an element
+  // actually fails. Without it MEDIA_ERR never reached the media manager, so a
+  // missing or undecodable file the backend classified as directly playable
+  // sat behind a "Ready" badge over a black stage — remux and proxy media
+  // failed visibly only because their failure comes from the job instead.
+  private readonly onErrorA = (): void => this.reportError("A");
+  private readonly onErrorB = (): void => this.reportError("B");
+
+  private listen(set: LayerSet): void {
+    set.videoA.media.addEventListener("error", this.onErrorA);
+    set.videoB.media.addEventListener("error", this.onErrorB);
+  }
+
+  private unlisten(set: LayerSet): void {
+    set.videoA.media.removeEventListener("error", this.onErrorA);
+    set.videoB.media.removeEventListener("error", this.onErrorB);
+  }
+
+  /** Stamp the slot's media failed — but only while the error still describes
+   *  what the media manager currently calls ready. A slot re-pointed since (a
+   *  relink, a different clip) or a media already marked otherwise is not this
+   *  error's business; markFailed itself ignores an id it does not track. */
+  private reportError(slot: Slot): void {
+    const err = this.video(slot).error;
+    if (err === null || err.code === MEDIA_ERR_ABORTED) return;
+    const id = this.slotMedia[slot];
+    const url = this.slotSrc[slot];
+    if (id === null || url === null) return;
+    const st = this.media.status.get()[id];
+    if (st?.state !== "ready" || st.url !== url) return;
+    this.media.markFailed(id, PLAYBACK_FAILED);
+  }
+
+  /** Drop the element listeners. The pooled elements outlive this scheduler
+   *  (the stage parks them), so they must not keep it reachable. */
+  dispose(): void {
+    this.unlisten(this.set);
+  }
+
+  /** The clip's media. A plain loop rather than `find`: preload asks this on
+   *  every playing tick, and a predicate closure per call is garbage per frame. */
   private mediaOf(clip: Clip): MediaRef | undefined {
-    return this.getProject().media.find((m) => m.id === clip.mediaId);
+    const media = this.getProject().media;
+    for (let i = 0; i < media.length; i++) {
+      if (media[i]!.id === clip.mediaId) return media[i];
+    }
+    return undefined;
   }
 
   /** What's under time t on THIS track. */
@@ -158,8 +264,9 @@ class LayerScheduler {
     return s?.state === "ready" ? s.url : null;
   }
 
-  private assign(slot: Slot, url: string): HTMLVideoElement {
+  private assign(slot: Slot, url: string, mediaId: string): HTMLVideoElement {
     const el = this.video(slot);
+    this.slotMedia[slot] = mediaId;
     if (this.slotSrc[slot] !== url) {
       this.slotSrc[slot] = url;
       el.src = url;
@@ -183,9 +290,15 @@ class LayerScheduler {
   }
 
   activeVideo(): { el: HTMLVideoElement; clip: Clip } | null {
+    const el = this.activeElement();
+    return el === null ? null : { el, clip: this.activeClip! };
+  }
+
+  /** activeVideo()'s element alone, without the record (the per-tick path). */
+  activeElement(): HTMLVideoElement | null {
     if (this.shown !== "A" && this.shown !== "B") return null;
     if (!this.activeClip) return null;
-    return { el: this.video(this.activeSlot), clip: this.activeClip };
+    return this.video(this.activeSlot);
   }
 
   activeClipRef(): Clip | null {
@@ -198,6 +311,17 @@ class LayerScheduler {
     if (!this.activeClip) return null;
     const el = this.video(this.activeSlot);
     if (el.readyState < 2) return null;
+    // An ended or errored element keeps a frozen currentTime and a readyState
+    // that still says "have data". Trusting it re-anchored the engine to the
+    // same instant every frame, so a file shorter than its probed duration (a
+    // remux or proxy output can be) or a read error mid-clip never reached the
+    // out-point: the transport sat "playing" on a still frame forever. Saying
+    // "no clock" hands timing to the next layer's element, or else to the
+    // engine's wall clock from the last good reading, which carries on
+    // seamlessly to the boundary.
+    // hasReadyVideo() deliberately keeps its own meaning: the audio graph and
+    // the dev hooks ask whether a frame is ON SCREEN, not whether it ticks.
+    if (el.ended || el.error !== null) return null;
     return timelineTime(this.activeClip, el.currentTime);
   }
 
@@ -278,7 +402,28 @@ class LayerScheduler {
           this.pauseAll();
           return segment;
         }
-        const el = this.assign(this.activeSlot, url);
+        // The preload went into the slot that was inactive at the time, and
+        // advanceBoundary only swaps after a VIDEO segment. After a still, a
+        // generated clip, a gap longer than the preload window or a loop
+        // restart, the preloaded element is therefore sitting in the OTHER
+        // slot — and assigning the URL to the active one threw it away for a
+        // fresh load: a black flash, a re-seek and two decoders for one file.
+        // Adopt the warm element instead. Never the one currently on screen:
+        // that is a different clip's frame, still showing.
+        if (
+          this.slotSrc[this.activeSlot] !== url &&
+          this.slotSrc[this.otherSlot()] === url &&
+          this.shown !== this.otherSlot()
+        ) {
+          this.swapSlots();
+        }
+        const el = this.assign(this.activeSlot, url, media.id);
+        if (clip.id !== this.leadClipId || url !== this.leadUrl) {
+          this.leadClipId = clip.id;
+          this.leadUrl = url;
+          this.seekLead = 0;
+          this.seekAimed = null;
+        }
         this.applyPose(this.boxes(this.activeSlot), clip, media, t);
         this.activeClip = clip;
         this.stillClip = null;
@@ -288,16 +433,11 @@ class LayerScheduler {
         const srcT = sourceTime(clip, t - clip.timelineStart);
         if (playing && !isMaster && el.readyState >= 2) {
           // slave: correct drift against engine time instead of hard-seeking
-          const drift = el.currentTime - srcT;
-          if (Math.abs(drift) > HARD_RESYNC_SEC) {
-            el.currentTime = srcT;
-            el.playbackRate = rate;
-          } else if (Math.abs(drift) > NUDGE_SEC) {
-            el.playbackRate = rate * (drift > 0 ? 0.98 : 1.02);
-          } else {
-            el.playbackRate = rate;
-          }
+          this.holdToClock(el, srcT, rate);
         } else {
+          // An exact seek (paused, the clock layer, or not decodable yet): its
+          // landing says nothing about the lead, so it must not be learned from.
+          this.seekAimed = null;
           if (Math.abs(el.currentTime - srcT) > 0.01) el.currentTime = srcT;
           el.playbackRate = rate;
         }
@@ -360,6 +500,54 @@ class LayerScheduler {
     }
   }
 
+  /** Per-tick drift correction for a layer that is NOT the clock: the same
+   *  three-band test activate() runs, against engine time `t`. Writes only on
+   *  change, so a layer in sync costs a few property reads. An element that is
+   *  still seeking, paused, ended, errored or not yet decodable is left alone —
+   *  its position means nothing until it settles, and a seek issued on top of
+   *  a seek only restarts it. */
+  syncAsSlave(t: number): void {
+    if (this.shown !== "A" && this.shown !== "B") return;
+    const clip = this.activeClip;
+    if (!clip) return;
+    const el = this.video(this.activeSlot);
+    if (el.readyState < 2 || el.seeking || el.paused || el.ended || el.error !== null) return;
+    const rate = clip.speed * this.previewSpeed();
+    this.holdToClock(el, sourceTime(clip, t - clip.timelineStart), rate);
+  }
+
+  /**
+   * The slave drift test, shared by activate() and syncAsSlave() so the two
+   * hard-seek sites cannot learn or aim differently. `srcT` is where the
+   * element should be now, `rate` its intended rate.
+   *
+   * Learn, then decide, in the same reading: the first settled reading after
+   * one of our hard seeks shows how far that seek missed, and the lead becomes
+   * the aim that would have landed on time — so the next seek, if one is still
+   * needed, already uses it and a slow-seeking layer settles in two seeks.
+   * The correction runs both ways: seek latency is not constant (a cold
+   * long-GOP seek is slow, a later one into decoded data is fast), and a lead
+   * that could only grow would land ahead by more than 120 ms and loop the
+   * other way. Inside the dead band the lead is left alone.
+   */
+  private holdToClock(el: HTMLVideoElement, srcT: number, rate: number): void {
+    const drift = el.currentTime - srcT;
+    if (this.seekAimed !== null && !el.seeking) {
+      if (Math.abs(drift) > NUDGE_SEC) {
+        this.seekLead = Math.min(SEEK_LEAD_MAX, Math.max(0, this.seekAimed - drift));
+      }
+      this.seekAimed = null;
+    }
+    const next = slaveRate(drift, rate);
+    if (next === null) {
+      el.currentTime = srcT + this.seekLead;
+      this.seekAimed = this.seekLead;
+      if (el.playbackRate !== rate) el.playbackRate = rate;
+    } else if (el.playbackRate !== next) {
+      el.playbackRate = next;
+    }
+  }
+
   /** Guarded play: by the time the play() promise resolves the transport may
    *  have paused, or this slot may no longer be the shown active video (a swap
    *  or a switch to image/gen/gap synchronously paused it). In either case pause
@@ -391,18 +579,30 @@ class LayerScheduler {
     this.activeSlot = this.otherSlot();
   }
 
-  /** Preload the next real video clip into the inactive slot. */
-  preload(t: number): void {
-    const next = this.nextVideoClipAfter(t);
-    if (!next) return;
-    const timeUntil = (next.timelineStart - t) / Math.max(0.25, this.previewSpeed());
+  /** Preload the next real video clip into the inactive slot. With `loopEnd`
+   *  (the timeline duration, while looping) the clip after the LAST one is
+   *  this track's first video clip, reached by wrapping through the restart —
+   *  without that, every loop restart loaded clip 1 from cold. */
+  preload(t: number, loopEnd: number | null): void {
+    const speed = Math.max(0.25, this.previewSpeed());
+    let next = this.nextVideoClipAfter(t);
+    let timeUntil = 0;
+    if (next) {
+      timeUntil = (next.timelineStart - t) / speed;
+    } else if (loopEnd !== null) {
+      next = this.nextVideoClipAfter(-Infinity);
+      if (!next) return;
+      timeUntil = (loopEnd - t + next.timelineStart) / speed;
+    } else {
+      return;
+    }
     if (timeUntil > PRELOAD_AHEAD_SEC) return;
     const media = this.mediaOf(next);
     if (!media) return;
     const url = this.urlFor(media);
     if (!url) return;
     const slot = this.otherSlot();
-    const el = this.assign(slot, url);
+    const el = this.assign(slot, url, media.id);
     const target = next.srcIn;
     if (el.readyState >= 1 && Math.abs(el.currentTime - target) > 0.05 && !el.seeking) {
       el.currentTime = target;
@@ -410,6 +610,10 @@ class LayerScheduler {
   }
 
   pauseAll(): void {
+    // A seek still in flight here lands while nothing is playing: by the next
+    // reading (a loop restart into the same clip, say) its position says
+    // nothing about how far a seek misses.
+    this.seekAimed = null;
     this.video("A").pause();
     this.video("B").pause();
   }
@@ -455,10 +659,11 @@ function styleGen(el: HTMLElement, g: Generator, w: number, h: number): void {
     el.style.background = "transparent";
     el.style.color = g.color;
     el.style.whiteSpace = "pre";
-    el.style.lineHeight = "1.25";
-    const style = g.italic ? "italic" : "normal";
-    const weight = g.bold ? "bold" : "normal";
-    el.style.font = `${style} ${weight} ${g.sizePx}px ${g.fontFamily}`;
+    // The line height rides INSIDE the shorthand (cssFont's "/1.25"): `font`
+    // resets line-height to `normal`, so the separate lineHeight this used to
+    // write first was silently wiped, and Segoe UI's ~1.33 `normal` spaced
+    // lines wider than the export's 1.25 and clipped the last one.
+    el.style.font = cssFont(g);
     el.textContent = g.text;
   }
 }
@@ -497,9 +702,25 @@ export class Scheduler {
     this.syncLayers();
   }
 
+  /** The video tracks, memoised on the identity of the project's `tracks`
+   *  array. Every edit replaces that array (core/project.ts updates it with
+   *  map/filter/spread, never in place), so an unchanged identity means an
+   *  unchanged list — and the several calls a playback tick makes (the clock,
+   *  animate, preload, each layer's getTrack) stop filtering a fresh copy each. */
+  private tracksSrc: readonly Track[] | null = null;
+  private tracksCache: Track[] = [];
   private videoTracks(): Track[] {
-    return this.getProject().timeline.tracks.filter((t) => t.kind === "video");
+    const all = this.getProject().timeline.tracks;
+    if (all !== this.tracksSrc) {
+      this.tracksSrc = all;
+      this.tracksCache = all.filter((t) => t.kind === "video");
+    }
+    return this.tracksCache;
   }
+
+  /** Set by activate(), cleared by the next syncSlaves(): the tick activate
+   *  just ran has already put every slave through the same drift test. */
+  private slavesFresh = false;
 
   /** Reconcile the layer array against the current video tracks. Element pools
    *  are parked by the stage (never destroyed — MediaElementSource is one-shot),
@@ -519,29 +740,33 @@ export class Scheduler {
         () => this.playing,
       );
       this.layers.push(ls);
+      this.elementsCache = null;
     }
-    // rebind each live layer to its (possibly new) layer set + track index
+    // Rebind each live layer to its (possibly new) layer set. Its track getter
+    // needs no rebinding: it already reads index i of the live list, and
+    // creating a fresh closure here on every activate() bought nothing.
     for (let i = 0; i < this.layers.length; i++) {
       const ls = this.layers[i]!;
       if (i < tracks.length) {
-        ls.setLayerSet(this.stage.layers[i]!);
-        const idx = i;
-        ls.setTrack(() => this.videoTracks()[idx]!);
+        if (ls.setLayerSet(this.stage.layers[i]!)) this.elementsCache = null;
       } else {
         ls.pauseAll();
       }
     }
   }
 
-  private activeLayers(): LayerScheduler[] {
+  /** The layers bound to a live video track, topmost first. Callers only
+   *  iterate it; it is `this.layers` itself whenever no layer is parked. */
+  private activeLayers(): readonly LayerScheduler[] {
     const n = this.videoTracks().length;
-    return this.layers.slice(0, n);
+    return n >= this.layers.length ? this.layers : this.layers.slice(0, n);
   }
 
   /** Activate every layer for time t. Returns the nearest segment boundary
    *  (min over layers of each layer's active segment end). */
   activate(t: number, playing: boolean): { boundary: number } {
     this.playing = playing;
+    this.slavesFresh = true;
     this.syncLayers();
     const layers = this.activeLayers();
 
@@ -616,17 +841,90 @@ export class Scheduler {
     }
   }
 
-  preload(t: number): void {
-    for (const layer of this.activeLayers()) layer.preload(t);
+  /**
+   * Keep every slaved video layer on the clock, once per playing tick.
+   *
+   * activate() used to be the only place a slave was corrected, so between
+   * activations its start offset was never revisited and a ±2% nudge applied
+   * there stayed applied: two overlapping video layers drifted ~1.2 s a minute
+   * apart and then jumped at the next cut. Called by the engine after
+   * animate(), only while playing.
+   *
+   * The clock layer is picked HERE, per tick, by exactly masterClockTime()'s
+   * rule (the topmost layer whose element is a live clock), not taken from
+   * activate()'s election — the layer activate() elected may since have ended
+   * or errored and stopped being the clock, and it then needs correcting like
+   * any other. The clock layer itself is never written to.
+   */
+  syncSlaves(t: number): void {
+    if (this.slavesFresh) {
+      // activate() ran since the last tick and already applied this test.
+      this.slavesFresh = false;
+      return;
+    }
+    const layers = this.activeLayers();
+    if (layers.length < 2) return;
+    let clock = -1;
+    for (let i = 0; i < layers.length; i++) {
+      const layer = layers[i]!;
+      if (layer.hasReadyVideo() && layer.clockTime() !== null) {
+        clock = i;
+        break;
+      }
+    }
+    for (let i = 0; i < layers.length; i++) {
+      if (i !== clock) layers[i]!.syncAsSlave(t);
+    }
+  }
+
+  /** Preload each layer's next video clip. `loopEnd` is the timeline duration
+   *  while looping (so the last clip preloads the first), otherwise null. */
+  preload(t: number, loopEnd: number | null = null): void {
+    for (const layer of this.activeLayers()) layer.preload(t, loopEnd);
   }
 
   /* ---------------- audio-graph / dev queries ---------------- */
 
-  /** All A/B video elements across every layer (audio graph attaches lazily). */
-  videoElements(): HTMLVideoElement[] {
-    const out: HTMLVideoElement[] = [];
-    for (const layer of this.layers) out.push(...layer.elements());
-    return out;
+  /** All A/B video elements across every layer (audio graph attaches lazily).
+   *  The audio graph walks this on every tick, so the list is rebuilt only when
+   *  a layer is added or rebound to a different element set; callers must
+   *  treat it as read-only. */
+  private elementsCache: HTMLVideoElement[] | null = null;
+  videoElements(): readonly HTMLVideoElement[] {
+    if (this.elementsCache === null) {
+      const out: HTMLVideoElement[] = [];
+      for (const layer of this.layers) out.push(...layer.elements());
+      this.elementsCache = out;
+    }
+    return this.elementsCache;
+  }
+
+  /** activeVideoInfos() for the audio graph's tick: the same answer written
+   *  into records reused from call to call, so a playing frame allocates
+   *  nothing for it. Valid only until the next call — read it, never keep it. */
+  private infosScratch: VideoInfo[] = [];
+  private infosView: VideoInfo[] = [];
+  activeVideoScratch(): readonly VideoInfo[] {
+    const tracks = this.videoTracks();
+    const layers = this.activeLayers();
+    const view = this.infosView;
+    view.length = 0;
+    for (let i = 0; i < layers.length; i++) {
+      const layer = layers[i]!;
+      const av = layer.activeElement();
+      if (av === null || !layer.hasReadyVideo()) continue;
+      let rec = this.infosScratch[view.length];
+      if (rec === undefined) {
+        rec = { el: av, clip: layer.activeClipRef()!, track: tracks[i]! };
+        this.infosScratch.push(rec);
+      } else {
+        rec.el = av;
+        rec.clip = layer.activeClipRef()!;
+        rec.track = tracks[i]!;
+      }
+      view.push(rec);
+    }
+    return view;
   }
 
   /** Every layer with an active ready video, TOPMOST-first, with its track. */
@@ -672,5 +970,6 @@ export class Scheduler {
 
   dispose(): void {
     this.pauseAll();
+    for (const layer of this.layers) layer.dispose();
   }
 }

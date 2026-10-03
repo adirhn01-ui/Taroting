@@ -40,6 +40,12 @@ export interface TheaterCtx {
    *  windowed size. The stage's ResizeObserver also fires, but the container jump
    *  to fixed inset-0 can race the observer, so we call this explicitly too. */
   refit?(): void;
+  /** Drop any canvas drag still in flight (the overlay's cancelGesture: revert
+   *  it, release its pointer, keep the selection). Called first thing on
+   *  enter, because the canvas is about to become view-only: a move or scale
+   *  drag that survived the switch kept editing the project from under the
+   *  theater, invisibly, and its eventual pointerup committed the result. */
+  cancelGesture?(): void;
 }
 
 /** How far a ±5s skip jumps, in seconds. */
@@ -364,6 +370,11 @@ export function mountTheater(ctx: TheaterCtx): Theater {
 
   function enter(): void {
     if (active) return;
+    // Revert the drag BEFORE leaving crop mode, so the Escape below finds no
+    // gesture left to cancel and only does what it is sent for. Not Escape for
+    // this: outside crop mode the overlay's Escape also clears the selection,
+    // which entering theater must never do.
+    ctx.cancelGesture?.();
     exitCropIfActive();
     active = true;
     container.classList.add("theater");

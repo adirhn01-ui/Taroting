@@ -285,39 +285,34 @@ describe("resolveMoveStart — the drag ghost matches the commit", () => {
   });
 });
 
-describe("marker drag history: reconstructing the undo target", () => {
-  // pointerup no longer pushes a pointerdown snapshot (that swallowed any commit
-  // landing mid-drag into the same undo step). It pushes the CURRENT project with
-  // just the marker put back, so undo reverts the marker move and nothing else.
-  it("undoing the marker move keeps an edit that landed during the drag", () => {
+// A property of moveMarkerTo alone: it touches the one marker's time and
+// nothing else, so moving a marker away and back is an exact round trip, with
+// any unrelated edit made in between left standing. What a marker DRAG writes
+// to history is the gesture's business and is driven through the real
+// handlers in interactions.test.ts — this block makes no claim about it.
+describe("moveMarkerTo round-trips", () => {
+  it("moving away and back restores the marker and keeps an edit made in between", () => {
     let p = emptyProject();
     const trackId = p.timeline.tracks[0]!.id;
     const added = addClip(p, trackId, 0, 10);
     p = added.project;
     p = { ...p, timeline: { ...p.timeline, markers: [{ id: "mk", t: 2, color: 0 }] } };
 
-    const startT = 2;
-    // …drag the marker (history-free replaces) …
-    let live = moveMarkerTo(p, "mk", 4);
-    // …a Delete lands mid-drag (its own commit, its own history entry) …
-    live = removeClip(live, added.id);
-    // …the drag continues …
-    live = moveMarkerTo(live, "mk", 7);
+    let moved = moveMarkerTo(p, "mk", 4);
+    moved = removeClip(moved, added.id);
+    moved = moveMarkerTo(moved, "mk", 7);
+    const back = moveMarkerTo(moved, "mk", 2);
 
-    // what pointerup pushes as the undo target
-    const undoTarget = moveMarkerTo(live, "mk", startT);
-
-    // undo #1 restores the marker AND leaves the deletion in place
-    expect(undoTarget.timeline.markers).toEqual([{ id: "mk", t: startT, color: 0 }]);
-    expect(findClip(undoTarget, added.id)).toBeUndefined();
-    // and it is exactly "the project as the other edit left it, marker unmoved"
-    expect(undoTarget).toEqual(removeClip(p, added.id));
+    expect(back.timeline.markers).toEqual([{ id: "mk", t: 2, color: 0 }]);
+    expect(findClip(back, added.id)).toBeUndefined();
+    // exactly the project the other edit alone would have made
+    expect(back).toEqual(removeClip(p, added.id));
   });
 
-  it("with no intervening edit it is the pre-drag project, so undo behaves as before", () => {
+  it("with nothing else changed, away and back is the original project", () => {
     let p = emptyProject();
     p = { ...p, timeline: { ...p.timeline, markers: [{ id: "mk", t: 2, color: 0 }] } };
-    const live = moveMarkerTo(p, "mk", 9);
-    expect(moveMarkerTo(live, "mk", 2)).toEqual(p);
+    const moved = moveMarkerTo(p, "mk", 9);
+    expect(moveMarkerTo(moved, "mk", 2)).toEqual(p);
   });
 });

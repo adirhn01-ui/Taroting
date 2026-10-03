@@ -120,32 +120,113 @@ pub(crate) fn true_or_false<'de, D: serde::Deserializer<'de>>(
     Ok(Value::deserialize(d)? == Value::Bool(true))
 }
 
-/// The strokes of a drawing that have the typed shape, skipping any that do
-/// not — never failing. `load_project` parses a project only to CHECK it and
-/// hands the raw JSON on, so one damaged stroke must not make the whole image
-/// project "invalid project file" (graceful failure on a corrupt `.trt`): the
-/// image editor drops the strokes it cannot validate and says so. The strict
-/// shape check belongs to `save_project`, which validates the raw value, so the
-/// app can never WRITE a stroke this skips. A `chunks` that is not an array of
-/// arrays reads as no strokes.
-fn strokes_that_parse<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> std::result::Result<Vec<Vec<Stroke>>, D::Error> {
-    let Value::Array(chunks) = Value::deserialize(d)? else {
-        return Ok(Vec::new());
-    };
-    Ok(chunks
-        .into_iter()
-        .filter_map(|chunk| match chunk {
-            Value::Array(strokes) => Some(
-                strokes
-                    .into_iter()
-                    .filter_map(|s| serde_json::from_value::<Stroke>(s).ok())
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .collect())
+/// How many entries a drawing's `chunks` lists, found WITHOUT building
+/// anything: every chunk and every stroke is walked with `IgnoredAny`, so not
+/// one point string is copied. Never fails on the contents. `load_project`
+/// parses a project only to CHECK it and hands the raw JSON on, so a damaged
+/// stroke must not make the whole image project "invalid project file"
+/// (graceful failure on a corrupt `.trt`): the image editor drops the strokes
+/// it cannot validate and says so. The strict per-stroke check belongs to
+/// `save_project`, which validates the raw value (`image_rules`), so the app
+/// can never WRITE a stroke the editor would drop.
+///
+/// Why only a count. Rust never draws, exports or rewrites a stroke — the
+/// video exporter refuses a drawing by its variant alone — and the typed copy
+/// of every stroke this used to build made each save and load (on the main
+/// thread) allocate a second full copy of the drawing's point data, a cloned
+/// JSON tree whose strings then moved into the parsed strokes, for nothing.
+/// The count costs 8 bytes, whatever the drawing weighs.
+///
+/// The count is of entries LISTED in array chunks — a damaged stroke counts,
+/// a chunk that is not an array contributes nothing, a `chunks` that is not an
+/// array reads as 0 — because Rust has no use for "strokes that would pass".
+fn count_strokes<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<u64, D::Error> {
+    d.deserialize_any(Entries { nested: true })
+}
+
+/// `count_strokes`' walker. `nested`: this level is the list of chunks, whose
+/// array elements are counted one level down; otherwise this level is one
+/// chunk, whose elements are the strokes counted. Anything that is not an
+/// array is skipped whole and counts 0.
+struct Entries {
+    nested: bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Entries {
+    type Value = u64;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> std::result::Result<u64, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Entries {
+    type Value = u64;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<u64, A::Error> {
+        let mut n = 0u64;
+        if self.nested {
+            while let Some(k) = seq.next_element_seed(Entries { nested: false })? {
+                n = n.saturating_add(k);
+            }
+        } else {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                n = n.saturating_add(1);
+            }
+        }
+        Ok(n)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<u64, A::Error> {
+        while map.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?.is_some() {}
+        Ok(0)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> std::result::Result<u64, D::Error> {
+        serde::de::IgnoredAny::deserialize(d).map(|_| 0)
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<u64, E> {
+        Ok(0)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<u64, E> {
+        Ok(0)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<u64, E> {
+        Ok(0)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<u64, E> {
+        Ok(0)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<u64, E> {
+        Ok(0)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<u64, E> {
+        Ok(0)
+    }
+
+    fn visit_str<E>(self, _: &str) -> std::result::Result<u64, E> {
+        Ok(0)
+    }
+}
+
+/// A drawing is never written from its typed form: the typed model holds a
+/// stroke COUNT, not the strokes, so a typed write would empty the drawing.
+/// Every writer writes the raw JSON it was given (`save_project`, the load-time
+/// repairs), and this makes any future typed write fail loudly instead of
+/// quietly losing a picture.
+fn never_written<S: serde::Serializer>(_: &u64, _: S) -> std::result::Result<S::Ok, S::Error> {
+    Err(serde::ser::Error::custom(
+        "a drawing layer is never written from its typed form; write the project's raw JSON",
+    ))
 }
 
 /// A photo layer's adjustments, or `None` when the value is not an object of
@@ -182,33 +263,45 @@ pub enum Generator {
     /// chunks of at most 256 (`STROKE_CHUNK` in src/core/types.ts).
     #[serde(rename = "drawing")]
     Drawing {
-        #[serde(deserialize_with = "strokes_that_parse")]
-        chunks: Vec<Vec<Stroke>>,
+        /// How many entries the drawing's `chunks` lists (`count_strokes`).
+        /// Required, as `chunks` always was: a drawing without it is not a
+        /// drawing the app wrote. Production only needs the variant (every
+        /// guard above matches `Drawing { .. }`); the count is what the
+        /// tests read to prove the walk is lenient.
+        #[serde(rename = "chunks", deserialize_with = "count_strokes", serialize_with = "never_written")]
+        #[allow(dead_code)]
+        strokes: u64,
     },
 }
 
-/// One committed mark on a drawing layer (TS `Stroke`). Typed only so
-/// `save_project` can prove the shape; the raw JSON value is what is written,
-/// so nothing here is ever re-serialized onto disk.
+/// One committed mark on a drawing layer (TS `Stroke`), as `save_project`'s
+/// check reads it straight out of the raw JSON. Never part of the typed
+/// project (see `count_strokes`) and never serialized.
+///
+/// Borrowed from the raw value it is read from, so checking a stroke copies
+/// none of it — a million-point `p` is 16 MB of text. That is safe here and
+/// only here: the check holds the value immutably for the stroke's lifetime,
+/// whereas the typed project must stay owned (`load_project` repairs its raw
+/// value in place after parsing it).
 ///
 /// Loose on purpose: which fields a stroke needs depends on `t` (ink and erase
 /// strokes carry `p`, shapes carry `a`/`b`, an erase has no `c`), and that rule
 /// — with the value checks — belongs to the save-time validation, not to
 /// serde. `p` is unpadded standard base64 of little-endian Float32
 /// `[x, y, pressure]` triples, 16 characters per point.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Stroke {
-    pub t: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub c: Option<String>,
+#[derive(Debug, Deserialize)]
+pub struct Stroke<'a> {
+    pub t: &'a str,
+    #[serde(default, borrow)]
+    pub c: Option<&'a str>,
     pub w: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub o: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub p: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, borrow)]
+    pub p: Option<&'a str>,
+    #[serde(default)]
     pub a: Option<[f64; 2]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub b: Option<[f64; 2]>,
 }
 
@@ -819,60 +912,80 @@ mod tests {
         assert!(migrate(serde_json::json!({"name": "no schema"})).is_err());
     }
 
+    /// A damaged stroke never makes an image project unopenable: the typed
+    /// parse only COUNTS a drawing's entries (the raw JSON the editor receives
+    /// still has every one, and it drops the damaged ones with a notice). The
+    /// fixture's numbers all differ — 6 entries listed in array chunks, 5
+    /// chunks, 2 array chunks, 2 strokes that would pass — so a walker that
+    /// counted chunks, counted only arrays, or skipped damaged entries cannot
+    /// pass.
+    #[test]
+    fn a_damaged_stroke_never_refuses_the_project() {
+        let media = serde_json::json!({
+            "id": "d1", "kind": "image", "path": "Drawing", "size": 0, "mtimeMs": 0,
+            "duration": 1, "width": 640, "height": 360, "hasAudio": false,
+            "generator": { "type": "drawing", "chunks": [
+                [
+                    { "t": "pen", "c": "#1a2b3c", "w": 4, "o": 1, "p": "AAAAAAAAAAAAAAAA" },
+                    { "t": "pen", "c": "#1a2b3c", "o": 1, "p": "AAAAAAAAAAAAAAAA" },
+                    { "t": "pen", "c": "#1a2b3c", "w": "wide", "o": 1, "p": "AAAAAAAAAAAAAAAA" }
+                ],
+                "not a chunk",
+                { "t": "pen", "w": 2 },
+                null,
+                [ 7, { "t": "erase", "w": 9, "p": "AAAAAAAAAAAAAAAA", "x": [[1, {"y": [2]}]] }, "eight" ]
+            ]}
+        });
+        let strokes = |m: MediaRef| match m.generator {
+            Some(Generator::Drawing { strokes }) => strokes,
+            other => panic!("expected a drawing, got {other:?}"),
+        };
+        // Borrowed (how `load_project` and `save_project` parse: from the raw
+        // value they keep) and owned (the migrate-then-parse path) alike.
+        let borrowed = MediaRef::deserialize(&media).expect("a damaged drawing still parses");
+        assert_eq!(strokes(borrowed), 6, "3 + 3 listed; the string, object and null chunks add nothing");
+        let owned: MediaRef = serde_json::from_value(media.clone()).expect("owned parse too");
+        assert_eq!(strokes(owned), 6);
+
+        // Not an array at all, or empty: no strokes, still no refusal.
+        let with_chunks = |chunks: Value| {
+            let mut m = media.clone();
+            m["generator"]["chunks"] = chunks;
+            MediaRef::deserialize(&m).map(strokes)
+        };
+        for odd in [serde_json::json!({ "oops": [1, 2] }), serde_json::json!("x"), serde_json::json!(3), Value::Null] {
+            assert_eq!(with_chunks(odd.clone()).expect("a non-array chunks still parses"), 0, "{odd}");
+        }
+        assert_eq!(with_chunks(serde_json::json!([])).unwrap(), 0);
+        assert_eq!(with_chunks(serde_json::json!([[], [1], []])).unwrap(), 1);
+        // Missing altogether is not a drawing the app wrote: refused, exactly
+        // as before the count replaced the strokes.
+        let mut bare = media.clone();
+        bare["generator"].as_object_mut().unwrap().remove("chunks");
+        let err = MediaRef::deserialize(&bare).unwrap_err().to_string();
+        assert!(err.contains("missing field `chunks`"), "{err}");
+    }
+
+    /// The typed drawing holds a count, so writing it would empty the
+    /// picture: any typed write of a drawing fails loudly instead.
+    #[test]
+    fn a_drawing_is_never_written_from_its_typed_form() {
+        let m: MediaRef = serde_json::from_value(serde_json::json!({
+            "id": "d1", "kind": "image", "path": "Drawing", "size": 0, "mtimeMs": 0,
+            "duration": 0, "width": 64, "height": 48, "hasAudio": false,
+            "generator": { "type": "drawing", "chunks": [[{ "t": "pen", "c": "#1a2b3c", "w": 4, "p": "AAAAAAAAAAAAAAAA" }]] }
+        }))
+        .unwrap();
+        let err = serde_json::to_value(&m).unwrap_err().to_string();
+        assert!(err.contains("never written from its typed form"), "{err}");
+        // Every other generator still writes as it always did.
+        let solid = Generator::Solid { color: "#336699".into() };
+        assert_eq!(serde_json::to_value(&solid).unwrap(), serde_json::json!({ "type": "solid", "color": "#336699" }));
+    }
+
     /// Schema 3 and `kind: "image"` come as a pair or not at all. Each refusal
     /// is told apart by its message, so a check that fired for the wrong reason
     /// (the "newer Taroting" range check, say) cannot pass for the right one.
-    /// A damaged stroke never makes an image project unopenable: the typed
-    /// check keeps the strokes that parse and skips the rest (the raw JSON the
-    /// editor receives still has them, and it drops them with a notice). Each
-    /// damaged shape differs from the good one on exactly one field.
-    #[test]
-    fn a_damaged_stroke_never_refuses_the_project() {
-        let project = serde_json::json!({
-            "schema": 3, "kind": "image", "name": "pic",
-            "timeline": { "width": 640, "height": 360, "fps": 30, "tracks": [], "markers": [] },
-            "media": [{
-                "id": "d1", "kind": "image", "path": "Drawing", "size": 0, "mtimeMs": 0,
-                "duration": 1, "width": 640, "height": 360, "hasAudio": false,
-                "generator": { "type": "drawing", "chunks": [
-                    [
-                        { "t": "pen", "c": "#1a2b3c", "w": 4, "o": 1, "p": "AAAAAAAAAAAAAAAA" },
-                        { "t": "pen", "c": "#1a2b3c", "o": 1, "p": "AAAAAAAAAAAAAAAA" },
-                        { "t": "pen", "c": "#1a2b3c", "w": "wide", "o": 1, "p": "AAAAAAAAAAAAAAAA" }
-                    ],
-                    "not a chunk",
-                    [ 7, { "t": "erase", "w": 9, "p": "AAAAAAAAAAAAAAAA" } ]
-                ]}
-            }],
-            "export": {}
-        });
-        let media = project["media"][0].clone();
-        let m: MediaRef = serde_json::from_value(media).expect("a damaged drawing still parses");
-        match m.generator {
-            Some(Generator::Drawing { chunks }) => {
-                let kept: Vec<(usize, Vec<&str>)> = chunks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (i, c.iter().map(|s| s.t.as_str()).collect()))
-                    .collect();
-                // chunk 0 keeps only the whole stroke; the string chunk is gone;
-                // chunk 2 keeps the erase and drops the bare number.
-                assert_eq!(kept, vec![(0, vec!["pen"]), (1, vec!["erase"])]);
-                assert_eq!(chunks[0][0].w, 4.0);
-                assert_eq!(chunks[1][0].w, 9.0);
-            }
-            other => panic!("expected a drawing, got {other:?}"),
-        }
-        // Not an array at all: no strokes, still no refusal.
-        let m: MediaRef = serde_json::from_value(serde_json::json!({
-            "id": "d2", "kind": "image", "path": "Drawing", "size": 0, "mtimeMs": 0,
-            "duration": 1, "width": 10, "height": 10, "hasAudio": false,
-            "generator": { "type": "drawing", "chunks": { "oops": true } }
-        }))
-        .expect("a non-array chunks still parses");
-        assert!(matches!(m.generator, Some(Generator::Drawing { chunks }) if chunks.is_empty()));
-    }
-
     #[test]
     fn schema_and_image_kind_must_agree() {
         let msg = |v: Value| match migrate(v) {
@@ -954,13 +1067,7 @@ mod tests {
         let adj = typed.timeline.tracks[0].clips[0].adjust.as_ref().unwrap();
         assert_eq!((adj.exposure, adj.hue, adj.contrast), (12.0, -40.0, 0.0));
         match &typed.media[0].generator {
-            Some(Generator::Drawing { chunks }) => {
-                assert_eq!(chunks.len(), 1);
-                assert_eq!(chunks[0].len(), 3);
-                assert_eq!(chunks[0][1].t, "erase");
-                assert!(chunks[0][1].c.is_none());
-                assert_eq!(chunks[0][2].b, Some([300.0, -5.0]));
-            }
+            Some(Generator::Drawing { strokes }) => assert_eq!(*strokes, 3),
             other => panic!("expected a drawing, got {other:?}"),
         }
         // A value no build writes, in any of the new keys, reads as absent —
@@ -982,12 +1089,17 @@ mod tests {
         assert!(parsed.timeline.tracks[0].hidden.is_none());
         assert!(parsed.timeline.tracks[0].clips[0].adjust.is_none());
 
-        // Written back (by anything that ever does) under the TS names.
+        // Written back (by anything that ever does) under the TS names. The
+        // drawing is the exception: it is never written from its typed form
+        // (`a_drawing_is_never_written_from_its_typed_form`), so the write is
+        // checked without it.
+        assert!(serde_json::to_value(&typed).is_err(), "a typed drawing must not write");
+        let mut typed = typed;
+        typed.media.clear();
         let out = serde_json::to_value(&typed).unwrap();
         assert_eq!(out["kind"], "image");
         assert_eq!(out["image"], image["image"]);
         assert_eq!(out["timeline"]["tracks"][0]["hidden"], true);
         assert_eq!(out["timeline"]["tracks"][0]["clips"][0]["adjust"]["hue"], -40.0);
-        assert_eq!(out["media"][0]["generator"], image["media"][0]["generator"]);
     }
 }

@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { Clip, ClipTransform, MediaInfo, MediaRef, ProjectFile, Stroke, Track } from "../core/types";
-import { createBlankImageProject, createPhotoImageProject } from "../core/image-project";
+import { createBlankImageProject, createPhotoImageProject, createPhotosImageProject } from "../core/image-project";
 import { checkInvariants, defaultAudio } from "../core/project";
 import { encodePoints, strokeCount } from "./strokes";
-import { layerCorners } from "./geom";
+import { layerCorners, layerToCanvas } from "./geom";
 import {
   addDrawingLayer,
   addGeneratorLayer,
   addPhotoLayer,
+  alignToPixels,
   appendStrokeTo,
   cropImage,
   drawingTarget,
@@ -78,6 +79,8 @@ function posed(): { p: ProjectFile; photoId: string; drawId: string } {
 }
 
 const transformOf = (p: ProjectFile, trackId: string): ClipTransform => findLayer(p, trackId)!.transform;
+/** An upright, uncropped, unflipped layer at 100%, exactly centred. */
+const setRot = (): ClipTransform => ({ x: 0, y: 0, scale: 1, rotate: 0, flipH: false, flipV: false, opacity: 1 });
 
 describe("layersOf", () => {
   it("lists one-clip video tracks top first, with kind and name, skipping the empty placeholder", () => {
@@ -399,12 +402,19 @@ describe("whole-image operations", () => {
     expect([tiny.timeline.width, tiny.timeline.height]).toEqual([1, 1]);
   });
 
-  it("resizeCanvas anchors at the centre and keeps any integer side", () => {
+  it("resizeCanvas anchors at the centre, to the whole pixel, and keeps any integer side", () => {
     const { p, photoId } = posed();
+    // 641 → 1000 is an ODD change (359): the old picture lands floor(359/2) =
+    // 179 px in, so every layer shifts −0.5 against the new centre. 361 → 99
+    // is even (−262): no shift.
     const r = resizeCanvas(p, 1000.4, 99);
     expect([r.timeline.width, r.timeline.height]).toEqual([1000, 99]);
-    expect(transformOf(r, photoId)).toBe(transformOf(p, photoId));
-    expectCorners(p, r, (x, y) => [x + (1000 - W) / 2, y + (99 - H) / 2]);
+    expect(transformOf(r, photoId)).toMatchObject({ x: 36.5, y: -19, scale: 0.73, rotate: 90 });
+    expectCorners(p, r, (x, y) => [x + 179, y - 131]);
+    // An even change on both axes leaves every transform exactly as it was.
+    const even = resizeCanvas(p, W + 10, H - 4);
+    expect(transformOf(even, photoId)).toBe(transformOf(p, photoId));
+    expectCorners(p, even, (x, y) => [x + 5, y - 2]);
     expect(resizeCanvas(p, W, H)).toBe(p);
     expect(resizeCanvas(p, NaN, 5)).toBe(p);
     expect(resizeCanvas(p, 70000, 0).timeline).toMatchObject({ width: 65535, height: 1 });
@@ -416,6 +426,92 @@ describe("whole-image operations", () => {
     expect(flipImage(sq, "h")).toBe(sq);
     const wide = rotateImage(blank(), -90);
     expect([wide.timeline.width, wide.timeline.height]).toEqual([H, W]);
+  });
+});
+
+describe("whole pixels at 100% (a soft export otherwise)", () => {
+  /** The layer's top-left in canvas px (the matrix's translation), which is
+   *  where every source pixel boundary lands relative to. */
+  const origin = (p: ProjectFile, trackId: string): [number, number] => {
+    const l = findLayer(p, trackId)!;
+    const m = layerToCanvas(l.transform, l.media.width!, l.media.height!, p.timeline.width, p.timeline.height);
+    return [m[4], m[5]];
+  };
+  const whole = (p: ProjectFile, trackId: string): void => {
+    const [e, f] = origin(p, trackId);
+    expect(Number.isInteger(e), `x origin ${e}`).toBe(true);
+    expect(Number.isInteger(f), `y origin ${f}`).toBe(true);
+  };
+
+  it("an added photo lands on whole pixels, the nudge differing per axis", () => {
+    // 641×361 canvas. 200×100: odd across, odd down. 201×100: even across.
+    const a = addPhotoLayer(blank(), photo(200, 100));
+    expect(transformOf(a.project, a.trackId)).toMatchObject({ x: 0.5, y: 0.5, scale: 1 });
+    whole(a.project, a.trackId);
+    const b = addPhotoLayer(blank(), photo(201, 100));
+    expect(transformOf(b.project, b.trackId)).toMatchObject({ x: 0, y: 0.5 });
+    whole(b.project, b.trackId);
+    // Scaled down to fit: resampled anyway, so exactly centred.
+    const big = addPhotoLayer(blank(), photo(1282, 300));
+    expect(transformOf(big.project, big.trackId)).toMatchObject({ x: 0, y: 0, scale: 0.5 });
+  });
+
+  it("text and solid layers land on whole pixels too", () => {
+    const gen = { type: "text", text: "Hi", fontFamily: "Arial", sizePx: 40, color: "#ffffff", bold: false, italic: false } as const;
+    const t = addGeneratorLayer(blank(), gen, 94, 50, "Text — Hi");
+    expect(transformOf(t.project, t.trackId)).toMatchObject({ x: 0.5, y: 0.5 });
+    whole(t.project, t.trackId);
+    const s = addGeneratorLayer(blank(640, 361), { type: "solid", color: "#123456" }, 98, 60, "Solid");
+    expect(transformOf(s.project, s.trackId)).toMatchObject({ x: 0, y: 0.5 });
+    whole(s.project, s.trackId);
+  });
+
+  it("alignToPixels agrees with createPhotosImageProject for a later picture", () => {
+    const made = createPhotosImageProject("Two", [photo(641, 361, "C:\\a\\canvas.png"), photo(200, 101, "C:\\a\\later.png")]);
+    const later = layersOf(made)[0]!;
+    expect(later.name).toBe("later");
+    const aligned = alignToPixels(
+      { ...later.transform, x: 0, y: 0 },
+      200,
+      101,
+      made.timeline.width,
+      made.timeline.height,
+    );
+    expect([later.transform.x, later.transform.y]).toEqual([aligned.x, aligned.y]);
+    expect([later.transform.x, later.transform.y]).toEqual([0.5, 0]);
+    whole(made, later.trackId);
+  });
+
+  it("alignToPixels reads rotation and crop, and leaves a scaled or aligned layer alone", () => {
+    // Rotated 90°: across the canvas the layer spans its HEIGHT (100, odd
+    // against 641), down it its WIDTH (201, even against 361).
+    const t = { ...setRot(), rotate: 90 as const };
+    const r = alignToPixels(t, 201, 100, W, H);
+    const m = layerToCanvas(r, 201, 100, W, H);
+    expect(Number.isInteger(m[4]) && Number.isInteger(m[5])).toBe(true);
+    expect([r.x, r.y]).toEqual([0.5, 0]);
+    // A crop 51 px wide centres on 25.5: the nudge follows the crop, not the box.
+    const c = alignToPixels({ ...setRot(), crop: { x: 3, y: 0, w: 51, h: 100 } }, 201, 100, W, H);
+    expect([c.x, c.y]).toEqual([0, 0.5]);
+    const scaled = { ...setRot(), scale: 0.5 };
+    expect(alignToPixels(scaled, 200, 100, W, H)).toBe(scaled);
+    const done = { ...setRot(), x: 0.5, y: 0.5 };
+    expect(alignToPixels(done, 200, 100, W, H)).toBe(done);
+  });
+
+  it("a resize by an odd amount on both axes keeps whole-pixel layers whole", () => {
+    let p = blank();
+    const a = addPhotoLayer(p, photo(200, 100));
+    p = setLayerTransform(a.project, a.trackId, { x: 37.5, y: -18.5 }); // moved, still whole
+    whole(p, a.trackId);
+    for (const [w, h] of [[W + 3, H - 7], [W - 1, H + 1], [W + 2, H + 5]] as const) {
+      const r = resizeCanvas(p, w, h);
+      whole(r, a.trackId);
+      // The picture stays exactly where the whole-pixel anchor puts it.
+      const [e0, f0] = origin(p, a.trackId);
+      const [e1, f1] = origin(r, a.trackId);
+      expect([e1 - e0, f1 - f0]).toEqual([Math.floor((w - W) / 2), Math.floor((h - H) / 2)]);
+    }
   });
 });
 
@@ -455,6 +551,22 @@ describe("drawingTarget", () => {
     const shown = setLayerHidden(p, d2, false);
     expect(drawingTarget(shown, d2)).toEqual({ trackId: d2 });
     expect(drawingTarget(shown, null)).toEqual({ trackId: d1 });
+  });
+
+  it("skips a 0%-opacity drawing as it skips a hidden one (nothing drawn there shows)", () => {
+    const { p, d1, d2, ph } = stack();
+    // D2 visible again but at 0%: selected, it is NOT the target — D1 above is.
+    const faded = setLayerTransform(setLayerHidden(p, d2, false), d2, { opacity: 0 });
+    expect(drawingTarget(faded, d2)).toEqual({ trackId: d1 });
+    // A barely visible one still is a target.
+    const faint = setLayerTransform(faded, d2, { opacity: 0.01 });
+    expect(drawingTarget(faint, d2)).toEqual({ trackId: d2 });
+    // The topmost drawing at 0% with nothing selected: the next visible one.
+    const topGone = setLayerTransform(faint, d1, { opacity: 0 });
+    expect(drawingTarget(topGone, null)).toEqual({ trackId: d2 });
+    // No drawable drawing at all: a new layer above the selection.
+    const none = setLayerTransform(topGone, d2, { opacity: 0 });
+    expect(drawingTarget(none, ph)).toEqual({ create: { above: ph } });
   });
 
   it("creates one directly above the selection (top without one) when none is drawable", () => {

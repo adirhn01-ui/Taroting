@@ -118,6 +118,15 @@
   font-weight: 600;
 }
 
+/* A note that belongs to the whole export rather than to one row (text the
+   export font cannot draw): full width, a normal form gap from its neighbours,
+   and one step brighter than a row note because it describes the result. */
+.export-note--block {
+  margin-top: 0;
+  padding-left: 0;
+  color: var(--text-2);
+}
+
 /* inline "file exists" warning strip */
 .export-warn {
   display: flex;

@@ -1,10 +1,135 @@
 //! ffprobe wrapper: probe a media file into structured MediaInfo.
 
+use std::ffi::OsString;
+use std::io::{BufRead, Cursor};
+use std::path::Path;
+use std::process::Output;
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, Result};
-use crate::jobs::ffmpeg;
+use crate::jobs::{ffmpeg, progress};
+use crate::media::source::{source_file, INPUT_PROTOCOL_ARGS};
 use crate::media::{exif, extensions};
+
+/// How long the stream probe may take. ~50 ms on a local file; the bound is
+/// for a source that never answers (a share gone to sleep, a cloud file that
+/// will not hydrate), which before this held an import — or a project load
+/// running the rotation repair — forever.
+const PROBE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The frame probe's bound (`frame_rotation`). Shorter: its failure is
+/// survivable, the sniffed orientation stands in for it.
+const FRAME_PROBE_DEADLINE: Duration = Duration::from_secs(15);
+
+/// The duration scan's bound (`scanned_duration`). It reads the whole file,
+/// so it gets longer; past it the file is refused as having no length.
+const DURATION_SCAN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Run a sidecar with `args` under `deadline`. `Ok(None)`: it was still
+/// running at the deadline and has been killed.
+fn run_bounded(name: &str, args: Vec<OsString>, deadline: Duration) -> Result<Option<Output>> {
+    let mut cmd = ffmpeg::command(name)?;
+    cmd.args(args);
+    Ok(ffmpeg::run_with_deadline(cmd, deadline)?)
+}
+
+/// `-i path`, limited to plain files (`media::source`). ffprobe takes `-i`
+/// as well as a bare input, and naming it lets every argv here be checked by
+/// the one assertion the other sinks use.
+fn push_input(args: &mut Vec<OsString>, path: &Path) {
+    args.extend(INPUT_PROTOCOL_ARGS.iter().map(OsString::from));
+    args.push("-i".into());
+    args.push(path.into());
+}
+
+fn strs(items: &[&str]) -> Vec<OsString> {
+    items.iter().map(OsString::from).collect()
+}
+
+/// The stream probe: format and streams, as JSON.
+fn probe_args(path: &Path) -> Vec<OsString> {
+    let mut args = strs(&["-v", "error", "-print_format", "json", "-show_format", "-show_streams"]);
+    push_input(&mut args, path);
+    args
+}
+
+/// The first decoded frame's size and display matrix (`frame_rotation`).
+fn frame_args(path: &Path) -> Vec<OsString> {
+    let mut args = strs(&[
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_frames",
+        "-read_intervals",
+        "%+#1",
+        "-show_entries",
+        "frame=width,height:frame_side_data=side_data_type,rotation",
+        "-of",
+        "json",
+    ]);
+    push_input(&mut args, path);
+    args
+}
+
+/// Demux the first video and audio streams to nowhere, copying (no decode),
+/// reporting progress on stdout: the last block's `out_time_us` is how long
+/// the file really is (`scanned_duration`).
+fn duration_scan_args(path: &Path) -> Vec<OsString> {
+    let mut args = strs(&["-v", "error", "-nostats", "-progress", "pipe:1"]);
+    push_input(&mut args, path);
+    args.extend(strs(&["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-f", "null", "-"]));
+    args
+}
+
+/// The final `out_time_us` of ffmpeg's `-progress` output, in seconds, when it
+/// is a usable length: the block that ends with `progress=end`, or failing
+/// that the last complete one. `None` for N/A (a raw elementary stream has no
+/// timestamps to count), zero, or no complete block at all.
+fn final_out_time(progress_out: &[u8]) -> Option<f64> {
+    let mut state = progress::Progress::default();
+    let mut last = None;
+    for line in Cursor::new(progress_out).lines().map_while(|l| l.ok()) {
+        if progress::parse_line(&line, &mut state) {
+            last = state.out_time_us;
+            // `parse_line` keeps a value across blocks; an N/A in the next
+            // block must not inherit this one's.
+            state.out_time_us = None;
+            if state.end {
+                break;
+            }
+        }
+    }
+    let secs = last? as f64 / 1_000_000.0;
+    (secs > 0.0).then_some(secs)
+}
+
+/// How long `path` is, read off the media itself, for a container that does
+/// not say: Matroska/WebM written live (no Duration element, no cues), a
+/// stream captured as it aired. Before this such a file imported as a 1/120 s
+/// clip nobody could use. `None` when the scan fails, times out, or finds no
+/// timestamps to measure.
+fn scanned_duration(path: &Path) -> Option<f64> {
+    let out = run_bounded("ffmpeg", duration_scan_args(path), DURATION_SCAN_DEADLINE).ok()??;
+    if !out.status.success() {
+        return None;
+    }
+    final_out_time(&out.stdout)
+}
+
+/// A length that can stand: finite and above zero. ffprobe's "N/A" never
+/// parses, but "0.000000" and "nan" do, and either would become a clip
+/// nothing can play.
+fn usable_duration(d: f64) -> Option<f64> {
+    (d.is_finite() && d > 0.0).then_some(d)
+}
+
+/// The refusal for a video or audio file whose length cannot be found.
+fn no_length() -> AppError {
+    AppError::BadInput("This file doesn't say how long it is.".into())
+}
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct Rational {
@@ -294,25 +419,13 @@ fn refuse_disguised_picture(
 ///
 /// Measured on a 12 MP JPEG: ~118 ms, against ~50 ms for the stream probe —
 /// which is why only a still whose header says it turns pays for it.
+///
+/// Also called on load by the still repair in `project/store.rs`, with the
+/// path a `.trt` gave — so the path is checked as every other sink checks it
+/// (`media::source`), and anything that is not a file is simply "no answer".
 fn frame_rotation(path: &str) -> Option<f64> {
-    let out = ffmpeg::run(
-        "ffprobe",
-        &[
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_frames",
-            "-read_intervals",
-            "%+#1",
-            "-show_entries",
-            "frame=width,height:frame_side_data=side_data_type,rotation",
-            "-of",
-            "json",
-            path,
-        ],
-    )
-    .ok()?;
+    let src = source_file(path).ok()?;
+    let out = run_bounded("ffprobe", frame_args(src), FRAME_PROBE_DEADLINE).ok()??;
     if !out.status.success() {
         return None;
     }
@@ -393,25 +506,20 @@ fn still_turn(
 }
 
 pub fn probe_sync(path: &str) -> Result<MediaInfo> {
-    let meta = std::fs::metadata(path)?;
+    // Every caller's path is untrusted to some degree (a `.trt`'s, on relink
+    // and the load-time repair): refused unless it names a real file, so a URL
+    // or a device never reaches ffprobe (`media::source`).
+    let src = source_file(path)?;
+    let meta = std::fs::metadata(src)?;
     let mtime_ms = meta
         .modified()?
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let out = ffmpeg::run(
-        "ffprobe",
-        &[
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            path,
-        ],
-    )?;
+    let out = run_bounded("ffprobe", probe_args(src), PROBE_DEADLINE)?.ok_or_else(|| {
+        AppError::Ffmpeg(format!("ffprobe took too long for {path} and was stopped"))
+    })?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(AppError::Ffmpeg(format!(
@@ -442,13 +550,22 @@ pub fn probe_sync(path: &str) -> Result<MediaInfo> {
         .iter()
         .find(|s| s.codec_type.as_deref() == Some("audio"));
 
-    let duration = parsed
+    let reported = parsed
         .format
         .as_ref()
         .and_then(|f| parse_f64(&f.duration))
-        .or_else(|| video.and_then(|v| parse_f64(&v.duration)))
-        .or_else(|| audio.and_then(|a| parse_f64(&a.duration)))
-        .unwrap_or(0.0);
+        .and_then(usable_duration)
+        .or_else(|| video.and_then(|v| parse_f64(&v.duration)).and_then(usable_duration))
+        .or_else(|| audio.and_then(|a| parse_f64(&a.duration)).and_then(usable_duration));
+    // A recording or a song with no length anywhere in its headers is
+    // measured by reading it (`scanned_duration`), and refused if even that
+    // finds none — never imported as a zero-length clip. Stills and GIFs keep
+    // whatever was reported: a still has no length to find.
+    let duration = match (reported, kind) {
+        (Some(d), _) => d,
+        (None, "video" | "audio") => scanned_duration(src).ok_or_else(no_length)?,
+        (None, _) => 0.0,
+    };
 
     let fps = video.and_then(|v| {
         v.avg_frame_rate
@@ -537,6 +654,108 @@ pub async fn probe_media(path: String) -> Result<MediaInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every ffprobe/ffmpeg this module runs opens its input as a plain file.
+    #[test]
+    fn every_probe_opens_its_input_as_a_file_only() {
+        let path = Path::new(r"C:\media\clip one.mkv");
+        for args in [probe_args(path), frame_args(path), duration_scan_args(path)] {
+            crate::media::source::assert_inputs_whitelisted(&args);
+        }
+        // The scan's progress options are GLOBAL, so they come before the
+        // input: placed after the output, ffmpeg ignores them as trailing.
+        let scan: Vec<String> = duration_scan_args(path).iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let input = scan.iter().position(|a| a == "-i").unwrap();
+        assert!(scan.iter().position(|a| a == "-progress").unwrap() < input);
+        assert!(scan.windows(2).any(|w| w[0] == "-c" && w[1] == "copy"), "a demux, never a decode");
+    }
+
+    /// A URL, a device and a relative name — what a crafted `.trt` can hold —
+    /// are refused as bad input by the probe, and are "no answer" to the
+    /// frame probe the load-time repair runs, before any sidecar starts.
+    #[test]
+    fn a_path_that_is_not_a_file_is_never_probed() {
+        for path in ["https://example.com/clip.mp4", r"\\.\pipe\clip.mp4", "clip.mp4", ""] {
+            assert!(matches!(probe_sync(path), Err(AppError::BadInput(_))), "{path:?}");
+            assert_eq!(frame_transposes(path), None, "{path:?}");
+        }
+        // A relative name that DOES resolve against the working directory
+        // (the crate root under `cargo test`) to a picture ffprobe would read
+        // happily: the check is what refuses it, not the protocol list.
+        let relative = "icons/32x32.png";
+        let absolute = std::env::current_dir().unwrap().join(relative);
+        assert!(absolute.is_file(), "fixture: {absolute:?}");
+        assert_eq!(frame_transposes(absolute.to_str().unwrap()), Some(false), "fixture: it decodes");
+        assert_eq!(frame_transposes(relative), None);
+        assert!(matches!(probe_sync(relative), Err(AppError::BadInput(_))));
+    }
+
+    /// The last progress block's time, in seconds; N/A, zero and an
+    /// unfinished block are no length at all. Values differ per row so a
+    /// parser reading the FIRST block, or the `out_time_ms` key's value as
+    /// milliseconds, fails.
+    #[test]
+    fn the_scanned_length_is_the_final_progress_block() {
+        let two_blocks = b"out_time_us=1000000\nout_time_ms=1000000\nprogress=continue\nframe=60\nout_time_us=2500000\nout_time_ms=2500000\nprogress=end\n";
+        assert_eq!(final_out_time(two_blocks), Some(2.5));
+        assert_eq!(final_out_time(b"out_time_us=N/A\nout_time_ms=N/A\nprogress=end\n"), None);
+        assert_eq!(final_out_time(b"out_time_us=1200000\nprogress=continue\nout_time_us=N/A\nprogress=end\n"), None);
+        assert_eq!(final_out_time(b"out_time_us=0\nprogress=end\n"), None);
+        assert_eq!(final_out_time(b"out_time_us=3000000\n"), None, "no block ever completed");
+        assert_eq!(final_out_time(b""), None);
+    }
+
+    /// Files whose headers carry no length anywhere. A live-written WebM (no
+    /// Duration element, no cues) — video, and audio-only — is measured by
+    /// reading it, to the length it really has; a raw H.264 stream has no
+    /// timestamps to measure and is refused with a plain reason. Before the
+    /// scan, all three imported with duration 0 (a 1/120 s clip). The two
+    /// lengths differ (2 s and 3 s) so a scan reading the wrong stream fails.
+    #[test]
+    fn a_file_that_does_not_say_its_length_is_measured_or_refused() {
+        let dir = std::env::temp_dir().join(format!("taroting probe lengthless {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, args: &[&str]| {
+            let out_path = dir.join(name);
+            let mut all = vec!["-y"];
+            all.extend_from_slice(args);
+            all.push(out_path.to_str().unwrap());
+            let out = ffmpeg::run("ffmpeg", &all).unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            out_path
+        };
+        let video = make("live video.webm", &[
+            "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30:duration=2",
+            "-c:v", "libvpx", "-b:v", "200k", "-live", "1", "-f", "webm",
+        ]);
+        let audio = make("live audio.webm", &[
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+            "-c:a", "libopus", "-live", "1", "-f", "webm",
+        ]);
+        let raw = make("raw stream.h264", &[
+            "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30:duration=2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-f", "h264",
+        ]);
+        // The premise: ffprobe reports no length for any of them.
+        for f in [&video, &audio, &raw] {
+            let out = ffmpeg::run("ffprobe", &["-v", "error", "-show_entries", "format=duration:stream=duration", "-of", "csv=p=0", f.to_str().unwrap()]).unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(!text.chars().any(|c| c.is_ascii_digit()), "fixture {f:?} reports a length: {text}");
+        }
+
+        let v = probe_sync(video.to_str().unwrap()).unwrap();
+        assert_eq!(v.kind, "video");
+        assert!((v.duration - 2.0).abs() < 0.1, "video measured {}", v.duration);
+        let a = probe_sync(audio.to_str().unwrap()).unwrap();
+        assert_eq!(a.kind, "audio");
+        assert!((a.duration - 3.0).abs() < 0.1, "audio measured {}", a.duration);
+        match probe_sync(raw.to_str().unwrap()) {
+            Err(AppError::BadInput(m)) => assert!(m.contains("how long"), "{m}"),
+            other => panic!("a raw stream must be refused, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// End-to-end: encode a tiny fixture with the ffmpeg sidecar (path with a
     /// space, on purpose), then probe it and check every field we rely on.

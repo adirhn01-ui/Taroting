@@ -185,25 +185,35 @@ export function windowHandleDrag(
   const signX = Math.sign(srcDir.x);
   const signY = Math.sign(srcDir.y);
 
+  // Each moved edge is clamped HERE, against the frame and against its fixed
+  // partner, before clampCrop ever sees the rect. clampCrop alone cannot do it:
+  // it limits the extent first and then slides the origin to fit, so an
+  // overshoot was absorbed by the edge that was NOT being dragged — flinging
+  // the right handle out past the frame dragged the left edge to 0, and a left
+  // handle pulled out grew the right edge. The fixed edge must stay exactly
+  // where it was; the moved one stops at the frame, or CROP_MIN short of its
+  // partner when dragged across it.
   let { x, y, w, h } = start.crop;
   if (moveX) {
     if (signX < 0) {
       // moving the left source edge: x and w change, x+w (right edge) fixed
-      const nx = x + sd.x;
-      w = w + (x - nx);
+      const right = x + w;
+      const nx = clamp(x + sd.x, 0, right - CROP_MIN);
+      w = right - nx;
       x = nx;
     } else {
       // moving the right source edge: w changes, x fixed
-      w = w + sd.x;
+      w = clamp(w + sd.x, CROP_MIN, srcW - x);
     }
   }
   if (moveY) {
     if (signY < 0) {
-      const ny = y + sd.y;
-      h = h + (y - ny);
+      const bottom = y + h;
+      const ny = clamp(y + sd.y, 0, bottom - CROP_MIN);
+      h = bottom - ny;
       y = ny;
     } else {
-      h = h + sd.y;
+      h = clamp(h + sd.y, CROP_MIN, srcH - y);
     }
   }
 

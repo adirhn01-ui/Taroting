@@ -6,7 +6,9 @@ import type { MediaInfo, ProjectFile } from "../core/types";
 // The paste's own flow, with the disk, the probe and the toasts faked: what is
 // under test is which of them it waits for and what it re-checks after.
 const saved = vi.hoisted(() => ({ resolve: null as null | ((v: { path: string }) => void) }));
-const toasts = vi.hoisted(() => ({ info: [] as string[], error: [] as string[] }));
+const toasts = vi.hoisted(() => ({ info: [] as string[], error: [] as string[], refuse: [] as string[] }));
+/** what the probe says the saved file is */
+const probe = vi.hoisted(() => ({ kind: "image" }));
 vi.mock("./save", () => ({
   saveBlob: () =>
     new Promise<{ path: string }>((r) => {
@@ -20,7 +22,7 @@ vi.mock("../core/ipc", () => ({
       path,
       size: 1,
       mtimeMs: 1,
-      kind: "image",
+      kind: probe.kind as MediaInfo["kind"],
       duration: 0,
       width: 320,
       height: 180,
@@ -33,6 +35,7 @@ vi.mock("../ui/toast", () => ({
   toast: {
     info: (m: string) => void toasts.info.push(m),
     error: (m: string) => void toasts.error.push(m),
+    refuse: (m: string) => void toasts.refuse.push(m),
   },
 }));
 vi.mock("../editor/media/relink", () => ({
@@ -81,6 +84,8 @@ describe("installPaste: something opened while the paste was being saved", () =>
     saved.resolve = null;
     toasts.info = [];
     toasts.error = [];
+    toasts.refuse = [];
+    probe.kind = "image";
     vi.stubGlobal("HTMLElement", class {});
     vi.stubGlobal("document", {
       activeElement: null,
@@ -206,6 +211,44 @@ describe("installPaste: something opened while the paste was being saved", () =>
     t.paste("text/plain", "string");
     expect(toasts.info).toEqual([]);
     expect(t.prevented()).toBe(0);
+    t.remove();
+  });
+
+  it("a second paste while the first is still saving says so, once, and the first still lands", async () => {
+    const BUSY = "Still adding the last pasted image — paste again once it appears.";
+    const t = rig();
+    t.paste();
+    await settle();
+    // Still saving: two more Ctrl+V (a held key repeats) — one toast, not two.
+    t.paste();
+    t.paste();
+    expect(toasts.info).toEqual([BUSY]);
+    // Both were image pastes, so both were claimed from the page.
+    expect(t.prevented()).toBe(3);
+    saved.resolve!({ path: "C:/Pasted images/Pasted 1.png" });
+    await settle();
+    // Not queued: only the first paste was ever saved, and it lands once.
+    expect(t.commits.length).toBe(1);
+    // The next busy spell may say it again.
+    saved.resolve = null;
+    t.paste();
+    await settle();
+    expect(saved.resolve).not.toBe(null);
+    t.paste();
+    expect(toasts.info.filter((m) => m === BUSY)).toEqual([BUSY, BUSY]);
+    t.remove();
+  });
+
+  it("a pasted file that probes as no still is refused, not recorded as a failure", async () => {
+    probe.kind = "video";
+    const t = rig();
+    t.paste();
+    await settle();
+    saved.resolve!({ path: "C:/Pasted images/Pasted 1.png" });
+    await settle();
+    expect(t.commits).toEqual([]);
+    expect(toasts.refuse).toEqual(["Only images can be added to an image project."]);
+    expect(toasts.error).toEqual([]);
     t.remove();
   });
 

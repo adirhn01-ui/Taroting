@@ -730,14 +730,13 @@ mod win {
     const LOUPE_RIM: u32 = colorref(236, 236, 238);
     const LOUPE_INK: u32 = colorref(242, 242, 245);
 
-    /// `GetDpiForWindow` resolved at run time.
+    /// The overlay's DPI, for sizing the loupe.
     ///
-    /// windows-sys hides it behind the `Win32_UI_HiDpi` feature, and pulling in
-    /// a whole feature for one call is a poor trade: the export has been in
-    /// `user32` since Windows 10 1607, `user32` is always loaded in a GUI
-    /// process, and the lookup happens once for the life of the process. Where
-    /// it is missing, 96 gives the loupe its unscaled size — small on a scaled
-    /// display, never broken.
+    /// `GetDpiForWindow` is imported statically (windows-sys, behind the
+    /// `Win32_UI_HiDpi` feature in Cargo.toml), so `user32` must export it:
+    /// Windows 10 1607 or later, or the exe does not load at all. It answers 0
+    /// for a handle it cannot place; that maps to 96, the unscaled baseline,
+    /// which leaves the loupe small on a scaled display but never broken.
     fn dpi_for_window(hwnd: HWND) -> u32 {
         // 0 means "no DPI could be determined" (an invalid handle); 96 is the
         // unscaled baseline every other value is a multiple of.

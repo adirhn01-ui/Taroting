@@ -5,11 +5,145 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use super::image_rules;
 use super::schema::{self, ProjectFile};
 use crate::error::{AppError, Result};
 use crate::paths;
+
+/* ------------------------------------------------------------------ */
+/* The store worker                                                    */
+/* ------------------------------------------------------------------ */
+
+// Every command here used to be a plain sync command, and in Tauri 2 that
+// runs on the WebView2 UI thread: an autosave on a disk Defender or OneDrive
+// is busy with, a Home listing against a sleeping NAS, a settings write behind
+// a backup agent's lock — each one froze the whole window for as long as the
+// disk took.
+//
+// The UI thread also SERIALIZED them, and correctness leaned on that without
+// saying so. Two saves of one project share one `<path>.tmp`, so two writers
+// at once interleave their bytes into the file that is then renamed into
+// place; a reader landing between a save's two renames finds no primary and
+// reports a `.bak` "recovery" of a project nothing happened to; Keep saves to
+// the new path and only then deletes the old one. Moving each command to its
+// own pool thread would have kept the window responsive and broken all three.
+//
+// So everything that WRITES project or settings state runs on this one
+// worker thread, one job at a time, in the order the jobs were queued. One
+// thread rather than a lock per path because the writes are not per path:
+// recents.json is shared by every save, rename writes one path and deletes
+// another, and settings ride along. A lock per path would need an order for
+// taking two of them; one queue has none to get wrong.
+//
+// What it does NOT promise is the arrival order of the invokes themselves.
+// An async command's arguments are parsed, and its job queued, on a tokio
+// task, and two tasks spawned in order may start in either order. Nothing
+// the frontend does depends on it: an autosave coalesces through its own
+// in-flight write, settings writes are chained, and Keep awaits each step.
+// The one unawaited overlap is a discard's delete racing an autosave already
+// out for the same temp file; at worst the save lands second and leaves a
+// temp `.trt` behind, which the startup sweep settles like any other orphan.
+//
+// What stays OFF the worker is what only needs a consistent view, never an
+// order: listing recents (its read holds `RECENTS_LOCK`, and dozens of stats
+// against a dead share must not hold every save up behind them), loading a
+// project (a 512 MB parse and its probes; only its repair write and its
+// recents stamp are queued), path checks, and the thumbnail backfill, whose
+// ffmpeg must never delay a save.
+
+/// One unit of work for the worker.
+type StoreJob = Box<dyn FnOnce() + Send>;
+
+thread_local! {
+    /// True on the worker thread itself, so a job that reaches a helper which
+    /// queues and waits runs that work inline instead of waiting on itself.
+    static ON_STORE_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The worker's queue, started on first use. `None` when the thread could not
+/// be started at all; every job then runs on its caller, which is the old
+/// unordered behaviour, never a failure.
+fn store_queue() -> Option<&'static mpsc::Sender<StoreJob>> {
+    static QUEUE: OnceLock<Option<mpsc::Sender<StoreJob>>> = OnceLock::new();
+    QUEUE
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<StoreJob>();
+            std::thread::Builder::new()
+                .name("taroting-store".into())
+                .spawn(move || {
+                    ON_STORE_WORKER.with(|w| w.set(true));
+                    for job in rx {
+                        job();
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+/// Queue `job` behind every job already queued, without waiting for it. On
+/// the worker itself, or when the worker is gone, it runs right here.
+fn submit_to_store(job: StoreJob) {
+    if ON_STORE_WORKER.with(|w| w.get()) {
+        return job();
+    }
+    match store_queue() {
+        Some(tx) => {
+            if let Err(mpsc::SendError(job)) = tx.send(job) {
+                job();
+            }
+        }
+        None => job(),
+    }
+}
+
+/// The error a caller sees when the worker dropped its job unanswered — only
+/// possible if a job panicked, which a release build turns into an abort long
+/// before anyone could read this.
+fn store_stopped() -> AppError {
+    AppError::Io(std::io::Error::other("the project store stopped unexpectedly"))
+}
+
+/// Run `work` on the worker and BLOCK until it is done. For callers that are
+/// already off the UI thread (a load's repair write, a test). Never from an
+/// async task: `on_store` is the one for those.
+fn on_store_blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    if ON_STORE_WORKER.with(|w| w.get()) {
+        return Ok(work());
+    }
+    let (tx, rx) = mpsc::channel();
+    submit_to_store(Box::new(move || {
+        let _ = tx.send(work());
+    }));
+    rx.recv().map_err(|_| store_stopped())
+}
+
+/// Run `work` on the worker and await its answer — what every queued command
+/// does. The task waits on a channel, not on a thread: nothing is blocked
+/// while the job sits in the queue.
+pub(crate) async fn on_store<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let (tx, mut rx) = tauri::async_runtime::channel::<Result<T>>(1);
+    submit_to_store(Box::new(move || {
+        // Capacity one, one send: never full, so this never blocks the worker.
+        let _ = tx.try_send(work());
+    }));
+    rx.recv().await.ok_or_else(store_stopped)?
+}
+
+/// Run blocking work that only has to be off the UI thread, NOT on the worker
+/// (see above for which work that is).
+async fn off_ui<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| AppError::Io(std::io::Error::other(format!("a background task failed: {e}"))))?
+}
 
 /* ------------------------------------------------------------------ */
 /* Atomic writes                                                       */
@@ -20,6 +154,16 @@ fn bak_path(path: &Path) -> PathBuf {
     let mut bak = path.as_os_str().to_owned();
     bak.push(".bak");
     PathBuf::from(bak)
+}
+
+/// `<path>.tmp` — the bytes `atomic_write` stages before renaming them into
+/// place. ONE fixed name per target, on purpose: the store worker never runs
+/// two writes at once, and a failed write's leftover is overwritten by the
+/// next one instead of piling up.
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    PathBuf::from(tmp)
 }
 
 /// Write via temp file + rename so a crash never corrupts the target.
@@ -35,9 +179,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .ok_or_else(|| AppError::BadInput(format!("no parent dir for {}", path.display())))?;
     std::fs::create_dir_all(dir)?;
 
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
+    let tmp = tmp_path(path);
     std::fs::write(&tmp, bytes)?;
 
     let bak = bak_path(path);
@@ -119,16 +261,41 @@ pub enum JsonRead<T> {
     Unreadable,
 }
 
+/// Largest recents.json or settings.json a read accepts: hundreds of times
+/// what 24 recents cards or a whole settings object take. Both are read whole
+/// on every Home listing and on every save's recents update, so a crafted or
+/// runaway file must not be read into memory each time.
+const JSON_INDEX_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 /// `(parsed value, whether the file is there at all)`.
 ///
 /// A file we cannot even open for a reason OTHER than "it isn't there" — a
 /// permission error, an exclusive lock, a bad sector — counts as PRESENT: the
-/// data may well still exist, so the caller must not overwrite it.
+/// data may well still exist, so the caller must not overwrite it. So does a
+/// file over `JSON_INDEX_MAX_BYTES`: it is left unread, and unwritten.
 fn read_json_one<T: serde::de::DeserializeOwned>(path: &Path) -> (Option<T>, bool) {
-    match std::fs::read(path) {
-        Ok(bytes) => (serde_json::from_slice::<T>(&bytes).ok(), true),
-        Err(e) => (None, e.kind() != std::io::ErrorKind::NotFound),
+    read_json_one_within(path, JSON_INDEX_MAX_BYTES)
+}
+
+/// `read_json_one` against any cap, so a test can prove the oversize rule
+/// without megabytes of JSON.
+fn read_json_one_within<T: serde::de::DeserializeOwned>(path: &Path, cap: u64) -> (Option<T>, bool) {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return (None, e.kind() != std::io::ErrorKind::NotFound),
+    };
+    // Sized from the opened handle, and the read bounded too, so a file that
+    // grows between the two still cannot be read past the cap.
+    match file.metadata() {
+        Ok(meta) if meta.len() <= cap => {}
+        _ => return (None, true),
     }
+    let mut bytes = Vec::new();
+    if file.take(cap + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > cap {
+        return (None, true);
+    }
+    (serde_json::from_slice::<T>(&bytes).ok(), true)
 }
 
 /// Read a JSON file, falling back to the `<path>.bak` that `atomic_write`
@@ -159,6 +326,19 @@ pub fn read_json_status<T: serde::de::DeserializeOwned>(path: &Path) -> JsonRead
 /* ------------------------------------------------------------------ */
 
 const MAX_RECENTS: usize = 24;
+
+/// The most of a project's name, and of its `modifiedAt`, a recents entry
+/// keeps. Both are copied from the `.trt` itself, which a crafted file can
+/// fill with megabytes; the index is read whole on every listing and every
+/// save, so it holds what a card can show and no more.
+const RECENT_NAME_MAX_CHARS: usize = 256;
+const RECENT_STAMP_MAX_CHARS: usize = 64;
+
+/// `s` cut to at most `max` characters — whole characters, never a byte
+/// index, so a multi-byte name is never split.
+fn clipped(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
 
 /// Current UTC time as an ISO 8601 string (e.g. `2026-07-02T15:04:05Z`),
 /// computed from the Unix epoch with no external date crate.
@@ -350,6 +530,8 @@ fn upsert_recent(mut item: RecentItem) -> Result<()> {
     if let Ok(meta) = std::fs::metadata(&item.path) {
         item.size_bytes = meta.len();
     }
+    item.name = clipped(&item.name, RECENT_NAME_MAX_CHARS);
+    item.modified_at = clipped(&item.modified_at, RECENT_STAMP_MAX_CHARS);
     update_recents(|index| {
         // Preserve a prior openedAt when the caller doesn't supply one.
         if let Some(prev) = index.items.iter().find(|r| r.path == item.path) {
@@ -393,28 +575,60 @@ pub(crate) fn set_recent_thumb(project_path: &str, thumb: &str) {
     });
 }
 
+/// Off the UI thread and off the store worker: a card per entry is a stat per
+/// entry, and against a sleeping NAS each one is an SMB timeout that must
+/// hold up neither the window nor anybody's save.
 #[tauri::command]
-pub fn list_recents() -> Result<RecentsIndex> {
-    let mut index = read_recents();
-    // Drop entries whose project file vanished (moved/deleted by the user), but
-    // KEEP one whose primary is gone while its .bak survives: that combination
-    // means an interrupted save, not a deletion, and read_project_value can
-    // recover it. Without this the card disappears from home and the user has no
-    // way to reach the recovery at all. delete_project and rename_project both
-    // remove the .bak alongside the primary, so an orphan .bak is unambiguous.
-    index
-        .items
-        .retain(|r| Path::new(&r.path).is_file() || bak_path(Path::new(&r.path)).is_file());
-    for r in &mut index.items {
-        if let Ok(meta) = std::fs::metadata(&r.path) {
-            r.size_bytes = meta.len();
-        }
+pub async fn list_recents() -> Result<RecentsIndex> {
+    off_ui(list_recents_now).await
+}
+
+/// `list_recents`' body.
+///
+/// An index that is on disk but cannot be read is an ERROR, not an empty
+/// list. Answering "no projects" made Home say "No projects yet" over a
+/// user's whole library, with nothing to tell them it was still there.
+fn list_recents_now() -> Result<RecentsIndex> {
+    let recents = {
+        let _guard = lock_recents();
+        read_recents_checked()
+    };
+    if !recents.writable {
+        return Err(AppError::Io(std::io::Error::other(
+            "the list is on disk but could not be read",
+        )));
     }
+    let mut index = recents.index;
+    // Drop entries whose project file vanished (moved/deleted by the user), but
+    // KEEP one whose primary is gone while its .bak survives. That is what an
+    // interrupted save leaves, and read_project_value recovers it; it is ALSO
+    // what deleting a saved-twice project's .trt in Explorer leaves, and that
+    // card is kept on purpose (owner's ruling): the .bak still holds the work,
+    // and Delete, Rename and Duplicate all work on such a card.
+    //
+    // One stat per card; the .bak is asked about only when the primary is
+    // gone. A primary that cannot be asked at all (a share that is offline, a
+    // permission error) keeps its card: an unreachable project is not a
+    // deleted one, and this listing writes nothing, so the card's fate is
+    // decided again on the next listing.
+    index.items.retain_mut(|r| match std::fs::metadata(&r.path) {
+        Ok(meta) if meta.is_file() => {
+            r.size_bytes = meta.len();
+            true
+        }
+        Ok(_) => bak_path(Path::new(&r.path)).is_file(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bak_path(Path::new(&r.path)).is_file(),
+        Err(_) => true,
+    });
     Ok(index)
 }
 
 #[tauri::command]
-pub fn remove_recent(path: String) -> Result<()> {
+pub async fn remove_recent(path: String) -> Result<()> {
+    on_store(move || remove_recent_now(&path)).await
+}
+
+fn remove_recent_now(path: &str) -> Result<()> {
     update_recents(|index| {
         index.items.retain(|r| r.path != path);
         true
@@ -446,10 +660,121 @@ fn mtime_ms_of(meta: &std::fs::Metadata) -> u64 {
 }
 
 /// The `.bak` sibling, parsed as JSON. `None` when it is absent or corrupt too
-/// (or over the `.trt` size cap).
+/// (or over the `.trt` size cap, or too dense to parse — `refuse_value_bomb`).
 fn read_bak_value(path: &Path) -> Option<Value> {
     let bytes = image_rules::read_capped(&bak_path(path)).ok()?;
-    serde_json::from_slice::<Value>(&bytes).ok()
+    parse_bak_bytes(path, &bytes)
+}
+
+/// A `.bak`'s bytes as JSON, behind the same density check as every read.
+fn parse_bak_bytes(path: &Path, bytes: &[u8]) -> Option<Value> {
+    refuse_value_bomb(bytes, path).ok()?;
+    serde_json::from_slice::<Value>(bytes).ok()
+}
+
+/* ------------------------------------------------------------------ */
+/* Parse-memory guard                                                  */
+/* ------------------------------------------------------------------ */
+
+// A `.trt` is parsed whole into `serde_json::Value` (the raw document is what
+// load hands on, unknown fields and all), and a Value costs far more than the
+// bytes it came from: every object is a B-tree whose first node alone is 632
+// bytes, every value a 32-byte slot in a vector that grows by doubling, every
+// string a heap block. A file under the 512 MB read cap made of nothing but
+// `{}` or `0` asks for tens of gigabytes, and a failed allocation aborts the
+// app silently — every other window's unsaved work with it. The size cap
+// stops a big file; this stops a DENSE one.
+//
+// So a file over `VALUE_SCAN_FROM_BYTES` is scanned once before the parse
+// (O(n), no allocation; string contents skipped, escapes honoured) for what
+// the parse would cost, and refused above `VALUE_BUDGET`. Below that size the
+// worst a file can ask for is a few hundred megabytes, and the scan is skipped
+// so an ordinary project pays nothing for it.
+
+/// Files at or under this are parsed without the scan.
+const VALUE_SCAN_FROM_BYTES: usize = 1024 * 1024;
+
+/// What one `{` costs once parsed: the B-tree's first node, 632 bytes for a
+/// `String` → `Value` map, plus the allocator's header.
+const OBJECT_COST: u64 = 704;
+/// What one more value in an array or object costs: its 32-byte slot, twice
+/// over for the doubling growth of the vector holding it.
+const SLOT_COST: u64 = 64;
+/// What one string costs beyond its own bytes: the heap block's rounding and
+/// header.
+const STRING_COST: u64 = 32;
+
+/// The heaviest stroke the editor writes, as `value_cost` prices it — a shape
+/// (arrow, line), whose two endpoint arrays cost more than an ink stroke's one
+/// points string; that string's length is priced separately below. A test
+/// prices every stroke shape against it.
+const WORST_STROKE_COST: u64 = 1_700;
+
+/// The most a parse may cost: a drawing at every cap at once —
+/// `MAX_STROKES_TOTAL` of the heaviest stroke, `MAX_POINTS_TOTAL` points of
+/// base64 (16 characters each) — plus room for the rest of the project. So
+/// the biggest drawing the editor can build still opens, and a crafted file
+/// can never ask for more memory than that drawing would (about 3.8 GB by
+/// this pricing; less in fact, the pricing is deliberately pessimistic).
+const VALUE_BUDGET: u64 = image_rules::MAX_STROKES_TOTAL * WORST_STROKE_COST
+    + image_rules::MAX_POINTS_TOTAL * 16
+    + 64 * 1024 * 1024;
+
+/// What parsing `bytes` into a `Value` would cost, priced per `{`, per value
+/// in a container (`[` and `,` outside strings) and per string. Whitespace is
+/// free; numbers, `true`, `false` and `null` are priced through the comma
+/// before them.
+fn value_cost(bytes: &[u8]) -> u64 {
+    let mut cost: u64 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i;
+                i += 1;
+                // Skip the string, honouring escapes: `\"` does not close it
+                // and `\\` does not escape the quote after it.
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b'"' => break,
+                        _ => i += 1,
+                    }
+                }
+                cost += STRING_COST + (i.min(bytes.len()) - start) as u64;
+            }
+            b'{' => cost += OBJECT_COST,
+            b'[' | b',' => cost += SLOT_COST,
+            _ => {}
+        }
+        i += 1;
+    }
+    cost
+}
+
+/// Refuse a project whose parse would cost more than `VALUE_BUDGET`.
+fn refuse_value_bomb(bytes: &[u8], path: &Path) -> Result<()> {
+    refuse_value_bomb_within(bytes, path, VALUE_SCAN_FROM_BYTES, VALUE_BUDGET)
+}
+
+/// `refuse_value_bomb` against any threshold and budget, so the tests can
+/// prove the refusal with kilobytes instead of gigabytes.
+fn refuse_value_bomb_within(bytes: &[u8], path: &Path, scan_from: usize, budget: u64) -> Result<()> {
+    if bytes.len() <= scan_from || value_cost(bytes) <= budget {
+        return Ok(());
+    }
+    Err(AppError::BadInput(format!(
+        "{} holds more data than Taroting can open safely",
+        path.display()
+    )))
+}
+
+/// What a read that found no primary settled on, on the store worker.
+enum Settled {
+    /// The primary was there after all: a save had it mid-rename.
+    Primary(std::io::Result<Vec<u8>>),
+    /// The primary really is gone: the `.bak`, read in the same step.
+    Gone(std::io::Result<Vec<u8>>),
 }
 
 /// An oversize `.trt` (see `image_rules::read_capped`) as the user-facing
@@ -462,34 +787,76 @@ fn capped_read_error(e: std::io::Error) -> AppError {
     }
 }
 
+/// Read a project as JSON, falling back to its `.bak`. `(value, recovered)`.
+///
+/// Runs OFF the store worker (load, the thumbnail backfill), so a save may be
+/// running at the same moment — and between its two renames a save leaves no
+/// primary at all. Reading the `.bak` then reported a recovery of a project
+/// nothing had happened to. So a missing primary is settled ON the worker,
+/// where no save can be half done: the primary is read again there, and only
+/// if it is still gone is the `.bak` read, in the same step.
 fn read_project_value(path: &Path) -> Result<(Value, bool)> {
     match image_rules::read_capped(path) {
-        Ok(bytes) => {
-            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                return Ok((v, false));
-            }
-            // corrupt main file → try the .bak
-            match read_bak_value(path) {
-                Some(v) => Ok((v, true)),
-                None if bak_path(path).exists() => Err(AppError::BadInput(format!(
-                    "{} and its backup are both corrupt",
-                    path.display()
-                ))),
-                None => Err(AppError::BadInput(format!(
-                    "{} is not valid JSON",
-                    path.display()
-                ))),
-            }
-        }
+        Ok(bytes) => parse_project_bytes(path, &bytes),
+        // Nothing to settle: a save mid-rename has always rotated the primary
+        // onto the `.bak` first, so with neither on disk there is no save.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !bak_path(path).exists() => Err(e.into()),
         // The primary is GONE — a save whose final rename failed used to leave
         // exactly this state, and returning NotFound here made the loss look
         // permanent. The rotated `.bak` is the last good copy, so recover from
         // it (flagged `recovered`) exactly as for a corrupt primary.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            read_bak_value(path).map(|v| (v, true)).ok_or_else(|| e.into())
+            let primary = path.to_path_buf();
+            let settled = on_store_blocking(move || match image_rules::read_capped(&primary) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Settled::Gone(image_rules::read_capped(&bak_path(&primary)))
+                }
+                read => Settled::Primary(read),
+            })?;
+            match settled {
+                Settled::Primary(Ok(bytes)) => parse_project_bytes(path, &bytes),
+                Settled::Primary(Err(e)) => Err(capped_read_error(e)),
+                Settled::Gone(bak) => bak
+                    .ok()
+                    .and_then(|bytes| parse_bak_bytes(path, &bytes))
+                    .map(|v| (v, true))
+                    .ok_or_else(|| e.into()),
+            }
         }
         Err(e) => Err(capped_read_error(e)),
     }
+}
+
+/// A primary's bytes as JSON, or — corrupt — its `.bak` instead.
+fn parse_project_bytes(path: &Path, bytes: &[u8]) -> Result<(Value, bool)> {
+    refuse_value_bomb(bytes, path)?;
+    if let Ok(v) = serde_json::from_slice::<Value>(bytes) {
+        return Ok((v, false));
+    }
+    // corrupt main file → try the .bak
+    match read_bak_value(path) {
+        Some(v) => Ok((v, true)),
+        None if bak_path(path).exists() => Err(AppError::BadInput(format!(
+            "{} and its backup are both corrupt",
+            path.display()
+        ))),
+        None => Err(AppError::BadInput(format!(
+            "{} is not valid JSON",
+            path.display()
+        ))),
+    }
+}
+
+/// A file's length and modification time, taken just before a load reads it.
+/// A load-time repair is written back only while the file still has exactly
+/// this stamp, checked on the store worker: anything else means a save landed
+/// after the read, and writing the repaired READ over it would revert that
+/// save.
+type FileStamp = (u64, SystemTime);
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
 }
 
 /// Whether the file behind `m` is on disk with exactly the size and mtime the
@@ -705,7 +1072,13 @@ fn apply_dim_fixes(value: &mut Value, fixes: &[DimFix], canvas: Option<(u32, u32
 /// (`clamp_clip_crops`), as the still repair does: a crop authored against the
 /// stale landscape box can hang off the portrait one, and the preview clamps
 /// x/y while the export does not.
-fn repair_rotated_dimensions(path: &Path, value: &mut Value, typed: &ProjectFile, recovered: bool) {
+fn repair_rotated_dimensions(
+    path: &Path,
+    value: &mut Value,
+    typed: &ProjectFile,
+    recovered: bool,
+    read_as: Option<FileStamp>,
+) {
     let fixes = rotation_fixes(&typed.media);
     apply_dim_fixes(value, &fixes, transposed_canvas(typed, &fixes));
     for fix in &fixes {
@@ -719,7 +1092,7 @@ fn repair_rotated_dimensions(path: &Path, value: &mut Value, typed: &ProjectFile
     // writing it back every open pays for the probes again — which would make
     // the schema gate, and with it the performance argument for gating at all,
     // pointless.
-    persist_repair(path, value, recovered);
+    persist_repair(path, value, recovered, read_as);
 }
 
 /// Write a load-time repair back to the project file.
@@ -735,15 +1108,33 @@ fn repair_rotated_dimensions(path: &Path, value: &mut Value, typed: &ProjectFile
 /// Fail-soft otherwise: a read-only volume or a locked file must not fail the
 /// open. The repair is already in `value`, so the user gets a correct project
 /// this session and the next load tries again.
-fn persist_repair(path: &Path, value: &Value, recovered: bool) {
+///
+/// The write is queued on the store worker, behind any save already queued,
+/// and happens only while the file still carries `read_as` — the stamp it had
+/// when the load read it. The load runs off the worker, so an autosave can
+/// land between its read and this write; writing the repaired read over that
+/// save would revert it. A skipped repair costs one more repair on the next
+/// load, nothing else. No stamp at all (the file could not be stat'd) skips
+/// it too.
+fn persist_repair(path: &Path, value: &Value, recovered: bool, read_as: Option<FileStamp>) {
     if recovered {
         return;
     }
+    let Some(read_as) = read_as else {
+        return;
+    };
     // Past the load cap, skipped like any other failed write: the file on
-    // disk still opens, the repaired one would not.
-    if let Ok(bytes) = project_bytes(value) {
-        let _ = atomic_write(path, &bytes);
-    }
+    // disk still opens, the repaired one would not. Serialized here, off the
+    // worker: only the write itself needs the queue.
+    let Ok(bytes) = project_bytes(value) else {
+        return;
+    };
+    let path = path.to_path_buf();
+    let _ = on_store_blocking(move || {
+        if file_stamp(&path) == Some(read_as) {
+            let _ = atomic_write(&path, &bytes);
+        }
+    });
 }
 
 /// Windows attributes marking a cloud placeholder — a file whose bytes are not
@@ -1070,9 +1461,22 @@ fn json_number(v: f64) -> Value {
     }
 }
 
+/// Off the UI thread, and off the store worker: a load reads and parses up to
+/// 512 MB, stats every media file (an SMB timeout each on a dead share) and may
+/// spend a probe per stale clip, none of which may hold up a save. Its two
+/// writes — a repair and the recents stamp — are queued (`persist_repair`,
+/// `stamp_opened`).
 #[tauri::command]
-pub fn load_project(path: String) -> Result<LoadedProject> {
-    let p = Path::new(&path);
+pub async fn load_project(path: String) -> Result<LoadedProject> {
+    off_ui(move || load_project_now(&path)).await
+}
+
+/// `load_project`'s body.
+fn load_project_now(path: &str) -> Result<LoadedProject> {
+    let p = Path::new(path);
+    // Before the read, so a save landing at any point after it changes the
+    // stamp the repair write checks.
+    let read_as = file_stamp(p);
     let (raw, recovered) = read_project_value(p)?;
     let schema::Migrated { mut value, from } = schema::migrate(raw)?;
     let typed: ProjectFile = ProjectFile::deserialize(&value)
@@ -1105,16 +1509,16 @@ pub fn load_project(path: String) -> Result<LoadedProject> {
     // the still repair writes on its own, and only when it changed something.
     let stills_changed = repair_still_orientation(&mut value, &typed.media);
     if from < schema::ROTATION_REPAIR_SCHEMA {
-        repair_rotated_dimensions(p, &mut value, &typed, recovered);
+        repair_rotated_dimensions(p, &mut value, &typed, recovered, read_as);
     } else if stills_changed {
-        persist_repair(p, &value, recovered);
+        persist_repair(p, &value, recovered, read_as);
     }
 
     // Stamp openedAt on this path's recents entry (create it if absent — a
     // freshly opened file may not be in the list yet). Temp quick-view projects
     // are deliberately excluded from recents, so they are never stamped.
-    if !is_temp_project_path(&path) {
-        stamp_opened(&path, &typed);
+    if !is_temp_project_path(path) {
+        stamp_opened(path, &typed);
     }
 
     Ok(LoadedProject {
@@ -1143,30 +1547,35 @@ fn recent_duration(typed: &ProjectFile) -> f64 {
 
 /// Record that `path` was just opened. Updates the existing recents entry's
 /// `opened_at`, or inserts a fresh entry built from the loaded project.
+///
+/// Queued on the store worker and NOT waited for: it is best-effort like
+/// every recents side effect, and a load must not wait behind a slow save of
+/// some other project for a timestamp. Queued before the load returns, so it
+/// is ahead of any save the editor makes of this project after opening it.
 fn stamp_opened(path: &str, typed: &ProjectFile) {
-    let now = now_iso8601();
-    let _ = update_recents(|index| {
-        if let Some(entry) = index.items.iter_mut().find(|r| r.path == path) {
-            entry.opened_at = Some(now);
-        } else {
-            let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            index.items.insert(
-                0,
-                RecentItem {
-                    path: path.to_string(),
-                    name: typed.name.clone(),
-                    modified_at: typed.modified_at.clone(),
-                    duration_sec: recent_duration(typed),
-                    thumb: None,
-                    size_bytes,
-                    opened_at: Some(now),
-                    kind: recent_kind(typed),
-                },
-            );
-            index.items.truncate(MAX_RECENTS);
-        }
-        true
-    });
+    let fresh = RecentItem {
+        path: path.to_string(),
+        name: clipped(&typed.name, RECENT_NAME_MAX_CHARS),
+        modified_at: clipped(&typed.modified_at, RECENT_STAMP_MAX_CHARS),
+        duration_sec: recent_duration(typed),
+        thumb: None,
+        size_bytes: 0,
+        opened_at: Some(now_iso8601()),
+        kind: recent_kind(typed),
+    };
+    submit_to_store(Box::new(move || {
+        let mut fresh = fresh;
+        fresh.size_bytes = std::fs::metadata(&fresh.path).map(|m| m.len()).unwrap_or(0);
+        let _ = update_recents(|index| {
+            if let Some(entry) = index.items.iter_mut().find(|r| r.path == fresh.path) {
+                entry.opened_at = fresh.opened_at;
+            } else {
+                index.items.insert(0, fresh);
+                index.items.truncate(MAX_RECENTS);
+            }
+            true
+        });
+    }));
 }
 
 #[derive(Debug, Serialize)]
@@ -1210,11 +1619,84 @@ fn first_clip_media(typed: &ProjectFile) -> Option<&schema::MediaRef> {
 /// The cache is looked up, never required: it only supplies the recents
 /// card's thumbnail, and main.rs runs without one when `%LOCALAPPDATA%` is
 /// unusable — a `State` parameter there failed EVERY save before its body ran.
+///
+/// Queued on the store worker: never on the UI thread, never beside another
+/// write.
 #[tauri::command]
-pub fn save_project(app: tauri::AppHandle, path: String, project: Value) -> Result<SavedProject> {
+pub async fn save_project(app: tauri::AppHandle, path: String, project: Value) -> Result<SavedProject> {
     use tauri::Manager;
-    let cache = app.try_state::<std::sync::Arc<crate::cache::Cache>>();
-    save_project_at(cache.as_deref().map(|c| &**c), path, project)
+    let cache = app.try_state::<Arc<crate::cache::Cache>>().map(|c| Arc::clone(&c));
+    on_store(move || save_project_at(cache.as_deref(), path, project)).await
+}
+
+/// The path a project is written to or deleted at, refused unless it is
+/// plainly a project file: an absolute `.trt` (any case) on a drive or a
+/// share, with no device form (`\\.\`, `\\?\`) and no alternate data stream.
+///
+/// Defence in depth for a compromised webview, which could otherwise hand
+/// these commands any path at all: delete any file of the user's (plus its
+/// `.bak`), or overwrite one with project JSON. It does NOT close every such
+/// sink — an export's output path is an arbitrary write by design — it keeps
+/// the project commands from being two more. Every path the app itself passes
+/// comes from `new_project_path`, `temp_project_path`, rename/duplicate (all
+/// `.trt` by construction) or a `.trt` the user opened.
+fn project_target(path: &str) -> Result<&Path> {
+    let refuse = || Err(AppError::BadInput(format!("not a Taroting project path: {path}")));
+    let starts = |prefix: &str| {
+        path.chars()
+            .take(4)
+            .map(|c| if c == '/' { '\\' } else { c })
+            .eq(prefix.chars())
+    };
+    if path.contains('\0') || crate::media::source::is_device_path(path) || starts(r"\\?\") {
+        return refuse();
+    }
+    let p = Path::new(path);
+    if !p.is_absolute() || !crate::media::source::is_file_namespace(p) {
+        return refuse();
+    }
+    // A colon past the drive names a stream of some other file ("a.txt:x.trt"
+    // writes into a.txt). The drive's own colon lives in the prefix component.
+    let stream = p.components().any(|c| match c {
+        std::path::Component::Normal(s) => s.to_string_lossy().contains(':'),
+        _ => false,
+    });
+    if stream || !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("trt")) {
+        return refuse();
+    }
+    Ok(p)
+}
+
+/// `(at_sec, cache suffix)` of the frame a project card shows: the frame the
+/// editor's bin asks `get_thumbnail` for (half the clip, at most half a
+/// second in), so the card and the bin share one cached file. The suffix is
+/// `ensure_thumb`'s own spelling (src/media/thumbs.rs), byte for byte; the
+/// save-time lookup below is only a hit while the two agree, which a test
+/// pins.
+pub(crate) fn card_thumb_frame(duration: f64) -> (f64, String) {
+    let at = (duration / 2.0).clamp(0.0, 0.5);
+    (at, format!("_{}.jpg", (at * 1000.0) as u64))
+}
+
+/// The cached card thumbnail of `media`, if one exists: the exact file for the
+/// card's frame first (one stat), then any frame of that media (a whole
+/// thumbs-directory listing) only when that misses. Every autosave asks this,
+/// and the listing used to run on every one of them. `is_file`, not
+/// `existing_file`: a save is not a use of the thumbnail, so it must not
+/// touch the cache's LRU index.
+fn cached_card_thumb(cache: &crate::cache::Cache, media: &schema::MediaRef) -> Option<PathBuf> {
+    let hash = crate::cache::MediaKey {
+        path: media.path.clone(),
+        size: media.size,
+        mtime_ms: media.mtime_ms,
+    }
+    .hash();
+    let (_, suffix) = card_thumb_frame(media.duration);
+    let exact = cache.file_path(crate::cache::CacheKind::Thumbs, &hash, &suffix);
+    if exact.is_file() {
+        return Some(exact);
+    }
+    crate::media::thumbs::any_thumb_for(cache, &hash)
 }
 
 /// `save_project` minus the Tauri state wrapper, so the tests can drive the
@@ -1230,6 +1712,7 @@ fn save_project_within(
     project: Value,
     cap: u64,
 ) -> Result<SavedProject> {
+    let target = project_target(&path)?;
     // Validate before writing — never persist something we can't read back.
     let typed: ProjectFile = ProjectFile::deserialize(&project)
         .map_err(|e| AppError::BadInput(format!("refusing to save invalid project: {e}")))?;
@@ -1250,31 +1733,32 @@ fn save_project_within(
     // Sized BEFORE the file is touched: a refusal leaves the previous save
     // (and its `.bak`) exactly as they were.
     let bytes = project_bytes_within(&project, cap)?;
-    atomic_write(Path::new(&path), &bytes)?;
+    atomic_write(target, &bytes)?;
 
     // Temp quick-view projects (autosaved to the temp dir) must never enter
     // recents. Pressing Back re-saves to a permanent Documents path, which does
     // upsert. Skip both the thumb lookup and the upsert for temp-dir paths.
     if !is_temp_project_path(&path) {
-        // Thumbnail for the recents grid: any cached thumb of the first clip's
-        // media. Never for an image project: its card is the rendered picture
-        // the image editor writes, and the raw first photo would overwrite it
-        // (`upsert_recent` keeps the card's current thumb instead).
+        // Thumbnail for the recents grid: the cached card frame of the first
+        // clip's media. Never for an image project: its card is the rendered
+        // picture the image editor writes, and the raw first photo would
+        // overwrite it (`upsert_recent` keeps the card's current thumb
+        // instead). Never for a generator or audio first clip either: neither
+        // has a frame in the cache (the same rule as `thumb_source_for`), so
+        // looking would only ever be a full directory listing that misses.
         let thumb = (!image)
             .then(|| first_clip_media(&typed))
             .flatten()
-            .map(|m| {
-                crate::cache::MediaKey {
-                    path: m.path.clone(),
-                    size: m.size,
-                    mtime_ms: m.mtime_ms,
-                }
-                .hash()
-            })
-            .and_then(|h| cache.and_then(|c| crate::media::thumbs::any_thumb_for(c, &h)))
+            .filter(|m| m.generator.is_none() && m.kind != "audio")
+            .and_then(|m| cache.and_then(|c| cached_card_thumb(c, m)))
             .map(|p| p.to_string_lossy().into_owned());
 
-        upsert_recent(RecentItem {
+        // Best-effort, like every other recents side effect. The project is
+        // already on disk: reporting this save as failed because recents.json
+        // was locked by a scanner made autosave say "Save failed" for good,
+        // made Keep write "<name> 2.trt" duplicates on retry, and left
+        // Duplicate's copy on disk without a card.
+        if let Err(e) = upsert_recent(RecentItem {
             path: path.clone(),
             name: typed.name.clone(),
             modified_at: typed.modified_at.clone(),
@@ -1283,7 +1767,9 @@ fn save_project_within(
             size_bytes: 0, // filled by upsert_recent via fs metadata
             opened_at: None, // preserved from any prior entry by upsert_recent
             kind: recent_kind(&typed),
-        })?;
+        }) {
+            eprintln!("Taroting: saved {path}, but the recent projects list was not updated ({e})");
+        }
     }
 
     Ok(SavedProject {
@@ -1315,7 +1801,9 @@ fn thumb_source_for(path: &str) -> Option<(crate::cache::MediaKey, f64)> {
     // The source must exist and match identity (size + mtime) before we hand a
     // path to ffmpeg — a stale/replaced file would otherwise yield a wrong or
     // failed frame. The same rule `load_project`'s missing-media scan applies.
-    if !identity_intact(media) {
+    // Nor an online-only cloud file: decoding one frame downloads it whole,
+    // and Home must never pull a video down just to draw a card.
+    if !identity_intact(media) || is_cloud_placeholder(Path::new(&media.path)) {
         return None;
     }
 
@@ -1325,7 +1813,7 @@ fn thumb_source_for(path: &str) -> Option<(crate::cache::MediaKey, f64)> {
         mtime_ms: media.mtime_ms,
     };
     // `at_sec` matches the editor bin's frame choice so both reuse one cached file.
-    let at = (media.duration / 2.0).clamp(0.0, 0.5);
+    let (at, _) = card_thumb_frame(media.duration);
     Some((key, at))
 }
 
@@ -1446,13 +1934,15 @@ fn refresh_thumbs_for(
 /// instead; this single-path form is kept for one-off callers and is a literal
 /// one-element batch, so the two can never drift apart.
 #[tauri::command]
-pub fn refresh_recent_thumb(
-    cache: tauri::State<'_, std::sync::Arc<crate::cache::Cache>>,
-    jobs: tauri::State<'_, std::sync::Arc<crate::jobs::Jobs>>,
+pub async fn refresh_recent_thumb(
+    cache: tauri::State<'_, Arc<crate::cache::Cache>>,
+    jobs: tauri::State<'_, Arc<crate::jobs::Jobs>>,
     path: String,
 ) -> Result<Option<String>> {
     // At most one entry can come back for one input path.
-    refresh_recent_thumbs(cache, jobs, vec![path]).map(|m| m.into_values().next())
+    refresh_recent_thumbs(cache, jobs, vec![path])
+        .await
+        .map(|m| m.into_values().next())
 }
 
 /// Batched `refresh_recent_thumb`: same resolution rules, same fail-soft
@@ -1466,18 +1956,35 @@ pub fn refresh_recent_thumb(
 /// Generation is sequential, so on a cold thumbnail cache the whole batch
 /// answers together rather than card by card — callers wanting progressive fill
 /// should chunk their paths.
+///
+/// Off the UI thread, where a batch of cold cards used to freeze the window
+/// for up to 30 s each, and off the store worker: ffmpeg must never hold up a
+/// save. Its one write, the recents write-back, holds `RECENTS_LOCK` like
+/// every other recents update.
 #[tauri::command]
-pub fn refresh_recent_thumbs(
-    cache: tauri::State<'_, std::sync::Arc<crate::cache::Cache>>,
-    jobs: tauri::State<'_, std::sync::Arc<crate::jobs::Jobs>>,
+pub async fn refresh_recent_thumbs(
+    cache: tauri::State<'_, Arc<crate::cache::Cache>>,
+    jobs: tauri::State<'_, Arc<crate::jobs::Jobs>>,
     paths: Vec<String>,
 ) -> Result<HashMap<String, String>> {
-    Ok(refresh_thumbs_for(&cache, &jobs, &paths).into_iter().collect())
+    let (cache, jobs) = (Arc::clone(&cache), Arc::clone(&jobs));
+    off_ui(move || Ok(refresh_thumbs_for(&cache, &jobs, &paths).into_iter().collect())).await
 }
 
+/// One stat — but a stat of a path on a sleeping share is an SMB timeout, so
+/// it is still off the UI thread.
 #[tauri::command]
-pub fn path_exists(path: String) -> bool {
-    Path::new(&path).exists()
+pub async fn path_exists(path: String) -> Result<bool> {
+    off_ui(move || Ok(Path::new(&path).exists())).await
+}
+
+/// Whether a project name is in use: by its `.trt`, or by a `.bak` the `.trt`
+/// is gone from. That `.bak` is a recoverable project with a card on Home
+/// (`list_recents`); handing its name to a new project made that card open
+/// the new one, and the new one's second save rotated over the old `.bak` —
+/// the last copy of the old work.
+fn name_taken(candidate: &Path) -> bool {
+    candidate.exists() || bak_path(candidate).exists()
 }
 
 /// Pick a fresh "Untitled N.trt" path in `dir`, deduping with a bare-space
@@ -1491,16 +1998,21 @@ fn fresh_untitled_in(dir: &Path, base: &str) -> Result<String> {
         } else {
             dir.join(format!("{base} {}.trt", n + 1))
         };
-        if !candidate.exists() {
+        if !name_taken(&candidate) {
             return Ok(candidate.to_string_lossy().into_owned());
         }
     }
     Err(AppError::BadInput("could not find a free project name".into()))
 }
 
-/// Pick a fresh "Untitled N.trt" path in Documents\Taroting.
+/// Pick a fresh "Untitled N.trt" path in Documents\Taroting. On the store
+/// worker, so the name is picked after every write already queued has landed.
 #[tauri::command]
-pub fn new_project_path(name: Option<String>) -> Result<String> {
+pub async fn new_project_path(name: Option<String>) -> Result<String> {
+    on_store(move || new_project_path_now(name)).await
+}
+
+fn new_project_path_now(name: Option<String>) -> Result<String> {
     let dir = paths::default_projects_dir()?;
     paths::ensure_dir(&dir)?;
     let base = sanitize_filename(&name.unwrap_or_else(|| "Untitled".to_string()));
@@ -1512,10 +2024,31 @@ pub fn new_project_path(name: Option<String>) -> Result<String> {
 /// `load_project` skips stamping and `save_project` skips the upsert for them.
 /// A resolution failure (no LOCALAPPDATA) yields `false` — the safe default is
 /// the classic permanent behavior.
+///
+/// The same rule as the frontend's `isTempProjectPath` (src/core/open-media.ts),
+/// which the editor uses to call a session temporary: `/` read as `\`, case
+/// folded, and the folder boundary required. A component-wise `starts_with`
+/// was case-sensitive, so a differently-cased path into tmp-projects was
+/// temporary to the editor and permanent here — it got a recents entry, and
+/// with 24 of them, evicted a real project's card for good.
 fn is_temp_project_path(path: &str) -> bool {
     paths::temp_projects_dir()
-        .map(|tmp| Path::new(path).starts_with(&tmp))
+        .map(|tmp| inside_folded(&tmp.to_string_lossy(), path))
         .unwrap_or(false)
+}
+
+/// Whether `path` is inside `dir`, compared as the frontend compares paths
+/// (`normalizePath` in open-media.ts): separators unified, case folded, and
+/// `dir` plus a separator as the prefix, so a sibling folder that merely
+/// starts with the same name ("tmp-projects-old") is not inside it.
+fn inside_folded(dir: &str, path: &str) -> bool {
+    let fold = |s: &str| s.replace('/', "\\").to_lowercase();
+    let dir = fold(dir);
+    let dir = dir.trim_end_matches('\\');
+    if dir.is_empty() {
+        return false;
+    }
+    fold(path).starts_with(&format!("{dir}\\"))
 }
 
 /// The temp-projects dir as a string, for the frontend to classify open-with
@@ -1530,16 +2063,187 @@ pub fn temp_projects_dir() -> Result<String> {
 /// Pick a fresh "Untitled N.trt" path in the temp-projects dir. Mirrors
 /// `new_project_path` but targets scratch storage for the quick-view flow.
 #[tauri::command]
-pub fn temp_project_path(name: Option<String>) -> Result<String> {
+pub async fn temp_project_path(name: Option<String>) -> Result<String> {
+    on_store(move || temp_project_path_now(name)).await
+}
+
+fn temp_project_path_now(name: Option<String>) -> Result<String> {
     let dir = paths::temp_projects_dir()?;
     paths::ensure_dir(&dir)?;
     let base = sanitize_filename(&name.unwrap_or_else(|| "Untitled".to_string()));
     fresh_untitled_in(&dir, &base)
 }
 
-/// Best-effort wipe of stale files in the temp-projects dir. ONLY touches the
+/// How long the startup sweep keeps an edited temporary project nobody came
+/// back for. Past this it is deleted like an untouched one: the recover line
+/// has been on Home for a month of launches.
+const ORPHAN_KEEP_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The edited temporary projects this run's startup sweep kept, by their
+/// `.trt` path — what `list_orphan_temp_projects` offers back. Recorded by the
+/// sweep, never re-read from the folder: a session this run opens lives in the
+/// same folder and is marked edited by its first edit, and a fresh listing
+/// would offer the user's own open work back to them as an orphan. New temp
+/// names never collide with these: `temp_project_path` skips a name whose
+/// `.trt` or `.bak` is on disk (`name_taken`).
+static KEPT_ORPHANS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// What the sweep does with one temporary project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanFate {
+    /// Edited, and recent: kept and offered back.
+    Keep,
+    /// Never edited, older than `ORPHAN_KEEP_FOR` or past the size cap:
+    /// deleted.
+    Delete,
+    /// Recent and within the cap, but not parseable — a zeroed or cut-short
+    /// file. `atomic_write` does not fsync, so a crash or a power loss can
+    /// leave exactly that `.trt` beside a complete `.bak`; the sweep then
+    /// judges the `.bak` instead (a load recovers from it). With no `.bak`
+    /// behind it, or when the file judged IS the `.bak`, it is deleted.
+    Unparseable,
+    /// Could not be read (a lock, a permission error): left exactly as it is,
+    /// and not offered. The next launch decides again.
+    Unknown,
+}
+
+/// The one field the sweep reads. `schema::true_or_false` is the editor's own
+/// rule — only a literal `true` counts — and every other field is skipped by
+/// serde without being built.
+#[derive(Deserialize)]
+struct TempMarker {
+    #[serde(default, rename = "tempEdited", deserialize_with = "schema::true_or_false")]
+    temp_edited: bool,
+}
+
+/// Decide one temporary project's fate from `file` — its `.trt`, or its
+/// `.bak` when a crash left only that.
+fn orphan_fate(file: &Path, now: SystemTime) -> OrphanFate {
+    let Ok(meta) = std::fs::metadata(file) else {
+        return OrphanFate::Unknown;
+    };
+    // Age first: an old orphan is deleted without being read at all.
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|m| now.duration_since(m).ok())
+        .unwrap_or(Duration::ZERO);
+    if age > ORPHAN_KEEP_FOR || meta.len() > image_rules::MAX_TRT_BYTES {
+        return OrphanFate::Delete;
+    }
+    let Ok(f) = std::fs::File::open(file) else {
+        return OrphanFate::Unknown;
+    };
+    // Streamed, never read whole: the folder can hold a big image project,
+    // and this runs during startup.
+    match serde_json::from_reader::<_, TempMarker>(std::io::BufReader::new(f)) {
+        Ok(m) if m.temp_edited => OrphanFate::Keep,
+        Err(e) if e.is_io() => OrphanFate::Unknown,
+        // Not JSON at all, or cut short: torn. Valid JSON of the wrong shape
+        // is no project — and a load would not fall back to the `.bak` for
+        // it either (`parse_project_bytes` only does for invalid JSON).
+        Err(e) if e.is_syntax() || e.is_eof() => OrphanFate::Unparseable,
+        _ => OrphanFate::Delete,
+    }
+}
+
+/// Settle the temp-projects folder at startup and return the projects kept.
+///
+/// A temporary project's Keep/Discard question is only ever asked on a
+/// graceful exit, so a crash, a renderer death, a Windows logoff or restart,
+/// the close escape hatch or Task Manager leaves it here, and this sweep used
+/// to delete it on the next launch — edits and all, without a trace. Now (the
+/// owner's ruling):
+/// - an EDITED project (`tempEdited: true`, set by the editor on the first
+///   edit and stripped by Keep) is kept and offered back on Home, unless it
+///   is older than `ORPHAN_KEEP_FOR`;
+/// - an untouched one is deleted, as before — it holds nothing a fresh open
+///   of the same file would not;
+/// - every `.tmp`, `.part` and other leftover is deleted, and a `.bak` beside
+///   a readable `.trt` (the copy that counts). A `.trt` that does not parse —
+///   a crash before the OS flushed it can leave it zeroed — defers to its
+///   `.bak`: an edited, recent `.bak` keeps both and the `.trt` is offered (a
+///   load recovers from the `.bak`). A `.bak` with NO `.trt` is the project itself, mid-save when the
+///   app died: it is judged like a `.trt`, kept as it is if edited, and the
+///   `.trt` path is what is offered (a load recovers it from the `.bak`).
+/// Folders are left alone.
+fn sweep_temp_dir(dir: &Path, now: SystemTime) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new(); // dir absent or unreadable → nothing to settle
+    };
+    // An ASCII suffix in any case, tested on bytes so a name that only
+    // LOWERCASES to one (the Kelvin sign folds to "k") is never sliced
+    // mid-character.
+    let has_suffix = |name: &str, suffix: &str| {
+        name.len() >= suffix.len() && name.as_bytes()[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+    };
+    let mut projects: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let p = entry.path();
+        let file_name = entry.file_name();
+        // A name that is not Unicode is no name this app ever wrote: left be.
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if has_suffix(name, ".trt") {
+            projects.push(p);
+        } else if has_suffix(name, ".trt.bak") {
+            // Judged with its project below, under the project's own name.
+            // The four bytes cut are ".bak" itself, so the cut is on a
+            // character boundary.
+            projects.push(p.with_file_name(&name[..name.len() - 4]));
+        } else {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    projects.sort();
+    projects.dedup();
+
+    let mut kept = Vec::new();
+    for primary in projects {
+        let bak = bak_path(&primary);
+        let has_primary = primary.is_file();
+        let fate = match orphan_fate(if has_primary { &primary } else { &bak }, now) {
+            // A torn primary: the `.bak` decides. Both files stay on Keep —
+            // the load reads the primary, finds it corrupt and recovers from
+            // the `.bak` (flagged `recovered`), so the `.bak` must survive.
+            OrphanFate::Unparseable if has_primary && bak.is_file() => match orphan_fate(&bak, now) {
+                OrphanFate::Keep => {
+                    kept.push(primary);
+                    continue;
+                }
+                OrphanFate::Unknown => OrphanFate::Unknown,
+                _ => OrphanFate::Delete,
+            },
+            fate => fate,
+        };
+        match fate {
+            OrphanFate::Keep => {
+                if has_primary {
+                    let _ = std::fs::remove_file(&bak);
+                }
+                kept.push(primary);
+            }
+            OrphanFate::Delete | OrphanFate::Unparseable => {
+                let _ = std::fs::remove_file(&primary);
+                let _ = std::fs::remove_file(&bak);
+            }
+            OrphanFate::Unknown => {}
+        }
+    }
+    kept
+}
+
+/// Settle leftover quick-view scratch projects from earlier runs
+/// (`sweep_temp_dir`), and remember the ones kept for Home. ONLY touches the
 /// app's own tmp-projects dir; a missing dir or any per-file error is ignored
 /// (the next startup retries).
+///
+/// Synchronous, before the event loop starts: a session this run opens must
+/// never meet a sweep still going through its folder.
 ///
 /// Must run from the Builder's `.setup()` hook, never from `main()` directly.
 /// A second launch (an Explorer double-click while the app is open) is a whole
@@ -1550,48 +2254,35 @@ pub fn temp_project_path(name: Option<String>) -> Result<String> {
 /// `.setup()` runs after every plugin has initialised, so only the instance that
 /// owns the single-instance mutex ever gets here, and it gets here before its
 /// event loop serves any command, so no session of its own can exist yet.
+///
+/// Normally the folder is empty and this is one `read_dir`. A kept project
+/// costs one streamed read of it per launch until it is settled.
 pub fn cleanup_temp_projects() {
     let Ok(dir) = paths::temp_projects_dir() else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return; // dir absent or unreadable → nothing to wipe
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_file() {
-            let _ = std::fs::remove_file(&p);
-        }
-    }
+    let kept = sweep_temp_dir(&dir, SystemTime::now());
+    *KEPT_ORPHANS.lock().unwrap_or_else(|e| e.into_inner()) = kept;
 }
 
-/// The `.trt` files in the temp-projects dir right now, as absolute paths.
-/// A missing or unreadable dir is simply none.
+/// The kept orphans still on disk (by their `.trt`, or by the `.bak` a load
+/// recovers them from), as absolute `.trt` paths. One the user has since
+/// recovered and kept or discarded is gone, and drops out.
 fn orphan_temp_projects() -> Vec<String> {
-    let Ok(dir) = paths::temp_projects_dir() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension().is_some_and(|x| x.eq_ignore_ascii_case("trt")) && p.is_file()
-        })
+    let kept = KEPT_ORPHANS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    kept.into_iter()
+        .filter(|p| p.is_file() || bak_path(p).is_file())
         .map(|p| p.to_string_lossy().into_owned())
         .collect()
 }
 
-/// Temporary projects the startup sweep left in place — the ones a crash,
-/// a logoff or a forced close orphaned — for Home to offer back. The folder
-/// is normally empty, so this is one `read_dir`, off the UI thread.
+/// Edited temporary projects the startup sweep kept — the ones a crash, a
+/// logoff or a forced close orphaned — for Home to offer back. Untouched ones
+/// were deleted, so this is usually empty. A stat per kept project, off the UI
+/// thread.
 #[tauri::command]
 pub async fn list_orphan_temp_projects() -> Result<Vec<String>> {
-    tauri::async_runtime::spawn_blocking(orphan_temp_projects)
-        .await
-        .map_err(|e| AppError::Io(std::io::Error::other(format!("could not list temporary projects: {e}"))))
+    off_ui(|| Ok(orphan_temp_projects())).await
 }
 
 /// Whether two paths name the same file on disk.
@@ -1674,10 +2365,18 @@ fn free_path_in(dir: &Path, base: &str, exclude: Option<&Path>) -> Result<PathBu
         } else {
             dir.join(format!("{base} ({}).trt", n + 1))
         };
-        // `exists()` short-circuits, so the identity check only runs — and only
-        // touches the disk — for a candidate that is actually taken.
-        if !candidate.exists()
-            || exclude.is_some_and(|e| path_identity(e, &candidate) == PathIdentity::Same)
+        // `name_taken` short-circuits, so the identity checks only run — and
+        // only touch the disk — for a candidate that is actually taken. The
+        // `.bak` comparison is what lets a card whose `.trt` is gone (only its
+        // `.bak` is left) be renamed to a different case of its own name: its
+        // `.bak` is the candidate's `.bak`, so the name is its own. Two `.bak`
+        // names one file only when the two project names are one name on this
+        // volume, so that never frees somebody else's project.
+        if !name_taken(&candidate)
+            || exclude.is_some_and(|e| {
+                path_identity(e, &candidate) == PathIdentity::Same
+                    || path_identity(&bak_path(e), &bak_path(&candidate)) == PathIdentity::Same
+            })
         {
             return Ok(candidate);
         }
@@ -1685,15 +2384,32 @@ fn free_path_in(dir: &Path, base: &str, exclude: Option<&Path>) -> Result<PathBu
     Err(AppError::BadInput("could not find a free project name".into()))
 }
 
-/// Read a project file as a raw JSON `Value`, preserving unknown fields.
+/// Read a project file as a raw JSON `Value`, preserving unknown fields — the
+/// `.trt`, or its `.bak` when the `.trt` is gone. That card is kept on Home on
+/// purpose (`list_recents`), so Rename and Duplicate must work on it rather
+/// than toast "not found" on a project Home is showing.
 ///
-/// Only an OBJECT is a project. Rename and duplicate assign `value["name"]` /
-/// `value["id"]` next, and serde_json's `IndexMut` panics on an array, a
-/// number, a string or a bool (only `null` becomes an object) — under
-/// `panic = "abort"` that kills the app, every other window's unsaved work
-/// included, for a Home card whose `.trt` was replaced on disk by `[]`.
+/// Only an OBJECT is a project — from the `.bak` as much as from the `.trt`.
+/// Rename and duplicate assign `value["name"]` / `value["id"]` next, and
+/// serde_json's `IndexMut` panics on an array, a number, a string or a bool
+/// (only `null` becomes an object) — under `panic = "abort"` that kills the
+/// app, every other window's unsaved work included, for a Home card whose
+/// `.trt` was replaced on disk by `[]`.
+///
+/// Called on the store worker, where no save can be half done, so a missing
+/// `.trt` is really missing.
 fn read_raw_value(path: &Path) -> Result<Value> {
-    let bytes = image_rules::read_capped(path).map_err(capped_read_error)?;
+    let bytes = match image_rules::read_capped(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match image_rules::read_capped(&bak_path(path)) {
+            Ok(bytes) => bytes,
+            // Neither copy: the primary's own NotFound is the honest answer.
+            Err(b) if b.kind() == std::io::ErrorKind::NotFound => return Err(e.into()),
+            Err(b) => return Err(capped_read_error(b)),
+        },
+        Err(e) => return Err(capped_read_error(e)),
+    };
+    refuse_value_bomb(&bytes, path)?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| AppError::BadInput(format!("{} is not valid JSON", path.display())))?;
     if !value.is_object() {
@@ -1702,12 +2418,21 @@ fn read_raw_value(path: &Path) -> Result<Value> {
     Ok(value)
 }
 
+/// Whether `path` is provably not on disk — NotFound, not merely unreadable.
+fn provably_absent(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Rename a project on disk: rewrite its inner `name`, move the file to a
 /// sanitized/deduped path in the same dir, drop the stale `.bak`, and update
-/// the recents entry. Returns the new path.
+/// the recents entry. Returns the new path. On the store worker.
 #[tauri::command]
-pub fn rename_project(path: String, new_name: String) -> Result<String> {
-    let old = Path::new(&path);
+pub async fn rename_project(path: String, new_name: String) -> Result<String> {
+    on_store(move || rename_project_now(&path, new_name)).await
+}
+
+fn rename_project_now(path: &str, new_name: String) -> Result<String> {
+    let old = project_target(path)?;
     let dir = old
         .parent()
         .ok_or_else(|| AppError::BadInput(format!("no parent dir for {}", old.display())))?;
@@ -1726,16 +2451,21 @@ pub fn rename_project(path: String, new_name: String) -> Result<String> {
     // one" here would delete the project we just wrote. An unprovable answer
     // must not be resolved that way either: leaving a stale copy behind is
     // recoverable, deleting the live one is not.
-    if path_identity(&new_path, old) == PathIdentity::Different {
+    //
+    // A card renamed from its `.bak` (its `.trt` was gone) has no old file to
+    // compare, so identity can only say Unknown. But with the new file now on
+    // disk, an old name that is STILL not found cannot be the new file under
+    // another case — that would find it — so the two are different files and
+    // the old `.bak` goes.
+    if provably_absent(old) || path_identity(&new_path, old) == PathIdentity::Different {
         let _ = std::fs::remove_file(old);
-        let mut bak = old.as_os_str().to_owned();
-        bak.push(".bak");
-        let _ = std::fs::remove_file(PathBuf::from(bak));
+        let _ = std::fs::remove_file(bak_path(old));
+        let _ = std::fs::remove_file(tmp_path(old));
     }
 
     // Replace the recents entry's path + name, preserving the rest.
     let new_path_str = new_path.to_string_lossy().into_owned();
-    let name_field = value["name"].as_str().unwrap_or_default().to_string();
+    let name_field = clipped(value["name"].as_str().unwrap_or_default(), RECENT_NAME_MAX_CHARS);
     let _ = update_recents(|index| {
         let Some(entry) = index.items.iter_mut().find(|r| r.path == path) else {
             return false;
@@ -1770,9 +2500,14 @@ fn copy_image_card(src: &Path, new_id: &Value, new_path: &str) -> Option<String>
 /// Duplicate a project: copy its raw JSON with a new `name` + `id`, to a
 /// deduped path derived from `new_name`, and add it to recents. The caller
 /// supplies `new_id` (frontend `crypto.randomUUID()`). Returns the new path.
+/// On the store worker.
 #[tauri::command]
-pub fn duplicate_project(path: String, new_name: String, new_id: String) -> Result<String> {
-    let src = Path::new(&path);
+pub async fn duplicate_project(path: String, new_name: String, new_id: String) -> Result<String> {
+    on_store(move || duplicate_project_now(&path, new_name, new_id)).await
+}
+
+fn duplicate_project_now(path: &str, new_name: String, new_id: String) -> Result<String> {
+    let src = project_target(path)?;
     let dir = src
         .parent()
         .ok_or_else(|| AppError::BadInput(format!("no parent dir for {}", src.display())))?;
@@ -1790,7 +2525,7 @@ pub fn duplicate_project(path: String, new_name: String, new_id: String) -> Resu
     let size_bytes = std::fs::metadata(&new_path).map(|m| m.len()).unwrap_or(0);
     // Carry the source's duration/thumb across so the new card looks right
     // before it is ever opened+saved.
-    let src_recent = read_recents().items.into_iter().find(|r| r.path == path);
+    let src_recent = read_recents().items.into_iter().find(|r| r.path == *path);
     // From the copied file itself, not the source's recents entry: the file is
     // what Home will open, and an entry can be missing or stale.
     let image = value.get("kind").and_then(Value::as_str) == Some("image");
@@ -1804,7 +2539,9 @@ pub fn duplicate_project(path: String, new_name: String, new_id: String) -> Resu
     } else {
         src_thumb
     };
-    upsert_recent(RecentItem {
+    // Best-effort, as for a save (see there): the copy is on disk, and an
+    // error here left it without a card while telling the user it failed.
+    if let Err(e) = upsert_recent(RecentItem {
         path: new_path_str.clone(),
         name: new_name,
         modified_at: value["modifiedAt"].as_str().unwrap_or_default().to_string(),
@@ -1816,24 +2553,86 @@ pub fn duplicate_project(path: String, new_name: String, new_id: String) -> Resu
         size_bytes,
         opened_at: None,
         kind: image.then(|| "image".to_string()),
-    })?;
+    }) {
+        eprintln!("Taroting: duplicated to {new_path_str}, but the recent projects list was not updated ({e})");
+    }
 
     Ok(new_path_str)
 }
 
 /// Permanently delete a project file, its `.bak` sibling, and its recents entry.
+/// On the store worker.
 #[tauri::command]
-pub fn delete_project(path: String) -> Result<()> {
-    let p = Path::new(&path);
-    std::fs::remove_file(p)?;
-    let mut bak = p.as_os_str().to_owned();
-    bak.push(".bak");
-    let _ = std::fs::remove_file(PathBuf::from(bak));
+pub async fn delete_project(path: String) -> Result<()> {
+    on_store(move || delete_project_now(&path)).await
+}
 
-    update_recents(|index| {
+/// `delete_project`'s body.
+///
+/// A `.trt` that is already gone is not an error: its card can still be on
+/// Home (only the `.bak` left — `list_recents` keeps that card), and refusing
+/// with "not found" before the `.bak` or the recents entry were touched made
+/// such a card impossible to delete. The `.bak` and any `.tmp` a failed save
+/// staged go with it, and the recents entry is dropped best-effort, as every
+/// recents side effect is: the files are gone either way.
+fn delete_project_now(path: &str) -> Result<()> {
+    let p = project_target(path)?;
+    match std::fs::remove_file(p) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    let _ = std::fs::remove_file(bak_path(p));
+    let _ = std::fs::remove_file(tmp_path(p));
+
+    if let Err(e) = update_recents(|index| {
         index.items.retain(|r| r.path != path);
         true
-    })
+    }) {
+        eprintln!("Taroting: deleted {path}, but the recent projects list was not updated ({e})");
+    }
+    Ok(())
+}
+
+/// Autotest only: delete one file the E2E itself wrote that is NOT a project —
+/// an export, a card picture, a scratch copy. `delete_project` refuses
+/// anything but a `.trt` (`project_target`), and the suite used to clean up
+/// through it.
+///
+/// Refused outright unless this is a debug build running the harness
+/// (`debug::autotest_mode`), so a shipped build cannot take it. Even then it
+/// deletes only a file under the run's scratch root or the derived-file cache
+/// (where card pictures live), never a folder.
+#[tauri::command]
+pub async fn debug_remove_test_file(app: tauri::AppHandle, path: String) -> Result<()> {
+    use tauri::Manager;
+    if !crate::debug::autotest_mode() {
+        return Err(AppError::BadInput("test files are removed only under the autotest harness".into()));
+    }
+    let mut roots = vec![crate::debug::autotest_root()];
+    if let Some(cache) = app.try_state::<Arc<crate::cache::Cache>>() {
+        roots.push(cache.root().to_path_buf());
+    }
+    off_ui(move || remove_test_file(&path, &roots)).await
+}
+
+/// `debug_remove_test_file`'s body: remove `path` if it is a file under one
+/// of `roots`. Already gone is fine. Lexical containment, with `..` refused
+/// so it cannot climb out.
+fn remove_test_file(path: &str, roots: &[PathBuf]) -> Result<()> {
+    let p = Path::new(path);
+    let climbs = p
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir));
+    let inside = roots.iter().any(|r| inside_folded(&r.to_string_lossy(), path));
+    if !p.is_absolute() || climbs || !inside {
+        return Err(AppError::BadInput(format!("not a test file: {path}")));
+    }
+    match std::fs::symlink_metadata(p) {
+        Ok(meta) if meta.is_file() => Ok(std::fs::remove_file(p)?),
+        Ok(_) => Err(AppError::BadInput(format!("not a file: {path}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn sanitize_filename(name: &str) -> String {
@@ -1896,6 +2695,10 @@ mod tests {
         std::env::set_var("USERPROFILE", dir.join("userprofile"));
 
         body(&dir);
+        // A job the body queued without waiting for it (a load's recents
+        // stamp) must land while THIS test's folders are still the ones the
+        // environment points at, not the next test's.
+        drain_store();
 
         match prev {
             Some(v) => std::env::set_var("APPDATA", v),
@@ -1910,6 +2713,42 @@ mod tests {
             None => std::env::remove_var("USERPROFILE"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wait until every job queued on the store worker so far has run.
+    fn drain_store() {
+        on_store_blocking(|| ()).unwrap();
+    }
+
+    // The commands' bodies under the commands' own names, synchronous, so a
+    // test reads as a call of the command. They shadow the async commands the
+    // glob import brings in. `load_project` waits for the recents stamp it
+    // queued, so a test can read recents right after it.
+    fn load_project(path: String) -> Result<LoadedProject> {
+        let loaded = load_project_now(&path);
+        drain_store();
+        loaded
+    }
+    fn rename_project(path: String, new_name: String) -> Result<String> {
+        rename_project_now(&path, new_name)
+    }
+    fn duplicate_project(path: String, new_name: String, new_id: String) -> Result<String> {
+        duplicate_project_now(&path, new_name, new_id)
+    }
+    fn delete_project(path: String) -> Result<()> {
+        delete_project_now(&path)
+    }
+    fn list_recents() -> Result<RecentsIndex> {
+        list_recents_now()
+    }
+    fn remove_recent(path: String) -> Result<()> {
+        remove_recent_now(&path)
+    }
+    fn temp_project_path(name: Option<String>) -> Result<String> {
+        temp_project_path_now(name)
+    }
+    fn new_project_path(name: Option<String>) -> Result<String> {
+        new_project_path_now(name)
     }
 
     fn write_json(path: &Path, v: &Value) {
@@ -3434,7 +4273,7 @@ mod tests {
             .unwrap();
             std::fs::write(&settings, b"not json at all").unwrap();
 
-            let loaded = crate::settings::get_settings().unwrap();
+            let loaded = crate::settings::read_settings().unwrap();
             assert_eq!(loaded.status, crate::settings::SettingsStatus::Ok);
             assert!(loaded.recovered, "the .bak supplied the value");
             let value = loaded
@@ -3446,7 +4285,7 @@ mod tests {
             // Nothing on disk at all is still a clean first run → frontend defaults.
             std::fs::remove_file(&settings).unwrap();
             std::fs::remove_file(data.join("settings.json.bak")).unwrap();
-            let fresh = crate::settings::get_settings().unwrap();
+            let fresh = crate::settings::read_settings().unwrap();
             assert_eq!(fresh.status, crate::settings::SettingsStatus::Absent);
             assert!(fresh.settings.is_none());
         });
@@ -3459,7 +4298,7 @@ mod tests {
     /// `{ ...DEFAULTS, ...patch }` over the user's real preferences.
     #[test]
     fn get_settings_separates_absent_from_unreadable() {
-        use crate::settings::{get_settings, SettingsStatus};
+        use crate::settings::{read_settings as get_settings, SettingsStatus};
 
         with_isolated("settings-status", |_dir| {
             let data = paths::data_dir().unwrap();
@@ -3504,7 +4343,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_locked_settings_file_reads_as_unreadable_not_absent() {
-        use crate::settings::{get_settings, SettingsStatus};
+        use crate::settings::{read_settings as get_settings, SettingsStatus};
         use std::os::windows::fs::OpenOptionsExt;
 
         with_isolated("settings-locked", |_dir| {
@@ -3739,68 +4578,149 @@ mod tests {
         });
     }
 
-    #[test]
-    fn cleanup_temp_projects_wipes_only_the_temp_dir() {
-        with_isolated("temp-cleanup", |_dir| {
-            // Seed a stale scratch file in the temp dir and an unrelated project
-            // in Documents\Taroting.
-            let temp_path = temp_project_path(Some("Stale".into())).unwrap();
-            std::fs::write(&temp_path, b"{}").unwrap();
-            let mut bak = temp_path.clone();
-            bak.push_str(".bak");
-            std::fs::write(&bak, b"{}").unwrap();
+    /// A temporary project as the editor writes one, edited (`tempEdited:
+    /// true`) or not — and, for the lenient-read rows, with any other value.
+    fn temp_project(name: &str, edited: Option<Value>) -> Value {
+        let mut p = minimal_project(name);
+        if let Some(v) = edited {
+            p["tempEdited"] = v;
+        }
+        p
+    }
 
+    /// Backdate a file's modification time by `days`.
+    fn age_by_days(path: &Path, days: u64) {
+        let when = SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
+    }
+
+    /// The startup sweep (owner's ruling): an EDITED temporary project a crash
+    /// orphaned is kept and offered back unless it is over 30 days old; an
+    /// untouched one is deleted, as is every leftover (`.tmp`, `.part`, any
+    /// other file, a `.bak` beside its `.trt`). A `.bak` with no `.trt` is the
+    /// project itself and is judged as one. Only a literal `true` counts as
+    /// edited. Folders and Documents are never touched. Before this every file
+    /// in the folder was deleted, edits and all.
+    #[test]
+    fn the_startup_sweep_keeps_only_edited_recent_temp_projects() {
+        with_isolated("temp-sweep", |_dir| {
+            let tmp = paths::temp_projects_dir().unwrap();
+            paths::ensure_dir(&tmp).unwrap();
+            let edited = |name: &str| temp_project(name, Some(Value::Bool(true)));
+            let put = |file: &str, v: &Value| write_json(&tmp.join(file), v);
+
+            put("Edited.trt", &edited("Edited"));
+            put("Edited.trt.bak", &edited("Edited"));
+            put("Loud.TRT", &edited("Loud"));
+            put("Month old.trt", &edited("Month old"));
+            age_by_days(&tmp.join("Month old.trt"), 29);
+            put("Too old.trt", &edited("Too old"));
+            age_by_days(&tmp.join("Too old.trt"), 31);
+            put("Untouched.trt", &temp_project("Untouched", None));
+            put("Untouched.trt.bak", &temp_project("Untouched", None));
+            put("Truthy.trt", &temp_project("Truthy", Some(Value::from("true"))));
+            put("Crashed.trt.bak", &edited("Crashed"));
+            put("Plain crash.trt.bak", &temp_project("Plain crash", None));
+            std::fs::write(tmp.join("Corrupt.trt"), b"{\"tempEdited\": tr").unwrap();
+            // A crash before the OS flushed the last save: the `.trt` is
+            // zeroed, the `.bak` beside it is complete and edited.
+            std::fs::write(tmp.join("Zeroed.trt"), b"").unwrap();
+            put("Zeroed.trt.bak", &edited("Zeroed"));
+            // Torn too, but the `.bak` holds nothing worth offering.
+            std::fs::write(tmp.join("Torn plain.trt"), b"").unwrap();
+            put("Torn plain.trt.bak", &temp_project("Torn plain", None));
+            for leftover in ["Edited.trt.tmp", "photo.png.part", "notes.txt"] {
+                std::fs::write(tmp.join(leftover), b"x").unwrap();
+            }
+            std::fs::create_dir(tmp.join("Folder.trt")).unwrap();
             let perm_dir = paths::default_projects_dir().unwrap();
             paths::ensure_dir(&perm_dir).unwrap();
-            let keep = perm_dir.join("Keep.trt");
-            std::fs::write(&keep, b"{}").unwrap();
+            let documents = perm_dir.join("Untouched.trt");
+            write_json(&documents, &temp_project("Documents", None));
 
             cleanup_temp_projects();
 
-            // Everything (including the .bak) in the temp dir is gone; the temp
-            // dir itself remains; the Documents project is untouched.
-            assert!(!Path::new(&temp_path).exists(), "temp file must be wiped");
-            assert!(!Path::new(&bak).exists(), "temp .bak must be wiped");
-            assert!(
-                paths::temp_projects_dir().unwrap().is_dir(),
-                "temp dir itself should survive"
+            let mut left: Vec<String> = std::fs::read_dir(&tmp)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            left.sort();
+            assert_eq!(
+                left,
+                ["Crashed.trt.bak", "Edited.trt", "Folder.trt", "Loud.TRT", "Month old.trt", "Zeroed.trt", "Zeroed.trt.bak"]
             );
-            assert!(keep.exists(), "Documents project must be untouched");
+            assert!(documents.exists(), "Documents is never swept");
 
-            // Idempotent: a second run on the now-empty dir is a clean no-op.
+            let mut offered = orphan_temp_projects();
+            offered.sort();
+            let want: Vec<String> = ["Crashed.trt", "Edited.trt", "Loud.TRT", "Month old.trt", "Zeroed.trt"]
+                .iter()
+                .map(|n| tmp.join(n).to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(offered, want, "the .bak-only one is offered by its .trt path");
+            // That path opens: the load recovers it from the .bak.
+            let crashed = load_project(want[0].clone()).unwrap();
+            assert!(crashed.recovered);
+            assert_eq!(crashed.project["name"], "Crashed");
+            // So does the zeroed one: its .bak supplies the project.
+            let zeroed = load_project(want[4].clone()).unwrap();
+            assert!(zeroed.recovered, "the zeroed .trt is recovered from its .bak");
+            assert_eq!(zeroed.project["name"], "Zeroed");
+
+            // A second sweep keeps the same set and deletes nothing more.
             cleanup_temp_projects();
-            assert!(keep.exists());
+            let mut again = orphan_temp_projects();
+            again.sort();
+            assert_eq!(again, want);
         });
     }
 
-    /// The orphan listing names exactly the `.trt` files in the temp dir, by
-    /// absolute path: not their `.bak`, not a folder named like a project, not
-    /// a project in Documents — and a temp dir that does not exist yet is an
-    /// empty list, not an error.
+    /// What Home is offered is what THIS run's sweep kept, never a fresh look
+    /// at the folder: a temporary project opened after the sweep — the user's
+    /// live session, marked edited by its first edit — is not an orphan. One
+    /// the user recovered and then kept or discarded drops out. A new temp
+    /// name never collides with a kept orphan, even one left only as a `.bak`.
     #[test]
-    fn orphan_temp_projects_lists_only_temp_trt_files() {
-        with_isolated("temp-orphans", |_dir| {
-            assert!(!paths::temp_projects_dir().unwrap().exists());
-            assert!(orphan_temp_projects().is_empty(), "a missing dir lists nothing");
+    fn only_the_sweep_s_survivors_are_offered_back() {
+        with_isolated("temp-offer", |_dir| {
+            let tmp = paths::temp_projects_dir().unwrap();
+            paths::ensure_dir(&tmp).unwrap();
+            write_json(&tmp.join("Clip.trt.bak"), &temp_project("Clip", Some(Value::Bool(true))));
+            write_json(&tmp.join("Photo.trt"), &temp_project("Photo", Some(Value::Bool(true))));
+            cleanup_temp_projects();
+            assert_eq!(orphan_temp_projects().len(), 2);
 
-            let a = temp_project_path(Some("Clip".into())).unwrap();
-            std::fs::write(&a, b"{}").unwrap();
-            std::fs::write(format!("{a}.bak"), b"{}").unwrap();
-            let b = temp_project_path(Some("Photo".into())).unwrap();
-            std::fs::write(&b, b"{}").unwrap();
-            let upper = paths::temp_projects_dir().unwrap().join("Loud.TRT");
-            std::fs::write(&upper, b"{}").unwrap();
-            std::fs::create_dir(paths::temp_projects_dir().unwrap().join("Folder.trt")).unwrap();
-            let perm_dir = paths::default_projects_dir().unwrap();
-            paths::ensure_dir(&perm_dir).unwrap();
-            std::fs::write(perm_dir.join("Kept.trt"), b"{}").unwrap();
+            // The live session: a temp project of the same media name, edited.
+            let live = temp_project_path(Some("Clip".into())).unwrap();
+            assert!(live.ends_with("Clip 2.trt"), "the orphan's name stays its own: {live}");
+            write_json(Path::new(&live), &temp_project("Clip", Some(Value::Bool(true))));
+            let offered = orphan_temp_projects();
+            assert!(!offered.contains(&live), "the open session is offered back: {offered:?}");
 
-            let mut listed = orphan_temp_projects();
-            listed.sort();
-            let mut want = vec![a, b, upper.to_string_lossy().into_owned()];
-            want.sort();
-            assert_eq!(listed, want);
-            assert!(listed.iter().all(|p| Path::new(p).is_absolute()));
+            // Recovered and discarded: gone from disk, gone from the offer.
+            delete_project(tmp.join("Photo.trt").to_string_lossy().into_owned()).unwrap();
+            assert_eq!(orphan_temp_projects(), [tmp.join("Clip.trt").to_string_lossy().into_owned()]);
+        });
+    }
+
+    /// A temporary project the sweep cannot read (held open with no sharing,
+    /// as a scanner would) is neither deleted nor offered: the next launch
+    /// decides again.
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_temp_project_is_left_for_the_next_launch() {
+        use std::os::windows::fs::OpenOptionsExt;
+        with_isolated("temp-locked", |_dir| {
+            let tmp = paths::temp_projects_dir().unwrap();
+            paths::ensure_dir(&tmp).unwrap();
+            let locked = tmp.join("Locked.trt");
+            write_json(&locked, &temp_project("Locked", Some(Value::Bool(true))));
+            let hold = std::fs::OpenOptions::new().read(true).share_mode(0).open(&locked).unwrap();
+            cleanup_temp_projects();
+            drop(hold);
+            assert!(locked.exists(), "an unreadable project must not be deleted");
+            assert!(orphan_temp_projects().is_empty(), "nor offered");
         });
     }
 
@@ -5029,5 +5949,582 @@ mod tests {
             }
             assert!(!dir.join("Renamed.trt").exists() && !dir.join("Copy.trt").exists());
         });
+    }
+
+    /* -------------------- the store worker ----------------------------- */
+
+    /// Two writes of one file share its single `.tmp`. On the UI thread they
+    /// could never overlap; off it, unqueued, two threads interleaved their
+    /// bytes into that `.tmp` (or renamed it out from under each other). Four
+    /// threads, payloads differing in every byte and in length, each writing
+    /// through the async queue: every write succeeds, and the file and its
+    /// `.bak` are each exactly one of the payloads.
+    #[test]
+    fn queued_writes_of_one_file_never_tear() {
+        with_isolated("store-tear", |dir| {
+            let target = dir.join("Torn.trt");
+            let payloads: Vec<Vec<u8>> =
+                (0..4u8).map(|i| vec![b'a' + i; 1_000_000 + usize::from(i) * 4_099]).collect();
+            std::thread::scope(|s| {
+                for p in &payloads {
+                    let target = target.clone();
+                    s.spawn(move || {
+                        for _ in 0..6 {
+                            let (t, bytes) = (target.clone(), p.clone());
+                            tauri::async_runtime::block_on(on_store(move || atomic_write(&t, &bytes)))
+                                .expect("a queued write succeeds");
+                        }
+                    });
+                }
+            });
+            let primary = std::fs::read(&target).unwrap();
+            let bak = std::fs::read(bak_path(&target)).unwrap();
+            assert!(payloads.contains(&primary), "the file is torn ({} bytes)", primary.len());
+            assert!(payloads.contains(&bak), "the .bak is torn ({} bytes)", bak.len());
+        });
+    }
+
+    /// A load runs off the worker, so a save can be between its two renames
+    /// while the load reads — and then there is no primary, only the `.bak`.
+    /// That read used to come back `recovered`: a "your project was damaged"
+    /// notice for a project nothing had happened to. Hundreds of queued saves
+    /// against a reader in a tight loop: never a recovery, never an error.
+    #[test]
+    fn a_read_overlapping_saves_never_reports_a_recovery() {
+        with_isolated("store-overlap", |dir| {
+            let target = dir.join("Busy.trt");
+            let bytes = serde_json::to_vec(&minimal_project("Busy")).unwrap();
+            atomic_write(&target, &bytes).unwrap();
+            atomic_write(&target, &bytes).unwrap(); // a .bak, as after any second save
+            let done = std::sync::atomic::AtomicBool::new(false);
+            let (mut reads, mut recoveries) = (0u32, 0u32);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    for _ in 0..400 {
+                        let (t, b) = (target.clone(), bytes.clone());
+                        on_store_blocking(move || atomic_write(&t, &b)).unwrap().unwrap();
+                    }
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    let (value, recovered) = read_project_value(&target).expect("every read succeeds");
+                    assert_eq!(value["name"], "Busy");
+                    reads += 1;
+                    recoveries += u32::from(recovered);
+                }
+            });
+            assert!(reads > 0);
+            assert_eq!(recoveries, 0, "{recoveries} of {reads} reads reported a recovery");
+        });
+    }
+
+    /// A job that reaches a helper which queues and waits — from the worker
+    /// itself — runs inline instead of waiting on itself forever.
+    #[test]
+    fn a_queued_job_can_queue_without_deadlocking() {
+        let nested = on_store_blocking(|| on_store_blocking(|| 7).unwrap()).unwrap();
+        assert_eq!(nested, 7);
+        let from_async = tauri::async_runtime::block_on(on_store(|| on_store_blocking(|| 8)));
+        assert_eq!(from_async.unwrap(), 8);
+    }
+
+    /* -------------------- load-time repairs ---------------------------- */
+
+    /// A load reads off the worker, so an autosave can land between its read
+    /// and its repair write. Written anyway, the repair of the OLD read
+    /// reverted that save. Only a file still exactly as the load read it gets
+    /// the repair.
+    #[test]
+    fn a_load_time_repair_never_reverts_a_save_that_landed_after_the_read() {
+        with_isolated("repair-stamp", |dir| {
+            let proj = dir.join("Raced.trt");
+            write_json(&proj, &minimal_project("Read by the load"));
+            let read_as = file_stamp(&proj);
+            write_json(&proj, &minimal_project("Saved after the read"));
+            persist_repair(&proj, &minimal_project("Repaired"), false, read_as);
+            assert_eq!(read_disk(&proj)["name"], "Saved after the read");
+
+            let read_as = file_stamp(&proj);
+            persist_repair(&proj, &minimal_project("Repaired"), false, read_as);
+            assert_eq!(read_disk(&proj)["name"], "Repaired", "an untouched file is repaired");
+
+            // No stamp (the file could not be stat'd at the read): skipped.
+            persist_repair(&proj, &minimal_project("Unstamped"), false, None);
+            assert_eq!(read_disk(&proj)["name"], "Repaired");
+        });
+    }
+
+    /* -------------------- recents failures ----------------------------- */
+
+    /// The project is on disk the moment `atomic_write` returns; a recents
+    /// update that then fails (recents.json's `.tmp` held by a scanner here)
+    /// used to fail the whole save — autosave stuck on "Save failed", Keep
+    /// writing "<name> 2.trt" on retry, Duplicate's copy left without a card.
+    #[cfg(windows)]
+    #[test]
+    fn a_save_whose_recents_update_fails_still_succeeds() {
+        use std::os::windows::fs::OpenOptionsExt;
+        with_isolated("recents-io", |dir| {
+            let data = paths::data_dir().unwrap();
+            paths::ensure_dir(&data).unwrap();
+            let tmp = data.join("recents.json.tmp");
+            std::fs::write(&tmp, b"").unwrap();
+            let hold = std::fs::OpenOptions::new().read(true).share_mode(0).open(&tmp).unwrap();
+
+            let proj = dir.join("Saved.trt");
+            let saved = save_project_at(None, proj.to_string_lossy().into_owned(), minimal_project("Saved"));
+            assert!(saved.is_ok(), "{saved:?}");
+            assert_eq!(read_disk(&proj)["name"], "Saved");
+            let copy = duplicate_project(proj.to_string_lossy().into_owned(), "Saved copy".into(), "c-1".into());
+            assert!(copy.as_ref().is_ok_and(|c| Path::new(c).is_file()), "{copy:?}");
+
+            // The updates really did fail: nothing reached recents.
+            drop(hold);
+            assert!(read_recents().items.is_empty());
+        });
+    }
+
+    /* -------------------- a card left as its .bak ---------------------- */
+
+    /// A project saved twice keeps a `.bak`; delete its `.trt` in Explorer and
+    /// Home keeps the card (owner's ruling: the `.bak` still holds the work).
+    /// Delete, Rename and Duplicate all failed on it with "not found" — Delete
+    /// before it had touched the `.bak` or the card, so the card could never
+    /// go. Now each works from the `.bak`.
+    #[test]
+    fn a_card_left_only_as_its_bak_can_be_deleted_renamed_and_duplicated() {
+        with_isolated("bak-only-card", |dir| {
+            let card = |name: &str| {
+                let p = dir.join(format!("{name}.trt"));
+                write_json(&bak_path(&p), &minimal_project(name));
+                let path = p.to_string_lossy().into_owned();
+                upsert_recent(RecentItem {
+                    path: path.clone(),
+                    name: name.into(),
+                    modified_at: "m".into(),
+                    duration_sec: 3.0,
+                    thumb: None,
+                    size_bytes: 0,
+                    opened_at: None,
+                    kind: None,
+                })
+                .unwrap();
+                path
+            };
+
+            let gone = card("Gone");
+            std::fs::write(tmp_path(Path::new(&gone)), b"a failed save's bytes").unwrap();
+            assert!(list_recents().unwrap().items.iter().any(|r| r.path == gone), "the card is listed");
+            delete_project(gone.clone()).expect("a .bak-only card deletes");
+            assert!(!bak_path(Path::new(&gone)).exists() && !tmp_path(Path::new(&gone)).exists());
+            assert!(recent(&gone).is_none(), "and its card goes");
+
+            let moved = card("Moved");
+            let arrived = rename_project(moved.clone(), "Arrived".into()).expect("a .bak-only card renames");
+            assert!(arrived.ends_with("Arrived.trt"), "{arrived}");
+            assert_eq!(read_disk(Path::new(&arrived))["name"], "Arrived");
+            assert!(!bak_path(Path::new(&moved)).exists(), "the old .bak goes with the rename");
+            assert_eq!(recent(&arrived).map(|r| r.name), Some("Arrived".to_string()));
+
+            let source = card("Source");
+            let copy = duplicate_project(source.clone(), "Source copy".into(), "copy-id".into())
+                .expect("a .bak-only card duplicates");
+            assert_eq!(read_disk(Path::new(&copy))["id"], "copy-id");
+            assert_eq!(read_disk(Path::new(&copy))["name"], "Source copy");
+            assert!(bak_path(Path::new(&source)).exists(), "a duplicate leaves its source alone");
+
+            // A case-only rename of such a card is still one project, no " (2)".
+            let quiet = card("Quiet");
+            let renamed = rename_project(quiet, "quiet".into()).unwrap();
+            assert!(renamed.ends_with("quiet.trt"), "{renamed}");
+            assert!(trt_names(dir).iter().all(|n| !n.contains("quiet (")), "{:?}", trt_names(dir));
+
+            // From the .bak too, only an object is a project (IndexMut aborts).
+            let odd = dir.join("Odd.trt");
+            std::fs::write(bak_path(&odd), b"[]").unwrap();
+            let r = rename_project(odd.to_string_lossy().into_owned(), "Even".into());
+            assert!(matches!(&r, Err(AppError::BadInput(m)) if m.ends_with("is not a Taroting project")), "{r:?}");
+            // Neither copy on disk: still not found.
+            let nothing = dir.join("Nothing.trt").to_string_lossy().into_owned();
+            assert!(matches!(rename_project(nothing, "X".into()), Err(AppError::Io(_))));
+        });
+    }
+
+    /* -------------------- names held by a .bak ------------------------- */
+
+    /// A recoverable project left as its `.bak` holds its name: New project,
+    /// a temp project, Rename and Duplicate all pick the next one instead of
+    /// handing it out — which made the old card open the new project, and the
+    /// new one's second save rotate over the old `.bak`.
+    #[test]
+    fn a_name_held_only_by_a_bak_is_never_handed_out() {
+        with_isolated("bak-names", |dir| {
+            let docs = paths::default_projects_dir().unwrap();
+            paths::ensure_dir(&docs).unwrap();
+            write_json(&docs.join("Untitled.trt.bak"), &minimal_project("Old work"));
+            assert!(new_project_path(None).unwrap().ends_with("Untitled 2.trt"));
+
+            let tmp = paths::temp_projects_dir().unwrap();
+            paths::ensure_dir(&tmp).unwrap();
+            write_json(&tmp.join("Clip.trt.bak"), &minimal_project("Clip"));
+            assert!(temp_project_path(Some("Clip".into())).unwrap().ends_with("Clip 2.trt"));
+
+            let held = dir.join("Held.trt");
+            write_json(&bak_path(&held), &minimal_project("Held"));
+            let other = dir.join("Other.trt");
+            write_json(&other, &minimal_project("Other"));
+            let renamed = rename_project(other.to_string_lossy().into_owned(), "Held".into()).unwrap();
+            assert!(renamed.ends_with("Held (2).trt"), "{renamed}");
+            let copy = duplicate_project(renamed, "Held".into(), "h-3".into()).unwrap();
+            assert!(copy.ends_with("Held (3).trt"), "{copy}");
+            assert!(!held.exists());
+            assert_eq!(read_disk(&bak_path(&held))["name"], "Held", "the held .bak is untouched");
+        });
+    }
+
+    /* -------------------- the save's card thumbnail -------------------- */
+
+    /// Every autosave used to list the whole thumbs directory for the card
+    /// picture. It now asks for the card's own frame first — the file the
+    /// editor's bin makes for the same media (`_300.jpg` for a 0.6 s clip) —
+    /// so with an earlier frame of the same media also cached, the save takes
+    /// the card frame where the listing took whichever came first. Generator
+    /// and audio first clips never look at all.
+    #[test]
+    fn a_save_takes_the_card_frame_itself() {
+        with_isolated("save-card-frame", |dir| {
+            assert_eq!(card_thumb_frame(0.6), (0.3, "_300.jpg".to_string()));
+            assert_eq!(card_thumb_frame(10.0), (0.5, "_500.jpg".to_string()));
+            assert_eq!(card_thumb_frame(0.0), (0.0, "_0.jpg".to_string()));
+
+            let cache = crate::cache::Cache::new_at(dir.join("cache"));
+            let file = dir.join("clip.bin");
+            std::fs::write(&file, b"0123456789").unwrap();
+            let meta = std::fs::metadata(&file).unwrap();
+            let media = serde_json::json!({
+                "id": "m1", "path": file.to_string_lossy(), "size": meta.len(),
+                "mtimeMs": mtime_ms_of(&meta), "kind": "video", "duration": 0.6, "hasAudio": false
+            });
+            let hash = crate::cache::MediaKey {
+                path: file.to_string_lossy().into_owned(),
+                size: meta.len(),
+                mtime_ms: mtime_ms_of(&meta),
+            }
+            .hash();
+            cache.ensure_kind_dir(crate::cache::CacheKind::Thumbs).unwrap();
+            let earlier = cache.file_path(crate::cache::CacheKind::Thumbs, &hash, "_100.jpg");
+            let card = cache.file_path(crate::cache::CacheKind::Thumbs, &hash, "_300.jpg");
+            std::fs::write(&earlier, b"frame at 0.1").unwrap();
+            std::fs::write(&card, b"frame at 0.3").unwrap();
+            assert_eq!(crate::media::thumbs::any_thumb_for(&cache, &hash), Some(earlier.clone()), "precondition");
+
+            let tracks = serde_json::json!([{ "id": "t1", "kind": "video", "name": "V1", "muted": false,
+                "clips": [clip_at("c1", "m1", 0.0)] }]);
+            let path = dir.join("Card.trt").to_string_lossy().into_owned();
+            save_project_at(Some(&cache), path.clone(), project_with_tracks(serde_json::json!([media]), tracks))
+                .unwrap();
+            assert_eq!(recent(&path).unwrap().thumb, Some(card.to_string_lossy().into_owned()));
+
+            // A generator first clip: no frame, so no card picture.
+            let solid = serde_json::json!({
+                "id": "g1", "path": "Solid", "size": 0, "mtimeMs": 0, "kind": "image",
+                "duration": 0.0, "hasAudio": false, "width": 64, "height": 64,
+                "generator": { "type": "solid", "color": "#00ff00" }
+            });
+            let tracks = serde_json::json!([{ "id": "t1", "kind": "video", "name": "V1", "muted": false,
+                "clips": [clip_at("c1", "g1", 0.0)] }]);
+            let gen_path = dir.join("Solid.trt").to_string_lossy().into_owned();
+            save_project_at(Some(&cache), gen_path.clone(), project_with_tracks(serde_json::json!([solid]), tracks))
+                .unwrap();
+            assert_eq!(recent(&gen_path).unwrap().thumb, None);
+        });
+    }
+
+    /* -------------------- parse-memory guard --------------------------- */
+
+    /// The scan skips string contents and honours escapes: a string full of
+    /// `{`, `[`, `,`, an escaped quote and an escaped backslash costs exactly
+    /// what a plain string of the same length does. (Were `\"` read as the
+    /// end, the `{` after it would be priced; were `\\` read as escaping the
+    /// closing quote, the string would run on to the end of the input.)
+    #[test]
+    fn the_parse_price_skips_string_contents() {
+        let tricky = br#"{"k":"{[,\"{\\","n":[1,2]}"#;
+        let plain = br#"{"k":"abcdefgh","n":[1,2]}"#;
+        assert_eq!(tricky.len(), plain.len());
+        assert_eq!(value_cost(tricky), value_cost(plain));
+        // One object, two array slots (the `[` and one `,`) plus the member
+        // comma, three strings with their bytes.
+        assert_eq!(value_cost(plain), OBJECT_COST + 3 * SLOT_COST + 3 * STRING_COST + 2 + 9 + 2);
+    }
+
+    /// The budget admits the biggest drawing the editor can build: every
+    /// stroke shape it writes, priced per stroke as it sits pretty-printed in
+    /// a project, fits `WORST_STROKE_COST`, so a drawing at every cap at once
+    /// prices under `VALUE_BUDGET`. And it refuses what it exists for: a file
+    /// at the read cap made of one-key objects, or of bare zeros, prices far
+    /// over it.
+    #[test]
+    fn the_parse_budget_admits_a_cap_sized_drawing_and_refuses_dense_files() {
+        let strokes = [
+            serde_json::json!({ "t": "pen", "c": "#1a2b3c", "w": 4.5, "o": 1.0, "p": "AB+/AB+/AB+/AB+/" }),
+            serde_json::json!({ "t": "marker", "c": "#FFD400", "w": 18.0, "o": 0.4, "p": "AAAAAAAAAAAAAAAA" }),
+            serde_json::json!({ "t": "erase", "w": 16.0, "p": "AAAAAAAAAAAAAAAA" }),
+            serde_json::json!({ "t": "arrow", "c": "#e5484d", "w": 3.0, "o": 1.0, "a": [10.0, 20.0], "b": [300.0, -5.0] }),
+            serde_json::json!({ "t": "line", "c": "#e5484d", "w": 65535.0, "o": 0.25, "a": [-1e7, 1e7], "b": [1e7, -1e7] }),
+        ];
+        let priced = |n: usize, s: &Value| {
+            let chunk: Vec<Value> = std::iter::repeat_n(s.clone(), n).collect();
+            value_cost(&serde_json::to_vec_pretty(&serde_json::json!({ "chunks": [chunk] })).unwrap())
+        };
+        let mut worst = 0;
+        for s in &strokes {
+            let per = (priced(200, s) - priced(100, s)) / 100;
+            assert!(per <= WORST_STROKE_COST, "{s} prices {per} per stroke");
+            worst = worst.max(per);
+        }
+        // The heaviest is within a whisker of the constant, so the budget is
+        // not padded beyond what a real drawing needs.
+        assert!(worst + 100 > WORST_STROKE_COST, "the heaviest stroke prices only {worst}");
+        let cap_sized = image_rules::MAX_STROKES_TOTAL * worst + image_rules::MAX_POINTS_TOTAL * 16;
+        assert!(cap_sized < VALUE_BUDGET);
+
+        let per_byte = |unit: &[u8]| value_cost(&unit.repeat(1000)) as f64 / (unit.len() * 1000) as f64;
+        let at_cap = |unit: &[u8]| (per_byte(unit) * image_rules::MAX_TRT_BYTES as f64) as u64;
+        assert!(at_cap(br#"{"a":0},"#) > 10 * VALUE_BUDGET);
+        assert!(at_cap(b"0,") > 4 * VALUE_BUDGET);
+        assert!(at_cap(b"{},") > 10 * VALUE_BUDGET);
+    }
+
+    /// The refusal itself, at a small budget: a few hundred kilobytes of
+    /// one-key objects is refused where an ordinary project of the same size
+    /// passes, and nothing at or under the threshold is scanned.
+    #[test]
+    fn a_dense_file_over_budget_is_refused() {
+        let path = Path::new("C:\\p\\Dense.trt");
+        let dense = format!("[{}{{\"a\":0}}]", "{\"a\":0},".repeat(40_000));
+        let ordinary = serde_json::to_vec_pretty(&serde_json::json!({
+            "name": "x".repeat(dense.len()), "media": [], "timeline": {}
+        }))
+        .unwrap();
+        let budget = 1_000_000;
+        assert!(matches!(
+            refuse_value_bomb_within(dense.as_bytes(), path, 1024, budget),
+            Err(AppError::BadInput(m)) if m.contains("more data than Taroting can open safely")
+        ));
+        assert!(refuse_value_bomb_within(&ordinary, path, 1024, budget).is_ok());
+        assert!(refuse_value_bomb_within(dense.as_bytes(), path, dense.len(), budget).is_ok());
+    }
+
+    /// Every project read is behind the guard: a real file over the budget
+    /// (~16 MB of empty objects, priced at several GB) is refused by load —
+    /// also when it is the `.bak` a missing primary would recover from — and
+    /// by rename and duplicate, before any of it is parsed.
+    #[test]
+    fn every_project_read_refuses_a_dense_file() {
+        with_isolated("dense-reads", |dir| {
+            let mut body = Vec::with_capacity(17_000_000);
+            body.push(b'[');
+            for _ in 0..5_600_000 {
+                body.extend_from_slice(b"{},");
+            }
+            body.extend_from_slice(b"{}]");
+            assert!(value_cost(&body) > VALUE_BUDGET, "the fixture must be over the real budget");
+
+            let dense = dir.join("Dense.trt");
+            std::fs::write(&dense, &body).unwrap();
+            let path = dense.to_string_lossy().into_owned();
+            let refused = |r: Result<()>| matches!(r, Err(AppError::BadInput(m)) if m.contains("more data"));
+            assert!(refused(load_project(path.clone()).map(|_| ())), "load");
+            assert!(refused(rename_project(path.clone(), "R".into()).map(|_| ())), "rename");
+            assert!(refused(duplicate_project(path.clone(), "D".into(), "d".into()).map(|_| ())), "duplicate");
+
+            let wounded = dir.join("Wounded.trt");
+            std::fs::write(bak_path(&wounded), &body).unwrap();
+            assert!(load_project(wounded.to_string_lossy().into_owned()).is_err(), "a dense .bak is not recovered");
+        });
+    }
+
+    /* -------------------- recents bounds ------------------------------- */
+
+    /// A crafted `.trt`'s name and `modifiedAt` reach recents.json verbatim
+    /// through a save or an open, and recents.json is read whole on every
+    /// listing and every save. Both are cut — by whole characters, never mid
+    /// character — to what a card shows.
+    #[test]
+    fn recents_entries_keep_a_bounded_name_and_stamp() {
+        with_isolated("recents-bounds", |dir| {
+            let mut long = minimal_project(&"é".repeat(10_000));
+            long["modifiedAt"] = Value::from("9".repeat(5_000));
+            let saved = dir.join("Saved.trt");
+            save_project_at(None, saved.to_string_lossy().into_owned(), long.clone()).unwrap();
+            let entry = recent(&saved.to_string_lossy()).unwrap();
+            assert_eq!(entry.name, "é".repeat(RECENT_NAME_MAX_CHARS));
+            assert_eq!(entry.modified_at, "9".repeat(RECENT_STAMP_MAX_CHARS));
+
+            let opened = dir.join("Opened.trt");
+            write_json(&opened, &long);
+            load_project(opened.to_string_lossy().into_owned()).unwrap();
+            let entry = recent(&opened.to_string_lossy()).unwrap();
+            assert_eq!(entry.name.chars().count(), RECENT_NAME_MAX_CHARS);
+            assert_eq!(entry.modified_at.len(), RECENT_STAMP_MAX_CHARS);
+        });
+    }
+
+    /// An index or a settings file over the read cap is present but unread —
+    /// never parsed, and never written over (the `Unreadable` protection).
+    #[test]
+    fn an_oversize_index_is_unread_and_kept() {
+        let dir = std::env::temp_dir().join(format!("taroting-json-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("index.json");
+        std::fs::write(&file, br#"{"schema":1,"items":[]}"#).unwrap();
+        let (parsed, present) = read_json_one_within::<RecentsIndex>(&file, 1_000);
+        assert!(parsed.is_some() && present);
+        let (parsed, present) = read_json_one_within::<RecentsIndex>(&file, 10);
+        assert!(parsed.is_none() && present, "over the cap: present, not parsed");
+        let (parsed, present) = read_json_one_within::<RecentsIndex>(&dir.join("absent.json"), 10);
+        assert!(parsed.is_none() && !present);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Home used to show "No projects yet" over a library whose index was on
+    /// disk but unreadable: the listing answered an empty list. It is an
+    /// error now (Home toasts it), for both copies corrupt and for an index
+    /// past the read cap — a perfectly valid one padded past 4 MB parses fine
+    /// without the cap — while an absent index is still an empty list.
+    #[test]
+    fn an_unreadable_index_lists_as_an_error_not_as_empty() {
+        with_isolated("recents-list-error", |_dir| {
+            let data = paths::data_dir().unwrap();
+            paths::ensure_dir(&data).unwrap();
+            let recents = data.join("recents.json");
+            assert!(list_recents().unwrap().items.is_empty(), "absent is a first run");
+
+            std::fs::write(&recents, b"{\"schema\":1,\"items\":[{\"pa").unwrap();
+            std::fs::write(bak_path(&recents), b"{\"schema\":1,\"items\":[{\"na").unwrap();
+            assert!(list_recents().is_err(), "both copies corrupt");
+
+            std::fs::remove_file(bak_path(&recents)).unwrap();
+            let mut padded = br#"{"schema":1,"items":[]}"#.to_vec();
+            padded.resize(JSON_INDEX_MAX_BYTES as usize + 1, b' ');
+            std::fs::write(&recents, &padded).unwrap();
+            assert!(list_recents().is_err(), "past the read cap");
+            upsert_recent(RecentItem {
+                path: "C:\\p\\X.trt".into(),
+                name: "X".into(),
+                modified_at: "m".into(),
+                duration_sec: 0.0,
+                thumb: None,
+                size_bytes: 0,
+                opened_at: None,
+                kind: None,
+            })
+            .unwrap();
+            assert_eq!(std::fs::read(&recents).unwrap(), padded, "and never written over");
+        });
+    }
+
+    /* -------------------- temp path classification -------------------- */
+
+    /// The frontend's own fixtures (src/core/open-media.test.ts): the temp dir
+    /// matches whatever the case or slash direction, a trailing separator on
+    /// the dir changes nothing, and a sibling folder that merely starts with
+    /// the same name is not inside it.
+    #[test]
+    fn temp_paths_classify_as_the_frontend_classifies_them() {
+        let dir = "C:\\Users\\Ana\\AppData\\Local\\Taroting\\tmp-projects";
+        assert!(inside_folded(dir, &format!("{dir}\\clip.trt")));
+        assert!(inside_folded(dir, "c:/users/ana/appdata/local/taroting/TMP-PROJECTS/clip.trt"));
+        assert!(!inside_folded(dir, "C:\\Users\\Ana\\Documents\\Taroting\\clip.trt"));
+        assert!(!inside_folded(dir, &format!("{dir}-old\\clip.trt")));
+        let trailing = format!("{dir}\\");
+        assert!(inside_folded(&trailing, &format!("{dir}\\clip.trt")));
+        assert!(!inside_folded(&trailing, &format!("{dir}-old\\clip.trt")));
+        assert!(!inside_folded("", &format!("{dir}\\clip.trt")));
+    }
+
+    /// A differently-cased path into tmp-projects is temporary to the editor,
+    /// so it must be to the store too: saving or opening it leaves recents
+    /// alone. Case-sensitive, it got a card — and with 24 of them evicted a
+    /// real project's card for good.
+    #[test]
+    fn a_differently_cased_temp_path_never_enters_recents() {
+        with_isolated("temp-case", |_dir| {
+            let tmp = paths::temp_projects_dir().unwrap();
+            paths::ensure_dir(&tmp).unwrap();
+            let shouty = tmp.to_string_lossy().to_uppercase().replace('\\', "/") + "/Quick.trt";
+            assert!(is_temp_project_path(&shouty));
+            save_project_at(None, shouty.clone(), minimal_project("Quick")).unwrap();
+            load_project(shouty).unwrap();
+            assert!(read_recents().items.is_empty(), "{:?}", read_recents().items);
+        });
+    }
+
+    /* -------------------- project paths only --------------------------- */
+
+    /// Save, delete, rename and duplicate take only an absolute `.trt` on a
+    /// drive or share: a compromised webview could otherwise delete any file
+    /// of the user's (and its `.bak`) or overwrite one with project JSON.
+    #[test]
+    fn only_a_project_path_is_written_or_deleted() {
+        for ok in ["C:\\p\\a.trt", "C:\\p\\A.TRT", "\\\\server\\share\\a.trt", "C:/p/a.trt"] {
+            assert!(project_target(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "C:\\p\\a.txt",
+            "C:\\p\\a.trt.bak",
+            "C:\\p\\a",
+            "a.trt",
+            "\\\\.\\C:\\p\\a.trt",
+            "\\\\?\\C:\\p\\a.trt",
+            "//?/C:/p/a.trt",
+            "C:\\p\\a.txt:s.trt",
+            "C:\\p\\a.trt\0",
+        ] {
+            assert!(matches!(project_target(bad), Err(AppError::BadInput(_))), "{bad:?}");
+        }
+        with_isolated("project-only", |dir| {
+            let doc = dir.join("letter.txt");
+            std::fs::write(&doc, b"Dear").unwrap();
+            let doc_path = doc.to_string_lossy().into_owned();
+            assert!(delete_project(doc_path.clone()).is_err());
+            assert!(save_project_at(None, doc_path.clone(), minimal_project("X")).is_err());
+            assert!(rename_project(doc_path.clone(), "X".into()).is_err());
+            assert!(duplicate_project(doc_path, "X".into(), "x".into()).is_err());
+            assert_eq!(std::fs::read(&doc).unwrap(), b"Dear", "untouched");
+        });
+    }
+
+    /// The E2E's own cleanup (`debug_remove_test_file`'s body): a file under
+    /// one of its roots goes, whatever the case of the path; anything outside
+    /// them, a `..` climb, a relative path or a folder is refused; a file
+    /// already gone is fine.
+    #[test]
+    fn the_test_cleanup_removes_only_its_own_files() {
+        let root = std::env::temp_dir().join(format!("taroting-cleanup-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("taroting-cleanup-out-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let mine = root.join("sub").join("export.png");
+        let theirs = outside.join("keep.png");
+        std::fs::write(&mine, b"x").unwrap();
+        std::fs::write(&theirs, b"x").unwrap();
+        let roots = [root.clone()];
+
+        remove_test_file(&mine.to_string_lossy().to_uppercase(), &roots).unwrap();
+        assert!(!mine.exists());
+        remove_test_file(&mine.to_string_lossy(), &roots).expect("already gone is fine");
+        for bad in [
+            theirs.to_string_lossy().into_owned(),
+            format!("{}\\..\\{}\\keep.png", root.display(), outside.file_name().unwrap().to_string_lossy()),
+            "keep.png".to_string(),
+            root.join("sub").to_string_lossy().into_owned(),
+        ] {
+            assert!(remove_test_file(&bad, &roots).is_err(), "{bad}");
+        }
+        assert!(theirs.exists() && root.join("sub").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

@@ -156,6 +156,42 @@ html[data-rescue-nav] #home-settings:focus-visible {
   margin-right: var(--sp-1);
 }
 
+/* Recover lines for temporary projects a crash or a logoff left behind. Calm
+   on purpose: nothing failed that the user can fix here and nothing is lost, so
+   it is a raised panel in the ordinary text colours, never the danger or warn
+   palette. Hidden (the normal case) it takes no room at all. */
+.home__recover {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.home__recover[hidden] {
+  display: none;
+}
+.home-recover__row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  font-size: var(--fs-13);
+  color: var(--text-2);
+}
+.home-recover__text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.home-recover__text strong {
+  color: var(--text-1);
+  font-weight: 600;
+}
+.home-recover__row > .btn {
+  flex: none;
+}
+
 .home__toolbar {
   display: flex;
   align-items: center;

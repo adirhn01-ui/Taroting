@@ -266,13 +266,18 @@ export async function createImageProjectFrom(
     const problem =
       info.kind !== "image" || info.generator ? `${stem} is not a still picture, so it was left out.` : stillSizeProblem(info);
     if (problem) {
-      toast.error(problem);
+      // Declined, not failed: the file is fine, it just is not a picture with
+      // a size this can use. A refusal is never recorded in Diagnostics.
+      toast.refuse(problem);
       continue;
     }
     infos.push(info);
   }
   if (infos.length === 0) {
-    toast.error("None of the pictures could be opened, so no project was made.");
+    // A summary, not a failure of its own: each probe that failed has already
+    // been reported (and recorded) above, so recording this too would count
+    // the same failures twice.
+    toast.refuse("None of the pictures could be opened, so no project was made.");
     return null;
   }
   const projectPath = await ipc.newProjectPath(fileStem(infos[0]!.path));

@@ -1,11 +1,13 @@
-//! Export engine: turn an `ExportSpec` into a single ffmpeg invocation on the
-//! export lane, streaming progress and atomically publishing the result.
+//! Export engine: turn an `ExportSpec` into ffmpeg invocations on the export
+//! lane (one; two for a GIF, whose palette is its own pass), streaming
+//! progress and atomically publishing the result.
 
 pub mod builder;
 pub mod estimate;
 pub mod model;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauri::{AppHandle, Manager, State};
@@ -13,128 +15,221 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::{AppError, Result};
 use crate::hw;
-use crate::jobs::{self, JobId, JobKind, Jobs, Lane};
+use crate::jobs::{self, JobFailure, JobId, JobKind, Jobs, Lane};
 use crate::project::schema::MediaRef;
 use crate::project::store::PathIdentity;
 
-use self::builder::{BuiltExport, FILTER_PLACEHOLDER};
+use self::builder::{BuiltExport, FILTER_PLACEHOLDER, PALETTE_PLACEHOLDER};
 use self::model::ExportSpec;
 
 /// Filtergraphs longer than this are written to a script file and passed via
-/// `-filter_complex_script` to avoid command-line length limits.
+/// `-/filter_complex <file>` to avoid command-line length limits.
 const INLINE_FILTER_LIMIT: usize = 8000;
 
-/// Temp files created while finalizing an export, cleaned up in every exit path
-/// (success, failure, cancel).
+/// Temp files of one export attempt, deleted in every exit path (success,
+/// failure, cancel): the filtergraph scripts, the drawtext textfiles and a
+/// GIF's palette.
 struct ExportTemps {
-    /// The `-filter_complex_script` file, if the graph exceeded the inline limit.
-    script: Option<std::path::PathBuf>,
-    /// The drawtext `textfile` files (one per text generator).
-    texts: Vec<std::path::PathBuf>,
+    files: Vec<PathBuf>,
 }
 
 impl ExportTemps {
     fn cleanup(&self) {
-        if let Some(s) = &self.script {
-            let _ = std::fs::remove_file(s);
-        }
-        for t in &self.texts {
-            let _ = std::fs::remove_file(t);
+        for f in &self.files {
+            let _ = std::fs::remove_file(f);
         }
     }
 }
 
-/// Escape a materialized textfile path for drawtext.
+/// An export attempt with every argv spliced and every temp file named, but
+/// nothing written yet: `compose` is pure apart from reading the sidecar's
+/// path, so everything that can refuse an export (the command-line length
+/// above all) runs before a single byte reaches the disk.
+struct Plan {
+    /// A GIF's palette pass, run first; `None` for every other format.
+    palette_args: Option<Vec<OsString>>,
+    /// The encode, writing `<out>.part`.
+    args: Vec<OsString>,
+    /// The encode's graph as spliced, for the failure report.
+    filter_complex: String,
+    duration_sec: f64,
+    /// The video encoder (`None` for a GIF): whether a failure ran on hardware.
+    encoder: Option<String>,
+    /// `(path, contents)` to write before the first run.
+    writes: Vec<(PathBuf, String)>,
+    /// Everything to delete afterwards: the writes, plus the palette the
+    /// first pass creates.
+    temps: Vec<PathBuf>,
+}
+
+impl Plan {
+    /// Write the textfiles and scripts. A failure removes what was written.
+    fn materialize(&self) -> Result<ExportTemps> {
+        let temps = ExportTemps { files: self.temps.clone() };
+        for (path, contents) in &self.writes {
+            if let Err(e) = std::fs::write(path, contents.as_bytes()) {
+                temps.cleanup();
+                return Err(e.into());
+            }
+        }
+        Ok(temps)
+    }
+}
+
+/// Splice a built export into runnable argv: text payloads named, the graph
+/// placed inline or into a script, the palette named, the output pointed at
+/// `<out>.part`.
 ///
-/// The transformation itself is `builder::escape_filter_value` — the ONE copy,
-/// shared with the builder rather than mirrored here. This function is the
-/// %TEMP%-specific rejection around it: an escaper that drifts from the one that
-/// wrote the placeholder produces a graph ffmpeg parses differently from the one
-/// whose length chose inline-vs-script mode.
+/// Every name that appears INSIDE a filtergraph is a bare file name in `temp`
+/// (`taroting-text-<hash>-<i>.txt`), and ffmpeg runs with `temp` as its
+/// working folder, so it resolves there. A full `%TEMP%` path inside the graph
+/// is what made text export impossible for a profile like `O'Brien`: ffmpeg's
+/// filter syntax has no escape for an apostrophe inside a quoted value. The
+/// bare name has nothing to escape, and since `plan_export` refuses relative
+/// media and destination paths, nothing else can resolve against that folder.
+/// The script paths are separate argv entries and need no escaping, so they
+/// stay absolute.
 ///
-/// A single quote is REJECTED for the same reason the builder rejects it:
-/// ffmpeg's filter-option syntax has no escape that survives inside a quoted
-/// value (neither `\'` nor `'\''`), so the path would silently truncate and
-/// ffmpeg would report a missing file. This path is `%TEMP%`, so on an account
-/// like `O'Brien` that would break EVERY export containing text — hence the
-/// message names the way out instead of just failing.
-fn escape_text_path(path: &str) -> Result<String> {
-    if path.contains('\'') {
+/// The text substitution happens BEFORE deciding inline-vs-script, so the
+/// composed graph is what the length check measures. In script mode the
+/// preceding `-filter_complex` becomes `-/filter_complex` (the "read this
+/// option's value from a file" form; `-filter_complex_script` is deprecated
+/// in ffmpeg 8).
+fn compose(built: &BuiltExport, out_path: &str, temp: &Path) -> Result<Plan> {
+    let hash = xxh3_64(out_path.as_bytes());
+    let mut writes: Vec<(PathBuf, String)> = Vec::new();
+
+    let mut text_names: Vec<(String, String)> = Vec::new();
+    for (i, (placeholder, content)) in built.text_payloads.iter().enumerate() {
+        let name = format!("taroting-text-{hash:016x}-{i}.txt");
+        writes.push((temp.join(&name), content.clone()));
+        // The placeholder was embedded escaped-quoted (`'…'`); the bare name
+        // goes in through the same escaper, so the two never drift apart.
+        text_names.push((format!("'{placeholder}'"), builder::escape_filter_value(&name)));
+    }
+    let substitute = |graph: &str| {
+        let mut g = graph.to_string();
+        for (placeholder, name) in &text_names {
+            g = g.replace(placeholder, name);
+        }
+        g
+    };
+
+    let palette = format!("taroting-palette-{hash:016x}.png");
+    let mut temps: Vec<PathBuf> = Vec::new();
+
+    // One argv, its graph spliced in (inline or as a script `tag`ged so the
+    // two passes of a GIF never share a script file).
+    let splice = |args: &[OsString], graph: &str, tag: &str, writes: &mut Vec<(PathBuf, String)>| -> Result<Vec<OsString>> {
+        let mut args: Vec<OsString> = args
+            .iter()
+            .map(|a| if a == PALETTE_PLACEHOLDER { OsString::from(&palette) } else { a.clone() })
+            .collect();
+        let pos = args
+            .iter()
+            .position(|a| a == FILTER_PLACEHOLDER)
+            .filter(|&p| p > 0)
+            .ok_or_else(|| AppError::Ffmpeg("filter placeholder missing from args".into()))?;
+        let graph = substitute(graph);
+        if graph.len() > INLINE_FILTER_LIMIT {
+            let script = temp.join(format!("taroting-filter-{hash:016x}{tag}.txt"));
+            args[pos - 1] = OsString::from("-/filter_complex");
+            args[pos] = OsString::from(&script);
+            writes.push((script, graph));
+        } else {
+            args[pos] = OsString::from(&graph);
+        }
+        Ok(args)
+    };
+
+    let palette_args = match &built.palette_pass {
+        Some(p) => Some(splice(&p.args, &p.filter_complex, "-palette", &mut writes)?),
+        None => None,
+    };
+    let mut args = splice(&built.args, &built.filter_complex, "", &mut writes)?;
+    // ffmpeg writes to "<out>.part"; the container is preserved because -f is
+    // set from the format, not inferred from the extension.
+    let last = args.len() - 1;
+    args[last] = OsString::from(format!("{out_path}.part"));
+
+    for a in palette_args.iter().chain(std::iter::once(&args)) {
+        refuse_overlong_command(a)?;
+    }
+
+    temps.extend(writes.iter().map(|(p, _)| p.clone()));
+    if palette_args.is_some() {
+        temps.push(temp.join(&palette));
+    }
+    Ok(Plan {
+        palette_args,
+        args,
+        filter_complex: substitute(&built.filter_complex),
+        duration_sec: built.duration_sec,
+        encoder: built.encoder.clone(),
+        writes,
+        temps,
+    })
+}
+
+/// The longest command line `CreateProcessW` accepts is 32,767 UTF-16 units,
+/// terminator included. A little is kept back for anything std adds.
+const MAX_COMMAND_LINE: usize = 32_000;
+
+/// Refuse an argv that would not fit on a Windows command line.
+///
+/// Every video clip adds `-ss … -to … -protocol_whitelist file -i <path>` and
+/// every audible clip a second input of the same shape, so a long edit (around
+/// 150-230 audible clips, fewer on long paths) passes the limit even with the
+/// graph in a script file, and the spawn failed with a bare OS error. The
+/// length is measured the way std quotes each argument (see
+/// `windows_arg_len`), so the check refuses exactly what would not start.
+fn refuse_overlong_command(args: &[OsString]) -> Result<()> {
+    let program = crate::jobs::ffmpeg::sidecar_path("ffmpeg")
+        .map(|p| windows_arg_len(p.as_os_str()))
+        .unwrap_or(260);
+    let total = program + args.iter().map(|a| windows_arg_len(a) + 1).sum::<usize>();
+    if total > MAX_COMMAND_LINE {
+        let inputs = args.iter().filter(|a| *a == "-i").count();
         return Err(AppError::BadInput(format!(
-            "text export needs a temp folder path without an apostrophe; \
-             set the TMP environment variable to a path like C:\\Temp \
-             and restart Taroting (current temp path: {path})"
+            "This project has too many clips to export in one pass ({inputs} inputs). \
+             Try exporting it in parts."
         )));
     }
-    Ok(builder::escape_filter_value(path))
+    Ok(())
 }
 
-/// Splice the built filtergraph into the argv. Text payloads are materialized to
-/// `%TEMP%` and their placeholders substituted (escaped) BEFORE deciding
-/// inline-vs-script, so the composed graph feeds the length check. When inline,
-/// the placeholder is replaced with the filter string; in script mode the
-/// preceding `-filter_complex` flag becomes `-filter_complex_script` and the
-/// placeholder becomes the script path. Returns temp files to delete after the
-/// job.
-fn finalize_args(built: &BuiltExport, out_path: &str) -> Result<(Vec<OsString>, ExportTemps)> {
-    let mut args = built.args.clone();
-    let pos = args
-        .iter()
-        .position(|a| a == FILTER_PLACEHOLDER)
-        .ok_or_else(|| AppError::Ffmpeg("filter placeholder missing from args".into()))?;
+/// The UTF-16 length one argument takes on a Windows command line, quoted
+/// the way std quotes it: wrapped in quotes when it is empty or holds a space
+/// or a tab, every `"` escaped with a backslash, and the backslashes before a
+/// `"` (or before the closing quote) doubled.
+fn windows_arg_len(arg: &OsStr) -> usize {
+    #[cfg(windows)]
+    let units: Vec<u16> = {
+        use std::os::windows::ffi::OsStrExt;
+        arg.encode_wide().collect()
+    };
+    #[cfg(not(windows))]
+    let units: Vec<u16> = arg.to_string_lossy().encode_utf16().collect();
 
-    let hash = xxh3_64(out_path.as_bytes());
-
-    // Materialize drawtext textfiles and substitute their escaped real paths for
-    // the placeholders inside the graph.
-    let mut filter = built.filter_complex.clone();
-    let mut texts: Vec<std::path::PathBuf> = Vec::new();
-    for (i, (placeholder, content)) in built.text_payloads.iter().enumerate() {
-        let file = std::env::temp_dir().join(format!("taroting-text-{hash:016x}-{i}.txt"));
-        if let Err(e) = std::fs::write(&file, content.as_bytes()) {
-            // best-effort cleanup of any earlier files before bailing
-            for t in &texts {
-                let _ = std::fs::remove_file(t);
+    let (space, tab, quote, backslash) = (b' ' as u16, b'\t' as u16, b'"' as u16, b'\\' as u16);
+    let quoted = units.is_empty() || units.iter().any(|&c| c == space || c == tab);
+    let mut len = 0;
+    let mut run = 0;
+    for &c in &units {
+        if c == backslash {
+            run += 1;
+        } else {
+            if c == quote {
+                len += run + 1;
             }
-            return Err(e.into());
+            run = 0;
         }
-        texts.push(file.clone());
-        let esc = match escape_text_path(&file.to_string_lossy()) {
-            Ok(esc) => esc,
-            Err(e) => {
-                for t in &texts {
-                    let _ = std::fs::remove_file(t);
-                }
-                return Err(e);
-            }
-        };
-        // The placeholder was embedded escaped-quoted (`'…'`); replace the
-        // quoted placeholder with the quoted real path.
-        let quoted_placeholder = format!("'{placeholder}'");
-        filter = filter.replace(&quoted_placeholder, &esc);
+        len += 1;
     }
-
-    if filter.len() > INLINE_FILTER_LIMIT {
-        let script = std::env::temp_dir().join(format!("taroting-filter-{hash:016x}.txt"));
-        if let Err(e) = std::fs::write(&script, filter.as_bytes()) {
-            for t in &texts {
-                let _ = std::fs::remove_file(t);
-            }
-            return Err(e.into());
-        }
-        if pos == 0 {
-            for t in &texts {
-                let _ = std::fs::remove_file(t);
-            }
-            return Err(AppError::Ffmpeg("malformed filter args".into()));
-        }
-        args[pos - 1] = OsString::from("-filter_complex_script");
-        args[pos] = OsString::from(&script);
-        Ok((args, ExportTemps { script: Some(script), texts }))
-    } else {
-        args[pos] = OsString::from(&filter);
-        Ok((args, ExportTemps { script: None, texts }))
+    if quoted {
+        len += run + 2;
     }
+    len
 }
 
 /// Publish a finished encode: move `<out>.part` onto `<out>`.
@@ -203,31 +298,80 @@ fn refuse_overwriting_a_source(out_path: &str, media: &[MediaRef]) -> Result<()>
     refuse_overwriting_a_source_with(out_path, media, |p| std::fs::canonicalize(p).ok())
 }
 
-/// Refuse an export whose source file is gone, naming it. The relink dialog is
-/// offered only when a project opens, so a file moved or deleted after that
-/// reached ffmpeg, and the export failed as "ffmpeg exited with ..." with the
-/// real cause buried in the log.
+/// Refuse an export whose source file is gone, or is not a file path at all,
+/// naming it. The relink dialog is offered only when a project opens, so a
+/// file moved or deleted after that reached ffmpeg, and the export failed as
+/// "ffmpeg exited with ..." with the real cause buried in the log.
 ///
 /// `sources` is `BuiltExport::sources`: the files ffmpeg will actually open,
 /// not every media entry. A file only a muted clip uses is never opened, and
-/// that export works today, so it is not refused. Only `Ok(false)` is proof
-/// the file is gone; a volume that cannot answer (`Err`) is left to ffmpeg,
-/// which will open it or say why.
+/// that export works today, so it is not refused.
+///
+/// First the SHAPE (`media::source`'s rules, the same gate every media sink
+/// uses): a path from a `.trt` that is relative (it would resolve against the
+/// app's own folder), a URL, a device or object-namespace path, or one with a
+/// NUL in it is not a media file, whatever is or is not on disk. Shares stay
+/// allowed. Then presence: only `Ok(false)` is proof the file is gone; a
+/// volume that cannot answer (`Err`) is left to ffmpeg, which will open it or
+/// say why. (Not `source_file` itself: its metadata read refuses that
+/// unanswered case too, and its messages do not name the file.)
 fn refuse_missing_sources(sources: &[OsString]) -> Result<()> {
+    use crate::media::source::{is_device_path, is_file_namespace};
     // One look per FILE, in argv order (so the file named is still the first
-    // one ffmpeg would open): a long edit of one clip opens it once per cut,
-    // and this runs on the IPC thread.
+    // one ffmpeg would open): a long edit of one clip opens it once per cut.
     let mut seen = std::collections::HashSet::with_capacity(sources.len());
     for src in sources {
         if !seen.insert(src.as_os_str()) {
             continue;
         }
-        if matches!(std::path::Path::new(src).try_exists(), Ok(false)) {
+        let text = src.to_string_lossy();
+        let path = Path::new(src);
+        let name = builder::display_name(&text);
+        if text.contains('\0') || is_device_path(&text) || !path.is_absolute() || !is_file_namespace(path) {
             return Err(AppError::BadInput(format!(
-                "{} is missing. Reopen the project to relink it, or replace it, then export.",
-                builder::display_name(&src.to_string_lossy())
+                "{name} isn't a full path to a file on a drive or a share. \
+                 Reopen the project to relink it, or replace it, then export."
             )));
         }
+        if matches!(path.try_exists(), Ok(false)) {
+            return Err(AppError::BadInput(format!(
+                "{name} is missing. Reopen the project to relink it, or replace it, then export."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a destination that is not a plain, full file path.
+///
+/// A relative one (`out.mp4`, and on Windows `D:out.mp4` and `\out.mp4`,
+/// which name a drive or a root but still resolve against a working folder)
+/// landed in the app's own folder — the install folder, or System32 — or
+/// failed with a raw error. A `\\.\` or `\\?\` form names a device or the
+/// whole object namespace rather than a file. A colon past the drive names
+/// an alternate data stream: `C:\x\a.mp4:s.mp4` would write a stream INTO
+/// `a.mp4`. The same rules as the image editor's save (`image_save.rs`), on
+/// the text, because Rust calls a device path absolute too. A share
+/// (`\\server\share\…`) is an ordinary destination.
+fn refuse_unusable_destination(out_path: &str) -> Result<()> {
+    if out_path.trim().is_empty() {
+        return Err(AppError::BadInput("Choose where to save the export.".into()));
+    }
+    let slashed = out_path.replace('/', "\\");
+    if slashed.starts_with(r"\\.\") || slashed.starts_with(r"\\?\") || slashed.starts_with(r"\??\") {
+        return Err(AppError::BadInput(
+            "The export can't be saved to a device path. Choose a folder on a drive or a share.".into(),
+        ));
+    }
+    // Bytes, not chars, so a multi-byte first character cannot shift the
+    // window off a boundary.
+    if slashed.as_bytes().get(2..).is_some_and(|rest| rest.contains(&b':')) {
+        return Err(AppError::BadInput(
+            "The export location isn't a plain file path. Choose another name.".into(),
+        ));
+    }
+    if !Path::new(out_path).is_absolute() {
+        return Err(AppError::BadInput("Choose a full folder path to export to.".into()));
     }
     Ok(())
 }
@@ -535,79 +679,227 @@ pub fn export_failure_report(state: State<'_, LastExportFailure>) -> Option<Reda
 /* Export command                                                      */
 /* ------------------------------------------------------------------ */
 
-/// What `start_export` decides before anything touches the disk: the graph,
-/// then the two refusals — a destination that is one of the project's own
-/// sources, and a source file that is gone. One function, so the tests pin
-/// the refusals the real command makes rather than a copy of them.
+/// What `start_export` decides before anything touches the disk: the
+/// destination must be a plain full path, then the graph, then the two
+/// refusals — a destination that is one of the project's own sources, and a
+/// source file that is gone (or not a full path to a file at all). One
+/// function, so the tests pin the refusals the real command makes rather than
+/// a copy of them.
 fn plan_export(spec: &ExportSpec, encoders: &hw::EncoderReport) -> Result<BuiltExport> {
+    refuse_unusable_destination(&spec.out_path)?;
     let built = builder::build(spec, encoders)?;
     refuse_overwriting_a_source(&spec.out_path, &spec.media)?;
     refuse_missing_sources(&built.sources)?;
     Ok(built)
 }
 
+/// The destination as `create_new` found it: claimed for this export.
+///
+/// ffmpeg runs with `-y`, so a file already called `<out>.part` (a browser
+/// download in progress, someone else's work) was truncated by the first
+/// frame and then deleted by the failure cleanup. Claiming the name first
+/// makes it ours or refuses the export. The job's cleanup removes the claim
+/// on failure or cancel, and the publish rename consumes it on success.
+fn claim_part(part: &Path) -> Result<()> {
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(part) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(AppError::BadInput(format!(
+            "A file named {} is in the way. Choose another name, or move that file.",
+            builder::display_name(&part.to_string_lossy())
+        ))),
+        Err(e) => Err(AppError::BadInput(format!(
+            "Taroting can't write the export to {}: {e}",
+            part.parent().map(|p| p.display().to_string()).unwrap_or_default()
+        ))),
+    }
+}
+
+/// An export ready to hand to the lane: its first attempt planned and its
+/// temp files written, and `<out>.part` claimed.
+struct Prepared {
+    plan: Plan,
+    temps: ExportTemps,
+    part: PathBuf,
+}
+
+/// Everything `start_export` does before the job exists, in the order that
+/// lets each refusal leave nothing behind: plan (pure), compose (pure, incl.
+/// the command-line length), claim `<out>.part`, write the temp files.
+fn prepare_export(spec: &ExportSpec, encoders: &hw::EncoderReport, temp: &Path) -> Result<Prepared> {
+    let built = plan_export(spec, encoders)?;
+    let plan = compose(&built, &spec.out_path, temp)?;
+    let part = PathBuf::from(format!("{}.part", spec.out_path));
+    claim_part(&part)?;
+    match plan.materialize() {
+        Ok(temps) => Ok(Prepared { plan, temps, part }),
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            Err(e)
+        }
+    }
+}
+
+/// Run one planned attempt: a GIF's palette pass, then the encode. The temp
+/// files go whatever happens. `run` is the ffmpeg runner: the job system's in
+/// the app, a plain sidecar spawn in the tests.
+fn run_plan(
+    plan: &Plan,
+    temps: ExportTemps,
+    run: &mut dyn FnMut(Vec<OsString>, Option<f64>) -> std::result::Result<(), JobFailure>,
+) -> std::result::Result<(), JobFailure> {
+    let result = (|| {
+        if let Some(palette) = &plan.palette_args {
+            // No ratio for this pass: ffmpeg reports no progress while the
+            // palette's single frame is still pending (it is written at end
+            // of stream), so the bar waits at 0 and then runs once, with the
+            // encode.
+            run(palette.clone(), None).map_err(|f| JobFailure {
+                message: if f.message == "canceled" {
+                    f.message
+                } else {
+                    format!("{} (while preparing the GIF's colours)", f.message)
+                },
+                log_tail: f.log_tail,
+            })?;
+        }
+        run(plan.args.clone(), Some(plan.duration_sec))
+    })();
+    temps.cleanup();
+    result
+}
+
+/// How an export job ended, with what its failure report needs.
+struct Outcome {
+    result: std::result::Result<(), JobFailure>,
+    /// The encode was redone in software after a hardware failure.
+    hw_fallback: bool,
+    /// The argv and graph of the LAST attempt (the one the result is about).
+    argv: Vec<String>,
+    filter_complex: String,
+}
+
+/// The export job's body: the prepared attempt, and when it failed on a
+/// HARDWARE encoder, the same export again in software on the same job.
+///
+/// A hardware encoder can pass the half-second probe and still fail a real
+/// export (a driver rolled back, a GPU swapped, a size or feature the probe
+/// never tried), and `encoders.json` is keyed only by the ffmpeg version, so
+/// before this the same failure repeated on every export until an app update.
+/// Now the encoder is forgotten (`forget`, which is `hw::invalidate`: the
+/// next export re-probes) and the software encode runs at once; progress
+/// restarts for it. The retry is built lazily, so an export that never fails
+/// pays nothing for it. A cancel is never retried, and a software failure is
+/// final.
+fn run_export(
+    spec: &ExportSpec,
+    prepared: Prepared,
+    temp: &Path,
+    run: &mut dyn FnMut(Vec<OsString>, Option<f64>) -> std::result::Result<(), JobFailure>,
+    canceled: &dyn Fn() -> bool,
+    forget: &dyn Fn(&str),
+) -> Outcome {
+    let Prepared { plan, temps, .. } = prepared;
+    let result = run_plan(&plan, temps, run);
+    let first = Outcome {
+        result,
+        hw_fallback: false,
+        argv: argv_snapshot(&plan.args),
+        filter_complex: plan.filter_complex.clone(),
+    };
+    let hardware = match &plan.encoder {
+        Some(enc) if spec.preset.use_hardware && !hw::is_software(enc) => enc.clone(),
+        _ => return first,
+    };
+    if first.result.is_ok() || canceled() {
+        return first;
+    }
+    forget(&hardware);
+
+    let mut soft = spec.clone();
+    soft.preset.use_hardware = false;
+    let retry = builder::build(&soft, &hw::software_report())
+        .and_then(|built| compose(&built, &soft.out_path, temp))
+        .and_then(|plan| plan.materialize().map(|temps| (plan, temps)));
+    match retry {
+        Ok((plan, temps)) => Outcome {
+            result: run_plan(&plan, temps, run),
+            hw_fallback: true,
+            argv: argv_snapshot(&plan.args),
+            filter_complex: plan.filter_complex,
+        },
+        // The software plan could not even be built: report the hardware
+        // failure, which is the one that actually ran.
+        Err(_) => first,
+    }
+}
+
+/// Start an export. Async, with everything slow on a blocking thread: a sync
+/// command runs on the WebView's UI thread, and this one waits on the
+/// encoder-probe lock (held by the dialog's own background detect for as long
+/// as a cold probe takes — seconds of test encodes), checks every source on
+/// disk (an unreachable share hangs that) and writes the temp files. The
+/// window froze for all of it.
 #[tauri::command]
-pub fn start_export(
+pub async fn start_export(
     app: AppHandle,
     jobs: State<'_, Arc<Jobs>>,
     spec: ExportSpec,
 ) -> Result<JobId> {
-    let (encoders, ffmpeg_version) = hw::detect(false);
-    // Before anything touches the disk (the text/script temps below, the
-    // `.part`, the publish rename).
-    let built = plan_export(&spec, &encoders)?;
-    let out_path = spec.out_path.clone();
+    let jobs = Arc::clone(&jobs);
+    tauri::async_runtime::spawn_blocking(move || start_export_blocking(app, jobs, spec))
+        .await
+        .map_err(|e| AppError::Ffmpeg(format!("the export could not start: {e}")))?
+}
 
-    let (mut final_args, temps) = finalize_args(&built, &out_path)?;
-
-    // ffmpeg writes to "<out>.part"; the container is preserved because -f is
-    // set from the format, not inferred from the extension.
-    let part_path = std::path::PathBuf::from(format!("{out_path}.part"));
-    // replace the output path (last argv entry) with the .part path
-    let last = final_args.len() - 1;
-    final_args[last] = OsString::from(&part_path);
-
-    let total = built.duration_sec;
-    // MOVE the graph out of `built` (not a clone — `built` is dead after
-    // `finalize_args` + `duration_sec`), so the report costs no extra
-    // allocation. The argv snapshot is one small Vec per export start.
-    let filter_complex = built.filter_complex;
-    let argv = argv_snapshot(&final_args);
+fn start_export_blocking(app: AppHandle, jobs: Arc<Jobs>, spec: ExportSpec) -> Result<JobId> {
+    // Only an export that asked for hardware needs to know what this machine
+    // has; a software one never waits on (or starts) the probe.
+    let encoders = if spec.preset.use_hardware {
+        hw::detect(false).0
+    } else {
+        hw::software_report()
+    };
+    let temp = std::env::temp_dir();
+    // Before the job exists: every refusal surfaces here, from the dialog's
+    // own await, and leaves nothing on disk.
+    let prepared = prepare_export(&spec, &encoders, &temp)?;
 
     let handle = jobs.allocate(JobKind::Export);
     let job_id = handle.id;
-
-    let app_clone = app.clone();
     let jobs_arc = Arc::clone(&jobs);
-    let out_final = out_path.clone();
 
     jobs.submit(
         Lane::Export,
         Box::new(move || {
-            // cleanup on cancel/failure targets the .part file
+            // cleanup on cancel/failure targets the .part file (the claim)
+            let part_path = prepared.part.clone();
             handle.set_output(part_path.clone());
 
-            let result = jobs::execute_ffmpeg(&app_clone, &handle, final_args, Some(total), None);
-
-            // always remove temp files (filter script + textfiles) whatever the
-            // outcome: success, failure, or cancel.
-            temps.cleanup();
+            let outcome = {
+                let mut run = |args: Vec<OsString>, total: Option<f64>| {
+                    jobs::execute_ffmpeg(&app, &handle, args, total, Some(&temp))
+                };
+                run_export(&spec, prepared, &temp, &mut run, &|| handle.is_canceled(), &hw::invalidate)
+            };
+            let Outcome { result, hw_fallback, argv, filter_complex } = outcome;
 
             // Record (or clear) the diagnostic detail for `export_failure_report`.
             // Nothing is retained after a healthy export. A user-initiated
             // cancel is not a failure: it neither stores a bogus report nor
-            // discards a real one the user has not copied out yet.
+            // discards a real one the user has not copied out yet. The version
+            // comes from the encoder memo when a detect ran; otherwise it is
+            // read now, and only because the export failed.
             let remember = |message: &str, log_tail: &[String]| {
                 if handle.is_canceled() {
                     return;
                 }
-                if let Some(state) = app_clone.try_state::<LastExportFailure>() {
+                if let Some(state) = app.try_state::<LastExportFailure>() {
                     state.store(ExportFailureDetail {
                         argv: argv.clone(),
                         filter_complex: filter_complex.clone(),
                         message: message.to_string(),
                         log_tail: log_tail.to_vec(),
-                        ffmpeg_version: ffmpeg_version.clone(),
+                        ffmpeg_version: hw::memo_version().unwrap_or_else(hw::ffmpeg_version),
                     });
                 }
             };
@@ -621,46 +913,40 @@ pub fn start_export(
                     // the user is waiting for.
                     handle.clear_output();
 
-                    let final_pb = std::path::PathBuf::from(&out_final);
+                    let final_pb = PathBuf::from(&spec.out_path);
                     match publish_export(&part_path, &final_pb) {
                         Ok(()) => {
-                            if let Some(state) = app_clone.try_state::<LastExportFailure>() {
+                            if let Some(state) = app.try_state::<LastExportFailure>() {
                                 state.clear();
                             }
-                            jobs::complete_job(
-                                &app_clone,
-                                &jobs_arc,
-                                &handle,
-                                serde_json::json!({ "path": out_final }),
-                            );
+                            jobs::complete_job(&app, &jobs_arc, &handle, done_output(&spec.out_path, hw_fallback));
                         }
                         Err(message) => {
                             remember(&message, &[]);
-                            jobs::fail_job(
-                                &app_clone,
-                                &jobs_arc,
-                                &handle,
-                                message,
-                                Vec::new(),
-                            );
+                            jobs::fail_job(&app, &jobs_arc, &handle, message, Vec::new());
                         }
                     }
                 }
                 Err(failure) => {
                     remember(&failure.message, &failure.log_tail);
-                    jobs::fail_job(
-                        &app_clone,
-                        &jobs_arc,
-                        &handle,
-                        failure.message,
-                        failure.log_tail,
-                    );
+                    jobs::fail_job(&app, &jobs_arc, &handle, failure.message, failure.log_tail);
                 }
             }
         }),
     );
 
     Ok(job_id)
+}
+
+/// The export job's done payload: `{ path }`, plus `hwFallback: true` when the
+/// hardware encode failed and the file was made in software (the dialog says
+/// so). The key is absent otherwise, never `false`.
+fn done_output(path: &str, hw_fallback: bool) -> serde_json::Value {
+    if hw_fallback {
+        serde_json::json!({ "path": path, "hwFallback": true })
+    } else {
+        serde_json::json!({ "path": path })
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -697,54 +983,189 @@ mod unit {
         }
     }
 
-    /* -------- (1) the apostrophe crash -------- */
+    /* -------- (1) composing the argv: temp names, script mode, length -------- */
 
-    #[test]
-    fn escape_text_path_rejects_an_apostrophe_with_an_actionable_message() {
-        let err = escape_text_path(r"C:\Users\O'Brien\AppData\Local\Temp\taroting-text-0.txt")
-            .unwrap_err();
-        assert!(matches!(err, AppError::BadInput(_)), "wrong variant: {err:?}");
-        let msg = err.to_string();
-        // must name the workaround, not just complain
-        assert!(msg.contains("apostrophe"), "message: {msg}");
-        assert!(msg.contains("TMP"), "message must name the TMP variable: {msg}");
-        assert!(msg.contains(r"C:\Temp"), "message must give a concrete path: {msg}");
+    /// A text clip in a minimal project, built by the real builder.
+    fn text_spec(out: &str, format: &str) -> (ExportSpec, crate::hw::EncoderReport) {
+        use crate::export::model::*;
+        use crate::project::schema::*;
+        let text = MediaRef {
+            id: "t".into(), path: "Text".into(), size: 0, mtime_ms: 0,
+            kind: "image".into(), duration: 0.0, fps: None,
+            width: Some(300), height: Some(80),
+            container: None, vcodec: None, acodec: None, pix_fmt: None,
+            bit_depth: None, has_audio: false, audio_rate: None, audio_channels: None,
+            generator: Some(Generator::Text {
+                text: "Ab".into(), font_family: "Arial".into(), size_px: 48.0,
+                color: "#000000".into(), bold: false, italic: false,
+            }),
+            no_autorotate: None,
+        };
+        let clip = Clip {
+            id: "c".into(), media_id: "t".into(), timeline_start: 0.0, src_in: 0.0, src_out: 1.0,
+            speed: 1.0, transform: None,
+            audio: ClipAudio { volume: 1.0, muted: false, fade_in_sec: 0.0, fade_out_sec: 0.0, gain_offset_db: 0.0, detached: false },
+            keyframes: None, adjust: None,
+        };
+        let spec = ExportSpec {
+            media: vec![text],
+            timeline: Timeline {
+                fps: Rational { num: 30, den: 1 }, width: 640, height: 360,
+                tracks: vec![Track { id: "v".into(), kind: "video".into(), name: "V".into(), muted: false, clips: vec![clip], hidden: None }],
+                markers: vec![],
+            },
+            preset: ExportPreset {
+                format: format.into(), vcodec: "h264".into(),
+                resolution: ResolutionPreset::Custom { w: 320, h: 180 },
+                fps: FpsPreset::Custom(15.0),
+                video_bitrate: BitratePreset::Auto(AutoTag::Auto),
+                audio_bitrate: BitratePreset::Auto(AutoTag::Auto),
+                use_hardware: false,
+            },
+            out_path: out.into(),
+        };
+        (spec, crate::hw::software_report())
     }
 
-    /// ONE escaper, two rejection messages.
-    ///
-    /// The builder embeds a PLACEHOLDER escaped by its own wrapper and this
-    /// module substitutes the real path escaped by that one; the graph whose
-    /// length picks inline-vs-script mode is measured between those two steps.
-    /// If the transformations ever drift apart, the string ffmpeg parses is not
-    /// the string that was measured — so they are the same function, and this is
-    /// what says so.
+    /// The textfile goes into the graph as a BARE name and is written into
+    /// the temp folder ffmpeg will run in. With a temp folder whose path holds
+    /// an apostrophe (a profile like O'Brien), the old full path could not be
+    /// written into a filter value at all and every text export was refused;
+    /// now no part of that folder's path is in the graph.
     #[test]
-    fn the_textfile_escaper_is_the_builders_escaper() {
-        for p in [
-            r"C:\Users\adele\AppData\Local\Temp\taroting-text-ab-0.txt",
-            r"D:\a folder\with-dashes_and.dots.txt",
-            r"\\server\share\clip.txt",
-            "no-separators-at-all",
-        ] {
-            assert_eq!(
-                escape_text_path(p).unwrap(),
-                builder::escape_filter_value(p),
-                "escapers disagree on {p}"
-            );
+    fn a_text_file_is_named_in_the_graph_without_its_folder() {
+        let temp = publish_dir("o'brien temp");
+        assert!(temp.to_string_lossy().contains('\''), "premise: the temp path has an apostrophe");
+        let out = temp.join("Final Cut.mp4").to_string_lossy().into_owned();
+        let (spec, enc) = text_spec(&out, "mp4");
+        let built = builder::build(&spec, &enc).unwrap();
+        let plan = compose(&built, &out, &temp).unwrap();
+
+        let hash = xxh3_64(out.as_bytes());
+        let name = format!("taroting-text-{hash:016x}-0.txt");
+        assert!(plan.filter_complex.contains(&format!("textfile='{name}':")), "{}", plan.filter_complex);
+        let graph = plan.args.iter().find(|a| a.to_string_lossy().contains("drawtext")).unwrap();
+        assert!(!graph.to_string_lossy().contains("o'brien"), "no folder in the graph: {graph:?}");
+        assert!(!graph.to_string_lossy().contains(&builder::text_placeholder(0)), "{graph:?}");
+        assert_eq!(plan.writes, [(temp.join(&name), "Ab".to_string())]);
+        assert_eq!(plan.args.last().unwrap(), &OsString::from(format!("{out}.part")));
+
+        let temps = plan.materialize().unwrap();
+        assert_eq!(std::fs::read_to_string(temp.join(&name)).unwrap(), "Ab");
+        temps.cleanup();
+        assert!(!temp.join(&name).exists());
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// A graph past `INLINE_FILTER_LIMIT` goes to a script passed with
+    /// `-/filter_complex` (not the deprecated `-filter_complex_script`), and
+    /// the script holds exactly the graph an inline export would have held.
+    #[test]
+    fn a_long_graph_goes_to_a_script_behind_the_file_form_of_the_option() {
+        let temp = publish_dir("script mode");
+        let out = temp.join("long.mp4").to_string_lossy().into_owned();
+        let (mut spec, enc) = text_spec(&out, "mp4");
+        let one = spec.timeline.tracks[0].clips[0].clone();
+        spec.timeline.tracks[0].clips = (0..60)
+            .map(|i| crate::project::schema::Clip { id: format!("c{i}"), timeline_start: i as f64, ..one.clone() })
+            .collect();
+        let built = builder::build(&spec, &enc).unwrap();
+        assert!(built.filter_complex.len() > INLINE_FILTER_LIMIT, "premise: a long graph");
+        let plan = compose(&built, &out, &temp).unwrap();
+        let i = plan.args.iter().position(|a| a == "-/filter_complex").expect("the file form of the option");
+        assert!(!plan.args.iter().any(|a| a == "-filter_complex" || a == "-filter_complex_script"));
+        let script = PathBuf::from(&plan.args[i + 1]);
+        let (_, body) = plan.writes.iter().find(|(p, _)| *p == script).expect("the script is written");
+        assert_eq!(body, &plan.filter_complex);
+        assert!(plan.temps.contains(&script), "and deleted afterwards");
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// A GIF composes into two runs: the palette pass writes the palette
+    /// under a bare name, the encode reads that same name back, both graphs
+    /// get the same text name, and the palette is in the cleanup list though
+    /// nothing writes it before the run.
+    #[test]
+    fn a_gif_composes_into_a_palette_pass_and_an_encode_sharing_one_palette() {
+        let temp = publish_dir("gif plan");
+        let out = temp.join("loop.gif").to_string_lossy().into_owned();
+        let (spec, enc) = text_spec(&out, "gif");
+        let plan = compose(&builder::build(&spec, &enc).unwrap(), &out, &temp).unwrap();
+        let hash = xxh3_64(out.as_bytes());
+        let palette = format!("taroting-palette-{hash:016x}.png");
+        let p1 = plan.palette_args.as_ref().expect("a palette pass");
+        assert_eq!(p1.last().unwrap(), &OsString::from(&palette), "pass 1 writes the palette");
+        let i = plan.args.iter().position(|a| a == palette.as_str()).expect("pass 2 reads it");
+        assert_eq!(plan.args[i - 1], "-i");
+        assert_eq!(plan.args.last().unwrap(), &OsString::from(format!("{out}.part")));
+        for a in [p1, &plan.args] {
+            assert!(a.iter().any(|s| s.to_string_lossy().contains(&format!("textfile='taroting-text-{hash:016x}-0.txt'"))));
+            assert!(!a.iter().any(|s| s == PALETTE_PLACEHOLDER || s == FILTER_PLACEHOLDER));
         }
-        // Both still refuse a quote — the rejection is what stayed per-caller.
-        assert!(escape_text_path("a'b").is_err());
+        assert!(plan.temps.contains(&temp.join(&palette)));
+        assert!(!plan.writes.iter().any(|(p, _)| *p == temp.join(&palette)));
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
+    /// A project whose argv cannot fit on a Windows command line is refused
+    /// with a message that says what to do, BEFORE anything is written — not
+    /// left to fail at spawn with an OS error. 300 audible clips on long
+    /// paths; the same project with 20 clips composes.
     #[test]
-    fn escape_text_path_leaves_a_normal_path_unchanged() {
-        let esc = escape_text_path(r"C:\Users\adele\AppData\Local\Temp\taroting-text-ab-0.txt")
-            .unwrap();
+    fn an_argv_too_long_for_windows_is_refused_before_anything_is_written() {
+        let dir = publish_dir("too many clips");
+        let long = dir.join(format!("{}.mp4", "a very long clip name for a very long edit ".repeat(4)));
+        let project = |n: usize| {
+            let (mut spec, enc) = spec_over(&dir, false);
+            let mut m = source("m1", &long);
+            m.has_audio = true;
+            spec.media = vec![m];
+            let one = crate::project::schema::Clip {
+                id: "c".into(), media_id: "m1".into(), timeline_start: 0.0, src_in: 0.0, src_out: 0.5,
+                speed: 1.0, transform: None,
+                audio: crate::project::schema::ClipAudio {
+                    volume: 1.0, muted: false, fade_in_sec: 0.0, fade_out_sec: 0.0, gain_offset_db: 0.0, detached: false,
+                },
+                keyframes: None, adjust: None,
+            };
+            spec.timeline.tracks = vec![crate::project::schema::Track {
+                id: "v".into(), kind: "video".into(), name: "V".into(), muted: false, hidden: None,
+                clips: (0..n).map(|i| crate::project::schema::Clip { id: format!("c{i}"), timeline_start: i as f64 * 0.5, ..one.clone() }).collect(),
+            }];
+            (spec, enc)
+        };
+        let (spec, enc) = project(300);
+        let built = builder::build(&spec, &enc).unwrap();
+        let err = match compose(&built, &spec.out_path, &dir) {
+            Err(e) => e,
+            Ok(_) => panic!("300 audible clips on long paths cannot fit"),
+        };
+        assert!(matches!(err, AppError::BadInput(_)), "{err:?}");
         assert_eq!(
-            esc,
-            r"'C\:/Users/adele/AppData/Local/Temp/taroting-text-ab-0.txt'"
+            err.to_string(),
+            "This project has too many clips to export in one pass (600 inputs). Try exporting it in parts."
         );
+        let (spec, enc) = project(20);
+        compose(&builder::build(&spec, &enc).unwrap(), &spec.out_path, &dir).expect("20 clips fit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The quoting arithmetic, against the rules std applies: no quotes for a
+    /// plain argument, quotes for a space, an escaped `"`, and the backslashes
+    /// before a quote (or the closing quote) doubled.
+    #[test]
+    fn windows_arg_len_counts_what_std_puts_on_the_command_line() {
+        for (arg, len) in [
+            ("abc", 3),
+            ("", 2),
+            ("a b", 5),
+            (r"C:\x\y", 6),
+            (r"C:\my dir\", 13),
+            (r#"a"b"#, 4),
+            (r#"a\"b"#, 6),
+        ] {
+            assert_eq!(windows_arg_len(OsStr::new(arg)), len, "{arg:?}");
+        }
     }
 
     /* -------- (2) redaction -------- */
@@ -1375,16 +1796,130 @@ mod unit {
     }
 
     /// Only `Ok(false)` proves a file is gone. A path the filesystem cannot be
-    /// asked about (a NUL in the name is the portable way to make `try_exists`
-    /// fail; an unreachable share behaves the same) is left to ffmpeg.
+    /// asked about is left to ffmpeg; an unreachable share behaves this way,
+    /// and so does a name Windows calls invalid (`<`), which is the portable
+    /// stand-in here. (A NUL used to be the stand-in; a NUL path is now
+    /// refused by shape, below, because no process can even be handed one.)
+    #[cfg(windows)]
     #[test]
     fn a_source_that_cannot_be_checked_is_left_to_ffmpeg() {
         let dir = publish_dir("missing-unknown");
-        let unreadable = dir.join("Rem\0ote Clip.mp4");
+        let unreadable = dir.join("Rem<ote Clip.mp4");
         assert!(unreadable.try_exists().is_err(), "premise: the source cannot be checked");
         refuse_missing_sources(&[unreadable.into_os_string()])
             .expect("an unanswered check is not proof the file is gone");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A source that is not a full path to a file is refused by its shape,
+    /// naming it, whatever is on disk — the relative name even though a file
+    /// of that name exists in the working directory, where it would have
+    /// resolved. A URL, a device and a NUL go the same way; a share does not.
+    #[test]
+    fn a_source_that_is_not_a_full_file_path_is_refused_by_name() {
+        let cwd = std::env::current_dir().unwrap();
+        let here = std::fs::read_dir(&cwd)
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().is_file())
+            .expect("the working directory holds a file");
+        let relative = here.file_name().into_string().unwrap();
+        let mut bad = vec![relative.clone(), "https://example.com/clip.mp4".into(), "C:\\clip\0.mp4".into()];
+        if cfg!(windows) {
+            bad.extend([r"C:clip.mp4".to_string(), r"\clip.mp4".into(), r"\\.\pipe\clip.mp4".into(), r"\\?\pipe\clip.mp4".into()]);
+        }
+        for p in bad {
+            let err = refuse_missing_sources(&[OsString::from(&p)]).expect_err(&p);
+            assert!(matches!(err, AppError::BadInput(_)), "{p}: {err:?}");
+            assert!(err.to_string().contains("isn't a full path to a file"), "{p}: {err}");
+        }
+        let err = refuse_missing_sources(&[OsString::from(&relative)]).unwrap_err().to_string();
+        assert!(err.starts_with(&format!("{relative} isn't")), "the file is named: {err}");
+    }
+
+    /// The destination must be a plain full path: relative, drive- or
+    /// root-relative, device, verbatim and alternate-data-stream forms are
+    /// refused before anything is built; a drive path and a share are not.
+    #[test]
+    fn a_destination_that_is_not_a_plain_full_path_is_refused() {
+        let mut bad: Vec<(&str, &str)> = vec![
+            ("", "Choose where"),
+            ("Final Cut.mp4", "full folder path"),
+            (r"exports\Final Cut.mp4", "full folder path"),
+        ];
+        if cfg!(windows) {
+            bad.extend([
+                (r"D:Final Cut.mp4", "full folder path"),
+                (r"\Final Cut.mp4", "full folder path"),
+                (r"\\.\C:\Final Cut.mp4", "device path"),
+                (r"\\?\C:\Final Cut.mp4", "device path"),
+                ("//./pipe/x.mp4", "device path"),
+                (r"C:\clips\a.mp4:stream.mp4", "plain file path"),
+            ]);
+        }
+        for (p, needle) in bad {
+            let err = refuse_unusable_destination(p).expect_err(p);
+            assert!(matches!(err, AppError::BadInput(_)), "{p}: {err:?}");
+            assert!(err.to_string().contains(needle), "{p}: {err}");
+        }
+        if cfg!(windows) {
+            refuse_unusable_destination(r"C:\Exports\Final Cut.mp4").unwrap();
+            refuse_unusable_destination(r"\\server\share\Final Cut.mp4").unwrap();
+        }
+        // ...and it is the real command's pre-flight that refuses it.
+        let dir = publish_dir("relative-dest");
+        std::fs::write(dir.join("Holiday Clip.mp4"), b"footage").unwrap();
+        std::fs::write(dir.join("Voice Memo.m4a"), b"voice").unwrap();
+        let (mut spec, enc) = spec_over(&dir, false);
+        spec.out_path = "Export final.mp4".into();
+        let Err(err) = plan_export(&spec, &enc) else { panic!("a relative destination must be refused") };
+        assert!(err.to_string().contains("full folder path"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* -------- (6) the .part name is claimed, never clobbered -------- */
+
+    /// A file already named `<out>.part` (a browser download, someone else's
+    /// work) is refused by name and left byte-for-byte alone; ffmpeg's `-y`
+    /// used to truncate it and the failure cleanup then deleted it. Without
+    /// one, the export claims the name, so the job's cleanup has something of
+    /// its own to remove.
+    #[test]
+    fn a_foreign_part_file_is_refused_and_left_alone() {
+        let dir = publish_dir("foreign-part");
+        std::fs::write(dir.join("Holiday Clip.mp4"), b"footage").unwrap();
+        std::fs::write(dir.join("Voice Memo.m4a"), b"voice").unwrap();
+        let (spec, enc) = spec_over(&dir, false);
+        let part = dir.join("Export final.mp4.part");
+        std::fs::write(&part, b"half of somebody's download").unwrap();
+
+        let Err(err) = prepare_export(&spec, &enc, &dir) else { panic!("the .part is in the way") };
+        assert!(matches!(err, AppError::BadInput(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "A file named Export final.mp4.part is in the way. Choose another name, or move that file."
+        );
+        assert_eq!(std::fs::read(&part).unwrap(), b"half of somebody's download");
+
+        std::fs::remove_file(&part).unwrap();
+        let prepared = prepare_export(&spec, &enc, &dir).expect("nothing in the way now");
+        assert_eq!(prepared.part, part);
+        assert!(part.exists(), "the name is claimed before the job starts");
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
+        prepared.temps.cleanup();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The done payload: `hwFallback: true` exactly when the encode was
+    /// redone in software, and no such key otherwise (the dialog reads the
+    /// key, so a `false` would be a second spelling of "no").
+    #[test]
+    fn the_done_output_names_a_hardware_fallback_only_when_one_happened() {
+        assert_eq!(done_output(r"C:\o.mp4", false), serde_json::json!({ "path": r"C:\o.mp4" }));
+        assert_eq!(
+            done_output(r"C:\o.mp4", true),
+            serde_json::json!({ "path": r"C:\o.mp4", "hwFallback": true })
+        );
     }
 }
 
@@ -1415,33 +1950,81 @@ mod e2e {
         );
     }
 
-    /// Run built argv directly through the sidecar (no job system needed for
-    /// the encode itself), splicing the filter inline.
-    fn run_built(built: &BuiltExport, out: &str, part: &std::path::Path) {
-        let (mut args, temps) = finalize_args(built, out).unwrap();
-        let last = args.len() - 1;
-        args[last] = OsString::from(part);
-        let res = ffmpeg::command("ffmpeg").unwrap().args(&args).output().unwrap();
-        temps.cleanup();
-        assert!(
-            res.status.success(),
-            "export ffmpeg failed: {}",
-            String::from_utf8_lossy(&res.stderr)
-        );
+    /// The app's ffmpeg runner without the job system: the sidecar run to its
+    /// end with `temp` as its working folder (where the textfile and palette
+    /// names resolve, exactly as `execute_ffmpeg` is told in the app), failing
+    /// with its stderr as the log tail.
+    fn direct_runner(
+        temp: &std::path::Path,
+    ) -> impl FnMut(Vec<OsString>, Option<f64>) -> std::result::Result<(), JobFailure> + '_ {
+        move |args, _total| {
+            let res = ffmpeg::command("ffmpeg").unwrap().current_dir(temp).args(&args).output().unwrap();
+            if res.status.success() {
+                Ok(())
+            } else {
+                Err(JobFailure {
+                    message: format!("ffmpeg exited with {}", res.status),
+                    log_tail: String::from_utf8_lossy(&res.stderr).lines().map(String::from).collect(),
+                })
+            }
+        }
     }
 
+    /// Run a built export the way the job does — composed, its temp files
+    /// written, every pass run, the temp files removed — minus the job
+    /// system. `part` is where the encode must land.
+    fn run_built(built: &BuiltExport, out: &str, part: &std::path::Path) {
+        run_built_in(built, out, part, &std::env::temp_dir());
+    }
+
+    fn run_built_in(built: &BuiltExport, out: &str, part: &std::path::Path, temp: &std::path::Path) {
+        let plan = compose(built, out, temp).unwrap();
+        assert_eq!(plan.args.last().unwrap(), part.as_os_str());
+        let temps = plan.materialize().unwrap();
+        if let Err(f) = run_plan(&plan, temps, &mut direct_runner(temp)) {
+            panic!("export ffmpeg failed: {}\n{}", f.message, f.log_tail.join("\n"));
+        }
+        for t in &plan.temps {
+            assert!(!t.exists(), "temp file left behind: {}", t.display());
+        }
+    }
+
+    /// The shared 3 s fixture, made once and trusted only when it probes.
+    ///
+    /// Parallel tests in this run, and other `cargo test` processes on the
+    /// machine, all reach for it. Before: each wrote the final name directly
+    /// behind an `exists()` check, so one test probed another's half-written
+    /// file ("moov atom not found"), and a run killed mid-write left a
+    /// truncated fixture that every later run trusted. Now one creator at a
+    /// time in this process, a part file named by process, the final name
+    /// only by rename, and a file that does not probe is made again.
     fn fixture_media(dir: &std::path::Path) -> (std::path::PathBuf, MediaRef) {
+        static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         // 3s testsrc2 + sine, 640x360, with a space in the path
         let src = dir.join("src fixture.mp4");
-        if !src.exists() {
-            ffmpeg_ok(&[
-                "-y",
-                "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=3",
-                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
-                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-shortest",
-                src.to_str().unwrap(),
-            ]);
+        {
+            let _one_at_a_time = CREATE.lock().unwrap_or_else(|e| e.into_inner());
+            if src.exists() && probe::probe_sync(src.to_str().unwrap()).is_err() {
+                let _ = std::fs::remove_file(&src);
+            }
+            if !src.exists() {
+                let part = dir.join(format!("src fixture.{}.part.mp4", std::process::id()));
+                ffmpeg_ok(&[
+                    "-y",
+                    "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=3",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-shortest",
+                    part.to_str().unwrap(),
+                ]);
+                // Another process may have renamed its own copy in first, and
+                // be reading it (Windows then refuses the replace): theirs is
+                // as good as ours.
+                if std::fs::rename(&part, &src).is_err() {
+                    let _ = std::fs::remove_file(&part);
+                    assert!(src.exists(), "fixture could not be published");
+                }
+            }
         }
         let info = probe::probe_sync(src.to_str().unwrap()).unwrap();
         let media = MediaRef {
@@ -2140,9 +2723,11 @@ mod e2e {
         assert_eq!(info.width, Some(1920));
         assert_eq!(info.height, Some(1080));
         // 131056:120 fits to a 1920x2 strip centred at y=539. It must actually
-        // carry the colour: `alphamerge` REPLACING the alpha instead of
-        // multiplying it would leave a black band here even though ffmpeg
-        // exited 0.
+        // carry the colour: a mask that came out empty or mis-sized would
+        // leave a black band here even though ffmpeg exited 0. (This source is
+        // OPAQUE, so it cannot tell an `alphamerge` that replaces the alpha
+        // from one that multiplies it — both give the ramp. That is
+        // `e2e_text_opacity_keyframes_keep_the_empty_text_box_transparent`.)
         let strip = yavg(&out, 0.05, 0, 539, 1920, 2);
         assert!(strip > 20.0, "the fitted strip should be lit, got YAVG {strip}");
 
@@ -2521,5 +3106,265 @@ mod e2e {
         assert!(est.exact);
         // (4000+160)*1000/8*10 = 5,200,000
         assert_eq!(est.bytes, 5_200_000);
+    }
+
+    /* -------- (9) the alpha a text clip brings with it -------- */
+
+    /// A black "Ab" text clip whose opacity is KEYFRAMED (0.3 -> 0.9 over
+    /// 3 s) over a white solid. A text frame is transparent everywhere but the
+    /// glyphs, and the opacity mask must MULTIPLY that alpha (issue #1, part
+    /// 4): wired straight into `alphamerge` instead, the ramp replaces it and
+    /// the whole 300x80 box exports as a translucent black rectangle.
+    ///
+    /// Geometry: the 300x80 box contain-fits the 640x360 canvas at 2.133x, so
+    /// it spans x 0..640, y ~95..265. At t=2.0 the opacity is 0.7. A patch
+    /// inside the box but right of the glyphs must stay white (~235; the
+    /// regressed graph measures ~82 there), and a patch over the glyphs must
+    /// be darker than it, so the text did render.
+    #[test]
+    fn e2e_text_opacity_keyframes_keep_the_empty_text_box_transparent() {
+        let dir = case_dir("text-alpha-kf");
+        let base = solid_media("base", "#ffffff");
+        let text = MediaRef {
+            id: "txt".into(), path: "Text".into(), size: 0, mtime_ms: 0,
+            kind: "image".into(), duration: 0.0, fps: None,
+            width: Some(300), height: Some(80),
+            container: None, vcodec: None, acodec: None, pix_fmt: None,
+            bit_depth: None, has_audio: false, audio_rate: None, audio_channels: None,
+            generator: Some(Generator::Text {
+                text: "Ab".into(),
+                font_family: "Arial".into(),
+                size_px: 48.0,
+                color: "#000000".into(),
+                bold: false,
+                italic: false,
+            }),
+            no_autorotate: None,
+        };
+        let bottom = vtrack("vbot", vec![clip_at("b1", "base", 0.0, 0.0, 3.0)]);
+        let mut t = clip_at("t1", "txt", 0.0, 0.0, 3.0);
+        t.keyframes = Some(ClipKeyframes {
+            x: None, y: None, scale: None,
+            opacity: Some(vec![Keyframe { t: 0.0, v: 0.3 }, Keyframe { t: 3.0, v: 0.9 }]),
+        });
+        let tl = Timeline {
+            fps: Rational { num: 30, den: 1 }, width: 640, height: 360,
+            tracks: vec![vtrack("vtop", vec![t]), bottom], markers: vec![],
+        };
+        let spec = ExportSpec {
+            media: vec![base, text], timeline: tl, preset: preset_640(30.0),
+            out_path: dir.join("textalpha.mp4").to_string_lossy().into_owned(),
+        };
+        let out = encode(&spec, &dir, "textalpha.mp4");
+
+        let empty_box = yavg(&out, 2.0, 440, 170, 30, 20);
+        let glyphs = yavg(&out, 2.0, 10, 150, 110, 60);
+        assert!(empty_box >= 200.0, "the empty part of the text box must stay transparent: YAVG {empty_box}");
+        assert!(glyphs < empty_box - 20.0, "the glyphs must render: glyphs {glyphs} vs box {empty_box}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* -------- (10) script mode, end to end -------- */
+
+    /// A graph past `INLINE_FILTER_LIMIT` (sixty 0.1 s solid clips) goes to
+    /// a script behind `-/filter_complex` and actually encodes from it, to
+    /// the frame: 6 s at 30 fps is 180 frames. `run_built_in` also checks the
+    /// script is gone afterwards.
+    #[test]
+    fn e2e_a_graph_too_long_to_inline_encodes_from_its_script() {
+        let dir = case_dir("script");
+        let colours = ["#ff0000", "#00ff00", "#0000ff"];
+        let media: Vec<MediaRef> = colours.iter().enumerate().map(|(i, c)| solid_media(&format!("s{i}"), c)).collect();
+        let clips: Vec<Clip> = (0..60)
+            .map(|i| clip_at(&format!("c{i}"), &format!("s{}", i % 3), i as f64 * 0.1, 0.0, 0.1))
+            .collect();
+        let tl = Timeline {
+            fps: Rational { num: 30, den: 1 }, width: 640, height: 360,
+            tracks: vec![vtrack("v", clips)], markers: vec![],
+        };
+        let out = dir.join("script.mp4");
+        let out_s = out.to_string_lossy().into_owned();
+        let spec = ExportSpec { media, timeline: tl, preset: preset_640(30.0), out_path: out_s.clone() };
+        let built = builder::build(&spec, &enc()).unwrap();
+        assert!(built.filter_complex.len() > INLINE_FILTER_LIMIT, "premise: {} chars", built.filter_complex.len());
+        let plan = compose(&built, &out_s, &dir).unwrap();
+        assert!(plan.args.iter().any(|a| a == "-/filter_complex"), "script mode");
+        let part = dir.join("script.mp4.part");
+        run_built_in(&built, &out_s, &part, &dir);
+        let frames = ffmpeg::run(
+            "ffprobe",
+            &["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames",
+              "-of", "default=nw=1:nk=1", part.to_str().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "180");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* -------- (11) the GIF's two passes -------- */
+
+    /// The two-pass GIF is the same file the old single `split` graph made,
+    /// byte for byte — the change is memory, not output — and its palette
+    /// does not outlive the export. The single-pass reference is built from
+    /// the very graph the encode used, with the palette input swapped for
+    /// the old in-graph `split`.
+    #[test]
+    fn e2e_a_two_pass_gif_is_the_single_pass_gif_without_the_buffering() {
+        let dir = case_dir("gif two pass");
+        let (_src, media) = fixture_media(&dir);
+        let c = clip_at("c", "m1", 0.0, 0.3, 1.3);
+        let tl = Timeline {
+            fps: Rational { num: 30, den: 1 }, width: 640, height: 360,
+            tracks: vec![vtrack("v", vec![c])], markers: vec![],
+        };
+        let mut preset = preset_640(15.0);
+        preset.format = "gif".into();
+        preset.resolution = ResolutionPreset::Custom { w: 320, h: 180 };
+        let out = dir.join("two.gif");
+        let out_s = out.to_string_lossy().into_owned();
+        let spec = ExportSpec { media: vec![media], timeline: tl, preset, out_path: out_s.clone() };
+        let built = builder::build(&spec, &enc()).unwrap();
+        let part = dir.join("two.gif.part");
+        run_built_in(&built, &out_s, &part, &dir);
+
+        // The old graph: the same video graph, split into palettegen and
+        // paletteuse inside one run.
+        let plan = compose(&built, &out_s, &dir).unwrap();
+        let video = &plan.filter_complex[..plan.filter_complex.rfind(";[vout]").unwrap()];
+        let single = format!(
+            "{video};[vout]split[g1][g2];[g1]palettegen=stats_mode=diff[pal];[g2][pal]paletteuse=dither=bayer:bayer_scale=4[gifout]"
+        );
+        let mut args: Vec<OsString> = Vec::new();
+        let mut i = 0;
+        while i < plan.args.len() {
+            let a = &plan.args[i];
+            if a == "-protocol_whitelist" && plan.args.get(i + 3).is_some_and(|p| p.to_string_lossy().starts_with("taroting-palette-")) {
+                i += 4; // the palette input
+                continue;
+            }
+            args.push(if a.to_string_lossy().contains("[vout][1:v]paletteuse") { OsString::from(&single) } else { a.clone() });
+            i += 1;
+        }
+        let reference = dir.join("one.gif");
+        let n = args.len();
+        args[n - 1] = OsString::from(&reference);
+        let res = ffmpeg::command("ffmpeg").unwrap().current_dir(&dir).args(&args).output().unwrap();
+        assert!(res.status.success(), "{}", String::from_utf8_lossy(&res.stderr));
+
+        assert_eq!(std::fs::read(&part).unwrap(), std::fs::read(&reference).unwrap(), "the GIF must not change");
+        assert!(plan.palette_args.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* -------- (12) a hardware failure is redone in software -------- */
+
+    fn hw_spec(dir: &std::path::Path, media: MediaRef) -> ExportSpec {
+        let tl = Timeline {
+            fps: Rational { num: 30, den: 1 }, width: 640, height: 360,
+            tracks: vec![vtrack("v", vec![clip_at("c", "m1", 0.0, 0.0, 1.0)])], markers: vec![],
+        };
+        let mut preset = preset_640(30.0);
+        preset.use_hardware = true;
+        ExportSpec {
+            media: vec![media], timeline: tl, preset,
+            out_path: dir.join("hw.mp4").to_string_lossy().into_owned(),
+        }
+    }
+
+    /// A "hardware" encoder that cannot run here (VA-API does not exist on
+    /// Windows) stands in for a driver that passed the probe and then failed
+    /// the real export. The job forgets that encoder, redoes the same export
+    /// in software on the same `.part`, and reports the fallback; a cancel is
+    /// never retried.
+    #[test]
+    fn e2e_a_failed_hardware_export_is_redone_in_software() {
+        assert!(!encoder_available("h264_vaapi"), "premise: h264_vaapi cannot encode on this machine");
+        let dir = case_dir("hw fallback");
+        let (_src, media) = fixture_media(&dir);
+        let report = crate::hw::EncoderReport {
+            h264: "h264_vaapi".into(),
+            hevc: "libx265".into(),
+            av1: "libsvtav1".into(),
+            detail: vec![],
+        };
+        let spec = hw_spec(&dir, media.clone());
+
+        let prepared = prepare_export(&spec, &report, &dir).unwrap();
+        assert_eq!(prepared.plan.encoder.as_deref(), Some("h264_vaapi"));
+        let part = prepared.part.clone();
+        let forgotten = std::cell::RefCell::new(Vec::<String>::new());
+        let outcome = run_export(
+            &spec,
+            prepared,
+            &dir,
+            &mut direct_runner(&dir),
+            &|| false,
+            &|enc| forgotten.borrow_mut().push(enc.to_string()),
+        );
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result.err().map(|f| f.message));
+        assert!(outcome.hw_fallback);
+        assert_eq!(*forgotten.borrow(), ["h264_vaapi"], "the failed encoder is forgotten");
+        assert!(outcome.argv.windows(2).any(|w| w[0] == "-c:v" && w[1] == "libx264"), "{:?}", outcome.argv);
+        let info = probe::probe_sync(part.to_str().unwrap()).unwrap();
+        assert_eq!(info.vcodec.as_deref(), Some("h264"));
+        decodes_cleanly(&part).unwrap();
+        std::fs::remove_file(&part).unwrap();
+
+        // A canceled hardware export stays canceled: no retry, nothing forgotten.
+        let prepared = prepare_export(&spec, &report, &dir).unwrap();
+        let forgotten = std::cell::RefCell::new(Vec::<String>::new());
+        let outcome = run_export(
+            &spec,
+            prepared,
+            &dir,
+            &mut direct_runner(&dir),
+            &|| true,
+            &|enc| forgotten.borrow_mut().push(enc.to_string()),
+        );
+        assert!(outcome.result.is_err());
+        assert!(!outcome.hw_fallback);
+        assert!(forgotten.borrow().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* -------- (13) text export from a temp folder with an apostrophe -------- */
+
+    /// The O'Brien case end to end: a text export run in a temp folder whose
+    /// path holds an apostrophe encodes, because the graph names its textfile
+    /// without the folder. (It used to be refused outright.)
+    #[test]
+    fn e2e_text_exports_from_a_temp_folder_with_an_apostrophe() {
+        let dir = case_dir("o'brien");
+        assert!(dir.to_string_lossy().contains('\''));
+        let base = solid_media("base", "#000000");
+        let text = MediaRef {
+            id: "txt".into(), path: "Text".into(), size: 0, mtime_ms: 0,
+            kind: "image".into(), duration: 0.0, fps: None,
+            width: Some(560), height: Some(120),
+            container: None, vcodec: None, acodec: None, pix_fmt: None,
+            bit_depth: None, has_audio: false, audio_rate: None, audio_channels: None,
+            generator: Some(Generator::Text {
+                text: "TAROTING".into(), font_family: "Arial".into(), size_px: 96.0,
+                color: "#ffffff".into(), bold: true, italic: false,
+            }),
+            no_autorotate: None,
+        };
+        let tl = Timeline {
+            fps: Rational { num: 30, den: 1 }, width: 640, height: 360,
+            tracks: vec![
+                vtrack("vtop", vec![clip_at("t1", "txt", 0.0, 0.0, 1.0)]),
+                vtrack("vbot", vec![clip_at("b1", "base", 0.0, 0.0, 1.0)]),
+            ],
+            markers: vec![],
+        };
+        let out = dir.join("text.mp4");
+        let out_s = out.to_string_lossy().into_owned();
+        let spec = ExportSpec { media: vec![base, text], timeline: tl, preset: preset_640(30.0), out_path: out_s.clone() };
+        let built = builder::build(&spec, &enc()).unwrap();
+        let part = dir.join("text.mp4.part");
+        run_built_in(&built, &out_s, &part, &dir);
+        let text_band = yavg(&part, 0.5, 0, 130, 640, 100);
+        assert!(text_band > 5.0, "the text must render: {text_band}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

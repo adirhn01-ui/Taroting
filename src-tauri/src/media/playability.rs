@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
 use crate::cache::{Cache, CacheKind, MediaKey};
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::jobs::{self, JobId, JobKind, Jobs, Lane};
 use crate::media::prepare;
+use crate::media::source::source_file;
 use crate::project::schema::MediaRef;
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -294,6 +295,21 @@ pub enum PlaybackPlan {
     Pending { job_id: JobId, output: String },
 }
 
+/// The lane a preparation job runs on. A proxy (a GIF's included) is a full
+/// re-encode — minutes on a slow CPU — so it runs on its own one-worker
+/// `Transcode` lane; on `Background` two of them held both workers, and every
+/// quick remux and waveform queued behind them (the viewer stepping onto an
+/// MKV waited for someone else's proxy to finish). Remuxes stay on
+/// `Background`. The cost: proxies now run one at a time.
+fn lane_for(kind: JobKind) -> Lane {
+    match kind {
+        JobKind::Proxy => Lane::Transcode,
+        JobKind::Remux | JobKind::Waveform => Lane::Background,
+        // Never prepared here; answered truthfully all the same.
+        JobKind::Export => Lane::Export,
+    }
+}
+
 fn media_key(media: &MediaRef) -> MediaKey {
     MediaKey {
         path: media.path.clone(),
@@ -307,7 +323,7 @@ fn ensure_prepared(
     app: &AppHandle,
     jobs: &Arc<Jobs>,
     cache: &Arc<Cache>,
-    inflight: &State<'_, Inflight>,
+    inflight: &Inflight,
     media: &MediaRef,
     cache_kind: CacheKind,
     job_kind: JobKind,
@@ -321,6 +337,10 @@ fn ensure_prepared(
         });
     }
 
+    // A miss means ffmpeg will open the source, and the path is the `.trt`'s:
+    // refused unless it names a real file (`media::source`). Checked after the
+    // lookup, so an offline file still plays the copy it already has.
+    let src = source_file(&media.path)?;
     cache.ensure_kind_dir(cache_kind)?;
     let final_path = cache.file_path(cache_kind, &hash, suffix);
 
@@ -339,7 +359,7 @@ fn ensure_prepared(
     // Named only now that the job id exists — see `job_tmp_suffix`.
     let tmp_path = cache.file_path(cache_kind, &hash, &job_tmp_suffix(suffix, handle.id));
 
-    let args = args_for(std::path::Path::new(&media.path), &tmp_path);
+    let args = args_for(src, &tmp_path);
     let total = if media.duration > 0.0 { Some(media.duration) } else { None };
 
     let app = app.clone();
@@ -350,14 +370,19 @@ fn ensure_prepared(
     let job_handle = handle.clone();
 
     jobs.submit(
-        Lane::Background,
+        lane_for(job_kind),
         Box::new(move || {
             job_handle.set_output(tmp_path.clone());
             let result = jobs::execute_ffmpeg(&app, &job_handle, args, total, None);
-            inflight_arc.release(&final_for_job, job_handle.id);
+            // The slot is freed only once the output is where it belongs (or
+            // the job has failed). Freed before the rename, a request arriving
+            // in between found neither the slot nor the final file, and
+            // started a second full job onto the same output.
             match result {
                 Ok(()) => {
-                    if let Err(e) = std::fs::rename(&tmp_path, &final_for_job) {
+                    let renamed = std::fs::rename(&tmp_path, &final_for_job);
+                    inflight_arc.release(&final_for_job, job_handle.id);
+                    if let Err(e) = renamed {
                         jobs::fail_job(
                             &app,
                             &jobs_arc,
@@ -376,6 +401,7 @@ fn ensure_prepared(
                     );
                 }
                 Err(failure) => {
+                    inflight_arc.release(&final_for_job, job_handle.id);
                     jobs::fail_job(&app, &jobs_arc, &job_handle, failure.message, failure.log_tail);
                 }
             }
@@ -393,8 +419,14 @@ fn ensure_prepared(
 /// it is: a file the webview can play still plays, and one it cannot fails
 /// in the player like any undecodable file, instead of the command failing
 /// before it runs.
+///
+/// Async, with the work on a blocking-pool thread: a cache hit refreshes the
+/// LRU index, which writes it to disk on an interval, and the source check
+/// stats a path that may be on a sleeping network share — neither belongs on
+/// the WebView's UI thread. Concurrent plans for one file are already
+/// serialized where it matters, by `Inflight::claim`.
 #[tauri::command]
-pub fn plan_playback(
+pub async fn plan_playback(
     app: AppHandle,
     jobs: State<'_, Arc<Jobs>>,
     inflight: State<'_, Inflight>,
@@ -402,48 +434,66 @@ pub fn plan_playback(
     hints: CodecHints,
     force_proxy_large: bool,
 ) -> Result<PlaybackPlan> {
-    let decision = decide(&media, hints, force_proxy_large);
+    let (jobs, inflight) = (Arc::clone(&jobs), Inflight::clone(&inflight));
+    tauri::async_runtime::spawn_blocking(move || {
+        plan_sync(&app, &jobs, &inflight, &media, hints, force_proxy_large)
+    })
+    .await
+    .map_err(|e| AppError::Ffmpeg(format!("playback planning stopped unexpectedly: {e}")))?
+}
+
+/// The original file as the answer — only once it is known to BE a file. The
+/// path comes out of a `.trt`, and "play it directly" hands it to the player
+/// as it is, so a URL or a device path is refused here rather than answered.
+fn direct(media: &MediaRef) -> Result<PlaybackPlan> {
+    source_file(&media.path)?;
+    Ok(PlaybackPlan::Direct {
+        path: media.path.clone(),
+    })
+}
+
+fn plan_sync(
+    app: &AppHandle,
+    jobs: &Arc<Jobs>,
+    inflight: &Inflight,
+    media: &MediaRef,
+    hints: CodecHints,
+    force_proxy_large: bool,
+) -> Result<PlaybackPlan> {
+    let decision = decide(media, hints, force_proxy_large);
     // Where the output lives comes from `prepared_target` alone, the table
     // `classify_playback` reads; each arm below only picks the recipe.
     let Some((cache_kind, suffix)) = prepared_target(&decision) else {
-        return Ok(PlaybackPlan::Direct {
-            path: media.path.clone(),
-        });
+        return direct(media);
     };
     let Some(cache) = app.try_state::<Arc<Cache>>() else {
-        return Ok(PlaybackPlan::Direct {
-            path: media.path.clone(),
-        });
+        return direct(media);
     };
     match decision {
         Decision::Remux { audio_copy_ok } => ensure_prepared(
-            &app, &jobs, &cache, &inflight, &media,
+            app, jobs, &cache, inflight, media,
             cache_kind, JobKind::Remux, suffix,
             move |src, dst| prepare::remux_args(src, dst, audio_copy_ok),
         ),
         Decision::AudioRemux => ensure_prepared(
-            &app, &jobs, &cache, &inflight, &media,
+            app, jobs, &cache, inflight, media,
             cache_kind, JobKind::Remux, suffix,
             prepare::audio_remux_args,
         ),
         Decision::Proxy => ensure_prepared(
-            &app, &jobs, &cache, &inflight, &media,
+            app, jobs, &cache, inflight, media,
             cache_kind, JobKind::Proxy, suffix,
             prepare::proxy_args,
         ),
         Decision::GifProxy => ensure_prepared(
-            &app, &jobs, &cache, &inflight, &media,
+            app, jobs, &cache, inflight, media,
             cache_kind, JobKind::Proxy, suffix,
             prepare::gif_proxy_args,
         ),
         // `prepared_target` names no file for these, so the early return above
         // already answered; kept total rather than `unreachable!()` because a
         // panic here would abort the whole app.
-        Decision::Direct | Decision::AudioDirect | Decision::ImageDirect => {
-            Ok(PlaybackPlan::Direct {
-                path: media.path.clone(),
-            })
-        }
+        Decision::Direct | Decision::AudioDirect | Decision::ImageDirect => direct(media),
     }
 }
 
@@ -811,8 +861,78 @@ mod tests {
         assert!(wave.contains("&job_tmp_suffix(\".pk\", job_id)"));
         // Each closure frees the slot with its OWN id, never an unconditional
         // remove: a canceled job finishing late must not evict its successor.
-        assert!(play.contains("inflight_arc.release(&final_for_job, job_handle.id)"));
-        assert!(wave.contains("inflight_arc.release(&final_clone, handle.id)"));
+        // And only AFTER its rename, on the success path: freed before it, a
+        // request in between found neither the slot nor the file and started
+        // a duplicate job. The failure path frees it too.
+        for (code, release, rename) in [
+            (play, "inflight_arc.release(&final_for_job, job_handle.id)", "std::fs::rename(&tmp_path, &final_for_job)"),
+            (wave, "inflight_arc.release(&final_clone, handle.id)", "std::fs::rename(&tmp_path, &final_clone)"),
+        ] {
+            let renamed = code.find(rename).expect(rename);
+            let releases: Vec<usize> = code.match_indices(release).map(|(i, _)| i).collect();
+            assert_eq!(releases.len(), 2, "{release}: once per outcome");
+            assert!(releases.iter().all(|&r| r > renamed), "{release} must follow {rename}");
+        }
         assert_eq!(job_tmp_suffix(".m4a", 12), ".m4a.12.tmp");
+    }
+
+    /// Proxies (a GIF's too: both are `JobKind::Proxy`) run on the Transcode
+    /// lane, remuxes and waveforms on Background — and the job really is
+    /// submitted to `lane_for`'s answer, pinned in the source because
+    /// submitting needs an `AppHandle`.
+    #[test]
+    fn proxies_run_on_their_own_lane() {
+        assert_eq!(lane_for(JobKind::Proxy), Lane::Transcode);
+        assert_eq!(lane_for(JobKind::Remux), Lane::Background);
+        assert_eq!(lane_for(JobKind::Waveform), Lane::Background);
+        let play = include_str!("playability.rs").split("#[cfg(test)]").next().unwrap();
+        let play: String = play.split_whitespace().collect();
+        assert!(play.contains("jobs.submit(lane_for(job_kind),"));
+        assert!(!play.contains("jobs.submit(Lane::Background"));
+        // The GIF arm asks for a Proxy job, so it lands on Transcode too.
+        assert!(play.contains("cache_kind,JobKind::Proxy,suffix,prepare::gif_proxy_args"));
+    }
+
+    /// The `.trt`'s path is checked before any answer hands it on: every
+    /// Direct answer goes through `direct`, which checks it, and a miss in
+    /// `ensure_prepared` checks it after the cache lookup and before anything
+    /// is claimed or built. Pinned in the source (the command needs an
+    /// `AppHandle`); `direct` itself is exercised for real below.
+    #[test]
+    fn no_answer_hands_on_a_path_that_is_not_a_file() {
+        let play = include_str!("playability.rs").split("#[cfg(test)]").next().unwrap();
+        let flat: String = play.split_whitespace().collect();
+        // The only Direct built anywhere is inside `direct`, after the check.
+        let built: Vec<usize> = flat.match_indices("PlaybackPlan::Direct{").map(|(i, _)| i).collect();
+        assert_eq!(built.len(), 1, "one place builds a Direct answer");
+        let check = flat.find("fndirect(media:&MediaRef)->Result<PlaybackPlan>{source_file(&media.path)?;");
+        assert!(check.is_some_and(|c| c < built[0]), "direct checks before it answers");
+        let body = &flat[flat.find("fnensure_prepared(").unwrap()..flat.find("pubasyncfnplan_playback(").unwrap()];
+        let lookup = body.find("cache.existing_file(cache_kind,&hash,suffix)").unwrap();
+        let checked = body.find("letsrc=source_file(&media.path)?;").expect("checked");
+        let claimed = body.find("inflight.claim(").unwrap();
+        assert!(lookup < checked && checked < claimed);
+        assert!(body.contains("args_for(src,&tmp_path)"), "the checked path is the one built into the argv");
+
+        let mut m = media("video", "https://example.com/clip.mp4");
+        m.container = Some("mov,mp4,m4a,3gp,3g2,mj2".into());
+        m.vcodec = Some("h264".into());
+        assert_eq!(decide(&m, NO_HINTS, false), Decision::Direct, "fixture: would play directly");
+        assert!(matches!(direct(&m), Err(AppError::BadInput(_))));
+        m.path = r"\\.\pipe\clip.mp4".into();
+        assert!(matches!(direct(&m), Err(AppError::BadInput(_))));
+        let real = std::env::current_exe().unwrap();
+        m.path = real.to_string_lossy().into_owned();
+        assert!(matches!(direct(&m), Ok(PlaybackPlan::Direct { path }) if path == m.path));
+    }
+
+    /// The command must not run on the UI thread (it writes the LRU index and
+    /// stats the source): async, with the work on the blocking pool.
+    #[test]
+    fn plan_playback_runs_off_the_ui_thread() {
+        let play = include_str!("playability.rs").split("#[cfg(test)]").next().unwrap();
+        let flat: String = play.split_whitespace().collect();
+        assert!(flat.contains("pubasyncfnplan_playback("));
+        assert!(flat.contains("spawn_blocking(move||{plan_sync(&app,&jobs,&inflight,&media,hints,force_proxy_large)})"));
     }
 }

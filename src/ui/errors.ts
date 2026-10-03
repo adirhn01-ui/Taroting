@@ -11,12 +11,83 @@
 // — imported, never re-implemented, because two copies of a privacy scrubber
 // drift and the quieter copy is the one that leaks.
 
-import { createRedactor } from "../core/diagnostics";
+import { createRedactor, redactEntryText } from "../core/diagnostics";
 import type { DiagnosticErrorEntry } from "../core/diagnostics";
 import { escapeHtml } from "../core/format";
 import { trapTab } from "./focus";
 import { icon } from "./icons";
 import { toast } from "./toast";
+
+/* ---------------- placement ---------------- */
+
+/**
+ * Where a floating surface (the toast host, an error dialog, a menu) has to
+ * live to be SEEN: the element holding fullscreen, else <body>.
+ *
+ * Element fullscreen puts that element in the browser's top layer, which paints
+ * above everything else in the document whatever its z-index — so a toast or a
+ * dialog appended to <body> while the viewer (or the theater) is fullscreen is
+ * there, focusable, and invisible. Inside the fullscreen element the ladder's
+ * z tokens apply again, locally: the viewer and the theater are their own
+ * stacking contexts, and menu 1000, modal 1100 and toast 1200 all clear their
+ * chrome (300).
+ */
+export function overlayParent(): Element {
+  return document.fullscreenElement ?? document.body;
+}
+
+/** Surfaces currently placed INSIDE a fullscreen element, each with the
+ *  fullscreenchange listener that will carry it back out. */
+const following = new Map<Element, () => void>();
+
+function unfollow(node: Element): void {
+  const onChange = following.get(node);
+  if (!onChange) return;
+  following.delete(node);
+  document.removeEventListener("fullscreenchange", onChange);
+}
+
+/** Move `node` under `target`, handing focus back if it was inside: appending
+ *  a connected node is a remove-and-insert, and the remove drops focus to
+ *  <body> — out of a dialog's focus trap, in the dialog's case. */
+function moveKeepingFocus(node: Element, target: Element): void {
+  const focused = node.isConnected ? document.activeElement : null;
+  const hadFocus = !!focused && node.contains(focused);
+  target.appendChild(node);
+  if (hadFocus && document.activeElement !== focused) (focused as HTMLElement).focus?.();
+}
+
+/**
+ * Put a floating surface where it can be seen (`overlayParent`), and keep it
+ * there: placed inside a fullscreen element, it follows the next
+ * fullscreenchange back out. Without that a dialog opened during theater
+ * fullscreen simply stayed inside `.editor__preview` after Esc. Nothing is torn
+ * down on that change: the theater's exit only drops its class and listeners
+ * (the container lives on; only its `dispose()` removes the bar), so the dialog
+ * was left parked in the preview subtree instead of on <body> with every other
+ * overlay, where document order (which `.modal-backdrop` counts as topmost for
+ * Escape) and the next fullscreen of that container would both still treat it
+ * as part of the preview.
+ *
+ * The listener exists only while the node sits inside a fullscreen element,
+ * one per node however often it is placed, so the ordinary case — no
+ * fullscreen — costs nothing beyond the append. Returns the release, for a
+ * surface that is going away (a disconnected node is also skipped on the
+ * change itself).
+ */
+export function placeOverlay(node: Element): () => void {
+  const target = overlayParent();
+  if (node.parentNode !== target) moveKeepingFocus(node, target);
+  if (target !== document.body && !following.has(node)) {
+    const onChange = (): void => {
+      unfollow(node);
+      if (node.isConnected) placeOverlay(node);
+    };
+    following.set(node, onChange);
+    document.addEventListener("fullscreenchange", onChange);
+  }
+  return () => unfollow(node);
+}
 
 /* ---------------- clipboard ---------------- */
 
@@ -43,7 +114,9 @@ function execCommandCopy(text: string): boolean {
     ta.value = text;
     ta.readOnly = true;
     ta.style.cssText = "position:fixed;top:-9999px;left:0;opacity:0";
-    document.body.appendChild(ta);
+    // Beside the dialog asking for the copy: inside the fullscreen element when
+    // there is one, so selecting it never reaches outside the top layer.
+    overlayParent().appendChild(ta);
     ta.select();
     ta.setSelectionRange(0, text.length);
     const ok = document.execCommand("copy");
@@ -70,10 +143,15 @@ const REDACTION_HINT = "Paths are replaced with <file N> tokens.";
  * lets the pane redact unconditionally instead of asking every caller whether
  * their string has been through it already.
  *
+ * `paths` are the whole file paths the text is known to name (a toast's
+ * `paths`): they are replaced whole, spaces and all, and so are their bare file
+ * names and stems — `redactEntryText`, the same pass the recent-errors list
+ * and the report run over the same entry.
+ *
  * Exported as the seam the tests pin — the pane around it is DOM.
  */
-export function redactDetail(text: string): string {
-  return createRedactor().text(text);
+export function redactDetail(text: string, paths: readonly string[] = []): string {
+  return redactEntryText(createRedactor(paths), text, paths);
 }
 
 /**
@@ -89,7 +167,7 @@ export function redactDetail(text: string): string {
  * with the ffmpeg log tail, which carries absolute paths by construction, and it
  * stays that text permanently whenever the report build fails.
  */
-export function detailPane(text: string): HTMLElement {
+export function detailPane(text: string, paths?: readonly string[]): HTMLElement {
   const wrap = document.createElement("div");
   wrap.className = "err-pane";
 
@@ -97,7 +175,7 @@ export function detailPane(text: string): HTMLElement {
   ta.className = "err-detail";
   ta.readOnly = true;
   ta.spellcheck = false;
-  ta.value = redactDetail(text);
+  ta.value = redactDetail(text, paths);
   ta.setAttribute("aria-label", "Details");
 
   const actions = document.createElement("div");
@@ -124,10 +202,13 @@ export interface ErrorDialogOptions {
   title: string;
   message: string;
   report: string;
+  /** Whole file paths `report` names — see `redactDetail`. */
+  paths?: readonly string[];
 }
 
-/** Every error dialog currently on document.body. Each entry is that dialog's
- *  own `close`, and each close removes itself. */
+/** Every error dialog currently open (on <body>, or inside the fullscreen
+ *  element). Each entry is that dialog's own `close`, and each close removes
+ *  itself. */
 const openDialogs = new Set<() => void>();
 
 /**
@@ -191,8 +272,10 @@ export function openErrorDialog(opts: ErrorDialogOptions): () => void {
         <button class="btn btn--primary" data-ok>Close</button>
       </div>
     </div>`;
-  document.body.appendChild(backdrop);
-  backdrop.querySelector("[data-pane-slot]")!.replaceWith(detailPane(opts.report));
+  // Not simply <body>: under element fullscreen that would be behind the top
+  // layer — open, focused, and invisible. See `placeOverlay`.
+  const releasePlacement = placeOverlay(backdrop);
+  backdrop.querySelector("[data-pane-slot]")!.replaceWith(detailPane(opts.report, opts.paths));
 
   const releaseTrap = trapTab(backdrop);
   // Idempotent: a screen's teardown may close a dialog the user has already
@@ -204,6 +287,7 @@ export function openErrorDialog(opts: ErrorDialogOptions): () => void {
     openDialogs.delete(close);
     window.removeEventListener("keydown", onKey, true);
     releaseTrap();
+    releasePlacement();
     backdrop.remove();
   };
   openDialogs.add(close);
@@ -262,17 +346,21 @@ export function recentErrors(): readonly DiagnosticErrorEntry[] {
  * file that fails twice then reads as the same `<file N>` in both entries
  * instead of two unrelated ones, which is what makes the dump diagnosable at
  * all after the names are gone.
+ *
+ * Seeded with every entry's `paths` BEFORE any text is scrubbed: a path the
+ * redactor knows is replaced whole, while one it has to find in free text is
+ * cut short at its first space ("Client Work\…" kept everything after
+ * "Client"). Unseeded, the dump had nothing known at all.
  */
 export function formatRecentErrors(entries: readonly DiagnosticErrorEntry[]): string {
   if (entries.length === 0) return "No errors this session.";
-  const redactor = createRedactor();
+  const redactor = createRedactor(entries.flatMap((e) => e.paths ?? []));
   return entries
     .map((e, i) => {
       const when = new Date(e.at).toISOString();
-      const headLine = `${String(i + 1).padStart(2)}. ${when}  ${e.op || "—"}\n    ${redactor.text(e.message)}`;
+      const headLine = `${String(i + 1).padStart(2)}. ${when}  ${e.op || "—"}\n    ${redactEntryText(redactor, e.message, e.paths)}`;
       if (!e.detail) return headLine;
-      const detail = redactor
-        .text(e.detail)
+      const detail = redactEntryText(redactor, e.detail, e.paths)
         .split("\n")
         .map((l) => `    ${l}`)
         .join("\n");

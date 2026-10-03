@@ -11,6 +11,7 @@ import { describeError } from "../core/ipc";
 import type { ProjectFile } from "../core/types";
 import { toast } from "../ui/toast";
 import { maxRenderSize, renderImageExport } from "./render/export";
+import type { RenderSources } from "./render/export";
 
 export const COPY_REFUSED_MESSAGE = "Couldn't copy the image — click the window and try again.";
 
@@ -24,14 +25,16 @@ function errorName(e: unknown): string {
 
 /** MUST be called synchronously inside the user gesture: the clipboard write
  *  is started there with a Promise-valued ClipboardItem, and the render fills
- *  it in. Toasts on rejection. */
-export function copyImage(doc: ProjectFile): void {
+ *  it in. Toasts on rejection. `blobFor` hands over the photo files the open
+ *  editor already holds (`PreviewResources.blobFor`), so a copy does not read
+ *  every photo from disk again through the asset protocol. */
+export function copyImage(doc: ProjectFile, blobFor?: RenderSources["blobFor"]): void {
   inFlight?.abort();
   const ac = new AbortController();
   inFlight = ac;
 
   const { w, h } = maxRenderSize(doc.timeline.width, doc.timeline.height);
-  const png = renderImageExport(doc, { format: "png", quality: 100, outW: w, outH: h }, ac.signal, () => {});
+  const png = renderImageExport(doc, { format: "png", quality: 100, outW: w, outH: h }, ac.signal, () => {}, { blobFor });
   // The render promise is also handed to the clipboard, which reports its
   // failure through write(). This reaction keeps a failed render from also
   // surfacing as an unhandled rejection, and remembers WHY it failed: an

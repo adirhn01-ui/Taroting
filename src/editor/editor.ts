@@ -3,8 +3,10 @@
 
 import "./editor.css";
 import "../ui/player-bar.css";
-import { escapeHtml, fileExt, fileStem, formatTimecode } from "../core/format";
+import { escapeHtml, fileExt, fileName, fileStem, formatTimecode } from "../core/format";
 import { describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles } from "../core/ipc";
+import type { LoadedProject } from "../core/ipc";
+import { mediaDisplayName } from "../core/media-name";
 import { exitDest, navigate } from "../core/nav";
 import type { EditorRoute } from "../core/nav";
 import { createMonitorVolume } from "../core/monitor-volume";
@@ -18,6 +20,7 @@ import {
   findMedia,
   findTrack,
   insertClip,
+  MIN_CLIP_DUR,
   makeClip,
   removeClip,
   removeMediaCascade,
@@ -33,9 +36,20 @@ import { registerCloseTask } from "../core/app-close";
 import { ProjectSession, currentSession, settingsStore, updateSettings } from "../core/session";
 import { ShortcutManager } from "../core/shortcuts";
 import { Store } from "../core/store";
-import { clipEnd, locate } from "../core/time";
+import { clipEnd, frameOf, locate } from "../core/time";
 import { MEDIA_FILE_EXTENSIONS, TIMELINE_HEIGHT_MAX } from "../core/types";
-import type { ActionId, Clip, MediaInfo, MediaRef, ProjectFile, Track } from "../core/types";
+import type {
+  ActionId,
+  AnimProp,
+  Clip,
+  ClipKeyframes,
+  MediaInfo,
+  MediaRef,
+  ProjectFile,
+  Rational,
+  Timeline,
+  Track,
+} from "../core/types";
 import { icon } from "../ui/icons";
 import { closeMenu, showMenu } from "../ui/menu";
 import { toast } from "../ui/toast";
@@ -49,13 +63,16 @@ import { AudioGraph } from "./playback/audio-graph";
 import { PlaybackEngine } from "./playback/engine";
 import { Scheduler } from "./playback/scheduler";
 import { mountStage } from "./preview/preview";
+import { clampCrop } from "./preview/canvas-math";
 import { mountCanvasOverlay } from "./preview/overlay";
+import type { CanvasOverlay } from "./preview/overlay";
 import { mountTheater } from "./preview/theater";
 import { collectCandidates, snapTime } from "./timeline/snap";
 import { laneLabels, laneLayout } from "./timeline/render";
 import { createLaneAutoScroll, type LaneAutoScroller } from "./timeline/interactions";
 import { focusFirst, trapTab } from "../ui/focus";
 import { createTempExits, createTempLeaveGate } from "../ui/temp-project";
+import type { TempExits } from "../ui/temp-project";
 import { PREVIEW_MIN_H, clampPanelHeight, maxPanelHeight } from "./timeline/panel-size";
 import { TimelineController } from "./timeline/timeline";
 
@@ -218,6 +235,135 @@ export async function mountEditor(
     return noop;
   }
   currentSession.set(session);
+
+  // From here on the session is PUBLISHED: it autosaves, and its leave guard
+  // intercepts every OS open. If building the screen throws — a mount that
+  // renders a corrupt project is the real shape: the inspector's first render
+  // and the first-frame seek both read every keyframe — nothing would ever
+  // dispose it, and the window would be stuck behind a dead editor's guard,
+  // shortcuts and close task. So a throw runs the same teardown dispose()
+  // does, over whatever had been built when it happened, and is then rethrown
+  // for the navigator to report.
+  const teardown = new Teardown();
+  try {
+    return buildEditor(root, route, loaded, session, media, exits, teardown);
+  } catch (e) {
+    teardown.run();
+    media.dispose();
+    if (currentSession.get() === session) currentSession.set(null);
+    void session.dispose();
+    throw e;
+  }
+}
+
+/**
+ * Everything a mounted editor must undo when it goes, registered as each piece
+ * is built and run last-in-first-out. ONE list serves both ways out — the
+ * handle's dispose() and a mount that threw halfway — so the failure path can
+ * never forget a piece the normal path remembers. The order is the build
+ * order reversed: a listener is removed before the thing it listens to is
+ * disposed, and nothing is touched that was never built.
+ */
+class Teardown {
+  private steps: (() => void)[] = [];
+  private ran = false;
+
+  /** True once run() has started: the editor is closed, so a late async
+   *  answer (a file picker, a probe, a drop registration) must not touch it. */
+  get done(): boolean {
+    return this.ran;
+  }
+
+  add(step: () => void): void {
+    this.steps.push(step);
+  }
+
+  /** Every step, newest first, each isolated: one piece that throws while
+   *  coming down must not leave the rest up — least of all the session flush
+   *  that follows, which is where the user's last edit lives. */
+  run(): void {
+    if (this.ran) return;
+    this.ran = true;
+    for (let i = this.steps.length - 1; i >= 0; i--) {
+      try {
+        this.steps[i]!();
+      } catch (e) {
+        console.error("Editor teardown step threw; the remaining steps still ran", e);
+      }
+    }
+    this.steps = [];
+  }
+}
+
+/** The refusal for files a closed editor never took in: an import, a drop or a
+ *  Replace media whose picker or probe answered after the project was gone. It
+ *  says so rather than letting the files vanish, on whatever screen is showing
+ *  now. Exported for the tests. */
+export function closedImportMessage(paths: string[]): string {
+  return paths.length === 1
+    ? `${fileName(paths[0]!)} wasn't imported because the project was closed.`
+    : `${paths.length} files weren't imported because the project was closed.`;
+}
+
+/**
+ * `c` pointed at a different file by Replace media, with everything that
+ * derives from the old file's identity carried over. Pure — exported for the
+ * tests.
+ *
+ * - srcIn restarts at 0 and the length is kept where the new file allows it:
+ *   clamped to the new file's duration, floored at one minimum clip in SOURCE
+ *   seconds (`MIN_CLIP_DUR * speed`, the floor relink applies), so a short
+ *   file never makes a zero-length clip. A still keeps its footprint: it has
+ *   no duration to clamp to.
+ * - Keyframes are in source seconds, so moving srcIn to 0 alone would slide
+ *   every one of them by the old srcIn: an animation timed to the clip's first
+ *   second would play wherever the old trim started. Every key is shifted by
+ *   -srcIn and none is dropped — x/y stay paired and no array goes empty (an
+ *   empty array throws in evalKfs). A key that lands before 0 is an
+ *   out-of-range anchor, which keyframes already allow.
+ * - The crop is in source pixels of the OLD file. A smaller replacement would
+ *   leave it hanging outside the frame, so it is clamped into the new one
+ *   exactly as relink clamps it.
+ */
+export function retargetClip(c: Clip, mediaId: string, info: MediaInfo): Clip {
+  const len = c.srcOut - c.srcIn;
+  const srcOut =
+    info.kind === "image" ? len : Math.max(MIN_CLIP_DUR * c.speed, Math.min(info.duration, len));
+  const next: Clip = { ...c, mediaId, srcIn: 0, srcOut };
+  if (c.keyframes && c.srcIn !== 0) {
+    const shifted: ClipKeyframes = {};
+    for (const prop of Object.keys(c.keyframes) as AnimProp[]) {
+      const kfs = c.keyframes[prop];
+      if (kfs) shifted[prop] = kfs.map((k) => ({ t: k.t - c.srcIn, v: k.v }));
+    }
+    next.keyframes = shifted;
+  }
+  const crop = c.transform?.crop;
+  if (crop && c.transform && info.width && info.height) {
+    next.transform = { ...c.transform, crop: clampCrop(crop, info.width, info.height) };
+  }
+  return next;
+}
+
+/**
+ * The video editor's screen, built against a session that is already
+ * published. Split from mountEditor only so that a throw anywhere in here
+ * reaches mountEditor's catch (see there); every piece that needs undoing
+ * registers with `teardown` as it is built.
+ */
+function buildEditor(
+  root: HTMLElement,
+  route: EditorRoute,
+  loaded: LoadedProject,
+  session: ProjectSession,
+  media: MediaManager,
+  exits: TempExits,
+  teardown: Teardown,
+): { dispose(): Promise<void> } {
+  /** The editor has closed (or never finished opening): a late answer to
+   *  anything it awaited must leave the session and the screen alone. */
+  const disposed = (): boolean => teardown.done;
+
   media.ensureAll(session.project);
 
   if (loaded.recovered) toast.info("Project restored from its automatic backup.");
@@ -303,12 +449,17 @@ export async function mountEditor(
     () => ({ width: session.project.timeline.width, height: session.project.timeline.height }),
     () => engineRef?.refresh(),
   );
+  teardown.add(() => stage.dispose());
   const scheduler = new Scheduler(stage, () => session.project, media);
   const engine = new PlaybackEngine(() => session.project, scheduler);
   engineRef = engine;
 
   const graph = new AudioGraph(() => session.project, media, scheduler);
-  const unGraphTick = engine.onTick((t, playing) => graph.tick(t, playing, engine.previewSpeed));
+  // Registered graph-then-engine so they come down engine-then-graph: the
+  // engine (which disposes the scheduler) stops before the audio context closes.
+  teardown.add(() => graph.dispose());
+  teardown.add(() => engine.dispose());
+  teardown.add(engine.onTick((t, playing) => graph.tick(t, playing, engine.previewSpeed)));
 
   /* ---------------- monitor (preview listening) volume ---------------- */
 
@@ -327,23 +478,28 @@ export async function mountEditor(
         title: "Monitor volume",
       }),
   );
+  teardown.add(() => volume.dispose());
   // The level is written 300 ms after the last change. Closing the window
   // inside that window would drop it; dispose() is not reached on a close, so
-  // the close flow runs this instead.
-  const unregVolumeFlush = registerCloseTask(() => volume.flush());
+  // the close flow runs this instead. Registered after the dispose above so it
+  // is unregistered BEFORE it: a close request landing after this screen is
+  // gone must not flush a disposed controller.
+  teardown.add(registerCloseTask(() => volume.flush()));
 
   // Refit the stage when the project canvas w/h changes (resolution adoption,
   // canvas settings). Cheap: compares two numbers per project change.
   let stageW = session.project.timeline.width;
   let stageH = session.project.timeline.height;
-  const unRefit = session.store.subscribe(() => {
-    const { width, height } = session.project.timeline;
-    if (width !== stageW || height !== stageH) {
-      stageW = width;
-      stageH = height;
-      stage.refit();
-    }
-  });
+  teardown.add(
+    session.store.subscribe(() => {
+      const { width, height } = session.project.timeline;
+      if (width !== stageW || height !== stageH) {
+        stageW = width;
+        stageH = height;
+        stage.refit();
+      }
+    }),
+  );
 
   /* ---------------- ui state ---------------- */
 
@@ -366,17 +522,32 @@ export async function mountEditor(
     onClipMenu: (clip, clientX, clientY) => openClipMenu(clip, clientX, clientY),
     onLaneMenu: (track, clientX, clientY) => openLaneMenu(track, clientX, clientY),
   });
+  teardown.add(() => timeline.dispose());
 
-  const inspector = mountInspector($("#ed-inspector"), {
+  // The inspector is mounted before the overlay, but reads the overlay's
+  // gesture state: a canvas drag replace()s the project once per pointermove,
+  // and the inspector skips its rebuilds while one is live, rebuilding once
+  // when it ends (onGestureEnd below). Same mutable-ref idiom as engineRef;
+  // false until the overlay exists, which is also the truth.
+  let overlayRef: CanvasOverlay | null = null;
+  // Built as a variable, not passed as a literal, so the extra field
+  // type-checks against an InspectorCtx that does not declare it yet.
+  const inspectorCtx = {
     session,
     media,
     engine,
     selection,
-    refresh: () => {
+    refresh: (): void => {
       engine.refresh();
       timeline.requestRender();
     },
-  });
+    overlayGestureActive: (): boolean => overlayRef?.gestureActive() ?? false,
+  };
+  const inspector: ReturnType<typeof mountInspector> & { rebuild?(): void } = mountInspector(
+    $("#ed-inspector"),
+    inspectorCtx,
+  );
+  teardown.add(() => inspector.dispose());
 
   // Canvas direct manipulation: selection box, drag/scale, and crop mode over
   // the preview stage. Shares the same selection store and refresh path.
@@ -390,16 +561,24 @@ export async function mountEditor(
       engine.refresh();
       timeline.requestRender();
     },
+    // A committed drag notifies no store subscriber on its way out, so the
+    // inspector that sat out the drag is told here.
+    onGestureEnd: () => inspector.rebuild?.(),
   });
+  overlayRef = overlay;
+  teardown.add(() => overlay.dispose());
 
   // Fullscreen playback (theater mode). Lives on the preview container so it can
   // lift the whole stage over the editor chrome; the transport button glyph flips
-  // to reflect the open/close state via onChange.
-  const theater = mountTheater({
+  // to reflect the open/close state via onChange. Entering it drops any canvas
+  // drag in flight (cancelGesture), so a drag cannot go on editing the project
+  // under the view-only theater canvas. A variable for the same reason as
+  // inspectorCtx: the callback is new to TheaterCtx.
+  const theaterCtx = {
     engine,
     container: $("#ed-stage"),
     volume,
-    onChange: (on) => {
+    onChange: (on: boolean): void => {
       const btn = $("#tr-fullscreen");
       btn.innerHTML = icon(on ? "fullscreenExit" : "fullscreen", 14);
       btn.title = on ? "Exit fullscreen (F)" : "Fullscreen (F)";
@@ -407,8 +586,11 @@ export async function mountEditor(
     // refit the letterbox on every theater/fullscreen size transition so the
     // video scales crisply to the new container box (the ResizeObserver alone
     // can race the fixed inset-0 jump).
-    refit: () => stage.refit(),
-  });
+    refit: (): void => stage.refit(),
+    cancelGesture: (): void => overlay.cancelGesture(),
+  };
+  const theater = mountTheater(theaterCtx);
+  teardown.add(() => theater.dispose());
 
   /* ---------------- actions ---------------- */
 
@@ -474,6 +656,11 @@ export async function mountEditor(
       if (!findMedia(session.project, clipboard.clip.mediaId)) return;
       const at = engine.time;
       const { clip, kind } = clipboard;
+      // The pasted clip becomes the selection, as a placed one does: left on
+      // the original, the next Delete removed the clip that was copied rather
+      // than the one just pasted (which insertClip may also have moved out of
+      // view).
+      const newId = uid();
       commit((p) => {
         let proj = p;
         let trackId: string;
@@ -488,9 +675,10 @@ export async function mountEditor(
             trackId = r.trackId;
           }
         }
-        const pasted: Clip = { ...clip, id: uid(), timelineStart: at };
+        const pasted: Clip = { ...clip, id: newId, timelineStart: at };
         return insertClip(proj, trackId, pasted);
       });
+      if (findClip(session.project, newId)) select(newId);
     },
     undo(): void {
       session.undo();
@@ -513,34 +701,51 @@ export async function mountEditor(
   /* ---------------- clip context menu ---------------- */
 
   // Pick one media file and retarget `clip` at it: probe → add to the bin →
-  // point the clip's mediaId at it, resetting srcIn and clamping srcOut to the
-  // new source length (images keep their footprint). No confirmation.
+  // point the clip's mediaId at it (retargetClip: srcIn restarts at 0, the
+  // length, keyframes and crop follow). No confirmation.
+  //
+  // Both awaits can outlast the editor — an Explorer open replaces it while
+  // the picker is up — and a closed editor's session must not take the file:
+  // the user is told instead (the same rule as importPaths).
   async function replaceClipMedia(clip: Clip): Promise<void> {
     const files = await pickMediaFiles();
     const path = files[0];
     if (!path) return;
+    if (disposed()) {
+      toast.refuse(closedImportMessage([path]));
+      return;
+    }
     let info: MediaInfo;
     try {
       info = await ipc.probeMedia(path);
     } catch (e) {
-      toast.error(`Couldn't read ${fileStem(path)}: ${describeError(e)}`);
+      if (disposed()) toast.refuse(closedImportMessage([path]));
+      else toast.error(`Couldn't read ${fileStem(path)}: ${describeError(e)}`);
       return;
     }
+    if (disposed()) {
+      toast.refuse(closedImportMessage([path]));
+      return;
+    }
+    // Gone by the time the file was read: there is nothing to retarget, and
+    // adding the file anyway would leave an orphan in the bin.
     const lane = findClip(session.project, clip.id)?.track.kind;
-    const refusal = lane ? replaceMediaRefusal(lane, info.kind) : null;
+    if (!lane) return;
+    const refusal = replaceMediaRefusal(lane, info.kind);
     if (refusal) {
-      toast.error(refusal);
+      toast.refuse(refusal);
+      return;
+    }
+    // A probe that reports no length for a timed file has nothing to clamp the
+    // clip to; taking it would make a clip that plays nothing. A still's 0 is
+    // the absence of a duration, not a zero-length file (relink's rule).
+    if (info.kind !== "image" && !(info.duration > 0)) {
+      toast.refuse(`${fileName(path)} has no length, so it can't replace this clip.`);
       return;
     }
     commit((p) => {
       const added = addMedia(p, info);
-      return updateClip(added.project, clip.id, (c) => ({
-        ...c,
-        mediaId: added.media.id,
-        srcIn: 0,
-        srcOut:
-          info.kind === "image" ? c.srcOut - c.srcIn : Math.min(info.duration, c.srcOut - c.srcIn),
-      }));
+      return updateClip(added.project, clip.id, (c) => retargetClip(c, added.media.id, info));
     });
     media.ensureAll(session.project);
     select(clip.id);
@@ -554,7 +759,13 @@ export async function mountEditor(
     showMenu(clientX, clientY, [
       { label: "Copy", onSelect: () => actions.copy() },
       { label: "Split at playhead", disabled: !insideClip, onSelect: () => actions.split() },
-      { label: "Replace media", onSelect: () => void replaceClipMedia(clip) },
+      {
+        label: "Replace media",
+        onSelect: () =>
+          void replaceClipMedia(clip).catch((e: unknown) => {
+            if (!disposed()) toast.error(describeError(e));
+          }),
+      },
       { label: "Delete", onSelect: () => actions.remove() },
       { label: "Ripple delete", danger: true, onSelect: () => actions.ripple() },
     ]);
@@ -580,6 +791,7 @@ export async function mountEditor(
   // to confirm first (undoable either way). The confirm lives on document.body,
   // so dispose() closes it with the editor.
   let closeDeleteLayer: () => void = () => {};
+  teardown.add(() => closeDeleteLayer());
   function openLaneMenu(track: Track, clientX: number, clientY: number): void {
     const label = laneLabelOf(track);
     const isSoleVideo = track.kind === "video" && videoTracks(session.project).length < 2;
@@ -622,9 +834,34 @@ export async function mountEditor(
     playBtnShows = want;
     playBtn.innerHTML = icon(want);
   };
+  // Runs on every tick (~60×/s in playback) and every project change, and the
+  // readout only moves when the FRAME does. So the duration is walked once per
+  // timeline (engine.duration() visits every clip of every track) and the two
+  // timecode strings are built only when the frame, the end frame or the rate
+  // changed — the theater bar's readout follows the same rule. Times are
+  // normalised the way formatTimecode does (non-finite or negative reads 0),
+  // so a NaN cannot make the key differ from itself on every tick.
+  let durOf: Timeline | null = null;
+  let dur = 0;
+  let shownFrame = -1;
+  let shownEnd = -1;
+  let shownFps: Rational | null = null;
   const updateTime = (): void => {
-    const fps = engine.fps();
-    timeEl.textContent = `${formatTimecode(engine.time, fps)} / ${formatTimecode(engine.duration(), fps)}`;
+    const tl = session.project.timeline;
+    if (tl !== durOf) {
+      durOf = tl;
+      dur = engine.duration();
+    }
+    const fps = tl.fps;
+    const t = Number.isFinite(engine.time) && engine.time > 0 ? engine.time : 0;
+    const end = Number.isFinite(dur) && dur > 0 ? dur : 0;
+    const frame = frameOf(t, fps);
+    const endFrame = frameOf(end, fps);
+    if (frame === shownFrame && endFrame === shownEnd && fps === shownFps) return;
+    shownFrame = frame;
+    shownEnd = endFrame;
+    shownFps = fps;
+    timeEl.textContent = `${formatTimecode(t, fps)} / ${formatTimecode(end, fps)}`;
   };
 
   playBtn.addEventListener("click", () => {
@@ -652,8 +889,23 @@ export async function mountEditor(
   });
   $("#tr-zoom-in").addEventListener("click", () => timeline.zoomCentered(1.5));
   $("#tr-zoom-out").addEventListener("click", () => timeline.zoomCentered(1 / 1.5));
-  $("#tr-speed").addEventListener("change", (e) => {
-    engine.setPreviewSpeed(Number((e.target as HTMLSelectElement).value));
+  // A <select> keeps focus after a mouse pick, and a focused select counts as
+  // a typing target: Space then reopened the dropdown and every shortcut went
+  // dead until something else was clicked. So a POINTER pick hands focus back
+  // (the play button's rule). A keyboard pick keeps it: on Windows the arrow
+  // keys fire change on every step, and blurring there would throw a keyboard
+  // user out of the control mid-choice.
+  const speedSel = $<HTMLSelectElement>("#tr-speed");
+  let speedByKeyboard = false;
+  speedSel.addEventListener("keydown", () => {
+    speedByKeyboard = true;
+  });
+  speedSel.addEventListener("pointerdown", () => {
+    speedByKeyboard = false;
+  });
+  speedSel.addEventListener("change", () => {
+    engine.setPreviewSpeed(Number(speedSel.value));
+    if (!speedByKeyboard) speedSel.blur();
   });
 
   /* ---------------- monitor volume (transport flyout) ---------------- */
@@ -679,7 +931,7 @@ export async function mountEditor(
     if (document.activeElement !== volSlider) volSlider.value = String(s.level);
   };
   reflectVolume(volume.get());
-  const unVolume = volume.subscribe(reflectVolume);
+  teardown.add(volume.subscribe(reflectVolume));
 
   // The flyout is open while the wrapper is hovered OR holds focus (keyboard
   // reach: a Tab user can step from the speaker into the range input). Derived
@@ -724,10 +976,12 @@ export async function mountEditor(
     snapBtn.classList.toggle("btn--on", snapOn);
   });
 
-  const unTick = engine.onTick(() => {
-    updateTime();
-    updatePlayBtn();
-  });
+  teardown.add(
+    engine.onTick(() => {
+      updateTime();
+      updatePlayBtn();
+    }),
+  );
   updateTime();
 
   /* ---------------- timeline panel height ---------------- */
@@ -759,6 +1013,9 @@ export async function mountEditor(
   // never touches the divider: no observers, no timers, nothing scheduled. Every
   // listener below is created on the gesture and destroyed with it.
   let tlResizeCleanup: (() => void) | null = null;
+  // Teardown mid-drag: the divider's own listeners die with the element, but
+  // the window keydown and the pending frame do not.
+  teardown.add(() => tlResizeCleanup?.());
   tlHandle.addEventListener("pointerdown", (e) => {
     if (e.button !== 0 || tlResizeCleanup) return;
     e.preventDefault();
@@ -872,8 +1129,18 @@ export async function mountEditor(
     }
   }
 
+  /** The media array the bin last rendered. A project change rebuilds the bin
+   *  only when this differs: clip edits — every pointermove of a canvas drag,
+   *  every step of a slider scrub — keep `project.media`'s identity, and the
+   *  rebuild they used to cost re-created every row and re-decoded every
+   *  thumbnail at pointer rate for a bin that had not changed. Recorded here
+   *  rather than compared against the store's `prev`, so a rebuild owed to the
+   *  status or thumbnail maps keeps it current as well. */
+  let shownMedia: MediaRef[] | null = null;
+
   function renderMedia(): void {
     const items = session.project.media;
+    shownMedia = items;
     if (items.length === 0) {
       mediaList.innerHTML = `<div class="empty-state">${icon("film", 24)}<div class="faint">No media yet.<br/>Drop files anywhere.</div></div>`;
       return;
@@ -884,13 +1151,10 @@ export async function mountEditor(
         const gen = m.generator;
         let thumb: string;
         let sub: string;
-        let name: string;
+        // The one naming rule the timeline and the inspector share, so a clip
+        // reads the same in the bin as everywhere else.
+        const name = mediaDisplayName(m);
         if (gen) {
-          // Three-way on purpose: a drawing is an image-project layer that never
-          // reaches this bin (load_project refuses one in a video project), but
-          // if it ever did it must not be labelled "Solid".
-          name =
-            gen.type === "text" ? gen.text || "Text" : gen.type === "drawing" ? "Drawing" : "Solid";
           sub = gen.type;
           // Swatch emitted empty for the same reason as the progress fill above;
           // `paintMediaRows` fills it. And NOT via a `background: var(--accent)`
@@ -905,7 +1169,6 @@ export async function mountEditor(
                 ? `<span class="gen-glyph gen-glyph--lg">✎</span>`
                 : `<span class="gen-glyph gen-glyph--lg">T</span>`;
         } else {
-          name = fileStem(m.path);
           sub = m.kind;
           thumb = thumbs[m.id]
             ? `<img src="${escapeHtml(mediaUrl(thumbs[m.id]!))}" alt="" />`
@@ -1045,9 +1308,15 @@ export async function mountEditor(
   }
   const unsubs = [
     session.store.subscribe(() => {
-      renderMedia();
+      if (session.project.media !== shownMedia) renderMedia();
       updateTime();
     }),
+    // The timeline paints the selection outline, but only repainted for the
+    // selections IT made. A click, Escape or double-click on the preview
+    // canvas (or the inspector) moved the selection with the timeline still
+    // outlining the old clip — and Delete then removed a clip it did not show
+    // as selected. requestRender coalesces, so this costs nothing idle.
+    selection.subscribe(() => timeline.requestRender()),
     media.status.subscribe((next, prev) => {
       const change = statusChange(prev, next);
       if (change === "none") return;
@@ -1065,6 +1334,9 @@ export async function mountEditor(
     // to leave "Temporary" for the normal states on its own.
     session.temp.subscribe(paintSaveBadge),
   ];
+  teardown.add(() => {
+    for (const u of unsubs) u();
+  });
   // Reflect the badge immediately: the initial state is "saved", which won't
   // fire the subscription, so the hard-coded "Saved" would be wrong for a temp
   // session.
@@ -1077,6 +1349,7 @@ export async function mountEditor(
   // Explorer open would leave it over the next screen, adding into a session
   // that has been torn down (the relink dialog's bug, applied everywhere).
   let closeGenerator: () => void = () => {};
+  teardown.add(() => closeGenerator());
   $("#ed-add-text").addEventListener("click", () => {
     closeGenerator = openGeneratorDialog("text", { session, media });
   });
@@ -1120,6 +1393,7 @@ export async function mountEditor(
   /* ---- custom pointer drag & drop from a media row (no HTML5 dnd) ---- */
 
   let dragCleanup: (() => void) | null = null;
+  teardown.add(() => dragCleanup?.());
 
   function startMediaDrag(m: MediaRef, downX: number, downY: number): void {
     const stageCanvas = stage.canvas;
@@ -1149,13 +1423,7 @@ export async function mountEditor(
       } else {
         inner = icon(m.kind === "audio" ? "music" : "film", 16);
       }
-      const label = gen
-        ? gen.type === "text"
-          ? gen.text || "Text"
-          : gen.type === "drawing"
-            ? "Drawing"
-            : "Solid"
-        : fileStem(m.path);
+      const label = mediaDisplayName(m);
       g.innerHTML = `<div class="media-drag-ghost__thumb">${inner}</div><span>${escapeHtml(label)}</span>`;
       // The generator's literal colour, through the CSSOM and not the markup:
       // the packaged build's style-src is a nonce policy, so a `style` attribute
@@ -1395,15 +1663,47 @@ export async function mountEditor(
   // Bin-first import: media lands in the panel only — no clips are created.
   // Drag a bin row to a lane/preview (or double-click) to place it. addMedia
   // still adopts the first visual's resolution/fps.
+  //
+  // The picker and every probe are awaits the editor can be closed across: an
+  // Explorer open forwarded to this window replaces the editor while its
+  // Import dialog is still up. A closed editor's session must not take the
+  // files (its final save may already be out, or may still write them into a
+  // project the user has left), and they must not silently vanish either: the
+  // ones it never took in are named in a refusal on the screen that replaced
+  // it. The probe is the loop's only await, so checking on entry and after
+  // each probe covers every file.
   async function importPaths(paths: string[]): Promise<void> {
-    const usable = paths.filter((p) => MEDIA_FILE_EXTENSIONS.has(fileExt(p)));
-    if (usable.length === 0) {
-      toast.error("Unsupported file type.");
+    if (disposed()) {
+      if (paths.length) toast.refuse(closedImportMessage(paths));
       return;
     }
-    for (const path of usable) {
+    const usable = paths.filter((p) => MEDIA_FILE_EXTENSIONS.has(fileExt(p)));
+    if (usable.length === 0) {
+      toast.refuse("Unsupported file type.");
+      return;
+    }
+    for (let i = 0; i < usable.length; i++) {
+      const path = usable[i]!;
+      let info: MediaInfo;
       try {
-        const info: MediaInfo = await ipc.probeMedia(path);
+        info = await ipc.probeMedia(path);
+      } catch (e) {
+        if (disposed()) {
+          toast.refuse(closedImportMessage(usable.slice(i)));
+          return;
+        }
+        toast.error(`Couldn't import ${fileStem(path)}: ${describeError(e)}`);
+        continue;
+      }
+      if (disposed()) {
+        toast.refuse(closedImportMessage(usable.slice(i)));
+        return;
+      }
+      // The commit runs the engine refresh synchronously: a throw there must
+      // cost this one file a message, not escape importPaths (the drop path
+      // calls it with `void`, which would leave the rejection unhandled) and
+      // not stop the files after it.
+      try {
         commit((p) => addMedia(p, info).project);
       } catch (e) {
         toast.error(`Couldn't import ${fileStem(path)}: ${describeError(e)}`);
@@ -1425,25 +1725,35 @@ export async function mountEditor(
   // The export dialog lives on document.body, so dispose() closes it (a no-op
   // while an export runs — the one state the leave block refuses anyway).
   let closeExport: () => void = () => {};
+  teardown.add(() => closeExport());
   const openExport = (): void => {
     closeExport = openExportDialog({ session });
   };
   $("#ed-export").addEventListener("click", openExport);
   $("#ed-import").addEventListener("click", () => {
-    void pickMediaFiles().then((files) => {
-      if (files.length) void importPaths(files);
-    });
+    // A picker that fails is said so — the chain used to end in an unhandled
+    // rejection — unless the editor has closed meanwhile, when there is no
+    // screen of its own left to say it on.
+    pickMediaFiles()
+      .then((files) => (files.length ? importPaths(files) : undefined))
+      .catch((e: unknown) => {
+        if (!disposed()) toast.error(describeError(e));
+      });
   });
 
   const dropOverlay = $("#ed-drop");
-  // `disposed` closes a real leak: dispose() can land while this registration is
-  // still in flight. The old code assigned the handle to a no-op placeholder, so
-  // teardown unlistened NOTHING and the listener survived for the life of the
-  // process — a later drop then fired both the dead handler (committing into a
-  // disposed session and toasting from whatever screen the user was now on) and
-  // the live editor's. Claim it immediately if teardown already happened.
-  let disposed = false;
+  // `disposed()` closes a real leak: teardown can land while this registration
+  // is still in flight. The old code assigned the handle to a no-op
+  // placeholder, so teardown unlistened NOTHING and the listener survived for
+  // the life of the process — a later drop then fired both the dead handler
+  // (committing into a disposed session and toasting from whatever screen the
+  // user was now on) and the live editor's. Claim it immediately if teardown
+  // already happened.
   let unlistenDrop: (() => void) | null = null;
+  teardown.add(() => {
+    unlistenDrop?.();
+    unlistenDrop = null;
+  });
   void onDragDrop({
     onHover: () => dropOverlay.classList.add("active"),
     onCancel: () => dropOverlay.classList.remove("active"),
@@ -1452,7 +1762,7 @@ export async function mountEditor(
       void importPaths(paths);
     },
   }).then((u) => {
-    if (disposed) u();
+    if (disposed()) u();
     else unlistenDrop = u;
   });
 
@@ -1508,10 +1818,14 @@ export async function mountEditor(
   nameEl.addEventListener("keydown", (e) => {
     if (!renaming && (e.key === "Enter" || e.key === " ")) {
       e.preventDefault();
+      // preventDefault does not stop the key reaching the window, where the
+      // ShortcutManager listens: Space here started the rename AND toggled
+      // playback. The name owns this key press outright.
+      e.stopPropagation();
       startRename();
     }
   });
-  const unName = session.store.subscribe(syncName);
+  teardown.add(session.store.subscribe(syncName));
 
   /* ---------------- shortcuts ---------------- */
 
@@ -1576,8 +1890,9 @@ export async function mountEditor(
   bind("goHome", () => goHome());
   bind("fullscreen", () => theater.toggle());
   shortcuts.attach();
+  teardown.add(() => shortcuts.detach());
 
-  const unsubSettings = settingsStore.subscribe((s) => shortcuts.setBindings(s.shortcuts));
+  teardown.add(settingsStore.subscribe((s) => shortcuts.setBindings(s.shortcuts)));
 
   // show the first frame
   engine.seek(0);
@@ -1587,8 +1902,9 @@ export async function mountEditor(
   // dialog lives on document.body, so dispose closes it: a navigation that
   // leaves this editor (an Explorer open) must not leave it over the next
   // screen, relinking into a project nobody saves.
-  const closeRelink =
-    loaded.missing.length > 0 ? openRelinkDialog({ session, media, missing: loaded.missing }) : () => {};
+  if (loaded.missing.length > 0) {
+    teardown.add(openRelinkDialog({ session, media, missing: loaded.missing }));
+  }
 
   // dev hook for the in-app autotest harness
   if (import.meta.env.DEV) {
@@ -1605,43 +1921,22 @@ export async function mountEditor(
 
   return {
     async dispose() {
-      disposed = true;
       // The teardown ui/menu documents every screen owing it. The host div lives
       // on document.body, which a route change never clears, so a menu open at
       // teardown would survive onto the next screen still pointing at this one's
       // callbacks — and, now that an open menu holds the keyboard, would leave
       // the next editor's shortcuts inert until something dismissed it.
       closeMenu();
-      closeRelink();
-      closeGenerator();
-      closeExport();
-      closeDeleteLayer();
-      shortcuts.detach();
-      unsubSettings();
-      unTick();
-      unGraphTick();
-      unVolume();
-      // Unregister before the final flush: a close request landing after this
-      // screen is gone must not flush a disposed controller.
-      unregVolumeFlush();
-      volume.dispose();
-      unRefit();
-      unName();
-      // Teardown mid-drag: the divider's own listeners die with the element, but
-      // the window keydown and the pending frame do not.
-      tlResizeCleanup?.();
-      if (dragCleanup) dragCleanup();
-      for (const u of unsubs) u();
-      unlistenDrop?.();
-      unlistenDrop = null;
-      theater.dispose();
-      overlay.dispose();
-      inspector.dispose();
-      timeline.dispose();
-      engine.dispose();
-      graph.dispose();
-      stage.dispose();
-      media.dispose();
+      // Everything registered above, newest first: the dialogs this screen
+      // opened, its shortcuts and subscriptions, then the timeline, overlay,
+      // theater and playback stack. It also flips `disposed()`, so a picker or
+      // probe still out refuses instead of committing.
+      teardown.run();
+      // A discarded quick-view project will never be opened again, so the
+      // remux or proxy it started has no one to finish for: cancel it rather
+      // than leave one transcode queued per file stepped through. A kept or
+      // permanent project lets them run on into the cache for its next open.
+      media.dispose({ cancelPlayback: session.discarded });
       // Only clear what is still ours: a newer mount may already have claimed
       // currentSession, and nulling it would strip that screen's leave guard.
       if (currentSession.get() === session) currentSession.set(null);

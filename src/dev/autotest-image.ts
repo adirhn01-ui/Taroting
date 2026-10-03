@@ -22,6 +22,7 @@
 // Waits poll at 20 ms and every timeout names what was on screen, so a red run
 // finishes inside the harness's 90 s cap and says why without a rerun.
 
+import { invoke } from "@tauri-apps/api/core";
 import { errorDetail, ipc, mediaUrl } from "../core/ipc";
 import { createBlankImageProject, createPhotoImageProject } from "../core/image-project";
 import { navigate } from "../core/nav";
@@ -45,6 +46,13 @@ import type { ToolState } from "../image/tool-state";
 import { closeMenu } from "../ui/menu";
 import { discardTempSession } from "../ui/temp-project";
 import type { Wave1Ctx } from "./autotest-wave1";
+
+/** Delete a file a block wrote that is NOT a project — an export, a card
+ *  picture, a scratch copy. `deleteProject` takes only a `.trt` (anything else
+ *  is refused, so a compromised page cannot delete a user's files through it);
+ *  `debug_remove_test_file` exists only under the harness and deletes only
+ *  inside the run's scratch root and the derived-file cache. */
+const removeTestFile = (path: string): Promise<void> => invoke<void>("debug_remove_test_file", { path });
 
 /** Same harness surface as the Wave 1 and viewer blocks. */
 export type ImageCtx = Wave1Ctx;
@@ -1221,7 +1229,7 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
         const runDialog = async (format: "png" | "jpeg", size: "100" | "50", name: string, px: string): Promise<string> => {
           const out = `${dir}\\${name}.${format === "jpeg" ? "jpg" : "png"}`;
           outs.push(out);
-          await ipc.deleteProject(out).catch(() => {});
+          await removeTestFile(out).catch(() => {});
           $<HTMLButtonElement>("#ed-export")!.click();
           await until(() => $(".export-modal #ix-name"), 2_000, () => `the export dialog (${onScreen()})`);
           $<HTMLButtonElement>(`.export-modal [data-format="${format}"]`)!.click();
@@ -1307,7 +1315,7 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
       } finally {
         ipc.imageSaveBegin = realBegin;
         await leave(paths);
-        for (const o of outs) await ipc.deleteProject(o).catch(() => {});
+        for (const o of outs) await removeTestFile(o).catch(() => {});
         // Unconditionally: the dialog's own write is fire-and-forget, and
         // settings writes are serialized, so this one lands after it.
         await updateSettings({ lastExportDir: lastDir }).catch(() => {});
@@ -1325,7 +1333,7 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
         needFixtures();
         const dir = await scratchDir();
         copy = `${dir}\\autotest-image-source.png`;
-        await ipc.deleteProject(copy).catch(() => {});
+        await removeTestFile(copy).catch(() => {});
         const { saveBlob } = await import("../image/save");
         const bytes = await fileBlob(fx(GRID));
         await saveBlob({ kind: "user", path: copy, sources: [] }, "png", bytes);
@@ -1348,7 +1356,7 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
         await saveBlob({ kind: "user", path: copy, sources: [fx(GRID)] }, "png", bytes);
         return `onto a source (upper-case spelling) → ${d.code} "${d.message}"; size ${after.size} and mtime unchanged; no .part; with another source the same save goes through — ${ms(t0)}`;
       } finally {
-        if (copy) await ipc.deleteProject(copy).catch(() => {});
+        if (copy) await removeTestFile(copy).catch(() => {});
       }
     });
 
@@ -1676,7 +1684,7 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
       } finally {
         await leave(paths);
         if (kept) await ipc.deleteProject(kept).catch(() => {});
-        if (thumb) await ipc.deleteProject(thumb).catch(() => {});
+        if (thumb) await removeTestFile(thumb).catch(() => {});
       }
     });
 
@@ -1721,7 +1729,7 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
         assert(entry(video) !== undefined && !entry(video)!.thumb && entry(video)!.kind !== "image", "precondition: the bare video project is not a thumb-less video entry");
         // Gone BEFORE Home ever showed it: a URL an <img> already loaded in this
         // document would be served from memory without asking for the file.
-        await ipc.deleteProject(gone.thumb);
+        await removeTestFile(gone.thumb);
         assert(!(await ipc.pathExists(gone.thumb)), "the card picture could not be deleted");
 
         const n0 = backfilled.length;
@@ -1790,7 +1798,7 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
         closeMenu();
         $<HTMLButtonElement>(".nimg-modal [data-act='cancel']")?.click();
         for (const p of made) await ipc.deleteProject(p).catch(() => {});
-        for (const p of thumbs) await ipc.deleteProject(p).catch(() => {});
+        for (const p of thumbs) await removeTestFile(p).catch(() => {});
       }
     });
 

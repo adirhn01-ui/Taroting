@@ -6,6 +6,14 @@ import {
   createExportRunHold,
   EXPORT_RUNNING_REASON,
   codecsForFormat,
+  destinationProblem,
+  exportHasAudio,
+  fontHasGlyph,
+  HW_FALLBACK_NOTE,
+  missingGlyphNote,
+  sanitizeExportPreset,
+  unsupportedTextSamples,
+  usedSoftwareFallback,
   gateHardware,
   hardwareBlockedBy,
   isProjectSource,
@@ -36,6 +44,32 @@ describe("sanitizeFileName", () => {
   });
   it("keeps ordinary names intact", () => {
     expect(sanitizeFileName("Holiday Cut 1")).toBe("Holiday Cut 1");
+  });
+  it("strips control characters, which the OS refuses as an opaque invalid argument", () => {
+    // U+0001, and U+001F at the top of the range: a filter that stopped short
+    // at either end would leave one of them behind.
+    expect(sanitizeFileName("Cut\u0001 one")).toBe("Cut one");
+    expect(sanitizeFileName("a\u001fb")).toBe("ab");
+    expect(sanitizeFileName("\u0000\u0007")).toBe("export");
+    // A newline goes too, rather than surviving as a space.
+    expect(sanitizeFileName("Line\none")).toBe("Lineone");
+  });
+});
+
+describe("destinationProblem", () => {
+  it("accepts a drive path with either separator, and a network share", () => {
+    for (const ok of ["C:\\Videos", "d:/Out", "Z:\\", "\\\\server\\share\\clips"]) {
+      expect(destinationProblem(ok), ok).toBeNull();
+    }
+  });
+  it("refuses anything that is not a full path", () => {
+    for (const bad of ["Videos", "./out", "..\\out", "C:", "C:Videos", "\\Videos", "\\\\", "/home/me"]) {
+      expect(destinationProblem(bad), bad).toBe("Enter a full folder path, like C:\\Videos, or choose one.");
+    }
+  });
+  it("asks for a folder when there is none", () => {
+    expect(destinationProblem("")).toBe("Choose a folder for the export.");
+    expect(destinationProblem("   ")).toBe("Choose a folder for the export.");
   });
 });
 
@@ -369,6 +403,103 @@ describe("mergeExportPreset", () => {
     expect(mergeExportPreset(undefined, edits)).toEqual(edits);
     expect(mergeExportPreset(null, edits)).toEqual(edits);
   });
+
+  it("takes nothing from a crafted base that is not an object", () => {
+    // Spreading the string "mp4" would save keys "0", "1", "2" into the project.
+    for (const base of ["mp4", 42, true, ["x", "y"]]) {
+      expect(mergeExportPreset(base as unknown as ExportPreset, edits), String(base)).toEqual(edits);
+    }
+  });
+});
+
+/* A `.trt` preset is data: every row below is something a crafted or damaged
+   project can carry, and the expected value is what the form and the backend
+   (u32 sizes, u64 kbps) can actually take. */
+describe("sanitizeExportPreset", () => {
+  const DEFAULTS: PresetEdits = {
+    format: "mp4",
+    vcodec: "h264",
+    resolution: "original",
+    fps: "original",
+    videoBitrate: "auto",
+    audioBitrate: "auto",
+    useHardware: false,
+  };
+
+  it("turns a missing, null or non-object preset into the controls' defaults", () => {
+    for (const raw of [undefined, null, "mp4", 7, [], {}]) {
+      expect(sanitizeExportPreset(raw), JSON.stringify(raw)).toEqual(DEFAULTS);
+    }
+  });
+
+  it("keeps a clean preset exactly as it is", () => {
+    const clean: PresetEdits = {
+      format: "mov",
+      vcodec: "hevc",
+      resolution: { w: 1234, h: 566 },
+      fps: 29.97,
+      videoBitrate: 12000,
+      audioBitrate: 256,
+      useHardware: true,
+    };
+    expect(sanitizeExportPreset(clean)).toEqual(clean);
+    expect(sanitizeExportPreset({ ...clean, resolution: "720p" }).resolution).toBe("720p");
+  });
+
+  it("never lets a string reach the form's markup", () => {
+    const out = sanitizeExportPreset({
+      format: "mp4",
+      vcodec: "h264",
+      resolution: { w: '1"><img src=x>', h: 720 },
+      fps: '30" autofocus onfocus="x" data-x="',
+      videoBitrate: '8000"><b>',
+      audioBitrate: "192",
+      useHardware: "true",
+    });
+    expect(out).toEqual(DEFAULTS);
+  });
+
+  it("falls back to Original for a null, unknown or 'custom' resolution", () => {
+    for (const r of [null, "1080P", "custom", "__proto__", { w: 1920 }, { w: NaN, h: 1080 }, { w: "1920", h: "1080" }]) {
+      expect(sanitizeExportPreset({ resolution: r }).resolution, JSON.stringify(r)).toBe("original");
+    }
+  });
+
+  it("rounds and clamps a custom size into whole pixels the backend's u32 takes", () => {
+    expect(sanitizeExportPreset({ resolution: { w: 1280.5, h: 719.4 } }).resolution).toEqual({ w: 1281, h: 719 });
+    expect(sanitizeExportPreset({ resolution: { w: -5, h: 1e9 } }).resolution).toEqual({ w: 16, h: 16384 });
+  });
+
+  it("keeps a frame rate in range, caps GIF at 30, and drops anything else to Original", () => {
+    expect(sanitizeExportPreset({ fps: 59.94 }).fps).toBe(59.94);
+    expect(sanitizeExportPreset({ format: "gif", fps: 60 }).fps).toBe(30);
+    expect(sanitizeExportPreset({ format: "gif", fps: 12 }).fps).toBe(12);
+    for (const f of [0, 0.5, 241, -30, Infinity, NaN, "60", null]) {
+      expect(sanitizeExportPreset({ fps: f }).fps, String(f)).toBe("original");
+    }
+  });
+
+  it("rounds a bitrate to whole kbps inside the field's range, else Auto", () => {
+    const at = (videoBitrate: unknown, audioBitrate: unknown) => {
+      const o = sanitizeExportPreset({ videoBitrate, audioBitrate });
+      return [o.videoBitrate, o.audioBitrate];
+    };
+    expect(at(8000.6, 191.5)).toEqual([8001, 192]);
+    // Below the floor: the floor, the same as typing it into the field does.
+    expect(at(5, 5)).toEqual([100, 32]);
+    expect(at(1e30, 1e30)).toEqual([1_000_000, 3_000]);
+    for (const bad of [0, -1, NaN, "8000", null, {}]) expect(at(bad, bad), String(bad)).toEqual(["auto", "auto"]);
+  });
+
+  it("asks for hardware only on a real true", () => {
+    expect(sanitizeExportPreset({ useHardware: true }).useHardware).toBe(true);
+    for (const v of ["true", 1, null, undefined]) expect(sanitizeExportPreset({ useHardware: v }).useHardware).toBe(false);
+  });
+
+  it("whitelists the format and codec through the existing rules", () => {
+    expect(sanitizeExportPreset({ format: "mkv", vcodec: "vp9" })).toMatchObject({ format: "mp4", vcodec: "h264" });
+    expect(sanitizeExportPreset({ format: "webm", vcodec: "vp9" })).toMatchObject({ format: "webm", vcodec: "av1" });
+  });
 });
 
 describe("splitPath", () => {
@@ -613,5 +744,161 @@ describe("createExportRunHold", () => {
     createExportRunHold(r.session, r.register, r.cancel).release();
     expect(r.session.blockLeave).toBe("Something else.");
     expect(r.unregisters).toBe(0);
+  });
+});
+
+/* ---------------- silent exports (the estimate's hasAudio) ---------------- */
+
+describe("exportHasAudio", () => {
+  type T = Parameters<typeof exportHasAudio>[0];
+  const media = (id: string, hasAudio: boolean) =>
+    ({ id, path: `C:\\m\\${id}.mp4`, size: 1, mtimeMs: 1, kind: "video", duration: 9, hasAudio }) as T["media"][number];
+  const clip = (id: string, mediaId: string, audio: { muted?: boolean; detached?: boolean } = {}) =>
+    ({
+      id,
+      mediaId,
+      timelineStart: 0,
+      srcIn: 0,
+      srcOut: 1,
+      speed: 1,
+      audio: { volume: 1, muted: false, fadeInSec: 0, fadeOutSec: 0, gainOffsetDb: 0, detached: false, ...audio },
+    }) as T["timeline"]["tracks"][number]["clips"][number];
+  const track = (id: string, clips: ReturnType<typeof clip>[], muted = false) =>
+    ({ id, kind: "video", name: id, muted, clips }) as T["timeline"]["tracks"][number];
+  const project = (tracks: ReturnType<typeof track>[], m = [media("loud", true), media("quiet", false)]): T => ({
+    media: m,
+    timeline: { fps: { num: 30, den: 1 }, width: 640, height: 360, tracks },
+  });
+
+  /* Four clips that each fail on exactly ONE condition, then the one audible
+     clip last, on the last track: a check that skipped any one condition would
+     answer true from a wrong clip, and the same fixture without the audible
+     clip must say false. */
+  const failing = [
+    track("t1", [clip("silentMedia", "quiet"), clip("muted", "loud", { muted: true })]),
+    track("t2", [clip("detached", "loud", { detached: true })]),
+    track("t3", [clip("onMutedTrack", "loud")], true),
+  ];
+
+  it("is false when every clip fails on a different single rule", () => {
+    expect(exportHasAudio(project(failing))).toBe(false);
+  });
+  it("is true once one clip passes every rule", () => {
+    expect(exportHasAudio(project([...failing, track("t4", [clip("heard", "loud")])]))).toBe(true);
+  });
+  it("is false with no clips, and with clips of media that has no audio", () => {
+    expect(exportHasAudio(project([track("t1", [])]))).toBe(false);
+    expect(exportHasAudio(project([track("t1", [clip("a", "quiet")])]))).toBe(false);
+  });
+  it("ignores a clip whose media is not in the list", () => {
+    expect(exportHasAudio(project([track("t1", [clip("ghost", "missing")])]))).toBe(false);
+  });
+});
+
+/* ---------------- text the export font cannot draw ---------------- */
+
+describe("fontHasGlyph", () => {
+  it("draws Latin, Greek and Cyrillic in every face", () => {
+    const families = ["Segoe UI", "Arial", "Georgia", "Times New Roman", "Courier New", "Impact"] as const;
+    for (const f of families) {
+      for (const ch of "Aé€—Ωж♥") expect(fontHasGlyph(f, ch.codePointAt(0)!), `${f} ${ch}`).toBe(true);
+    }
+  });
+  it("knows Hebrew and Arabic are in Arial but not in Georgia or Impact", () => {
+    for (const ch of "שم") {
+      const cp = ch.codePointAt(0)!;
+      expect(fontHasGlyph("Arial", cp)).toBe(true);
+      expect(fontHasGlyph("Segoe UI", cp)).toBe(true);
+      expect(fontHasGlyph("Georgia", cp)).toBe(false);
+      expect(fontHasGlyph("Impact", cp)).toBe(false);
+    }
+  });
+  it("knows Armenian is Segoe UI's alone", () => {
+    const cp = "Ա".codePointAt(0)!;
+    expect(fontHasGlyph("Segoe UI", cp)).toBe(true);
+    expect(fontHasGlyph("Arial", cp)).toBe(false);
+  });
+  it("has no emoji, dingbats, CJK or Thai in any face, nor the emoji joiners", () => {
+    for (const ch of ["😀", "🎉", "★", "✓", "中", "あ", "ก", "\u200d", "\ufe0f"]) {
+      for (const f of ["Segoe UI", "Arial", "Impact"] as const) {
+        expect(fontHasGlyph(f, ch.codePointAt(0)!), `${f} U+${ch.codePointAt(0)!.toString(16)}`).toBe(false);
+      }
+    }
+  });
+});
+
+describe("unsupportedTextSamples", () => {
+  type T = Parameters<typeof unsupportedTextSamples>[0];
+  const text = (id: string, t: string, fontFamily: "Arial" | "Georgia" = "Arial") =>
+    ({
+      id,
+      path: "Text",
+      size: 0,
+      mtimeMs: 0,
+      kind: "image",
+      duration: 5,
+      hasAudio: false,
+      generator: { type: "text", text: t, fontFamily, sizePx: 64, color: "#ffffff", bold: false, italic: false },
+    }) as T["media"][number];
+  const placed = (...ids: string[]): T["timeline"] => ({
+    fps: { num: 30, den: 1 },
+    width: 640,
+    height: 360,
+    tracks: [
+      {
+        id: "v",
+        kind: "video",
+        name: "V1",
+        muted: false,
+        clips: ids.map((mediaId, i) => ({
+          id: `c${i}`,
+          mediaId,
+          timelineStart: i,
+          srcIn: 0,
+          srcOut: 1,
+          speed: 1,
+          audio: { volume: 1, muted: false, fadeInSec: 0, fadeOutSec: 0, gainOffsetDb: 0, detached: false },
+        })),
+      },
+    ],
+  });
+
+  it("is empty for text every face draws", () => {
+    expect(unsupportedTextSamples({ media: [text("a", "Hello — Ωmega")], timeline: placed("a") })).toEqual([]);
+  });
+  it("quotes whole graphemes, once each, at most three", () => {
+    // The family emoji is five code points joined by ZWJs; it comes back as one.
+    const t = text("a", "Party 🎉 🎉 👨‍👩‍👧 ★ 中 文");
+    expect(unsupportedTextSamples({ media: [t], timeline: placed("a") })).toEqual(["🎉", "👨‍👩‍👧", "★"]);
+  });
+  it("judges each text by its own font", () => {
+    // The same Hebrew word is fine in Arial and missing from Georgia.
+    const media = [text("arial", "שלום", "Arial"), text("georgia", "שלום", "Georgia")];
+    expect(unsupportedTextSamples({ media, timeline: placed("arial") })).toEqual([]);
+    expect(unsupportedTextSamples({ media, timeline: placed("georgia") })).toEqual(["ש", "ל", "ו"]);
+  });
+  it("ignores text that only sits in the bin", () => {
+    const media = [text("bin", "🎉"), text("used", "plain")];
+    expect(unsupportedTextSamples({ media, timeline: placed("used") })).toEqual([]);
+  });
+  it("words the note around the samples, and says nothing without them", () => {
+    expect(missingGlyphNote([])).toBeNull();
+    expect(missingGlyphNote(["🎉", "★"])).toBe(
+      "Some characters in your text, like 🎉 ★, aren't in the text's font, so the export will show empty boxes in their place.",
+    );
+  });
+});
+
+describe("usedSoftwareFallback", () => {
+  it("is true only for the backend's real flag", () => {
+    expect(usedSoftwareFallback({ path: "C:\\o.mp4", hwFallback: true })).toBe(true);
+    for (const v of [false, "true", 1, null, undefined]) {
+      expect(usedSoftwareFallback({ path: "C:\\o.mp4", hwFallback: v }), String(v)).toBe(false);
+    }
+    expect(usedSoftwareFallback({})).toBe(false);
+    expect(usedSoftwareFallback(null)).toBe(false);
+  });
+  it("words the note calmly, with no action to take", () => {
+    expect(HW_FALLBACK_NOTE).toBe("Hardware encoding failed, so this export used the CPU instead.");
   });
 });

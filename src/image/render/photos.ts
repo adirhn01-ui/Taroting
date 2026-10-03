@@ -27,6 +27,15 @@
 // SHARING. Pixels are keyed by the FILE (path + size + mtime), not the layer:
 // a duplicated layer is a new MediaRef over the same file and must not fetch,
 // hold and decode it again. Only the adjusted copy is per layer.
+//
+// DRAGGING AN ADJUSTMENT. Zoomed in on a big photo the working level IS the
+// photo, and re-adjusting 24 MP every frame of a slider drag is hundreds of
+// milliseconds a frame. A change that lands within ADJUST_DRAG_MS of the last
+// one is a drag: it adjusts a proxy of about the stage's pixel count instead
+// (drawn into the same recorded box, so only sharpness differs), and the full
+// level is adjusted once, when the drag has been quiet for ADJUST_DRAG_MS. A
+// single change, and any level already near the stage's size, takes the
+// sharp path directly: nothing here runs unless a big photo is being dragged.
 
 import { mediaUrl } from "../../core/ipc";
 import type { ClipAdjust, MediaRef } from "../../core/types";
@@ -40,6 +49,11 @@ export const ADJUST_STRIP_ROWS = 256;
 export const LEVEL_DEBOUNCE_MS = 200;
 /** Levels kept per photo. */
 const MAX_LEVELS = 2;
+/** An adjustment change this soon after the previous one is a drag (a slider,
+ *  a held key); the same quiet time ends it. */
+export const ADJUST_DRAG_MS = 150;
+/** The stage's device-pixel count until the stage says otherwise. */
+const DEFAULT_STAGE_AREA = 1920 * 1080;
 
 /** How a decoded still relates to the size its MediaRef recorded:
  *  - match: the same size (the only healthy answer);
@@ -133,6 +147,19 @@ interface Adjusted {
   level: Level;
   adjust: ClipAdjust;
   canvas: OffscreenCanvas;
+  /** made from a drag proxy, not from `level` itself */
+  proxy: boolean;
+}
+
+/** What a drag adjusts instead of a big level: the smallest level when it is
+ *  near the stage's size already, else a downscale of the level made once
+ *  (`canvas`, owned here; null when a level is used as it is). */
+interface ProxyBase {
+  /** the level bitmap it stands for */
+  of: ImageBitmap;
+  canvas: OffscreenCanvas | null;
+  w: number;
+  h: number;
 }
 
 /** One FILE's pixels, shared by every layer that shows it (a duplicated
@@ -168,6 +195,11 @@ interface LayerEntry {
   media: MediaRef;
   adjusted: Adjusted | null;
   lastNeed: number;
+  /** when the adjust object last changed (performance.now) */
+  adjustAt: number;
+  /** a drag's settle timer: when it fires, the sharp level is adjusted */
+  settle: number | undefined;
+  proxy: ProxyBase | null;
 }
 
 function keyOf(m: MediaRef): string {
@@ -192,12 +224,21 @@ export class PhotoCache {
   private disposed = false;
   /** at most one re-adjust per synchronous render pass */
   private adjustSpent = false;
+  /** device pixels of the stage: the size a drag proxy is capped to */
+  private stageArea = DEFAULT_STAGE_AREA;
 
   constructor(private readonly emit: () => void) {}
 
   onMediaDims(fn: (mediaId: string, w: number, h: number) => void): () => void {
     this.dimsListeners.add(fn);
     return () => this.dimsListeners.delete(fn);
+  }
+
+  /** The stage's size in device px: a drag proxy never holds more pixels
+   *  than the stage can show. */
+  setStage(w: number, h: number): void {
+    const a = Math.floor(w) * Math.floor(h);
+    this.stageArea = Number.isFinite(a) && a > 0 ? a : DEFAULT_STAGE_AREA;
   }
 
   status(media: MediaRef | undefined): {
@@ -332,7 +373,7 @@ export class PhotoCache {
       this.files.set(key, fe);
     }
     fe.refs.add(media.id);
-    const le: LayerEntry = { file: fe, media, adjusted: null, lastNeed: needScale };
+    const le: LayerEntry = { file: fe, media, adjusted: null, lastNeed: needScale, adjustAt: -Infinity, settle: undefined, proxy: null };
     this.layers.set(media.id, le);
     if (fresh) void this.loadInto(fe, media);
     else if (fe.state === "ready") {
@@ -566,7 +607,10 @@ export class PhotoCache {
 
   private adjusted(le: LayerEntry, level: Level, adjust: ClipAdjust): CanvasImageSource {
     const a = le.adjusted;
-    if (a && a.level.bmp === level.bmp && a.adjust === adjust) return a.canvas;
+    const changed = a === null || a.adjust !== adjust;
+    if (!changed && !a.proxy && a.level.bmp === level.bmp) return a.canvas;
+    // Mid-drag and nothing new: the proxy stands until the drag goes quiet.
+    if (!changed && a.proxy && le.settle !== undefined) return a.canvas;
     if (this.adjustSpent) {
       // One re-adjust per render pass: show the last adjusted pixels (or the
       // plain level) now, and ask for another pass.
@@ -577,7 +621,20 @@ export class PhotoCache {
     queueMicrotask(() => {
       this.adjustSpent = false;
     });
-    const canvas = a && a.canvas.width === level.w && a.canvas.height === level.h ? a.canvas : new OffscreenCanvas(level.w, level.h);
+    // Measured from the END of the previous adjust, not its start: a sharp
+    // adjust of a 12-24 MP level takes a few hundred milliseconds itself, so
+    // a stamp taken before it would put every next frame of a drag outside
+    // the window and the drag would never be seen.
+    const dragging = changed && a !== null && performance.now() - le.adjustAt < ADJUST_DRAG_MS;
+    if (dragging && level.w * level.h > 2 * this.stageArea) {
+      const proxied = this.adjustProxy(le, level, adjust);
+      if (proxied) return proxied;
+    }
+
+    clearTimeout(le.settle);
+    le.settle = undefined;
+    freeProxy(le);
+    const canvas = a && !a.proxy && a.canvas.width === level.w && a.canvas.height === level.h ? a.canvas : new OffscreenCanvas(level.w, level.h);
     const c = canvas.getContext("2d", { willReadFrequently: true });
     if (!c) return level.bmp;
     c.setTransform(1, 0, 0, 1, 0, 0);
@@ -587,16 +644,93 @@ export class PhotoCache {
     c.globalCompositeOperation = "source-over";
     adjustInStrips(c, level.w, level.h, adjust);
     if (a && a.canvas !== canvas) a.canvas.width = 0;
-    le.adjusted = { level, adjust, canvas };
+    le.adjusted = { level, adjust, canvas, proxy: false };
+    // The settle's own sharp adjust restarts the window too: a change right
+    // after it is the same drag resuming.
+    le.adjustAt = performance.now();
     return canvas;
+  }
+
+  /** A drag's frame: adjust a proxy of about the stage's pixel count, and
+   *  (re)arm the settle that adjusts the sharp level once the drag stops.
+   *  Null when no proxy could be made (the caller adjusts the level). */
+  private adjustProxy(le: LayerEntry, level: Level, adjust: ClipAdjust): OffscreenCanvas | null {
+    const base = this.proxyBase(le, level);
+    if (!base) return null;
+    const a = le.adjusted;
+    const canvas = a && a.proxy && a.canvas.width === base.w && a.canvas.height === base.h ? a.canvas : new OffscreenCanvas(base.w, base.h);
+    const c = canvas.getContext("2d", { willReadFrequently: true });
+    if (!c) return null;
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.globalAlpha = 1;
+    c.globalCompositeOperation = "copy";
+    c.drawImage(base.canvas ?? base.of, 0, 0);
+    c.globalCompositeOperation = "source-over";
+    adjustInStrips(c, base.w, base.h, adjust);
+    // The sharp copy goes too: it is stale from the first drag frame on, and
+    // on a big photo it is the largest thing this layer holds.
+    if (a && a.canvas !== canvas) a.canvas.width = 0;
+    le.adjusted = { level, adjust, canvas, proxy: true };
+    clearTimeout(le.settle);
+    le.settle = setTimeout(() => {
+      le.settle = undefined;
+      if (!this.disposed && this.layers.get(le.media.id) === le) this.emit();
+    }, ADJUST_DRAG_MS);
+    le.adjustAt = performance.now();
+    return canvas;
+  }
+
+  /** What a drag adjusts for `level`: the file's smallest level when that is
+   *  near the stage's size already, else a downscale of `level`, made once per
+   *  drag (and per level) and kept until the drag ends. "Near" both ways: the
+   *  fitted level a zoom-in leaves behind can be a few hundred px wide, and
+   *  stretched over a zoomed-in stage it would show the drag as a blur. */
+  private proxyBase(le: LayerEntry, level: Level): ProxyBase | null {
+    const cap = this.stageArea;
+    const small = pickLevel(le.file.levels, 0);
+    const smallArea = small.w * small.h;
+    if (smallArea <= 2 * cap && smallArea >= cap / 4) {
+      freeProxy(le);
+      le.proxy = { of: small.bmp, canvas: null, w: small.w, h: small.h };
+      return le.proxy;
+    }
+    const p = le.proxy;
+    if (p && p.of === level.bmp && p.canvas) return p;
+    freeProxy(le);
+    const k = Math.sqrt(cap / (level.w * level.h));
+    const w = Math.max(1, Math.round(level.w * k));
+    const h = Math.max(1, Math.round(level.h * k));
+    const canvas = new OffscreenCanvas(w, h);
+    // Drawn once, read on every frame of the drag (copied into the adjusted
+    // proxy, itself a CPU canvas): keep it on the CPU side too.
+    const c = canvas.getContext("2d", { willReadFrequently: true });
+    if (!c) {
+      canvas.width = 0;
+      return null;
+    }
+    c.imageSmoothingEnabled = true;
+    c.imageSmoothingQuality = "high";
+    c.drawImage(level.bmp, 0, 0, w, h);
+    le.proxy = { of: level.bmp, canvas, w, h };
+    return le.proxy;
   }
 }
 
 function freeAdjusted(le: LayerEntry): void {
+  clearTimeout(le.settle);
+  le.settle = undefined;
+  freeProxy(le);
   if (le.adjusted) {
     le.adjusted.canvas.width = 0;
     le.adjusted = null;
   }
+}
+
+/** Give back a drag proxy's own downscale (a level used as the base is the
+ *  file's, not ours to close). */
+function freeProxy(le: LayerEntry): void {
+  if (le.proxy?.canvas) le.proxy.canvas.width = 0;
+  le.proxy = null;
 }
 
 /** The smallest level at least `want` wide, else the largest there is. */

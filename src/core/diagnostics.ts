@@ -14,6 +14,8 @@
 //     a colour or a coordinate (a drawing can be a signature or handwriting)
 //   * the image editor's recent ink colours appear only as a count
 //   * free text (ffmpeg argv, log lines, messages) is swept for the user name
+//   * a recent error that names its files (`paths`) loses those paths whole,
+//     and its message loses their bare file names and stems as well
 //   * there is no machine id, install id or session id, here or anywhere else
 //   * nothing is sent anywhere; the report exists only where the user puts it
 
@@ -156,9 +158,30 @@ export const MAX_REPORT_CHARS = 48_000;
  * trim in `text` below. `"` stays excluded — it is illegal in a filename. */
 const WIN_USER = /([A-Za-z]:[\\/]+Users[\\/]+)[^\\/\r\n"]+/gi;
 const NIX_USER = /(\/(?:home|Users)\/)[^/\s"]+/g;
-/** An absolute Windows path embedded in free text. Stops at whitespace, so a
- *  name containing spaces is only caught by the exact known-path pass. */
-const PATH_LIKE = /[A-Za-z]:[\\/][^\s"<>|*?]*/g;
+/**
+ * An absolute Windows path embedded in free text: a drive (`C:\`) or a UNC
+ * share (`\\server\share\`), then any run of FOLDERS, then the last segment.
+ *
+ * A folder may contain spaces, because a separator after it proves where it
+ * ends: `C:\Client Work\Secret Project\clip.mp4` is consumed whole, where the
+ * old pattern stopped at the first space and left "Work\Secret Project\clip.mp4"
+ * in the "redacted" text. The LAST segment still stops at whitespace — nothing
+ * marks where a spaced file name ends inside a sentence — so a spaced file
+ * name the redactor was never told about keeps its tail (the documented
+ * residual; `DiagnosticErrorEntry.paths` is how a caller closes it). A folder
+ * may not contain `:`, which is what keeps a folder run from swallowing the
+ * rest of a log line (`… from 'C:\x\a.mp4': Stream #0:0 … avc1 / 0x…`); a colon
+ * is illegal in a Windows name past the drive anyway.
+ *
+ * `<user>` is let through as part of a path because the profile sweep runs
+ * FIRST (see `text`): `<` and `>` are otherwise excluded, so without it
+ * `C:\Users\<user>\Videos\a.mp4` would be cut at `C:\Users\` and everything
+ * after the account would leak. The `\\?\C:\…` long-path form needs no branch
+ * of its own: `?` cannot start a UNC server name, so it falls through to the
+ * drive branch at the `C:\`.
+ */
+const PATH_LIKE =
+  /(?:[A-Za-z]:[\\/]|\\\\[^\\/\s"<>|*?]+[\\/]+)(?:(?:<user>|[^\\/:\r\n"<>|*?])*[\\/]+)*(?:<user>|[^\s"<>|*?])*/g;
 
 /** Replace the account name inside any user-profile path with `<user>`. */
 export function sweepUsernames(text: string): string {
@@ -191,17 +214,25 @@ export interface Redactor {
  * media table — while the folder and the file name never appear.
  */
 export function createRedactor(knownPaths: readonly string[] = []): Redactor {
+  /** Token per path, keyed by the path with its account name swept: the free-
+   *  text pass sees a path only AFTER the profile sweep, so keying on the raw
+   *  string would give a file found in a log line one token and the same file
+   *  registered whole (an argv element) another. */
   const seen = new Map<string, string>();
   /** Absolute paths we can match verbatim (so names with spaces are safe),
    *  longest first so a folder never shadows a file inside it. */
   const known: string[] = [];
+  const tokenOf = new Map<string, string>();
 
   const path = (p: string): string => {
-    const existing = seen.get(p);
-    if (existing !== undefined) return existing;
-    const token = `<file ${seen.size + 1}${extOf(p)}>`;
-    seen.set(p, token);
-    if (looksLikePath(p)) {
+    const key = sweepUsernames(p);
+    let token = seen.get(key);
+    if (token === undefined) {
+      token = `<file ${seen.size + 1}${extOf(p)}>`;
+      seen.set(key, token);
+    }
+    if (looksLikePath(p) && !tokenOf.has(p)) {
+      tokenOf.set(p, token);
       known.push(p);
       known.sort((a, b) => b.length - a.length);
     }
@@ -211,9 +242,16 @@ export function createRedactor(knownPaths: readonly string[] = []): Redactor {
   const text = (s: string): string => {
     let out = s;
     for (const p of known) {
-      if (out.includes(p)) out = out.split(p).join(seen.get(p)!);
+      if (out.includes(p)) out = out.split(p).join(tokenOf.get(p)!);
     }
-    out = out.replace(PATH_LIKE, (m) => {
+    // The profile sweep runs BEFORE the path pass. The other way round, the
+    // path pass cut `C:\Users\John Smith\…` at the space and consumed the
+    // `X:\Users\` anchor with it, so the sweep could no longer see " Smith" —
+    // a spaced account name kept its surname. PATH_LIKE accepts the `<user>`
+    // this leaves behind (see its comment), so the path is still tokenised
+    // whole.
+    out = sweepUsernames(out);
+    return out.replace(PATH_LIKE, (m) => {
       // The quote joins the punctuation trim because PATH_LIKE no longer stops
       // at apostrophes (see WIN_USER above): in `fontfile='C:/…/f.ttf'` the
       // match swallows the closing quote, which belongs to the filtergraph,
@@ -221,11 +259,77 @@ export function createRedactor(knownPaths: readonly string[] = []): Redactor {
       const trimmed = m.replace(/[.,;:)\]}']+$/, "");
       return path(trimmed) + m.slice(trimmed.length);
     });
-    return sweepUsernames(out);
   };
 
   for (const p of knownPaths) path(p);
   return { path, text };
+}
+
+/** A token the redactor wrote, the account placeholder, or one of the
+ *  backend's own placeholders an export failure arrives with (`<temp>`,
+ *  `<home>`, `<appdata>` …) — never rewritten by the per-entry name pass
+ *  below, so a file whose stem is "temp" cannot turn `<temp>` into
+ *  `<<file 1.mp4>>`. */
+const TOKEN = /(<file \d+[^<>\r\n]*>|<[a-z]+>)/;
+/** A file name shorter than this is not replaced on its own: one or two
+ *  characters say nothing about the user, and would match ordinary words. */
+const MIN_NAME_CHARS = 3;
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** The file name and the stem of a path ("" and too-short parts dropped). */
+function namesOf(p: string): string[] {
+  const name = p.slice(Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/")) + 1);
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : "";
+  return [name, stem].filter((n) => n.length >= MIN_NAME_CHARS);
+}
+
+/**
+ * Scrub text that is KNOWN to name `paths` — one recent-errors entry, or the
+ * detail pane of the toast that recorded it.
+ *
+ * `r.text` replaces the whole paths (seed `r` with them first, so a spaced
+ * path is replaced whole rather than found and cut short). This then replaces
+ * what `r.text` cannot see: the bare file name or STEM a message carries on its
+ * own — every "Couldn't import <stem>: …" toast is recorded, and printing it
+ * verbatim made "file names were replaced" false for the commonest failure.
+ *
+ * Deliberately PER ENTRY, never registered on the redactor: a stem is often an
+ * ordinary word ("export", "final"), and replacing it across a whole report
+ * would eat that word out of every unrelated line. Within the one entry that
+ * says it names this file, the match is that file. Whole words only, so
+ * "export" never bites into "exported"; tokens are never rewritten.
+ */
+export function redactEntryText(r: Redactor, s: string, paths: readonly string[] | undefined): string {
+  if (!paths || paths.length === 0) return r.text(s);
+  // The paths are registered (by `r.path` below) BEFORE `r.text` runs, so they
+  // are replaced whole even for a caller that did not seed `r` with them: once
+  // the free-text pass has cut a spaced file name at its space, the tail is no
+  // longer a whole name this pass could repair.
+  const swaps = paths.flatMap((p) => {
+    const token = r.path(p);
+    return namesOf(p).map((n) => ({
+      re: new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRegExp(n)}(?![\\p{L}\\p{N}_])`, "gu"),
+      token,
+    }));
+  });
+  // Longest name first, so a file name is replaced before its own stem can
+  // split it ("clip.final.mp4" before "clip.final").
+  swaps.sort((a, b) => b.re.source.length - a.re.source.length);
+  return r
+    .text(s)
+    .split(TOKEN)
+    .map((part, i) => {
+      // split() with a capture group puts the tokens at the odd indices.
+      if (i % 2 === 1) return part;
+      let seg = part;
+      for (const { re, token } of swaps) seg = seg.replace(re, token);
+      return seg;
+    })
+    .join("");
 }
 
 /* ---------------- project shape ---------------- */
@@ -401,9 +505,17 @@ function countCustomShortcuts(s: Settings): number {
  * pastes cleanly inside a GitHub fence.
  */
 export function buildReport(ctx: ReportContext): string {
+  const recent = ctx.recentErrors?.slice(-MAX_ERRORS_LISTED) ?? [];
   // Seed from the project media so "<file 1>" is the first media item no matter
-  // which section happens to mention a path first.
-  const redactor = createRedactor(ctx.project ? ctx.project.media.map((m) => m.path) : []);
+  // which section happens to mention a path first — then from the paths the
+  // listed errors name, so a spaced path in one of them is replaced whole
+  // instead of being found in free text and cut short at the space. Seeding
+  // only from the project left a report with no project open (Settings →
+  // Diagnostics) with nothing known at all.
+  const redactor = createRedactor([
+    ...(ctx.project ? ctx.project.media.map((m) => m.path) : []),
+    ...recent.flatMap((e) => e.paths ?? []),
+  ]);
 
   const out: string[] = [];
   const title = "Taroting diagnostic report";
@@ -535,15 +647,13 @@ export function buildReport(ctx: ReportContext): string {
     out.push(row("Ink colors", Array.isArray(s.inkColors) ? s.inkColors.length : 0));
   }
 
-  const recent = ctx.recentErrors;
-  if (recent && recent.length > 0) {
-    out.push(head(`Recent errors (${recent.length} this session)`));
+  if (recent.length > 0) {
+    out.push(head(`Recent errors (${ctx.recentErrors!.length} this session)`));
     out.push(
       recent
-        .slice(-MAX_ERRORS_LISTED)
         .map(
           (e, i) =>
-            `${String(i + 1).padStart(2)}  ${new Date(e.at).toISOString()}  ${(e.op || "—").padEnd(12)}  ${clip(redactor.text(e.message), 200)}`,
+            `${String(i + 1).padStart(2)}  ${new Date(e.at).toISOString()}  ${(e.op || "—").padEnd(12)}  ${clip(redactEntryText(redactor, e.message, e.paths), 200)}`,
         )
         .join("\n"),
     );

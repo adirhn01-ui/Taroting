@@ -191,3 +191,65 @@ describe("redactDetail", () => {
     expect(redactDetail(line)).toBe(createRedactor().text(line));
   });
 });
+
+/**
+ * THE REGRESSION THESE PIN: entries carry the whole paths they name
+ * (`DiagnosticErrorEntry.paths`), but the dump built its redactor with nothing
+ * known, so a spaced path was only ever FOUND in free text — and cut short at
+ * its first space. And since every error toast is now recorded, the bare stem
+ * in "Couldn't import <stem>: …" reached the dump verbatim.
+ *
+ * Names differ before and after every space, so a fragment left behind cannot
+ * pass for the other half.
+ */
+describe("recent errors that name their paths", () => {
+  const CLIP = "D:\\Client Work\\Secret Project\\harbour night.mov";
+  const PEAKS = "C:\\Users\\John Smith\\AppData\\Local\\Taroting\\cache\\9f3a 1.pk";
+
+  it("replaces an entry's own spaced paths whole", () => {
+    const text = formatRecentErrors([
+      entry({ op: "Waveform", message: `Waveform data for ${CLIP} couldn't be read`, detail: `Peaks cache file: ${PEAKS}`, paths: [CLIP, PEAKS] }),
+    ]);
+    for (const part of ["Client", "Work", "Secret", "Project", "harbour", "night", "John", "Smith", "9f3a"]) {
+      expect(text).not.toContain(part);
+    }
+    expect(text).toBe(
+      " 1. 2026-07-28T08:59:00.000Z  Waveform\n    Waveform data for <file 1.mov> couldn't be read\n    Peaks cache file: <file 2.pk>",
+    );
+  });
+
+  // The seeding is what this pins, and it only shows ACROSS entries: each entry
+  // registers its own `paths` anyway. Entry 1 names the clip in free text and
+  // lists no paths; only entry 2 lists it. Unseeded, entry 1 is scrubbed before
+  // the redactor has heard of the clip, and the free-text pass stops at the
+  // first space: "failed on <file 1> night.mov today".
+  it("seeds the dump with every entry's paths, so an earlier entry that only names a path in prose goes whole", () => {
+    const text = formatRecentErrors([
+      entry({ op: "Import", message: `failed on ${CLIP} today` }),
+      entry({ op: "Import", message: "again", paths: [CLIP] }),
+    ]);
+    for (const part of ["Client", "Work", "Secret", "Project", "harbour", "night"]) {
+      expect(text).not.toContain(part);
+    }
+    expect(text).toContain("failed on <file 1.mov> today");
+  });
+
+  it("replaces the stem a plain toast message carries, in that entry only", () => {
+    const exportPath = "D:\\Renders\\export.mp4";
+    const text = formatRecentErrors([
+      entry({ op: "Import", message: "Couldn't import harbour night: access denied", paths: [CLIP] }),
+      entry({ op: "Import", message: "Couldn't import export: busy", paths: [exportPath] }),
+      entry({ op: "Export", message: "export failed: encoder busy" }),
+    ]);
+    expect(text).toContain("Couldn't import <file 1.mov>: access denied");
+    expect(text).toContain("Couldn't import <file 2.mp4>: busy");
+    expect(text).toContain("export failed: encoder busy");
+  });
+
+  it("redacts a toast's detail pane with the paths the toast named", () => {
+    const pane = redactDetail(`cannot read ${CLIP}\nharbour night.mov is locked`, [CLIP]);
+    expect(pane).toBe("cannot read <file 1.mov>\n<file 1.mov> is locked");
+    // Without the paths it is the plain free-text pass, residual and all.
+    expect(redactDetail(`cannot read ${CLIP}`)).toBe("cannot read <file 1> night.mov");
+  });
+});

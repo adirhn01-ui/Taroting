@@ -10,6 +10,7 @@ vi.mock("../ui/toast", () => ({
       toasts.push(`error:${m}`);
       if (o?.detail !== undefined) details.push(o.detail);
     },
+    refuse: (m: string) => toasts.push(`refuse:${m}`),
   },
 }));
 vi.mock("../core/ipc", () => ({ describeError: (e: unknown) => (e instanceof Error ? e.message : String(e)) }));
@@ -18,11 +19,19 @@ let render: Promise<Blob>;
 let renderFor: ((signal: AbortSignal) => Promise<Blob>) | null = null;
 const sizes: string[] = [];
 const signals: AbortSignal[] = [];
+const sources: ({ blobFor?: (m: { id: string }) => Blob | null } | undefined)[] = [];
 vi.mock("./render/export", () => ({
   maxRenderSize: (w: number, h: number) => (w > 32767 ? { w: 32767, h: Math.floor((h * 32767) / w), reduced: true } : { w, h, reduced: false }),
-  renderImageExport: (_d: unknown, o: { format: string; outW: number; outH: number }, signal: AbortSignal) => {
+  renderImageExport: (
+    _d: unknown,
+    o: { format: string; outW: number; outH: number },
+    signal: AbortSignal,
+    _p: unknown,
+    src?: { blobFor?: (m: { id: string }) => Blob | null },
+  ) => {
     sizes.push(`${o.format}:${o.outW}x${o.outH}`);
     signals.push(signal);
+    sources.push(src);
     return renderFor ? renderFor(signal) : render;
   },
 }));
@@ -56,6 +65,7 @@ beforeEach(() => {
   details.length = 0;
   sizes.length = 0;
   signals.length = 0;
+  sources.length = 0;
   writes = [];
   render = Promise.resolve(new Blob([new Uint8Array(4)], { type: "image/png" }));
   renderFor = null;
@@ -82,6 +92,16 @@ describe("copyImage", () => {
     expect(sizes).toEqual(["png:641x361"]);
     await flush();
     expect(toasts).toEqual(["info:Image copied"]);
+  });
+
+  it("hands the render the photo files the editor already holds", () => {
+    const held = new Blob([new Uint8Array(3)], { type: "image/jpeg" });
+    const blobFor = (m: { id: string }): Blob | null => (m.id === "m-harbour" ? held : null);
+    copyImage(doc(641, 361), blobFor as never);
+    expect(sources).toHaveLength(1);
+    const got = sources[0]?.blobFor;
+    expect(got?.({ id: "m-harbour" })).toBe(held);
+    expect(got?.({ id: "m-other" })).toBe(null);
   });
 
   it("renders a canvas past the engine's limits at the largest size that fits", () => {

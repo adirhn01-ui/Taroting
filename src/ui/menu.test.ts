@@ -69,9 +69,17 @@ class El extends Listeners {
     this.attrs.set(k, v);
   }
   appendChild(c: El): El {
+    // A real append MOVES the node: it leaves its old parent first. Without
+    // this, "the host went back to <body>" would pass with the host still
+    // listed inside the element it was supposed to leave.
+    if (c.parentNode) c.parentNode.children = c.parentNode.children.filter((x) => x !== c);
     c.parentNode = this;
     this.children.push(c);
     return c;
+  }
+  remove(): void {
+    if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((x) => x !== this);
+    this.parentNode = null;
   }
   contains(n: unknown): boolean {
     for (let x = n as El | null; x; x = x.parentNode) if (x === this) return true;
@@ -80,8 +88,10 @@ class El extends Listeners {
   focus(): void {
     doc.activeElement = this;
   }
+  /** Connected = hangs off <body>, as in a real DOM. */
   get isConnected(): boolean {
-    return true;
+    for (let x: El | null = this; x; x = x.parentNode) if (x === body) return true;
+    return false;
   }
   getBoundingClientRect(): { width: number; height: number } {
     return { width: 200, height: 80 };
@@ -105,6 +115,7 @@ const body = new El("body");
 const doc = Object.assign(new Listeners(), {
   body,
   activeElement: body as El | null,
+  fullscreenElement: null as El | null,
   createElement: (tag: string) => new El(tag),
 });
 const win = Object.assign(new Listeners(), { innerWidth: 1200, innerHeight: 800 });
@@ -239,5 +250,64 @@ describe("showMenu rendering", () => {
     key("Escape");
     expect(picked).toEqual([]);
     expect(host().style.display).toBe("none");
+  });
+});
+
+/**
+ * Element fullscreen (the viewer) puts that element in the top layer, so a menu
+ * host on <body> was open, focused and invisible. The host goes inside the
+ * fullscreen element — and is re-checked on every open, because a cached host
+ * left inside an element that has since left fullscreen (or left the document,
+ * when the router clears the screen) would otherwise stay wrong forever.
+ */
+describe("the menu host under element fullscreen", () => {
+  const ctxHost = (): El => [...body.children, ...body.children.flatMap((c) => c.children)].find((c) => c.cls.has("ctx-menu"))!;
+
+  afterEach(() => {
+    doc.fullscreenElement = null;
+  });
+
+  it("opens inside the fullscreen element, and back on <body> once fullscreen ends", () => {
+    showMenu(10, 10, [{ label: "Open", onSelect: () => {} }]);
+    const menuHost = ctxHost();
+    expect(menuHost.parentNode).toBe(body);
+    closeMenu();
+
+    const viewer = new El("div");
+    body.appendChild(viewer);
+    doc.fullscreenElement = viewer;
+    showMenu(10, 10, [{ label: "Show in folder", onSelect: () => {} }]);
+    // The same host, moved — not a second one.
+    expect(menuHost.parentNode).toBe(viewer);
+    expect(viewer.children.includes(menuHost)).toBe(true);
+    expect(body.children.includes(menuHost)).toBe(false);
+    expect(menuHost.textContent).toBe("Show in folder");
+    closeMenu();
+
+    doc.fullscreenElement = null;
+    showMenu(10, 10, [{ label: "Open", onSelect: () => {} }]);
+    expect(menuHost.parentNode).toBe(body);
+    expect(viewer.children.includes(menuHost)).toBe(false);
+    viewer.remove();
+  });
+
+  it("re-attaches a host whose screen was torn down underneath it", () => {
+    const viewer = new El("div");
+    body.appendChild(viewer);
+    doc.fullscreenElement = viewer;
+    showMenu(10, 10, [{ label: "Show in folder", onSelect: () => {} }]);
+    const menuHost = ctxHost();
+    closeMenu();
+
+    // The router clears the screen while it is still fullscreen: the viewer —
+    // and the host inside it — leave the document.
+    viewer.remove();
+    doc.fullscreenElement = null;
+    expect(menuHost.isConnected).toBe(false);
+
+    showMenu(10, 10, [{ label: "Open", onSelect: () => {} }]);
+    expect(menuHost.isConnected).toBe(true);
+    expect(menuHost.parentNode).toBe(body);
+    expect(menuHost.style.display).toBe("block");
   });
 });

@@ -84,6 +84,11 @@ function normalizeKey(key: string): string | null {
   // itself reports; without it a bare AltGr press in the Shortcuts capture
   // would be stored as a binding instead of waiting for the key it modifies.
   if (["Control", "Shift", "Alt", "Meta", "AltGraph"].includes(key)) return null;
+  // "+" is the chord separator, so it cannot also be the key: "Ctrl++" splits
+  // into nothing but the modifier, and normalizeChord read that as "deliberately
+  // unbound" — rebinding Zoom in to the numpad + (or the German + key) silently
+  // erased the action's chord. The key is spelled out instead.
+  if (key === "+") return "Plus";
   if (key.length === 1) return key.toUpperCase();
   return key; // ArrowLeft, Delete, Home, F1, …
 }
@@ -190,11 +195,18 @@ const KEY_ALIASES: Record<string, string> = {
   up: "ArrowUp",
   arrowdown: "ArrowDown",
   down: "ArrowDown",
+  plus: "Plus",
 };
 
 /** Normalize a user-stored chord string ("ctrl + shift + z" → "Ctrl+Shift+Z"). */
 export function normalizeChord(stored: string): string {
-  const bits = stored
+  // A trailing "+" that follows another "+" (or stands alone) is the plus KEY,
+  // as chordOf wrote it before it learned to say "Plus": "Ctrl++" was stored by
+  // every earlier build, and reading it as the key here migrates those strings
+  // instead of leaving the action unbound.
+  const trimmed = stored.trim();
+  const plusKey = trimmed === "+" || /\+\s*\+$/.test(trimmed);
+  const bits = (plusKey ? trimmed.slice(0, -1) : trimmed)
     .split("+")
     .map((s) => s.trim())
     .filter(Boolean);
@@ -210,6 +222,7 @@ export function normalizeChord(stored: string): string {
     else if (/^f\d{1,2}$/.test(low)) key = low.toUpperCase();
     else key = bit.charAt(0).toUpperCase() + bit.slice(1);
   }
+  if (plusKey) key = "Plus";
   if (!key) return "";
   const parts: string[] = [];
   if (mods.ctrl) parts.push("Ctrl");

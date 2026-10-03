@@ -2,13 +2,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProjectFile } from "../core/types";
 import { Store } from "../core/store";
 import { createPhotoImageProject } from "../core/image-project";
-import { addGeneratorLayer, layersOf, setLayerAdjust, setLayerTransform } from "./layers";
+import type { Stroke } from "../core/types";
+import { addDrawingLayer, addGeneratorLayer, appendStrokeTo, layersOf, setLayerAdjust, setLayerTransform } from "./layers";
 
 // The Layers panel mounted against a small fake DOM (vitest runs in node):
 // what it asks the preview resources for, the generator dialog's overlay
 // entry, and a row drag that loses the window.
 
 const menu = vi.hoisted(() => ({ items: [] as { label: string; onSelect: () => void }[] }));
+const toasts = vi.hoisted(() => ({ info: [] as string[], error: [] as string[], refuse: [] as string[] }));
+/** The picker and the probe, held open by the test (a slow PC's window). */
+const io = vi.hoisted(() => ({
+  pick: null as null | (() => Promise<string | null>),
+  probe: null as null | ((path: string) => Promise<unknown>),
+}));
 const gen = vi.hoisted(() => ({
   opts: null as null | {
     onCreate: (g: unknown, w: number, h: number, label: string) => void;
@@ -28,7 +35,27 @@ vi.mock("../editor/media/generators", () => ({
     return gen.closer;
   },
 }));
-vi.mock("../ui/toast", () => ({ toast: { error: () => {}, info: () => {} } }));
+vi.mock("../ui/toast", () => ({
+  toast: {
+    error: (m: string) => void toasts.error.push(m),
+    info: (m: string) => void toasts.info.push(m),
+    refuse: (m: string) => void toasts.refuse.push(m),
+  },
+}));
+vi.mock("../core/ipc", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../core/ipc")>();
+  return {
+    ...real,
+    pickImageFile: () => (io.pick ? io.pick() : Promise.resolve(null)),
+    ipc: { ...real.ipc, probeMedia: (path: string) => (io.probe ? io.probe(path) : Promise.reject(new Error("no probe"))) },
+  };
+});
+// The drawing caps, shrunk so Duplicate can be refused with a few strokes
+// (strokes.test.ts pins the real numbers).
+vi.mock("./strokes", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./strokes")>()),
+  MAX_TOTAL_STROKES: 3,
+}));
 vi.mock("./icons", () => ({ imgIcon: (n: string) => `<svg data-i="${n}"></svg>` }));
 vi.mock("../ui/icons", () => ({ icon: (n: string) => `<svg data-i="${n}"></svg>` }));
 vi.mock("./render/export", () => ({ maxRenderSize: (w: number, h: number) => ({ w, h, reduced: false }) }));
@@ -168,6 +195,11 @@ beforeEach(() => {
   win = new Listeners();
   menu.items = [];
   gen.opts = null;
+  toasts.info = [];
+  toasts.error = [];
+  toasts.refuse = [];
+  io.pick = null;
+  io.probe = null;
   vi.stubGlobal("Element", El);
   vi.stubGlobal("HTMLElement", El);
   vi.stubGlobal("document", {
@@ -342,6 +374,94 @@ describe("layers panel: row drag", () => {
     win.fire("blur", {}); // Alt-Tab: no pointerup will ever come
     down(t.solidId);
     expect(t.selection.get()).toBe(t.solidId);
+    t.handle.dispose();
+  });
+});
+
+describe("layers panel: Add layer > Photo", () => {
+  const still = {
+    path: "C:/pics/later.png", size: 9, mtimeMs: 0, kind: "image", duration: 0, hasAudio: false, width: 300, height: 201,
+  };
+
+  /** Opens Add layer > Photo with the probe held open; returns its release. */
+  async function addWithProbeHeld(t: ReturnType<typeof mount>) {
+    let release: (info: unknown) => void = () => {};
+    io.pick = () => Promise.resolve("C:/pics/later.png");
+    io.probe = () => new Promise((r) => (release = r));
+    t.host.find((e) => e.id === "imged-add-layer")!.fire("click", {});
+    const item = menu.items.find((i) => i.label === "Photo");
+    expect(item, "the Add layer menu names photo layers Photo, as their rows do").toBeDefined();
+    expect(menu.items.find((i) => i.label === "Image")).toBeUndefined();
+    item!.onSelect();
+    await flush();
+    return (info: unknown) => release(info);
+  }
+
+  it("adds the photo above the selection when nothing opened meanwhile", async () => {
+    const t = mount(1);
+    const release = await addWithProbeHeld(t);
+    release(still);
+    await flush();
+    expect(layersOf(t.store.get())).toHaveLength(3);
+    expect(layersOf(t.store.get())[0]!.name).toBe("later");
+    expect([toasts.info, toasts.refuse, toasts.error]).toEqual([[], [], []]);
+    t.handle.dispose();
+  });
+
+  it("a crop begun during the probe refuses the add, and says what to finish", async () => {
+    const t = mount(1);
+    const release = await addWithProbeHeld(t);
+    t.ctx.mode.set("crop-layer"); // the user started a crop while it probed
+    const before = t.store.get();
+    release(still);
+    await flush();
+    expect(t.store.get()).toBe(before);
+    expect(toasts.info).toEqual(["Finish the crop first, then add the photo again."]);
+    t.handle.dispose();
+  });
+
+  it("a probe that is not a still is refused, not recorded as a failure", async () => {
+    const t = mount(1);
+    const release = await addWithProbeHeld(t);
+    release({ ...still, kind: "video", duration: 3 });
+    await flush();
+    expect(layersOf(t.store.get())).toHaveLength(2);
+    expect(toasts.refuse).toEqual(["This isn't a still image."]);
+    expect(toasts.error).toEqual([]);
+    t.handle.dispose();
+  });
+});
+
+describe("layers panel: Duplicate", () => {
+  const pen = (x: number): Stroke => ({ t: "line", c: "#112233", w: 3, a: [x, 1], b: [x + 5, 9] });
+
+  it("duplicates a layer in one step, selecting the copy", async () => {
+    const t = mount(1);
+    let p = t.store.get();
+    const d = addDrawingLayer(p);
+    p = appendStrokeTo(d.project, d.trackId, pen(4));
+    t.store.set(p);
+    await flush();
+    t.list.fire("contextmenu", { target: t.row(d.trackId), clientX: 5, clientY: 5, preventDefault() {} });
+    const dup = menu.items.find((i) => i.label === "Duplicate");
+    expect(dup).toBeDefined();
+    dup!.onSelect();
+    expect(layersOf(t.store.get())).toHaveLength(4);
+    expect(layersOf(t.store.get())[0]!.name).toBe("Drawing 1 copy");
+    expect(toasts.refuse).toEqual([]);
+    t.handle.dispose();
+  });
+
+  it("refuses out loud a drawing whose copy would pass the caps every save checks", async () => {
+    const t = mount(1);
+    const d = addDrawingLayer(t.store.get());
+    const p = appendStrokeTo(appendStrokeTo(d.project, d.trackId, pen(4)), d.trackId, pen(20)); // 2 strokes; a copy makes 4 > 3
+    t.store.set(p);
+    await flush();
+    t.list.fire("contextmenu", { target: t.row(d.trackId), clientX: 5, clientY: 5, preventDefault() {} });
+    menu.items.find((i) => i.label === "Duplicate")!.onSelect();
+    expect(t.store.get()).toBe(p);
+    expect(toasts.refuse).toEqual(["This drawing is too large to duplicate."]);
     t.handle.dispose();
   });
 });

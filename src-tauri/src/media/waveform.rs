@@ -4,7 +4,9 @@
 //!
 //! Format: "TPK1" magic · u32le pairsPerSec · u32le pairCount · [i8 min, i8 max]×
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -15,6 +17,7 @@ use crate::cache::{Cache, CacheKind, MediaKey};
 use crate::error::{AppError, Result};
 use crate::jobs::{self, JobId, JobKind, Jobs, Lane};
 use crate::media::playability::{job_tmp_suffix, Inflight};
+use crate::media::source::{source_file, INPUT_PROTOCOL_ARGS};
 
 pub const SAMPLE_RATE: u32 = 8000;
 pub const PAIRS_PER_SEC: u32 = 100;
@@ -63,12 +66,29 @@ fn pairs_capacity_hint(duration: f64) -> usize {
     (duration.max(0.0) * PAIRS_PER_SEC as f64).min(MAX_PAIRS) as usize
 }
 
+/// The decode: the first audio stream as 8 kHz mono s16 on stdout. The input
+/// is limited to plain files (`media::source`): the path came out of a `.trt`.
+fn decode_args(src: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["-v".into(), "error".into()];
+    args.extend(INPUT_PROTOCOL_ARGS.iter().map(OsString::from));
+    args.push("-i".into());
+    args.push(src.into());
+    for a in ["-map", "a:0", "-ac", "1", "-ar"] {
+        args.push(a.into());
+    }
+    args.push(SAMPLE_RATE.to_string().into());
+    for a in ["-f", "s16le", "-"] {
+        args.push(a.into());
+    }
+    args
+}
+
 /// Decode + bucket the whole stream (runs on a worker thread). Emits progress
 /// through the job system using the known duration.
 fn extract(
     app: &AppHandle,
     handle: &jobs::JobHandle,
-    src: &str,
+    src: &Path,
     duration: f64,
     dst: &std::path::Path,
 ) -> Result<()> {
@@ -79,18 +99,10 @@ fn extract(
         return Err(AppError::Ffmpeg("canceled".into()));
     }
     let mut cmd = jobs::ffmpeg::command("ffmpeg")?;
-    cmd.args([
-        "-v", "error",
-        "-i", src,
-        "-map", "a:0",
-        "-ac", "1",
-        "-ar", &SAMPLE_RATE.to_string(),
-        "-f", "s16le",
-        "-",
-    ])
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .stdin(Stdio::null());
+    cmd.args(decode_args(src))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
 
     let mut child = jobs::ffmpeg::spawn_owned(&mut cmd)?;
     let mut stdout = child.stdout.take().expect("piped stdout");
@@ -165,13 +177,34 @@ pub enum WaveformResult {
     None,
 }
 
+/// Async, with the work on a blocking-pool thread, like `plan_playback` and
+/// for the same reasons: a cache hit can write the LRU index, and the source
+/// check stats a path that may be on a sleeping share. Concurrent requests
+/// for one waveform are serialized by `Inflight::claim`, not by the thread.
 #[tauri::command]
-pub fn ensure_waveform(
+pub async fn ensure_waveform(
     app: AppHandle,
     jobs: State<'_, Arc<Jobs>>,
     cache: State<'_, Arc<Cache>>,
     inflight: State<'_, Inflight>,
     key: MediaKey,
+    duration: f64,
+    has_audio: bool,
+) -> Result<WaveformResult> {
+    let (jobs, cache, inflight) = (Arc::clone(&jobs), Arc::clone(&cache), Inflight::clone(&inflight));
+    tauri::async_runtime::spawn_blocking(move || {
+        waveform_sync(&app, &jobs, &cache, &inflight, &key, duration, has_audio)
+    })
+    .await
+    .map_err(|e| AppError::Ffmpeg(format!("the waveform request stopped unexpectedly: {e}")))?
+}
+
+fn waveform_sync(
+    app: &AppHandle,
+    jobs: &Arc<Jobs>,
+    cache: &Arc<Cache>,
+    inflight: &Inflight,
+    key: &MediaKey,
     duration: f64,
     has_audio: bool,
 ) -> Result<WaveformResult> {
@@ -184,6 +217,10 @@ pub fn ensure_waveform(
             path: existing.to_string_lossy().into_owned(),
         });
     }
+    // A miss means ffmpeg will decode the source, and the path is the
+    // `.trt`'s: refused unless it names a real file (`media::source`).
+    // Checked after the lookup, so an offline file keeps the peaks it has.
+    let src = source_file(&key.path)?.to_path_buf();
     cache.ensure_kind_dir(CacheKind::Waveform)?;
     let final_path = cache.file_path(CacheKind::Waveform, &hash, ".pk");
 
@@ -198,7 +235,7 @@ pub fn ensure_waveform(
     // with a remux's or proxy's `.mp4`. Both claim sites use the same
     // `Inflight::claim`/`release` pair, so a canceled decode is replaced here
     // exactly as a canceled remux is there.
-    let (job_id, handle) = match inflight.claim(&jobs, &final_path, || {
+    let (job_id, handle) = match inflight.claim(jobs, &final_path, || {
         let h = jobs.allocate(JobKind::Waveform);
         (h.id, h)
     }) {
@@ -214,10 +251,9 @@ pub fn ensure_waveform(
     let tmp_path = cache.file_path(CacheKind::Waveform, &hash, &job_tmp_suffix(".pk", job_id));
 
     let app_clone = app.clone();
-    let jobs_arc = Arc::clone(&jobs);
-    let cache_arc = Arc::clone(&cache);
-    let inflight_arc = Inflight::clone(&inflight);
-    let src = key.path.clone();
+    let jobs_arc = Arc::clone(jobs);
+    let cache_arc = Arc::clone(cache);
+    let inflight_arc = Inflight::clone(inflight);
     let final_clone = final_path.clone();
 
     jobs.submit(
@@ -225,14 +261,15 @@ pub fn ensure_waveform(
         Box::new(move || {
             handle.set_output(tmp_path.clone());
             let extracted = extract(&app_clone, &handle, &src, duration, &tmp_path);
-            // Released before the rename, exactly as `ensure_prepared` does: the
-            // decode is what must not be duplicated, and a request arriving
-            // during the rename either finds the finished file or starts a fresh
-            // job, both of which are correct.
-            inflight_arc.release(&final_clone, handle.id);
+            // Released only once the `.pk` is in place (or the decode has
+            // failed), exactly as `ensure_prepared` does: released before the
+            // rename, a request arriving in between found neither the slot
+            // nor the file and started a second decode of the same media.
             match extracted {
                 Ok(()) => {
-                    if std::fs::rename(&tmp_path, &final_clone).is_ok() {
+                    let renamed = std::fs::rename(&tmp_path, &final_clone);
+                    inflight_arc.release(&final_clone, handle.id);
+                    if renamed.is_ok() {
                         cache_arc.mark_used(&final_clone);
                         jobs::complete_job(
                             &app_clone,
@@ -245,6 +282,7 @@ pub fn ensure_waveform(
                     }
                 }
                 Err(e) => {
+                    inflight_arc.release(&final_clone, handle.id);
                     jobs::fail_job(&app_clone, &jobs_arc, &handle, e.to_string(), Vec::new());
                 }
             }
@@ -388,6 +426,41 @@ mod tests {
         let write = body.find("write_pk(dst").expect("writes the peaks");
         let after_wait = body[wait..].find(guard).map(|i| i + wait).expect("guard after wait");
         assert!(after_wait < write, "a canceled job must not write or rename its peaks");
+    }
+
+    /// The decode argv, whole: the source limited to plain files right before
+    /// its `-i`, then the PCM shape the bucketing assumes.
+    #[test]
+    fn the_decode_opens_its_source_as_a_file_only() {
+        let src = Path::new(r"C:\media\talk one.mkv");
+        let args = decode_args(src);
+        crate::media::source::assert_inputs_whitelisted(&args);
+        let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            [
+                "-v", "error", "-protocol_whitelist", "file", "-i", r"C:\media\talk one.mkv",
+                "-map", "a:0", "-ac", "1", "-ar", "8000", "-f", "s16le", "-",
+            ]
+        );
+    }
+
+    /// The `.trt`'s path is checked on a miss before anything is claimed or
+    /// spawned, the checked path is the one decoded, and the command does its
+    /// work off the UI thread. Pinned in the source: both need an `AppHandle`.
+    #[test]
+    fn a_waveform_miss_checks_its_source_and_runs_off_the_ui_thread() {
+        let code = include_str!("waveform.rs").split("#[cfg(test)]").next().unwrap();
+        let flat: String = code.split_whitespace().collect();
+        assert!(flat.contains("pubasyncfnensure_waveform("));
+        assert!(flat.contains("spawn_blocking(move||{waveform_sync(&app,&jobs,&cache,&inflight,&key,duration,has_audio)})"));
+        let body = &flat[flat.find("fnwaveform_sync(").unwrap()..];
+        let lookup = body.find("cache.existing_file(CacheKind::Waveform,&hash,\".pk\")").unwrap();
+        let checked = body.find("letsrc=source_file(&key.path)?.to_path_buf();").expect("checked");
+        let claimed = body.find("inflight.claim(").unwrap();
+        assert!(lookup < checked && checked < claimed);
+        assert!(body.contains("extract(&app_clone,&handle,&src,duration,&tmp_path)"));
+        assert!(flat.contains("cmd.args(decode_args(src))"));
     }
 
     #[test]

@@ -121,8 +121,13 @@ impl Sniff {
 /// a named pipe or a raw device with size and mtime 0 — which an identity
 /// check can pass — and OPENING one of those is already the harm (a pipe
 /// blocks, a device reads the disk), so this is asked of the metadata before
-/// any open.
+/// any open. And before the metadata, the path must be a drive or share path
+/// (`media::source`): even a stat OPENS its target, and on a `\\.\pipe\`
+/// name that is a connection to whatever serves the pipe.
 fn open_regular(path: &Path) -> Option<std::fs::File> {
+    if !crate::media::source::is_file_namespace(path) {
+        return None;
+    }
     if !std::fs::metadata(path).ok()?.is_file() {
         return None;
     }
@@ -149,9 +154,9 @@ pub(crate) struct Still {
     /// its tag says, if it has one (`read_still`). The probe stores this as
     /// `MediaRef.noAutorotate` (`probe.rs`), the load-time repair stamps it on
     /// older entries (`project/store.rs`), the export builder reads that
-    /// stored answer (`export/builder.rs`), and the thumbnail and filmstrip
-    /// jobs, which hold only a path, ask `read_flag` (`media/thumbs.rs`) — the
-    /// same rule (`flag_of`) on the same file.
+    /// stored answer (`export/builder.rs`), and the thumbnail job, which
+    /// holds only a path, asks `read_flag` (`media/thumbs.rs`) — the same rule
+    /// (`flag_of`) on the same file.
     pub no_autorotate: bool,
     /// A flagged still's coded (width, height), from the header's own size
     /// fields — IHDR, the VP8X / VP8 / VP8L header, IFD0 — however its
@@ -235,7 +240,7 @@ pub(crate) fn read_still(path: &Path) -> Still {
 /// `read_still` without the sniff: the flag and a flagged still's coded size,
 /// from chunk and segment HEADERS alone — never the PNG tail search, which
 /// only a followed PNG's sniff reads. For the callers that need nothing more
-/// and may run often: the thumbnail and filmstrip jobs (once per cache miss)
+/// and may run often: the thumbnail job (once per cache miss)
 /// and the load-time recheck of stamped PNGs and WebPs (every load). Decided
 /// by the same `flag_of` as `read_still`, so the two never disagree.
 pub(crate) fn read_flag(path: &Path) -> Flag {

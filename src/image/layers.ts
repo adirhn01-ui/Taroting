@@ -33,15 +33,29 @@ import { fileStem } from "../core/format";
 import { sanitizeAdjust } from "./adjust/plan";
 import {
   appendStroke,
+  MAX_STROKE_POINTS,
   MAX_TOTAL_POINTS,
   MAX_TOTAL_STROKES,
   pointCountOf,
   removeStrokes,
+  strokeTotals,
   validateStroke,
+  type StrokeTotals,
 } from "./strokes";
-import { IMAGE_SCALE_GUARD } from "./geom";
+import { IMAGE_SCALE_GUARD, layerToCanvas } from "./geom";
 
 export type LayerKind = "photo" | "drawing" | "text" | "solid";
+
+/** What the UI calls each kind, in sentence case: the Layers panel's row
+ *  label, the inspector's badge and the Add layer menu all read this, so a
+ *  photo layer is a "Photo" wherever it is named. ("Image" is the whole
+ *  picture: Copy image, Export image, an image project.) */
+export const KIND_LABEL: Readonly<Record<LayerKind, string>> = {
+  photo: "Photo",
+  drawing: "Drawing",
+  text: "Text",
+  solid: "Solid color",
+};
 
 export interface Layer {
   trackId: string;
@@ -212,12 +226,37 @@ function side(v: number | undefined, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
+/** `t` nudged (by at most half a pixel on each axis) so that a layer drawn at
+ *  100% has its edges on whole canvas pixels; same reference when it already
+ *  has, or when it is not at 100% (a scaled layer is resampled anyway).
+ *
+ *  A layer centred on the canvas sits on whole pixels only when the canvas
+ *  side and the layer side have the same parity: a 200 px photo on a 641 px
+ *  canvas starts at 220.5, and an export at 100% then filters every pixel
+ *  between two source pixels — visibly soft for a screenshot or text. Read
+ *  through `layerToCanvas`, so a rotation or a crop is accounted for. */
+export function alignToPixels(
+  t: ClipTransform,
+  srcW: number,
+  srcH: number,
+  canvasW: number,
+  canvasH: number,
+): ClipTransform {
+  if (t.scale !== 1) return t;
+  const m = layerToCanvas(t, srcW, srcH, canvasW, canvasH);
+  const dx = Math.round(m[4]) - m[4];
+  const dy = Math.round(m[5]) - m[5];
+  if (dx === 0 && dy === 0) return t;
+  return { ...t, x: t.x + dx, y: t.y + dy };
+}
+
 /* ------------------------------------------------------------------ */
 /* Adding and removing layers                                          */
 /* ------------------------------------------------------------------ */
 
-/** A photo as a new layer, centred, at native pixels — scaled down only when
- *  it is larger than the canvas (`min(1, W/w, H/h)`: fit, never upscale).
+/** A photo as a new layer, centred (on whole pixels: `alignToPixels`), at
+ *  native pixels — scaled down only when it is larger than the canvas
+ *  (`min(1, W/w, H/h)`: fit, never upscale).
  *  Throws for anything that is not a still (a probed video, a GIF, a
  *  generator): such a layer would be dropped again on the next load, so a
  *  caller must refuse the file rather than commit it. */
@@ -234,7 +273,7 @@ export function addPhotoLayer(
   const H = p.timeline.height;
   const w = side(info.width, W);
   const h = side(info.height, H);
-  const transform = { ...defaultTransform(), scale: Math.min(1, W / w, H / h) };
+  const transform = alignToPixels({ ...defaultTransform(), scale: Math.min(1, W / w, H / h) }, w, h, W, H);
   return insertLayer(p, fileStem(info.path), media, transform, opts?.above);
 }
 
@@ -260,7 +299,9 @@ export function addDrawingLayer(
   return insertLayer(p, nextDrawingName(p), media, defaultTransform(), opts?.above);
 }
 
-/** A text or solid generator as a new layer, at native pixels, centred.
+/** A text or solid generator as a new layer, at native pixels, centred on
+ *  whole pixels (an even text box on an odd canvas would otherwise land on a
+ *  half pixel and export soft).
  *  `w`/`h` are its intrinsic box (the measured text box, or the solid's
  *  size); `label` is the MediaRef's display label (the path field). */
 export function addGeneratorLayer(
@@ -284,7 +325,8 @@ export function addGeneratorLayer(
     generator: gen,
   };
   const name = gen.type === "text" ? "Text" : "Solid";
-  return insertLayer(p, name, media, defaultTransform(), opts?.above);
+  const transform = alignToPixels(defaultTransform(), media.width!, media.height!, p.timeline.width, p.timeline.height);
+  return insertLayer(p, name, media, transform, opts?.above);
 }
 
 /** Removes the layer's clip AND its MediaRef; drops the track unless it is
@@ -351,16 +393,69 @@ export function renameLayer(p: ProjectFile, trackId: string, name: string): Proj
   return withTrack(p, trackId, { ...track, name: clean });
 }
 
+/* ------------------------------------------------------------------ */
+/* The drawing budget                                                  */
+/* ------------------------------------------------------------------ */
+
+/** Strokes and points across every drawing MediaRef, counted the way the save
+ *  check counts them: per MediaRef, so a duplicated drawing (which shares its
+ *  chunks by reference) counts twice, exactly as it is written twice. O(media)
+ *  per call — each drawing's own totals are memoized (`strokeTotals`). */
+export function drawingTotals(p: ProjectFile): StrokeTotals {
+  let strokes = 0;
+  let points = 0;
+  for (const m of p.media) {
+    const g = m.generator;
+    if (g?.type !== "drawing") continue;
+    const t = strokeTotals(g.chunks);
+    strokes += t.strokes;
+    points += t.points;
+  }
+  return { strokes, points };
+}
+
+/** Would `more` on top of what the project already holds stay inside the
+ *  caps `image_rules.rs` refuses a save beyond? Past them EVERY save fails —
+ *  autosave included — so the edit is refused instead of committed. */
+function fitsDrawingBudget(p: ProjectFile, more: StrokeTotals): boolean {
+  const t = drawingTotals(p);
+  return t.strokes + more.strokes <= MAX_TOTAL_STROKES && t.points + more.points <= MAX_TOTAL_POINTS;
+}
+
+/** Why this stroke cannot be added to the project, or null when it can: the
+ *  stroke alone holds more points than one stroke may, or the drawings would
+ *  cross the project-wide caps. `appendStrokeTo` refuses exactly these; a
+ *  caller says this message so the stroke does not vanish unexplained. */
+export function strokeRefusal(p: ProjectFile, s: Stroke): string | null {
+  const points = "p" in s ? pointCountOf(s.p) : 0;
+  if (points > MAX_STROKE_POINTS) return "This stroke is too long to keep. Draw it in shorter pieces.";
+  if (!fitsDrawingBudget(p, { strokes: 1, points })) {
+    return "The drawings in this image are at their size limit, so the stroke wasn't added.";
+  }
+  return null;
+}
+
+/** Why the layer cannot be duplicated, or null when it can: a drawing whose
+ *  copy would carry the project past the caps (the copy is written out in
+ *  full, though it shares its strokes in memory). Other kinds hold no strokes. */
+export function duplicateRefusal(p: ProjectFile, trackId: string): string | null {
+  const l = findLayer(p, trackId);
+  if (!l || l.kind !== "drawing") return null;
+  const gen = l.media.generator as DrawingGen;
+  return fitsDrawingBudget(p, strokeTotals(gen.chunks)) ? null : "This drawing is too large to duplicate.";
+}
+
 /** New ids for the track, the clip AND the MediaRef, for EVERY kind (each
  *  layer owns its media 1:1), placed directly above the original and named
  *  "<name> copy". A drawing's chunks are shared by reference — strokes are
- *  immutable — so duplicating one is O(1) however much is drawn on it. */
+ *  immutable — so duplicating one is O(1) however much is drawn on it. A
+ *  drawing too large to copy (`duplicateRefusal`) → same project. */
 export function duplicateLayer(
   p: ProjectFile,
   trackId: string,
 ): { project: ProjectFile; trackId: string } {
   const l = findLayer(p, trackId);
-  if (!l) return { project: p, trackId };
+  if (!l || duplicateRefusal(p, trackId) !== null) return { project: p, trackId };
   const media: MediaRef = { ...l.media, id: uid() };
   const clip: Clip = { ...l.clip, id: uid(), mediaId: media.id };
   const track: Track = {
@@ -434,11 +529,11 @@ export function setLayerAdjust(
 /* ------------------------------------------------------------------ */
 
 /** Append a committed stroke to a drawing layer. Copies the layer's chunk
- *  index and last chunk only (see strokes.ts). Not a drawing layer → same
- *  reference. */
+ *  index and last chunk only (see strokes.ts). Not a drawing layer, or a
+ *  stroke the save check would refuse (`strokeRefusal`) → same reference. */
 export function appendStrokeTo(p: ProjectFile, trackId: string, s: Stroke): ProjectFile {
   const l = findLayer(p, trackId);
-  if (!l || l.kind !== "drawing") return p;
+  if (!l || l.kind !== "drawing" || strokeRefusal(p, s) !== null) return p;
   const gen = l.media.generator as DrawingGen;
   const media: MediaRef = {
     ...l.media,
@@ -556,15 +651,28 @@ export function cropImage(
   };
 }
 
-/** New canvas size, anchored at the centre: layer x/y are offsets from the
- *  centre, so they stay as they are. Sides are `clampImageCanvas`ed (any
- *  integer >= 1). Unchanged or not a number → same reference. */
+/** New canvas size, anchored at the centre — to the whole pixel: the old
+ *  picture lands `floor((new − old) / 2)` px in from the new edge. Layer x/y
+ *  are offsets from the centre, so on an even change they stay as they are;
+ *  an odd change moves the centre by half a pixel, and every layer shifts by
+ *  that half pixel back, so a layer that sat on whole pixels still does (an
+ *  exact-centre anchor would leave each one straddling two). Sides are
+ *  `clampImageCanvas`ed (any integer >= 1). Unchanged or not a number → same
+ *  reference. */
 export function resizeCanvas(p: ProjectFile, w: number, h: number): ProjectFile {
   if (!Number.isFinite(w) || !Number.isFinite(h)) return p;
   const width = clampImageCanvas(w);
   const height = clampImageCanvas(h);
-  if (width === p.timeline.width && height === p.timeline.height) return p;
-  return { ...p, timeline: { ...p.timeline, width, height } };
+  const { width: W, height: H } = p.timeline;
+  if (width === W && height === H) return p;
+  // 0 for an even change, −0.5 for an odd one (either sign of change).
+  const sx = Math.floor((width - W) / 2) - (width - W) / 2;
+  const sy = Math.floor((height - H) / 2) - (height - H) / 2;
+  // Decided BEFORE mapTransforms, which reports a change for any non-empty
+  // track whatever its function does.
+  const tracks =
+    sx === 0 && sy === 0 ? null : mapTransforms(p, (t) => ({ ...t, x: t.x + sx, y: t.y + sy }));
+  return { ...p, timeline: { ...p.timeline, width, height, tracks: tracks ?? p.timeline.tracks } };
 }
 
 /** "transparent", or any colour `normalizeHexColor` reads (stored as
@@ -579,12 +687,14 @@ export type DrawTarget = { trackId: string } | { create: { above: string | null 
 
 /** Nearest VISIBLE drawing layer at or above `selected` (or topmost visible
  *  drawing if selected is null); else create one directly above `selected`
- *  (top if null). A hidden drawing layer is never drawn on — ink nobody can
- *  see is worse than a new layer. A selection that is not a layer counts as
+ *  (top if null). A hidden or 0%-opacity drawing layer is never drawn on —
+ *  ink nobody can see is worse than a new layer. A selection that is not a layer counts as
  *  null. */
 export function drawingTarget(p: ProjectFile, selected: string | null): DrawTarget {
   const layers = layersOf(p);
-  const drawable = (l: Layer): boolean => l.kind === "drawing" && !l.hidden;
+  // A 0% layer is as invisible as a hidden one: the compositor skips it, the
+  // live mark included, so ink on it would be committed and never seen.
+  const drawable = (l: Layer): boolean => l.kind === "drawing" && !l.hidden && opacityOf(l) > 0;
   const at = selected === null ? -1 : layers.findIndex((l) => l.trackId === selected);
   if (at < 0) {
     // No selection: the topmost visible drawing (index 0 is the top).

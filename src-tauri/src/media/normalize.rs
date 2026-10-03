@@ -1,10 +1,15 @@
 //! Peak analysis for the Normalize button: run ffmpeg volumedetect over a
 //! clip's source range and suggest the gain that brings the peak to -1 dBFS.
 
+use std::ffi::OsString;
+use std::path::Path;
+use std::time::Duration;
+
 use serde::Serialize;
 
 use crate::error::{AppError, Result};
 use crate::jobs::ffmpeg;
+use crate::media::source::{source_file, INPUT_PROTOCOL_ARGS};
 
 pub const TARGET_PEAK_DB: f64 = -1.0;
 
@@ -60,18 +65,36 @@ pub fn parse_max_volume(stderr: &str) -> Option<f64> {
     None
 }
 
+/// How long one analysis may run. It decodes only the clip's own range of
+/// audio, which takes seconds even for an hour of it; the bound is for a
+/// source that never answers (a share that went to sleep), which before this
+/// held the Normalize button's task forever.
+const SCAN_DEADLINE: Duration = Duration::from_secs(300);
+
+/// The volumedetect pass over `[src_in, src_out]` of `src`, its input limited
+/// to plain files (`media::source`): the path came out of a `.trt`.
+fn scan_args(src: &Path, src_in: f64, src_out: f64) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["-hide_banner".into()];
+    args.push("-ss".into());
+    args.push(format!("{src_in:.3}").into());
+    args.push("-to".into());
+    args.push(format!("{src_out:.3}").into());
+    args.extend(INPUT_PROTOCOL_ARGS.iter().map(OsString::from));
+    args.push("-i".into());
+    args.push(src.into());
+    for a in ["-map", "a:0", "-af", "volumedetect", "-f", "null", "-"] {
+        args.push(a.into());
+    }
+    args
+}
+
 fn scan_sync(path: &str, src_in: f64, src_out: f64) -> Result<NormalizeResult> {
+    let src = source_file(path)?;
     let mut cmd = ffmpeg::command("ffmpeg")?;
-    cmd.args([
-        "-hide_banner",
-        "-ss", &format!("{src_in:.3}"),
-        "-to", &format!("{src_out:.3}"),
-        "-i", path,
-        "-map", "a:0",
-        "-af", "volumedetect",
-        "-f", "null", "-",
-    ]);
-    let out = ffmpeg::output_owned(&mut cmd)?;
+    cmd.args(scan_args(src, src_in, src_out));
+    let out = ffmpeg::run_with_deadline(cmd, SCAN_DEADLINE)?.ok_or_else(|| {
+        AppError::Ffmpeg("volume analysis took too long and was stopped".into())
+    })?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
         return Err(AppError::Ffmpeg(format!(
@@ -151,6 +174,32 @@ mod tests {
         // Only implausible corrections are bounded.
         assert_eq!(result_for_max(-80.0).unwrap().suggested_gain_db, 30.0);
         assert_eq!(result_for_max(60.0).unwrap().suggested_gain_db, -40.0);
+    }
+
+    /// The analysis argv, whole: the source limited to plain files right
+    /// before its `-i`, and the range formatted as before.
+    #[test]
+    fn the_analysis_opens_its_source_as_a_file_only() {
+        let args = scan_args(Path::new(r"C:\audio\take two.wav"), 1.5, 4.25);
+        crate::media::source::assert_inputs_whitelisted(&args);
+        let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            [
+                "-hide_banner", "-ss", "1.500", "-to", "4.250",
+                "-protocol_whitelist", "file", "-i", r"C:\audio\take two.wav",
+                "-map", "a:0", "-af", "volumedetect", "-f", "null", "-",
+            ]
+        );
+    }
+
+    /// A URL or a device from a `.trt` is refused as bad input before any
+    /// ffmpeg starts (a URL used to be fetched and analysed).
+    #[test]
+    fn a_path_that_is_not_a_file_is_refused() {
+        for path in ["https://example.com/a.wav", r"\\.\pipe\a.wav", "a.wav"] {
+            assert!(matches!(scan_sync(path, 0.0, 1.0), Err(AppError::BadInput(_))), "{path}");
+        }
     }
 
     /// E2E: a -20 dB sine peak should suggest ≈ +19 dB of gain.

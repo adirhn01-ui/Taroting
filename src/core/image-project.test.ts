@@ -128,7 +128,31 @@ describe("createPhotosImageProject", () => {
     expect(bottom!.transform!.scale).toBe(1);
     for (const c of [top, mid, bottom]) {
       expect(c).toMatchObject({ timelineStart: 0, srcIn: 0, srcOut: 1, speed: 1 });
-      expect(c!.transform).toMatchObject({ x: 0, y: 0, rotate: 0, opacity: 1 });
+      expect(c!.transform).toMatchObject({ rotate: 0, opacity: 1 });
+    }
+    // The canvas-sized and the scaled picture sit exactly centred; the small
+    // one (17×29 on 36×64: odd differences both ways) half a pixel off it.
+    expect([bottom!.transform!.x, bottom!.transform!.y]).toEqual([0, 0]);
+    expect([mid!.transform!.x, mid!.transform!.y]).toEqual([0, 0]);
+    expect([top!.transform!.x, top!.transform!.y]).toEqual([0.5, 0.5]);
+  });
+
+  it("puts a picture at actual size on whole canvas pixels, axis by axis", () => {
+    // 36×64 canvas. 17×30: odd across, even down. 18×29: even across, odd down.
+    const across = still({ path: "C:\\p\\c.png", width: 17, height: 30 });
+    const down = still({ path: "C:\\p\\d.png", width: 18, height: 29 });
+    const p = createPhotosImageProject("Grid", [first, across, down]);
+    const byPath = (path: string) => {
+      const m = p.media.find((x) => x.path === path)!;
+      return p.timeline.tracks.find((t) => t.clips[0]!.mediaId === m.id)!.clips[0]!.transform!;
+    };
+    expect([byPath(across.path).x, byPath(across.path).y]).toEqual([0.5, 0]);
+    expect([byPath(down.path).x, byPath(down.path).y]).toEqual([0, 0.5]);
+    // The left/top edge, (W − w) / 2 + x, is a whole number for every layer.
+    for (const info of [first, across, down]) {
+      const t = byPath(info.path);
+      expect(Number.isInteger((36 - info.width!) / 2 + t.x), info.path).toBe(true);
+      expect(Number.isInteger((64 - info.height!) / 2 + t.y), info.path).toBe(true);
     }
   });
 

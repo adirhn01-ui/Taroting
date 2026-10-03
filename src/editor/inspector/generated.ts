@@ -19,6 +19,16 @@ const MAX_DIM = 8192;
 const clamp = (v: number, lo: number, hi: number): number => Math.min(Math.max(v, lo), hi);
 const evenDim = (v: number): number => clamp(Math.round(v / 2) * 2, MIN_DIM, MAX_DIM);
 
+/** A number field's value, or `fallback` when it holds none. An emptied field
+ *  (or one left at "-") reads "", and Number("") is 0 — which used to commit
+ *  the minimum size, an 8 px text or a 16 px solid, for a field the user had
+ *  only cleared on the way to typing a new number. */
+function numberOr(input: HTMLInputElement, fallback: number): number {
+  if (input.value === "") return fallback;
+  const v = Number(input.value);
+  return Number.isFinite(v) ? v : fallback;
+}
+
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
   cls?: string,
@@ -110,8 +120,8 @@ function buildSolid(
   hInput.value = String(media.height ?? MIN_DIM);
 
   const applyDims = (): void => {
-    const w = evenDim(Number(wInput.value) || MIN_DIM);
-    const h = evenDim(Number(hInput.value) || MIN_DIM);
+    const w = evenDim(numberOr(wInput, media.width ?? MIN_DIM));
+    const h = evenDim(numberOr(hInput, media.height ?? MIN_DIM));
     wInput.value = String(w);
     hInput.value = String(h);
     commitMedia({ width: w, height: h });
@@ -187,7 +197,7 @@ function buildText(
     type: "text",
     text: textarea.value,
     fontFamily: fontSel.value as FontFamily,
-    sizePx: clamp(Math.round(Number(sizeInput.value) || MIN_SIZE), MIN_SIZE, MAX_SIZE),
+    sizePx: clamp(Math.round(numberOr(sizeInput, gen.sizePx)), MIN_SIZE, MAX_SIZE),
     color: color.value,
     bold: boldSwitch.checked,
     italic: italicSwitch.checked,

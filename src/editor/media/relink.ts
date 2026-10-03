@@ -6,7 +6,7 @@
 // re-track the media so previews rebuild. Unresolved rows are surfaced via a
 // toast if the user closes early.
 
-import { escapeHtml, fileExt, fileStem } from "../../core/format";
+import { escapeHtml, fileExt, fileName, fileStem } from "../../core/format";
 import { inTauri, ipc } from "../../core/ipc";
 import { findMedia, MIN_CLIP_DUR, updateClip, updateMedia } from "../../core/project";
 import type { ProjectSession } from "../../core/session";
@@ -199,9 +199,13 @@ export function openRelinkDialog(ctx: RelinkCtx): () => void {
   const releaseTrap = trapTab(backdrop);
 
   let closed = false;
+  /** Closed by the screen that opened it (the quiet closer: an Explorer open
+   *  replaced the editor) rather than by the user's own Close. */
+  let closedByScreen = false;
   function close(quiet = false): void {
     if (closed) return;
     closed = true;
+    closedByScreen = quiet;
     document.removeEventListener("keydown", onKeydown, true);
     releaseTrap();
     backdrop.remove();
@@ -226,17 +230,24 @@ export function openRelinkDialog(ctx: RelinkCtx): () => void {
   backdrop.querySelector("[data-close]")!.addEventListener("click", () => close());
   backdrop.querySelector("[data-close-btn]")!.addEventListener("click", () => close());
 
-  /** Apply a probed replacement for a media id. */
-  function apply(m: MediaRef, path: string, info: MediaInfo): void {
+  /** Apply a probed replacement for a media id. A closed dialog applies
+   *  nothing: the editor that opened it has closed with it, and its session
+   *  must not take a relink nobody will see saved. */
+  function apply(m: MediaRef, path: string, info: MediaInfo, row: HTMLElement): void {
+    if (closed) return;
     session.commit((p) => applyRelink(p, m.id, path, info));
-    media.retrack(m.id);
+    // `fileChanged`: this is a different file now, so the old one's waveform
+    // and thumbnail go with it instead of standing in until a reopen.
+    media.retrack(m.id, true);
     resolved.add(m.id);
-    markResolved(m.id, path);
+    markResolved(row, path);
   }
 
-  function markResolved(id: string, path: string): void {
-    const row = listEl.querySelector<HTMLElement>(`[data-row="${id}"]`);
-    if (!row) return;
+  /** The row is the one Locate was pressed on, handed through rather than
+   *  looked up again: a lookup built a selector from the media id, and an id
+   *  holding a quote or a bracket made querySelector throw AFTER the relink
+   *  had committed, so the row never said "Relinked". */
+  function markResolved(row: HTMLElement, path: string): void {
     row.classList.add("relink-row--resolved");
     const status = row.querySelector<HTMLElement>(".relink-row__status");
     if (status) {
@@ -274,6 +285,11 @@ export function openRelinkDialog(ctx: RelinkCtx): () => void {
     });
     const path = typeof picked === "string" ? picked : null;
     if (!path) return;
+    // The picker and the probe below are awaits the dialog can close across.
+    if (closed) {
+      refuseClosed(path);
+      return;
+    }
 
     const status = row.querySelector<HTMLElement>(".relink-row__status");
     if (status) {
@@ -285,11 +301,19 @@ export function openRelinkDialog(ctx: RelinkCtx): () => void {
     try {
       info = await ipc.probeMedia(path);
     } catch (e) {
+      if (closed) {
+        refuseClosed(path);
+        return;
+      }
       if (status) {
         status.className = "relink-row__status relink-row__status--bad";
         status.textContent = "Couldn't read that file.";
       }
       void e;
+      return;
+    }
+    if (closed) {
+      refuseClosed(path);
       return;
     }
 
@@ -313,10 +337,17 @@ export function openRelinkDialog(ctx: RelinkCtx): () => void {
       if (kindDiffers) parts.push(`kind ${m.kind} → ${info.kind}`);
       if (durDiffers) parts.push(`length ${oldDur.toFixed(1)}s → ${info.duration.toFixed(1)}s`);
       if (status) status.textContent = "Differs from original";
-      showWarn(row, `This file differs (${parts.join(", ")}).`, () => apply(m, path, info));
+      showWarn(row, `This file differs (${parts.join(", ")}).`, () => apply(m, path, info, row));
       return;
     }
-    apply(m, path, info);
+    apply(m, path, info, row);
+  }
+
+  /** A pick that answered after the dialog closed is dropped. When the screen
+   *  closed it, the user never chose to stop, so they are told; a dialog they
+   *  closed themselves needs no word. */
+  function refuseClosed(path: string): void {
+    if (closedByScreen) toast.refuse(`${fileName(path)} wasn't relinked because the project was closed.`);
   }
 
   for (const m of rows) {

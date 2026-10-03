@@ -220,6 +220,19 @@ describe("move and the centre snap", () => {
     expect(m.y).toBe(0);
   });
 
+  it("a centre snap keeps the move whole, so a layer on whole pixels stays on them", () => {
+    // A 200×101 photo on the 641×361 canvas sits on whole pixels at x = 0.5,
+    // y = 0 (and at every whole step from there). Dragged to 3.5 px right of
+    // the centre it snaps — to x = 0.5, not to the exact (half-pixel) centre.
+    const a = moveWithSnap(10.5, -7, { x: 10.5, y: -7 }, -7, -4, 8);
+    expect(a).toEqual({ x: 0.5, y: -11, snappedX: true, snappedY: false });
+    // A drawing whose strokes' centre is off the grid: the snap lands its
+    // layer on a whole-pixel move too (the delta, not the centre, is kept whole).
+    const d = moveWithSnap(4, 2, { x: 57.3, y: -12.6 }, -55, 10, 8);
+    expect(d.snappedX && d.snappedY).toBe(true);
+    expect([d.x - 4, d.y - 2]).toEqual([-57, 13]);
+  });
+
   it("moves in whole canvas px: a (+40, +25) drag at zoom 1 is exactly that", () => {
     expect(moveWithSnap(30, -10, { x: 30, y: -10 }, 40, 25, 8)).toEqual({
       x: 70, y: 15, snappedX: false, snappedY: false,

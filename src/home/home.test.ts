@@ -16,9 +16,21 @@ vi.mock("../core/ipc", () => ({
 vi.mock("../core/nav", () => ({ navigate: () => {} }));
 vi.mock("../core/open-media", () => ({ isTempProjectPath: async () => false }));
 vi.mock("../ui/menu", () => ({ showMenu: () => {}, closeMenu: () => {} }));
-vi.mock("../ui/toast", () => ({ toast: { error: () => {}, info: () => {} } }));
+vi.mock("../ui/toast", () => ({ toast: { error: () => {}, info: () => {}, refuse: () => {} } }));
 
-const { openRouteInfo, openRouteNotice, routeDrop, routeOpenPicks } = await import("./home");
+const {
+  emptyGridHtml,
+  gridEnterAction,
+  isSearchChord,
+  modalEnterConfirms,
+  openRouteInfo,
+  openRouteNotice,
+  orphanRowsHtml,
+  routeDrop,
+  routeOpenPicks,
+  sortRecents,
+} = await import("./home");
+import type { RecentItem } from "../core/types";
 
 describe("routeOpenPicks (Home's Open)", () => {
   it("does nothing when nothing was picked", () => {
@@ -96,5 +108,116 @@ describe("Home never opens media in the viewer", () => {
     // other path in the screen navigates there either.
     const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "home.ts"), "utf8");
     expect(src).not.toMatch(/view:\s*"viewer"/);
+  });
+});
+
+describe("sortRecents by Name", () => {
+  const rec = (name: string, i: number): RecentItem => ({
+    path: `C:\\Docs\\${i}.trt`,
+    name,
+    modifiedAt: `2026-09-0${i}T10:00:00Z`,
+    durationSec: 0,
+    thumb: null,
+    sizeBytes: i,
+  });
+
+  it("is natural, the way Explorer orders names: 2 before 10, case ignored", () => {
+    // Input order differs from every expected position, and a plain
+    // localeCompare would put "Clip 10" before "Clip 2".
+    const items = [rec("Clip 10", 1), rec("clip 3", 2), rec("Clip 2", 3), rec("Clip 1", 4)];
+    expect(sortRecents(items, "name").map((r) => r.name)).toEqual(["Clip 1", "Clip 2", "clip 3", "Clip 10"]);
+    // The input is not reordered in place.
+    expect(items.map((r) => r.name)).toEqual(["Clip 10", "clip 3", "Clip 2", "Clip 1"]);
+  });
+});
+
+/** An event target whose `closest` answers for the selectors listed. */
+const inside = (...sels: string[]) => ({ closest: (s: string) => (sels.includes(s) ? {} : null) });
+
+describe("gridEnterAction (Enter on the recents grid)", () => {
+  it("opens a focused card", () => {
+    expect(gridEnterAction(inside(".project-card"), false)).toBe("open");
+  });
+
+  it("leaves Enter on a card's More button to the button's own click (the menu)", () => {
+    expect(gridEnterAction(inside(".project-card", "[data-more]"), false)).toBeNull();
+  });
+
+  it("leaves Enter in an inline rename to the rename", () => {
+    expect(gridEnterAction(inside(".project-card", ".project-card__rename"), false)).toBeNull();
+  });
+
+  it("toggles in select mode, More button included, and ignores anything outside a card", () => {
+    expect(gridEnterAction(inside(".project-card"), true)).toBe("toggle");
+    expect(gridEnterAction(inside(".project-card", "[data-more]"), true)).toBe("toggle");
+    expect(gridEnterAction(inside(), false)).toBeNull();
+    expect(gridEnterAction(inside("[data-more]"), true)).toBeNull();
+  });
+});
+
+describe("modalEnterConfirms (Enter in a Home dialog)", () => {
+  const input = { id: "input" };
+  const cancel = { id: "cancel" };
+
+  it("confirms only from the name field", () => {
+    expect(modalEnterConfirms({ key: "Enter", target: input }, input)).toBe(true);
+  });
+
+  it("never confirms from a focused Cancel (or any other button)", () => {
+    expect(modalEnterConfirms({ key: "Enter", target: cancel }, input)).toBe(false);
+  });
+
+  it("leaves a dialog without a field, other keys and an IME's Enter alone", () => {
+    expect(modalEnterConfirms({ key: "Enter", target: cancel }, null)).toBe(false);
+    expect(modalEnterConfirms({ key: "Escape", target: input }, input)).toBe(false);
+    expect(modalEnterConfirms({ key: "Enter", target: input, isComposing: true }, input)).toBe(false);
+  });
+});
+
+describe("isSearchChord (Ctrl+F)", () => {
+  const ev = (key: string, code: string, mods: Partial<Record<"ctrlKey" | "altKey" | "shiftKey", boolean>> = {}) => ({
+    key,
+    code,
+    ctrlKey: false,
+    altKey: false,
+    shiftKey: false,
+    metaKey: false,
+    ...mods,
+  });
+
+  it("matches Ctrl+F by label and, on a non-Latin layout, by position", () => {
+    expect(isSearchChord(ev("f", "KeyF", { ctrlKey: true }))).toBe(true);
+    expect(isSearchChord(ev("כ", "KeyF", { ctrlKey: true }))).toBe(true);
+  });
+
+  it("does not match plain F, Ctrl+Shift+F, or a Latin layout's F on another key", () => {
+    expect(isSearchChord(ev("f", "KeyF"))).toBe(false);
+    expect(isSearchChord(ev("F", "KeyF", { ctrlKey: true, shiftKey: true }))).toBe(false);
+    // Dvorak: the key labelled F sits where QWERTY has Y; Ctrl+U at KeyF is not find.
+    expect(isSearchChord(ev("u", "KeyF", { ctrlKey: true }))).toBe(false);
+  });
+});
+
+describe("the grid's empty states", () => {
+  it("tells an unreadable list apart from an empty one, with a way to try again", () => {
+    const err = emptyGridHtml("error");
+    expect(err).toContain("Couldn't read your recent projects.");
+    expect(err).toContain('data-act="retry-recents"');
+    expect(err).not.toContain("No projects yet.");
+    expect(emptyGridHtml("none")).toContain("No projects yet.");
+    expect(emptyGridHtml("none")).not.toContain("retry-recents");
+    expect(emptyGridHtml("searching")).toContain("No projects match your search.");
+  });
+});
+
+describe("orphanRowsHtml (Recover lines)", () => {
+  it("names each orphan by its file, escaped, keyed by index rather than by path", () => {
+    const html = orphanRowsHtml(["C:\\tmp\\Holiday.trt", "C:\\tmp\\<b>&co.trt"]);
+    expect(html).toContain("<strong>Holiday</strong>");
+    expect(html).toContain("<strong>&lt;b&gt;&amp;co</strong>");
+    expect(html).toContain('data-recover="0"');
+    expect(html).toContain('data-recover="1"');
+    expect(html).not.toContain("tmp");
+    expect(orphanRowsHtml([])).toBe("");
   });
 });

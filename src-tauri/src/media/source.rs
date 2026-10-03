@@ -24,17 +24,11 @@ use crate::error::{AppError, Result};
 /// The input option that limits ffmpeg to plain files for the input after it.
 /// Goes immediately before each file `-i` (not before a lavfi `color` or
 /// `anullsrc` input, which opens no protocol at all).
-// Not referenced yet: the media and export argv builders adopt it in this
-// same release. Drop the allow when they do.
-#[allow(dead_code)]
 pub const INPUT_PROTOCOL_ARGS: [&str; 2] = ["-protocol_whitelist", "file"];
 
 /// `path` as a `Path`, when it names an existing file a sidecar may open:
 /// spelled in full, on a drive or a share, not a device, and a file rather
 /// than a folder. Anything else is `BadInput`, with no ffmpeg started.
-// Not called yet: the media and export sinks adopt it in this same release.
-// Drop the allow when they do.
-#[allow(dead_code)]
 pub fn source_file(path: &str) -> Result<&Path> {
     if path.is_empty() {
         return refuse("No media file was given.");
@@ -98,6 +92,22 @@ pub(crate) fn is_file_namespace(path: &Path) -> bool {
 #[cfg(not(windows))]
 pub(crate) fn is_file_namespace(path: &Path) -> bool {
     path.is_absolute()
+}
+
+/// The argv check every sink's tests share: each `-i` in `args` comes right
+/// after [`INPUT_PROTOCOL_ARGS`], and there is at least one `-i` (an argv with
+/// none would pass vacuously). Panics with the argv on a miss.
+#[cfg(test)]
+pub(crate) fn assert_inputs_whitelisted<S: AsRef<std::ffi::OsStr>>(args: &[S]) {
+    let args: Vec<String> = args.iter().map(|a| a.as_ref().to_string_lossy().into_owned()).collect();
+    let inputs: Vec<usize> = (0..args.len()).filter(|&i| args[i] == "-i").collect();
+    assert!(!inputs.is_empty(), "no -i in {args:?}");
+    for i in inputs {
+        assert!(
+            i >= 2 && args[i - 2..i] == INPUT_PROTOCOL_ARGS,
+            "the -i at {i} is not limited to files: {args:?}"
+        );
+    }
 }
 
 #[cfg(test)]

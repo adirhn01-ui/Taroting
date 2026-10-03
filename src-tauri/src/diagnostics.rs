@@ -21,14 +21,23 @@ const KEEP: usize = 10;
 const PREFIX: &str = "taroting-report-";
 const SUFFIX: &str = ".txt";
 
-/// Current UTC time as a filename-safe stamp, e.g. `20260728-140501Z`.
+/// Milliseconds since the Unix epoch, now.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// A UTC time (epoch milliseconds) as a filename-safe stamp, e.g.
+/// `20260728-140501-042Z`. Fixed width, so name order stays age order for
+/// `prune`. Milliseconds because two saves in one second (a double-click on
+/// Save report) used to get the same name, and the second overwrote the first.
 /// (`project::store::now_iso8601` is the ISO form; its colons are illegal in a
 /// Windows filename, so this variant is separate by necessity.)
-fn utc_stamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+fn utc_stamp(millis: u64) -> String {
+    let ms = millis % 1000;
+    let secs = millis / 1000;
     let days = (secs / 86_400) as i64;
     let tod = secs % 86_400;
     let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
@@ -43,7 +52,7 @@ fn utc_stamp() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
-    format!("{year:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}Z")
+    format!("{year:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}-{ms:03}Z")
 }
 
 /// Truncate to at most `MAX_BYTES`, never mid-character (validate before you
@@ -77,14 +86,42 @@ fn prune(dir: &Path) {
     }
 }
 
+/// A name already taken moves the stamp on by this many milliseconds, at most.
+const NAME_TRIES: u64 = 1000;
+
 /// Write one report into `dir` and prune. Split out from the command so it is
 /// testable without writing into the real user profile.
 fn write_report(dir: &Path, content: &str) -> Result<String> {
+    write_report_at(dir, content, now_millis())
+}
+
+/// [`write_report`] at a given time, so a test can make two saves collide.
+///
+/// The file is created with `create_new`, never truncated: a name that is
+/// already there (a second save in the same millisecond, or a clock set back)
+/// moves the stamp on by one millisecond rather than overwriting a report. A
+/// later stamp, not a "-2" suffix: the suffix would sort before the original
+/// and break name-order-is-age-order.
+fn write_report_at(dir: &Path, content: &str, millis: u64) -> Result<String> {
+    use std::io::Write;
     std::fs::create_dir_all(dir)?;
-    let path = dir.join(format!("{PREFIX}{}{SUFFIX}", utc_stamp()));
-    std::fs::write(&path, capped(content).as_bytes())?;
-    prune(dir);
-    Ok(path.to_string_lossy().into_owned())
+    for step in 0..NAME_TRIES {
+        let path = dir.join(format!("{PREFIX}{}{SUFFIX}", utc_stamp(millis.saturating_add(step))));
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if let Err(e) = file.write_all(capped(content).as_bytes()) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(e.into());
+        }
+        drop(file);
+        prune(dir);
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    Err(AppError::BadInput("no free name for the diagnostic report".into()))
 }
 
 /// `%LOCALAPPDATA%\Taroting\diagnostics`, derived from the cache dir's parent so
@@ -115,8 +152,8 @@ mod tests {
 
     #[test]
     fn utc_stamp_is_filename_safe_and_sorts_chronologically() {
-        let s = utc_stamp();
-        assert_eq!(s.len(), 16, "unexpected stamp: {s}");
+        let s = utc_stamp(now_millis());
+        assert_eq!(s.len(), 20, "unexpected stamp: {s}");
         assert!(s.ends_with('Z'));
         assert!(
             !s.contains(':') && !s.contains('/') && !s.contains('\\'),
@@ -124,9 +161,35 @@ mod tests {
         );
         let year: i64 = s[0..4].parse().unwrap();
         assert!((2024..3000).contains(&year), "implausible year: {year}");
-        // lexicographic order == chronological order
-        assert!("20260728-140501Z" < "20260728-140502Z");
-        assert!("20260728-235959Z" < "20260729-000000Z");
+        // 2026-07-28 14:05:01.042 UTC, then the carries: a millisecond into
+        // the next second, a second into the next day.
+        assert_eq!(utc_stamp(1_785_247_501_042), "20260728-140501-042Z");
+        assert_eq!(utc_stamp(1_785_247_501_999), "20260728-140501-999Z");
+        assert_eq!(utc_stamp(1_785_247_502_000), "20260728-140502-000Z");
+        assert_eq!(utc_stamp(1_785_283_199_999), "20260728-235959-999Z");
+        assert_eq!(utc_stamp(1_785_283_200_000), "20260729-000000-000Z");
+        // fixed width: lexicographic order == chronological order
+        let times = [1_785_247_501_009, 1_785_247_501_010, 1_785_247_501_999, 1_785_247_502_000];
+        let stamps: Vec<String> = times.iter().map(|&t| utc_stamp(t)).collect();
+        assert!(stamps.windows(2).all(|w| w[0] < w[1]), "{stamps:?}");
+    }
+
+    /// Two saves at the SAME millisecond (the double-click case, forced): two
+    /// files, both contents intact, the second one millisecond later so name
+    /// order stays age order. With a truncating write the second save
+    /// replaced the first report.
+    #[test]
+    fn two_saves_in_the_same_millisecond_keep_both_reports() {
+        let dir = scratch("collide");
+        let at = 1_785_247_501_999; // the bump must carry into the next second
+        let first = write_report_at(&dir, "first report", at).unwrap();
+        let second = write_report_at(&dir, "second report", at).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first report");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second report");
+        assert!(first.ends_with(&format!("{PREFIX}20260728-140501-999Z{SUFFIX}")), "{first}");
+        assert!(second.ends_with(&format!("{PREFIX}20260728-140502-000Z{SUFFIX}")), "{second}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

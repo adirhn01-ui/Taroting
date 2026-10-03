@@ -52,8 +52,10 @@ import { IMAGE_SCALE_GUARD, layerToCanvas, visibleBox } from "./geom";
 import { imgIcon } from "./icons";
 import { flipCanvas, rotateCanvas } from "./image-menu";
 import {
+  alignToPixels,
   eraseStrokes,
   findLayer,
+  KIND_LABEL,
   setBackground,
   setLayerAdjust,
   setLayerTransform,
@@ -575,7 +577,7 @@ export function mountImageInspector(
     );
     header.appendChild(name);
     const meta = el("div", "insp-header__meta");
-    meta.appendChild(el("span", "badge", l.kind));
+    meta.appendChild(el("span", "badge", KIND_LABEL[l.kind]));
     if (l.kind === "photo") {
       const size = el("span", "insp-header__dur mono");
       watch(
@@ -637,10 +639,23 @@ export function mountImageInspector(
         if (!cur) return;
         const { w, h } = dims(cur);
         const { width: W, height: H } = session.project.timeline;
-        commit((p) => setLayerTransform(p, id, { scale: fitScale(cur.transform, w, h, W, H), x: 0, y: 0 }));
+        // Centred — on whole pixels when the fit happens to be 100%.
+        const fit = alignToPixels({ ...cur.transform, scale: fitScale(cur.transform, w, h, W, H), x: 0, y: 0 }, w, h, W, H);
+        commit((p) => setLayerTransform(p, id, { scale: fit.scale, x: fit.x, y: fit.y }));
       }),
     );
-    sizeRow.appendChild(button("Actual size", "btn btn--sm", () => commit((p) => setLayerTransform(p, id, { scale: 1 }))));
+    sizeRow.appendChild(
+      button("Actual size", "btn btn--sm", () => {
+        const cur = findLayer(session.project, id);
+        if (!cur) return;
+        const { w, h } = dims(cur);
+        const { width: W, height: H } = session.project.timeline;
+        // Actual size is meant to be pixel for pixel: the nearest position
+        // on whole canvas pixels, not one straddling two (soft on export).
+        const t = alignToPixels({ ...cur.transform, scale: 1 }, w, h, W, H);
+        commit((p) => setLayerTransform(p, id, { scale: 1, x: t.x, y: t.y }));
+      }),
+    );
     s.appendChild(sizeRow);
 
     // Rotation: quarter turns about the layer's own centre.
@@ -665,28 +680,28 @@ export function mountImageInspector(
     rotRow.appendChild(button(`${imgIcon("rotateRight", 14)}Right`, "btn btn--sm", () => turn(90), "Rotate right"));
     s.appendChild(rotRow);
 
+    // The layer's own flips: they mirror the layer along ITS sides, before its
+    // rotation (the video inspector's convention, and what keeps each switch
+    // meaning one thing however the layer is turned) — so on a quarter-turned
+    // layer "Horizontal" mirrors top to bottom on screen. The labels and the
+    // tooltip say so; mirroring the whole picture is the Canvas panel's Flip.
+    const flipTip =
+      "Mirrors this layer along its own sides, before its rotation. To mirror the whole picture, use Flip on the Canvas panel.";
     const flips = el("div", "insp-row");
-    flips.appendChild(
-      field(
-        "Flip H",
-        switchToggle(
-          "Flip horizontally",
-          () => tf(id)?.flipH ?? false,
-          (v) => commit((p) => setLayerTransform(p, id, { flipH: v })),
-        ),
-      ),
-    );
-    flips.appendChild(
-      field(
-        "Flip V",
-        switchToggle(
-          "Flip vertically",
-          () => tf(id)?.flipV ?? false,
-          (v) => commit((p) => setLayerTransform(p, id, { flipV: v })),
-        ),
-      ),
-    );
-    s.appendChild(flips);
+    const flipSwitch = (label: string, aria: string, axis: "flipH" | "flipV"): HTMLElement => {
+      const sw = switchToggle(
+        aria,
+        () => tf(id)?.[axis] ?? false,
+        (v) => commit((p) => setLayerTransform(p, id, { [axis]: v })),
+      );
+      sw.title = flipTip;
+      return field(label, sw);
+    };
+    flips.appendChild(flipSwitch("Horizontal", "Flip layer horizontally", "flipH"));
+    flips.appendChild(flipSwitch("Vertical", "Flip layer vertically", "flipV"));
+    const flipField = field("Flip layer", flips);
+    flipField.title = flipTip;
+    s.appendChild(flipField);
 
     s.appendChild(
       field(
@@ -791,7 +806,7 @@ export function mountImageInspector(
       const [x, y, cw, ch] = inputs.map(numOf) as [number, number, number, number];
       const crop = parseCrop(x, y, cw, ch, w, h);
       if (crop === null) {
-        toast.error(`Crop must fit inside ${w}×${h}.`);
+        toast.refuse(`Crop must fit inside ${w}×${h}.`);
         // Back to what the layer really has: a refused rect is never left
         // showing as though it had been applied.
         fill(storedKey());
@@ -1122,7 +1137,25 @@ export function mountImageInspector(
     typedCrop = null;
   }
 
+  /** Blur a control of this panel that still holds focus, so its own
+   *  change/focusout commit runs now. The canvas tools preventDefault their
+   *  pointerdown, so a click on another layer never takes focus out of, say,
+   *  a text layer's textarea — and a field removed while focused fires
+   *  nothing, so whatever was typed in it would simply be lost. */
+  function releaseFocus(): boolean {
+    const a = document.activeElement;
+    if (!(a instanceof HTMLElement) || !host.contains(a)) return false;
+    a.blur();
+    return true;
+  }
+
   function rebuild(key: string): void {
+    // A field still focused commits FIRST, while it is still in the panel:
+    // its commit names the layer it was built for, so the text lands there
+    // even though the selection has already moved on. Store notifications are
+    // batched, so nothing re-enters here; the key is read again only because
+    // that commit may have changed what to build (a generator's stamp).
+    if (releaseFocus()) key = structKey();
     clearBuild();
     host.replaceChildren();
     builtKey = key;
@@ -1175,11 +1208,17 @@ export function mountImageInspector(
   // keeps the step instead). The crop fields' typed rect is judged here too.
   // Capture phase, so it runs before the tool reads the project; two compares
   // per press while nothing is pending.
+  //
+  // A control that commits on its own change/focusout (a text layer's
+  // textarea, a solid's size) is blurred here for the same reason, so what was
+  // typed lands before the tool acts — rather than vanish when a click on
+  // another layer rebuilds the panel around a field that never lost focus.
   const onPressOutside = (e: PointerEvent): void => {
-    if (gestures.pending === 0 && typedCrop === null) return;
+    if (gestures.pending === 0 && typedCrop === null && !host.contains(document.activeElement)) return;
     if (e.target instanceof Node && host.contains(e.target)) return;
     flushGestures();
     typedCrop?.();
+    releaseFocus();
   };
   document.addEventListener("pointerdown", onPressOutside, true);
 

@@ -132,7 +132,11 @@ export function scaleAboutPivot(
  *  started with). `boxOff` is the chrome box centre's offset from the canvas
  *  centre at the start — for a photo that IS x/y; for a drawing it is where
  *  its strokes sit — and the snap brings that centre, not the media box's, onto
- *  the canvas centre. `threshold` null = snapping off. */
+ *  the canvas centre. The snapped delta is rounded too: an odd-sized layer on
+ *  an even canvas is exactly centred only on a half pixel, and the nearest
+ *  whole-pixel position is a sharper result than the exact centre (half a
+ *  pixel off it is invisible; a soft export is not). `threshold` null =
+ *  snapping off. */
 export function moveWithSnap(
   startX: number,
   startY: number,
@@ -152,7 +156,7 @@ export function moveWithSnap(
     snappedX = s.snappedX;
     snappedY = s.snappedY;
   }
-  return { x: startX + (bx - boxOff.x), y: startY + (by - boxOff.y), snappedX, snappedY };
+  return { x: startX + Math.round(bx - boxOff.x), y: startY + Math.round(by - boxOff.y), snappedX, snappedY };
 }
 
 /** Crop + position of one layer during a crop gesture. */

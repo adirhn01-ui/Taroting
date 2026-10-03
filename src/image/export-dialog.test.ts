@@ -10,6 +10,7 @@ import {
   exportSources,
   extForImageFormat,
   lockedSide,
+  parseExportSide,
   planOutput,
   qualityReadout,
   sanitizeImagePreset,
@@ -125,6 +126,17 @@ describe("image export dialog helpers", () => {
     expect(defaultFolder({ lastExportDir: null, defaultExportDir: "F:\\Def" }, p)).toBe("F:\\Def");
     expect(defaultFolder({ lastExportDir: null, defaultExportDir: null }, p)).toBe("D:\\Photos\\Trip");
     expect(defaultFolder({ lastExportDir: null, defaultExportDir: null }, project({ media: [] }))).toBe("");
+  });
+
+  it("reads a typed side as whole pixels or nothing", () => {
+    // Number("") is 0: the old parse turned a cleared box into a 1-px export.
+    for (const bad of ["", "  ", "0", "12.5", "-3", "1e4", "0x10", "abc", "1234567"]) {
+      expect(parseExportSide(bad), JSON.stringify(bad)).toBeNull();
+    }
+    expect(parseExportSide("641")).toBe(641);
+    expect(parseExportSide(" 1 ")).toBe(1);
+    // Past the render limit is still a size: the export fits it, and says so.
+    expect(parseExportSide("40000")).toBe(40000);
   });
 
   it("keeps a custom size on the canvas aspect", () => {

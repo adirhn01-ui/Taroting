@@ -1,6 +1,6 @@
 // The image editor's Layers panel: one row per layer, top first, with the eye
 // toggle, rename, duplicate, reorder and delete, and "Add layer" (drawing,
-// image, text, solid colour).
+// photo, text, solid colour).
 //
 // Built from the video editor's media bin (.media-panel / .media-list /
 // .media-row*) so it reads as the same app. Rows are KEYED by track id and
@@ -20,6 +20,7 @@ import { isTypingTarget, shortcutsBlocked } from "../core/shortcuts";
 import { normalizeHexColor } from "../core/session";
 import type { ProjectFile } from "../core/types";
 import { openGeneratorDialog } from "../editor/media/generators";
+import { isStillInfo } from "../editor/media/relink";
 import { icon } from "../ui/icons";
 import { closeMenu, showMenu, type MenuItem } from "../ui/menu";
 import { toast } from "../ui/toast";
@@ -31,6 +32,8 @@ import {
   addGeneratorLayer,
   addPhotoLayer,
   duplicateLayer,
+  duplicateRefusal,
+  KIND_LABEL,
   layersOf,
   moveLayer,
   nextSelectionAfterRemove,
@@ -40,6 +43,7 @@ import {
   type Layer,
   type LayerKind,
 } from "./layers";
+import { addRefusal } from "./paste";
 import { maxRenderSize } from "./render/export";
 
 /** Drag dead zone in client px before a row press becomes a reorder. */
@@ -48,12 +52,6 @@ const DRAG_THRESHOLD_PX = 4;
 const THUMB_W = 56;
 const THUMB_H = 32;
 
-const KIND_LABEL: Record<LayerKind, string> = {
-  photo: "Photo",
-  drawing: "Drawing",
-  text: "Text",
-  solid: "Solid color",
-};
 const KIND_ICON: Record<LayerKind, ImgIconName> = {
   photo: "image",
   drawing: "drawing",
@@ -512,8 +510,25 @@ export function mountLayersPanel(host: HTMLElement, ctx: ImageEditorCtx): { disp
     try {
       const info = await ipc.probeMedia(path);
       if (disposed) return;
-      if (info.kind !== "image" || info.generator || !info.width || !info.height) {
-        toast.error("This isn't a still image.");
+      // The paste's and the drop's own re-check, for whatever opened while the
+      // picker and the probe ran (a slow disk makes that a real window): a
+      // crop (a commit now would merge into it), a dialog, or a menu or
+      // picker (under a colour preview, the layer would record that unpicked
+      // colour as the undo step before it).
+      const refused = addRefusal(
+        ctx.mode.get(),
+        document.querySelector(".modal-backdrop") !== null,
+        shortcutsBlocked(),
+        "add the photo again",
+      );
+      if (refused !== null) {
+        toast.info(refused);
+        return;
+      }
+      // A still with a size: one without would be placed at the canvas size
+      // and drawn from nothing.
+      if (!isStillInfo(info) || !info.width || !info.height) {
+        toast.refuse("This isn't a still image.");
         return;
       }
       const above = selection.get();
@@ -533,7 +548,7 @@ export function mountLayersPanel(host: HTMLElement, ctx: ImageEditorCtx): { disp
           commitAdd((p) => addDrawingLayer(p, { above }));
         },
       },
-      { label: "Image", onSelect: () => void addImage() },
+      { label: KIND_LABEL.photo, onSelect: () => void addImage() },
       { label: "Text", onSelect: () => openGenerator("text") },
       { label: "Solid color", onSelect: () => openGenerator("solid") },
     ];
@@ -568,7 +583,16 @@ export function mountLayersPanel(host: HTMLElement, ctx: ImageEditorCtx): { disp
       { label: "Rename", onSelect: () => startRename(trackId) },
       {
         label: "Duplicate",
-        onSelect: () => commitAdd((p) => duplicateLayer(p, trackId)),
+        onSelect: () => {
+          // Refused out loud: a copy past the drawing caps would make every
+          // later save fail.
+          const refused = duplicateRefusal(session.project, trackId);
+          if (refused !== null) {
+            toast.refuse(refused);
+            return;
+          }
+          commitAdd((p) => duplicateLayer(p, trackId));
+        },
       },
       {
         label: "Move up",

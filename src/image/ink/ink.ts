@@ -37,7 +37,7 @@ import { normalizeHexColor } from "../../core/session";
 import { toast } from "../../ui/toast";
 import type { ImageEditorCtx } from "../context";
 import { canvasToLayer } from "../geom";
-import { addDrawingLayer, appendStrokeTo, drawingTarget, eraseStrokes, findLayer, layersOf } from "../layers";
+import { addDrawingLayer, appendStrokeTo, drawingTarget, eraseStrokes, findLayer, layersOf, opacityOf } from "../layers";
 import { encodePoints } from "../strokes";
 import { cssToSource, type ToolId } from "../tool-state";
 import { collectStrokeHits } from "./eraser";
@@ -419,7 +419,9 @@ export function mountInk(ctx: ImageEditorCtx): { dispose(): void } {
     const H = p.timeline.height;
     let added = 0;
     for (const l of layersOf(p)) {
-      if (l.hidden || l.kind !== "drawing") continue;
+      // A layer at 0% opacity shows nothing, exactly like a hidden one: the
+      // eraser cannot see its strokes, so it must not take them either.
+      if (l.hidden || opacityOf(l) <= 0 || l.kind !== "drawing") continue;
       const gen = l.media.generator;
       if (!gen || gen.type !== "drawing") continue;
       const mw = l.media.width;
@@ -631,7 +633,21 @@ export function mountInk(ctx: ImageEditorCtx): { dispose(): void } {
 
   const onPointerMove = (e: PointerEvent): void => {
     palm.note(e.pointerType, now());
-    moveCursor(e);
+    // The brush circle is placed AFTER the gesture has read the stage
+    // (`clientToCanvas` measures it): writing its transform first would make
+    // every one of those reads recalculate style mid-frame. Reads, then the
+    // one write — on every way out, a cancel included. The surface's own rect
+    // is measured up front for the same reason, before anything below can
+    // write to the DOM (an erase preview re-renders the Layers panel).
+    if (surface && cursor && !surfaceRect && e.pointerType !== "touch") surfaceRect = surface.getBoundingClientRect();
+    try {
+      moveGesture(e);
+    } finally {
+      moveCursor(e);
+    }
+  };
+
+  const moveGesture = (e: PointerEvent): void => {
     const cur = g;
     if (!cur || e.pointerId !== cur.pointerId) return;
     // A pan that took the pointer over (Space held, or the view decided this

@@ -17,8 +17,10 @@ import { errorDetail } from "../core/ipc";
 import { settingsStore, updateSettings, type ProjectSession } from "../core/session";
 import type { ImageExportFormat, ImageExportPreset, ProjectFile, Settings } from "../core/types";
 import {
+  destinationProblem,
   isProjectSource,
   joinPath,
+  MISSING_FOLDER,
   RENAME_ATTEMPT_LIMIT,
   renameWithSuffix,
   sanitizeFileName,
@@ -67,6 +69,7 @@ export const LARGE_EXPORT_PX = 50_000_000;
 
 export const WEBP_TOO_LARGE = "WebP can't be larger than 16383 px on a side.";
 export const ORIGINAL_FILE_WARNING = "That's the original file — choose a different name. Originals are never changed.";
+export const SIZE_INVALID = "Enter the width and height in whole pixels.";
 export const METADATA_NOTE = "Location and camera details are not included in the exported file.";
 
 /** The quality readout: WebP at 100 is the engine's lossless mode (quality
@@ -169,6 +172,19 @@ export function planOutput(size: ImageExportPreset["size"], canvasW: number, can
     webpOk: webpFits(out.w, out.h),
     large: out.w * out.h > LARGE_EXPORT_PX,
   };
+}
+
+/** A typed custom width or height: whole pixels, at least 1, or null for
+ *  anything else (an empty box, "12.5", "-3", "1e4"). `Number("")` is 0, and
+ *  the old `Math.max(1, …)` turned a cleared box into a 1-px-wide export that
+ *  was then saved into the project's preset. No upper bound beyond six digits:
+ *  a size past what the engine renders is fitted to it, with the "reduced"
+ *  note saying so. */
+export function parseExportSide(raw: string): number | null {
+  const t = raw.trim();
+  if (!/^\d{1,6}$/.test(t)) return null;
+  const n = Number(t);
+  return n >= 1 ? n : null;
 }
 
 /** The other side of an aspect-locked custom size. */
@@ -288,6 +304,14 @@ export function openImageExportDialog(ctx: ImageEditorCtx, sourceHint: ExportSou
   function preset(): ImageExportPreset {
     return { format, quality, size: typeof size === "object" ? { ...size } : size };
   }
+  /** False while Custom is chosen and either box does not hold whole pixels. */
+  function customSizeTyped(): boolean {
+    if (typeof size !== "object") return true;
+    const w = q<HTMLInputElement>("#ix-w");
+    const h = q<HTMLInputElement>("#ix-h");
+    if (!w || !h) return true;
+    return parseExportSide(w.value) !== null && parseExportSide(h.value) !== null;
+  }
   function plan(): OutputPlan {
     const tl = session.project.timeline;
     return planOutput(size, tl.width, tl.height);
@@ -343,6 +367,7 @@ export function openImageExportDialog(ctx: ImageEditorCtx, sourceHint: ExportSou
             <span class="mono imgx-px ${custom ? "export-row--hidden" : ""}" id="ix-px"></span>
           </div>
         </div>
+        <div class="export-note" id="ix-note-size" hidden>${escapeHtml(SIZE_INVALID)}</div>
         <div class="export-note" id="ix-note-webp" hidden>${escapeHtml(WEBP_TOO_LARGE)}</div>
         <div class="export-note" id="ix-note-reduced" hidden></div>
         <div class="export-note" id="ix-note-large" hidden>Large image — exporting may take a while.</div>
@@ -416,8 +441,13 @@ export function openImageExportDialog(ctx: ImageEditorCtx, sourceHint: ExportSou
     if (ext) ext.textContent = `.${currentExt()}`;
     const out = q<HTMLElement>("#ix-outpath");
     if (out) out.textContent = outPath();
+    // A custom box that does not hold whole pixels leaves `size` on its last
+    // valid pair, so the inputs themselves are what decide this.
+    const sizeOk = customSizeTyped();
+    const nSize = q<HTMLElement>("#ix-note-size");
+    if (nSize) nSize.hidden = sizeOk;
     const runBtn = q<HTMLButtonElement>("#ix-run");
-    if (runBtn) runBtn.disabled = format === "webp" && !p.webpOk;
+    if (runBtn) runBtn.disabled = (format === "webp" && !p.webpOk) || !sizeOk;
     // The warning strip is about a name that has since changed.
     const slot = q<HTMLElement>("#ix-warn-slot");
     if (slot && slot.childElementCount) slot.innerHTML = "";
@@ -455,8 +485,14 @@ export function openImageExportDialog(ctx: ImageEditorCtx, sourceHint: ExportSou
       q<HTMLElement>("#ix-custom")!.classList.toggle("export-row--hidden", !custom);
       q<HTMLElement>("#ix-px")!.classList.toggle("export-row--hidden", custom);
       if (custom) {
-        q<HTMLInputElement>("#ix-w")!.value = String((size as { w: number }).w);
-        q<HTMLInputElement>("#ix-h")!.value = String((size as { h: number }).h);
+        for (const [sel, v] of [
+          ["#ix-w", (size as { w: number }).w],
+          ["#ix-h", (size as { h: number }).h],
+        ] as const) {
+          const box = q<HTMLInputElement>(sel)!;
+          box.value = String(v);
+          box.removeAttribute("aria-invalid");
+        }
       }
       refresh();
     });
@@ -464,22 +500,25 @@ export function openImageExportDialog(ctx: ImageEditorCtx, sourceHint: ExportSou
     // Aspect-locked: typing one side sets the other from the canvas aspect.
     const wIn = q<HTMLInputElement>("#ix-w")!;
     const hIn = q<HTMLInputElement>("#ix-h")!;
-    wIn.addEventListener("input", () => {
+    // A box that does not parse (cleared, mid-edit, "12.5") changes nothing:
+    // `size` keeps its last valid pair, the other box is left as it is, and
+    // the box says it is invalid until it parses again.
+    const onSide = (typed: HTMLInputElement, other: HTMLInputElement, isWidth: boolean): void => {
       const tl = session.project.timeline;
-      const w = Math.max(1, Math.round(Number(wIn.value) || 0));
-      const h = lockedSide(w, tl.width, tl.height);
-      size = { w, h };
-      hIn.value = String(h);
+      const n = parseExportSide(typed.value);
+      if (n === null) {
+        typed.setAttribute("aria-invalid", "true");
+      } else {
+        typed.removeAttribute("aria-invalid");
+        other.removeAttribute("aria-invalid");
+        const m = isWidth ? lockedSide(n, tl.width, tl.height) : lockedSide(n, tl.height, tl.width);
+        size = isWidth ? { w: n, h: m } : { w: m, h: n };
+        other.value = String(m);
+      }
       refresh();
-    });
-    hIn.addEventListener("input", () => {
-      const tl = session.project.timeline;
-      const h = Math.max(1, Math.round(Number(hIn.value) || 0));
-      const w = lockedSide(h, tl.height, tl.width);
-      size = { w, h };
-      wIn.value = String(w);
-      refresh();
-    });
+    };
+    wIn.addEventListener("input", () => onSide(wIn, hIn, true));
+    hIn.addEventListener("input", () => onSide(hIn, wIn, false));
 
     const nameInput = q<HTMLInputElement>("#ix-name")!;
     nameInput.addEventListener("input", () => {
@@ -536,8 +575,13 @@ export function openImageExportDialog(ctx: ImageEditorCtx, sourceHint: ExportSou
           <button class="btn btn--sm" data-w="cancel">Cancel</button>
         </div>
       </div>`;
+    // Clearing the strip removes the button just clicked; focus would fall to
+    // <body>, out of the Tab trap. Checked after the clear (the clicked button
+    // is still inside during its own click). Replace and Rename go on to the
+    // progress view, which seats its own focus over this.
     const clear = (): void => {
       slot.innerHTML = "";
+      reseatAfterStrip();
     };
     slot.querySelector('[data-w="replace"]')?.addEventListener("click", () => {
       clear();
@@ -550,6 +594,10 @@ export function openImageExportDialog(ctx: ImageEditorCtx, sourceHint: ExportSou
     slot.querySelector('[data-w="cancel"]')!.addEventListener("click", clear);
   }
 
+  function reseatAfterStrip(): void {
+    if (!backdrop.contains(document.activeElement)) focusFirst(backdrop, "#ix-run");
+  }
+
   async function onExportClick(): Promise<void> {
     if (exporting) return;
     if (!folder) {
@@ -558,10 +606,30 @@ export function openImageExportDialog(ctx: ImageEditorCtx, sourceHint: ExportSou
     }
     filename = sanitizeFileName(filename);
     if (!filename) {
-      toast.error("Please enter a file name.");
+      toast.refuse("Please enter a file name.");
       return;
     }
     if (format === "webp" && !plan().webpOk) return;
+    // The run button is disabled while a custom box is invalid; this guard is
+    // for any other way in, and comes before the preset is saved below.
+    if (!customSizeTyped()) {
+      toast.refuse(SIZE_INVALID);
+      return;
+    }
+    // Checked before anything is persisted, exactly as the video export does:
+    // a folder that is not a full path, or names nothing, must never become
+    // the remembered export folder.
+    const bad = destinationProblem(folder);
+    if (bad) {
+      toast.refuse(bad);
+      return;
+    }
+    const folderExists = await pathExists(folder);
+    if (closed) return;
+    if (!folderExists) {
+      toast.refuse(MISSING_FOLDER);
+      return;
+    }
 
     // Remember the choices on the project — not an edit the user made to the
     // image, so it must not make an untouched temporary project ask "keep?".
@@ -613,6 +681,7 @@ export function openImageExportDialog(ctx: ImageEditorCtx, sourceHint: ExportSou
           `Tried ${RENAME_ATTEMPT_LIMIT} numbered variations of "${filename}.${ext}" in ${dir}` +
           ` and every one already exists. Nothing was overwritten — choose a different name or folder.`,
       });
+      reseatAfterStrip();
       return;
     }
     filename = free;
@@ -682,7 +751,8 @@ export function openImageExportDialog(ctx: ImageEditorCtx, sourceHint: ExportSou
         <div class="export-progress__meta"><span id="ix-phase">Rendering</span></div>
       </div>
     `;
-    footerEl.innerHTML = `<button class="btn btn--danger" id="ix-cancel">Cancel</button>`;
+    // Plain, not danger-red: canceling deletes nothing of the user's.
+    footerEl.innerHTML = `<button class="btn" id="ix-cancel">Cancel</button>`;
     q<HTMLElement>("#ix-cancel")!.addEventListener("click", () => run?.abort());
     focusFirst(backdrop, "#ix-cancel");
   }

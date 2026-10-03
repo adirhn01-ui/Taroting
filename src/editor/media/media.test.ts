@@ -3,6 +3,7 @@ import type { PlaybackPlan } from "../../core/ipc";
 import { ipc } from "../../core/ipc";
 import type { MediaRef, ProjectFile } from "../../core/types";
 import { createProject } from "../../core/project";
+import { recentErrors } from "../../ui/errors";
 import { MediaManager, type WaveformData } from "./media";
 
 /**
@@ -487,5 +488,195 @@ describe("markFailed", () => {
     media.markFailed("m-relink", "error during teardown");
 
     expect(media.status.get()).toBe(before);
+  });
+});
+
+/**
+ * Media `load_project` reported missing or changed. An ABSENT file must end
+ * "failed" without a single backend request made for it: the plan mock below
+ * answers "direct" for every path exactly as the backend does for a path that
+ * is not there, so a manager that skipped the existence check publishes
+ * "ready" and these tests see it. A CHANGED file (present, new mtime) previews
+ * as before. The bystander is never reported, and proves the check costs
+ * nothing for intact media.
+ */
+describe("media the load reported missing", () => {
+  const GONE: MediaRef = { ...OLD_FILE, hasAudio: true };
+
+  function spies() {
+    return {
+      plan: vi.spyOn(ipc, "planPlayback").mockImplementation(async (m) => ({ mode: "direct" as const, path: m.path })),
+      thumb: vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {})),
+      wave: vi.spyOn(ipc, "ensureWaveform").mockReturnValue(new Promise(() => {})),
+    };
+  }
+
+  it("marks an absent file 'File not found' and asks the backend nothing for it", async () => {
+    const { plan, thumb, wave } = spies();
+    const exists = vi.spyOn(ipc, "pathExists").mockResolvedValue(false);
+    const project = projectWith(GONE, BYSTANDER);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project, ["m-relink"]);
+    await settle();
+
+    expect(media.status.get()["m-relink"]).toEqual({ state: "failed", message: "File not found" });
+    expect(exists.mock.calls).toEqual([[GONE.path]]);
+    // Nothing went out for the gone path; the bystander was ensured normally.
+    expect(plan.mock.calls.map((c) => c[0].id)).toEqual(["m-keep"]);
+    expect(thumb.mock.calls.map((c) => c[0].path)).toEqual([BYSTANDER.path]);
+    expect(wave).not.toHaveBeenCalled();
+    expect(media.status.get()["m-keep"]).toEqual({ state: "ready", url: BYSTANDER.path, sourcePath: BYSTANDER.path });
+  });
+
+  it("previews a file that is present but changed, exactly as before", async () => {
+    const { plan, wave } = spies();
+    vi.spyOn(ipc, "pathExists").mockResolvedValue(true);
+    const project = projectWith(GONE);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project, ["m-relink"]);
+    await settle();
+
+    expect(plan).toHaveBeenCalledTimes(1);
+    expect(wave).toHaveBeenCalledTimes(1);
+    expect(media.status.get()["m-relink"]).toEqual({ state: "ready", url: GONE.path, sourcePath: GONE.path });
+  });
+
+  it("stays failed through a later ensureAll, and plans afresh once relinked", async () => {
+    const { plan } = spies();
+    const exists = vi.spyOn(ipc, "pathExists").mockResolvedValue(false);
+    let project = projectWith(GONE);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project, ["m-relink"]);
+    await settle();
+
+    // An import calls ensureAll again without the list: nothing changes.
+    media.ensureAll(project);
+    await settle();
+    expect(media.status.get()["m-relink"]).toEqual({ state: "failed", message: "File not found" });
+    expect(plan).not.toHaveBeenCalled();
+
+    // The relink dialog commits the new file, then retracks.
+    project = projectWith(NEW_FILE);
+    media.retrack("m-relink", true);
+    await settle();
+    expect(media.status.get()["m-relink"]).toEqual({ state: "ready", url: NEW_FILE.path, sourcePath: NEW_FILE.path });
+    // The relinked file is not stat'd again: it came from a fresh probe.
+    expect(exists).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops an existence answer that a relink overtook", async () => {
+    spies();
+    const answer = deferred<boolean>();
+    vi.spyOn(ipc, "pathExists").mockReturnValue(answer.promise);
+    let project = projectWith(GONE);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project, ["m-relink"]);
+    await settle();
+
+    project = projectWith(NEW_FILE);
+    media.retrack("m-relink", true);
+    await settle();
+    answer.resolve(false);
+    await settle();
+
+    expect(media.status.get()["m-relink"]).toEqual({ state: "ready", url: NEW_FILE.path, sourcePath: NEW_FILE.path });
+  });
+
+  it("does not declare a file gone when the question itself fails", async () => {
+    const { plan } = spies();
+    vi.spyOn(ipc, "pathExists").mockRejectedValue(new Error("ipc down"));
+    const project = projectWith(GONE);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project, ["m-relink"]);
+    await settle();
+
+    expect(plan).toHaveBeenCalledTimes(1);
+    expect(media.status.get()["m-relink"]).toEqual({ state: "ready", url: GONE.path, sourcePath: GONE.path });
+  });
+});
+
+/**
+ * Soft failures recorded for diagnostics name every whole path they mention,
+ * so the redactor can replace each one whole. The paths contain spaces on
+ * purpose: those are what free-text path hunting cuts short.
+ */
+describe("soft failure diagnostics carry their paths", () => {
+  const SPACED: MediaRef = {
+    ...OLD_FILE,
+    id: "m-spaced",
+    path: "D:\\Family Videos\\beach day.mov",
+    hasAudio: true,
+  };
+  const PEAKS = "C:\\Users\\Some One\\AppData\\Local\\Taroting\\cache\\peaks\\ab12.pk";
+
+  function lastEntry(op: string) {
+    const all = recentErrors().filter((e) => e.op === op);
+    return all[all.length - 1];
+  }
+
+  it("a failed thumbnail names the media path", async () => {
+    vi.spyOn(ipc, "planPlayback").mockReturnValue(new Promise(() => {}));
+    vi.spyOn(ipc, "ensureWaveform").mockReturnValue(new Promise(() => {}));
+    vi.spyOn(ipc, "getThumbnail").mockRejectedValue(new Error("ffmpeg exited with 1"));
+    const project = projectWith(SPACED);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project);
+    await settle();
+
+    expect(lastEntry("Thumbnail")?.paths).toEqual([SPACED.path]);
+  });
+
+  it("a failed waveform request names the media path", async () => {
+    vi.spyOn(ipc, "planPlayback").mockReturnValue(new Promise(() => {}));
+    silentThumbnails();
+    vi.spyOn(ipc, "ensureWaveform").mockRejectedValue(new Error("no audio stream"));
+    const project = projectWith(SPACED);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project);
+    await settle();
+
+    const e = lastEntry("Waveform");
+    expect(e?.message).toContain("Couldn't build the audio waveform");
+    expect(e?.paths).toEqual([SPACED.path]);
+  });
+
+  it("a peaks file that cannot be loaded names the media AND the cache file", async () => {
+    vi.spyOn(ipc, "planPlayback").mockReturnValue(new Promise(() => {}));
+    silentThumbnails();
+    vi.spyOn(ipc, "ensureWaveform").mockResolvedValue({ state: "ready", path: PEAKS });
+    vi.stubGlobal("fetch", () => Promise.reject(new Error("asset protocol refused")));
+    try {
+      const project = projectWith(SPACED);
+      const media = new MediaManager(() => project);
+      media.ensureAll(project);
+      await settle();
+
+      const e = lastEntry("Waveform");
+      expect(e?.message).toContain("Couldn't load the audio waveform");
+      expect(e?.paths).toEqual([SPACED.path, PEAKS]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("unreadable peaks for media that has left the project name only the cache file", async () => {
+    vi.spyOn(ipc, "planPlayback").mockReturnValue(new Promise(() => {}));
+    silentThumbnails();
+    vi.spyOn(ipc, "ensureWaveform").mockResolvedValue({ state: "ready", path: PEAKS });
+    // A body that is not TPK1 peaks.
+    vi.stubGlobal("fetch", () => Promise.resolve(new Response(new Uint8Array([1, 2, 3]))));
+    try {
+      // The project no longer lists the media the ensure was started for.
+      const project = projectWith(BYSTANDER);
+      const media = new MediaManager(() => project);
+      void media.ensure(SPACED);
+      await settle();
+
+      const e = lastEntry("Waveform");
+      expect(e?.message).toBe(`Waveform data for ${PEAKS} couldn't be read`);
+      expect(e?.paths).toEqual([PEAKS]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

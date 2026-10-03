@@ -32,10 +32,9 @@ fn dir_from_env(var: &str, value: Option<OsString>) -> Result<PathBuf> {
 /// Under the in-app E2E harness (debug build + TAROTING_AUTOTEST=1) every
 /// location that holds the OWNER's data is redirected into a private scratch
 /// root, so a test run can never touch their settings, recents, projects or
-/// temporary projects. The cache is deliberately NOT redirected: it is
-/// regenerable, keyed by file identity, and re-deriving every proxy on every run
-/// would push the suite past its time cap. A normal or shipped run never takes
-/// this branch (`autotest_mode` is false in release builds).
+/// temporary projects. The cache has a redirect of its own (`cache_dir_for`),
+/// because this root is wiped at every autotest start. A normal or shipped run
+/// never takes this branch (`autotest_mode` is false in release builds).
 fn autotest_redirect(leaf: &str) -> Option<PathBuf> {
     crate::debug::autotest_mode().then(|| crate::debug::autotest_root().join(leaf))
 }
@@ -50,7 +49,34 @@ pub fn data_dir() -> Result<PathBuf> {
 
 /// %LOCALAPPDATA%\Taroting\cache — regenerable derived files
 pub fn cache_dir() -> Result<PathBuf> {
-    Ok(env_dir("LOCALAPPDATA")?.join("Taroting").join("cache"))
+    cache_dir_for(
+        crate::debug::autotest_mode(),
+        std::env::var_os("LOCALAPPDATA"),
+        std::env::temp_dir(),
+    )
+}
+
+/// `cache_dir`'s decision, split from the environment reads so both branches
+/// are testable without touching process-global state.
+///
+/// Under autotest the cache moves to `%TEMP%\taroting-autotest-cache\cache`.
+/// Left in the owner's cache, every E2E run (which starts from factory
+/// settings, so a 2 GB limit) LRU-trimmed their proxies down to 2 GB and left
+/// its fixture entries among them. It is NOT inside `autotest_root`, which is
+/// wiped at every autotest start: the cache is regenerable and keyed by file
+/// identity, so keeping it across runs is what spares each run re-deriving
+/// every fixture proxy against the suite's time cap.
+///
+/// The extra `cache` level is load-bearing: `diagnostics.rs` derives the app
+/// root as this directory's PARENT, and that parent must be a folder of ours,
+/// never `%TEMP%` itself.
+fn cache_dir_for(autotest: bool, local_app_data: Option<OsString>, temp: PathBuf) -> Result<PathBuf> {
+    if autotest {
+        return Ok(temp.join("taroting-autotest-cache").join("cache"));
+    }
+    Ok(dir_from_env("LOCALAPPDATA", local_app_data)?
+        .join("Taroting")
+        .join("cache"))
 }
 
 /// %LOCALAPPDATA%\Taroting — the app's local root. Holds the crash note
@@ -116,5 +142,50 @@ mod tests {
         }
         // The failure that matters is the shape of what would have been built.
         assert!(!PathBuf::from("").join("Taroting").is_absolute());
+    }
+
+    /// The E2E's cache is its own: nowhere under the owner's %LOCALAPPDATA%
+    /// (or a trim at the run's factory 2 GB limit evicts their proxies), and
+    /// not under the autotest root, which every run wipes. The local and temp
+    /// values differ in every component, so a branch that used the wrong one
+    /// cannot pass.
+    #[test]
+    fn the_autotest_cache_is_a_persistent_folder_of_its_own() {
+        let local = OsString::from(r"C:\Users\owner\AppData\Local");
+        let temp = PathBuf::from(r"D:\scratch\tmp");
+
+        let owner = cache_dir_for(false, Some(local.clone()), temp.clone()).unwrap();
+        assert_eq!(owner, PathBuf::from(r"C:\Users\owner\AppData\Local\Taroting\cache"));
+
+        let e2e = cache_dir_for(true, Some(local.clone()), temp.clone()).unwrap();
+        assert!(
+            !e2e.starts_with(PathBuf::from(&local)),
+            "the E2E must not use the owner's cache: {e2e:?}"
+        );
+        assert!(e2e.starts_with(&temp), "{e2e:?}");
+        assert!(
+            !e2e.starts_with(temp.join("taroting-autotest")),
+            "inside the wiped autotest root the cache would be rebuilt every run: {e2e:?}"
+        );
+        // diagnostics.rs takes the cache's parent as the app root: that must be
+        // a folder of ours, not the temp directory itself.
+        let parent = e2e.parent().unwrap();
+        assert_ne!(parent, temp.as_path());
+        assert!(parent.starts_with(&temp), "{parent:?}");
+    }
+
+    /// The redirect never needs LOCALAPPDATA, and the normal path still refuses
+    /// a missing or empty one exactly as every other location does.
+    #[test]
+    fn the_cache_dir_reads_local_app_data_only_outside_autotest() {
+        let temp = PathBuf::from(r"D:\scratch\tmp");
+        assert!(cache_dir_for(true, None, temp.clone()).is_ok());
+        for value in [None, Some(OsString::new())] {
+            let err = cache_dir_for(false, value, temp.clone()).expect_err("must not yield a path");
+            assert!(
+                matches!(&err, AppError::BadInput(m) if m.contains("LOCALAPPDATA")),
+                "unexpected error: {err}"
+            );
+        }
     }
 }

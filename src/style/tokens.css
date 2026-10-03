@@ -83,12 +83,16 @@
    * Ascending = closer to the viewer. Anything that stacks MUST pick a token
    * here (no ad-hoc z-index) so the order below stays authoritative.
    *   media layer sets .......... 1..n  (JS-driven inside .preview__canvas)
+   *   timeline drop guide ....... 5     (inside .timeline-host, see below)
+   *   timeline scrollbar ........ 6     (inside .timeline-host, see below)
    *   stage overlay ............. 200   (manip. chrome: above media, below UI)
+   *   stage status scrim ........ 250   ("Preparing preview" card)
    *   editor float chrome ....... 300   (drop-overlay guide)
    *   drag ghost ................ 400   (cursor-following drag preview)
    *   theater mode .............. 500   (fullscreen preview over editor chrome)
    *   context menu .............. 1000
    *   modal backdrop ............ 1100  (MUST beat the stage overlay + chrome)
+   *   modal popover ............. 1150  (a picker a dialog opens over itself)
    *   toast ..................... 1200  (always on top)
    * The stage overlay must beat the media layer sets (z = track count) inside
    * its own .preview__canvas — 200 keeps headroom for absurd layer counts
@@ -100,6 +104,15 @@
    * layers (1..n) and the stage overlay (200) that live inside that container.
    * 300 clears both with headroom yet has no meaning outside .theater. */
   --z-stage-overlay: 200;
+  /* The timeline pair is LOCAL in meaning: the two only have to order against
+   * each other and the timeline canvas (z auto) that share .timeline-host with
+   * them — the scrollbar above the drop guide, so it stays grabbable during an
+   * external drag. .timeline-host is NOT a stacking context (position:relative,
+   * no z-index), so they do sit in the editor's context; nothing else paints
+   * over the timeline panel there, and keeping them in single digits keeps
+   * them far under every UI layer above even so. */
+  --z-tl-drop-guide: 5;
+  --z-tl-vscroll: 6;
   /* The "Preparing preview" / "Preview unavailable" scrim. Above the media
    * layers (1..n) and the manipulation overlay (200) — a status message that a
    * lower layer's picture can paint over is a failure the user never sees —

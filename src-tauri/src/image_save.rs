@@ -2,14 +2,23 @@
 //! thumbnail, a pasted image — through one chunked save protocol.
 //!
 //! **The protocol.** `image_save_begin` (JSON: the destination, the format, the
-//! declared byte count) opens `<target>.part` and returns a token plus the
-//! final path. `image_save_chunk` carries the bytes as a RAW request body (the
-//! token in the `x-taroting-save` header, because the body IS the bytes), any
-//! number of times. `image_save_commit` checks the declared total and the
+//! declared byte count) opens `<target>.taroting-part` (called "the `.part`"
+//! below) and returns a token plus the final path. `image_save_chunk` carries
+//! the bytes as a RAW request body (the token in the `x-taroting-save` header,
+//! because the body IS the bytes), any number of times. `image_save_commit` checks the declared total and the
 //! format's magic bytes, syncs, and renames the `.part` over the target;
 //! `image_save_abort` removes the `.part` and forgets the token. Any failure
 //! removes the `.part` too, so nothing half-written is ever left beside the
 //! user's files.
+//!
+//! **Why its own suffix, not a plain `.part`.** A plain `<name>.part` beside the
+//! user's files may be anyone's — a browser's half-finished download — so a
+//! leftover could not be told from someone else's file: it had to be refused,
+//! and one left by a crash mid-export blocked that name until the user found
+//! and deleted it by hand. `.taroting-part` is only ever ours, so a leftover
+//! is the app's own (a save a crash cut short) and the next save to that name
+//! simply truncates it. Within a run, two saves still never share one (see
+//! "One save per `.part`" below), and a foreign `.part` is never touched.
 //!
 //! **Why not `atomic_write`.** It keeps the previous file as a `.bak`, which is
 //! right for a project and wrong for an exported picture: the user would find a
@@ -243,21 +252,19 @@ struct Resolved {
     thumb_recent: Option<String>,
 }
 
-/// How a begin opens `<target>.part` when no open save of ours holds it.
+/// How a begin opens `<target>.taroting-part` when no open save of ours holds
+/// it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PartOpen {
-    /// A project card: the cache's own file, so a leftover is the app's own
-    /// (a card a crash cut short) and is simply truncated.
+    /// A project card or a user's export: a file already at that name can
+    /// only be the app's own (a save a crash cut short — the suffix is ours
+    /// alone), so it is simply truncated. A save of THIS run holding it was
+    /// already refused or superseded by the `by_part` claim before the open.
     Replace,
     /// A pasted image picks its own free name: created exclusively, so two
     /// pastes racing for " pasted 3.png" cannot share it, and a taken one
     /// means pick again.
     Repick,
-    /// A user's export: created exclusively, and a file already there is
-    /// refused. It is not ours — a browser's half-finished download named
-    /// "photo.png.part", say — and a truncating open emptied it the moment the
-    /// export began, then deleted it on an abort or renamed over it on commit.
-    Refuse,
 }
 
 /// Lock that never panics: a poisoned lock only means another save panicked
@@ -271,11 +278,15 @@ fn bad(msg: impl Into<String>) -> AppError {
     AppError::BadInput(msg.into())
 }
 
-/// `<target>.part`, beside the target so the final rename never crosses a
-/// volume.
+/// The suffix of every file a save writes before it is renamed into place.
+/// Ours alone — see "Why its own suffix" above.
+const PART_SUFFIX: &str = ".taroting-part";
+
+/// `<target>.taroting-part`, beside the target so the final rename never
+/// crosses a volume.
 fn part_of(target: &Path) -> PathBuf {
     let mut s: OsString = target.as_os_str().to_owned();
-    s.push(".part");
+    s.push(PART_SUFFIX);
     PathBuf::from(s)
 }
 
@@ -384,11 +395,11 @@ fn check_user_target(target: &Path, sources: &[String], format: ImageFormat) -> 
         return Err(bad("the save location is a folder"));
     }
     refuse_a_source(target, sources, "that file")?;
-    // The save writes `<target>.part` first and renames it into place, so
-    // that file is written too, and must be no original either. (A file
-    // merely SITTING there is refused when begin claims it — `PartOpen::Refuse`
-    // — after the "already being saved" check, so our own in-flight save still
-    // gets that answer.)
+    // The save writes `<target>.taroting-part` first and renames it into
+    // place, so that file is written too, and must be no original either. (A
+    // leftover merely SITTING there is the app's own and is truncated when
+    // begin claims it, after the "already being saved" check, so our own
+    // in-flight save still gets that answer.)
     let part = part_of(target);
     refuse_a_source(&part, sources, &format!("a file named {}", part_name(&part)))
 }
@@ -430,7 +441,7 @@ fn part_name(part: &Path) -> String {
 /// The first free `<project> pasted N.png` in `dir` (N ≥ 1). A name whose
 /// `.part` exists counts as taken: another paste is writing it right now.
 fn pasted_name(dir: &Path, project: &str) -> Result<PathBuf> {
-    // Bounded so the name (plus " pasted N.png.part") stays far inside a
+    // Bounded so the name (plus " pasted N.png.taroting-part") stays far inside a
     // file-name component's limit, whatever the project is called.
     let base: String = store::sanitize_filename(project).chars().take(96).collect();
     for n in 1..=9_999u32 {
@@ -445,7 +456,7 @@ fn pasted_name(dir: &Path, project: &str) -> Result<PathBuf> {
 fn resolve_user(path: &str, sources: &[String], format: ImageFormat) -> Result<Resolved> {
     let target = PathBuf::from(path);
     check_user_target(&target, sources, format)?;
-    Ok(Resolved { target, part: PartOpen::Refuse, supersede: false, max_bytes: MAX_IMAGE_BYTES, thumb_recent: None })
+    Ok(Resolved { target, part: PartOpen::Replace, supersede: false, max_bytes: MAX_IMAGE_BYTES, thumb_recent: None })
 }
 
 fn resolve_pasted(dir: &Path, project_name: &str, format: ImageFormat) -> Result<Resolved> {
@@ -533,16 +544,9 @@ impl ImageSaves {
             let part = part_of(&r.target);
             match opts.open(&part) {
                 Ok(f) => break (r, f, key),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match r.part {
-                    PartOpen::Repick if attempts < 8 => attempts += 1,
-                    PartOpen::Refuse => {
-                        return Err(bad(format!(
-                            "a file named {} is in the way; choose another name",
-                            part_name(&part)
-                        )))
-                    }
-                    _ => return Err(e.into()),
-                },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && r.part == PartOpen::Repick && attempts < 8 => {
+                    attempts += 1
+                }
                 Err(e) => return Err(e.into()),
             }
         };
@@ -1096,25 +1100,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The save writes `<target>.part` too, so it gets the same source check
+    /// The save writes `<target>.taroting-part` too, so it gets the same source check
     /// as the target: an original sitting at that name (in any spelling), or
     /// an offline one recorded under it, is refused before a byte is written.
     #[test]
     fn the_part_of_a_user_target_is_never_a_source_either() {
         let dir = scratch("part-source");
         let target = dir.join("Sea.png");
-        let original = dir.join("Sea.png.part");
+        let original = dir.join("Sea.png.taroting-part");
         std::fs::write(&original, JPEG).unwrap();
-        for spelling in [original.clone(), dir.join("SEA.PNG.PART")] {
+        for spelling in [original.clone(), dir.join("SEA.PNG.TAROTING-PART")] {
             let sources = vec![spelling.to_string_lossy().into_owned()];
             assert_eq!(
                 msg(check_user_target(&target, &sources, ImageFormat::Png)),
-                "a file named Sea.png.part is one of this project's originals, which are never overwritten; choose another name",
+                "a file named Sea.png.taroting-part is one of this project's originals, which are never overwritten; choose another name",
                 "{spelling:?}"
             );
         }
         // Offline, but recorded at exactly that name: still refused.
-        let offline = vec![dir.join("Sky.png.part").to_string_lossy().into_owned()];
+        let offline = vec![dir.join("Sky.png.taroting-part").to_string_lossy().into_owned()];
         assert!(msg(check_user_target(&dir.join("Sky.png"), &offline, ImageFormat::Png)).contains("originals"));
         // A source elsewhere leaves the name free.
         let elsewhere = vec![dir.join("Other.png").to_string_lossy().into_owned()];
@@ -1123,30 +1127,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A file already at `<target>.part` that no save of ours holds — a
-    /// browser's half-finished download, say — is refused, never emptied: a
-    /// truncating open wiped it at begin and the abort then deleted it.
+    /// A plain `<target>.part` that is not ours — a browser's half-finished
+    /// download, say — is never touched: the save writes its own suffix. And a
+    /// `<target>.taroting-part` a crash left behind no longer blocks the name:
+    /// it can only be the app's own, so the next export truncates it and lands
+    /// exactly its own bytes. Three different payloads, so the file on disk
+    /// says which one survived where; the leftover is LONGER than the export,
+    /// so a write that did not truncate would leave its tail behind.
     #[test]
-    fn a_user_export_never_touches_a_foreign_part_file() {
-        let dir = scratch("foreign-part");
+    fn a_crash_leftover_is_reused_and_a_foreign_part_file_is_never_touched() {
+        let dir = scratch("leftover-part");
         let target = dir.join("photo.png");
-        let part = dir.join("photo.png.part");
-        std::fs::write(&part, b"half a download").unwrap();
-        let saves = ImageSaves::default();
-        assert_eq!(
-            msg(begin_user(&saves, &target, ImageFormat::Png, PNG.len() as u64)),
-            "a file named photo.png.part is in the way; choose another name"
-        );
-        assert_eq!(std::fs::read(&part).unwrap(), b"half a download");
-        assert!(lock(&saves.open).by_token.is_empty(), "the refused begin holds no slot");
-        assert_eq!(names_in(&dir), ["photo.png.part"]);
+        let foreign = dir.join("photo.png.part");
+        let leftover = dir.join("photo.png.taroting-part");
+        std::fs::write(&foreign, b"half a download").unwrap();
+        let crash: Vec<u8> = PNG.iter().copied().chain([0xEE; 64]).collect();
+        std::fs::write(&leftover, &crash).unwrap();
+        let body: Vec<u8> = PNG.iter().copied().chain([0x11; 3]).collect();
+        assert!(body.len() < crash.len());
 
-        // Once it is gone, the same export goes through.
-        std::fs::remove_file(&part).unwrap();
-        let b = begin_user(&saves, &target, ImageFormat::Png, PNG.len() as u64).unwrap();
-        saves.chunk(b.token, PNG).unwrap();
+        let saves = ImageSaves::default();
+        let b = begin_user(&saves, &target, ImageFormat::Png, body.len() as u64).expect("a leftover never blocks the name");
+        saves.chunk(b.token, &body).unwrap();
         saves.commit(b.token).unwrap();
-        assert_eq!(names_in(&dir), ["photo.png"]);
+        assert_eq!(std::fs::read(&target).unwrap(), body, "the export, with no tail of the leftover");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"half a download", "the foreign .part is untouched");
+        assert_eq!(names_in(&dir), ["photo.png", "photo.png.part"]);
+
+        // An abort over a leftover removes it too: nothing of ours is left.
+        std::fs::write(&leftover, &crash).unwrap();
+        let b = begin_user(&saves, &target, ImageFormat::Png, body.len() as u64).unwrap();
+        saves.abort(b.token);
+        assert_eq!(names_in(&dir), ["photo.png", "photo.png.part"]);
+        assert_eq!(std::fs::read(&target).unwrap(), body, "an aborted save keeps the previous export");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project card's leftover is reused the same way (the cache's own
+    /// file), and an in-run claim still decides first: a leftover never lets
+    /// a second export to one file in.
+    #[test]
+    fn a_leftover_never_bypasses_the_in_run_claim() {
+        let dir = scratch("leftover-claim");
+        let target = dir.join("Card (edited).jpg");
+        let saves = ImageSaves::default();
+        let body = card_bytes(0x3C);
+        let first = begin_user(&saves, &target, ImageFormat::Jpeg, body.len() as u64).unwrap();
+        // The first save's own `.taroting-part` is exactly a "leftover" on
+        // disk; the claim, not the file, refuses the second begin.
+        assert_eq!(msg(begin_user(&saves, &target, ImageFormat::Jpeg, 16)), "that file is already being saved");
+        saves.chunk(first.token, &body).unwrap();
+        saves.commit(first.token).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+
+        std::fs::write(dir.join(format!("{PIC_CARD}.taroting-part")), [0xEE; 40]).unwrap();
+        let card = card_bytes(0x7E);
+        let b = saves
+            .begin(ImageFormat::Jpeg, card.len() as u64, || resolve_thumb(&dir, r"C:\P\Pic.trt", "p-9", ImageFormat::Jpeg))
+            .unwrap();
+        saves.chunk(b.token, &card).unwrap();
+        saves.commit(b.token).unwrap();
+        assert_eq!(std::fs::read(dir.join(PIC_CARD)).unwrap(), card);
+        assert_eq!(names_in(&dir), ["Card (edited).jpg", PIC_CARD]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1157,8 +1199,11 @@ mod tests {
         assert_eq!(first, dir.join("Holiday card pasted 1.png"));
         std::fs::write(&first, PNG).unwrap();
         assert_eq!(pasted_name(&dir, "Holiday card").unwrap(), dir.join("Holiday card pasted 2.png"));
-        // A `.part` in flight is taken too.
-        std::fs::write(dir.join("Holiday card pasted 2.png.part"), b"").unwrap();
+        // A `.taroting-part` in flight (or left by a crash) is taken too.
+        std::fs::write(dir.join("Holiday card pasted 2.png.taroting-part"), b"").unwrap();
+        assert_eq!(pasted_name(&dir, "Holiday card").unwrap(), dir.join("Holiday card pasted 3.png"));
+        // A plain `.part` is someone else's file and says nothing about ours.
+        std::fs::write(dir.join("Holiday card pasted 3.png.part"), b"").unwrap();
         assert_eq!(pasted_name(&dir, "Holiday card").unwrap(), dir.join("Holiday card pasted 3.png"));
         assert_eq!(pasted_name(&dir, "a<b>c:\"d|e?f*").unwrap(), dir.join("a_b_c__d_e_f_ pasted 1.png"));
         assert_eq!(pasted_name(&dir, "  ...  ").unwrap(), dir.join("Untitled pasted 1.png"));
@@ -1173,7 +1218,7 @@ mod tests {
     }
 
     /// The whole happy path over an existing export: the old file is replaced
-    /// in one step, and nothing is left beside it — no `.bak`, no `.part`.
+    /// in one step, and nothing is left beside it — no `.bak`, no `.taroting-part`.
     #[test]
     fn a_commit_replaces_the_target_and_leaves_nothing_behind() {
         let dir = scratch("commit");
@@ -1184,7 +1229,7 @@ mod tests {
         let saves = ImageSaves::default();
         let begun = begin_user(&saves, &target, ImageFormat::Png, body.len() as u64).unwrap();
         assert_eq!(begun.path, target.to_string_lossy());
-        assert_eq!(names_in(&dir), ["Card (edited).png", "Card (edited).png.part"]);
+        assert_eq!(names_in(&dir), ["Card (edited).png", "Card (edited).png.taroting-part"]);
         // Chunks of 5, 7 and the rest: the magic straddles the first boundary.
         saves.chunk(begun.token, &body[..5]).unwrap();
         saves.chunk(begun.token, &body[5..12]).unwrap();
@@ -1251,7 +1296,7 @@ mod tests {
         let saves = ImageSaves::default();
         let b = begin_user(&saves, &dir.join("a.jpg"), ImageFormat::Jpeg, 64).unwrap();
         saves.chunk(b.token, JPEG).unwrap();
-        assert_eq!(names_in(&dir), ["a.jpg.part"]);
+        assert_eq!(names_in(&dir), ["a.jpg.taroting-part"]);
         saves.abort(b.token);
         assert!(names_in(&dir).is_empty());
         saves.abort(b.token);
@@ -1285,7 +1330,7 @@ mod tests {
         distinct.dedup();
         assert_eq!(distinct.len(), MAX_PENDING, "tokens are never reused");
         assert!(msg(begin_user(&saves, &dir.join("p9.png"), ImageFormat::Png, 16)).contains("too many"));
-        assert!(!dir.join("p9.png.part").exists());
+        assert!(!dir.join("p9.png.taroting-part").exists());
 
         saves.abort(tokens[1]);
         let fifth = begin_user(&saves, &dir.join("p5.png"), ImageFormat::Png, 16).unwrap();
@@ -1302,7 +1347,7 @@ mod tests {
         }
         let sixth = begin_user(&saves, &dir.join("p6.png"), ImageFormat::Png, 16).unwrap();
         assert!(saves.entry(stale).is_none());
-        assert!(!dir.join("p2.png.part").exists());
+        assert!(!dir.join("p2.png.taroting-part").exists());
         for live in [tokens[0], tokens[3], fifth.token, sixth.token] {
             assert!(saves.entry(live).is_some(), "{live}");
         }
@@ -1375,7 +1420,7 @@ mod tests {
         assert_ne!(a.token, b.token);
         assert!(msg(saves.chunk(a.token, &[0])).contains("unknown"), "A is over");
         assert!(msg(saves.commit(a.token)).contains("unknown"));
-        assert_eq!(names_in(&dir), [format!("{PIC_CARD}.part")], "B's .part survives A's late calls");
+        assert_eq!(names_in(&dir), [format!("{PIC_CARD}.taroting-part")], "B's .part survives A's late calls");
         saves.chunk(b.token, &b_bytes).unwrap();
         saves.commit(b.token).unwrap();
         assert_eq!(std::fs::read(dir.join(PIC_CARD)).unwrap(), b_bytes);
@@ -1432,7 +1477,7 @@ mod tests {
         let saves = ImageSaves::default();
         let b = begin_user(&saves, &dir.join("a.png"), ImageFormat::Png, 64).unwrap();
         chunk_body(&saves, b.token, owned_body(&InvokeBody::Raw(PNG.to_vec()))).unwrap();
-        assert_eq!(names_in(&dir), ["a.png.part"]);
+        assert_eq!(names_in(&dir), ["a.png.taroting-part"]);
         let json = InvokeBody::Json(json!([137, 80, 78, 71]));
         assert_eq!(msg(chunk_body(&saves, b.token, owned_body(&json))), "image bytes must arrive as a raw body");
         assert!(names_in(&dir).is_empty());

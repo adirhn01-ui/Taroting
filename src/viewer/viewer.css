@@ -239,6 +239,19 @@ html[data-rescue-chrome] #vw-back:focus-visible {
   outline-color: var(--safe-accent);
 }
 
+/* ---------- element fullscreen ----------
+ * The "…" menu is hosted on document.body (ui/menu.ts). Real element
+ * fullscreen puts .viewer in the top layer, which paints over EVERYTHING else
+ * in the document, so the menu opened there invisibly and, being open, held
+ * blockShortcuts: arrows, Space and F went inert, and ArrowDown+Enter could
+ * pick "Open as project" blind. Both of its items leave the viewing anyway,
+ * so fullscreen simply does without the button. Only the true :fullscreen
+ * state hides it; the in-window fallback (.viewer--fullscreen alone, when the
+ * request is refused) has no top layer, and there the menu shows normally. */
+.viewer:fullscreen #vw-more {
+  display: none;
+}
+
 /* ---------- screen-reader announcements ---------- */
 
 .viewer__live {

@@ -12,8 +12,10 @@ import {
 } from "../core/format";
 import { describeError, ipc, mediaUrl, onDragDrop, pickOpenFiles } from "../core/ipc";
 import { navigate } from "../core/nav";
-import { isTempProjectPath } from "../core/open-media";
+import { isTempProjectPath, runOnOpenChain } from "../core/open-media";
 import { addMedia, createProject } from "../core/project";
+import { chordOf, physicalChordOf } from "../core/shortcuts";
+import type { ChordSource } from "../core/shortcuts";
 import { MEDIA_FILE_EXTENSIONS } from "../core/types";
 import type { RecentItem } from "../core/types";
 import { focusFirst, trapTab } from "../ui/focus";
@@ -23,7 +25,7 @@ import { toast } from "../ui/toast";
 
 /* ---------------- sorting ---------------- */
 
-type SortKey = "name" | "lastOpened" | "modified" | "size";
+export type SortKey = "name" | "lastOpened" | "modified" | "size";
 const SORT_KEY = "taroting.homeSort";
 const SORT_LABELS: Record<SortKey, string> = {
   name: "Name",
@@ -37,11 +39,21 @@ function loadSort(): SortKey {
   return v === "name" || v === "lastOpened" || v === "modified" || v === "size" ? v : "lastOpened";
 }
 
-function sortRecents(items: RecentItem[], key: SortKey): RecentItem[] {
+/** The one name order on this screen, the order Explorer uses: numbers by
+ *  value ("Clip 2" before "Clip 10"), case ignored. Built on first use, not at
+ *  import: a collator loads collation data, and Home is on the boot path while
+ *  the default sort is Last opened. */
+let nameCollator: Intl.Collator | null = null;
+function compareNames(a: string, b: string): number {
+  nameCollator ??= new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+  return nameCollator.compare(a, b);
+}
+
+export function sortRecents(items: readonly RecentItem[], key: SortKey): RecentItem[] {
   const out = items.slice();
   switch (key) {
     case "name":
-      out.sort((a, b) => a.name.localeCompare(b.name));
+      out.sort((a, b) => compareNames(a.name, b.name));
       break;
     case "lastOpened":
       out.sort((a, b) => Date.parse(b.openedAt ?? b.modifiedAt) - Date.parse(a.openedAt ?? a.modifiedAt));
@@ -80,8 +92,7 @@ function mediaRoute(paths: readonly string[]): OpenRoute {
   const media = paths.filter((p) => MEDIA_FILE_EXTENSIONS.has(fileExt(p)));
   const skipped = paths.length - media.length;
   if (media.length === 0) return { kind: "unsupported", count: skipped };
-  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
-  media.sort((a, b) => collator.compare(fileName(a), fileName(b)));
+  media.sort((a, b) => compareNames(fileName(a), fileName(b)));
   return { kind: "media", media, skipped };
 }
 
@@ -130,6 +141,84 @@ export function openRouteNotice(route: OpenRoute): string | null {
   }
 }
 
+/* ---------------- keyboard decisions and markup (pure, exported for the tests) ---------------- */
+
+/** The part of an event target the keyboard decisions read. */
+interface Closest {
+  closest(selector: string): unknown;
+}
+
+/** What Enter does on the recents grid: toggle the card in select mode, open
+ *  it otherwise, or nothing. Nothing on a card's More button, because the
+ *  engine turns Enter on a <button> into that button's own click, which opens
+ *  the menu — opening the project here as well took the user somewhere they
+ *  had not asked to go. Nothing inside a live rename either: its own handler
+ *  commits it. */
+export function gridEnterAction(target: Closest, selectMode: boolean): "toggle" | "open" | null {
+  if (target.closest(".project-card") === null) return null;
+  if (selectMode) return "toggle";
+  if (target.closest("[data-more]") !== null) return null;
+  if (target.closest(".project-card__rename") !== null) return null;
+  return "open";
+}
+
+/** Whether Enter confirms a Home dialog: only when typed into its name field.
+ *  On a button the engine already activates that button, so Enter on a
+ *  focused Cancel cancels; confirming from the dialog's keydown as well (and
+ *  calling preventDefault, which suppressed Cancel's own click) made Cancel
+ *  duplicate. An Enter that ends an IME composition is the IME's. */
+export function modalEnterConfirms(
+  e: { key: string; target: unknown; isComposing?: boolean },
+  input: unknown,
+): boolean {
+  return e.key === "Enter" && e.isComposing !== true && input != null && e.target === input;
+}
+
+/** Ctrl+F, the search shortcut: by the label the layout typed, or by the key's
+ *  position where the layout typed a non-Latin letter (core/shortcuts explains
+ *  the guard), so Ctrl+F on a Hebrew or Russian layout still finds. */
+export function isSearchChord(e: ChordSource): boolean {
+  return chordOf(e) === "Ctrl+F" || physicalChordOf(e) === "Ctrl+F";
+}
+
+/** What the grid shows when it has no cards. `error`: the recents list could
+ *  not be read, which is not the same as having no projects — "No projects
+ *  yet" there told the user their library was gone. */
+export function emptyGridHtml(state: "error" | "searching" | "none"): string {
+  if (state === "error") {
+    return `
+      <div class="empty-state">
+        ${icon("warning", 32)}
+        <div>Couldn't read your recent projects.</div>
+        <div class="faint">Your project files are not affected.</div>
+        <button class="btn" data-act="retry-recents">Try again</button>
+      </div>`;
+  }
+  const searching = state === "searching";
+  return `
+      <div class="empty-state">
+        ${icon("film", 32)}
+        <div>${searching ? "No projects match your search." : "No projects yet."}</div>
+        ${searching ? "" : `<div class="faint">Create one, or drop a video anywhere in this window.</div>`}
+      </div>`;
+}
+
+/** One line per temporary project a crash or a logoff left behind with edits
+ *  in it. Keyed by index, never by path, so no path has to survive a trip
+ *  through an attribute; the name is the file's own (a temporary project is
+ *  named after its media). */
+export function orphanRowsHtml(paths: readonly string[]): string {
+  return paths
+    .map(
+      (p, i) => `
+      <div class="home-recover__row">
+        <span class="home-recover__text">Unsaved temporary project <strong>${escapeHtml(fileStem(p))}</strong> was left open when Taroting closed.</span>
+        <button class="btn btn--sm" data-recover="${i}">Recover</button>
+      </div>`,
+    )
+    .join("");
+}
+
 /** What Home publishes on window for the in-app E2E (dev + autotest only):
  *  the native file picker cannot be driven, so a block hands paths straight
  *  to the same routing the picker's result and a drop take. */
@@ -173,6 +262,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
               <button class="btn btn--ghost" id="btn-select-cancel" title="Leave select mode">Cancel</button>
             </div>
           </div>
+          <div class="home__recover" id="home-recover" hidden></div>
           <div class="home__toolbar">
             <input class="input home__search" id="home-search" placeholder="Search projects" spellcheck="false" />
             <select class="select select--sm home__sort" id="home-sort" title="Sort by">
@@ -203,8 +293,15 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   const selectAllBtn = root.querySelector<HTMLButtonElement>("#btn-select-all")!;
   const selectCancelBtn = root.querySelector<HTMLButtonElement>("#btn-select-cancel")!;
   const newBtn = root.querySelector<HTMLButtonElement>("#btn-new")!;
+  const recoverEl = root.querySelector<HTMLElement>("#home-recover")!;
 
   let recents: RecentItem[] = [];
+  /** The last read of the recents list failed: the grid says so, with a way
+   *  to try again, instead of "No projects yet". */
+  let recentsError = false;
+  /** Temporary projects a crash or a logoff left behind with edits in them
+   *  (see loadOrphans), in the order their Recover lines show. */
+  let orphans: string[] = [];
   let sortKey: SortKey = loadSort();
   let busy = false;
   let disposed = false;
@@ -264,13 +361,8 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     grid.classList.toggle("recents-grid--select", selectMode);
     const items = currentItems();
     if (items.length === 0) {
-      const searching = search.value.trim().length > 0;
-      grid.innerHTML = `
-        <div class="empty-state">
-          ${icon("film", 32)}
-          <div>${searching ? "No projects match your search." : "No projects yet."}</div>
-          ${searching ? "" : `<div class="faint">Create one, or drop a video anywhere in this window.</div>`}
-        </div>`;
+      const state = recentsError ? "error" : search.value.trim().length > 0 ? "searching" : "none";
+      grid.innerHTML = emptyGridHtml(state);
       return;
     }
     grid.innerHTML = items.map(cardHtml).join("");
@@ -381,9 +473,18 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
 
   /* Backfill missing thumbnails. Projects opened via the OS "Open with" get a
      recents entry before any thumb is cached, so their card shows a placeholder
-     until the backend can produce one. Fire one shot per thumb-less path per
-     mount (no polling/timers); on a hit, swap just that card's placeholder for
-     an <img> without re-rendering the grid. */
+     until the backend can produce one. One shot per thumb-less path per mount
+     (no polling); on a hit, swap just that card's placeholder for an <img>
+     without re-rendering the grid.
+
+     ONE batch in flight at a time, through one queue and one pump. Every batch
+     lands on the backend's single thumbnail lane anyway, so firing them all at
+     once bought nothing but a line of waits, each counting toward its own
+     timeout behind the ones ahead of it — a big cold library timed out its
+     later batches. And the first pump waits (armBackgroundWork) until every
+     open in progress has settled and the window is idle: a Home painted as the
+     fallback while a launch file is still being opened must not compete with
+     that file for the disk and the decoder. */
   /** Cards per backend call. The batched command does ONE recents read/write and
    *  ONE thumbs-dir scan per call, so a whole mount used to cost ~7 filesystem
    *  ops per card. Batching all of them would be cheapest, but generation inside
@@ -406,36 +507,53 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     }
   }
 
+  /** Paths waiting for their batch, in card order. */
+  const thumbQueue: string[] = [];
+  /** A pump is running; another call only adds to its queue. */
+  let thumbPumping = false;
+  /** The first pump's wait is over (armBackgroundWork). Until then the queue
+   *  only fills. */
+  let backgroundArmed = false;
+
   function backfillThumbs(): void {
-    const pending: string[] = [];
     for (const item of recents) {
       // An image project's card picture is RENDERED by the image editor when
       // it is left, never derived from a source file, so there is nothing to
-      // backfill. Skipped before the IPC, not just in Rust:
-      // refresh_recent_thumbs is a SYNC command, and asking would read and
-      // parse a possibly multi-megabyte .trt on the main thread for every
-      // picture-less image card on every Home visit, only to be told no.
+      // backfill. Skipped before the IPC, not just in Rust: asking would read
+      // and parse a possibly multi-megabyte .trt for every picture-less image
+      // card on every Home visit, only to be told no.
       if (item.kind === "image") continue;
       if (item.thumb || thumbTried.has(item.path)) continue;
       thumbTried.add(item.path);
-      pending.push(item.path);
+      thumbQueue.push(item.path);
     }
-    for (let i = 0; i < pending.length; i += THUMB_BATCH) {
-      const batch = pending.slice(i, i + THUMB_BATCH);
-      void ipc
-        .refreshRecentThumbs(batch)
-        .then((found) => {
+    void pumpThumbs();
+  }
+
+  async function pumpThumbs(): Promise<void> {
+    if (!backgroundArmed || thumbPumping) return;
+    thumbPumping = true;
+    try {
+      while (!disposed && thumbQueue.length > 0) {
+        // A project deleted or removed from the list while it waited is not
+        // worth an ffmpeg run.
+        const batch = thumbQueue.splice(0, THUMB_BATCH).filter((p) => recentByPath(p) !== undefined);
+        if (batch.length === 0) continue;
+        try {
+          const found = await ipc.refreshRecentThumbs(batch);
           if (disposed) return;
           // Only projects that resolved come back; a missing key is the batch
           // equivalent of the single-path `null`.
           for (const [path, thumb] of Object.entries(found)) {
             if (thumb) paintThumb(path, thumb);
           }
-        })
-        .catch(() => {
+        } catch {
           // Best-effort: the backend already fails soft. A fresh mount clears
           // thumbTried, so the next home visit retries.
-        });
+        }
+      }
+    } finally {
+      thumbPumping = false;
     }
   }
 
@@ -483,10 +601,17 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     try {
       const index = await ipc.listRecents();
       recents = index.items;
+      // A store that could read neither recents.json nor its backup may say so
+      // in the answer rather than reject; with nothing to show, that is the
+      // same "couldn't read", not "no projects".
+      recentsError = (index as { unreadable?: unknown }).unreadable === true && recents.length === 0;
     } catch (e) {
       toast.error(`Couldn't read recent projects: ${describeError(e)}`);
       recents = [];
+      recentsError = true;
     }
+    // The read is async: a screen left meanwhile has no grid to paint.
+    if (disposed) return;
     renderGrid();
     backfillThumbs();
     syncSelectAvailability();
@@ -599,7 +724,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       if (e.key === "Escape") {
         e.preventDefault();
         close();
-      } else if (e.key === "Enter" && input) {
+      } else if (modalEnterConfirms(e, input)) {
         e.preventDefault();
         void confirm();
       }
@@ -728,7 +853,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
         // in" says (that setting is about Explorer): opening files from Home
         // is starting a project with them, so they go to the "Open as" dialog
         // (routeOpenPicks / routeDrop) and the user says which kind.
-        toast.error("Unsupported file type.");
+        toast.refuse("Unsupported file type.");
         return;
       }
       if (!(await ipc.pathExists(path))) {
@@ -736,11 +861,10 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
         await refresh();
         return;
       }
-      // A .trt inside tmp-projects is a live temporary project (a drop, or the
+      // A .trt inside tmp-projects is a temporary project (a drop, or the
       // picker pointed at the scratch folder): it opens as temp, so it gets the
       // Temporary badge and the keep gate instead of being edited in place
-      // until the next start's sweep deletes it — the same classification an
-      // Explorer open applies.
+      // outside the library — the same classification an Explorer open applies.
       const temp = await isTempProjectPath(path);
       // Both checks are disk round-trips; see createNew for why a disposed
       // screen must not navigate once they resolve.
@@ -749,6 +873,61 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       if (openedInfo) toast.info(openedInfo);
     } finally {
       busy = false;
+    }
+  }
+
+  /* ---------------- recovering orphaned temporary projects ---------------- */
+
+  /* A temporary project's keep-or-discard question is asked when it is left —
+     Back, the window close, another open. A crash, a Windows logoff or a forced
+     close never asks it, and the startup sweep then keeps the edited ones
+     (untouched ones it deletes; Home never sees those). Each kept one gets a
+     calm line here that reopens it as what it is, a TEMPORARY project, so the
+     ordinary question settles it: Keep files it in the library, Discard
+     removes it. It is never added to recents here, and nothing about it is
+     decided on the user's behalf. Listed once per mount, after the first paint
+     and any open in progress (armBackgroundWork): the folder is normally
+     empty, and nothing on screen waits for the answer. */
+  async function loadOrphans(): Promise<void> {
+    let paths: string[];
+    try {
+      paths = await ipc.listOrphanTempProjects();
+    } catch {
+      // Best-effort: the files stay where they are, and the next Home visit
+      // asks again.
+      return;
+    }
+    if (disposed) return;
+    orphans = paths.filter((p) => typeof p === "string" && fileExt(p) === "trt");
+    renderOrphans();
+  }
+
+  function renderOrphans(): void {
+    const none = orphans.length === 0;
+    if (recoverEl.hidden !== none) recoverEl.hidden = none;
+    recoverEl.innerHTML = none ? "" : orphanRowsHtml(orphans);
+  }
+
+  async function recoverOrphan(path: string): Promise<void> {
+    if (guard()) return;
+    let gone = false;
+    try {
+      gone = !(await ipc.pathExists(path));
+      if (disposed) return;
+      if (gone) {
+        toast.error("Temporary project not found");
+        return;
+      }
+      // Always temporary, by route, not by asking where the file lives: the
+      // keep gate is the whole point of this line.
+      navigate({ view: "editor", projectPath: path, temp: true });
+    } catch (e) {
+      if (!disposed) toast.error(describeError(e));
+    } finally {
+      busy = false;
+      // Whatever removed the file may have removed others: list again rather
+      // than leave lines that lead nowhere.
+      if (gone && !disposed) void loadOrphans();
     }
   }
 
@@ -795,8 +974,9 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   }
 
   function followRoute(route: OpenRoute): void {
+    // A refusal, never recorded: nothing failed, the files were declined.
     const notice = openRouteNotice(route);
-    if (notice) toast.error(notice);
+    if (notice) toast.refuse(notice);
     if (route.kind === "project") void openPath(route.path, openRouteInfo(route));
     else if (route.kind === "media") void offerOpenAs(route.media);
   }
@@ -923,17 +1103,25 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     input.addEventListener("blur", () => void commit());
   }
 
-  function openMore(path: string, x: number, y: number): void {
+  /** `fromKeyboard`: opened with Enter or Space on the More button, so the
+   *  menu starts on its first row and the arrow keys and Enter work at once. */
+  function openMore(path: string, x: number, y: number, fromKeyboard = false): void {
     const item = recentByPath(path);
     if (!item) return;
     const card = grid.querySelector<HTMLElement>(`.project-card[data-path="${CSS.escape(path)}"]`);
-    showMenu(x, y, [
-      { label: "Open", onSelect: () => void openPath(path) },
-      { label: "Rename", onSelect: () => card && startRename(card, item) },
-      { label: "Duplicate", onSelect: () => promptDuplicate(item) },
-      { label: "Remove from list", onSelect: () => removeFromList(path) },
-      { label: "Delete file", danger: true, onSelect: () => promptDelete(item) },
-    ]);
+    showMenu(
+      x,
+      y,
+      [
+        { label: "Open", onSelect: () => void openPath(path) },
+        { label: "Rename", onSelect: () => card && startRename(card, item) },
+        { label: "Duplicate", onSelect: () => promptDuplicate(item) },
+        { label: "Remove from list", onSelect: () => removeFromList(path) },
+        { label: "Delete file", danger: true, onSelect: () => promptDelete(item) },
+      ],
+      undefined,
+      fromKeyboard,
+    );
   }
 
   function handleDroppedPaths(paths: string[]): void {
@@ -971,16 +1159,34 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   selectDeleteBtn.addEventListener("click", confirmDeleteSelection);
   // Esc leaves select mode. Capture phase so it beats the search field; skipped
   // when a modal is up so Esc there cancels the dialog, not the whole mode.
-  const onEscape = (e: KeyboardEvent): void => {
-    if (e.key !== "Escape" || !selectMode || deleting) return;
-    if (document.querySelector(".modal-backdrop")) return;
+  //
+  // Ctrl+F goes to the search field. Home no longer focuses it on mount (see
+  // the end of this function), so this is the keyboard's way there besides
+  // Tab. Not over a dialog or a menu, whose keys are their own, and not during
+  // an inline rename, which the blur would commit.
+  const onDocKey = (e: KeyboardEvent): void => {
+    if (e.key === "Escape") {
+      if (!selectMode || deleting) return;
+      if (document.querySelector(".modal-backdrop")) return;
+      e.preventDefault();
+      leaveSelectMode();
+      return;
+    }
+    if (!isSearchChord(e) || renaming) return;
+    if (document.querySelector(".modal-backdrop, .ctx-menu")) return;
     e.preventDefault();
-    leaveSelectMode();
+    search.focus();
+    search.select();
   };
-  document.addEventListener("keydown", onEscape, true);
+  document.addEventListener("keydown", onDocKey, true);
 
   grid.addEventListener("click", (e) => {
     const target = e.target as HTMLElement;
+    // The unreadable-recents state's own button (no cards exist then).
+    if (target.closest('[data-act="retry-recents"]')) {
+      void refresh();
+      return;
+    }
     // In select mode a card click toggles selection and never opens; the "..."
     // menu and rename affordances are inert.
     if (selectMode) {
@@ -992,7 +1198,8 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     if (moreBtn) {
       e.stopPropagation();
       const rect = moreBtn.getBoundingClientRect();
-      openMore(moreBtn.dataset.more!, rect.left, rect.bottom + 2);
+      // detail 0: Enter or Space on the button, not a pointer.
+      openMore(moreBtn.dataset.more!, rect.left, rect.bottom + 2, e.detail === 0);
       return;
     }
     // A rename in progress swallows its own clicks; guard the card open.
@@ -1003,18 +1210,23 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   grid.addEventListener("keydown", (e) => {
     if (e.key !== "Enter") return;
     const target = e.target as HTMLElement;
-    // Enter toggles selection in select mode instead of opening.
-    if (selectMode) {
-      const card = target.closest<HTMLElement>(".project-card");
-      if (card) {
-        e.preventDefault();
-        toggleSelection(card.dataset.path!);
-      }
-      return;
+    const action = gridEnterAction(target, selectMode);
+    if (action === null) return;
+    const card = target.closest<HTMLElement>(".project-card")!;
+    if (action === "toggle") {
+      // Enter toggles selection in select mode instead of opening. The
+      // preventDefault also stops Enter on the (inert) More button from
+      // turning into a click that would toggle the card a second time.
+      e.preventDefault();
+      toggleSelection(card.dataset.path!);
+    } else {
+      void openPath(card.dataset.path!);
     }
-    if (target.closest(".project-card__rename")) return;
-    const card = target.closest<HTMLElement>(".project-card");
-    if (card) void openPath(card.dataset.path!);
+  });
+  recoverEl.addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-recover]");
+    const path = btn ? orphans[Number(btn.dataset.recover)] : undefined;
+    if (path !== undefined) void recoverOrphan(path);
   });
   grid.addEventListener("contextmenu", (e) => {
     // The per-card menu is inert during select mode.
@@ -1061,8 +1273,34 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     else unlistenDrop = u;
   });
 
+  /* The work that can wait: thumbnail backfill and the orphan listing. First
+     every open already queued or running settles — a launch whose file is still
+     opening painted this Home only as a fallback, and that open then navigates
+     away, which disposes this screen before any of it starts — and then the
+     window goes idle, so the first paint and the first input come first. The
+     wait is a no-op task on the open chain, and nothing waits on IT, so it
+     cannot hold anything up. An open parked on a question (keep or discard?)
+     holds the thumbnails until it is answered, which is the right order. */
+  function armBackgroundWork(): void {
+    const start = (): void => {
+      if (disposed) return;
+      backgroundArmed = true;
+      void pumpThumbs();
+      void loadOrphans();
+    };
+    void runOnOpenChain(async () => {}).then(() => {
+      if (disposed) return;
+      if (typeof requestIdleCallback === "function") requestIdleCallback(start, { timeout: 1000 });
+      else window.setTimeout(start, 50);
+    });
+  }
+
   void refresh();
-  search.focus();
+  armBackgroundWork();
+  // The search field is NOT focused here. Home is the first screen of every
+  // plain launch, so a focused field ate whatever the user typed first — a
+  // keypress meant for another window while this one came up landed in it as
+  // a stray letter and filtered the grid. Tab and Ctrl+F reach it.
 
   return {
     dispose() {
@@ -1070,7 +1308,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       window.clearTimeout(thumbRetry);
       unlistenDrop?.();
       unlistenDrop = null;
-      document.removeEventListener("keydown", onEscape, true);
+      document.removeEventListener("keydown", onDocKey, true);
       // The context menu and any open dialog live on document.body, outside the
       // subtree the router clears — and both hold callbacks (promptDelete,
       // startRename, the confirm handler) that reach back into this screen.

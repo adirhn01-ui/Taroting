@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::error::Result;
 use crate::paths;
-use crate::project::store::{atomic_write, read_json_status, JsonRead};
+use crate::project::store::{atomic_write, on_store, read_json_status, JsonRead};
 
 fn settings_path() -> Result<std::path::PathBuf> {
     Ok(paths::data_dir()?.join("settings.json"))
@@ -70,8 +70,20 @@ impl SettingsRead {
 /// keeping that backup all along; now it is consulted, AND the case where even
 /// it cannot be read is reported as its own state instead of being flattened
 /// into the same answer as "you have never saved anything".
+///
+/// Off the UI thread (a roaming profile or a backup agent can hold this file
+/// for seconds), and on the project store's worker with `save_settings`: the
+/// worker runs one job at a time, so a read can never meet a write between
+/// its two renames — the moment the primary is gone and only the `.bak`
+/// answers, which would be reported as a recovery. That queue is the settings
+/// lock; nothing in Rust reads settings anywhere else.
 #[tauri::command]
-pub fn get_settings() -> Result<SettingsRead> {
+pub async fn get_settings() -> Result<SettingsRead> {
+    on_store(read_settings).await
+}
+
+/// `get_settings`' body.
+pub(crate) fn read_settings() -> Result<SettingsRead> {
     // No data dir means we could not even look, which is not the same as
     // looking and finding nothing — report it as unreadable so a caller stays
     // off the write path, exactly as `read_recents_checked` does.
@@ -89,12 +101,19 @@ pub fn get_settings() -> Result<SettingsRead> {
     })
 }
 
+/// On the project store's worker, like `get_settings` (see there): never on
+/// the UI thread, never beside another settings write.
 #[tauri::command]
-pub fn save_settings(settings: Value) -> Result<()> {
+pub async fn save_settings(settings: Value) -> Result<()> {
+    on_store(move || write_settings(&settings)).await
+}
+
+/// `save_settings`' body.
+pub(crate) fn write_settings(settings: &Value) -> Result<()> {
     let path = settings_path()?;
     let dir = paths::data_dir()?;
     paths::ensure_dir(&dir)?;
-    atomic_write(&path, serde_json::to_vec_pretty(&settings)?.as_slice())
+    atomic_write(&path, serde_json::to_vec_pretty(settings)?.as_slice())
 }
 
 #[cfg(test)]

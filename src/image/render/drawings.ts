@@ -17,7 +17,9 @@
 //   V·L is composed into one reused array, and each raster owns the copy of
 //   the matrix it was painted with.
 // - Hidden layers hold no raster; a layer that goes away takes its raster with
-//   it (`retain`).
+//   it (`retain`). Neither does a layer with no strokes: a stage-size canvas
+//   is ~5 MB at 1080p and several times that on a high-DPI screen, and an empty
+//   drawing layer (just added, or erased clean) would hold one for nothing.
 //
 // Opacity is NOT baked in: the compositor applies it once, as group opacity.
 
@@ -146,13 +148,22 @@ export class DrawingRasters {
   }
 
   /** The layer's raster for `view`, or null when there is no stage yet (the
-   *  compositor then paints the strokes itself). */
+   *  compositor then paints the strokes itself) or nothing to paint (the
+   *  compositor then draws nothing, unless a live mark targets the layer). */
   raster(doc: ProjectFile, l: Layer, view: ViewXf): CanvasImageSource | null {
     if (this.stageW < 1 || this.stageH < 1) return null;
-    const box = layerBox(l);
-    const m = composeView(view, layerMatrix(l.transform, box.w, box.h, doc.timeline.width, doc.timeline.height), this.cur);
     const chunks = chunksOf(l);
     let r = this.rasters.get(l.trackId);
+    if (countOf(chunks) === 0) {
+      // Erased clean (or never drawn on): give back what it held.
+      if (r) {
+        this.free(r);
+        this.rasters.delete(l.trackId);
+      }
+      return null;
+    }
+    const box = layerBox(l);
+    const m = composeView(view, layerMatrix(l.transform, box.w, box.h, doc.timeline.width, doc.timeline.height), this.cur);
     const resized = r !== undefined && (r.canvas.width !== this.stageW || r.canvas.height !== this.stageH);
 
     // The stage is being resized under a heavy drawing: show the old raster

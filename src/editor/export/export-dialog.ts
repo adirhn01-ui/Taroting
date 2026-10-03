@@ -11,7 +11,7 @@ import { appVersion, describeError, errorDetail, ipc, onJobEvents } from "../../
 import type { JobDone, JobFailed, JobProgress } from "../../core/ipc";
 import { ProjectSession, settingsStore, updateSettings } from "../../core/session";
 import { timelineDuration } from "../../core/time";
-import type { ExportPreset, ProjectFile, ResolutionPreset } from "../../core/types";
+import type { ExportPreset, FontFamily, ProjectFile, ResolutionPreset } from "../../core/types";
 import { detailPane, recentErrors, recordError } from "../../ui/errors";
 import { focusFirst, trapTab } from "../../ui/focus";
 import { icon } from "../../ui/icons";
@@ -35,11 +35,34 @@ type Codec = ExportPreset["vcodec"];
 
 /* ---------------- pure helpers (tested) ---------------- */
 
-/** Strip characters Windows forbids in file names, collapse whitespace. */
+/** Strip characters Windows forbids in file names, collapse whitespace.
+ *  Control characters (U+0000–U+001F) are forbidden too: a project name that
+ *  carried one reached the OS as an opaque "invalid argument" with nothing on
+ *  screen to say which character it meant. They go before the whitespace
+ *  collapse, so a stray tab or newline does not survive as a space either. */
 export function sanitizeFileName(name: string): string {
-  const cleaned = name.replace(/[<>:"/\\|?*]/g, "").replace(/\s+/g, " ").trim();
+  const cleaned = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "").replace(/\s+/g, " ").trim();
   return cleaned || "export";
 }
+
+/**
+ * Why `folder` cannot be an export destination, or null when it can.
+ *
+ * The folder field is free text and used to be taken verbatim — and saved as
+ * the remembered export folder before anything checked it, so "Videos" or
+ * "./out" (resolved against wherever the process happens to run) became the
+ * default for every later export, image exports included. Only a full path is
+ * a destination: a drive path (`C:\…`, `C:/…`) or a network share (`\\server\…`).
+ * Whether it exists is the caller's second, asynchronous question.
+ */
+export function destinationProblem(folder: string): string | null {
+  if (folder.trim() === "") return "Choose a folder for the export.";
+  if (/^[A-Za-z]:[\\/]/.test(folder) || /^\\\\[^\\]/.test(folder)) return null;
+  return "Enter a full folder path, like C:\\Videos, or choose one.";
+}
+
+/** What the export says when the typed folder is a full path to nothing. */
+export const MISSING_FOLDER = "That folder doesn't exist.";
 
 /** File extension (without dot) for an export format. */
 export function extForFormat(format: Format): string {
@@ -124,7 +147,11 @@ export function mergeExportPreset(
   base: ExportPreset | null | undefined,
   edits: PresetEdits,
 ): ExportPreset {
-  return { ...base, ...edits };
+  // The base is a value out of a `.trt`. Spreading a string would copy its
+  // characters in as keys "0", "1", … and save them back into the project, so
+  // anything that is not a plain object contributes nothing.
+  const kept = base && typeof base === "object" && !Array.isArray(base) ? base : {};
+  return { ...kept, ...edits };
 }
 
 /* ---------------- option tables ---------------- */
@@ -259,6 +286,161 @@ export function nothingToExport(p: ProjectFile): string | null {
 }
 
 /**
+ * Whether the export will carry any sound: some placed clip is audible. The
+ * exact rule of the backend's `clip_audible` (media has audio, the clip is
+ * neither muted nor detached, its track is not muted) — the backend writes a
+ * project with none as `-an`, and the size estimate has to price the same file.
+ *
+ * Runs on every estimate (a 300 ms debounce per control change), so it is one
+ * pass that stops at the first audible clip, never touches a muted track's
+ * clips, and allocates only the set of media that carry audio at all.
+ */
+export function exportHasAudio(p: Pick<ProjectFile, "media" | "timeline">): boolean {
+  const audible = new Set<string>();
+  for (const m of p.media) if (m.hasAudio) audible.add(m.id);
+  if (audible.size === 0) return false;
+  for (const t of p.timeline.tracks) {
+    if (t.muted) continue;
+    for (const c of t.clips) {
+      if (!c.audio.muted && !c.audio.detached && audible.has(c.mediaId)) return true;
+    }
+  }
+  return false;
+}
+
+/* ---------------- text the export font cannot draw ---------------- */
+
+type Range = readonly [number, number];
+
+/** Code points every one of the six export faces draws: Latin (with the
+ *  extended blocks and combining marks), Greek, Cyrillic, punctuation,
+ *  currency, letterlike symbols, number forms, arrows, maths operators, box
+ *  drawing and geometric shapes, plus the handful of WGL4 symbols (☺ ♀ ♠ ♥ ♪)
+ *  that Georgia and Impact, the two narrowest faces, also carry. */
+const COMMON_GLYPHS: readonly Range[] = [
+  [0x0000, 0x036f],
+  [0x0370, 0x03ff],
+  [0x0400, 0x052f],
+  [0x1e00, 0x1eff],
+  [0x2000, 0x200c],
+  [0x200e, 0x206f],
+  [0x2070, 0x20cf],
+  [0x2100, 0x22ff],
+  [0x2500, 0x25ff],
+  [0x263a, 0x263c],
+  [0x2640, 0x2640],
+  [0x2642, 0x2642],
+  [0x2660, 0x2660],
+  [0x2663, 0x2663],
+  [0x2665, 0x2666],
+  [0x266a, 0x266b],
+  [0xfb00, 0xfb06],
+];
+
+/** Hebrew, Arabic (with its presentation forms) and Greek Extended: in the
+ *  Segoe UI, Arial, Times New Roman and Courier New files, not in Georgia or
+ *  Impact. */
+const RTL_AND_GREEK_EXT: readonly Range[] = [
+  [0x0590, 0x05ff],
+  [0x0600, 0x06ff],
+  [0x0750, 0x077f],
+  [0x1f00, 0x1fff],
+  [0xfb1d, 0xfdff],
+  [0xfe70, 0xfeff],
+];
+
+/** Segoe UI alone adds Armenian, Georgian and the later Latin extensions. */
+const SEGOE_EXTRA: readonly Range[] = [
+  [0x0530, 0x058f],
+  [0x10a0, 0x10ff],
+  [0x2c60, 0x2c7f],
+  [0xa720, 0xa7ff],
+];
+
+const FONT_COVERAGE: Record<FontFamily, readonly (readonly Range[])[]> = {
+  "Segoe UI": [COMMON_GLYPHS, RTL_AND_GREEK_EXT, SEGOE_EXTRA],
+  Arial: [COMMON_GLYPHS, RTL_AND_GREEK_EXT],
+  "Times New Roman": [COMMON_GLYPHS, RTL_AND_GREEK_EXT],
+  "Courier New": [COMMON_GLYPHS, RTL_AND_GREEK_EXT],
+  Georgia: [COMMON_GLYPHS],
+  Impact: [COMMON_GLYPHS],
+};
+
+/**
+ * Whether the export's font file for `family` has a glyph for code point `cp`.
+ *
+ * The export draws text with ONE whitelisted font file and no fallback, while
+ * the preview is Chromium, which borrows any missing glyph from another font —
+ * so an emoji, a CJK title or a Thai caption looks right in the editor and
+ * exports as empty boxes. This is a conservative, table-driven view of what
+ * each of the six files covers (the faces `font_file` maps them to): it says
+ * "missing" only for blocks the file certainly lacks — emoji and pictographs,
+ * dingbats, CJK, the Indic and South-East Asian scripts — so a warning built on
+ * it never fires on ordinary text. The zero-width joiner and the emoji
+ * presentation selector (U+FE0F) count as missing: they only ever appear inside
+ * an emoji the preview draws in colour and the export cannot.
+ *
+ * Measuring with a canvas cannot answer this: canvas text falls back per glyph
+ * exactly like the preview, so it measures the borrowed glyph.
+ */
+export function fontHasGlyph(family: FontFamily, cp: number): boolean {
+  const tables = FONT_COVERAGE[family] ?? FONT_COVERAGE["Segoe UI"];
+  for (const ranges of tables) {
+    for (const [lo, hi] of ranges) if (cp >= lo && cp <= hi) return true;
+  }
+  return false;
+}
+
+/** How many example characters the warning quotes. */
+const MISSING_GLYPH_SAMPLES = 3;
+
+/**
+ * The characters of placed text clips that the export's font cannot draw, as
+ * up to three distinct user-visible characters (whole graphemes, so a family
+ * emoji joined with ZWJs is quoted as one character, not as fragments).
+ * Empty when there are none. A text media sitting in the bin is never drawn,
+ * so only text a clip actually uses is read.
+ */
+export function unsupportedTextSamples(p: Pick<ProjectFile, "media" | "timeline">): string[] {
+  const used = new Set<string>();
+  for (const t of p.timeline.tracks) for (const c of t.clips) used.add(c.mediaId);
+  const found: string[] = [];
+  let segmenter: Intl.Segmenter | null = null;
+  for (const m of p.media) {
+    const g = m.generator;
+    if (g?.type !== "text" || !used.has(m.id) || typeof g.text !== "string") continue;
+    // Cheap first pass: most text is plain, and needs no segmenter at all.
+    let any = false;
+    for (const ch of g.text) {
+      if (!fontHasGlyph(g.fontFamily, ch.codePointAt(0)!)) {
+        any = true;
+        break;
+      }
+    }
+    if (!any) continue;
+    segmenter ??= new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    for (const { segment } of segmenter.segment(g.text)) {
+      if (found.includes(segment)) continue;
+      for (const ch of segment) {
+        if (!fontHasGlyph(g.fontFamily, ch.codePointAt(0)!)) {
+          found.push(segment);
+          break;
+        }
+      }
+      if (found.length >= MISSING_GLYPH_SAMPLES) return found;
+    }
+  }
+  return found;
+}
+
+/** The export form's note for `samples`, or null when there is nothing to say.
+ *  A note, never a refusal: the export still runs, and the user decides. */
+export function missingGlyphNote(samples: readonly string[]): string | null {
+  if (samples.length === 0) return null;
+  return `Some characters in your text, like ${samples.join(" ")}, aren't in the text's font, so the export will show empty boxes in their place.`;
+}
+
+/**
  * Whether `target` is one of the files this project reads. Exporting onto one
  * would replace an original, so the overwrite strip must not offer Replace for
  * it. Generated media have no file (their `path` is a placeholder) and never
@@ -299,6 +481,83 @@ const RESOLUTIONS: { value: string; label: string }[] = [
   { value: "480p", label: "480p" },
   { value: "custom", label: "Custom" },
 ];
+
+/** A custom export size's side, in px. The floor is the dialog's own `min`;
+ *  the ceiling is past 8K on either axis, far beyond anything the encoders
+ *  take, and keeps the value a small integer the backend's `u32` accepts. */
+export const RES_MIN = 16;
+export const RES_MAX = 16384;
+/** Frame-rate bounds: the custom field's own range (GIF tops out lower). */
+export const FPS_MAX = 240;
+export const GIF_FPS_MAX = 30;
+/** Bitrate bounds in kbps. The floors are the custom fields' `min`; the
+ *  ceilings only keep a crafted number inside what ffmpeg and the backend's
+ *  `u64` can be handed. */
+export const VIDEO_KBPS_MIN = 100;
+export const VIDEO_KBPS_MAX = 1_000_000;
+export const AUDIO_KBPS_MIN = 32;
+export const AUDIO_KBPS_MAX = 3_000;
+
+const clampInt = (n: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, Math.round(n)));
+
+function finiteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+function sanitizeBitrate(v: unknown, lo: number, hi: number): "auto" | number {
+  return finiteNumber(v) && v > 0 ? clampInt(v, lo, hi) : "auto";
+}
+
+/**
+ * A project's persisted export preset — a value out of a `.trt`, so untrusted —
+ * as one this dialog can render and the backend can parse.
+ *
+ * The dialog used to whitelist only the format and the codec. Everything else
+ * was interpolated straight into the form's markup (`value="${…}"`), so a
+ * crafted string fps or width became attributes and elements of its own (the
+ * CSP stops script, not markup); `export: null` threw before the dialog
+ * painted; `resolution: null` left an empty modal; a string bitrate or a
+ * fractional width reached Rust, whose `u64`/`u32` refuse it, as a failed
+ * export. Every field now arrives as the type its control expects, or as the
+ * control's own default.
+ *
+ * Fields this build does not own are not the business of this function: the
+ * persisted preset stays the merge base for `mergeExportPreset`, so a newer
+ * build's keys survive the save exactly as before.
+ */
+export function sanitizeExportPreset(raw: unknown): PresetEdits {
+  const o = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  const format = whitelistFormat(o.format);
+  const vcodec = whitelistCodec(o.vcodec, format);
+
+  let resolution: ResolutionPreset = "original";
+  const r = o.resolution;
+  if (typeof r === "string" && r !== "custom" && RESOLUTIONS.some((x) => x.value === r)) {
+    resolution = r as ResolutionPreset;
+  } else if (r && typeof r === "object") {
+    const { w, h } = r as { w?: unknown; h?: unknown };
+    if (finiteNumber(w) && finiteNumber(h)) {
+      resolution = { w: clampInt(w, RES_MIN, RES_MAX), h: clampInt(h, RES_MIN, RES_MAX) };
+    }
+  }
+
+  // GIF caps the frame rate the same way the format switch does (and the
+  // backend after it): an over-cap value becomes the cap, not "original".
+  let fps: "original" | number = "original";
+  if (finiteNumber(o.fps) && o.fps >= 1 && o.fps <= FPS_MAX) {
+    fps = format === "gif" ? Math.min(o.fps, GIF_FPS_MAX) : o.fps;
+  }
+
+  return {
+    format,
+    vcodec,
+    resolution,
+    fps,
+    videoBitrate: sanitizeBitrate(o.videoBitrate, VIDEO_KBPS_MIN, VIDEO_KBPS_MAX),
+    audioBitrate: sanitizeBitrate(o.audioBitrate, AUDIO_KBPS_MIN, AUDIO_KBPS_MAX),
+    useHardware: o.useHardware === true,
+  };
+}
 
 const FPS_OPTIONS = [
   { value: "original", label: "Original" },
@@ -371,6 +630,21 @@ export function gateHardware(preset: ExportPreset, blocked: HardwareBlock): Expo
   return blocked === null ? { ...preset } : { ...preset, useHardware: false };
 }
 
+/** The success view's note when the backend redid a failed hardware encode in
+ *  software. Calm, and with no action: the file is there and it is fine. */
+export const HW_FALLBACK_NOTE = "Hardware encoding failed, so this export used the CPU instead.";
+
+/**
+ * Whether a finished export job was redone in software after its hardware
+ * encode failed. The backend adds `hwFallback: true` to the export job's done
+ * output in exactly that case (and omits it otherwise). Strictly `true`: the
+ * output is a loose JSON record, and nothing but the real flag may claim the
+ * hardware failed.
+ */
+export function usedSoftwareFallback(output: Record<string, unknown> | null | undefined): boolean {
+  return output?.hwFallback === true;
+}
+
 /** Human ETA like "about 12s left" / "about 2m left". */
 function formatEta(sec: number): string {
   if (sec < 1) return "less than a second left";
@@ -392,11 +666,11 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
      Only the OPENING values are snapshotted here. Everything that feeds an
      estimate or the export itself reads `session.project` live, so an edit made
      while this dialog is open is the one that gets exported. */
-  const start = session.project.export;
-  // Whitelisted first: everything below (the file extension, the codec list,
-  // the gif-only rows) is derived from these two.
-  let format: Format = whitelistFormat(start.format);
-  let codec: Codec = whitelistCodec(start.vcodec, format);
+  // Sanitized first, every field: everything below (the file extension, the
+  // codec list, the gif-only rows, the form's markup) is derived from these.
+  const start = sanitizeExportPreset(session.project.export);
+  let format: Format = start.format;
+  let codec: Codec = start.vcodec;
   let resolution: ResolutionPreset = start.resolution;
   let fps: "original" | number = start.fps;
   let videoBitrate: "auto" | number = start.videoBitrate;
@@ -624,9 +898,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
               ).join("")}
             </select>
             <span class="export-row__control ${isCustomRes ? "" : "export-row--hidden"}" id="ex-res-custom">
-              <input class="input export-num" id="ex-res-w" type="number" min="16" step="2" value="${customW}" aria-label="Width" />
+              <input class="input export-num" id="ex-res-w" type="number" min="16" step="2" value="${Number(customW)}" aria-label="Width" />
               <span class="export-dim-x">×</span>
-              <input class="input export-num" id="ex-res-h" type="number" min="16" step="2" value="${customH}" aria-label="Height" />
+              <input class="input export-num" id="ex-res-h" type="number" min="16" step="2" value="${Number(customH)}" aria-label="Height" />
             </span>
           </div>
         </div>
@@ -640,7 +914,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
                 .join("")}
             </select>
             <input class="input export-num ${isCustomFps ? "" : "export-row--hidden"}" id="ex-fps-custom"
-              type="number" min="1" max="${format === "gif" ? 30 : 240}" step="1" value="${customFps}" aria-label="Custom frame rate" />
+              type="number" min="1" max="${format === "gif" ? GIF_FPS_MAX : FPS_MAX}" step="1" value="${Number(customFps)}" aria-label="Custom frame rate" />
           </div>
         </div>
 
@@ -652,7 +926,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
               <option value="custom" ${videoBitrate !== "auto" ? "selected" : ""}>Custom</option>
             </select>
             <input class="input export-num ${videoBitrate !== "auto" ? "" : "export-row--hidden"}" id="ex-vbr"
-              type="number" min="100" step="100" value="${videoBitrate === "auto" ? 8000 : videoBitrate}" aria-label="Video bitrate kbps" />
+              type="number" min="100" step="100" value="${videoBitrate === "auto" ? 8000 : Number(videoBitrate)}" aria-label="Video bitrate kbps" />
             <span class="export-ext ${videoBitrate !== "auto" ? "" : "export-row--hidden"}" id="ex-vbr-unit">kbps</span>
           </div>
         </div>
@@ -665,7 +939,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
               <option value="custom" ${audioBitrate !== "auto" ? "selected" : ""}>Custom</option>
             </select>
             <input class="input export-num ${audioBitrate !== "auto" ? "" : "export-row--hidden"}" id="ex-abr"
-              type="number" min="32" step="16" value="${audioBitrate === "auto" ? 192 : audioBitrate}" aria-label="Audio bitrate kbps" />
+              type="number" min="32" step="16" value="${audioBitrate === "auto" ? 192 : Number(audioBitrate)}" aria-label="Audio bitrate kbps" />
             <span class="export-ext ${audioBitrate !== "auto" ? "" : "export-row--hidden"}" id="ex-abr-unit">kbps</span>
           </div>
         </div>
@@ -696,6 +970,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
 
         <div class="export-outpath" id="ex-outpath"></div>
         <div class="export-estimate" id="ex-estimate"></div>
+        <div class="export-note export-note--block" id="ex-glyph-note" hidden></div>
         <div id="ex-warn-slot"></div>
       </div>
     `;
@@ -709,8 +984,21 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
     updateEncoderBadge();
     updateHardwareRow();
     refreshOutPath();
+    updateGlyphNote();
     scheduleEstimate();
     seatFormFocus();
+  }
+
+  /** Say so, without stopping anything, when placed text uses characters the
+   *  export's font file cannot draw (see fontHasGlyph). Read from the live
+   *  project on every paint of the form, so returning from an edit is current.
+   *  Written as text: the samples are the user's own characters. */
+  function updateGlyphNote(): void {
+    const el = backdrop.querySelector<HTMLElement>("#ex-glyph-note");
+    if (!el) return;
+    const note = missingGlyphNote(unsupportedTextSamples(session.project));
+    el.hidden = note === null;
+    el.textContent = note ?? "";
   }
 
   /** Focus lives in the body this function just replaced. Every view swap here
@@ -745,7 +1033,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
       // leaving a note when it had to.
       adoptFormat(next);
       // gif caps fps at 30
-      if (format === "gif" && fps !== "original" && (fps as number) > 30) fps = 30;
+      if (format === "gif" && fps !== "original" && (fps as number) > GIF_FPS_MAX) fps = GIF_FPS_MAX;
       renderForm();
     });
 
@@ -772,8 +1060,8 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
       renderForm();
     });
     const applyCustomRes = (): void => {
-      const w = Math.max(16, Math.round(Number($<HTMLInputElement>("#ex-res-w").value) || 0));
-      const h = Math.max(16, Math.round(Number($<HTMLInputElement>("#ex-res-h").value) || 0));
+      const w = clampInt(Number($<HTMLInputElement>("#ex-res-w").value) || 0, RES_MIN, RES_MAX);
+      const h = clampInt(Number($<HTMLInputElement>("#ex-res-h").value) || 0, RES_MIN, RES_MAX);
       resolution = { w, h };
       scheduleEstimate();
     };
@@ -789,7 +1077,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
       renderForm();
     });
     $<HTMLInputElement>("#ex-fps-custom").addEventListener("input", (e) => {
-      const cap = format === "gif" ? 30 : 240;
+      const cap = format === "gif" ? GIF_FPS_MAX : FPS_MAX;
       const n = Math.max(1, Math.min(cap, Math.round(Number((e.target as HTMLInputElement).value) || 1)));
       fps = n;
       scheduleEstimate();
@@ -802,7 +1090,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
         renderForm();
       });
       $<HTMLInputElement>("#ex-vbr")?.addEventListener("input", (e) => {
-        videoBitrate = Math.max(100, Math.round(Number((e.target as HTMLInputElement).value) || 100));
+        videoBitrate = clampInt(Number((e.target as HTMLInputElement).value) || VIDEO_KBPS_MIN, VIDEO_KBPS_MIN, VIDEO_KBPS_MAX);
         scheduleEstimate();
       });
     }
@@ -814,7 +1102,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
         renderForm();
       });
       $<HTMLInputElement>("#ex-abr")?.addEventListener("input", (e) => {
-        audioBitrate = Math.max(32, Math.round(Number((e.target as HTMLInputElement).value) || 32));
+        audioBitrate = clampInt(Number((e.target as HTMLInputElement).value) || AUDIO_KBPS_MIN, AUDIO_KBPS_MIN, AUDIO_KBPS_MAX);
         scheduleEstimate();
       });
     }
@@ -928,6 +1216,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
         // The estimate has to describe the encode that will actually run, so
         // it reads the gated preset — not the project's stored preference.
         preset: runPreset(),
+        // A silent export is written with `-an`; without this the estimate
+        // priced an audio stream the file will never have.
+        hasAudio: exportHasAudio(live),
       });
       if (!el.isConnected) return;
       const prefix = est.exact ? "" : "≈ ";
@@ -984,8 +1275,14 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
           <button class="btn btn--sm" data-w="cancel">Cancel</button>
         </div>
       </div>`;
+    // Clearing the strip removes the button that was just clicked, and focus
+    // falls to <body>, where the Tab trap never sees a key again. Seat it on
+    // Export once the strip is gone (checked AFTER the clear: during its own
+    // click the button is still inside the dialog). Replace and Rename move
+    // on to the progress view, which seats its own focus over this.
     const clear = (): void => {
       slot.innerHTML = "";
+      reseatAfterStrip();
     };
     if (onReplace !== null) {
       slot.querySelector('[data-w="replace"]')!.addEventListener("click", () => {
@@ -1000,9 +1297,17 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
     slot.querySelector('[data-w="cancel"]')!.addEventListener("click", clear);
   }
 
+  /** Put focus back inside the dialog when it fell out (see the strip's
+   *  clear()). A control that still holds it keeps it. */
+  function reseatAfterStrip(): void {
+    if (!backdrop.contains(document.activeElement)) focusFirst(backdrop, "#ex-run");
+  }
+
   /* -------- Export click flow -------- */
   async function onExportClick(): Promise<void> {
     // Before any Save As dialog: there is nothing to ask a destination for.
+    // An info toast on purpose: a timeline with no clips is where every new
+    // project starts, not a mistake to flag in red.
     const nothing = nothingToExport(session.project);
     if (nothing) {
       toast.info(nothing);
@@ -1014,7 +1319,21 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
       if (!picked) return;
     }
     if (!filename) {
-      toast.error("Please enter a file name.");
+      toast.refuse("Please enter a file name.");
+      return;
+    }
+    // The destination is checked BEFORE anything is persisted below: a typed
+    // folder that is not a full path, or names nothing, must not become the
+    // remembered export folder (it is the image export's default too).
+    const bad = destinationProblem(folder);
+    if (bad) {
+      toast.refuse(bad);
+      return;
+    }
+    const folderExists = await pathExists(folder);
+    if (closed) return;
+    if (!folderExists) {
+      toast.refuse(MISSING_FOLDER);
       return;
     }
 
@@ -1077,6 +1396,8 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
           `Tried ${RENAME_ATTEMPT_LIMIT} numbered variations of "${filename}.${ext}" in ${dir}` +
           ` and every one already exists. Nothing was overwritten — choose a different name or folder.`,
       });
+      // The strip that offered Rename is gone; keep focus inside the dialog.
+      reseatAfterStrip();
       return;
     }
     filename = free;
@@ -1169,7 +1490,9 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
         </div>
       </div>
     `;
-    footerEl.innerHTML = `<button class="btn btn--danger" id="ex-cancel">Cancel</button>`;
+    // A plain button: destructive red is for permanently deleting a real
+    // library item, and canceling an export deletes nothing of the user's.
+    footerEl.innerHTML = `<button class="btn" id="ex-cancel">Cancel</button>`;
     $("#ex-cancel").addEventListener("click", () => void onCancelExport());
     // The Export button the user just pressed no longer exists. Cancel is the
     // only thing this view offers, and it is the one control they may urgently
@@ -1208,7 +1531,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
       unlistenJobs = null;
     }
     const path = typeof e.output.path === "string" ? e.output.path : outPath();
-    renderSuccess(path);
+    renderSuccess(path, usedSoftwareFallback(e.output));
   }
 
   function handleFailed(e: JobFailed): void {
@@ -1251,13 +1574,14 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
      RESULT VIEWS
      ============================================================ */
 
-  function renderSuccess(path: string): void {
+  function renderSuccess(path: string, hwFallback: boolean): void {
     jobId = null;
     bodyEl.innerHTML = `
       <div class="export-result">
         <div class="export-result__icon export-result__icon--ok">${checkIcon(24)}</div>
         <div class="export-result__title">Exported</div>
         <div class="export-result__path">${escapeHtml(path)}</div>
+        ${hwFallback ? `<div class="export-result__msg" id="ex-hw-fallback">${escapeHtml(HW_FALLBACK_NOTE)}</div>` : ""}
       </div>
     `;
     footerEl.innerHTML = `

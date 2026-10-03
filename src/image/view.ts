@@ -172,6 +172,27 @@ function panBindings(shortcuts: Record<ActionId, string>): Map<string, ActionId[
 
 const modalOpen = (): boolean => document.querySelector(".modal-backdrop") !== null;
 
+/** Focused controls that Space ACTIVATES (presses, toggles, opens). Hold to
+ *  pan leaves the key to them: a keyboard user tabbing to the Flip switch must
+ *  be able to flip it. Deliberately not listed: sliders and range inputs (the
+ *  ruler, the inspector's amounts), which keep focus after a pointer drag and
+ *  give Space no meaning of their own — "place the ruler, then hold Space and
+ *  drag" must still pan — and the Layers list, for the same reason. */
+export const SPACE_ACTIVATES =
+  "button, input:not([type=range]), select, textarea, summary, [role=button], [role=switch], [role=checkbox], " +
+  "[role=radio], [role=tab], [role=menuitem], [role=menuitemcheckbox], [role=menuitemradio]";
+
+export interface ViewOptions {
+  /** True while a keyboard hold (`blockShortcuts`) should still let hold to
+   *  pan through. The shell answers it for its two crop modes: each holds the
+   *  keyboard for its whole session, so a stray Delete or Ctrl+Z cannot edit
+   *  the picture being framed — but moving the view is not an edit, and a
+   *  crop is exactly when the user zooms in and needs to look around. The
+   *  stage's capture-phase pointerdown already claims a held-key drag before
+   *  either crop sees it, so the drag pans and never moves the crop window. */
+  panThroughBlock?: () => boolean;
+}
+
 /** One `ResizeObserver` on `stage` and one DPR listener; `fit()` on mount and
  *  on the first resize. `getCanvasSize` is read live (a crop or a canvas
  *  resize changes it). `dispose()` disconnects everything it attached. */
@@ -179,6 +200,7 @@ export function createViewController(
   stage: HTMLElement,
   canvas: HTMLCanvasElement,
   getCanvasSize: () => { w: number; h: number },
+  opts: ViewOptions = {},
 ): ViewController & { dispose(): void } {
   let dpr = window.devicePixelRatio || 1;
   const rect0 = stage.getBoundingClientRect();
@@ -378,9 +400,14 @@ export function createViewController(
       return;
     }
     // The §2.8 guards, all of them: this is a key handler of its own, outside
-    // the ShortcutManager, so it re-applies what the manager would.
-    if (e.repeat || isTypingTarget(e.target) || shortcutsBlocked() || modalOpen()) return;
+    // the ShortcutManager, so it re-applies what the manager would — except
+    // that a crop's keyboard hold lets the pan through (ViewOptions).
+    if (e.repeat || isTypingTarget(e.target) || modalOpen()) return;
+    if (shortcutsBlocked() && !opts.panThroughBlock?.()) return;
     if (resolveChord(e, bindings) !== "imgPanHold") return;
+    // A focused switch or button takes its own Space (SPACE_ACTIVATES).
+    // Checked after the chord, so only the pan key pays for the lookup.
+    if (e.target instanceof Element && e.target.closest(SPACE_ACTIVATES) !== null) return;
     e.preventDefault();
     holdCode = e.code || e.key;
     paintPanClass();

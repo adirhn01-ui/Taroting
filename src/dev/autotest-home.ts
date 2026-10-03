@@ -15,6 +15,7 @@
 //
 // Each block ends on Home with every project it created deleted.
 
+import { invoke } from "@tauri-apps/api/core";
 import { CRASH_TITLES, showCrashNotes } from "../core/crash-notes";
 import { ipc } from "../core/ipc";
 import { navigate } from "../core/nav";
@@ -23,6 +24,12 @@ import { currentSession } from "../core/session";
 import type { ProjectFile } from "../core/types";
 import { closeMenu } from "../ui/menu";
 import type { Wave1Ctx } from "./autotest-wave1";
+
+/** Delete a file a block wrote that is NOT a project (a card picture).
+ *  `deleteProject` takes only a `.trt`; `debug_remove_test_file` exists only
+ *  under the harness and deletes only inside the run's scratch root and the
+ *  derived-file cache. */
+const removeTestFile = (path: string): Promise<void> => invoke<void>("debug_remove_test_file", { path });
 
 /** Same harness surface as the Wave 1, viewer and image blocks. */
 export type HomeCtx = Wave1Ctx;
@@ -318,7 +325,7 @@ export async function runHomeBlocks(ctx: HomeCtx): Promise<void> {
       for (const p of made) {
         const thumb = recents.items.find((i) => norm(i.path) === norm(p))?.thumb;
         await ipc.deleteProject(p).catch(() => {});
-        if (thumb) await ipc.deleteProject(thumb).catch(() => {});
+        if (thumb) await removeTestFile(thumb).catch(() => {});
       }
     }
   });

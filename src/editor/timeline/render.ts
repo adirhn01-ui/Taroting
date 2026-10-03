@@ -4,7 +4,7 @@
 // identity, and static clips cost nothing extra. What still allocates per draw:
 // the xOf closure and the ruler tick labels.
 
-import { fileStem } from "../../core/format";
+import { mediaDisplayName } from "../../core/media-name";
 import { clipDuration, timelineTime } from "../../core/time";
 import type { AnimProp, Clip, MediaRef, ProjectFile, Track } from "../../core/types";
 import type { WaveformData } from "../media/media";
@@ -557,7 +557,8 @@ function drawClip(
   );
   ctx.stroke();
 
-  // name label
+  // name label: the one shared naming rule (a text clip by its current text,
+  // not the label stamped into its path at creation)
   if (w > 40 && media) {
     ctx.save();
     ctx.beginPath();
@@ -566,7 +567,7 @@ function drawClip(
     ctx.fillStyle = colors.text1;
     ctx.font = "11px 'Segoe UI Variable Text', 'Segoe UI', sans-serif";
     ctx.textBaseline = "top";
-    ctx.fillText(fileStem(media.path), x + 7, y + 5);
+    ctx.fillText(mediaDisplayName(media), x + 7, y + 5);
     ctx.restore();
   }
 

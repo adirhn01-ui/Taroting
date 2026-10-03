@@ -14,7 +14,7 @@
 
 import "./settings.css";
 import { escapeHtml, formatBytes } from "../core/format";
-import { appVersion, describeError, ipc } from "../core/ipc";
+import { appVersion, describeError, errorDetail, ipc } from "../core/ipc";
 import { navigate } from "../core/nav";
 import {
   currentSession,
@@ -35,7 +35,7 @@ import {
   recentErrors,
   recordError,
 } from "../ui/errors";
-import { trapTab } from "../ui/focus";
+import { focusFirst, trapTab } from "../ui/focus";
 import { icon } from "../ui/icons";
 import { toast } from "../ui/toast";
 
@@ -279,6 +279,151 @@ const CACHE_KIND_ORDER = ["remux", "proxy", "waveform", "thumbs", "filmstrip"];
 
 type CacheStats = { totalBytes: number; byKind: Record<string, number> };
 
+/** The cache-limit wording. The list's own values say "2 GB" for 2048 MB, so an
+ *  off-list value is put in the same binary units — `formatBytes` counts in
+ *  thousands and would call 3000 MB "3.1 GB", more than the 2.9 it is here. */
+export function cacheLimitLabel(mb: number): string {
+  if (mb < 1024) return `${mb} MB`;
+  return `${Number((mb / 1024).toFixed(1))} GB`;
+}
+
+/**
+ * A numeric `<select>` that always shows the value actually in effect.
+ *
+ * `sanitizeSettings` accepts any value in a range (autosave 1-3600 s, cache
+ * 1 MB-1 TB), but the list offers five. A hand-edited or older settings.json
+ * holding 7 s or 3000 MB used to render with nothing marked `selected`, so the
+ * browser showed the FIRST option — "1s", "1 GB" — while the app went on using
+ * the real value. The screen lied, and re-picking the shown option to "keep" it
+ * silently changed the setting. An off-list value now gets its own option, in
+ * numeric order, and nothing is written back: the file keeps what it says.
+ */
+export function selectHtml(
+  id: string,
+  value: number,
+  options: readonly number[],
+  labelOf: (v: number) => string,
+): string {
+  const values =
+    options.includes(value) || !Number.isFinite(value)
+      ? [...options]
+      : [...options, value].sort((a, b) => a - b);
+  return `<select class="select select--sm" id="${id}">${values
+    .map(
+      (v) =>
+        `<option value="${v}" ${v === value ? "selected" : ""}>${escapeHtml(labelOf(v))}</option>`,
+    )
+    .join("")}</select>`;
+}
+
+/** True when every action is bound exactly as shipped. Compared chord by chord
+ *  through `normalizeChord`, so a hand-written "ctrl+z" counts as the default
+ *  "Ctrl+Z" (the same key does the same thing), while an action the loader
+ *  emptied because its default chord was taken does not. */
+export function shortcutsAtDefaults(shortcuts: Record<string, string>): boolean {
+  return ACTION_ORDER.every(
+    (a) => normalizeChord(shortcuts[a] ?? "") === normalizeChord(DEFAULT_SHORTCUTS[a]),
+  );
+}
+
+/**
+ * The look of a two-step confirm while it waits for its second click: the
+ * accent fill, so it is plainly not the button it was a moment ago. NOT
+ * `btn--danger` — that red is reserved for permanently deleting a real library
+ * item, and neither of these does: the cache regenerates, and shortcuts can be
+ * bound again.
+ */
+const ARMED_CLASS = "btn--primary";
+
+export function clearCacheButton(armed: boolean): string {
+  return `<button class="btn btn--sm ${armed ? ARMED_CLASS : ""}" id="settings-clear-cache">${armed ? "Really clear?" : "Clear cache"}</button>`;
+}
+
+/** Disabled while the shortcuts already are the defaults: there is nothing to
+ *  reset, and a "Really reset?" that changes nothing would only teach the user
+ *  to click straight through it. */
+export function resetShortcutsButton(armed: boolean, atDefaults: boolean): string {
+  const on = armed && !atDefaults;
+  return `<button class="btn btn--sm ${on ? ARMED_CLASS : "btn--ghost"}" id="settings-reset-shortcuts" ${atDefaults ? "disabled" : ""}>${on ? "Really reset?" : "Reset to defaults"}</button>`;
+}
+
+/** What to tell the user when the Uninstall button finds no uninstaller to run:
+ *  a portable copy (or a dev build) has no `uninstall.exe` beside it, and
+ *  `uninstall_app` then says exactly "not installed" with code `bad_input`.
+ *  Matched on BOTH, because the same code also carries a real failure
+ *  ("uninstall task failed: …"), which must stay an error. Null means a genuine
+ *  failure. */
+export function uninstallRefusal(e: unknown): string | null {
+  const { code, message } = errorDetail(e);
+  if (code === "bad_input" && message === "not installed") {
+    return "This is a portable copy. To remove it, delete its folder.";
+  }
+  return null;
+}
+
+/* ---------------- keeping keyboard focus across a re-render ----------------
+ *
+ * The screen rebuilds its markup on every settings change, every two-step
+ * confirm arm and disarm, every shortcut capture and when the cache figure
+ * lands. Rebuilding destroys the focused node, so focus fell to <body>: the
+ * next Tab started again at the theme buttons, and "Really clear?" was out of a
+ * keyboard user's reach — Enter on Clear cache re-rendered the button out from
+ * under them. A render now notes WHICH control had focus (by id, or by the data
+ * attribute a repeated control carries) and seats focus on its successor. Keys
+ * are matched by comparing attribute values, never by building a selector from
+ * them, so no value ever needs escaping. */
+
+type FocusKey = { id: string } | { attr: string; value: string };
+
+/** The data attributes that name a control without an id: the theme and
+ *  opening-files choices, and the shortcut rows. */
+const FOCUS_ATTRS = ["data-theme-opt", "data-openwith-opt", "data-action"] as const;
+
+/** Where focus goes when the control it was on is gone or disabled after the
+ *  render. Each of these takes itself out of reach by being used. */
+const FOCUS_FALLBACK: Record<string, FocusKey> = {
+  // "Clear" empties the folder, which disables it.
+  "settings-clear-dir": { id: "settings-choose-dir" },
+  // The confirming "Really reset?" restores the defaults, which disables it.
+  "settings-reset-shortcuts": { attr: "data-action", value: ACTION_ORDER[0]! },
+  // The cache error's Details button goes away once usage reads cleanly.
+  "settings-cache-error": { id: "settings-cache-limit" },
+};
+
+function focusKeyOf(el: Element): FocusKey | null {
+  if (el.id) return { id: el.id };
+  for (const attr of FOCUS_ATTRS) {
+    const value = el.getAttribute(attr);
+    if (value !== null) return { attr, value };
+  }
+  return null;
+}
+
+function findByKey(container: HTMLElement, key: FocusKey): HTMLElement | null {
+  const attr = "id" in key ? "id" : key.attr;
+  const value = "id" in key ? key.id : key.value;
+  for (const el of container.querySelectorAll<HTMLElement>(`[${attr}]`)) {
+    if (el.getAttribute(attr) === value) return el;
+  }
+  return null;
+}
+
+function reachable(el: HTMLElement | null): el is HTMLElement {
+  return !!el && !(el as HTMLButtonElement).disabled;
+}
+
+/** Seat focus on the control `key` names inside `container`, or on its fallback
+ *  when that one is gone or disabled. Never scrolls: the control is where the
+ *  user just was. */
+function restoreFocus(container: HTMLElement, key: FocusKey): void {
+  let target = findByKey(container, key);
+  if (!reachable(target) && "id" in key) {
+    const fallback = FOCUS_FALLBACK[key.id];
+    if (fallback) target = findByKey(container, fallback);
+  }
+  if (reachable(target)) target.focus({ preventScroll: true });
+}
+
 /**
  * Write a settings change, and SAY SO if the write fails.
  *
@@ -347,6 +492,17 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   // render so we can suppress full re-renders while capturing.
   let clearConfirmTimer: number | undefined;
   let clearConfirmArmed = false;
+  // "Reset to defaults" is the same two-step confirm: one click used to wipe
+  // every custom shortcut at once, with nothing to undo it.
+  let resetConfirmTimer: number | undefined;
+  let resetConfirmArmed = false;
+  /** True while a system report is being built and written. The button is
+   *  rendered disabled from this, not just disabled in place, because any
+   *  re-render while the ffmpeg probe runs (the cache figure landing, a settings
+   *  change) would otherwise hand back an enabled button mid-save. */
+  let savingReport = false;
+  /** The Uninstall confirm is up: a second one must never stack on it. */
+  let uninstallOpen = false;
   let capturing: ActionId | null = null;
   let captureCleanup: (() => void) | null = null;
   // An open colour picker is anchored to a button inside `inner`, so a full
@@ -411,19 +567,6 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       .join("")}</div>`;
   }
 
-  function selectHtml(
-    id: string,
-    value: number,
-    options: { value: number; label: string }[],
-  ): string {
-    return `<select class="select select--sm" id="${id}">${options
-      .map(
-        (o) =>
-          `<option value="${o.value}" ${o.value === value ? "selected" : ""}>${escapeHtml(o.label)}</option>`,
-      )
-      .join("")}</select>`;
-  }
-
   function switchRow(id: string, label: string, on: boolean, hint?: string): string {
     return `
       <div class="settings__row">
@@ -476,11 +619,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   }
 
   function autosaveSection(s: Settings): string {
-    const sel = selectHtml(
-      "settings-autosave",
-      s.autosaveSeconds,
-      AUTOSAVE_OPTIONS.map((n) => ({ value: n, label: `${n}s` })),
-    );
+    const sel = selectHtml("settings-autosave", s.autosaveSeconds, AUTOSAVE_OPTIONS, (n) => `${n}s`);
     return `
       <section class="card settings__card">
         <div class="settings__section-head">Autosave</div>
@@ -575,11 +714,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
         <div class="settings__cache-total">${formatBytes(cacheStats.totalBytes)} used</div>
         <div class="settings__hint settings__cache-breakdown">${escapeHtml(parts)}</div>`;
     }
-    const sel = selectHtml(
-      "settings-cache-limit",
-      s.cacheLimitMB,
-      CACHE_LIMIT_OPTIONS_MB.map((mb) => ({ value: mb, label: `${mb / 1024} GB` })),
-    );
+    const sel = selectHtml("settings-cache-limit", s.cacheLimitMB, CACHE_LIMIT_OPTIONS_MB, cacheLimitLabel);
     return `
       <section class="card settings__card">
         <div class="settings__section-head">Cache</div>
@@ -595,7 +730,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
             <div class="settings__row-label">Clear cache</div>
             <div class="settings__hint">Remove generated previews, waveforms and thumbnails. Originals are never touched.</div>
           </div>
-          <button class="btn btn--sm ${clearConfirmArmed ? "btn--danger" : ""}" id="settings-clear-cache">${clearConfirmArmed ? "Really clear?" : "Clear cache"}</button>
+          ${clearCacheButton(clearConfirmArmed)}
         </div>
       </section>`;
   }
@@ -641,7 +776,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       <section class="card settings__card">
         <div class="settings__section-head settings__section-head--row">
           <span>Keyboard shortcuts</span>
-          <button class="btn btn--sm btn--ghost" id="settings-reset-shortcuts">Reset to defaults</button>
+          ${resetShortcutsButton(resetConfirmArmed, shortcutsAtDefaults(s.shortcuts))}
         </div>
         ${warning}
         <div class="settings__shortcuts">${rows}</div>
@@ -667,7 +802,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
           </div>
           <div class="settings__row-actions">
             <button class="btn btn--sm" id="settings-copy-report">Copy details</button>
-            <button class="btn btn--sm" id="settings-save-report">Save report</button>
+            <button class="btn btn--sm" id="settings-save-report" ${savingReport ? "disabled" : ""}>Save report</button>
           </div>
         </div>
       </section>`;
@@ -699,7 +834,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
         <div class="settings__row">
           <div class="settings__row-text">
             <div class="settings__row-label">Uninstall Taroting</div>
-            <div class="settings__hint">Removes the app, its settings and caches. Your projects in Documents\\Taroting and exported files are kept.</div>
+            <div class="settings__hint">Removes the app. The uninstaller asks whether to remove your settings and caches too. Your projects in Documents\\Taroting and exported files are kept.</div>
           </div>
           <button class="btn btn--sm btn--danger settings__uninstall-btn" id="settings-uninstall">Uninstall Taroting</button>
         </div>
@@ -710,6 +845,12 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
 
   function render(): void {
     const s = settingsStore.get();
+    // Read BEFORE the markup is replaced: the assignment detaches the focused
+    // node and focus falls to <body>. Only focus inside this screen's own
+    // content is carried over — never a dialog's or a toast's, and never the
+    // header's Back button, which this render does not touch.
+    const active = document.activeElement;
+    const focusKey = active && active !== inner && inner.contains(active) ? focusKeyOf(active) : null;
     inner.innerHTML = [
       appearanceSection(s),
       autosaveSection(s),
@@ -728,6 +869,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     // laid out with an empty swatch. See the block comment above colorRow.
     paintColorSwatches(s);
     wire();
+    if (focusKey) restoreFocus(inner, focusKey);
   }
 
   /* ---------------- wiring (re-run after each render) ---------------- */
@@ -802,12 +944,10 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       .querySelector<HTMLButtonElement>("#settings-clear-cache")
       ?.addEventListener("click", () => void handleClearCache());
 
-    // Reset shortcuts
+    // Reset shortcuts (two-step confirm)
     inner
       .querySelector<HTMLButtonElement>("#settings-reset-shortcuts")
-      ?.addEventListener("click", () => {
-        persist({ shortcuts: { ...DEFAULT_SHORTCUTS } });
-      });
+      ?.addEventListener("click", () => handleResetShortcuts());
 
     // Cache read failure → let the user actually read the reason
     inner
@@ -1031,27 +1171,63 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     });
   }
 
+  /** Enable or disable the CURRENT Save report button — a render may have
+   *  replaced the one that was clicked. */
+  function setSaveReportBusy(busy: boolean): void {
+    const btn = inner.querySelector<HTMLButtonElement>("#settings-save-report");
+    if (btn) btn.disabled = busy;
+  }
+
   async function saveSystemReport(): Promise<void> {
-    const report = await systemReport(true);
-    let path: string;
+    // One save at a time. A double click used to build two reports, write two
+    // files and show two toasts and two Explorer windows. The whole sequence is
+    // covered, the slow part first: building the report waits on an ffmpeg
+    // probe on a cold cache.
+    if (savingReport) return;
+    savingReport = true;
+    const hadFocus = document.activeElement === inner.querySelector("#settings-save-report");
+    setSaveReportBusy(true);
     try {
-      path = await ipc.saveDiagnosticReport(report);
+      const report = await systemReport(true);
+      let path: string;
+      try {
+        path = await ipc.saveDiagnosticReport(report);
+      } catch (e) {
+        // The report itself rides along as the detail, so a failed write never
+        // costs the user the text they asked for.
+        toast.error("Couldn't save the report.", {
+          detail: `${describeError(e)}\n\n${report}`,
+          op: "Settings",
+          title: "System report",
+        });
+        return;
+      }
+      toast.info("Report saved");
+      try {
+        const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+        await revealItemInDir(path);
+      } catch {
+        /* the file is written; showing it in Explorer is a nicety */
+      }
     } catch (e) {
-      // The report itself rides along as the detail, so a failed write never
-      // costs the user the text they asked for.
-      toast.error("Couldn't save the report.", {
-        detail: `${describeError(e)}\n\n${report}`,
+      // Building the report failed (its lazy module could not load). Said, not
+      // dropped: this used to be an unhandled rejection with no feedback at all.
+      toast.error("Couldn't build the report.", {
+        detail: describeError(e),
         op: "Settings",
         title: "System report",
       });
-      return;
-    }
-    toast.info("Report saved");
-    try {
-      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
-      await revealItemInDir(path);
-    } catch {
-      /* the file is written; showing it in Explorer is a nicety */
+    } finally {
+      savingReport = false;
+      if (!disposed) {
+        setSaveReportBusy(false);
+        // Disabling a focused button drops focus to <body>. Hand it back to a
+        // keyboard user who pressed Enter here, unless focus has gone elsewhere.
+        const ae = document.activeElement;
+        if (hadFocus && (!ae || ae === document.body)) {
+          inner.querySelector<HTMLElement>("#settings-save-report")?.focus({ preventScroll: true });
+        }
+      }
     }
   }
 
@@ -1100,12 +1276,41 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     await loadCacheStats();
   }
 
+  /* ---------------- shortcuts reset ---------------- */
+
+  function disarmResetConfirm(): void {
+    window.clearTimeout(resetConfirmTimer);
+    resetConfirmArmed = false;
+  }
+
+  /** The Clear-cache pattern: the first click arms "Really reset?" for three
+   *  seconds, the second restores the defaults. A no-op when there is nothing to
+   *  reset (the button is disabled then anyway). */
+  function handleResetShortcuts(): void {
+    if (shortcutsAtDefaults(settingsStore.get().shortcuts)) {
+      disarmResetConfirm();
+      return;
+    }
+    if (!resetConfirmArmed) {
+      resetConfirmArmed = true;
+      render();
+      resetConfirmTimer = window.setTimeout(() => {
+        resetConfirmArmed = false;
+        if (!capturing && !picker) render();
+      }, 3000);
+      return;
+    }
+    disarmResetConfirm();
+    persist({ shortcuts: { ...DEFAULT_SHORTCUTS } });
+  }
+
   /* ---------------- uninstall ---------------- */
 
   function confirmUninstall(): void {
     // Nothing new goes onto document.body once the screen is gone: teardown has
     // already run, so there would be no owner left to close it.
-    if (disposed) return;
+    if (disposed || uninstallOpen) return;
+    uninstallOpen = true;
     const backdrop = document.createElement("div");
     backdrop.className = "modal-backdrop";
     backdrop.innerHTML = `
@@ -1123,6 +1328,11 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     document.body.appendChild(backdrop);
 
     const releaseTrap = trapTab(backdrop);
+    // Focus starts INSIDE the dialog, on Cancel (danger dialogs never open on
+    // the red button). It used to stay on the Uninstall button behind the
+    // backdrop, so the trap above never saw a key, Tab walked the screen
+    // underneath, and Enter clicked Uninstall again — stacking a second dialog.
+    focusFirst(backdrop, "[data-cancel]");
     let closed = false;
     // Every exit — Cancel, Escape, a click on the backdrop, a failed uninstall,
     // and teardown — funnels through here, which is what keeps the focus trap
@@ -1131,35 +1341,53 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     const close = (): void => {
       if (closed) return;
       closed = true;
+      uninstallOpen = false;
       openOverlays.delete(close);
       document.removeEventListener("keydown", onKey, true);
       releaseTrap();
       backdrop.remove();
     };
     openOverlays.add(close);
+    /** A close the user asked for: focus goes back to the button that opened
+     *  the dialog (re-queried, a render may have replaced it). Teardown calls
+     *  plain `close` — there is no screen left to return to. */
+    const dismiss = (): void => {
+      close();
+      if (!disposed) inner.querySelector<HTMLElement>("#settings-uninstall")?.focus({ preventScroll: true });
+    };
     function onKey(e: KeyboardEvent): void {
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
-        close();
+        dismiss();
       }
     }
     document.addEventListener("keydown", onKey, true);
     backdrop.addEventListener("mousedown", (e) => {
-      if (e.target === backdrop) close();
+      if (e.target === backdrop) dismiss();
     });
-    backdrop.querySelector("[data-cancel]")!.addEventListener("click", close);
-    backdrop.querySelector("[data-confirm]")!.addEventListener("click", () => {
+    backdrop.querySelector("[data-cancel]")!.addEventListener("click", dismiss);
+    const confirmBtn = backdrop.querySelector<HTMLButtonElement>("[data-confirm]")!;
+    confirmBtn.addEventListener("click", () => {
       // The second lock, matching the delete confirms on home: a torn-down
       // screen never acts. Teardown now closes this dialog, so a click here
       // should be impossible afterwards — but the listener outlives the node,
       // and this particular button uninstalls the application.
-      if (disposed) return;
-      // On success the app process exits before this promise resolves; on
-      // failure (e.g. a dev or portable copy with no uninstall.exe beside the
-      // exe) surface the error.
+      if (disposed || confirmBtn.disabled) return;
+      // One uninstaller. On success the backend waits ~300 ms for uninstall.exe
+      // to re-launch itself before the app exits, and a second click inside
+      // that window used to start a second wizard.
+      confirmBtn.disabled = true;
+      // On success the app process exits before this promise resolves.
       void ipc.uninstallApp().catch((e: unknown) => {
-        close();
+        dismiss();
+        // A portable copy has no uninstaller: not a failure, just not how this
+        // copy is removed — so it is said, not recorded among the errors.
+        const refusal = uninstallRefusal(e);
+        if (refusal) {
+          toast.refuse(refusal);
+          return;
+        }
         toast.error("Couldn't uninstall Taroting.", {
           detail: describeError(e),
           op: "Settings",
@@ -1232,6 +1460,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       unsubscribe();
       endCapture();
       disarmClearConfirm();
+      disarmResetConfirm();
       // Closing commits the value on screen, so leaving Settings mid-pick can
       // never strand a previewed colour that was never persisted.
       picker?.close();

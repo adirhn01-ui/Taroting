@@ -172,6 +172,28 @@ function withoutKey<T>(map: Record<string, T>, key: string): Record<string, T> {
  */
 const CACHE_ENFORCE_COALESCE_MS = 1000;
 
+/**
+ * How many recent terminal job events a MediaManager remembers, so a plan or
+ * waveform answer still on its way can claim one (see `MediaManager.orphans`).
+ *
+ * Every terminal event is remembered, matched or not: one job can serve two
+ * media entries, and the second answer may land after the event has already
+ * resolved the first. So the ring has to outlast the whole burst a project
+ * open produces (about one remux or proxy plus one waveform per media, some
+ * forty completions for a large project) while the slowest answer of that
+ * burst is still in flight. Sixty-four leaves headroom over that. The ring is
+ * keyed by job id, so a repeated event never takes a second slot, and it holds
+ * only the event objects the listener already received. The viewer keeps 4
+ * for the same race (`ORPHAN_KEEP` in viewer/loader.ts); the two constants are
+ * kept apart on purpose: the viewer chunk must not import editor code, nor the
+ * reverse.
+ */
+export const ORPHAN_KEEP = 64;
+
+/** A terminal job event, remembered for an answer that may name it later.
+ *  Only a failure carries `canceled`, which is how the two are told apart. */
+type Orphan = JobDone | JobFailed;
+
 export class MediaManager {
   /** mediaId → preview readiness */
   readonly status = new Store<Record<string, MediaState>>({});
@@ -202,6 +224,41 @@ export class MediaManager {
    * withdrawn in one session.
    */
   private generations = new Map<string, number>();
+  /**
+   * Recent terminal events by job id, whether or not anyone here was waiting
+   * on them. Tauri events and invoke answers travel separate channels, so a
+   * short remux (or a job this plan JOINED as it was finishing) can report
+   * `job:done` before the `plan_playback` answer naming it reaches us.
+   * Dropped, as it used to be, it left the media on "Preparing" for the rest
+   * of the session: the job never reports again. A lost foreign cancel was
+   * just as sticky, and also defeated the re-plan in `targetFailed`.
+   *
+   * MATCHED events are kept too: one job can serve two media entries (see
+   * `JobEntry`), and an end that lands between their two answers resolves the
+   * first and finds nobody yet for the second. Consulted only for an id an
+   * answer just returned (`claimOrphan`), and never removed by it, for the
+   * same reason. Leaving the entry is safe because the backend never hands a
+   * finished or canceled job to a fresh request, so no later answer can name
+   * it by mistake; it simply ages out. Insertion order, oldest evicted first,
+   * bounded by ORPHAN_KEEP; cleared on dispose.
+   */
+  private orphans = new Map<number, Orphan>();
+  /**
+   * Media ids `load_project` reported missing or changed on disk, not yet
+   * ensured. `ensure` stats each one ONCE before doing anything for it: a file
+   * that is not there gets "File not found" and no thumbnail, waveform or
+   * playback request at all. Previously each of those went out for a path the
+   * backend had just said was gone (a crafted `.trt` aims them wherever it
+   * likes), and `plan_playback` answered "direct" for it, so the bin said Ready
+   * over a black stage. A file that is there but CHANGED (a new mtime from a
+   * copy) is ensured as before: the relink dialog already asks about it, and
+   * withholding it would stop a project that merely moved machines from
+   * previewing until every file was relinked.
+   *
+   * Empty for any project whose media are all intact, so the check costs one
+   * `Set.delete` per ensure.
+   */
+  private withheld = new Set<string>();
   private unlisten: (() => void) | null = null;
   private disposed = false;
   /** Set by `dispose({ cancelPlayback: true })`: the project is gone for good,
@@ -229,27 +286,8 @@ export class MediaManager {
           this.targetProgress(entry, e);
         }
       },
-      onDone: (e) => {
-        const entry = this.jobs.get(e.id);
-        if (entry === undefined) return;
-        this.jobs.delete(e.id);
-        if (Array.isArray(entry)) {
-          for (let i = 0; i < entry.length; i++) this.targetDone(entry[i]!, e);
-        } else {
-          this.targetDone(entry, e);
-        }
-        this.enforceCache();
-      },
-      onFailed: (e) => {
-        const entry = this.jobs.get(e.id);
-        if (entry === undefined) return;
-        this.jobs.delete(e.id);
-        if (Array.isArray(entry)) {
-          for (let i = 0; i < entry.length; i++) this.targetFailed(entry[i]!, e);
-        } else {
-          this.targetFailed(entry, e);
-        }
-      },
+      onDone: (e) => this.jobDone(e),
+      onFailed: (e) => this.jobFailed(e),
     });
     // Registration is async, so dispose() can land BEFORE the listener exists.
     // It had nothing to call, so hand the unlisten back here — otherwise the
@@ -259,8 +297,83 @@ export class MediaManager {
     else this.unlisten = unlisten;
   }
 
+  /** A job finished: remember it for an answer that may still name it (see
+   *  `orphans`), then resolve whoever is already waiting on it. */
+  private jobDone(e: JobDone): void {
+    this.keepOrphan(e);
+    const entry = this.jobs.get(e.id);
+    if (entry === undefined) return;
+    this.jobs.delete(e.id);
+    this.resolveDone(entry, e);
+  }
+
+  /** A job failed or was canceled: remembered and resolved exactly as in
+   *  `jobDone`. */
+  private jobFailed(e: JobFailed): void {
+    this.keepOrphan(e);
+    const entry = this.jobs.get(e.id);
+    if (entry === undefined) return;
+    this.jobs.delete(e.id);
+    this.resolveFailed(entry, e);
+  }
+
+  /** Resolve every waiter in an entry already taken out of `jobs`, then ask
+   *  for a cache trim. */
+  private resolveDone(entry: JobEntry, e: JobDone): void {
+    if (Array.isArray(entry)) {
+      for (let i = 0; i < entry.length; i++) this.targetDone(entry[i]!, e);
+    } else {
+      this.targetDone(entry, e);
+    }
+    this.enforceCache();
+  }
+
+  /** Tell every waiter in an entry already taken out of `jobs`. */
+  private resolveFailed(entry: JobEntry, e: JobFailed): void {
+    if (Array.isArray(entry)) {
+      for (let i = 0; i < entry.length; i++) this.targetFailed(entry[i]!, e);
+    } else {
+      this.targetFailed(entry, e);
+    }
+  }
+
+  private keepOrphan(e: Orphan): void {
+    if (this.disposed) return;
+    // Deleted first so a repeat moves to the newest end instead of keeping its
+    // old place in line.
+    this.orphans.delete(e.id);
+    this.orphans.set(e.id, e);
+    if (this.orphans.size > ORPHAN_KEEP) {
+      const oldest = this.orphans.keys().next();
+      if (!oldest.done) this.orphans.delete(oldest.value);
+    }
+  }
+
+  /**
+   * A plan or waveform answer just named job `jobId` and its waiter is now
+   * registered: if that job's terminal event already arrived, resolve the
+   * waiter with it. Called only AFTER everything the answer publishes is in
+   * place, so the replayed outcome is the last word — replayed before the
+   * "preparing" patch, a finished job would be painted straight back over
+   * with "Preparing".
+   *
+   * It resolves directly rather than going back through `jobDone`/`jobFailed`:
+   * the event is already in the ring, and a second trip would only re-insert
+   * it. Nor is it taken out: a second media entry sharing the job may still be
+   * waiting for its own answer, and it needs the same replay (see `orphans`).
+   */
+  private claimOrphan(jobId: number): void {
+    const o = this.orphans.get(jobId);
+    if (o === undefined) return;
+    const entry = this.jobs.get(jobId);
+    if (entry === undefined) return;
+    this.jobs.delete(jobId);
+    if ("canceled" in o) this.resolveFailed(entry, o);
+    else this.resolveDone(entry, o);
+  }
+
   /* --- what one job event means for ONE of its waiters ------------------ *
-   * Split out so the three handlers above can apply them to a lone target or
+   * Split out so the handlers above can apply them to a lone target or
    * to each of several without duplicating the body. Bodies are unchanged
    * from when the mapping was one-to-one. */
 
@@ -298,8 +411,8 @@ export class MediaManager {
     // never hands a canceled job to a fresh request, it starts a new one. And
     // it cannot spin — each round needs a fresh cancel from outside.
     //
-    // `onFailed` has already deleted this job id from `jobs` before calling
-    // here, so `retrack`'s `dropMediaTargets` never touches the entry array
+    // `jobFailed` (or `claimOrphan`, replaying one) has already deleted this
+    // job id from `jobs` before calling here, so `retrack`'s `dropMediaTargets` never touches the entry array
     // the caller is still iterating.
     if (target.type === "playback") {
       this.retrack(target.mediaId);
@@ -311,8 +424,16 @@ export class MediaManager {
     if (media?.hasAudio) this.requestWaveform(media, this.generationOf(media.id));
   }
 
-  /** Track every media item in the project (idempotent). */
-  ensureAll(project: ProjectFile): void {
+  /**
+   * Track every media item in the project (idempotent).
+   *
+   * `missing`: the ids `load_project` reported missing or changed, passed once,
+   * on the call that follows the load. Each is checked for existence before
+   * anything else is asked for it (see `withheld`). The ids are taken BEFORE
+   * the loop because `ensure` reads them synchronously, up to its first await.
+   */
+  ensureAll(project: ProjectFile, missing?: readonly string[]): void {
+    if (missing) for (const id of missing) this.withheld.add(id);
     for (const media of project.media) void this.ensure(media);
   }
 
@@ -346,6 +467,8 @@ export class MediaManager {
    *  display data is still right and dropping it would only flash it away. */
   retrack(mediaId: string, fileChanged = false): void {
     this.tracked.delete(mediaId);
+    // A relink resolved it: the new file is ensured like any other.
+    this.withheld.delete(mediaId);
     // Cut it loose from the jobs the OLD file started, or their eventual
     // outcome lands on the relinked media — most visibly a "failed" stamp from
     // a file the project no longer references, over a fresh preparing/ready
@@ -407,6 +530,7 @@ export class MediaManager {
    */
   untrack(mediaId: string): void {
     this.tracked.delete(mediaId);
+    this.withheld.delete(mediaId);
     dropMediaTargets(this.jobs, mediaId);
     this.bumpGeneration(mediaId);
     this.status.update((s) => withoutKey(s, mediaId));
@@ -432,6 +556,25 @@ export class MediaManager {
 
     this.patchStatus(media.id, { state: "checking" });
 
+    // Reported missing or changed by the load: find out which before asking the
+    // backend for anything (see `withheld`). The stat is the one `load_project`
+    // already made of the same path, so it reaches nothing new.
+    if (this.withheld.delete(media.id)) {
+      let present: boolean;
+      try {
+        present = await ipc.pathExists(media.path);
+      } catch {
+        // The question could not be asked; behave as before rather than
+        // declare a file gone on no evidence.
+        present = true;
+      }
+      if (this.disposed || this.overtaken(media.id, gen)) return;
+      if (!present) {
+        this.patchStatus(media.id, { state: "failed", message: "File not found" });
+        return;
+      }
+    }
+
     // Thumbnail (visual media) — runs on its own lane, fire and forget.
     if (media.kind !== "audio") {
       const at = Math.min(0.5, Math.max(0, media.duration / 2));
@@ -446,6 +589,7 @@ export class MediaManager {
             "Thumbnail",
             `Couldn't create a thumbnail for ${media.path}`,
             describeError(e),
+            [media.path],
           ),
         );
     }
@@ -484,6 +628,8 @@ export class MediaManager {
           output: plan.output,
         });
         this.patchStatus(media.id, { state: "preparing", ratio: null, jobId: plan.jobId });
+        // Last, so a job that already finished lands on top of "Preparing".
+        this.claimOrphan(plan.jobId);
       }
     } catch (e) {
       // A failure belonging to the file this ensure started against, reported
@@ -515,6 +661,7 @@ export class MediaManager {
             mediaId: media.id,
             output: wf.output,
           });
+          this.claimOrphan(wf.jobId);
         }
       })
       .catch((e: unknown) =>
@@ -522,6 +669,7 @@ export class MediaManager {
           "Waveform",
           `Couldn't build the audio waveform for ${media.path}`,
           describeError(e),
+          [media.path],
         ),
       );
   }
@@ -574,14 +722,20 @@ export class MediaManager {
    * bounded, and only ever written on a failure, so a healthy session still
    * costs nothing; a broken one becomes explainable from Settings →
    * Diagnostics and from a diagnostic report.
+   *
+   * `paths`: every whole path the message and detail name. The redactor is
+   * seeded only with the OPEN project's media, so an entry about media that
+   * has since been removed or relinked, or about a peaks file in the cache,
+   * would otherwise leave it hunting for the path in free text, where a name
+   * with a space can be cut short and half of it left in a pasted report.
    */
-  private noteSoftFailure(op: string, message: string, detail: string): void {
-    recordError({ at: Date.now(), op, message, detail });
+  private noteSoftFailure(op: string, message: string, detail: string, paths: string[]): void {
+    recordError({ at: Date.now(), op, message, detail, paths });
   }
 
-  /** Source path behind a media id (falls back to `alt` if it has gone away). */
-  private mediaPath(mediaId: string, alt: string): string {
-    return this.getProject().media.find((m) => m.id === mediaId)?.path ?? alt;
+  /** Source path behind a media id, or undefined if it has left the project. */
+  private mediaPath(mediaId: string): string | undefined {
+    return this.getProject().media.find((m) => m.id === mediaId)?.path;
   }
 
   private async loadWaveform(mediaId: string, path: string): Promise<void> {
@@ -594,18 +748,22 @@ export class MediaManager {
       if (data) {
         this.waveforms.update((w) => ({ ...w, [mediaId]: data }));
       } else {
+        const source = this.mediaPath(mediaId);
         this.noteSoftFailure(
           "Waveform",
-          `Waveform data for ${this.mediaPath(mediaId, path)} couldn't be read`,
+          `Waveform data for ${source ?? path} couldn't be read`,
           `Peaks cache file: ${path}`,
+          source === undefined ? [path] : [source, path],
         );
       }
     } catch (e) {
       if (this.disposed) return;
+      const source = this.mediaPath(mediaId);
       this.noteSoftFailure(
         "Waveform",
-        `Couldn't load the audio waveform for ${this.mediaPath(mediaId, path)}`,
+        `Couldn't load the audio waveform for ${source ?? path}`,
         `${describeError(e)}\nPeaks cache file: ${path}`,
+        source === undefined ? [path] : [source, path],
       );
     }
   }
@@ -671,5 +829,7 @@ export class MediaManager {
       }
     }
     this.jobs.clear();
+    this.orphans.clear();
+    this.withheld.clear();
   }
 }

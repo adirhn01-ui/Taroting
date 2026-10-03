@@ -44,12 +44,20 @@ import { imgIcon } from "./icons";
 import { openImageMenu } from "./image-menu";
 import { mountInk } from "./ink/ink";
 import { mountImageInspector } from "./inspector";
-import { addPhotoLayer, findLayer, layersOf, removeLayer, validateImageProject } from "./layers";
+import {
+  addPhotoLayer,
+  findLayer,
+  layersOf,
+  nextSelectionAfterRemove,
+  removeLayer,
+  validateImageProject,
+} from "./layers";
 import { mountLayersPanel } from "./layers-panel";
 import { addRefusal, installPaste } from "./paste";
 import { PreviewResources, renderComposite } from "./render";
 import type { LiveInk } from "./render";
 import { renderThumbnail } from "./render/export";
+import type { RenderSources } from "./render/export";
 import { saveBlob } from "./save";
 import { mountSelectTool } from "./select-tool";
 import { SIZE_MAX, SIZE_MIN, createToolStore } from "./tool-state";
@@ -132,6 +140,58 @@ const samePixels = (a: Pixels, b: Pixels): boolean =>
 const THUMB_CAP_MS = 1500;
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/** The Home-card render still running for each project path, and the tail
+ *  of that card's save queue. Module level, not per mount: a Keep, a leave
+ *  and the next mount of the same project can all be rendering one card. */
+const thumbRenders = new Map<string, AbortController>();
+const thumbSaves = new Map<string, Promise<void>>();
+
+/**
+ * Render `doc`'s Home card and save it for `projectPath`, waiting for it at
+ * most until `deadline` (a `Date.now()` time) — a leave or a close never waits
+ * longer than that for a picture. The deadline only stops the WAITING, never
+ * the render: it runs on and saves late, which is how a slow PC still gets
+ * its card.
+ *
+ * That late write is why renders of one project are ordered. A newer render
+ * aborts the one before it, whose picture is older; and the saves queue, each
+ * re-checking its abort when its turn comes, so a render already saving when
+ * a newer one starts finishes BEFORE the newer one writes — never after it,
+ * over the newer card. A render still drawing never holds the queue up.
+ * `blobFor` hands over photo files the caller already holds. Never rejects:
+ * a missing thumbnail is cosmetic, Home shows the placeholder.
+ */
+export async function writeProjectThumb(
+  doc: ProjectFile,
+  projectPath: string,
+  deadline: number,
+  blobFor?: RenderSources["blobFor"],
+): Promise<void> {
+  thumbRenders.get(projectPath)?.abort();
+  const ac = new AbortController();
+  thumbRenders.set(projectPath, ac);
+  const { signal } = ac;
+  const work = (async (): Promise<void> => {
+    try {
+      const blob = await renderThumbnail(doc, { signal, blobFor });
+      const save = (thumbSaves.get(projectPath) ?? Promise.resolve())
+        .then(async () => {
+          if (signal.aborted) return;
+          await saveBlob({ kind: "projectThumb", projectPath, projectId: doc.id }, "jpeg", blob);
+        })
+        .catch(() => {});
+      thumbSaves.set(projectPath, save);
+      await save;
+      if (thumbSaves.get(projectPath) === save) thumbSaves.delete(projectPath);
+    } catch {
+      // Superseded (an AbortError) or failed: either way, no card from this one.
+    } finally {
+      if (thumbRenders.get(projectPath) === ac) thumbRenders.delete(projectPath);
+    }
+  })();
+  await Promise.race([work, sleep(Math.max(0, deadline - Date.now()))]);
+}
+
 /**
  * Mount the image editor for a project `mountEditor` has already loaded
  * (`loaded` is `ipc.loadProject`'s result, already through `sanitizeProject`).
@@ -196,10 +256,14 @@ export async function mountImageEditor(
   // Everything a half-built mount must undo if something below throws: the
   // shell must never be left holding a session nobody will dispose, or a
   // `currentSession` that points at a screen that is not there.
-  const built: Built = { session: null, teardown: [] };
+  const built: Built = { session: null, teardown: [], closeOverlays: null };
   try {
     return mount(root, route, loaded, built);
   } catch (e) {
+    // Body-parked surfaces first, as dispose() does (a relink dialog opened
+    // just before the throw): they hold keyboard tokens and callbacks into
+    // the session about to be dropped.
+    built.closeOverlays?.();
     runTeardown(built.teardown);
     // A child that parked a menu on document.body before the throw.
     closeMenu();
@@ -222,6 +286,8 @@ interface Built {
   session: ProjectSession | null;
   /** synchronous cleanups, run in REVERSE order (last built, first undone) */
   teardown: (() => void)[];
+  /** closes every overlay registered so far; set once the registry exists */
+  closeOverlays: (() => void) | null;
 }
 
 function runTeardown(list: (() => void)[]): void {
@@ -336,6 +402,7 @@ function mount(
       }
     }
   };
+  built.closeOverlays = closeOverlays;
 
   /* ---------------- ctx ---------------- */
 
@@ -344,10 +411,19 @@ function mount(
   const mode = new Store<"idle" | "crop-image" | "crop-layer">("idle");
   const res = new PreviewResources(() => session.project);
   undo.push(() => res.dispose());
-  const view = createViewController(stage, canvas, () => ({
-    w: session.project.timeline.width,
-    h: session.project.timeline.height,
-  }));
+  // Hold to pan still works inside either crop: both hold the keyboard for
+  // their whole session, but moving the view is not an edit (view.ts
+  // `panThroughBlock`). A menu or picker opened during a crop lets it through
+  // too, which is harmless — the pan changes nothing in the document.
+  const view = createViewController(
+    stage,
+    canvas,
+    () => ({
+      w: session.project.timeline.width,
+      h: session.project.timeline.height,
+    }),
+    { panThroughBlock: () => mode.get() !== "idle" },
+  );
   undo.push(() => view.dispose());
 
   let live: LiveInk | null = null;
@@ -577,6 +653,10 @@ function mount(
   nameEl.addEventListener("keydown", (e) => {
     if (!renaming && (e.key === "Enter" || e.key === " ")) {
       e.preventDefault();
+      // The key is the rename's: without this the window's own listeners
+      // still hear it — view.ts would take this Space as hold to pan, with
+      // the stage in pan mode while the user types the new name.
+      e.stopPropagation();
       startRename();
     }
   });
@@ -586,16 +666,21 @@ function mount(
   const undoBtn = $<HTMLButtonElement>("#imged-undo");
   const redoBtn = $<HTMLButtonElement>("#imged-redo");
   const zoomBtn = $<HTMLButtonElement>("#imged-zoom");
+  const exportBtn = $<HTMLButtonElement>("#ed-export");
+  const copyBtn = $<HTMLButtonElement>("#imged-copy");
   // Written only on a flip, from the store subscription above (commit, undo,
   // redo), from `commitFrom` below and on a mode change. Greyed during a crop:
   // doUndo/doRedo refuse there, and a live-looking button that does nothing
-  // reads as broken.
+  // reads as broken. Export and Copy image too — they refuse during a crop
+  // (`refusedNow`), since they would render the crop nobody has applied.
   function refreshUndo(): void {
     const busy = mode.get() !== "idle";
     const u = busy || !session.history.canUndo;
     const r = busy || !session.history.canRedo;
     if (undoBtn.disabled !== u) undoBtn.disabled = u;
     if (redoBtn.disabled !== r) redoBtn.disabled = r;
+    if (exportBtn.disabled !== busy) exportBtn.disabled = busy;
+    if (copyBtn.disabled !== busy) copyBtn.disabled = busy;
   }
   // `commitFrom` (the end of a drag, a slider, a nudge) pushes the undo step
   // for changes already shown through replace() — WITHOUT a store change, so
@@ -670,19 +755,38 @@ function mount(
   const goHome = (): void => exits.confirmLeave(() => navigate(exitDest(route)));
   const goSettings = (): void => exits.confirmLeave(() => navigate({ view: "settings" }));
 
+  const modalOpen = (): boolean => document.querySelector(".modal-backdrop") !== null;
+  // Export and Copy image render the live document, so they take the paste's
+  // and the drop's own refusal. During a layer crop the live document holds a
+  // crop nobody has applied (select-tool writes it through replace()), and the
+  // export dialog's first write would end the crop with neither a commit nor a
+  // revert; behind a dialog, a menu or a picker, a colour being previewed
+  // would be rendered as though it had been picked. The chords already stay
+  // inert there; the top-bar buttons are mouse paths around that, so they ask
+  // here. Synchronous, so a copy still starts inside the user activation.
+  const refusedNow = (retry: string): boolean => {
+    const r = addRefusal(mode.get(), modalOpen(), shortcutsBlocked(), retry);
+    if (r !== null) toast.info(r);
+    return r !== null;
+  };
   // The dialog registers its own closer with the overlay registry (and drops
   // it on every close path), so dispose() reaches it without a second entry.
   const openExport = (): void => {
+    if (refusedNow("export")) return;
     openImageExportDialog(ctx, exportSourceHint(session.project));
   };
   // Synchronous inside the gesture, both from the button and from the chord:
-  // the clipboard write must START inside the user activation.
-  const copyNow = (): void => copyImage(session.project);
+  // the clipboard write must START inside the user activation. The photos the
+  // preview already holds are handed over rather than read again from disk.
+  const copyNow = (): void => {
+    if (refusedNow("copy the image")) return;
+    copyImage(session.project, (m) => res.blobFor(m));
+  };
 
   $("#ed-home").addEventListener("click", goHome);
   $("#ed-settings").addEventListener("click", goSettings);
-  $("#ed-export").addEventListener("click", openExport);
-  onClick($("#imged-copy"), copyNow);
+  exportBtn.addEventListener("click", openExport);
+  onClick(copyBtn, copyNow);
 
   /* ---------------- thumbnail for Home ---------------- */
 
@@ -721,33 +825,27 @@ function mount(
       return false;
     }
   }
+  // The photo files the preview holds, for a render that runs while it is
+  // alive (a Keep, the window close); dispose() hands over a snapshot instead.
+  const liveBlobs: RenderSources["blobFor"] = (m) => res.blobFor(m);
   // ONE budget for the check and the render together: the close task gets
   // TASK_CAP_MS in all, so a slow card check must eat into the render's time,
   // never add a second cap on top of it.
-  const writeThumbIfOwed = async (): Promise<void> => {
+  const writeThumbIfOwed = async (blobFor = liveBlobs): Promise<void> => {
     const deadline = Date.now() + THUMB_CAP_MS;
-    if (await thumbOwed(deadline)) await writeThumb(deadline);
+    if (await thumbOwed(deadline)) await writeThumb(deadline, blobFor);
   };
-  async function writeThumb(deadline = Date.now() + THUMB_CAP_MS): Promise<void> {
+  // Bounded and never rejecting (writeProjectThumb): a leave or a close never
+  // waits longer than the deadline for a picture.
+  async function writeThumb(deadline = Date.now() + THUMB_CAP_MS, blobFor = liveBlobs): Promise<void> {
     const doc = session.project;
-    const projectPath = session.path;
     thumbFor = pixelsOf(doc);
-    try {
-      // Bounded: a leave or a close never waits longer than this for a picture.
-      await Promise.race([
-        renderThumbnail(doc).then((b) =>
-          saveBlob({ kind: "projectThumb", projectPath, projectId: doc.id }, "jpeg", b),
-        ),
-        sleep(Math.max(0, deadline - Date.now())),
-      ]);
-    } catch {
-      // A missing thumbnail is cosmetic: Home shows the placeholder.
-    }
+    await writeProjectThumb(doc, session.path, deadline, blobFor);
   }
   // The window close never reaches dispose(): this is how Home stays current
   // after X. It runs after the close flow settled the session (a Keep in the
   // close prompt has already made it permanent; a Discard leaves it temp).
-  const unregThumbTask = registerCloseTask(writeThumbIfOwed);
+  const unregThumbTask = registerCloseTask(() => writeThumbIfOwed());
   undo.push(unregThumbTask);
 
   /* ---------------- children ---------------- */
@@ -786,7 +884,6 @@ function mount(
 
   /* ---------------- shortcuts ---------------- */
 
-  const modalOpen = (): boolean => document.querySelector(".modal-backdrop") !== null;
   const shortcuts = new ShortcutManager("image");
   shortcuts.setBindings(settingsStore.get().shortcuts);
   // Chords stay inert behind a dialog (the video editor's predicate) and
@@ -814,10 +911,18 @@ function mount(
     const at = view.clientToCanvas(c.x, c.y);
     tools.update((t) => ({ ...t, ruler: { cx: at.x, cy: at.y, angle: 0 } }));
   };
+  // The selection moves to the neighbour, exactly as the layer menu's Delete
+  // does (layers.ts `nextSelectionAfterRemove`), so a run of Delete presses
+  // clears layers one after another. Read before the commit: after it the
+  // removed layer has no place in the list to look beside. The store
+  // subscriber that clears a selection whose layer is gone runs after this
+  // (notifications are batched to a microtask) and finds the neighbour.
   const deleteSelected = (): void => {
     const sel = selection.get();
     if (sel === null || mode.get() !== "idle") return;
+    const next = nextSelectionAfterRemove(session.project, sel);
     session.commit((p) => removeLayer(p, sel));
+    selection.set(next);
   };
 
   bind("undo", doUndo);
@@ -931,7 +1036,7 @@ function mount(
     }
     if (disposed) return;
     if (project > 0) toast.info("Open projects from the home screen.");
-    if (other > 0) toast.error("Only images can be added to an image project.");
+    if (other > 0) toast.refuse("Only images can be added to an image project.");
   };
   // The unlisten can arrive after dispose(): claim it then, or the listener
   // outlives the screen and a later drop commits into a disposed session.
@@ -1024,13 +1129,20 @@ function mount(
       closeMenu();
       unlistenDrop?.();
       unlistenDrop = null;
+      // The card render below runs after the teardown has freed the preview's
+      // photo files (a disposed PhotoCache hands over nothing): snapshot the
+      // ones it holds now, so the render does not read them all from disk.
+      const blobs = new Map<string, Blob | null>();
+      for (const l of layersOf(session.project)) {
+        if (l.kind === "photo") blobs.set(l.media.id, res.blobFor(l.media));
+      }
       // Reverse build order: the dev hook, paste, Escape and the shortcuts,
       // then the children (ink, select, inspector, toolbar, layers), the close
       // task, the gesture hooks, the subscriptions, the view and the pixels.
       runTeardown(undo);
       if (raf) window.cancelAnimationFrame(raf);
       raf = 0;
-      await writeThumbIfOwed();
+      await writeThumbIfOwed((m) => blobs.get(m.id) ?? null);
       if (currentSession.get() === session) currentSession.set(null);
       await session.dispose();
     },

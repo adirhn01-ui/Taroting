@@ -25,7 +25,7 @@ pub struct ExportSpec {
 /// dialog re-estimates on a 300 ms debounce after every control change, so a
 /// 1600-clip project was serializing 783 KB of JSON on the UI thread (1.5 ms of
 /// `JSON.stringify`) and parsing all of it here, to compute a number that
-/// depends on none of it. The payload is now a fixed 213 bytes whatever the
+/// depends on none of it. The payload is now a few hundred bytes whatever the
 /// project holds, so this command's parse is constant too.
 ///
 /// `durationSec` is the timeline duration (latest clip end across all tracks)
@@ -152,6 +152,16 @@ impl Container {
     }
 }
 
+/// `30` for a whole rate, `30000/1001` otherwise: the spelling `fps=` and
+/// `color=...:r=` take.
+pub fn format_rate((num, den): (u64, u64)) -> String {
+    if den <= 1 {
+        format!("{num}")
+    } else {
+        format!("{num}/{den}")
+    }
+}
+
 fn round_down_even(v: f64) -> u32 {
     let n = v.floor().max(2.0) as u32;
     n - (n % 2)
@@ -218,27 +228,29 @@ impl ExportPreset {
         }
     }
 
-    /// Resolve output fps as a rational string suitable for `fps=` and
-    /// `-r`. `"original"` mirrors the timeline rational (e.g. NTSC
-    /// `30000/1001`); a custom value becomes `N/1000` for fractional rates
-    /// or `N` for integers.
-    pub fn output_fps(&self, timeline: &Timeline) -> String {
+    /// The output rate as an exact rational `(num, den)` with `den >= 1`
+    /// (`format_rate` spells it for `fps=` and `r=`). `"original"` mirrors the
+    /// timeline rational (e.g. NTSC `30000/1001`); a custom value becomes
+    /// `N/1000` for fractional rates or `N/1` for integers. The builder places
+    /// every frame boundary with THIS pair: a float parsed back out of
+    /// "30000/1001" is not the rate ffmpeg runs at, and frame indices taken
+    /// from it drift off ffmpeg's grid.
+    ///
+    /// A Custom value outside the range `build` accepts still maps to
+    /// something here (a negative becomes 0); `build` refuses it before the
+    /// pair is ever used.
+    pub fn output_rate(&self, timeline: &Timeline) -> (u64, u64) {
         match &self.fps {
             FpsPreset::Original(_) => {
                 let r = timeline.fps;
-                if r.den <= 1 {
-                    format!("{}", r.num)
-                } else {
-                    format!("{}/{}", r.num, r.den)
-                }
+                (u64::from(r.num), u64::from(r.den.max(1)))
             }
             FpsPreset::Custom(f) => {
                 if (f.fract()).abs() < 1e-9 {
-                    format!("{}", f.round() as i64)
+                    (f.round().max(0.0) as u64, 1)
                 } else {
                     // Represent to 3 decimal places as an exact rational.
-                    let milli = (f * 1000.0).round() as i64;
-                    format!("{milli}/1000")
+                    ((f * 1000.0).round().max(0.0) as u64, 1000)
                 }
             }
         }

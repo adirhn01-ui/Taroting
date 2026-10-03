@@ -11,12 +11,13 @@
 //! make a project unopenable (the image editor drops it with a notice), but the
 //! app must never WRITE a stroke that the lenient loader would then skip.
 //!
-//! **Why the save check reads the RAW value.** The typed parse
-//! (`schema::strokes_that_parse`) skips any stroke that does not have the typed
-//! shape, so "it deserialized" proves nothing about the strokes any more. The
-//! raw JSON is what `save_project` writes, so the raw JSON is what is checked:
-//! every stroke must deserialize as `schema::Stroke` (which proves every field
-//! present has the right type) AND then meet the value rules below.
+//! **Why the save check reads the RAW value.** The typed parse only counts a
+//! drawing's entries (`schema::count_strokes`) — it never looks inside one —
+//! so "it deserialized" proves nothing about the strokes. The raw JSON is what
+//! `save_project` writes, so the raw JSON is what is checked, one stroke at a
+//! time: every stroke must deserialize as `schema::Stroke` (which proves every
+//! field present has the right type, and borrows rather than copies its
+//! points) AND then meet the value rules below.
 
 use std::io::Read;
 use std::path::Path;
@@ -263,7 +264,7 @@ fn check_stroke(raw: &Value, max_points: u64) -> std::result::Result<u64, String
         Erase,
         Shape,
     }
-    let class = match s.t.as_str() {
+    let class = match s.t {
         "pen" | "pencil" | "marker" => Class::Ink,
         "erase" => Class::Erase,
         "line" | "rect" | "ellipse" | "arrow" => Class::Shape,
@@ -281,12 +282,12 @@ fn check_stroke(raw: &Value, max_points: u64) -> std::result::Result<u64, String
             return Err("opacity must be 0 to 1".into());
         }
     }
-    if matches!(class, Class::Ink | Class::Shape) && !is_hex_colour(s.c.as_deref()) {
+    if matches!(class, Class::Ink | Class::Shape) && !is_hex_colour(s.c) {
         return Err("color is not #rrggbb".into());
     }
     match class {
         Class::Ink | Class::Erase => {
-            let p = s.p.as_deref().ok_or("points are missing")?;
+            let p = s.p.ok_or("points are missing")?;
             if p.is_empty() || p.len() % POINT_CHARS != 0 {
                 return Err("points are not whole [x, y, pressure] triples".into());
             }

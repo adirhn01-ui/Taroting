@@ -70,8 +70,12 @@ async function asPng(file: Blob): Promise<Blob> {
 export function installPaste(ctx: ImageEditorCtx, isDisposed: () => boolean): () => void {
   let told = false;
   // One paste at a time: a second Ctrl+V while the first is still being
-  // written would race it for the layer order the user expects.
+  // written would race it for the layer order the user expects. Not queued
+  // either — the user can see when the first lands and paste again.
   let busy = false;
+  // The refused paste says so, once per busy spell: a Ctrl+V that silently
+  // does nothing reads as broken, and a key held down must not stack toasts.
+  let busyTold = false;
 
   const onPaste = (e: ClipboardEvent): void => {
     // The §2.8 guards: a paste into a text field (a layer rename, a dialog's
@@ -97,10 +101,17 @@ export function installPaste(ctx: ImageEditorCtx, isDisposed: () => boolean): ()
     const file = items[i]!.getAsFile();
     if (!file) return;
     e.preventDefault();
-    if (busy) return;
+    if (busy) {
+      if (!busyTold) {
+        busyTold = true;
+        toast.info("Still adding the last pasted image — paste again once it appears.");
+      }
+      return;
+    }
     busy = true;
     void run(file).finally(() => {
       busy = false;
+      busyTold = false;
     });
   };
 
@@ -130,7 +141,7 @@ export function installPaste(ctx: ImageEditorCtx, isDisposed: () => boolean): ()
       // (an animated or mis-typed payload) would otherwise reach
       // addPhotoLayer and surface as its raw refusal.
       if (!isStillInfo(info)) {
-        toast.error("Only images can be added to an image project.");
+        toast.refuse("Only images can be added to an image project.");
         return;
       }
       let added: string | null = null;
