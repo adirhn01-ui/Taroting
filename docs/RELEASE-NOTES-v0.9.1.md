@@ -3,7 +3,7 @@
 A quality release. It began with a bug report: a project with a video was
 open, a video was opened from File Explorer at the same moment, and Taroting
 closed itself without a word (the second try worked). Tracing it found a
-mistake in how Taroting was built, explained below, and turned into a full
+defect in how Taroting was built, explained below, and turned into a full
 review of 0.9.0; this release is what that review found and fixed. There are
 no new features; everything here makes Taroting steadier, lighter while it
 works, and safer with your work. Free and open source, as always.
@@ -27,29 +27,33 @@ works, and safer with your work. Free and open source, as always.
   the app, and background work runs at a lower priority so the window stays
   responsive while it runs.
 
-## The window no longer waits on slow work
+## Blocking calls on the UI thread
 
-Taroting is meant to run well on any PC. The most likely cause of the report
-was a mistake that broke that promise, and the mistake was ours, not the
-computer's.
+The most likely cause of the report was a defect in how Taroting was built,
+and it would have hit any PC.
 
-- **Slow work ran on the window's own thread.** A window has one thread that
-  draws it and answers clicks, and anything slow belongs somewhere else.
-  Taroting ran a lot of slow work there anyway: opening a project with video
-  (which checks every video file), making the project pictures on the home
-  screen, saving, reading settings and recent projects, cache clean-up,
-  starting an export and reading media for the preview. While any of it ran,
-  the window could not draw or respond, on any machine, for as long as the
-  work took: a picture for a large video could hold it for many seconds. A
-  file opened from File Explorer at that moment had to wait on that same
-  thread, which is the situation in the report. All of this work now runs in
-  the background, and the window stays free to answer.
-- **One stuck file can no longer hold up the rest.** Every background step
-  has a time limit, a thumbnail that hangs no longer blocks the ones after
-  it, and preview copies have a queue of their own, so quick jobs such as
-  waveforms are not stuck behind a long conversion.
-- **A second launch from File Explorer is passed over safely**: no crash on
-  an unusual file name, and no endless wait while the first window is busy.
+- **Taroting blocked its own UI thread.** In Tauri, a command that is not
+  declared `async` runs on the main thread, the thread that runs the window's
+  message loop. In 0.9.0 most of the commands that read or write files, or
+  wait on ffmpeg and ffprobe, were written that way: loading and saving
+  projects, the recent-projects list, settings, cache clean-up, starting an
+  export, and thumbnails, where the UI thread waited up to 30 seconds for
+  ffmpeg to grab a frame. The preview's media reads (`asset://`) were
+  answered on that thread too. While it was blocked the window could not
+  repaint or take a click, and after 5 seconds Windows marks a window like
+  that "Not responding". All of this now runs on background threads; the UI
+  thread only answers from memory.
+- **Opening a file from File Explorer waited on that blocked thread.** A
+  second launch hands its file to the running window with `SendMessageW`,
+  which returns only once that window's UI thread handles the message, and
+  it had no time limit. It now gives up after 20 seconds, never panics on an
+  unusual file name, and no longer starts a second copy of the app when it
+  lands during start-up.
+- **Every external process has a deadline and an owner.** Every ffmpeg and
+  ffprobe wait has a time limit (a thumbnail's 30 seconds now start when its
+  work starts, not when it was queued), a stuck thumbnail no longer blocks
+  the ones after it, preview copies have their own queue, and every child
+  process runs in a Windows job object, so it ends when Taroting does.
 - **The editor does less while you work.** Autosave no longer redraws the
   panels, the media bin and the side panel no longer rebuild on every step of
   a canvas drag, playback allocates less per frame, and an editor with
@@ -158,8 +162,8 @@ The 0.9.0 notes said that "if the window ever stops responding, a second
 close a few seconds later still closes it." That holds for the page inside
 the window: if it stops answering, a second close a few seconds later still
 closes the window. If Windows itself reports Taroting as not responding, use
-the close option Windows offers. That state came from the mistake above, slow
-work on the window's own thread, and 0.9.1 removes it.
+the close option Windows offers. That state came from the defect above,
+blocking calls on the UI thread, and 0.9.1 removes it.
 
 ---
 
