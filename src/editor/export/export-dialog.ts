@@ -58,6 +58,12 @@ export function sanitizeFileName(name: string): string {
 export function destinationProblem(folder: string): string | null {
   if (folder.trim() === "") return "Choose a folder for the export.";
   if (/^[A-Za-z]:[\\/]/.test(folder) || /^\\\\[^\\]/.test(folder)) return null;
+  // A bare drive ("D:") is taken as that drive's root: 0.9.0 remembered the
+  // folder of an export to a drive root in exactly this shape, and refusing it
+  // here refused every export after the upgrade until the field was retyped.
+  // joinPath puts the separator back. "D:Videos" (relative to the drive's
+  // current directory) is still refused.
+  if (/^[A-Za-z]:$/.test(folder)) return null;
   return "Enter a full folder path, like C:\\Videos, or choose one.";
 }
 
@@ -77,11 +83,25 @@ export function joinPath(dir: string, file: string): string {
   return `${trimmed}${sep}${file}`;
 }
 
-/** Split a full path into its directory and file name. */
+/** Split a full path into its directory and file name.
+ *
+ *  A file at a drive root keeps the separator: "D:\clip.mp4" is in "D:\", not
+ *  "D:". Cut like any other path, the folder came out as a bare drive — which
+ *  Windows reads as the drive's current directory, not its root — and the
+ *  destination check refused it, so an export to a USB stick picked in the
+ *  app's own Save As could not be started. */
 export function splitPath(path: string): { dir: string; file: string } {
   const i = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
   if (i < 0) return { dir: "", file: path };
-  return { dir: path.slice(0, i), file: path.slice(i + 1) };
+  const driveRoot = i === 2 && /^[A-Za-z]:/.test(path);
+  return { dir: path.slice(0, driveRoot ? 3 : i), file: path.slice(i + 1) };
+}
+
+/** A remembered or default export folder as the dialog shows it: a bare drive
+ *  ("D:", the shape 0.9.0 stored for an export to a drive root) becomes that
+ *  drive's root. Anything else comes back unchanged. */
+export function driveRootFolder(folder: string): string {
+  return /^[A-Za-z]:$/.test(folder) ? `${folder}\\` : folder;
 }
 
 /** How many " (n)" candidates a rename tries before it gives up. */
@@ -686,7 +706,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
   let codecNote: string | null = null;
 
   const settings = settingsStore.get();
-  let folder = settings.lastExportDir ?? settings.defaultExportDir ?? "";
+  let folder = driveRootFolder(settings.lastExportDir ?? settings.defaultExportDir ?? "");
   let filename = sanitizeFileName(session.project.name);
 
   let encoders: EncoderReport | null = null;

@@ -127,6 +127,9 @@ const doc = {
   activeElement: null as unknown,
   /** What document.querySelector finds: set to simulate an open dialog. */
   present: new Set<string>(),
+  /** Elements document.querySelector hands back as real nodes, checked first:
+   *  the menu host, whose `style.display` says whether a menu is showing. */
+  nodes: new Map<string, object>(),
   body: new Stub("body"),
   addEventListener(t: string, fn: Handler): void {
     if (!docListeners.has(t)) docListeners.set(t, new Set());
@@ -136,6 +139,8 @@ const doc = {
     docListeners.get(t)?.delete(fn);
   },
   querySelector(sel: string): object | null {
+    const node = doc.nodes.get(sel.trim());
+    if (node) return node;
     return sel.split(",").some((s) => doc.present.has(s.trim())) ? {} : null;
   },
 };
@@ -216,6 +221,7 @@ beforeEach(() => {
   m.picks = [];
   doc.activeElement = null;
   doc.present.clear();
+  doc.nodes.clear();
 });
 afterEach(() => {
   for (const v of mounted.splice(0)) v.dispose();
@@ -251,6 +257,65 @@ describe("Home's search field", () => {
     fireDoc("keydown", over);
     expect(search.focusCalls).toBe(2);
     expect(over.defaultPrevented).toBe(false);
+  });
+
+  it("is still reached with Ctrl+F after a menu has been opened and closed", async () => {
+    const root = mount();
+    await flush();
+    const search = root.el("#home-search");
+    // ui/menu.ts creates its host once and only hides it on close: after the
+    // first menu of a session it stays on <body> for good.
+    const host = { className: "ctx-menu", style: { display: "none" } };
+    doc.nodes.set(".ctx-menu", host);
+    const after = keyEvent({ key: "f", code: "KeyF", ctrlKey: true });
+    fireDoc("keydown", after);
+    expect(search.focusCalls).toBe(1);
+    expect(after.defaultPrevented).toBe(true);
+    // While a menu is SHOWING, its keys are its own.
+    host.style.display = "block";
+    const open = keyEvent({ key: "f", code: "KeyF", ctrlKey: true });
+    fireDoc("keydown", open);
+    expect(search.focusCalls).toBe(1);
+    expect(open.defaultPrevented).toBe(false);
+  });
+});
+
+describe("refreshes that answer out of order", () => {
+  it("paint only the newest one's list, and no stale error", async () => {
+    const answers: Array<{ resolve: (v: RecentsIndex) => void; reject: (e: unknown) => void }> = [];
+    m.recents = () =>
+      new Promise<RecentsIndex>((resolve, reject) => void answers.push({ resolve, reject }));
+    const root = mount();
+    await flush();
+    expect(answers).toHaveLength(1);
+    const grid = root.el("#recents");
+    // A second refresh while the mount's read is still out (the retry button
+    // stands in for any mutation's refresh: they all call the same function).
+    grid.fire("click", { target: target({ '[data-act="retry-recents"]': {} }) });
+    await flush();
+    expect(answers).toHaveLength(2);
+    // The newer read answers first, after the card "Cut 1" was removed...
+    answers[1]!.resolve({ schema: 1, items: [item(2)] });
+    await flush();
+    expect(grid.innerHTML).toContain("Cut 2");
+    expect(grid.innerHTML).not.toContain("Cut 1");
+    // ...then the older one lands with the list from before the removal.
+    answers[0]!.resolve({ schema: 1, items: [item(1), item(2)] });
+    await flush();
+    expect(grid.innerHTML).toContain("Cut 2");
+    expect(grid.innerHTML).not.toContain("Cut 1");
+
+    // A stale FAILURE is dropped the same way: no toast, no "couldn't read".
+    grid.fire("click", { target: target({ '[data-act="retry-recents"]': {} }) });
+    grid.fire("click", { target: target({ '[data-act="retry-recents"]': {} }) });
+    await flush();
+    expect(answers).toHaveLength(4);
+    answers[3]!.resolve({ schema: 1, items: [item(3)] });
+    answers[2]!.reject(new Error("share went to sleep"));
+    await flush();
+    expect(m.errors).toEqual([]);
+    expect(grid.innerHTML).toContain("Cut 3");
+    expect(grid.innerHTML).not.toContain("Couldn't read");
   });
 });
 
@@ -355,6 +420,21 @@ describe("Recover lines for orphaned temporary projects", () => {
     expect(m.navigations).toEqual([{ view: "editor", projectPath: B, temp: true }]);
   });
 
+  it("reopens one whose crash left only its .bak, which the load recovers from", async () => {
+    // Death between atomic_write's two renames: the primary went to .bak, the
+    // staged .tmp never came in (and the sweep removed it). The store still
+    // offers the .trt path, and load_project reads the .bak.
+    m.orphans = [A, B];
+    m.exists.add(`${A}.bak`);
+    m.exists.add(B);
+    const root = mount();
+    await flush();
+    root.el("#home-recover").fire("click", { target: target({ "[data-recover]": { dataset: { recover: "0" } } }) });
+    await flush();
+    expect(m.errors).toEqual([]);
+    expect(m.navigations).toEqual([{ view: "editor", projectPath: A, temp: true }]);
+  });
+
   it("says a vanished one is gone and lists again instead of opening anything", async () => {
     m.orphans = [A];
     const root = mount();
@@ -408,5 +488,37 @@ describe("the recents grid's keyboard", () => {
     grid.fire("keydown", keyEvent({ key: "Enter", target: target({ ".project-card": card }) }));
     await flush();
     expect(m.navigations).toEqual([{ view: "editor", projectPath: P }]);
+  });
+});
+
+describe("opening a recents card", () => {
+  const P = "C:\Docs\Taroting\Cut 1.trt";
+  const Q = "C:\Docs\Taroting\Cut 2.trt";
+
+  it("opens one whose .trt is gone but whose .bak survives, as the list promises", async () => {
+    m.recents = () => Promise.resolve({ schema: 1, items: [item(1), item(2)] });
+    // Only the backup of Cut 1 is on disk; Cut 2 has its primary. A bare
+    // `${P}.bak` must not satisfy a check for Q, nor Q's file one for P.
+    m.exists.add(`${P}.bak`);
+    m.exists.add(Q);
+    const root = mount();
+    await flush();
+    root.el("#recents").fire("keydown", keyEvent({ key: "Enter", target: target({ ".project-card": { dataset: { path: P } } }) }));
+    await flush();
+    expect(m.errors).toEqual([]);
+    expect(m.navigations).toEqual([{ view: "editor", projectPath: P }]);
+  });
+
+  it("still says not found when neither the .trt nor its .bak exists", async () => {
+    m.recents = () => Promise.resolve({ schema: 1, items: [item(1)] });
+    m.exists.add(`${P}.tmp`);
+    const root = mount();
+    await flush();
+    const before = m.listCalls;
+    root.el("#recents").fire("keydown", keyEvent({ key: "Enter", target: target({ ".project-card": { dataset: { path: P } } }) }));
+    await flush();
+    expect(m.navigations).toEqual([]);
+    expect(m.errors).toEqual(["Project file not found"]);
+    expect(m.listCalls).toBe(before + 1);
   });
 });

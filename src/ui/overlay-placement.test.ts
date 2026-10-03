@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * remove-and-insert drops it.
  */
 
-vi.mock("./focus", () => ({ trapTab: () => () => {} }));
+vi.mock("./focus", () => ({ trapTab: () => () => {}, focusFirst: () => {} }));
 vi.mock("./icons", () => ({ icon: () => "" }));
 
 type Handler = (e?: unknown) => void;
@@ -141,13 +141,22 @@ beforeEach(() => {
   keydown.clear();
   vi.stubGlobal("document", doc);
   vi.stubGlobal("window", win);
+  // The prompts seat focus a frame later; nothing here depends on it.
+  vi.stubGlobal("requestAnimationFrame", () => 0);
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-const { openErrorDialog, overlayParent, placeOverlay } = await import("./errors");
+const { closeErrorDialogs, openErrorDialog, overlayParent, placeOverlay } = await import("./errors");
+const { askCloseAnyway, askKeepTemp } = await import("./temp-project");
+
+/** Escape as the prompts hear it: a document-level capture listener. */
+function pressEscapeOnDocument(): void {
+  const e = { key: "Escape", preventDefault() {} };
+  for (const fn of [...(listeners.get("keydown") ?? [])]) fn(e);
+}
 
 function fullscreen(): Node_ {
   const viewer = new Node_();
@@ -271,5 +280,91 @@ describe("the error dialog under element fullscreen", () => {
     expect(under!.parentNode).toBe(body);
     pressEscape();
     expect(under!.parentNode).toBe(null);
+  });
+});
+
+/**
+ * The Keep / Leave / Close-anyway prompts (ui/temp-project). Under theater
+ * fullscreen they used to go on <body>, behind the top layer: open, focused on
+ * Keep, and invisible — so Ctrl+W, the window's X or an Explorer open during
+ * fullscreen raised a question nobody could see, and the Space the user then
+ * pressed to play kept the project.
+ */
+describe("the temporary-project prompts under element fullscreen", () => {
+  const backdropIn = (parent: Node_): Node_ | undefined =>
+    parent.children.find((c) => c.className === "modal-backdrop");
+
+  it("Keep temporary project? opens inside the fullscreen element and follows it back out", async () => {
+    const theater = fullscreen();
+    const answer = askKeepTemp();
+    const backdrop = backdropIn(theater)!;
+    expect(backdrop).toBeDefined();
+    expect(backdropIn(body)).toBeUndefined();
+    expect(fsListeners()).toBe(1);
+
+    doc.fullscreenElement = null;
+    fireFullscreenChange();
+    expect(backdropIn(body)).toBe(backdrop);
+
+    pressEscapeOnDocument();
+    expect(await answer).toBe("cancel");
+    expect(backdrop.parentNode).toBe(null);
+    expect(fsListeners()).toBe(0);
+  });
+
+  it("Leave this project? and Close Taroting? open inside it too, and let go of it when answered", async () => {
+    const theater = fullscreen();
+    const leave = askCloseAnyway("Your latest changes are still being saved.", "leave");
+    const close = askCloseAnyway("Your latest changes couldn't be saved.");
+    const shown = theater.children.filter((c) => c.className === "modal-backdrop");
+    expect(shown).toHaveLength(2);
+    expect(backdropIn(body)).toBeUndefined();
+    expect(fsListeners()).toBe(2);
+
+    pressEscapeOnDocument();
+    expect(await leave).toBe(false);
+    expect(await close).toBe(false);
+    expect(theater.children.some((c) => c.className === "modal-backdrop")).toBe(false);
+    expect(fsListeners()).toBe(0);
+  });
+
+  it("opens on <body>, listening for nothing, when nothing is fullscreen", async () => {
+    const answer = askKeepTemp();
+    expect(backdropIn(body)).toBeDefined();
+    expect(fsListeners()).toBe(0);
+    pressEscapeOnDocument();
+    expect(await answer).toBe("cancel");
+  });
+});
+
+/**
+ * A LEAVE question belongs to its screen: an Explorer open already past its
+ * own check could replace the screen while "Leave this project?" was up, and
+ * the prompt then sat over the NEW screen, where "Leave anyway" navigated away
+ * from the file just opened. The router's screen change answers it Stay. A
+ * CLOSE question is about the window and stays up.
+ */
+describe("the router's screen change and the leave / close prompts", () => {
+  it("answers an open LEAVE prompt Stay and removes it", async () => {
+    const leave = askCloseAnyway("Your latest changes couldn't be saved.", "leave");
+    const backdrop = body.children.find((c) => c.className === "modal-backdrop")!;
+    closeErrorDialogs();
+    expect(await leave).toBe(false);
+    expect(backdrop.parentNode).toBe(null);
+  });
+
+  it("leaves a CLOSE prompt up, still waiting for the user", async () => {
+    let settled = false;
+    const close = askCloseAnyway("Your latest changes couldn't be saved.").then((v) => {
+      settled = true;
+      return v;
+    });
+    closeErrorDialogs();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(body.children.some((c) => c.className === "modal-backdrop")).toBe(true);
+    pressEscapeOnDocument();
+    expect(await close).toBe(false);
   });
 });

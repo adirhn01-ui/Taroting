@@ -56,7 +56,7 @@ import { toast } from "../ui/toast";
 import { openExportDialog } from "./export/export-dialog";
 import { mountInspector } from "./inspector/inspector";
 import { openGeneratorDialog } from "./media/generators";
-import { MediaManager } from "./media/media";
+import { abandonsPlayback, MediaManager } from "./media/media";
 import { openRelinkDialog } from "./media/relink";
 import { statusChange } from "./media/status-diff";
 import { AudioGraph } from "./playback/audio-graph";
@@ -1938,10 +1938,12 @@ function buildEditor(
       // probe still out refuses instead of committing.
       teardown.run();
       // A discarded quick-view project will never be opened again, so the
-      // remux or proxy it started has no one to finish for: cancel it rather
-      // than leave one transcode queued per file stepped through. A kept or
+      // remux or proxy it started is abandoned rather than left queued, one
+      // transcode per file opened — but abandoned, not canceled: the next
+      // editor may be showing the same file, and joins the job instead of
+      // restarting it (see abandonsPlayback for the viewer case). A kept or
       // permanent project lets them run on into the cache for its next open.
-      media.dispose({ cancelPlayback: session.discarded });
+      media.dispose({ abandonPlayback: abandonsPlayback(session.discarded, route.returnTo !== undefined) });
       // Only clear what is still ours: a newer mount may already have claimed
       // currentSession, and nulling it would strip that screen's leave guard.
       if (currentSession.get() === session) currentSession.set(null);

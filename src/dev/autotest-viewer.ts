@@ -18,10 +18,10 @@
 // short and every timeout names what WAS on screen: a red run must finish
 // inside the harness's 90 s cap and say why without a rerun.
 
-import { getWindowTitle, ipc, onJobEvents, type PlaybackClass } from "../core/ipc";
+import { devOverrideMediaPicker, getWindowTitle, ipc, onJobEvents, type PlaybackClass } from "../core/ipc";
 import { navigate } from "../core/nav";
 import { isTempProjectPath } from "../core/open-media";
-import { addMarkerAt, createProject, trimClip } from "../core/project";
+import { addMarkerAt, createProject, importMediaAsClip, trimClip } from "../core/project";
 import {
   currentSession,
   leaveBlockedReason,
@@ -1342,6 +1342,513 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
       } catch {
         // As above.
       }
+      await backHome();
+    }
+  });
+  /* ---------------------------------------------------------------- */
+  /* 0.9.1: the reported crash scenario, mount supersession, an import  */
+  /* answered after its editor closed, error-report copy-out, and the   */
+  /* Uninstall confirm's focus. Estimated cost (from the measured       */
+  /* blocks above, ~50-1700 ms each): ~5-6 s for the six together.      */
+  /* ---------------------------------------------------------------- */
+
+  /** A PERMANENT library project holding one clip on `clipFile` (probed for
+   *  real), so its editor mounts with a media manager, a video element and
+   *  background work like any project a user opens. */
+  const mp4Project = async (name: string, clipFile: string): Promise<string> => {
+    const path = await ipc.newProjectPath(name);
+    const info = await ipc.probeMedia(fx(clipFile));
+    await ipc.saveProject(path, importMediaAsClip(createProject(name), info).project);
+    return path;
+  };
+  const dropProject = async (path: string): Promise<void> => {
+    if (!path) return;
+    await ipc.deleteProject(path).catch(() => {});
+    await ipc.removeRecent(path).catch(() => {});
+  };
+
+  /** Window responsiveness, measured the way a user feels it: a trivial IPC
+   *  round trip (the window title) every ~25 ms, each one needing the
+   *  WebView2 UI thread to receive and answer it. A UI thread blocked on a
+   *  synchronous command, or a page busy in a long task, shows up as one slow
+   *  round trip. */
+  const startIpcProbe = (): { stop(): Promise<{ max: number; n: number }> } => {
+    let running = true;
+    let max = 0;
+    let n = 0;
+    const loop = (async () => {
+      while (running) {
+        const t = performance.now();
+        await getWindowTitle();
+        const d = performance.now() - t;
+        if (d > max) max = d;
+        n++;
+        await sleep(25);
+      }
+    })();
+    return {
+      async stop() {
+        running = false;
+        await loop;
+        return { max, n };
+      },
+    };
+  };
+
+  /** Every toast now painted, as text — for a failure message, and to prove
+   *  that nothing refused or failed. */
+  const toastTexts = (): string[] =>
+    Array.from(document.querySelectorAll<HTMLElement>(".toast"))
+      .filter((t) => rendered(t))
+      .map((t) => (t.textContent ?? "").trim());
+  const assertNoFailureToast = (when: string): void => {
+    const bad = Array.from(document.querySelectorAll<HTMLElement>(".toast")).filter(
+      (t) => rendered(t) && (t.classList.contains("toast--error") || /wasn['’]t opened|Still editing/.test(t.textContent ?? "")),
+    );
+    assert(bad.length === 0, `${when}: ${bad.map((t) => `"${(t.textContent ?? "").trim()}"`).join(", ")}`);
+  };
+  /** No editor left anywhere: not in the DOM, not painted at the window's
+   *  centre, not holding the session. */
+  const assertNoEditor = (when: string): void => {
+    const editors = document.querySelectorAll(".editor").length;
+    assert(editors === 0, `${when}: ${editors} .editor element(s) still in the document`);
+    const hit = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
+    assert(!hit?.closest(".editor"), `${when}: the window's centre paints ${describeEl(hit)} inside an editor`);
+    assert(currentSession.get() === null, `${when}: a project session is still current (${currentSession.get()?.path ?? ""})`);
+  };
+
+  // The v0.7.3 copy-out regression ("can't copy-past the log"), driven
+  // through the REAL export dialog to a REAL ffmpeg failure: the clip's media
+  // is pointed at `._clip2.mp4`, a 16-byte file with a video extension (the
+  // viewer fixtures' macOS litter), which every check before ffmpeg passes —
+  // it is a file, on a drive, that exists — and ffmpeg cannot read. Every
+  // destination problem is refused before ffmpeg now, so the input is the
+  // only way to get ffmpeg's own argv and log into the report, and without
+  // them the privacy checks below would have nothing to leak. Never touches
+  // the owner's clipboard: both copy routes are replaced by spies. ~1 s.
+  await test("error-report", async () => {
+    const t0 = performance.now();
+    let tempPath = "";
+    const clip = navigator.clipboard as Clipboard | undefined;
+    const spied: { text: string | null; exec: number } = { text: null, exec: 0 };
+    try {
+      needFixtures();
+      const junk = fx("._clip2.mp4");
+      assert(await ipc.pathExists(junk), `fixture ${junk} is missing — run npm run fixtures`);
+      // The account name the report must not carry, from paths this run KNOWS
+      // sit under the profile. Underivable means the check below would pass
+      // for any report, so that is a failure, not a skip.
+      const info = await ipc.debugInfo();
+      const user = [info.reportPath, fixturesDir]
+        .map((p) => (p.match(/^[A-Za-z]:\\Users\\([^\\]+)/i) ?? [])[1])
+        .find((u): u is string => !!u);
+      assert(user !== undefined, `cannot derive the Windows account name from ${info.reportPath} or ${fixturesDir} — the leak check would be vacuous`);
+
+      await setOpenWith("editor");
+      const prev = editorDev();
+      await ipc.debugPushOpenPath(fx("clip2.mp4"));
+      const session = await waitEditor(prev, "a temp project on clip2.mp4");
+      tempPath = session.path;
+      const p = session.project;
+      // `edit: false`: the scratch project stays unedited, so the teardown
+      // discards it with no prompt. A small software encode, like
+      // export-leave-hold's, in case ffmpeg ever got further than the input.
+      session.replace(
+        {
+          ...p,
+          media: p.media.map((m) => ({ ...m, path: junk })),
+          export: {
+            ...p.export,
+            format: "mp4" as const,
+            vcodec: "h264" as const,
+            resolution: { w: 320, h: 180 },
+            fps: 30,
+            videoBitrate: "auto" as const,
+            audioBitrate: "auto" as const,
+            useHardware: false,
+          },
+        },
+        { edit: false },
+      );
+
+      const ex = $<HTMLButtonElement>("#ed-export");
+      assert(rendered(ex), "#ed-export is not rendered");
+      ex!.click();
+      const nameIn = await until(() => $<HTMLInputElement>(".export-modal #ex-name"), 2_000, () => "the export dialog's form");
+      const folderIn = $<HTMLInputElement>(".export-modal #ex-folder")!;
+      folderIn.value = `${fixturesDir}\\..`;
+      folderIn.dispatchEvent(new Event("input"));
+      nameIn.value = "autotest-error-report";
+      nameIn.dispatchEvent(new Event("input"));
+      $<HTMLButtonElement>(".export-modal #ex-run")!.click();
+      await until(
+        () => {
+          $<HTMLButtonElement>('.export-modal #ex-warn-slot [data-w="replace"]')?.click();
+          return $(".export-modal .export-result__icon--bad");
+        },
+        8_000,
+        () => `the export's failure view (dialog: "${text(".export-modal #ex-body").slice(0, 160)}"; toasts: ${toastTexts().join(" | ") || "none"})`,
+      );
+
+      // The detail pane: painted, holding text, selectable, and Ctrl+C left to
+      // the browser (a hijack would preventDefault it for the timeline's
+      // copy-clip binding — the v0.7.3 bug).
+      const ta = $<HTMLTextAreaElement>(".export-modal .err-detail");
+      assert(rendered(ta), "the failure view has no rendered .err-detail textarea");
+      assert(ta!.value.trim().length > 0, "the detail textarea is empty");
+      const us = getComputedStyle(ta!).userSelect;
+      assert(us !== "none", `the detail textarea has user-select: ${us}`);
+      const ctrlC = new KeyboardEvent("keydown", { key: "c", code: "KeyC", ctrlKey: true, bubbles: true, cancelable: true });
+      ta!.dispatchEvent(ctrlC);
+      assert(!ctrlC.defaultPrevented, "Ctrl+C in the detail textarea was claimed by an app shortcut (preventDefault) — the copy never reaches the clipboard");
+
+      // The assembled report replaces the raw log; THAT is what users copy.
+      await until(
+        () => ta!.value.startsWith("Taroting diagnostic report") || null,
+        5_000,
+        () => `the assembled report in the textarea (it holds: "${ta!.value.slice(0, 80)}")`,
+      );
+      ta!.focus();
+      ta!.select();
+      assert(
+        ta!.selectionStart === 0 && ta!.selectionEnd === ta!.value.length,
+        `select-all in the textarea selected ${ta!.selectionStart}-${ta!.selectionEnd} of ${ta!.value.length}`,
+      );
+      const report = ta!.value;
+      // Non-vacuity: the report carries ffmpeg's own command line, which names
+      // the source and the destination in full — so the checks below are
+      // looking at text that HAD the paths to leak.
+      assert(
+        report.includes("FFmpeg command") && !report.includes("(not captured)"),
+        "the report carries no captured ffmpeg command: the failure never reached ffmpeg, and the leak checks below would prove nothing",
+      );
+      const low = report.toLowerCase();
+      assert(!low.includes(user!.toLowerCase()), `the report leaks the account name "${user}"`);
+      assert(!low.includes(fixturesDir.toLowerCase()), "the report leaks the fixtures folder");
+      assert(!report.includes("._clip2"), "the report leaks the source file's name");
+      assert(!/machineId|installId|sessionId/i.test(report), "the report carries a correlating identifier");
+
+      // "Copy details" copies exactly that text — through spies, never the
+      // real clipboard. Own properties shadow the prototype's methods and are
+      // deleted again below, which puts the real ones back.
+      if (clip) {
+        Object.defineProperty(clip, "writeText", {
+          configurable: true,
+          writable: true,
+          value: async (t: string): Promise<void> => {
+            spied.text = t;
+          },
+        });
+      }
+      Object.defineProperty(document, "execCommand", {
+        configurable: true,
+        writable: true,
+        value: (cmd: string): boolean => {
+          if (cmd !== "copy") return false;
+          spied.exec++;
+          spied.text = document.querySelector<HTMLTextAreaElement>('textarea[style*="-9999px"]')?.value ?? "";
+          return true;
+        },
+      });
+      const copyBtn = Array.from(document.querySelectorAll<HTMLButtonElement>(".export-modal .err-pane__actions button")).find(
+        (b) => b.textContent?.trim() === "Copy details",
+      );
+      assert(rendered(copyBtn ?? null), "the failure view has no rendered Copy details button");
+      copyBtn!.click();
+      await until(() => spied.text !== null || null, 2_000, () => "Copy details to reach the clipboard");
+      assert(spied.text === report, `Copy details copied ${spied.text?.length ?? 0} chars, not the ${report.length}-char report shown`);
+      return `real dialog → ffmpeg failed on ._clip2.mp4 → textarea painted, selectable (${us}), Ctrl+C not claimed; report ${report.length} chars with the ffmpeg command, no account name / folder / file name / id; Copy details copied it via ${spied.exec ? "execCommand" : "clipboard.writeText"} (spied) — ${ms(t0)}`;
+    } finally {
+      if (clip) delete (clip as unknown as Record<string, unknown>).writeText;
+      delete (document as unknown as Record<string, unknown>).execCommand;
+      $<HTMLButtonElement>(".export-modal [data-close-btn], .export-modal [data-close]")?.click();
+      document.querySelector(".export-modal")?.closest(".modal-backdrop")?.remove();
+      await backHome();
+      if (tempPath) await ipc.deleteProject(tempPath).catch(() => {});
+    }
+  });
+
+  /**
+   * The reported crash: a project with an mp4 is open (its media work possibly
+   * still running), there is an edit not yet autosaved, and File Explorer
+   * opens an mp4 into the same window. The open must flush the edit, replace
+   * the editor with the viewer, leave nothing of the editor behind, and keep
+   * the window answering throughout.
+   */
+  const openOverBusyEditor = async (projectClip: string, opened: string, w: number, h: number): Promise<string> => {
+    const t0 = performance.now();
+    let path = "";
+    let probe: ReturnType<typeof startIpcProbe> | null = null;
+    let releaseAutosave: () => void = () => {};
+    try {
+      needFixtures();
+      await setOpenWith("viewer");
+      // Named by the stem: a ".mp4" inside a project name is not what this tests.
+      path = await mp4Project(`Autotest busy open ${projectClip.replace(/\.[^.]+$/, "")}`, projectClip);
+      const prev = editorDev();
+      // The .trt through the real Explorer route too, as the user opened it.
+      await ipc.debugPushOpenPath(path);
+      const session = await waitEditor(prev, `the project on ${projectClip}`);
+      assert(!session.temp.get(), `precondition: the library project opened as temporary (${session.path})`);
+      // Not waited for: whatever the media manager is still doing is part of
+      // the scenario. Reported, not asserted — the cache outlives the run, so
+      // from the second run on the work may already be done.
+      const states = Object.values(editorDev()!.media.status.get()).map((s) => s.state);
+      const busy = states.filter((s) => s !== "ready").length;
+      // Autosave is HELD from before the edit (the image editor's own
+      // mid-gesture hold: explicit saves and dispose still write). So the
+      // only way the marker can reach the disk is the open's leave flush —
+      // on a slow run the 500 ms debounce would otherwise save it first, and
+      // "the edit reached the .trt" would pass through autosave instead.
+      releaseAutosave = session.holdAutosave();
+      session.commit((p) => addMarkerAt(p, 0.37).project);
+      // Unflushed is the scenario.
+      assert(session.saveState.get() === "dirty", `precondition: the edit is already "${session.saveState.get()}", not "dirty"`);
+      probe = startIpcProbe();
+      const tPush = performance.now();
+      await ipc.debugPushOpenPath(fx(opened));
+      const v = await until(
+        () => videoShown((x) => x.videoWidth === w && x.videoHeight === h),
+        6_000,
+        () => `${opened} (${w}x${h}) in the viewer — ${viewerState()}; editor ${$(".editor") ? "STILL MOUNTED" : "gone"}, dialog ${$(".modal-backdrop") ? `"${text(".modal-backdrop .modal__header")}"` : "none"}, toasts: ${toastTexts().join(" | ") || "none"}`,
+      );
+      const switchMs = performance.now() - tPush;
+      const { max, n } = await probe.stop();
+      probe = null;
+      assert(max < 1_000, `the window stopped answering for ${Math.round(max)} ms during the switch (slowest of ${n} title round trips)`);
+      assert(hitAtCentre() === v, `the stage centre hits ${describeEl(hitAtCentre())}, not #vw-video`);
+      assert($(".modal-backdrop") === null, `a dialog is up over the viewer: "${text(".modal-backdrop .modal__header")}"`);
+      assertNoEditor("after the open");
+      assertNoFailureToast("the open said");
+      const disk = await ipc.loadProject(path);
+      const marks = disk.project.timeline.markers ?? [];
+      assert(
+        marks.some((m) => Math.abs(m.t - 0.37) < 1e-6),
+        `the unflushed edit never reached the .trt (markers on disk: [${marks.map((m) => m.t).join(", ")}])`,
+      );
+      return `project on ${projectClip} (${busy}/${states.length} media still busy) + unsaved marker → open ${opened}: viewer on ${w}x${h} in ${Math.round(switchMs)} ms, marker on disk, no editor left, no dialog/refusal; slowest IPC round trip ${Math.round(max)} ms of ${n} — ${ms(t0)}`;
+    } finally {
+      releaseAutosave();
+      if (probe) await probe.stop();
+      await backHome();
+      await dropProject(path);
+    }
+  };
+
+  // ~1.2 s each.
+  await test("open-over-busy-editor", () => openOverBusyEditor("phone.mp4", "clip10.mp4", 128, 72));
+  // The same file the project is playing: the editor's <video> and the
+  // viewer's open it one after the other, on one decoder budget.
+  await test("open-same-file-over-busy-editor", () => openOverBusyEditor("clip2.mp4", "clip2.mp4", 96, 54));
+
+  // Mount supersession: an Explorer open arriving while the editor is still
+  // MOUNTING. Back-to-back pushes usually finish the first mount before the
+  // second arrives, which would make this pass by construction, so the mount
+  // is held open deterministically at each of its two awaits in turn:
+  //   1. ipc.loadProject (wrapped through the shared `ipc` object the editor
+  //      calls it on) — the mount is caught by the check after the load, or
+  //      failing that by the one after media.init; this phase cannot tell
+  //      which, only that one of them did;
+  //   2. MediaManager.prototype.init — only the check after media.init stands
+  //      between this mount and painting over the viewer, so this is the
+  //      phase that fails if that check goes.
+  // What a lost check looks like on screen: an editor painted over the viewer,
+  // a session in currentSession that nothing shows, a new editor dev hook.
+  // ~1.5 s for both phases.
+  await test("open-during-editor-mount", async () => {
+    const t0 = performance.now();
+    let path = "";
+    const realLoad = ipc.loadProject;
+    const { MediaManager } = await import("../editor/media/media");
+    const realInit = MediaManager.prototype.init;
+    const gate: { release: () => void; entered: number; left: number } = { release: () => {}, entered: 0, left: 0 };
+    const hold = (): Promise<void> => new Promise<void>((r) => (gate.release = r));
+    const steps: string[] = [];
+    try {
+      needFixtures();
+      await setOpenWith("viewer");
+      path = await mp4Project("Autotest mount supersession", "clip2.mp4");
+      const phase = async (where: "load" | "init", opened: string, w: number, h: number): Promise<void> => {
+        gate.entered = 0;
+        gate.left = 0;
+        const held = hold();
+        // Only the FIRST call is held (the mount's own — nothing else loads a
+        // project or builds a media manager during a phase). Not matched by
+        // path: the open route may hand the editor a respelled one.
+        if (where === "load") {
+          ipc.loadProject = async (p: string) => {
+            const r = await realLoad(p);
+            if (gate.entered === 0) {
+              gate.entered++;
+              await held;
+              gate.left++;
+            }
+            return r;
+          };
+        } else {
+          MediaManager.prototype.init = async function (this: InstanceType<typeof MediaManager>): Promise<void> {
+            await realInit.call(this);
+            if (gate.entered === 0) {
+              gate.entered++;
+              await held;
+              gate.left++;
+            }
+          };
+        }
+        try {
+          const prev = editorDev();
+          await ipc.debugPushOpenPath(path);
+          await until(() => gate.entered === 1 || null, 5_000, () => `the editor mount to reach ${where} (on screen: ${$(".editor") ? "editor" : $("#vw") ? "viewer" : $(".home") ? "home" : "?"})`);
+          await ipc.debugPushOpenPath(fx(opened));
+          const v = await until(
+            () => videoShown((x) => x.videoWidth === w && x.videoHeight === h),
+            5_000,
+            () => `${opened} in the viewer while the mount is held at ${where} — ${viewerState()}`,
+          );
+          gate.release();
+          await until(() => gate.left === 1 || null, 2_000, () => `the held ${where} to return`);
+          // Let the superseded mount run to wherever it stops: two frames and
+          // a beat for its remaining awaits and its tracked dispose.
+          await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+          await sleep(150);
+          assertNoEditor(`${where}: after the held mount resumed`);
+          assert(editorDev() === prev, `${where}: the superseded mount published a new editor dev hook — it built an editor`);
+          assert(vwVideo() === v && hitAtCentre() === v, `${where}: the viewer is no longer what the stage shows (centre hits ${describeEl(hitAtCentre())})`);
+          assertNoFailureToast(`${where}: a toast says`);
+          steps.push(`held at ${where} → ${opened} shown → released → no editor, no session, no hook`);
+        } finally {
+          gate.release();
+          ipc.loadProject = realLoad;
+          MediaManager.prototype.init = realInit;
+        }
+        await backHome();
+      };
+      await phase("load", "clip2.mp4", 96, 54);
+      await phase("init", "clip10.mp4", 128, 72);
+      return `${steps.join("; ")} — ${ms(t0)}`;
+    } finally {
+      gate.release();
+      ipc.loadProject = realLoad;
+      MediaManager.prototype.init = realInit;
+      await backHome();
+      await dropProject(path);
+    }
+  });
+
+  // An Import dialog still open when an Explorer open replaces its editor
+  // (reproduced by hand: pick files after the editor is gone). The answer
+  // must be refused in words on the screen that replaced it, and nothing may
+  // reach the closed project — neither its session nor its .trt. The native
+  // picker is stood in for by a dev seam in ipc.ts (the off-screen harness
+  // cannot answer a real one). ~0.8 s.
+  await test("import-after-close-refused", async () => {
+    const t0 = performance.now();
+    let path = "";
+    let answer: ((paths: string[]) => void) | null = null;
+    let asked = 0;
+    try {
+      needFixtures();
+      await setOpenWith("viewer");
+      path = await mp4Project("Autotest import after close", "clip2.mp4");
+      const prev = editorDev();
+      navigate({ view: "editor", projectPath: path });
+      const session = await waitEditor(prev, "the project on clip2.mp4");
+      const before = session.project.media.map((m) => m.path);
+      devOverrideMediaPicker(() => {
+        asked++;
+        return new Promise<string[]>((r) => (answer = r));
+      });
+      const imp = $<HTMLButtonElement>("#ed-import");
+      assert(rendered(imp), "#ed-import is not rendered");
+      imp!.click();
+      await until(() => asked === 1 || null, 2_000, () => "Import to open the (stand-in) picker");
+      await openInViewer("clip10.mp4");
+      assertNoEditor("with the picker still open");
+      answer!([fx("a1.mp3")]);
+      answer = null;
+      const said = await until(
+        () =>
+          Array.from(document.querySelectorAll<HTMLElement>(".toast")).find(
+            (t) => rendered(t) && (t.textContent ?? "").includes("a1.mp3 wasn't imported because the project was closed."),
+          ),
+        3_000,
+        () => `the "wasn't imported because the project was closed" toast (toasts: ${toastTexts().join(" | ") || "none"})`,
+      );
+      // Anything that slipped through would commit and autosave: give it the
+      // debounce's time to land before reading the file.
+      await sleep(600);
+      assert(
+        session.project.media.length === before.length && !session.project.media.some((m) => m.path.endsWith("a1.mp3")),
+        `the closed editor's session took the file (${session.project.media.length} media, was ${before.length})`,
+      );
+      const disk = await ipc.loadProject(path);
+      const onDisk = disk.project.media.map((m) => m.path);
+      assert(
+        onDisk.length === before.length && !onDisk.some((p) => p.endsWith("a1.mp3")),
+        `the .trt was written with the refused file (${onDisk.map(baseName).join(", ")})`,
+      );
+      assert(rendered($("#vw")) && baseName(viewerDev()?.path() ?? "") === "clip10.mp4", `the viewer did not stay on clip10.mp4 — ${viewerState()}`);
+      return `Import open → Explorer open → viewer; the late answer refused: "${said.textContent?.trim()}"; session and .trt still ${before.length} media — ${ms(t0)}`;
+    } finally {
+      devOverrideMediaPicker(null);
+      if (answer) (answer as (paths: string[]) => void)([]);
+      await backHome();
+      await dropProject(path);
+    }
+  });
+
+  // Settings → Uninstall: the confirm opens with focus INSIDE it on Cancel
+  // (never the red button), painted on top, never stacks a second copy, and
+  // every way out puts focus back. The confirm is never pressed, and the
+  // uninstall IPC is replaced by a spy that would refuse anyway. ~0.4 s.
+  await test("settings-uninstall-focus", async () => {
+    const t0 = performance.now();
+    const realUninstall = ipc.uninstallApp;
+    let calls = 0;
+    ipc.uninstallApp = async (): Promise<void> => {
+      calls++;
+      throw new Error("autotest: the uninstaller is never run");
+    };
+    const dialog = (): HTMLElement | null => $('.modal[aria-label="Uninstall Taroting"]');
+    const openBtn = (): HTMLButtonElement | null => $<HTMLButtonElement>("#settings-uninstall");
+    try {
+      navigate({ view: "settings" });
+      await until(() => rendered(openBtn()) || null, 5_000, () => "Settings → Uninstall Taroting button");
+      openBtn()!.click();
+      const dlg = await until(dialog, 2_000, () => "the Uninstall Taroting? dialog");
+      const cancel = dlg.querySelector<HTMLButtonElement>("[data-cancel]");
+      const confirm = dlg.querySelector<HTMLButtonElement>("[data-confirm]");
+      assert(cancel !== null && confirm !== null, "the dialog has no Cancel / Uninstall pair");
+      assert(
+        document.activeElement === cancel,
+        `focus opened on ${describeEl(document.activeElement)}${document.activeElement === confirm ? " (the red Uninstall button)" : ""}, not Cancel`,
+      );
+      const r = cancel!.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      assert(hit === cancel || (hit !== null && cancel!.contains(hit)), `Cancel's centre paints ${describeEl(hit)}`);
+      // The button behind the backdrop, pressed again (the old Enter path):
+      // still exactly one dialog.
+      openBtn()!.click();
+      await sleep(30);
+      const count = document.querySelectorAll(".modal-backdrop").length;
+      assert(count === 1, `${count} dialogs after a second press of Uninstall Taroting`);
+      // From the focused Cancel, as a real key arrives: the dialog's capture
+      // listener on document must see it before anything of the screen's.
+      (document.activeElement ?? document.body).dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+      );
+      await until(() => !dialog() || null, 2_000, () => "Escape to close the dialog");
+      assert(document.activeElement === openBtn(), `after Escape focus is on ${describeEl(document.activeElement)}, not #settings-uninstall`);
+      openBtn()!.click();
+      const again = await until(dialog, 2_000, () => "the dialog, reopened");
+      again.querySelector<HTMLButtonElement>("[data-cancel]")!.click();
+      await until(() => !dialog() || null, 2_000, () => "Cancel to close the dialog");
+      assert(document.activeElement === openBtn(), `after Cancel focus is on ${describeEl(document.activeElement)}, not #settings-uninstall`);
+      assert(calls === 0, `the uninstall IPC was called ${calls} time(s)`);
+      return `opens on Cancel (painted on top), a second press stacks nothing, Escape and Cancel both close and refocus the button; uninstall never called — ${ms(t0)}`;
+    } finally {
+      dialog()?.querySelector<HTMLButtonElement>("[data-cancel]")?.click();
+      ipc.uninstallApp = realUninstall;
       await backHome();
     }
   });

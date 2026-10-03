@@ -72,6 +72,51 @@ function presentedMediaTime(el: HTMLVideoElement): Promise<number> {
   });
 }
 
+/**
+ * Start an export and wait for ITS outcome. The listener is attached BEFORE
+ * the job starts — a fast failure (or success) can land before startExport's
+ * answer — and events are buffered until the id is known, then filtered by
+ * it, so another job's done/failed (a waveform, a proxy) is never mistaken
+ * for this one. The listener is always released, whatever happens.
+ */
+async function runExportJob(
+  spec: import("../editor/export/export-ipc").ExportSpec,
+  capMs: number,
+): Promise<{ ok: true; path: string } | { ok: false; detail: string }> {
+  const { startExport } = await import("../editor/export/export-ipc");
+  const { onJobEvents } = await import("../core/ipc");
+  type Outcome = { ok: true; path: string } | { ok: false; detail: string };
+  const seen = new Map<number, Outcome>();
+  let wanted: number | null = null;
+  let settle: (o: Outcome) => void = () => {};
+  const outcome = new Promise<Outcome>((r) => (settle = r));
+  const note = (id: number, o: Outcome): void => {
+    if (wanted === null) seen.set(id, o);
+    else if (id === wanted) settle(o);
+  };
+  const un = await onJobEvents({
+    onDone: (e) => note(e.id, { ok: true, path: String(e.output.path ?? spec.outPath) }),
+    onFailed: (e) =>
+      note(e.id, { ok: false, detail: `${e.message} | ${e.logTail.slice(-3).join(" / ")}` }),
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const id = await startExport(spec);
+    wanted = id;
+    const early = seen.get(id);
+    if (early) return early;
+    return await Promise.race([
+      outcome,
+      new Promise<Outcome>((r) => {
+        timer = setTimeout(() => r({ ok: false, detail: `export timed out after ${capMs / 1000}s` }), capMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    un();
+  }
+}
+
 export async function runAutotest(fixturesDir: string): Promise<void> {
   const results: TestResult[] = [];
   const startedAt = new Date().toISOString();
@@ -86,11 +131,19 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     errors.push(`unhandledrejection: ${r?.stack ?? String(e.reason)}`);
   });
 
+  // Set once by the 90 s hard timeout and never cleared. From then on the
+  // report says done (the run is over as far as anyone polling it is
+  // concerned) and failed, whatever a block still running writes afterwards:
+  // a late `write(false)` used to flip `done` back to false, and a late result
+  // overwrote the "overall" entry the timeout had just pushed.
+  let timedOut = false;
+
   const write = async (done: boolean): Promise<void> => {
-    const pass = done && results.length > 0 && results.every((r) => r.pass) && errors.length === 0;
+    const pass =
+      !timedOut && done && results.length > 0 && results.every((r) => r.pass) && errors.length === 0;
     const report = {
       pass,
-      done,
+      done: done || timedOut,
       startedAt,
       updatedAt: new Date().toISOString(),
       results,
@@ -105,7 +158,15 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
   const finish = (): Promise<void> => write(true);
 
   const test = async (name: string, fn: () => Promise<string> | string): Promise<void> => {
-    results.push({ name, pass: false, detail: "…running" });
+    // Past the cap nothing new starts: the report is already final, and a
+    // block started now would only race the teardown of the one that hung.
+    if (timedOut) {
+      results.push({ name, pass: false, detail: "skipped: the run had already timed out" });
+      return;
+    }
+    // This block's OWN slot. `results[results.length - 1]` landed on whatever
+    // was pushed last — after the hard timeout, its "overall" entry.
+    const idx = results.push({ name, pass: false, detail: "…running" }) - 1;
     await write(false);
     // Every block starts with no toasts on screen: one an earlier block raised
     // on purpose ("Still editing…", an export refusal) lives for seconds and
@@ -113,7 +174,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     for (const t of Array.from(document.querySelectorAll(".toast"))) t.remove();
     try {
       const detail = await fn();
-      results[results.length - 1] = { name, pass: true, detail };
+      results[idx] = { name, pass: true, detail };
     } catch (e) {
       // An assert() (a plain Error) says everything; an unexpected throw (a
       // TypeError from a null deref) says nothing about WHERE without its frames.
@@ -121,13 +182,19 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         e instanceof Error && e.name !== "Error" && e.stack
           ? ` @ ${e.stack.split(/\r?\n/).slice(1, 4).map((l) => l.trim()).join(" < ")}`
           : "";
-      results[results.length - 1] = { name, pass: false, detail: String(e) + where };
+      results[idx] = { name, pass: false, detail: String(e) + where };
     }
     await write(false);
   };
 
   const hardTimeout = setTimeout(() => {
-    results.push({ name: "overall", pass: false, detail: "timed out after 90s" });
+    timedOut = true;
+    const running = results.filter((r) => r.detail === "…running").map((r) => r.name);
+    results.push({
+      name: "overall",
+      pass: false,
+      detail: `timed out after 90s${running.length ? ` (still running: ${running.join(", ")})` : ""}`,
+    });
     void finish();
   }, 90_000);
 
@@ -1820,14 +1887,20 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       const projW = session.project.timeline.width;
       const clientDx = 80; // px on screen
       const projDx = (clientDx * projW) / box.width; // project-space px dragged
-      const ev = (type: string, x: number, y: number) =>
+      // `buttons` as a real mouse reports it: 1 while the primary is held (down
+      // and every move), 0 on the up. A drag dispatched with buttons 0 is a
+      // move with nothing held — the overlay's lost-pointer rule
+      // (primaryReleased) only stays out of the way because it also sees 0 at
+      // the down, so it never armed. Honest buttons are what make this the
+      // drag a user makes, and keep that rule's own path exercised.
+      const ev = (type: string, x: number, y: number, buttons: number) =>
         overlay!.dispatchEvent(
-          new PointerEvent(type, { clientX: x, clientY: y, pointerId: 1, button: 0, bubbles: true }),
+          new PointerEvent(type, { clientX: x, clientY: y, pointerId: 1, button: 0, buttons, bubbles: true }),
         );
-      ev("pointerdown", cx, cy);
-      ev("pointermove", cx + clientDx / 2, cy);
-      ev("pointermove", cx + clientDx, cy);
-      ev("pointerup", cx + clientDx, cy);
+      ev("pointerdown", cx, cy, 1);
+      ev("pointermove", cx + clientDx / 2, cy, 1);
+      ev("pointermove", cx + clientDx, cy, 1);
+      ev("pointerup", cx + clientDx, cy, 0);
       const x1 = clip0().transform!.x;
       assert(
         Math.abs(x1 - x0 - projDx) < 1.5,
@@ -1840,6 +1913,77 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       assert(Math.abs(x2 - x0) < 1e-6, `undo did not restore x: ${x2} vs ${x0}`);
       engine.refresh();
       return `drag ${projDx.toFixed(1)}px = 1 history entry, undo restores`;
+    });
+
+    // A canvas drag still in flight when theater opens (F, or the button) is
+    // dropped and REVERTED on the way in (theater.enter → overlay.cancelGesture):
+    // the canvas becomes view-only, and a drag that survived the switch kept
+    // editing the project from under it, invisibly, until its pointerup
+    // committed the result. In-window theater (requestFullscreen needs a real
+    // user gesture this harness cannot give). Estimated ~0.4 s.
+    await test("theater-cancels-canvas-drag", async () => {
+      const overlay = document.querySelector<HTMLElement>(".stage-overlay");
+      const preview = document.querySelector<HTMLElement>(".editor__preview");
+      const fsBtn = document.querySelector<HTMLButtonElement>("#tr-fullscreen");
+      assert(overlay !== null && preview !== null && fsBtn !== null, "no .stage-overlay / .editor__preview / #tr-fullscreen");
+      if (engine.playing) engine.pause();
+      engine.seek(3);
+      await sleep(150);
+      const clip0 = () => session.project.timeline.tracks[0]!.clips[0]!;
+      const x0 = clip0().transform!.x;
+      // History is private; its depth is the one number that says whether a
+      // commit happened, whatever earlier blocks left on the stack.
+      const depth = (): number => (session.history as unknown as { undoStack: unknown[] }).undoStack.length;
+      const depth0 = depth();
+      const box = (overlay!.parentElement as HTMLElement).getBoundingClientRect();
+      const cx = box.left + box.width / 2;
+      const cy = box.top + box.height / 2;
+      const ev = (type: string, x: number, buttons: number): void => {
+        overlay!.dispatchEvent(
+          new PointerEvent(type, { clientX: x, clientY: cy, pointerId: 7, button: 0, buttons, bubbles: true }),
+        );
+      };
+      const inTheater = (): boolean => preview!.classList.contains("theater");
+      let xLive = x0;
+      try {
+        ev("pointerdown", cx, 1);
+        ev("pointermove", cx + 40, 1);
+        ev("pointermove", cx + 80, 1);
+        xLive = clip0().transform!.x;
+        // Precondition: without a live edit there is nothing to revert, and the
+        // check below would pass for a theater that cancels nothing.
+        assert(Math.abs(xLive - x0) > 1, `precondition: the drag did not move the clip live (x ${x0} → ${xLive})`);
+        fsBtn!.click();
+        await sleep(60);
+        assert(inTheater(), "#tr-fullscreen did not open the in-window theater");
+        const xIn = clip0().transform!.x;
+        assert(
+          Math.abs(xIn - x0) < 1e-6,
+          `entering theater kept the live drag: x is ${xIn.toFixed(2)}, ${x0.toFixed(2)} before the drag (${xLive.toFixed(2)} mid-drag)`,
+        );
+        assert(depth() === depth0, `entering theater committed the drag (${depth() - depth0} new history entr${depth() - depth0 === 1 ? "y" : "ies"})`);
+        // Out again; the same pointer goes on moving and finally comes up on
+        // the overlay. The drag is dead: neither may edit or commit anything.
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+        await sleep(40);
+        assert(!inTheater(), "Escape did not leave the theater");
+        ev("pointermove", cx + 120, 1);
+        ev("pointerup", cx + 120, 0);
+        const xEnd = clip0().transform!.x;
+        assert(Math.abs(xEnd - x0) < 1e-6, `the cancelled drag resumed after theater: x ${xEnd.toFixed(2)}, expected ${x0.toFixed(2)}`);
+        assert(depth() === depth0, `the cancelled drag's pointerup committed (${depth() - depth0} new entr${depth() - depth0 === 1 ? "y" : "ies"})`);
+        return `drag live (x ${x0.toFixed(1)} → ${xLive.toFixed(1)}) → theater: reverted to ${x0.toFixed(1)}, no history entry; after exit a move + pointerup changed nothing`;
+      } finally {
+        if (inTheater()) {
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+          await sleep(40);
+        }
+        // A red run may have left a commit or a live edit: undo exactly what
+        // this block added, then drop the drag and the selection.
+        while (depth() > depth0) session.undo();
+        overlay!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        engine.refresh();
+      }
     });
 
     await test("crop-mode-cycle", async () => {
@@ -2078,7 +2222,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
 
         return `divider hit-topmost; drag→${h1.toFixed(0)}px rendered, canvas store ${cvs!.height}px @dpr ${window.devicePixelRatio}, repainted (diff=${diffAfter}), stored ${TARGET}; clamps ${TIMELINE_HEIGHT_MIN}/${maxExpect}; Escape at ${MID_DRAG}→${beforeEsc.toFixed(0)}px, settings untouched`;
       } finally {
-        // Put the panel and the owner's settings back exactly as they were —
+        // Put the panel and the run's settings back exactly as they were —
         // the inline declaration verbatim, not the height it happened to render.
         panel!.style.height = styleBefore;
         try {
@@ -2293,8 +2437,6 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
 
     // Full-stack export: spec → Rust builder → ffmpeg → probe the output.
     await test("export-e2e", async () => {
-      const { startExport } = await import("../editor/export/export-ipc");
-      const { onJobEvents } = await import("../core/ipc");
       const project = session.project;
       const outPath = `${fixturesDir}\\..\\autotest-export.mp4`;
       const spec = {
@@ -2311,30 +2453,9 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         },
         outPath,
       };
-      const jobId = await startExport(spec);
-      const result = await new Promise<{ ok: boolean; detail: string }>((resolve) => {
-        let un: () => void = () => {};
-        const timer = setTimeout(() => {
-          un();
-          resolve({ ok: false, detail: "export timed out after 60s" });
-        }, 60_000);
-        void onJobEvents({
-          onDone: (e) => {
-            if (e.id !== jobId) return;
-            clearTimeout(timer);
-            un();
-            resolve({ ok: true, detail: String(e.output.path ?? outPath) });
-          },
-          onFailed: (e) => {
-            if (e.id !== jobId) return;
-            clearTimeout(timer);
-            un();
-            resolve({ ok: false, detail: `${e.message} | ${e.logTail.slice(-3).join(" / ")}` });
-          },
-        }).then((u) => (un = u));
-      });
-      assert(result.ok, result.detail);
-      const info = await ipc.probeMedia(result.detail);
+      const result = await runExportJob(spec, 60_000);
+      if (!result.ok) throw new Error(result.detail);
+      const info = await ipc.probeMedia(result.path);
       assert(info.vcodec === "h264", `vcodec=${info.vcodec}`);
       assert(info.width === 640 && info.height === 360, `${info.width}x${info.height}`);
       assert(Math.abs(info.duration - engine.duration()) < 0.6, `duration=${info.duration}`);
@@ -2347,8 +2468,6 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     // Exercises overlay stacking, kf_expr (position + alphamerge), drawtext
     // textfile lifecycle, tail-pad.
     await test("export-v06-layers-keyframes-text", async () => {
-      const { startExport } = await import("../editor/export/export-ipc");
-      const { onJobEvents } = await import("../core/ipc");
       const p = session.project;
       const baseTrack = p.timeline.tracks.find((t) => t.kind === "video")!;
       const baseClip = baseTrack.clips[0];
@@ -2393,85 +2512,17 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
           fps: 30, videoBitrate: "auto" as const, audioBitrate: "auto" as const, useHardware: false },
         outPath,
       };
-      const jobId = await startExport(spec);
-      const result = await new Promise<{ ok: boolean; detail: string }>((resolve) => {
-        let un: () => void = () => {};
-        const timer = setTimeout(() => { un(); resolve({ ok: false, detail: "timeout 60s" }); }, 60_000);
-        void onJobEvents({
-          onDone: (e) => { if (e.id !== jobId) return; clearTimeout(timer); un();
-            resolve({ ok: true, detail: String(e.output.path ?? outPath) }); },
-          onFailed: (e) => { if (e.id !== jobId) return; clearTimeout(timer); un();
-            resolve({ ok: false, detail: `${e.message} | ${e.logTail.slice(-3).join(" / ")}` }); },
-        }).then((u) => (un = u));
-      });
-      assert(result.ok, result.detail);
-      const info = await ipc.probeMedia(result.detail);
+      const result = await runExportJob(spec, 60_000);
+      if (!result.ok) throw new Error(result.detail);
+      const info = await ipc.probeMedia(result.path);
       assert(info.vcodec === "h264", `vcodec=${info.vcodec}`);
       assert(info.width === 640 && info.height === 360, `${info.width}x${info.height}`);
       return `v0.6 layered+keyframed+text export ok: ${info.width}x${info.height} ${info.duration.toFixed(2)}s`;
     });
 
-    // The bug report that started v0.7.3 said "(can't copy-past the log :/)" —
-    // the reporter could SELECT the failed-export log but had no way to extract
-    // it, because the context menu is suppressed outside inputs AND Ctrl+C
-    // resolved to the timeline's copy-clip binding. Asserts real rendered
-    // behavior per AGENTS.md, then the privacy gate on the generated report
-    // (only E2E has real paths to leak).
-    await test("error-report", async () => {
-      const { buildReport } = await import("../core/diagnostics");
-      const openBackdrops = (): number => document.querySelectorAll(".modal-backdrop").length;
-      const before = openBackdrops();
-      try {
-        // Fail fast: an output path in a directory that cannot exist.
-        const { startExport } = await import("../editor/export/export-ipc");
-        const { onJobEvents } = await import("../core/ipc");
-        const bad = `${fixturesDir}\\__nope__\\out.mp4`;
-        const p = session.project;
-        const jobId = await startExport({
-          media: p.media, timeline: p.timeline,
-          preset: { format: "mp4" as const, vcodec: "h264" as const,
-            resolution: { w: 320, h: 180 }, fps: 30, videoBitrate: "auto" as const,
-            audioBitrate: "auto" as const, useHardware: false },
-          outPath: bad,
-        }).catch(() => null);
-        if (jobId !== null) {
-          await new Promise<void>((resolve) => {
-            const t = setTimeout(resolve, 20_000);
-            void onJobEvents({
-              onDone: () => { clearTimeout(t); resolve(); },
-              onFailed: () => { clearTimeout(t); resolve(); },
-            });
-          });
-        }
-
-        // A report must be buildable and must not carry identifying data.
-        const report = buildReport({
-          operation: "Export",
-          project: session.project,
-          error: { code: "ffmpeg", message: "ffmpeg exited with exit code: 1" },
-        } as Parameters<typeof buildReport>[0]);
-        assert(report.length > 0, "report is empty");
-
-        const user = (fixturesDir.match(/^[A-Za-z]:\\Users\\([^\\]+)/) ?? [])[1];
-        if (user) {
-          assert(
-            !report.toLowerCase().includes(user.toLowerCase()),
-            `report leaked the account name "${user}"`,
-          );
-        }
-        assert(!report.includes(fixturesDir), "report leaked the fixtures directory");
-        assert(
-          !/machineId|installId|sessionId/i.test(report),
-          "report must not carry any correlating identifier",
-        );
-        return `report ${report.length} chars, no account name / path / id leaked`;
-      } finally {
-        // Never leak an open dialog into a later block.
-        for (const b of Array.from(document.querySelectorAll(".modal-backdrop")).slice(before)) {
-          b.remove();
-        }
-      }
-    });
+    // "error-report" (the v0.7.3 copy-out regression) lives in autotest-viewer.ts
+    // now: it drives the REAL export dialog to a real ffmpeg failure, which
+    // needs a scratch editor of its own rather than this run's main project.
 
     // LAST block on purpose: it navigates away from the editor, so nothing after
     // it could inherit a different route. Asserts the version is really PAINTED,
@@ -3229,7 +3280,8 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
           cp.querySelector<HTMLElement>(".cp__done")?.click();
           cp.remove();
         }
-        // Never leave the owner's real theme changed by a test run — and nothing
+        // Never leave the run's theme changed by this block (the run has its own
+        // isolated settings, but every later block reads them) — and nothing
         // clamps any more, so a leaked pathological theme would leave the app
         // genuinely unusable. The repaint inside updateSettings is synchronous;
         // the await is only so the restore is the LAST write to settings.json.
@@ -3747,7 +3799,8 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
 
         return `Settings → home → Settings via the real Back and gear: ${afterTrip} (unchanged from ${beforeTrip}); ${seg}; persisted ${disk}; and the guard was proven red on a blanked swatch, a swatch painted from the wrong role, a rewritten caption, and a ring put back inside the chip face`;
       } finally {
-        // Never leave the owner's real theme changed by a test run. Nothing
+        // Never leave the run's theme changed by this block: later blocks read
+        // the same (isolated) settings. Nothing
         // clamps any more, so a leaked theme is a genuinely unusable app. The
         // repaint inside updateSettings is synchronous; the await is only so the
         // restore is the LAST write to settings.json.

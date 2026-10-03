@@ -3,8 +3,10 @@
 // size) and that scaling the picture lives in Export. Apply is one commit of
 // `resizeCanvas`, anchored at the centre rounded to the whole pixel: an even
 // change keeps every layer's offset from the centre, an odd one shifts every
-// layer by −0.5 px on that axis so its edges stay on whole pixels. The shell
-// refits the view when the canvas size changes.
+// layer by half a pixel on that axis so its edges stay on whole pixels (an odd
+// grow adds the extra pixel on the right/bottom, an odd shrink trims it there,
+// so applying a size and then the old one again is an exact round trip). The
+// shell refits the view when the canvas size changes.
 //
 // The app's modal pattern, whole: .modal-backdrop + .modal, trapTab released
 // on EVERY close path, Escape / backdrop / X cancel, focus seated on the

@@ -365,7 +365,8 @@ describe("runCloseFlow", () => {
     await vi.advanceTimersByTimeAsync(3999);
     expect(m.askCloseAnyway).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
-    expect(m.askCloseAnyway).toHaveBeenCalledWith("Your latest changes couldn't be saved.");
+    // Late, not failed: the question says so.
+    expect(m.askCloseAnyway).toHaveBeenCalledWith("Your latest changes are still being saved.");
     expect(await run).toBe("stayed");
     expect(d.destroy).not.toHaveBeenCalled();
   });
@@ -520,7 +521,7 @@ describe("runCloseFlow", () => {
     expect(await first).toBe("stayed");
     expect(second).toBe("stayed");
     expect(acks).toBe(2);
-    expect(m.askCloseAnyway).toHaveBeenCalledWith("Your latest changes couldn't be saved.");
+    expect(m.askCloseAnyway).toHaveBeenCalledWith("Your latest changes are still being saved.");
     expect(d.destroy).not.toHaveBeenCalled();
   });
 
@@ -766,7 +767,10 @@ describe("flushOrAsk", () => {
     quiet.mockRestore();
   });
 
-  it("a save still out at the 4 s cap is asked about", async () => {
+  // A write that is merely LATE (a slow disk, a OneDrive-locked folder, a
+  // large image project) used to be reported as failed — and every leave of a
+  // permanent project now waits for it, so the false alarm was one Back away.
+  it("a save still out at the 4 s cap is asked about as STILL BEING SAVED, not failed", async () => {
     vi.useFakeTimers();
     const s = fakeSession({
       state: "dirty",
@@ -779,7 +783,36 @@ describe("flushOrAsk", () => {
     await vi.advanceTimersByTimeAsync(3999);
     expect(m.askCloseAnyway).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
-    expect(m.askCloseAnyway).toHaveBeenCalledWith("Your latest changes couldn't be saved.", "leave");
+    expect(m.askCloseAnyway).toHaveBeenCalledWith("Your latest changes are still being saved.", "leave");
     expect(await run).toBe(false);
+  });
+
+  // The two failure signals are independent: a save() that rejects while the
+  // state still reads "saving", and a retry that hangs after an earlier write
+  // already left the state at "error". Each alone must say "couldn't".
+  it("a save that REJECTS inside the cap says it couldn't be saved, whatever the state reads", async () => {
+    const ask = vi.fn(async () => false);
+    const s = fakeSession({
+      state: "dirty",
+      save: (b) => {
+        b.state = "saving";
+        return Promise.reject(new Error("Access is denied."));
+      },
+    });
+    expect(await flushOrAsk(s, "leave", ask)).toBe(false);
+    expect(ask).toHaveBeenCalledWith("Your latest changes couldn't be saved.");
+  });
+
+  it("a save still out at the cap after an earlier write FAILED says it couldn't be saved", async () => {
+    vi.useFakeTimers();
+    const ask = vi.fn(async () => true);
+    const s = fakeSession({
+      state: "error",
+      save: () => new Promise<void>(() => {}),
+    });
+    const run = flushOrAsk(s, "close", ask);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(await run).toBe(true);
+    expect(ask).toHaveBeenCalledWith("Your latest changes couldn't be saved.");
   });
 });

@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime};
 use super::image_rules;
 use super::schema::{self, ProjectFile};
 use crate::error::{AppError, Result};
+use crate::media::source::{is_cloud_placeholder, may_touch};
 use crate::paths;
 
 /* ------------------------------------------------------------------ */
@@ -39,14 +40,24 @@ use crate::paths;
 // another, and settings ride along. A lock per path would need an order for
 // taking two of them; one queue has none to get wrong.
 //
+// What the queue guarantees is FIFO among the jobs it holds: a save already
+// queued when a delete of the same file is queued is written first, and the
+// delete then removes it (pinned by
+// `a_save_queued_before_a_delete_cannot_resurrect_the_file`).
+//
 // What it does NOT promise is the arrival order of the invokes themselves.
 // An async command's arguments are parsed, and its job queued, on a tokio
-// task, and two tasks spawned in order may start in either order. Nothing
-// the frontend does depends on it: an autosave coalesces through its own
-// in-flight write, settings writes are chained, and Keep awaits each step.
-// The one unawaited overlap is a discard's delete racing an autosave already
-// out for the same temp file; at worst the save lands second and leaves a
-// temp `.trt` behind, which the startup sweep settles like any other orphan.
+// task, and two tasks spawned in order may start in either order — a save
+// carrying a large project can reach the queue after a delete invoked well
+// after it. Only the frontend can order those, by awaiting one invoke before
+// it sends the next: an autosave coalesces through its own in-flight write,
+// settings writes are chained, Keep awaits each step. Discard is where a miss
+// matters most: a save that reaches the queue after the delete re-creates the
+// temp `.trt` with `tempEdited: true`, and the startup sweep does not delete
+// such a file — it KEEPS it and offers it back on Home, so the project the
+// user discarded would return. Nothing here can tell that late save from a
+// real one: temp names are reused once free (`fresh_untitled_in`), so a
+// remembered "discarded" path would refuse the next session's saves.
 //
 // What stays OFF the worker is what only needs a consistent view, never an
 // order: listing recents (its read holds `RECENTS_LOCK`, and dozens of stats
@@ -871,10 +882,35 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
 /// Compares both size and mtime. `mtime_ms_of` uses the exact derivation from
 /// `probe_sync` (modified() → ms since epoch, u64) so an unchanged file
 /// compares bit-identical; an exact match is correct (no tolerance).
+///
+/// A share off the local network fails it without being looked at
+/// (`media::source::may_touch`): the stat alone would connect to whatever
+/// server a crafted project names, and hand it the user's sign-in.
 fn identity_intact(m: &schema::MediaRef) -> bool {
-    std::fs::metadata(&m.path)
-        .map(|meta| meta.len() == m.size && mtime_ms_of(&meta) == m.mtime_ms)
-        .unwrap_or(false)
+    let path = Path::new(&m.path);
+    may_touch(path)
+        && media_stat(path)
+            .map(|meta| meta.len() == m.size && mtime_ms_of(&meta) == m.mtime_ms)
+            .unwrap_or(false)
+}
+
+/// The stat of a path a `.trt` gave (`identity_intact`, `path_exists_now`).
+/// In the tests it also records every path it was asked about, so a test can
+/// prove a path was never looked at.
+#[cfg(not(test))]
+fn media_stat(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    std::fs::metadata(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static STATTED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn media_stat(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    STATTED.with(|s| s.borrow_mut().push(path.to_path_buf()));
+    std::fs::metadata(path)
 }
 
 /// A media entry whose stored dimensions a fresh probe contradicts by exactly a
@@ -1135,39 +1171,6 @@ fn persist_repair(path: &Path, value: &Value, recovered: bool, read_as: Option<F
             let _ = atomic_write(&path, &bytes);
         }
     });
-}
-
-/// Windows attributes marking a cloud placeholder — a file whose bytes are not
-/// on this machine (OneDrive "online-only", and any sync provider built on the
-/// same Cloud Files API). Reading even a header from one downloads it.
-#[cfg_attr(not(windows), allow(dead_code))]
-const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
-#[cfg_attr(not(windows), allow(dead_code))]
-const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x4_0000;
-#[cfg_attr(not(windows), allow(dead_code))]
-const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
-
-/// Whether a file with these attributes is a cloud placeholder. Pure, so the
-/// three bits are pinned by a test rather than by a OneDrive account.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn is_placeholder_attributes(attributes: u32) -> bool {
-    attributes
-        & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
-        != 0
-}
-
-/// Whether reading `path` would download it. Metadata alone never does, so
-/// this is asked BEFORE anything opens the file. Unreadable metadata counts as
-/// a placeholder: the repair is optional, a surprise download is not.
-#[cfg(windows)]
-fn is_cloud_placeholder(path: &Path) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    std::fs::metadata(path).map_or(true, |m| is_placeholder_attributes(m.file_attributes()))
-}
-
-#[cfg(not(windows))]
-fn is_cloud_placeholder(_path: &Path) -> bool {
-    false
 }
 
 /// Correct the stored size of stills probed before `probe_sync` learned EXIF
@@ -1622,11 +1625,70 @@ fn first_clip_media(typed: &ProjectFile) -> Option<&schema::MediaRef> {
 ///
 /// Queued on the store worker: never on the UI thread, never beside another
 /// write.
+///
+/// The request is `{ path, project }` either way it arrives. As a JSON body,
+/// tauri's ipc handler parses it whole on the WebView's UI thread before this
+/// command exists — for a large image project, a hitch on every autosave. As
+/// RAW bytes (`Uint8Array`, the way `image_save_chunk` sends its chunks) it
+/// is only copied there, and parsed here, on the store worker.
 #[tauri::command]
-pub async fn save_project(app: tauri::AppHandle, path: String, project: Value) -> Result<SavedProject> {
+pub async fn save_project(app: tauri::AppHandle, request: tauri::ipc::Request<'_>) -> Result<SavedProject> {
     use tauri::Manager;
+    let body = save_body(request.body())?;
     let cache = app.try_state::<Arc<crate::cache::Cache>>().map(|c| Arc::clone(&c));
-    on_store(move || save_project_at(cache.as_deref(), path, project)).await
+    on_store(move || {
+        let (path, project) = body.into_parts()?;
+        save_project_at(cache.as_deref(), path, project)
+    })
+    .await
+}
+
+/// A save request as it arrived: already parsed (a JSON body), or the bytes
+/// of one, parsed only on the store worker.
+enum SaveBody {
+    Parsed(String, Value),
+    Raw(Vec<u8>),
+}
+
+#[derive(Deserialize)]
+struct SaveRequest {
+    path: String,
+    project: Value,
+}
+
+/// The most a raw request may hold: the project's own cap, plus room for the
+/// path and the wrapper around it. Refused before it is parsed.
+const MAX_SAVE_REQUEST_BYTES: u64 = image_rules::MAX_TRT_BYTES + 64 * 1024;
+
+fn save_body(body: &tauri::ipc::InvokeBody) -> Result<SaveBody> {
+    save_body_within(body, MAX_SAVE_REQUEST_BYTES)
+}
+
+/// `save_body` against any cap, so a test need not build a 512 MB body.
+fn save_body_within(body: &tauri::ipc::InvokeBody, cap: u64) -> Result<SaveBody> {
+    let bad = |what: &str| AppError::BadInput(format!("invalid save request: {what}"));
+    match body {
+        tauri::ipc::InvokeBody::Json(v) => {
+            let path = v.get("path").and_then(Value::as_str).ok_or_else(|| bad("no path"))?;
+            let project = v.get("project").ok_or_else(|| bad("no project"))?;
+            Ok(SaveBody::Parsed(path.to_owned(), project.clone()))
+        }
+        tauri::ipc::InvokeBody::Raw(bytes) if bytes.len() as u64 > cap => {
+            Err(bad("too large"))
+        }
+        tauri::ipc::InvokeBody::Raw(bytes) => Ok(SaveBody::Raw(bytes.clone())),
+    }
+}
+
+impl SaveBody {
+    fn into_parts(self) -> Result<(String, Value)> {
+        match self {
+            SaveBody::Parsed(path, project) => Ok((path, project)),
+            SaveBody::Raw(bytes) => serde_json::from_slice::<SaveRequest>(&bytes)
+                .map(|r| (r.path, r.project))
+                .map_err(|e| AppError::BadInput(format!("invalid save request: {e}"))),
+        }
+    }
 }
 
 /// The path a project is written to or deleted at, refused unless it is
@@ -1975,7 +2037,18 @@ pub async fn refresh_recent_thumbs(
 /// it is still off the UI thread.
 #[tauri::command]
 pub async fn path_exists(path: String) -> Result<bool> {
-    off_ui(move || Ok(Path::new(&path).exists())).await
+    off_ui(move || Ok(path_exists_now(Path::new(&path)))).await
+}
+
+/// `path_exists`'s body. The editor asks it about media `load_project`
+/// reported missing — paths a `.trt` gave — so a share off the local network
+/// answers "does not exist" without being looked at
+/// (`media::source::may_touch`): the stat alone would connect to whatever
+/// server a crafted project names and hand it the user's sign-in, the very
+/// stat the load's own scan declined to make. `media_stat` is the plain
+/// metadata read `exists()` makes.
+fn path_exists_now(path: &Path) -> bool {
+    may_touch(path) && media_stat(path).is_ok()
 }
 
 /// Whether a project name is in use: by its `.trt`, or by a `.bak` the `.trt`
@@ -2277,12 +2350,141 @@ fn orphan_temp_projects() -> Vec<String> {
 }
 
 /// Edited temporary projects the startup sweep kept — the ones a crash, a
-/// logoff or a forced close orphaned — for Home to offer back. Untouched ones
-/// were deleted, so this is usually empty. A stat per kept project, off the UI
-/// thread.
+/// logoff or a forced close orphaned — for Home to offer back, and the ones a
+/// page reload adopted (`begin_reload_adoption`). Untouched ones were deleted,
+/// so this is usually empty. A stat per kept project, off the UI thread.
 #[tauri::command]
 pub async fn list_orphan_temp_projects() -> Result<Vec<String>> {
-    off_ui(|| Ok(orphan_temp_projects())).await
+    off_ui(|| Ok(orphans_for_home())).await
+}
+
+/// What Home is offered: the orphan list once any page reload's adoption has
+/// landed in it, so a reloaded page never asks between the two.
+fn orphans_for_home() -> Vec<String> {
+    wait_for_reload_adoption(RELOAD_ADOPTION_WAIT);
+    orphan_temp_projects()
+}
+
+/* ------------------------------------------------------------------ */
+/* After a page reload                                                 */
+/* ------------------------------------------------------------------ */
+
+/// How long a caller that must see a reload's adoption waits for it. Judging
+/// is one streamed read per temporary project, normally milliseconds; the
+/// bound is for a folder on a disk that has stopped answering.
+pub(crate) const RELOAD_ADOPTION_WAIT: Duration = Duration::from_secs(5);
+
+/// Reload adoptions begun and not yet finished, and the signal that one
+/// finished.
+struct Adopting {
+    pending: Mutex<usize>,
+    done: std::sync::Condvar,
+}
+
+static ADOPTING: Adopting = Adopting { pending: Mutex::new(0), done: std::sync::Condvar::new() };
+
+/// The temporary projects in the folder when the page died, waiting to be
+/// judged. Begun on the UI thread inside the page-failure handler (one folder
+/// listing, names only); finished on a thread of its own.
+pub(crate) struct ReloadAdoption {
+    candidates: Vec<PathBuf>,
+}
+
+/// The page process died (crash.rs `on_page_exit`) and is about to be
+/// reloaded. The reloaded page boots to Home, and the temporary project that
+/// was open there is in no list Home shows: temp projects never enter
+/// recents, and the orphan list was filled once, by the startup sweep. So its
+/// autosaved edits sat on disk, out of reach until the next launch.
+///
+/// The folder is listed NOW, between the old page's death and the new page's
+/// start, while no page owns a session: everything in it is the dead page's
+/// (or an older orphan). A session the reloaded page opens afterwards is not
+/// in this listing, so it can never be offered back to the user as an orphan.
+/// Nothing is deleted or renamed — the dead page's last writes may still be
+/// landing on the store worker, and the next startup sweep settles the rest.
+///
+/// Until [`ReloadAdoption::finish`] runs, `list_orphan_temp_projects` (and
+/// crash.rs's note handover) wait for it, up to [`RELOAD_ADOPTION_WAIT`].
+pub(crate) fn begin_reload_adoption() -> ReloadAdoption {
+    let candidates = paths::temp_projects_dir().map(|dir| temp_project_candidates(&dir)).unwrap_or_default();
+    *ADOPTING.pending.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    ReloadAdoption { candidates }
+}
+
+impl ReloadAdoption {
+    /// Judge the listed projects with the startup sweep's own rule
+    /// (`kept_as_orphan`) and add each edited one to the orphan list Home
+    /// reads. `before_release` is handed whether any project was newly
+    /// adopted and runs BEFORE the waiters are released, so whatever it
+    /// records (crash.rs's page note) is in place when they look.
+    pub(crate) fn finish(self, before_release: impl FnOnce(bool)) {
+        let adopted = adopt_orphans(&self.candidates, SystemTime::now());
+        before_release(adopted);
+        let mut pending = ADOPTING.pending.lock().unwrap_or_else(|e| e.into_inner());
+        *pending = pending.saturating_sub(1);
+        ADOPTING.done.notify_all();
+    }
+}
+
+/// Wait until no reload adoption is pending, or `limit` has passed.
+pub(crate) fn wait_for_reload_adoption(limit: Duration) {
+    let pending = ADOPTING.pending.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = ADOPTING.done.wait_timeout_while(pending, limit, |p| *p > 0);
+}
+
+/// The temporary projects in `dir`, by their `.trt` path (a `.bak` with no
+/// `.trt` stands for its project, as in `sweep_temp_dir`). Names only.
+fn temp_project_candidates(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let has_suffix = |name: &str, suffix: &str| {
+        name.len() >= suffix.len() && name.as_bytes()[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_owned();
+            if has_suffix(&name, ".trt") {
+                Some(e.path())
+            } else if has_suffix(&name, ".trt.bak") {
+                Some(e.path().with_file_name(&name[..name.len() - 4]))
+            } else {
+                None
+            }
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether the startup sweep would keep the temporary project at `primary`:
+/// `sweep_temp_dir`'s rule, torn-primary deferral included, with nothing
+/// deleted.
+fn kept_as_orphan(primary: &Path, now: SystemTime) -> bool {
+    let bak = bak_path(primary);
+    let has_primary = primary.is_file();
+    match orphan_fate(if has_primary { primary } else { &bak }, now) {
+        OrphanFate::Keep => true,
+        OrphanFate::Unparseable if has_primary && bak.is_file() => orphan_fate(&bak, now) == OrphanFate::Keep,
+        _ => false,
+    }
+}
+
+/// Add every kept one of `candidates` to the orphan list; whether any was new.
+fn adopt_orphans(candidates: &[PathBuf], now: SystemTime) -> bool {
+    let kept: Vec<&PathBuf> = candidates.iter().filter(|p| kept_as_orphan(p, now)).collect();
+    let mut list = KEPT_ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut adopted = false;
+    for p in kept {
+        if !list.contains(p) {
+            list.push(p.clone());
+            adopted = true;
+        }
+    }
+    adopted
 }
 
 /// Whether two paths name the same file on disk.
@@ -2655,6 +2857,8 @@ pub fn sanitize_filename(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::media::source::FILE_ATTRIBUTE_OFFLINE;
 
     #[test]
     fn sanitizes_filenames() {
@@ -2839,6 +3043,104 @@ mod tests {
             let proj = dir.join("Scan.trt");
             assert_eq!(missing_for(&proj, &media_file, size, stale_mtime), vec!["m1"]);
         });
+    }
+
+    /// Opening a crafted project never stats a share off the local network:
+    /// its media is reported missing without being looked at, while a local
+    /// file beside it IS looked at (so the row cannot pass by nothing being
+    /// stat-ed at all). The server is this machine behind `@SSL`, so even a
+    /// regression that did stat it would reach no further than localhost.
+    #[cfg(windows)]
+    #[test]
+    fn opening_a_project_never_stats_a_share_off_the_local_network() {
+        with_isolated("scan-unc", |dir| {
+            let media_file = dir.join("v.bin");
+            std::fs::write(&media_file, b"0123456789").unwrap();
+            let size = std::fs::metadata(&media_file).unwrap().len();
+            let mtime = disk_mtime_ms(&media_file);
+            let remote = r"\\127.0.0.1@SSL\share\clip.mp4";
+            let proj = dir.join("Remote.trt");
+            write_json(
+                &proj,
+                &serde_json::json!({
+                    "schema": 1, "app": "taroting", "id": "p1", "name": "Remote",
+                    "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+                    "media": [
+                        { "id": "m1", "path": media_file.to_string_lossy(), "size": size,
+                          "mtimeMs": mtime, "kind": "video", "duration": 1.0, "hasAudio": false },
+                        { "id": "m2", "path": remote, "size": 10,
+                          "mtimeMs": mtime, "kind": "video", "duration": 1.0, "hasAudio": false }
+                    ],
+                    "timeline": {
+                        "fps": {"num": 30, "den": 1}, "width": 640, "height": 360,
+                        "tracks": [{ "id": "t1", "kind": "video", "name": "V1",
+                                     "muted": false, "clips": [] }]
+                    },
+                    "export": {}
+                }),
+            );
+            STATTED.with(|s| s.borrow_mut().clear());
+            let loaded = load_project(proj.to_string_lossy().into_owned()).unwrap();
+            let statted = STATTED.with(|s| s.borrow().clone());
+            assert_eq!(loaded.missing, vec!["m2"]);
+            assert!(statted.contains(&media_file), "fixture: the local file is looked at");
+            assert!(!statted.contains(&PathBuf::from(remote)), "the remote share was stat-ed");
+        });
+    }
+
+    /// The editor's re-check of a missing media file (`path_exists`) declines
+    /// the same share the load declined: it answers "does not exist" without
+    /// a stat, while a local file beside it IS stat-ed and found (so the row
+    /// cannot pass by nothing being looked at). Called through the body, on
+    /// this thread, because the stat log is per thread.
+    #[cfg(windows)]
+    #[test]
+    fn checking_a_path_never_stats_a_share_off_the_local_network() {
+        with_isolated("exists-unc", |dir| {
+            let local = dir.join("v.bin");
+            std::fs::write(&local, b"0123456789").unwrap();
+            let remote = r"\\127.0.0.1@SSL\share\clip.mp4";
+            // The same share spelled so a UNC-prefix check cannot see its
+            // server: through the device namespace, and as the NT object path
+            // (no Rust prefix at all). The gate fails closed on both.
+            let hidden = [r"\\.\UNC\127.0.0.1@SSL\share\clip.mp4", r"\??\UNC\127.0.0.1@SSL\share\clip.mp4"];
+            STATTED.with(|s| s.borrow_mut().clear());
+            assert!(path_exists_now(&local), "fixture: a local file exists");
+            assert!(!path_exists_now(Path::new(remote)), "a refused share reads as missing");
+            for h in hidden {
+                assert!(!path_exists_now(Path::new(h)), "a disguised share reads as missing: {h}");
+            }
+            assert!(!path_exists_now(&dir.join("gone.mp4")), "a missing local file reads as missing");
+            let statted = STATTED.with(|s| s.borrow().clone());
+            assert!(statted.contains(&local), "fixture: the local file is looked at");
+            assert!(!statted.contains(&PathBuf::from(remote)), "the remote share was stat-ed");
+            for h in hidden {
+                assert!(!statted.contains(&PathBuf::from(h)), "the disguised share was stat-ed: {h}");
+            }
+        });
+    }
+
+    /// A save arrives as a JSON body (parsed by tauri) or as raw bytes
+    /// (parsed on the store worker); both give the same path and project, and
+    /// a raw body that is not a save request, or is past the cap, is refused.
+    #[test]
+    fn a_save_request_reads_the_same_as_json_or_as_raw_bytes() {
+        use tauri::ipc::InvokeBody;
+        let project = serde_json::json!({ "schema": 2, "name": "Café" });
+        let request = serde_json::json!({ "path": r"C:\Projects\Café.trt", "project": project });
+        let parsed = save_body(&InvokeBody::Json(request.clone())).unwrap().into_parts().unwrap();
+        let raw = save_body(&InvokeBody::Raw(serde_json::to_vec(&request).unwrap())).unwrap().into_parts().unwrap();
+        assert_eq!(parsed, (r"C:\Projects\Café.trt".to_owned(), project.clone()));
+        assert_eq!(raw, parsed);
+
+        assert!(save_body(&InvokeBody::Json(serde_json::json!({ "project": project }))).is_err(), "no path");
+        let garbage = save_body(&InvokeBody::Raw(b"{\"path\": 7}".to_vec())).unwrap().into_parts();
+        assert!(matches!(garbage, Err(AppError::BadInput(_))), "{garbage:?}");
+        let body = serde_json::to_vec(&request).unwrap();
+        let cap = body.len() as u64;
+        assert!(save_body_within(&InvokeBody::Raw(body.clone()), cap).is_ok(), "at the cap");
+        let past = save_body_within(&InvokeBody::Raw([body, b" ".to_vec()].concat()), cap);
+        assert!(matches!(past, Err(AppError::BadInput(_))), "one byte past the cap");
     }
 
     #[test]
@@ -4594,6 +4896,51 @@ mod tests {
         std::fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
     }
 
+    /// A page reload adopts the temporary projects that were in the folder
+    /// when the page died: the edited one is offered back on Home at once
+    /// (before, only the next launch's sweep found it), the untouched one is
+    /// not offered and NOT deleted (the dead page's writes may still be
+    /// landing), and a session the reloaded page opens afterwards — after the
+    /// listing — is never offered, edited or not. A waiter for the list is
+    /// released only when the adoption is finished, and what `finish`
+    /// records first is visible to it.
+    #[test]
+    fn a_page_reload_offers_back_the_temp_project_that_was_open() {
+        with_isolated("temp-reload", |_dir| {
+            let tmp = paths::temp_projects_dir().unwrap();
+            paths::ensure_dir(&tmp).unwrap();
+            cleanup_temp_projects();
+            assert!(orphan_temp_projects().is_empty(), "fixture: nothing kept at startup");
+            let put = |file: &str, v: &Value| write_json(&tmp.join(file), v);
+            put("Open.trt", &temp_project("Open", Some(Value::Bool(true))));
+            put("Untouched.trt", &temp_project("Untouched", None));
+
+            let adoption = begin_reload_adoption();
+            // The reloaded page opens a session of its own and edits it.
+            put("New session.trt", &temp_project("New session", Some(Value::Bool(true))));
+            let waiter = std::thread::spawn(orphans_for_home);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!waiter.is_finished(), "the list did not wait for the adoption");
+            let adopted = std::sync::atomic::AtomicBool::new(false);
+            adoption.finish(|a| adopted.store(a, std::sync::atomic::Ordering::SeqCst));
+            assert!(adopted.load(std::sync::atomic::Ordering::SeqCst), "the open project was newly adopted");
+
+            let open = tmp.join("Open.trt").to_string_lossy().into_owned();
+            assert_eq!(waiter.join().unwrap(), vec![open.clone()]);
+            assert_eq!(orphan_temp_projects(), vec![open]);
+            assert!(tmp.join("Untouched.trt").exists(), "an adoption never deletes");
+
+            // The reloaded page dies too: its session is adopted now, and the
+            // project already offered is not listed twice.
+            begin_reload_adoption().finish(|_| {});
+            let mut offered = orphan_temp_projects();
+            offered.sort();
+            let want: Vec<String> =
+                ["New session.trt", "Open.trt"].iter().map(|n| tmp.join(n).to_string_lossy().into_owned()).collect();
+            assert_eq!(offered, want);
+        });
+    }
+
     /// The startup sweep (owner's ruling): an EDITED temporary project a crash
     /// orphaned is kept and offered back unless it is over 30 days old; an
     /// untouched one is deleted, as is every leftover (`.tmp`, `.part`, any
@@ -5405,19 +5752,6 @@ mod tests {
         });
     }
 
-    /// The three bits that mean "the bytes are in the cloud", and neighbours
-    /// that do not: ARCHIVE and NORMAL are on every ordinary file, PINNED and
-    /// UNPINNED describe a sync policy, not where the bytes are.
-    #[test]
-    fn only_offline_and_recall_bits_mark_a_placeholder() {
-        for local in [0u32, 0x20, 0x80, 0x2000, 0x8_0000, 0x10_0000, 0x20 | 0x10_0000] {
-            assert!(!is_placeholder_attributes(local), "{local:#x}");
-        }
-        for cloud in [0x1000u32, 0x4_0000, 0x40_0000, 0x20 | 0x40_0000, 0x10_0000 | 0x40_0000 | 0x1000] {
-            assert!(is_placeholder_attributes(cloud), "{cloud:#x}");
-        }
-    }
-
     /// `RecentItem.kind` is "image" or absent, and nothing else a recents index
     /// holds there may cost the index its parse (the whole home screen reads
     /// from it). A video entry writes no `kind` key, so an index this build
@@ -6026,6 +6360,57 @@ mod tests {
         assert_eq!(nested, 7);
         let from_async = tauri::async_runtime::block_on(on_store(|| on_store_blocking(|| 8)));
         assert_eq!(from_async.unwrap(), 8);
+    }
+
+    /// The queue's one ordering promise (see the worker's comment): a save
+    /// queued before a delete of the same file is written first, so the
+    /// delete removes it — the save cannot land afterwards and bring a
+    /// discarded project back. The worker is held while both are queued, so
+    /// the save is still waiting when the delete joins the queue; both
+    /// commands route through the queue, pinned in the source (a delete run
+    /// beside the queue would remove nothing and the save would then write).
+    #[test]
+    fn a_save_queued_before_a_delete_cannot_resurrect_the_file() {
+        with_isolated("store-fifo", |dir| {
+            let target = dir.join("Discarded.trt");
+            atomic_write(&target, &serde_json::to_vec(&minimal_project("Discarded")).unwrap()).unwrap();
+            let (release, hold) = mpsc::channel::<()>();
+            let (held_tx, held) = mpsc::channel::<()>();
+            submit_to_store(Box::new(move || {
+                let _ = held_tx.send(());
+                let _ = hold.recv();
+            }));
+            held.recv().unwrap();
+            let (saved_tx, saved) = mpsc::channel();
+            let (path, project) = (target.to_string_lossy().into_owned(), minimal_project("Late save"));
+            submit_to_store(Box::new(move || {
+                let _ = saved_tx.send(save_project_at(None, path, project).map(|_| ()));
+            }));
+            let (deleted_tx, deleted) = mpsc::channel();
+            let path = target.to_string_lossy().into_owned();
+            submit_to_store(Box::new(move || {
+                let _ = deleted_tx.send(delete_project_now(&path));
+            }));
+            release.send(()).unwrap();
+            saved.recv().unwrap().expect("the save is written");
+            deleted.recv().unwrap().expect("the delete runs");
+            assert!(!target.exists(), "the save landed after the delete");
+            assert!(!bak_path(&target).exists() && !tmp_path(&target).exists());
+        });
+        // Only the code before the test module: the needles appear here too.
+        let source = include_str!("store.rs");
+        let code: String = source[..source.find("#[cfg(test)]\nmod tests").or_else(|| source.find("#[cfg(test)]\r\nmod tests")).expect("the test module")]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let delete = &code[code.find("pubasyncfndelete_project(").expect("delete_project")..];
+        let head = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+        assert!(head(delete, 120).contains("{on_store(move||delete_project_now(&path)).await}"), "delete_project is queued");
+        let save = &code[code.find("pubasyncfnsave_project(").expect("save_project")..];
+        assert!(
+            head(save, 400).contains("on_store(move||{let(path,project)=body.into_parts()?;save_project_at("),
+            "save_project is queued"
+        );
     }
 
     /* -------------------- load-time repairs ---------------------------- */

@@ -792,7 +792,14 @@ export function mountLayersPanel(host: HTMLElement, ctx: ImageEditorCtx): { disp
       (t.closest("button") as HTMLButtonElement | null)?.blur();
     } else if (t.closest(".imged-layer__more")) {
       e.stopPropagation();
-      const b = (t.closest("button") as HTMLButtonElement).getBoundingClientRect();
+      const btn = t.closest("button") as HTMLButtonElement;
+      // A pointer open blurs FIRST, as the Canvas menu button does: the menu
+      // hands focus back to whatever was focused when it opened, and the view
+      // yields Space to a focused button, so after a mouse pick the next hold
+      // to pan would reopen this menu instead. A keyboard activation (detail
+      // 0) keeps the button as the place Escape returns to.
+      if (e.detail > 0) btn.blur();
+      const b = btn.getBoundingClientRect();
       openRowMenu(id, b.left, b.bottom + 4);
     }
   }

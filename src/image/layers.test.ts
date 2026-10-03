@@ -404,7 +404,7 @@ describe("whole-image operations", () => {
 
   it("resizeCanvas anchors at the centre, to the whole pixel, and keeps any integer side", () => {
     const { p, photoId } = posed();
-    // 641 → 1000 is an ODD change (359): the old picture lands floor(359/2) =
+    // 641 → 1000 is an ODD change (359): the old picture lands trunc(359/2) =
     // 179 px in, so every layer shifts −0.5 against the new centre. 361 → 99
     // is even (−262): no shift.
     const r = resizeCanvas(p, 1000.4, 99);
@@ -504,13 +504,52 @@ describe("whole pixels at 100% (a soft export otherwise)", () => {
     const a = addPhotoLayer(p, photo(200, 100));
     p = setLayerTransform(a.project, a.trackId, { x: 37.5, y: -18.5 }); // moved, still whole
     whole(p, a.trackId);
-    for (const [w, h] of [[W + 3, H - 7], [W - 1, H + 1], [W + 2, H + 5]] as const) {
+    // Each row: the size, and where the old picture's top-left lands in the
+    // new canvas — half the change rounded toward zero (an odd grow adds its
+    // pixel on the right/bottom, an odd shrink trims it from there).
+    const rows = [
+      [W + 3, H - 7, 1, -3],
+      [W - 1, H + 1, 0, 0],
+      [W + 2, H + 5, 1, 2],
+    ] as const;
+    for (const [w, h, dx, dy] of rows) {
       const r = resizeCanvas(p, w, h);
       whole(r, a.trackId);
-      // The picture stays exactly where the whole-pixel anchor puts it.
       const [e0, f0] = origin(p, a.trackId);
       const [e1, f1] = origin(r, a.trackId);
-      expect([e1 - e0, f1 - f0]).toEqual([Math.floor((w - W) / 2), Math.floor((h - H) / 2)]);
+      expect([e1 - e0, f1 - f0]).toEqual([dx, dy]);
+    }
+  });
+
+  it("a resize and its reverse are an exact round trip, and an odd shrink trims the right/bottom", () => {
+    // A: moved off centre, on whole pixels. B: flush with the top-left corner
+    // (201×100 at x −220, y −130.5 on 641×361 → top-left at 0,0), the layer
+    // that would lose its first column and row to a left/top trim.
+    let p = blank();
+    const a = addPhotoLayer(p, photo(200, 100));
+    p = setLayerTransform(a.project, a.trackId, { x: 37.5, y: -18.5 });
+    const b = addPhotoLayer(p, photo(201, 100));
+    p = setLayerTransform(b.project, b.trackId, { x: -220, y: -130.5 });
+    expect(origin(p, b.trackId)).toEqual([0, 0]);
+    const pose = (q: ProjectFile, id: string): number[] => {
+      const t = transformOf(q, id);
+      return [t.x, t.y, ...origin(q, id)];
+    };
+    // Each row: the size, and B's top-left there. A 1 px shrink comes off the
+    // right/bottom, so B keeps its first column and row; a 5 px one takes 2
+    // from the top and 3 from the bottom.
+    const rows = [
+      [W + 1, H + 1, 0, 0],
+      [W - 1, H - 1, 0, 0],
+      [W + 3, H - 5, 1, -2],
+    ] as const;
+    for (const [w, h, bx, by] of rows) {
+      const there = resizeCanvas(p, w, h);
+      expect(origin(there, b.trackId)).toEqual([bx, by]);
+      const back = resizeCanvas(there, W, H);
+      expect([back.timeline.width, back.timeline.height]).toEqual([W, H]);
+      expect(pose(back, a.trackId)).toEqual(pose(p, a.trackId));
+      expect(pose(back, b.trackId)).toEqual(pose(p, b.trackId));
     }
   });
 });

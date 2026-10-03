@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { CRASH_TITLES, ENGINE_FAILED_AT_STARTUP, ENGINE_NOT_RESTARTED, crashTitle, showCrashNotes, type CrashNoteSink } from "./crash-notes";
+import {
+  CRASH_TITLES,
+  ENGINE_FAILED_AT_STARTUP,
+  ENGINE_NOT_RESTARTED,
+  PAGE_NOT_RELOADED,
+  PAGE_TEMP_KEPT,
+  crashTitle,
+  showCrashNotes,
+  type CrashNoteSink,
+} from "./crash-notes";
 import type { CrashNote } from "./ipc";
 import type { ToastOptions } from "../ui/toast";
 
@@ -124,8 +133,58 @@ describe("showCrashNotes", () => {
     expect(crashTitle("constructor")).toBe(CRASH_TITLES.panic);
   });
 
+  // A page reload in the same run used to leave the temporary project that
+  // was open in no list at all until the next launch, with a title that only
+  // said edits may be lost. The backend's line says it was kept; the title
+  // then says where to find it.
+  it("tells where an open temporary project went when the page note says it was kept", () => {
+    const kept: CrashNote = { ...PAGE, detail: `${PAGE.detail}
+temporary project: kept` };
+    const { sink, calls } = recorder();
+    showCrashNotes([kept, PAGE], sink);
+    expect(calls.map((c) => c.message)).toEqual([PAGE_TEMP_KEPT, CRASH_TITLES.page]);
+    expect(PAGE_TEMP_KEPT).toContain("recovered from Home");
+    // Only a page note reads the line: an engine note quoting it is still an engine note.
+    expect(crashTitle("engine", "temporary project: kept")).toBe(CRASH_TITLES.engine);
+  });
+
+  it("says the page was not reloaded when the page note refused the reload", () => {
+    const refused: CrashNote = { ...PAGE, detail: `${PAGE.detail}
+reloaded: no (the page had stopped too often)
+temporary project: kept` };
+    expect(crashTitle(refused.kind, refused.detail)).toBe(PAGE_NOT_RELOADED);
+    expect(crashTitle("page", "reloaded: yes")).toBe(CRASH_TITLES.page);
+    expect(crashTitle("panic", "reloaded: no")).toBe(CRASH_TITLES.panic);
+  });
+
+  it("says a run that left no note ended without one, not that it crashed with one", () => {
+    // The exact lines crash.rs `exit_note_text` writes at the next launch
+    // when the previous run's running marker was still there: no time of its
+    // own, a started stamp and a noticed stamp.
+    const exit: CrashNote = {
+      kind: "exit",
+      at: null,
+      detail:
+        "Taroting 0.9.1\ntime: unknown\nkind: exit\nprocess: app\n" +
+        "reason: ended without an error report (out of memory, or stopped from outside)\n" +
+        "started: 2026-10-02T18:30:05Z\nnoticed: 2026-10-03T07:14:51Z\n",
+    };
+    const { sink, calls } = recorder();
+    showCrashNotes([exit, PANIC], sink);
+    expect(calls.map((c) => c.message)).toEqual([CRASH_TITLES.exit, CRASH_TITLES.panic]);
+    expect(CRASH_TITLES.exit).not.toBe(CRASH_TITLES.panic);
+    expect(CRASH_TITLES.exit).toContain("without leaving an error report");
+    expect(calls[0]?.opts?.detail).toBe(exit.detail);
+  });
+
   it("titles are sentence case with no trailing ellipsis", () => {
-    for (const t of [...Object.values(CRASH_TITLES), ENGINE_NOT_RESTARTED, ENGINE_FAILED_AT_STARTUP]) {
+    for (const t of [
+      ...Object.values(CRASH_TITLES),
+      ENGINE_NOT_RESTARTED,
+      ENGINE_FAILED_AT_STARTUP,
+      PAGE_TEMP_KEPT,
+      PAGE_NOT_RELOADED,
+    ]) {
       expect(t[0]).toBe(t[0]!.toUpperCase());
       expect(t.endsWith("…") || t.endsWith("...")).toBe(false);
     }

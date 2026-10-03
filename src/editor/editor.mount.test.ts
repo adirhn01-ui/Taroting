@@ -138,9 +138,12 @@ vi.mock("../ui/temp-project", () => ({
 vi.mock("./export/export-dialog", () => ({ openExportDialog: () => () => {} }));
 vi.mock("./media/generators", () => ({ openGeneratorDialog: () => () => {} }));
 vi.mock("./media/relink", () => ({ openRelinkDialog: () => () => {} }));
-vi.mock("./media/media", async () => {
+vi.mock("./media/media", async (importOriginal) => {
   const { Store } = await import("../core/store");
+  // The real rule, so the dispose tests below exercise what ships.
+  const { abandonsPlayback } = await importOriginal<typeof import("./media/media")>();
   return {
+    abandonsPlayback,
     MediaManager: class {
       status = new Store<Record<string, unknown>>({});
       thumbs = new Store<Record<string, string>>({});
@@ -890,16 +893,34 @@ describe("a mount that throws halfway", () => {
 });
 
 describe("dispose and the shared teardown", () => {
-  it("cancels playback jobs only for a discarded project", async () => {
+  it("abandons playback jobs only for a discarded project", async () => {
     const kept = await mount();
     await kept.handle.dispose();
-    expect(m.mediaDispose).toEqual([{ cancelPlayback: false }]);
+    expect(m.mediaDispose).toEqual([{ abandonPlayback: false }]);
 
     m.mediaDispose = [];
     const thrown = await mount();
     thrown.session.discard();
     await thrown.handle.dispose();
-    expect(m.mediaDispose).toEqual([{ cancelPlayback: true }]);
+    expect(m.mediaDispose).toEqual([{ abandonPlayback: true }]);
+  });
+
+  it("leaves them to the viewer when a discarded project goes back to it", async () => {
+    // Viewer → Edit → Back without an edit: the temporary project is discarded
+    // without a question, and the viewer shows the same file again on the job
+    // it handed over. It cannot claim an abandoned job, so abandoning it here
+    // restarted the transcode from 0% on every Edit → Back round trip.
+    m.loaded = { project: fixture().project, missing: [], recovered: false };
+    const handle = await mountEditor(
+      new FakeEl() as unknown as HTMLElement,
+      { view: "editor", projectPath: "C:/p/shell.trt", temp: true, returnTo: "D:\\clips\\hevc.mov" },
+      () => false,
+    );
+    handles.push(handle);
+    await flush();
+    currentSession.get()!.discard();
+    await handle.dispose();
+    expect(m.mediaDispose).toEqual([{ abandonPlayback: false }]);
   });
 
   it("takes every piece down once, newest first, and releases the session", async () => {

@@ -489,6 +489,31 @@ describe("Uninstall", () => {
     expect(confirm.disabled).toBe(true);
   });
 
+  it("cannot be left or reopened while a confirmed uninstall is under way", async () => {
+    mount();
+    await flush();
+    q("#settings-uninstall").click();
+    const dialog = backdrops()[0]!;
+    dialog.querySelector("[data-confirm]")!.click();
+    // Every way out of the dialog is inert until the backend answers: on
+    // success the app exits, and a fresh dialog's Confirm would start a
+    // second uninstaller in the meantime.
+    pressKey("Escape");
+    dialog.fire("mousedown", { target: dialog });
+    dialog.querySelector("[data-cancel]")!.fire("click");
+    expect(backdrops()).toEqual([dialog]);
+    expect(dialog.querySelector("[data-cancel]")!.disabled).toBe(true);
+    q("#settings-uninstall").click();
+    expect(backdrops()).toEqual([dialog]);
+    expect(m.uninstall).toHaveLength(1);
+    // A failure lets go: the dialog closes and a retry can open it again.
+    m.uninstall[0]!.reject({ code: "bad_input", message: "uninstall task failed: panicked" });
+    await flush();
+    expect(backdrops()).toHaveLength(0);
+    q("#settings-uninstall").click();
+    expect(backdrops()).toHaveLength(1);
+  });
+
   it("Escape closes it and hands focus back to the Uninstall button", async () => {
     mount();
     await flush();

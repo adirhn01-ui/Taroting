@@ -35,6 +35,8 @@ const h = vi.hoisted(() => ({
   viewOpts: null as null | { panThroughBlock?: () => boolean },
   /** the drop handlers the shell registered */
   drop: null as null | { onDrop(paths: string[]): void },
+  /** each Canvas menu open: was its button still focused, and from the keyboard? */
+  menuOpens: [] as { buttonFocused: boolean; fromKeyboard: boolean }[],
 }));
 
 vi.mock("../ui/toast", () => ({
@@ -88,7 +90,15 @@ vi.mock("./export-dialog", () => ({
     h.exports++;
   },
 }));
-vi.mock("./image-menu", () => ({ openImageMenu: () => {} }));
+// What the real menu reads at open time: the focused element, which it hands
+// focus back to on close.
+vi.mock("./image-menu", () => ({
+  openImageMenu: (anchor: unknown, _ctx: unknown, fromKeyboard: boolean) =>
+    void h.menuOpens.push({
+      buttonFocused: (document as unknown as { activeElement: unknown }).activeElement === anchor,
+      fromKeyboard,
+    }),
+}));
 vi.mock("./crop-image", () => ({ cancelImageCrop: () => {} }));
 vi.mock("./layers-panel", () => ({
   mountLayersPanel: (_el: unknown, ctx: Record<string, unknown>) => {
@@ -307,6 +317,7 @@ beforeEach(() => {
   h.recents = [];
   h.viewOpts = null;
   h.drop = null;
+  h.menuOpens.length = 0;
   modal = false;
   win = Object.assign(new Target(), {
     requestAnimationFrame: () => 1,
@@ -552,6 +563,45 @@ describe("the view's keyboard-hold pass-through", () => {
   });
 });
 
+/* ---------------- ts-image-1: the Canvas menu button and Space ---------------- */
+
+describe("the Canvas menu button", () => {
+  /** The button, with focus and blur tracked on the fake document. */
+  function focusable(btn: El): void {
+    const doc = document as unknown as { activeElement: unknown };
+    btn.focus = () => {
+      doc.activeElement = btn;
+    };
+    btn.blur = () => {
+      if (doc.activeElement === btn) doc.activeElement = null;
+    };
+  }
+
+  it("a pointer open is not recorded with the button focused, so a pick cannot hand focus back to it", async () => {
+    const m = await mount(withPhotos("C:/p/harbour.jpg"));
+    const btn = m.$("#imged-menu");
+    focusable(btn);
+    // Chromium focuses a button on mousedown; the click follows with detail 1.
+    btn.focus();
+    btn.fire("click", { detail: 1 });
+    expect(h.menuOpens).toEqual([{ buttonFocused: false, fromKeyboard: false }]);
+    expect((document as unknown as { activeElement: unknown }).activeElement).not.toBe(btn);
+    await m.handle.dispose();
+  });
+
+  it("control: a keyboard open keeps the button as the opener and starts on the first row", async () => {
+    const m = await mount(withPhotos("C:/p/harbour.jpg"));
+    const btn = m.$("#imged-menu");
+    focusable(btn);
+    btn.focus();
+    btn.fire("click", { detail: 0 });
+    expect(h.menuOpens).toEqual([{ buttonFocused: true, fromKeyboard: true }]);
+    // Blurred after the open, all the same.
+    expect((document as unknown as { activeElement: unknown }).activeElement).not.toBe(btn);
+    await m.handle.dispose();
+  });
+});
+
 /* ---------------- toast.refuse: a refused file is not a failure ---------------- */
 
 describe("a dropped file that is not an image", () => {
@@ -609,6 +659,41 @@ describe("the Home card rendered on leave", () => {
     h.saves[0]!.resolve();
     await left;
     expect(h.saves).toHaveLength(1);
+  });
+
+  it("does not hold the screen's published session while the card renders", async () => {
+    // A permanent project's leave navigates only while `currentSession` is
+    // still the screen it was asked from (ui/temp-project leavePermanent). The
+    // card render can hold dispose for up to THUMB_CAP_MS; a session still
+    // published through it let a late leave save navigate Home over the file
+    // an Explorer open had just shown.
+    const m = await mount(withPhotos("C:/p/harbour.jpg"));
+    const session = currentSession.get();
+    expect(session).not.toBe(null);
+    m.ctx.session.commit((d) => ({ ...d, image: { ...d.image! } }));
+    await flush();
+    const left = m.handle.dispose();
+    // Synchronously, before the render has even been asked for.
+    expect(currentSession.get()).toBe(null);
+    await flush();
+    // The render is out and the session's final save has not run: the window
+    // the leave guard has to see through.
+    expect(h.thumbs).toHaveLength(1);
+    expect(h.sessions[0]!.disposed).toBe(0);
+    expect(currentSession.get()).toBe(null);
+    h.thumbs[0]!.resolve(new Blob([new Uint8Array(3)], { type: "image/jpeg" }));
+    await flush();
+    h.saves[0]!.resolve();
+    await left;
+    expect(h.sessions[0]!.disposed).toBe(1);
+  });
+
+  it("leaves a newer screen's published session alone", async () => {
+    const m = await mount(withPhotos("C:/p/harbour.jpg"));
+    const newer = { path: "C:/p/next.trt" } as unknown as Parameters<typeof currentSession.set>[0];
+    currentSession.set(newer);
+    await leave(m);
+    expect(currentSession.get()).toBe(newer);
   });
 });
 

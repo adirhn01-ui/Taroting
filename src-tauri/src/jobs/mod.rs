@@ -74,11 +74,22 @@ impl JobHandle {
     pub fn clear_output(&self) {
         *self.output.lock().unwrap() = None;
     }
-    fn attach_child(&self, child: Child) {
+    /// Make `child` the process `Jobs::cancel` kills. Anything that runs its
+    /// own ffmpeg on a lane (not through `execute_ffmpeg`) must attach it, or
+    /// a cancel only sets a flag that a blocked read never gets to see.
+    pub(crate) fn attach_child(&self, child: Child) {
         *self.child.lock().unwrap() = Some(child);
     }
-    fn take_child(&self) -> Option<Child> {
+    /// The attached child, taken back: `None` once a cancel has taken it.
+    pub(crate) fn take_child(&self) -> Option<Child> {
         self.child.lock().unwrap().take()
+    }
+    /// Kill and reap the attached child, if a cancel has not already.
+    pub(crate) fn kill_child(&self) {
+        if let Some(mut c) = self.take_child() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
     fn cleanup_output(&self) {
         if let Some(path) = self.output.lock().unwrap().take() {

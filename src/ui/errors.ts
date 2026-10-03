@@ -245,6 +245,20 @@ export function closeErrorDialogs(): void {
 }
 
 /**
+ * Put a dialog that is not an error dialog on the same floor: `close` runs on
+ * the router's next screen change, unless the returned release ran first. For
+ * a question that only means something while its screen is up (the "Leave this
+ * project?" prompt, core/app-close `flushOrAsk`). `close` must be idempotent
+ * and should call the release itself, as every closer here does.
+ */
+export function closeWithScreen(close: () => void): () => void {
+  openDialogs.add(close);
+  return () => {
+    openDialogs.delete(close);
+  };
+}
+
+/**
  * A modal showing one message plus a copyable detail pane. Safe to nest over
  * the export dialog: `trapTab` listens on its own container, and the Escape
  * handler binds on `window` in the capture phase — which runs BEFORE the

@@ -346,25 +346,31 @@ export function redactEntryText(r: Redactor, s: string, paths: readonly string[]
   // are replaced whole even for a caller that did not seed `r` with them: once
   // the free-text pass has cut a spaced file name at its space, the tail is no
   // longer a whole name this pass could repair.
-  const swaps = paths.flatMap((p) => {
+  // Every name maps to the token of the FIRST path that has it.
+  const tokenByName = new Map<string, string>();
+  for (const p of paths) {
     const token = r.path(p);
-    return namesOf(p).map((n) => ({
-      re: new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRegExp(n)}(?![\\p{L}\\p{N}_])`, "gu"),
-      token,
-    }));
-  });
-  // Longest name first, so a file name is replaced before its own stem can
-  // split it ("clip.final.mp4" before "clip.final").
-  swaps.sort((a, b) => b.re.source.length - a.re.source.length);
+    for (const n of namesOf(p)) if (!tokenByName.has(n)) tokenByName.set(n, token);
+  }
+  // ONE pass over all the names, never one pass per name: a token this pass
+  // writes is then never read again. Run in sequence, a later swap matched
+  // inside an earlier one's token — a file named "file.mp4" became
+  // "<<file 1.mp4> 1.mp4>", and a stem equal to an extension ("mp4.mp4")
+  // rewrote the extension inside every token. Longest name first: an
+  // alternation tries its branches left to right, so a file name wins over its
+  // own stem at the same place ("clip.final.mp4" before "clip.final").
+  const names = [...tokenByName.keys()].sort((a, b) => b.length - a.length);
+  const re =
+    names.length > 0
+      ? new RegExp(`(?<![\\p{L}\\p{N}_])(?:${names.map(escapeRegExp).join("|")})(?![\\p{L}\\p{N}_])`, "gu")
+      : null;
   return r
     .text(s)
     .split(TOKEN)
     .map((part, i) => {
       // split() with a capture group puts the tokens at the odd indices.
-      if (i % 2 === 1) return part;
-      let seg = part;
-      for (const { re, token } of swaps) seg = seg.replace(re, token);
-      return seg;
+      if (i % 2 === 1 || re === null) return part;
+      return part.replace(re, (m) => tokenByName.get(m)!);
     })
     .join("");
 }

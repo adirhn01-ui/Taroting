@@ -4,21 +4,22 @@ import { dirname, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 /*
- * The "…" menu in real element fullscreen. Its host lives on document.body, and
- * the fullscreen .viewer sits in the top layer above all of it: the menu opened
- * unseen and, while open, blocked the viewer's shortcuts. The viewer's answer
- * is to show no More button in true fullscreen.
+ * The "…" menu in real element fullscreen. Element fullscreen puts .viewer in
+ * the top layer, above everything else in the document, so a menu hosted on
+ * document.body used to open there unseen. ui/menu.ts now attaches its host
+ * inside `document.fullscreenElement` on every open (ui/menu.test.ts pins
+ * that), and the menu paints above the viewer's chrome. The viewer used
+ * to answer the same bug by hiding its More button in true fullscreen; with
+ * the menu fixed, that hide only took "Open as project" and "Show in folder"
+ * away, so it is gone and must not come back.
  *
  * Neither vitest (node, no CSSOM) nor the in-app E2E (no user activation, so
  * requestFullscreen is always refused) can enter a real :fullscreen state, so
- * this is a STRUCTURAL pin — weaker than a rendered check, and said so: it
- * proves the rule exists in the shape that matters, and that the button it
- * hides is still the only way the viewer opens a menu.
+ * this is a STRUCTURAL pin — weaker than a rendered check, and said so.
  */
 
 const here = dirname(fileURLToPath(import.meta.url));
 const css = readFileSync(resolve(here, "viewer.css"), "utf8");
-const ts = readFileSync(resolve(here, "viewer.ts"), "utf8");
 
 /** Every `selector { body }` rule in a flat stylesheet, comments stripped. */
 function rules(sheet: string): { selector: string; body: string }[] {
@@ -30,34 +31,23 @@ function rules(sheet: string): { selector: string; body: string }[] {
   return out;
 }
 
+/** Rules that could take the More button out of a fullscreen viewer. */
+function hidingMore(selectorPart: string): { selector: string; body: string }[] {
+  return rules(css).filter(
+    (r) =>
+      r.selector.split(",").some((s) => s.includes(selectorPart) && s.includes("vw-more")) &&
+      /(^|;)\s*(display:\s*none|visibility:\s*hidden)\s*(;|$)/.test(r.body),
+  );
+}
+
 describe("the viewer's More button in element fullscreen", () => {
-  it("is hidden while .viewer holds true fullscreen", () => {
-    const hits = rules(css).filter((r) =>
-      r.selector.split(",").some((s) => s.trim() === ".viewer:fullscreen #vw-more"),
-    );
-    expect(hits).toHaveLength(1);
-    expect(hits[0]!.body).toMatch(/(^|;)\s*display:\s*none\s*(;|$)/);
+  it("stays visible while .viewer holds true fullscreen", () => {
+    expect(hidingMore(":fullscreen")).toEqual([]);
   });
 
-  it("is not hidden by the in-window fallback, which has no top layer", () => {
-    // .viewer--fullscreen alone is the refused-request layout: the menu's host
-    // on body still paints above it, so the button must keep working there.
-    const fallback = rules(css).filter(
-      (r) => r.selector.includes("viewer--fullscreen") && r.selector.includes("vw-more"),
-    );
-    expect(fallback).toEqual([]);
-  });
-
-  it("is still the only control that opens a menu from the viewer", () => {
-    // If another path to showMenu appears, it needs its own answer for
-    // fullscreen; hiding this one button would no longer close the hole.
-    const calls = ts.match(/\bshowMenu\(/g) ?? [];
-    expect(calls).toHaveLength(1);
-    const listener = ts.indexOf('moreBtn.addEventListener("click"');
-    const call = ts.indexOf("showMenu(");
-    expect(listener).toBeGreaterThan(-1);
-    expect(call).toBeGreaterThan(listener);
-    // ...inside that listener, not merely somewhere after it.
-    expect(ts.slice(listener, call)).not.toMatch(/\n {2}\}\);/);
+  it("stays visible in the in-window fallback too", () => {
+    // .viewer--fullscreen alone is the refused-request layout: no top layer,
+    // and the menu on body paints above it.
+    expect(hidingMore("viewer--fullscreen")).toEqual([]);
   });
 });

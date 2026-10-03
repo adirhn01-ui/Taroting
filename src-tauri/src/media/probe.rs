@@ -10,13 +10,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, Result};
 use crate::jobs::{ffmpeg, progress};
-use crate::media::source::{source_file, INPUT_PROTOCOL_ARGS};
+use crate::media::source::{deadline_for, deadline_for_path, source_file, INPUT_PROTOCOL_ARGS};
 use crate::media::{exif, extensions};
 
 /// How long the stream probe may take. ~50 ms on a local file; the bound is
 /// for a source that never answers (a share gone to sleep, a cloud file that
 /// will not hydrate), which before this held an import — or a project load
 /// running the rotation repair — forever.
+///
+/// All three bounds here are for a file on this machine. A cloud placeholder
+/// still downloading gets the time its bytes need on top
+/// (`source::deadline_for`).
 const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The frame probe's bound (`frame_rotation`). Shorter: its failure is
@@ -112,7 +116,8 @@ fn final_out_time(progress_out: &[u8]) -> Option<f64> {
 /// clip nobody could use. `None` when the scan fails, times out, or finds no
 /// timestamps to measure.
 fn scanned_duration(path: &Path) -> Option<f64> {
-    let out = run_bounded("ffmpeg", duration_scan_args(path), DURATION_SCAN_DEADLINE).ok()??;
+    let deadline = deadline_for_path(DURATION_SCAN_DEADLINE, path);
+    let out = run_bounded("ffmpeg", duration_scan_args(path), deadline).ok()??;
     if !out.status.success() {
         return None;
     }
@@ -425,7 +430,8 @@ fn refuse_disguised_picture(
 /// (`media::source`), and anything that is not a file is simply "no answer".
 fn frame_rotation(path: &str) -> Option<f64> {
     let src = source_file(path).ok()?;
-    let out = run_bounded("ffprobe", frame_args(src), FRAME_PROBE_DEADLINE).ok()??;
+    let deadline = deadline_for_path(FRAME_PROBE_DEADLINE, src);
+    let out = run_bounded("ffprobe", frame_args(src), deadline).ok()??;
     if !out.status.success() {
         return None;
     }
@@ -517,7 +523,7 @@ pub fn probe_sync(path: &str) -> Result<MediaInfo> {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let out = run_bounded("ffprobe", probe_args(src), PROBE_DEADLINE)?.ok_or_else(|| {
+    let out = run_bounded("ffprobe", probe_args(src), deadline_for(PROBE_DEADLINE, &meta))?.ok_or_else(|| {
         AppError::Ffmpeg(format!("ffprobe took too long for {path} and was stopped"))
     })?;
     if !out.status.success() {
@@ -654,6 +660,23 @@ pub async fn probe_media(path: String) -> Result<MediaInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every sidecar run here gets its bound through `source::deadline_for`,
+    /// so a cloud placeholder that is still downloading is given the time
+    /// its bytes need instead of the bound for a local file. Pinned in the
+    /// source: a slow-hydrating placeholder cannot be made in a test. Only
+    /// the code before the test module is searched.
+    #[test]
+    fn every_bound_allows_for_a_placeholder_still_downloading() {
+        let code = include_str!("probe.rs").split("#[cfg(test)]").next().unwrap();
+        let code: String = code.split_whitespace().collect();
+        assert!(code.contains("deadline_for(PROBE_DEADLINE,&meta)"), "the stream probe");
+        assert!(code.contains("deadline_for_path(FRAME_PROBE_DEADLINE,src)"), "the frame probe");
+        assert!(code.contains("deadline_for_path(DURATION_SCAN_DEADLINE,path)"), "the duration scan");
+        for bare in [",PROBE_DEADLINE)", ",FRAME_PROBE_DEADLINE)", ",DURATION_SCAN_DEADLINE)"] {
+            assert!(!code.contains(bare), "a sidecar bounded by {bare} alone");
+        }
+    }
 
     /// Every ffprobe/ffmpeg this module runs opens its input as a plain file.
     #[test]

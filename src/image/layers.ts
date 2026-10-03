@@ -652,22 +652,26 @@ export function cropImage(
 }
 
 /** New canvas size, anchored at the centre — to the whole pixel: the old
- *  picture lands `floor((new − old) / 2)` px in from the new edge. Layer x/y
- *  are offsets from the centre, so on an even change they stay as they are;
- *  an odd change moves the centre by half a pixel, and every layer shifts by
- *  that half pixel back, so a layer that sat on whole pixels still does (an
- *  exact-centre anchor would leave each one straddling two). Sides are
- *  `clampImageCanvas`ed (any integer >= 1). Unchanged or not a number → same
- *  reference. */
+ *  picture lands `trunc((new − old) / 2)` px in from the new left/top edge.
+ *  Layer x/y are offsets from the centre, so on an even change they stay as
+ *  they are; an odd change moves the centre by half a pixel, and every layer
+ *  shifts by that half pixel back, so a layer that sat on whole pixels still
+ *  does (an exact-centre anchor would leave each one straddling two). Rounded
+ *  toward zero, an odd grow adds its extra pixel on the right/bottom and an
+ *  odd shrink trims it from there too, so a resize and its reverse through
+ *  the dialog are an exact round trip (floor would add on the right but trim
+ *  on the left: +1 then −1 moved the picture a pixel left and lost its first
+ *  column). Sides are `clampImageCanvas`ed (any integer >= 1). Unchanged or
+ *  not a number → same reference. */
 export function resizeCanvas(p: ProjectFile, w: number, h: number): ProjectFile {
   if (!Number.isFinite(w) || !Number.isFinite(h)) return p;
   const width = clampImageCanvas(w);
   const height = clampImageCanvas(h);
   const { width: W, height: H } = p.timeline;
   if (width === W && height === H) return p;
-  // 0 for an even change, −0.5 for an odd one (either sign of change).
-  const sx = Math.floor((width - W) / 2) - (width - W) / 2;
-  const sy = Math.floor((height - H) / 2) - (height - H) / 2;
+  // 0 for an even change; −0.5 for an odd grow, +0.5 for an odd shrink.
+  const sx = Math.trunc((width - W) / 2) - (width - W) / 2;
+  const sy = Math.trunc((height - H) / 2) - (height - H) / 2;
   // Decided BEFORE mapTransforms, which reports a change for any non-empty
   // track whatever its function does.
   const tracks =

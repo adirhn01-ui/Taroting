@@ -135,9 +135,17 @@ fn diagnostics_dir() -> Result<PathBuf> {
 }
 
 /// Save a diagnostic report and return the path it was written to.
+///
+/// Async, with the writing on a blocking-pool thread: a plain command runs on
+/// the WebView's UI thread, and this one creates a folder, writes up to a
+/// megabyte and prunes old reports — under an antivirus scan or on a roaming
+/// profile, long enough to freeze the window.
 #[tauri::command]
-pub fn save_diagnostic_report(content: String) -> Result<String> {
-    write_report(&diagnostics_dir()?, &content)
+pub async fn save_diagnostic_report(content: String) -> Result<String> {
+    let dir = diagnostics_dir()?;
+    tauri::async_runtime::spawn_blocking(move || write_report(&dir, &content))
+        .await
+        .map_err(|e| AppError::BadInput(format!("the report could not be saved: {e}")))?
 }
 
 #[cfg(test)]
@@ -148,6 +156,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("taroting-diag-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// The save writes files, so it must not run on the WebView's UI thread,
+    /// which is where a plain `#[tauri::command] fn` runs. Pinned in the
+    /// source: the thread is tauri's choice at registration.
+    #[test]
+    fn the_report_is_saved_off_the_ui_thread() {
+        let code = include_str!("diagnostics.rs").split("#[cfg(test)]").next().unwrap();
+        // Line endings as checked out (CRLF here) must not decide the search.
+        let code = code.replace('\r', "");
+        let at = code.find("pub async fn save_diagnostic_report(").expect("the save must be an async command");
+        let body = &code[at..];
+        let body = &body[..body.find("
+}
+").expect("the command's end")];
+        assert!(body.contains("spawn_blocking"), "the write must run on a blocking-pool thread");
     }
 
     /// Reports go under the app's local root (`paths::app_local_dir`, which

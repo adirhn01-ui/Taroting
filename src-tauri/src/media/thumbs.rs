@@ -194,13 +194,22 @@ fn remember_failure(dst: &Path) {
     lock(&FAILED).insert(dst.to_path_buf());
 }
 
-/// Forget every remembered failure, so the next request for each tries
-/// ffmpeg again. For Clear cache: the one action a user takes to say "redo
-/// all of it".
-// Called from `cache::clear_cache`, which wires it in this same release.
-#[allow(dead_code)]
-pub fn forget_failures() {
-    lock(&FAILED).clear();
+/// Forget every remembered failure under `cache_root`, so the next request
+/// for each tries ffmpeg again. For Clear cache (`cache::clear_cache`): the
+/// one action a user takes to say "redo all of it". Scoped to one cache's
+/// folder because the destination paths are, and the set is process-wide.
+pub fn forget_failures(cache_root: &Path) {
+    lock(&FAILED).retain(|dst| !dst.starts_with(cache_root));
+}
+
+#[cfg(test)]
+pub(crate) fn remember_failure_for_test(dst: &Path) {
+    remember_failure(dst);
+}
+
+#[cfg(test)]
+pub(crate) fn failed_before_for_test(dst: &Path) -> bool {
+    failed_before(dst)
 }
 
 /* ------------------------------------------------------------------ */
@@ -391,11 +400,13 @@ fn ensure_thumb_within(
     let at = seek_of(at_sec);
     let hash = key.hash();
     let suffix = format!("_{}.jpg", (at * 1000.0) as u64);
-    let dst = cache.file_path(CacheKind::Thumbs, &hash, &suffix);
-    if is_ready(&dst) {
-        cache.mark_used(&dst);
+    // Checked and stamped under one hold of the index lock: checked first and
+    // stamped after, a trim could delete the file in between and this would
+    // hand back the path of a file that is gone (`Cache::existing_file`).
+    if let Some(dst) = cache.existing_nonempty_file(CacheKind::Thumbs, &hash, &suffix) {
         return Ok(dst);
     }
+    let dst = cache.file_path(CacheKind::Thumbs, &hash, &suffix);
     // The path is the `.trt`'s: refused unless it names a real file, so a URL
     // or a device never reaches ffmpeg (`media::source`).
     let src = source_file(&key.path)?.to_path_buf();
@@ -682,7 +693,7 @@ mod tests {
         assert!(ensure_thumb(&cache, &jobs, &changed, 0.0).is_err());
         assert_eq!(runs(&changed_dst), 1, "a changed file is tried afresh");
 
-        forget_failures();
+        forget_failures(cache.root());
         assert!(ensure_thumb(&cache, &jobs, &key, 0.0).is_err());
         assert_eq!(runs(&dst), 2, "forgotten, so tried again");
         assert!(!dst.exists());

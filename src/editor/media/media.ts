@@ -194,6 +194,74 @@ export const ORPHAN_KEEP = 64;
  *  Only a failure carries `canceled`, which is how the two are told apart. */
 type Orphan = JobDone | JobFailed;
 
+/**
+ * How long a discarded project's remux or proxy is left running for the next
+ * editor to join before it is canceled (see `abandonPlaybackJob`).
+ *
+ * It has to cover the gap between one editor's teardown and the next one's
+ * `plan_playback` answer: an Explorer open in editor mode probes the file and
+ * writes a temporary project before the editor even mounts, which on a slow
+ * machine is seconds. A job the timer cancels after a successor joined it is
+ * not lost — the successor hears the cancel and plans again — it is only
+ * restarted, which is what this window exists to avoid. The price of a longer
+ * window is that a transcode nobody wants holds the one transcode worker that
+ * long before the next file's own preparation can start.
+ */
+export const ABANDON_GRACE_MS = 8000;
+
+/**
+ * Playback jobs a discarded project left behind, by job id, each with the timer
+ * that cancels it. Module-level on purpose: the manager that can rejoin one is
+ * the NEXT editor's, a different instance from the one that let it go.
+ */
+const abandoned = new Map<number, ReturnType<typeof setTimeout>>();
+
+/**
+ * Let go of a discarded project's remux or proxy: cancel it, but only once the
+ * next editor has had `ABANDON_GRACE_MS` to join it.
+ *
+ * Canceling at once (as 0.9.1 first did) threw away the transcode the very
+ * next screen needed whenever that screen showed the SAME file — an untouched
+ * temporary project is discarded without a question, so Explorer reopening the
+ * file it showed restarted a minutes-long proxy from 0%. Never canceling
+ * (0.9.0) left every discarded file's transcode queued on the single transcode
+ * worker ahead of the next file's. This keeps both: a successor that joins the
+ * job claims it (`reclaimPlaybackJob`), and nobody else's wait grows unbounded.
+ */
+function abandonPlaybackJob(jobId: number): void {
+  if (abandoned.has(jobId)) return;
+  abandoned.set(
+    jobId,
+    setTimeout(() => {
+      abandoned.delete(jobId);
+      void ipc.cancelJob(jobId).catch(() => {});
+    }, ABANDON_GRACE_MS),
+  );
+}
+
+/** A live manager's plan named this job: it is wanted again, so it is no longer
+ *  anyone's to cancel. A no-op for a job nobody abandoned. */
+function reclaimPlaybackJob(jobId: number): void {
+  const timer = abandoned.get(jobId);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  abandoned.delete(jobId);
+}
+
+/**
+ * Whether a closing editor abandons its playback preparation (see
+ * `MediaManager.dispose`). Only a DISCARDED project does — a kept or permanent
+ * one will be opened again and lets its transcodes run on into the cache — and
+ * not even then when the editor goes back to the viewer it came from: the
+ * viewer shows the same file again and joins the same job, but it is not a
+ * MediaManager and cannot claim it, so the grace timer would cancel the
+ * transcode it is waiting on. The viewer cancels its own jobs when it steps
+ * past the file, so that case stays bounded without this.
+ */
+export function abandonsPlayback(discarded: boolean, returnsToViewer: boolean): boolean {
+  return discarded && !returnsToViewer;
+}
+
 export class MediaManager {
   /** mediaId → preview readiness */
   readonly status = new Store<Record<string, MediaState>>({});
@@ -205,6 +273,21 @@ export class MediaManager {
   /** job id → the media entry (or entries) waiting on it; see `JobEntry`. */
   private jobs = new Map<number, JobEntry>();
   private tracked = new Set<string>();
+  /**
+   * Ids `markFailed` stamped: the preview's own element could not play them.
+   * Empty unless an element has failed, so `healSiblings` costs one size check
+   * per ready plan. Cleared for an id by `retrack` and `untrack`.
+   */
+  private elementFailed = new Set<string>();
+  /**
+   * Ids `healSiblings` retracked whose fresh plan has not come back yet. That
+   * plan's ready answer heals nobody in turn: two entries for one file the
+   * element cannot play, both on stage, would otherwise retrack each other
+   * for ever — each round a plan, a thumbnail, a waveform and a bin re-render.
+   * Consumed by the id's next ready plan; cleared by any other `retrack` and
+   * by `untrack`. Empty unless a heal ran.
+   */
+  private healed = new Set<string>();
   /**
    * mediaId → how many times that id's identity has been withdrawn.
    *
@@ -261,9 +344,9 @@ export class MediaManager {
   private withheld = new Set<string>();
   private unlisten: (() => void) | null = null;
   private disposed = false;
-  /** Set by `dispose({ cancelPlayback: true })`: the project is gone for good,
-   *  so its playback preparation is canceled too (see `dispose`). */
-  private cancelPlayback = false;
+  /** Set by `dispose({ abandonPlayback: true })`: the project is gone for
+   *  good, so its playback preparation is abandoned too (see `dispose`). */
+  private abandonPlayback = false;
   /** Pending coalesced cache enforcement (see CACHE_ENFORCE_COALESCE_MS). */
   private cacheTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -467,6 +550,10 @@ export class MediaManager {
    *  display data is still right and dropping it would only flash it away. */
   retrack(mediaId: string, fileChanged = false): void {
     this.tracked.delete(mediaId);
+    this.elementFailed.delete(mediaId);
+    // A retrack for any other reason (a relink, a foreign cancel) is a fresh
+    // try of its own, free to heal; `healSiblings` marks its own after this.
+    this.healed.delete(mediaId);
     // A relink resolved it: the new file is ensured like any other.
     this.withheld.delete(mediaId);
     // Cut it loose from the jobs the OLD file started, or their eventual
@@ -503,7 +590,8 @@ export class MediaManager {
    * was showing the file BEFORE a relink describes a file the media no longer
    * points at; the scheduler compares the element's URL with the ready state's.
    *
-   * The stamp sticks until the media is retracked (a relink) or removed: the
+   * The stamp sticks until the media is retracked — a relink, or the same file
+   * coming up ready again under another id (`healSiblings`) — or removed: the
    * generation is bumped, so an answer already in flight for this identity — a
    * plan that would say "ready" for a path that is not there, or a thumbnail —
    * is dropped instead of painting over the failure. A job already REGISTERED
@@ -512,6 +600,7 @@ export class MediaManager {
    */
   markFailed(mediaId: string, message: string): void {
     if (this.disposed || !this.tracked.has(mediaId)) return;
+    this.elementFailed.add(mediaId);
     this.bumpGeneration(mediaId);
     this.patchStatus(mediaId, { state: "failed", message });
   }
@@ -531,6 +620,8 @@ export class MediaManager {
   untrack(mediaId: string): void {
     this.tracked.delete(mediaId);
     this.withheld.delete(mediaId);
+    this.elementFailed.delete(mediaId);
+    this.healed.delete(mediaId);
     dropMediaTargets(this.jobs, mediaId);
     this.bumpGeneration(mediaId);
     this.status.update((s) => withoutKey(s, mediaId));
@@ -603,10 +694,10 @@ export class MediaManager {
       // Answered after dispose: a pending job is deliberately LEFT RUNNING,
       // not canceled — see `cancelOrphan` for why playback preparation outlives
       // the editor that asked for it — unless the project was discarded, when
-      // nothing will ever rejoin it. It is registered nowhere, so this is the
-      // only chance to stop it.
+      // it is abandoned like the ones `dispose` held. It is registered nowhere,
+      // so this is the only chance to.
       if (this.disposed) {
-        if (this.cancelPlayback && plan.mode === "pending") this.cancelOrphan(plan.jobId);
+        if (this.abandonPlayback && plan.mode === "pending") abandonPlaybackJob(plan.jobId);
         return;
       }
       // The one that was actually reachable, if only just: a relink cuts the
@@ -621,7 +712,12 @@ export class MediaManager {
           url: mediaUrl(plan.path),
           sourcePath: plan.path,
         });
+        // A plan a heal asked for heals nobody back (see `healed`).
+        if (!this.healed.delete(media.id)) this.healSiblings(media);
       } else {
+        // A job a discarded project let go of is this media's now: keep its
+        // grace timer from canceling what this editor is about to wait on.
+        reclaimPlaybackJob(plan.jobId);
         addJobTarget(this.jobs, plan.jobId, {
           type: "playback",
           mediaId: media.id,
@@ -694,12 +790,14 @@ export class MediaManager {
    * `requestWaveform` for an answer that arrived after dispose — that job was
    * started for us and is registered nowhere, so without this it escapes.
    *
-   * The one exception to "only waveforms" is a DISCARDED project
-   * (`dispose({ cancelPlayback: true })`): its temporary file is deleted, no
-   * open will ever rejoin its remuxes or proxies, and stepping through a folder
-   * of such files would otherwise queue one transcode per file behind the one
-   * the user is looking at. Then `dispose` cancels every job it holds and
-   * `ensure` cancels a pending plan that answers late.
+   * A DISCARDED project (`dispose({ abandonPlayback: true })`) does not leave
+   * its remuxes and proxies to run forever either — opening one file after
+   * another would queue one transcode per file on the single transcode worker
+   * ahead of the one the user is looking at. They are not canceled HERE,
+   * though: the next screen is often showing the same file (an untouched
+   * temporary project is discarded without a question), so they are handed to
+   * `abandonPlaybackJob`, which cancels them only if no new editor joins them
+   * within its grace window.
    *
    * A successor that had ALREADY joined the job hears it canceled and asks
    * again (`targetFailed`); the backend never hands a canceled job to a fresh
@@ -708,6 +806,38 @@ export class MediaManager {
    */
   private cancelOrphan(jobId: number): void {
     void ipc.cancelJob(jobId).catch(() => {});
+  }
+
+  /**
+   * The file behind `media` was just planned ready: give every OTHER entry for
+   * the same path that the preview's element had failed (`markFailed`) another
+   * try.
+   *
+   * Nothing else could. The stamp is cleared only by `retrack`, which only the
+   * relink dialog calls, and that dialog opens at load for files reported
+   * missing — so an element failure mid-session (a file still being copied, a
+   * USB stick unplugged for a moment) failed the media until the project was
+   * reopened, its audio-track clips silent with it. The way the Failed badge
+   * invites — re-import the file, or Replace media with it — is exactly what
+   * lands here, and now heals the old entry too.
+   *
+   * ONE try per heal. A file that really cannot be played fails again on its
+   * next load, and the entry healed here must not heal in turn when its own
+   * plan comes back ready: with two entries for that file on stage at once,
+   * each one's ready plan retracked the other after the element had failed
+   * it, and the pair re-planned each other without end. So the ids retracked
+   * here are marked (`healed`) and their next ready plan skips this. Only a
+   * plan nobody healed — an import, Replace media, a relink — heals.
+   */
+  private healSiblings(media: MediaRef): void {
+    if (this.elementFailed.size === 0) return;
+    for (const m of this.getProject().media) {
+      if (m.id !== media.id && m.path === media.path && this.elementFailed.has(m.id)) {
+        this.retrack(m.id);
+        // After the retrack, which clears the mark for every other caller.
+        this.healed.add(m.id);
+      }
+    }
   }
 
   private patchStatus(mediaId: string, state: MediaState): void {
@@ -796,17 +926,19 @@ export class MediaManager {
   /**
    * Stop listening and let go of this project's work.
    *
-   * `cancelPlayback`: the project will never be opened again (a discarded
-   * temporary project), so its playback preparation is canceled along with its
-   * waveforms — here for every job it holds, and in `ensure` for a plan that
-   * answers late. Left unset, remuxes and proxies run on into the cache for the
-   * next open (see `cancelOrphan`). Another consumer riding on a canceled job
-   * hears the cancel and plans again (`targetFailed`), so canceling a shared
-   * job cannot strand it.
+   * `abandonPlayback` (see `abandonsPlayback` for when): the project will
+   * never be opened again (a discarded temporary project), so its playback
+   * preparation is abandoned — every job it holds here, and in `ensure` a plan
+   * that answers late. Abandoned is not canceled yet: `abandonPlaybackJob`
+   * gives the next editor a window to join the job before it goes. Left unset,
+   * remuxes and proxies run on into the cache for the next open (see
+   * `cancelOrphan`). Another consumer riding on a canceled job hears the cancel
+   * and plans again (`targetFailed`), so canceling a shared job cannot strand
+   * it.
    */
-  dispose(opts?: { cancelPlayback?: boolean }): void {
+  dispose(opts?: { abandonPlayback?: boolean }): void {
     this.disposed = true;
-    if (opts?.cancelPlayback === true) this.cancelPlayback = true;
+    if (opts?.abandonPlayback === true) this.abandonPlayback = true;
     this.unlisten?.();
     this.unlisten = null;
     // A coalesced trim must not be lost just because the editor closed inside
@@ -818,15 +950,15 @@ export class MediaManager {
       this.cacheTimer = null;
       this.runEnforceCache();
     }
-    // Waveform scans only; remuxes and proxies run on into the cache for the
-    // next open to rejoin or find (see `cancelOrphan`). A job id never mixes
-    // lanes (the two write different outputs), but the test is per waiter all
-    // the same: a job any playback waiter rides on is never canceled — unless
-    // the project was discarded, when everything goes.
+    // Waveform scans are canceled now; remuxes and proxies run on into the
+    // cache for the next open to rejoin or find (see `cancelOrphan`) — or,
+    // for a discarded project, are abandoned to the grace timer. A job id never
+    // mixes lanes (the two write different outputs), but the test is per
+    // waiter all the same: a job any playback waiter rides on is never
+    // canceled outright.
     for (const [id, entry] of this.jobs) {
-      if (this.cancelPlayback || (Array.isArray(entry) ? entry.every(isWaveform) : isWaveform(entry))) {
-        this.cancelOrphan(id);
-      }
+      if (Array.isArray(entry) ? entry.every(isWaveform) : isWaveform(entry)) this.cancelOrphan(id);
+      else if (this.abandonPlayback) abandonPlaybackJob(id);
     }
     this.jobs.clear();
     this.orphans.clear();

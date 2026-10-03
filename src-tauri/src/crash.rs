@@ -12,7 +12,17 @@
 //! - a Rust panic, from the panic hook (it runs before the abort);
 //! - a native fault, from an unhandled-exception filter, with NO heap use —
 //!   the heap may be what broke;
-//! - the WebView2 engine (browser process) dying, from its ProcessFailed event.
+//! - the WebView2 engine (browser process) dying, from its ProcessFailed event;
+//! - a page that kept dying and was not reloaded again (`reloaded: no`);
+//! - and, at the NEXT launch, a run that ended with none of the above: a
+//!   failed allocation (`handle_alloc_error` aborts with `__fastfail`, which
+//!   skips both the panic hook and the exception filter), a `/GS` or CRT
+//!   check inside a codec DLL, an outside `TerminateProcess`. The primary
+//!   instance leaves `running.txt` beside the note while it runs and removes
+//!   it on an orderly exit; one found at startup with no note beside it means
+//!   the last run ended without one, and becomes an "exit" note — when it was
+//!   left by this same build (an installer ends the app to replace it). A
+//!   plain debug run never leaves one (`exit_watch_wanted`).
 //!
 //! The next launch's `take_crash_notes` hands the note to the page once
 //! ("Taroting closed unexpectedly last time.", details copyable through the
@@ -32,6 +42,7 @@
 
 use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -42,6 +53,8 @@ use crate::paths;
 
 const NOTE_FILE: &str = "last-crash.txt";
 const SEEN_FILE: &str = "last-crash.seen.txt";
+/// Present while the primary instance runs; see the module doc.
+const RUNNING_FILE: &str = "running.txt";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A panic message longer than this is cut (on a char boundary).
@@ -67,7 +80,8 @@ pub const ENGINE_LOOP_WINDOW: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CrashNote {
-    /// "panic" | "fault" | "engine" from the note file; "page" in memory.
+    /// "panic" | "fault" | "engine" | "exit" | "page" from the note file;
+    /// "page" in memory.
     pub kind: &'static str,
     /// UTC "YYYY-MM-DDTHH:MM:SSZ", when the note has a readable time.
     pub at: Option<String>,
@@ -383,6 +397,8 @@ fn parse_head(text: &str) -> (&'static str, Option<String>) {
     let kind = match kind {
         Some("fault") => "fault",
         Some("engine") => "engine",
+        Some("exit") => "exit",
+        Some("page") => "page",
         _ => "panic",
     };
     (kind, at)
@@ -542,12 +558,157 @@ fn startup_failure_note_text(at: Option<UtcTime>, runtime: &str) -> String {
     )
 }
 
-/// The previous run's note (once) and this run's page reloads.
+/// The previous run's note (once) and this run's page reloads. The file's
+/// read and rename run on a blocking-pool thread, not on the async runtime's
+/// own worker — which is also where a reloaded page's ask waits for the page
+/// note its reload is still finishing (`project::store::begin_reload_adoption`).
 #[tauri::command]
 pub async fn take_crash_notes(notes: tauri::State<'_, Notes>) -> Result<Vec<CrashNote>> {
-    let mut out: Vec<CrashNote> = note_dir().and_then(|d| take_file_note(&d)).into_iter().collect();
+    let file = tauri::async_runtime::spawn_blocking(|| {
+        crate::project::store::wait_for_reload_adoption(crate::project::store::RELOAD_ADOPTION_WAIT);
+        note_dir().and_then(|d| take_file_note(&d))
+    })
+    .await
+    .unwrap_or(None);
+    let mut out: Vec<CrashNote> = file.into_iter().collect();
     out.extend(notes.drain());
     Ok(out)
+}
+
+/* ------------------------- the unclean-exit watch ------------------------- */
+
+/// Whether THIS process armed the watch, so only it removes `running.txt`.
+static ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Note a previous run that ended without a word, and arm the watch for this
+/// one (see the module doc). From `.setup()` in the PRIMARY instance only —
+/// a second launch would find the running instance's file and report a crash
+/// that is not one — and after the autotest wipe, so an E2E run killed by its
+/// harness leaves nothing a later run reads as a crash.
+pub fn arm_exit_watch() {
+    if !exit_watch_wanted(cfg!(debug_assertions), crate::debug::autotest_mode()) {
+        return;
+    }
+    let Some(dir) = note_dir() else { return };
+    if arm_exit_watch_in(&dir, UtcTime::now(), &this_build()) {
+        ARMED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Whether this run arms the watch: a shipped build, or the E2E harness
+/// (whose folder `paths.rs` redirects into its own scratch root). Never a
+/// plain debug run: it writes the OWNER's real `%LOCALAPPDATA%\Taroting`, and
+/// a dev run is stopped from outside as a matter of course (the terminal
+/// closed, the dev server killed) — the next real launch would then report a
+/// crash that never happened.
+fn exit_watch_wanted(debug_build: bool, autotest: bool) -> bool {
+    !debug_build || autotest
+}
+
+/// Which build of the app this process is: its version, and the exe it was
+/// started from with that file's size and modification time. A run is
+/// reported only by a launch of the SAME build — an installer replacing the
+/// exe stops the running app first (the NSIS template ends it, and that is
+/// no crash), and a re-shipped build of the same version changes the file's
+/// size or time even when the version does not. Running the SAME installer
+/// again restores the exe's build-time date and size, so the build line
+/// cannot see that case: the installer's own pre-install and pre-uninstall
+/// hooks (windows/hooks.nsh) delete `running.txt` before the template ends
+/// the app. One stat, at startup.
+fn this_build() -> String {
+    let exe = std::env::current_exe().ok();
+    let stamp = exe.as_deref().and_then(|p| std::fs::metadata(p).ok()).map_or_else(
+        || "unknown".to_owned(),
+        |m| {
+            let modified = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_millis());
+            format!("{} bytes, modified {modified}", m.len())
+        },
+    );
+    let path = exe.map_or_else(|| "unknown".to_owned(), |p| p.to_string_lossy().into_owned());
+    format!("{VERSION}, {stamp}, {path}")
+}
+
+/// `arm_exit_watch` in `dir`, as the build `build` (`this_build`). Returns
+/// whether the watch is armed.
+fn arm_exit_watch_in(dir: &Path, now: Option<UtcTime>, build: &str) -> bool {
+    let running = dir.join(RUNNING_FILE);
+    if let Some(previous) = read_capped(&running) {
+        // A note beside it is that run's own account (a panic, a fault, an
+        // engine that stopped): it says more than this one could. And only
+        // the same build's marker counts: another build's (an upgrade that
+        // ended the app to replace it, a marker from before markers named
+        // their build) says nothing about how that run ended.
+        if build_of(&previous) == Some(build) && !dir.join(NOTE_FILE).is_file() {
+            write_note(dir, &exit_note_text(now, started_of(&previous)));
+        }
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let started = now.map_or_else(|| "unknown".to_owned(), |t| t.to_string());
+    std::fs::write(&running, format!("Taroting {VERSION}\nbuild: {build}\nstarted: {started}\n")).is_ok()
+}
+
+/// The `build:` line a `running.txt` carries, if it has one.
+fn build_of(running: &str) -> Option<&str> {
+    running.lines().find_map(|l| l.strip_prefix("build: ")).map(str::trim_end)
+}
+
+/// The orderly way out: `RunEvent::Exit` (main.rs) and the uninstaller's own
+/// exit (os.rs). Removes `running.txt` only if this process armed it.
+pub fn disarm_exit_watch() {
+    if ARMED.swap(false, Ordering::SeqCst) {
+        if let Some(dir) = note_dir() {
+            disarm_exit_watch_in(&dir);
+        }
+    }
+}
+
+fn disarm_exit_watch_in(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(RUNNING_FILE));
+}
+
+/// The `started:` stamp a `running.txt` carries, if it is one.
+fn started_of(running: &str) -> Option<&str> {
+    running
+        .lines()
+        .find_map(|l| l.strip_prefix("started: "))
+        .map(str::trim)
+        .filter(|t| is_stamp(t))
+}
+
+/// The note for a run that ended without leaving one. Its time is unknown:
+/// all that is known is when that run started and when this one noticed.
+fn exit_note_text(now: Option<UtcTime>, started: Option<&str>) -> String {
+    let noticed = now.map_or_else(|| "unknown".to_owned(), |t| t.to_string());
+    note_text(
+        "exit",
+        None,
+        &[
+            ("process", "app"),
+            ("reason", "ended without an error report (out of memory, or stopped from outside)"),
+            ("started", started.unwrap_or("unknown")),
+            ("noticed", &noticed),
+        ],
+    )
+}
+
+/// A page-process note. `reloaded`: whether the page was reloaded (a page
+/// that dies too often is left dead). `temp_kept`: a temporary project the
+/// dead page held was handed to Home's recover list (src/core/crash-notes.ts
+/// reads both lines for its title).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn page_note_text(at: Option<UtcTime>, reason: &str, exit: &str, reloaded: bool, temp_kept: bool) -> String {
+    let mut fields = vec![("process", "page"), ("reason", reason), ("exit code", exit)];
+    if !reloaded {
+        fields.push(("reloaded", "no (the page had stopped too often)"));
+    }
+    if temp_kept {
+        fields.push(("temporary project", "kept"));
+    }
+    note_text("page", at, &fields)
 }
 
 /* --------------------------- Windows: faults --------------------------- */
@@ -734,8 +895,8 @@ mod page {
     use windows::core::Interface;
 
     use super::{
-        engine_restart_allowed, note_dir, note_text, previous_note, reason_name, take_reload, write_note, CrashNote,
-        Notes, UtcTime,
+        engine_restart_allowed, note_dir, note_text, page_note_text, previous_note, reason_name, take_reload,
+        write_note, CrashNote, Notes, UtcTime,
     };
 
     /// Runs on the UI thread (inside `with_webview`).
@@ -785,15 +946,43 @@ mod page {
         }
 
         fn on_page_exit(&mut self, sender: Option<ICoreWebView2>, args: &ICoreWebView2ProcessFailedEventArgs) {
-            if !take_reload(&mut self.reloads, self.started.elapsed()) {
-                eprintln!("Taroting: the page stopped again; not reloading it a fourth time in two minutes");
-                return;
-            }
             let (reason, exit) = details(args);
             let at = UtcTime::now();
-            let detail = note_text("page", at, &[("process", "page"), ("reason", reason), ("exit code", &exit)]);
-            if let Some(notes) = self.app.try_state::<Notes>() {
-                notes.push(CrashNote { kind: "page", at: at.map(|t| t.to_string()), detail });
+            if !take_reload(&mut self.reloads, self.started.elapsed()) {
+                eprintln!("Taroting: the page stopped again; not reloading it a fourth time in two minutes");
+                // No page is left to show a note on: it goes to disk, for the
+                // next launch.
+                if let Some(dir) = note_dir() {
+                    write_note(&dir, &page_note_text(at, reason, &exit, false, false));
+                }
+                return;
+            }
+            // Before the reload: the temporary project the dead page held is
+            // handed to Home's recover list (listed now, judged on a thread;
+            // `project::store::begin_reload_adoption`), and the note says so.
+            // The reloaded page's asks for the note and the list wait for it.
+            let adoption = crate::project::store::begin_reload_adoption();
+            let app = self.app.clone();
+            let finish = move || {
+                adoption.finish(|temp_kept| {
+                    let detail = page_note_text(at, reason, &exit, true, temp_kept);
+                    if let Some(notes) = app.try_state::<Notes>() {
+                        notes.push(CrashNote { kind: "page", at: at.map(|t| t.to_string()), detail });
+                    }
+                });
+            };
+            let finish = std::sync::Arc::new(std::sync::Mutex::new(Some(finish)));
+            let on_thread = std::sync::Arc::clone(&finish);
+            let spawned = std::thread::Builder::new().name("taroting-page-adopt".into()).spawn(move || {
+                if let Some(f) = on_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    f();
+                }
+            });
+            if spawned.is_err() {
+                // No thread: judged right here, which is slower but never lost.
+                if let Some(f) = finish.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    f();
+                }
             }
             if let Some(webview) = sender {
                 // SAFETY: COM call on the UI thread that raised the event.
@@ -830,6 +1019,11 @@ mod page {
         if !allowed {
             return;
         }
+        // The restart relaunches with THIS process's original command line;
+        // the marker (inherited by the new process) tells it to leave that
+        // line's file alone and boot to Home (os.rs `capture_launch_arg`).
+        // Set here, before the restart thread exists.
+        std::env::set_var(crate::os::ENGINE_RESTART_ENV, "1");
         let app = app.clone();
         let spawned = std::thread::Builder::new()
             .name("taroting-restart".into())
@@ -877,6 +1071,116 @@ mod tests {
     }
 
     /* ---- message truncation ---- */
+
+    /// A run that ended without a word (here: armed and never disarmed) is
+    /// reported once by the next start; a run that left its own note keeps
+    /// that note; a clean exit (disarmed) leaves nothing to report. Each row
+    /// differs from the reporting one on exactly one of those facts.
+    #[test]
+    fn a_run_that_ended_without_a_note_is_reported_by_the_next() {
+        let dir = std::env::temp_dir().join(format!("taroting-exit-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let t = |second| Some(UtcTime { year: 2026, month: 10, day: 3, hour: 9, minute: 30, second });
+        let build = r"0.9.1, 40000000 bytes, modified 1790000000000, C:\Apps\Taroting\taroting.exe";
+
+        assert!(arm_exit_watch_in(&dir, t(1), build), "fixture: armed");
+        assert!(!dir.join(NOTE_FILE).exists(), "a first start reports nothing");
+        // Killed: never disarmed. The next start reports it, and re-arms.
+        assert!(arm_exit_watch_in(&dir, t(2), build));
+        let note = take_file_note(&dir).expect("the silent end is reported");
+        assert_eq!(note.kind, "exit");
+        assert!(note.detail.contains("started: 2026-10-03T09:30:01Z"), "{}", note.detail);
+        assert!(note.detail.contains("noticed: 2026-10-03T09:30:02Z"), "{}", note.detail);
+
+        // A clean exit: nothing to report at the next start.
+        disarm_exit_watch_in(&dir);
+        assert!(arm_exit_watch_in(&dir, t(3), build));
+        assert!(take_file_note(&dir).is_none(), "a clean exit was reported");
+
+        // A run that panicked left its own note: that one stands.
+        write_note(&dir, &panic_note_text(t(4), "main", "x.rs:1:1", "boom"));
+        assert!(arm_exit_watch_in(&dir, t(5), build));
+        assert_eq!(take_file_note(&dir).map(|n| n.kind), Some("panic"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A marker left by ANOTHER build is no crash: an installer ends the
+    /// running app before it replaces the exe, and the next launch is the new
+    /// build. Each row differs from the reporting `build` on one axis — the
+    /// version, the exe's size or time (a re-shipped build of the same version;
+    /// running the same installer again keeps both, which the installer's own
+    /// hooks cover by deleting the marker), the exe's
+    /// path (another copy) — and the last is a marker with no build line at
+    /// all. The row that DOES report proves the fixture can report.
+    #[test]
+    fn a_marker_left_by_another_build_is_not_reported() {
+        let dir = std::env::temp_dir().join(format!("taroting-exit-build-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let t = |second| Some(UtcTime { year: 2026, month: 10, day: 3, hour: 9, minute: 31, second });
+        let build = r"0.9.1, 40000000 bytes, modified 1790000000000, C:\Apps\Taroting\taroting.exe";
+        let others = [
+            (r"0.9.0, 40000000 bytes, modified 1790000000000, C:\Apps\Taroting\taroting.exe", "an older version"),
+            (r"0.9.1, 40000512 bytes, modified 1790000000000, C:\Apps\Taroting\taroting.exe", "another size"),
+            (r"0.9.1, 40000000 bytes, modified 1790000099000, C:\Apps\Taroting\taroting.exe", "re-shipped since"),
+            (r"0.9.1, 40000000 bytes, modified 1790000000000, D:\Portable\taroting.exe", "another copy"),
+        ];
+        for (previous, why) in others {
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(arm_exit_watch_in(&dir, t(1), previous), "fixture: armed");
+            assert!(arm_exit_watch_in(&dir, t(2), build));
+            assert!(take_file_note(&dir).is_none(), "{why}: reported as a crash");
+            // Re-armed as THIS build: the next silent end is reported.
+            assert!(arm_exit_watch_in(&dir, t(3), build));
+            assert_eq!(take_file_note(&dir).map(|n| n.kind), Some("exit"), "{why}: the fixture never reports");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(RUNNING_FILE), "Taroting 0.9.1\nstarted: 2026-10-03T09:31:00Z\n").unwrap();
+        assert!(arm_exit_watch_in(&dir, t(4), build));
+        assert!(take_file_note(&dir).is_none(), "a marker with no build line was reported");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The watch is armed in a shipped build and under the E2E harness, never
+    /// in a plain debug run (it would write the owner's real folder). And
+    /// `arm_exit_watch` asks before it touches anything: without the source
+    /// pin, the table passes with the question unwired.
+    #[test]
+    fn a_plain_debug_run_never_arms_the_watch() {
+        assert!(exit_watch_wanted(false, false), "a shipped build");
+        assert!(exit_watch_wanted(true, true), "the E2E harness");
+        assert!(!exit_watch_wanted(true, false), "a plain debug run");
+        assert!(exit_watch_wanted(false, true), "a shipped build ignores the variable");
+        let code: String = include_str!("crash.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let body = &code[code.find("pubfnarm_exit_watch(){").expect("arm_exit_watch")..];
+        assert!(
+            body.starts_with(
+                "pubfnarm_exit_watch(){if!exit_watch_wanted(cfg!(debug_assertions),crate::debug::autotest_mode()){return;}"
+            ),
+            "arm_exit_watch must ask exit_watch_wanted first"
+        );
+    }
+
+    /// The page note's two optional lines, read by src/core/crash-notes.ts
+    /// for its title: present exactly when their facts are, and the kind
+    /// survives a trip through the note file.
+    #[test]
+    fn a_page_note_says_whether_it_reloaded_and_kept_the_temp_project() {
+        let plain = page_note_text(None, "crashed", "0x00000001", true, false);
+        assert!(!plain.contains("reloaded:") && !plain.contains("temporary project:"), "{plain}");
+        let kept = page_note_text(None, "crashed", "0x00000001", true, true);
+        assert!(kept.lines().any(|l| l == "temporary project: kept"), "{kept}");
+        let dead = page_note_text(None, "crashed", "0x00000001", false, false);
+        assert!(dead.lines().any(|l| l.starts_with("reloaded: no")), "{dead}");
+        assert_eq!(parse_head(&dead).0, "page");
+        assert_eq!(parse_head(&exit_note_text(None, None)).0, "exit");
+    }
 
     #[test]
     fn a_long_message_is_cut_to_2000_chars_on_a_char_boundary() {

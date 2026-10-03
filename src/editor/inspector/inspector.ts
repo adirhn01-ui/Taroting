@@ -179,6 +179,17 @@ export function mountInspector(
   // While a slider drag is in flight we update numbers in place instead of
   // tearing down and rebuilding the DOM (which would kill the drag).
   let dragging = false;
+  // WHICH control set `dragging` — a token per slider or number field. A
+  // commit releases the hold only when it is its own: pressing slider B while
+  // field A has focus runs B's begin() (pointerdown) BEFORE A's blur commit
+  // (the focus change is mousedown's default action), and A clearing the flag
+  // there left B's drag unguarded against every rebuild trigger.
+  let holder: object | null = null;
+  // A stale auto-key gesture's rebuild is owed (see scheduleStaleRebuild).
+  let staleRebuild = false;
+  let staleFrame = 0;
+  // A pointer went down inside the panel and has not come up yet.
+  let pressed = false;
   // Cleanup for listeners attached during the current build.
   let cleanup: (() => void)[] = [];
   // True while rebuild() blurs the field that had focus, so the commits that
@@ -220,7 +231,57 @@ export function mountInspector(
     // unconditionally — used to strand the flag at true with no control left
     // that could ever clear it.
     dragging = false;
+    holder = null;
   }
+
+  /** End a control's hold on `dragging` — only if the hold is still its own. */
+  function release(token: object): void {
+    if (holder !== token && holder !== null) return;
+    dragging = false;
+    holder = null;
+  }
+
+  /**
+   * Rebuild after a STALE auto-key gesture — one that paused playback, or found
+   * the playhead off the clip — so the panel describes the frame now on screen.
+   *
+   * Never synchronously from the commit that closes the gesture. That commit
+   * runs from change, pointerup, blur and focusout, and the blur one is set off
+   * by the user pressing the NEXT control: its pointerdown has already run, and
+   * a rebuild there tore that control out from under the press — the drag did
+   * nothing and a second press was needed. So it waits for a frame (a
+   * microtask would still land before the pressed control's focusin), and for
+   * as long as anything in the panel is held: a slider or number field until
+   * its own commit, which schedules this again, and any other press — a
+   * button, a select, a diamond — until the pointer comes up (`onPanelPress`),
+   * whose click fires before the next frame does.
+   */
+  function scheduleStaleRebuild(): void {
+    invalidateBuilt();
+    staleRebuild = true;
+    if (staleFrame !== 0) return;
+    staleFrame = requestAnimationFrame(() => {
+      staleFrame = 0;
+      if (!staleRebuild || disposed || dragging || pressed) return;
+      rebuild();
+    });
+  }
+
+  // Idle cost: one capture listener on the panel. The document listeners exist
+  // only while a press that started in the panel is down.
+  function onPanelRelease(): void {
+    pressed = false;
+    document.removeEventListener("pointerup", onPanelRelease, true);
+    document.removeEventListener("pointercancel", onPanelRelease, true);
+    if (staleRebuild && !disposed) scheduleStaleRebuild();
+  }
+  function onPanelPress(): void {
+    if (pressed) return;
+    pressed = true;
+    document.addEventListener("pointerup", onPanelRelease, true);
+    document.addEventListener("pointercancel", onPanelRelease, true);
+  }
+  host.addEventListener("pointerdown", onPanelPress, true);
 
   const playhead = (): number => ctx.engine.time;
 
@@ -370,8 +431,10 @@ export function mountInspector(
     // The value last written to the project — what every part of the control
     // shows once the gesture ends, whatever is left in the number field.
     let last = opts.value;
+    const token = {};
     const begin = (): void => {
       dragging = true;
+      holder = token;
       if (!before) before = ctx.session.project;
     };
     const apply = (v: number): void => {
@@ -389,15 +452,15 @@ export function mountInspector(
         ctx.session.commitFrom(before);
         before = null;
       }
-      dragging = false;
+      release(token);
       // Settle all three views on the applied value: a typed 5 in a 0..1 field
       // applied 1, and an emptied field applied nothing at all.
       input.value = String(last);
       num.value = fmtNum(last);
       readout.textContent = opts.format(last);
-      // Last, with the gesture fully closed: the rebuild blurs this control,
-      // and the commit that blur runs must find nothing left to do.
-      if (gesture?.stale && !blurring) rebuild();
+      // Last, with the gesture fully closed. Never a rebuild from in here: see
+      // scheduleStaleRebuild.
+      if (!blurring && (gesture?.stale || staleRebuild)) scheduleStaleRebuild();
     };
     const onSlider = (): void => {
       // begin() here, not only on focusin/pointerdown: a range input fires
@@ -486,8 +549,10 @@ export function mountInspector(
     let before: ProjectFile | null = null;
     let key: KeyGesture | null = null; // as in slider()
     let last = opts.value; // as in slider()
+    const token = {}; // as in slider()
     const begin = (): void => {
       dragging = true;
+      holder = token;
       if (!before) before = ctx.session.project;
     };
     const onInput = (): void => {
@@ -515,8 +580,8 @@ export function mountInspector(
         ctx.session.commitFrom(before);
         before = null;
       }
-      dragging = false;
-      if (gesture?.stale && !blurring) rebuild(); // as in slider()
+      release(token);
+      if (!blurring && (gesture?.stale || staleRebuild)) scheduleStaleRebuild(); // as in slider()
     };
     input.addEventListener("focusin", begin);
     input.addEventListener("input", onInput);
@@ -1290,6 +1355,7 @@ export function mountInspector(
       }
     }
     overlayPending = false;
+    staleRebuild = false;
     clearBuild();
     host.innerHTML = "";
 
@@ -1379,6 +1445,11 @@ export function mountInspector(
     },
     dispose(): void {
       disposed = true;
+      if (staleFrame !== 0) cancelAnimationFrame(staleFrame);
+      staleFrame = 0;
+      host.removeEventListener("pointerdown", onPanelPress, true);
+      document.removeEventListener("pointerup", onPanelRelease, true);
+      document.removeEventListener("pointercancel", onPanelRelease, true);
       unsubSel();
       unsubSession();
       unsubTick();

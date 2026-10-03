@@ -532,7 +532,13 @@ export class AudioGraph {
         if (fresh && voice.clipId !== null) this.parkVoice(voice);
 
         voice.clipId = clip.id;
-        if (voice.url !== status.url) {
+        // A pooled element that errored keeps its error until its src is set
+        // again, and the URL test alone never sets it for the same file under
+        // a new media id (a re-import, Replace media) — that clip played
+        // silence. Reloaded only when a clip TAKES the voice, never per tick:
+        // a file that truly cannot be decoded costs one load per claim, not a
+        // load per frame.
+        if (voice.url !== status.url || (fresh && voice.el.error)) {
           voice.url = status.url;
           voice.el.src = status.url;
         }

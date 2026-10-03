@@ -455,6 +455,87 @@ describe("markFailed", () => {
     expect(media.status.get()["m-relink"]).toEqual({ state: "ready", url: NEW_FILE.path, sourcePath: NEW_FILE.path });
   });
 
+  it("is cleared when the same file comes up ready under another id (a re-import, Replace media)", async () => {
+    // Nothing else could clear it mid-session: retrack is only reached from the
+    // relink dialog, which opens at load. A transient element error (a file
+    // still being copied) failed the media until the project was reopened.
+    directPlans();
+    let project = projectWith(OLD_FILE, BYSTANDER);
+    const media = new MediaManager(() => project);
+    media.ensureAll(project);
+    await settle();
+    media.markFailed("m-relink", "This file couldn't be played");
+    // A failed entry for a DIFFERENT file must stay failed.
+    media.markFailed("m-keep", "This file couldn't be played");
+
+    const reimported: MediaRef = { ...OLD_FILE, id: "m-reimported" };
+    project = projectWith(OLD_FILE, BYSTANDER, reimported);
+    media.ensureAll(project);
+    await settle();
+
+    const ready = { state: "ready", url: OLD_FILE.path, sourcePath: OLD_FILE.path };
+    expect(media.status.get()["m-reimported"]).toEqual(ready);
+    expect(media.status.get()["m-relink"]).toEqual(ready);
+    expect(media.status.get()["m-keep"]).toEqual({ state: "failed", message: "This file couldn't be played" });
+  });
+
+  it("heals a sibling once, not in a loop, when the file really cannot be played", async () => {
+    // Two entries for one file the preview's element cannot decode, both on
+    // stage: the element fails each one shortly after it goes ready. Each
+    // ready plan used to retrack the other (already failed by then), whose
+    // ready plan retracked the first again — a plan, a thumbnail and a bin
+    // re-render per round, for ever. The plan and the element answer on
+    // different clocks (5 ms, 1 ms) so neither order hides the other.
+    let plans = 0;
+    vi.spyOn(ipc, "planPlayback").mockImplementation(async (m) => {
+      plans++;
+      await new Promise((r) => setTimeout(r, 5));
+      return { mode: "direct" as const, path: m.path };
+    });
+    silentThumbnails();
+    const sameFile: MediaRef = { ...OLD_FILE, id: "m-second-layer" };
+    let project = projectWith(OLD_FILE, BYSTANDER);
+    const media = new MediaManager(() => project);
+    // The element: any entry for the undecodable path that goes ready fails.
+    let was: Record<string, string> = {};
+    media.status.subscribe((s) => {
+      for (const [id, st] of Object.entries(s)) {
+        if (st.state === "ready" && was[id] !== "ready" && project.media.find((m) => m.id === id)?.path === OLD_FILE.path) {
+          setTimeout(() => media.markFailed(id, "This file couldn't be played"), 1);
+        }
+      }
+      was = Object.fromEntries(Object.entries(s).map(([id, st]) => [id, st.state]));
+    });
+    const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+    media.ensureAll(project);
+    await wait(40);
+    expect(media.status.get()["m-relink"]?.state).toBe("failed");
+    expect(plans).toBe(2); // m-relink + the bystander
+
+    // The second layer's entry comes up: it heals the first once.
+    project = projectWith(OLD_FILE, BYSTANDER, sameFile);
+    media.ensureAll(project);
+    await wait(100);
+    expect(plans).toBe(4); // + m-second-layer + one heal of m-relink
+    expect(media.status.get()["m-relink"]?.state).toBe("failed");
+    expect(media.status.get()["m-second-layer"]?.state).toBe("failed");
+    await wait(100);
+    expect(plans).toBe(4); // and then silence
+
+    // A later re-import is a fresh try for both, once each, and stops again:
+    // the mark is spent by one heal, it does not switch healing off.
+    const third: MediaRef = { ...OLD_FILE, id: "m-reimported" };
+    project = projectWith(OLD_FILE, BYSTANDER, sameFile, third);
+    media.ensureAll(project);
+    await wait(100);
+    expect(plans).toBe(7); // + m-reimported + one heal each of the other two
+    await wait(100);
+    expect(plans).toBe(7);
+    expect(media.status.get()["m-keep"]?.state).toBe("ready");
+    media.dispose();
+  });
+
   it("leaves media it does not track alone: never ensured, or removed since", async () => {
     directPlans();
     const project = projectWith(OLD_FILE, BYSTANDER);

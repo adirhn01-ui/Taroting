@@ -3,6 +3,7 @@
 //! progress and atomically publishing the result.
 
 pub mod builder;
+pub mod claims;
 pub mod estimate;
 pub mod model;
 
@@ -316,7 +317,7 @@ fn refuse_overwriting_a_source(out_path: &str, media: &[MediaRef]) -> Result<()>
 /// say why. (Not `source_file` itself: its metadata read refuses that
 /// unanswered case too, and its messages do not name the file.)
 fn refuse_missing_sources(sources: &[OsString]) -> Result<()> {
-    use crate::media::source::{is_device_path, is_file_namespace};
+    use crate::media::source::{is_device_path, is_file_namespace, may_touch};
     // One look per FILE, in argv order (so the file named is still the first
     // one ffmpeg would open): a long edit of one clip opens it once per cut.
     let mut seen = std::collections::HashSet::with_capacity(sources.len());
@@ -330,6 +331,13 @@ fn refuse_missing_sources(sources: &[OsString]) -> Result<()> {
         if text.contains('\0') || is_device_path(&text) || !path.is_absolute() || !is_file_namespace(path) {
             return Err(AppError::BadInput(format!(
                 "{name} isn't a full path to a file on a drive or a share. \
+                 Reopen the project to relink it, or replace it, then export."
+            )));
+        }
+        // Before the presence check, which would connect to the share.
+        if !may_touch(path) {
+            return Err(AppError::BadInput(format!(
+                "{name} is on a network share outside the local network, which Taroting doesn't open. \
                  Reopen the project to relink it, or replace it, then export."
             )));
         }
@@ -402,6 +410,19 @@ fn refuse_overwriting_a_source_with(
         let real_dest = resolve(dest);
         for m in media.iter().filter(|m| m.generator.is_none()) {
             let src = std::path::Path::new(&m.path);
+            // A share off the local network is never looked at
+            // (`media::source::may_touch`), so only its spelling can say it
+            // is the destination. A used one is refused by
+            // `refuse_missing_sources` anyway.
+            if !crate::media::source::may_touch(src) {
+                if comparable_path(dest) == comparable_path(src) {
+                    let name = builder::display_name(&m.path);
+                    return Err(AppError::BadInput(format!(
+                        "This would overwrite {name}, which this project uses. Choose another name."
+                    )));
+                }
+                continue;
+            }
             let identity = if dest.as_path() == src {
                 PathIdentity::Same
             } else {
@@ -703,16 +724,30 @@ fn plan_export(spec: &ExportSpec, encoders: &hw::EncoderReport) -> Result<BuiltE
 ///
 /// The file in the way is just as often the user's own: an export killed with
 /// the app (a crash, Task Manager, a power cut) leaves its `.part`, and so does
-/// an app closed while an export was still queued. Nothing on disk tells the
-/// two apart, so the refusal says both, and says what to do.
+/// an app closed while an export was still queued. Every claim is written down
+/// (`claims`), so a leftover of OURS — claimed by an earlier run, never
+/// released, still the very file that run created — is deleted and the name
+/// claimed again; the startup sweep usually got there first. Anything else in
+/// the way keeps the refusal, which says both possibilities and what to do.
 ///
 /// A folder that is not there is the one OS error worth its own words (the
 /// dialog's folder may have been deleted or renamed since it was chosen); any
 /// other keeps the OS's text, which is the only thing that can name it.
 fn claim_part(part: &Path) -> Result<()> {
+    let create = || std::fs::OpenOptions::new().write(true).create_new(true).open(part);
+    let created = match create() {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && claims::left_by_earlier_run(part) => {
+            let _ = std::fs::remove_file(part);
+            create()
+        }
+        other => other,
+    };
     let folder = || part.parent().map(|p| p.display().to_string()).unwrap_or_default();
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(part) {
-        Ok(_) => Ok(()),
+    match created {
+        Ok(_) => {
+            claims::record(part);
+            Ok(())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(AppError::BadInput(format!(
             "A file named {} is in the way. It may be left from an export that didn't finish: \
              delete it if so, or choose another name.",
@@ -746,6 +781,7 @@ fn prepare_export(spec: &ExportSpec, encoders: &hw::EncoderReport, temp: &Path) 
         Ok(temps) => Ok(Prepared { plan, temps, part }),
         Err(e) => {
             let _ = std::fs::remove_file(&part);
+            claims::release(&part);
             Err(e)
         }
     }
@@ -802,6 +838,13 @@ struct Outcome {
 /// restarts for it. The retry is built lazily, so an export that never fails
 /// pays nothing for it. A cancel is never retried, and a software failure is
 /// final.
+///
+/// Only a failure the ENCODER can be blamed for is retried, and only then is
+/// it forgotten (`encoder_failure`). A disk that fills up, a source that is
+/// damaged or goes away, or a graph ffmpeg refuses fails a software encode
+/// just the same — retried, a long export failed twice, the second time
+/// several times slower on the machines that most need the hardware, and the
+/// next export paid a fresh probe for an encoder that had done nothing wrong.
 fn run_export(
     spec: &ExportSpec,
     prepared: Prepared,
@@ -822,8 +865,12 @@ fn run_export(
         Some(enc) if spec.preset.use_hardware && !hw::is_software(enc) => enc.clone(),
         _ => return first,
     };
-    if first.result.is_ok() || canceled() {
+    if canceled() {
         return first;
+    }
+    match &first.result {
+        Err(failure) if encoder_failure(failure, &hardware) => {}
+        _ => return first,
     }
     forget(&hardware);
 
@@ -843,6 +890,79 @@ fn run_export(
         // failure, which is the one that actually ran.
         Err(_) => first,
     }
+}
+
+/// ffmpeg's words for a failure that is NOT the encoder's, whatever else the
+/// log says: the output's disk, the input's bytes or its drive, the filter
+/// graph. ffmpeg prefixes every line its encoder thread logs with the
+/// encoder's name (`[vost#0:0/h264_nvenc @ …]`), so a full disk's "Error
+/// submitting a packet to the muxer: No space left on device" names the
+/// encoder too: these are checked first, and win.
+///
+/// "Error reinitializing filters" is deliberately NOT here: it is how ffmpeg
+/// reports a graph that cannot hand the encoder a format it takes, which is
+/// the encoder's trouble (measured: every hardware encoder that cannot run
+/// here logs it, followed by "Could not open encoder").
+///
+/// Nor is the bare "Invalid data found when processing input": a damaged
+/// clip's DECODER prints it for every bad packet and carries on (measured on
+/// a damaged H.264 MP4 at `-loglevel error`: `[dec:h264] Error submitting
+/// packet to decoder: Invalid data found …`, repeated, exit 0), so it sat in
+/// the tail of a genuine NVENC failure and cost that export its software
+/// retry. An input that cannot be read at all says "Error opening input".
+const NOT_THE_ENCODER: [&str; 5] = [
+    "no space left on device",
+    "not enough space on the disk",
+    "error opening input",
+    "error initializing complex filters",
+    "error opening output",
+];
+
+/// Plain OS error texts, which say WHAT failed but not where: an input read
+/// or a share that dropped ("Input/output error" on the demuxer's line), or
+/// the encoder's own device — Quick Sync reports a GPU that failed or was
+/// lost mid-export as EIO, on the encoder's line. So each counts against the
+/// encoder only on a line that does not name it.
+const NOT_THE_ENCODER_UNLESS_NAMED: [&str; 3] = ["input/output error", "no such file or directory", "permission denied"];
+
+/// ffmpeg's and the drivers' words for an encoder that could not start or
+/// gave up: the open itself, the vendor libraries (NVENC, Quick Sync's MFX)
+/// and the device behind them. AMF's own lines carry the encoder's name
+/// (`[h264_amf @ …]`), which the name rule below catches.
+const ENCODER_TROUBLE: [&str; 9] = [
+    "could not open encoder",
+    "error while opening encoder",
+    "generic error in an external library",
+    "openencodesessionex",
+    "no capable devices found",
+    "no nvenc capable devices",
+    "device creation failed",
+    "failed to create a device",
+    "mfx",
+];
+
+/// Whether `failure` is one the hardware `encoder` can be blamed for: no line
+/// of it points elsewhere (`NOT_THE_ENCODER`), and some line points at the
+/// encoder — its own trouble words (`ENCODER_TROUBLE`), or a line that names
+/// it and says it failed. A failure that says nothing either way (ffmpeg would
+/// not even start) is not the encoder's.
+fn encoder_failure(failure: &JobFailure, encoder: &str) -> bool {
+    let lines: Vec<String> = std::iter::once(&failure.message)
+        .chain(&failure.log_tail)
+        .map(|l| l.to_ascii_lowercase())
+        .collect();
+    let encoder = encoder.to_ascii_lowercase();
+    let names_it = |l: &str| l.contains(&encoder) || l.contains("[enc:");
+    if lines.iter().any(|l| {
+        NOT_THE_ENCODER.iter().any(|m| l.contains(m))
+            || (!names_it(l) && NOT_THE_ENCODER_UNLESS_NAMED.iter().any(|m| l.contains(m)))
+    }) {
+        return false;
+    }
+    lines.iter().any(|l| {
+        ENCODER_TROUBLE.iter().any(|m| l.contains(m))
+            || (l.contains(&encoder) && ["error", "fail", "not supported", "unsupported"].iter().any(|w| l.contains(w)))
+    })
 }
 
 /// Start an export. Async, with everything slow on a blocking thread: a sync
@@ -944,6 +1064,10 @@ fn start_export_blocking(app: AppHandle, jobs: Arc<Jobs>, spec: ExportSpec) -> R
                     jobs::fail_job(&app, &jobs_arc, &handle, failure.message, failure.log_tail);
                 }
             }
+            // Every way out has settled the claim by now: published (renamed
+            // away), deleted by `fail_job`'s cleanup, or kept as the user's
+            // finished encode when the rename failed — theirs from then on.
+            claims::release(&part_path);
         }),
     );
 
@@ -1922,6 +2046,35 @@ mod unit {
         assert!(part.exists(), "the name is claimed before the job starts");
         assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
         prepared.temps.cleanup();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.part` this app claimed in an earlier run and never released (the
+    /// app was killed mid-export) is ours: a re-export to the same name
+    /// deletes it and claims the name afresh, instead of sending the user to
+    /// find it by hand. A claim THIS run holds (another export to the same
+    /// name, still queued) is refused exactly like a stranger's file.
+    #[test]
+    fn our_own_leftover_part_is_reclaimed_but_a_live_claim_is_not() {
+        let dir = publish_dir("leftover-part");
+        std::fs::write(dir.join("Holiday Clip.mp4"), b"footage").unwrap();
+        std::fs::write(dir.join("Voice Memo.m4a"), b"voice").unwrap();
+        let (spec, enc) = spec_over(&dir, false);
+        let part = dir.join("Export final.mp4.part");
+
+        let first = prepare_export(&spec, &enc, &dir).expect("nothing in the way");
+        first.temps.cleanup();
+        std::fs::write(&part, b"half an encode").unwrap();
+        let Err(err) = prepare_export(&spec, &enc, &dir) else { panic!("a live claim was taken over") };
+        assert!(err.to_string().contains("is in the way"), "{err}");
+        assert_eq!(std::fs::read(&part).unwrap(), b"half an encode");
+
+        claims::as_if_from_an_earlier_run(&part);
+        let again = prepare_export(&spec, &enc, &dir).expect("our own leftover is reclaimed");
+        assert_eq!(again.part, part);
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 0, "the leftover was replaced by a fresh claim");
+        again.temps.cleanup();
+        claims::release(&part);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3361,6 +3514,77 @@ mod e2e {
         assert!(outcome.result.is_err());
         assert!(!outcome.hw_fallback);
         assert!(forgotten.borrow().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What ffmpeg says, sorted: each row differs from a retried one on the
+    /// one axis the rule reads. The disk-full row NAMES the encoder (ffmpeg's
+    /// encoder thread prefixes it) and still must not be blamed on it.
+    #[test]
+    fn only_an_encoder_failure_is_blamed_on_the_encoder() {
+        let f = |tail: &[&str]| JobFailure {
+            message: "ffmpeg exited with exit code: 0xffffffea".into(),
+            log_tail: tail.iter().map(|l| l.to_string()).collect(),
+        };
+        let rows: [(&str, &[&str], bool, &str); 13] = [
+            ("h264_nvenc", &["[vost#0:0/h264_nvenc @ 0x1] [enc:h264_nvenc @ 0x2] Could not open encoder before EOF"], true, "the open failed"),
+            ("h264_nvenc", &["[h264_nvenc @ 0x1] OpenEncodeSessionEx failed: unsupported device (2)"], true, "the NVENC session"),
+            ("h264_qsv", &["[h264_qsv @ 0x1] Error initializing an internal MFX session: unsupported (-3)"], true, "Quick Sync's library"),
+            ("h264_amf", &["[h264_amf @ 0x1] Encode failed with AMF error"], true, "a line naming the encoder that failed"),
+            ("h264_nvenc", &["[vost#0:0/h264_nvenc @ 0x1] Error submitting a packet to the muxer: No space left on device"], false, "the disk filled up"),
+            ("h264_nvenc", &["[vost#0:0/h264_nvenc @ 0x1] Could not open encoder before EOF", "[in#0 @ 0x3] Error opening input: Invalid data found when processing input"], false, "the input failed first"),
+            ("h264_nvenc", &["[fc#0 @ 0x1] Error initializing complex filters", "[vost#0:0/h264_nvenc @ 0x2] Task finished with error code: -22"], false, "the graph was refused"),
+            ("h264_nvenc", &["[out#0/mp4 @ 0x1] Error opening output x.mp4.part: Permission denied"], false, "the output could not be opened"),
+            ("h264_nvenc", &[], false, "nothing to go on"),
+            ("h264_qsv", &["[fc#0 @ 0x1] Error reinitializing filters!", "[vost#0:0/h264_qsv @ 0x2] [enc:h264_qsv @ 0x3] Could not open encoder before EOF"], true, "a format the encoder would not take"),
+            ("h264_qsv", &["[h264_qsv @ 0x1] Error during encoding: device failed (-17)", "[vost#0:0/h264_qsv @ 0x2] Error encoding a frame: Input/output error"], true, "the GPU failed mid-export"),
+            ("h264_qsv", &["[in#0/mov @ 0x1] Error during demuxing: Input/output error", "[vost#0:0/h264_qsv @ 0x2] Task finished with error code: -5"], false, "the source's drive failed"),
+            ("h264_nvenc", &["[vist#0:0/h264 @ 0x1] [dec:h264 @ 0x2] Error submitting packet to decoder: Invalid data found when processing input", "[h264_nvenc @ 0x3] OpenEncodeSessionEx failed: out of memory (10)"], true, "a damaged clip's decode warning beside the NVENC session failing"),
+        ];
+        for (encoder, tail, want, why) in rows {
+            assert_eq!(encoder_failure(&f(tail), encoder), want, "{why}");
+        }
+        // The name rule is the named encoder's, not any encoder's.
+        assert!(!encoder_failure(&f(&["[h264_amf @ 0x1] Encode failed"]), "h264_nvenc"));
+    }
+
+    /// A hardware export that fails because the DISK filled up is reported as
+    /// it is: no software retry (it would fail the same way, much later) and
+    /// the encoder is not forgotten. The runner is scripted, so nothing is
+    /// encoded; only the planned attempt is counted.
+    #[test]
+    fn a_hardware_export_that_ran_out_of_disk_is_not_redone_in_software() {
+        let dir = case_dir("hw disk full");
+        let (_src, media) = fixture_media(&dir);
+        let report = crate::hw::EncoderReport {
+            h264: "h264_nvenc".into(),
+            hevc: "libx265".into(),
+            av1: "libsvtav1".into(),
+            detail: vec![],
+        };
+        let spec = hw_spec(&dir, media);
+        let prepared = prepare_export(&spec, &report, &dir).unwrap();
+        assert_eq!(prepared.plan.encoder.as_deref(), Some("h264_nvenc"));
+        let runs = std::cell::Cell::new(0);
+        let forgotten = std::cell::RefCell::new(Vec::<String>::new());
+        let mut run = |_args: Vec<OsString>, _total: Option<f64>| {
+            runs.set(runs.get() + 1);
+            Err(JobFailure {
+                message: "ffmpeg exited with exit code: 0xffffffe4".into(),
+                log_tail: vec![
+                    "[vost#0:0/h264_nvenc @ 0x1] Error submitting a packet to the muxer: No space left on device".into(),
+                    "[out#0/mp4 @ 0x2] Error writing trailer: No space left on device".into(),
+                ],
+            })
+        };
+        let outcome = run_export(&spec, prepared, &dir, &mut run, &|| false, &|enc| {
+            forgotten.borrow_mut().push(enc.to_string())
+        });
+        assert!(outcome.result.is_err());
+        assert!(!outcome.hw_fallback, "a full disk was retried in software");
+        assert_eq!(runs.get(), 1, "one attempt only");
+        assert!(forgotten.borrow().is_empty(), "the encoder was forgotten for a full disk");
+        assert!(outcome.argv.windows(2).any(|w| w[0] == "-c:v" && w[1] == "h264_nvenc"), "the report is the attempt that ran");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

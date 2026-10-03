@@ -814,10 +814,11 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   function onHideTimer(): void {
     hideTimer = undefined;
     if (!wantsAutoHide()) return;
-    // The "…" menu lives on document.body (ui/menu.ts), so a pointer over it
-    // never reaches `el`: while it is open, count it as activity rather than
-    // fade the bar out from under it. Asked only here, at timer fire, so it
-    // costs one lookup per interval while already playing — nothing when idle.
+    // Outside fullscreen the "…" menu lives on document.body (ui/menu.ts), so
+    // a pointer over it never reaches `el`: while it is open, count it as
+    // activity rather than fade the bar out from under it. Asked only here,
+    // at timer fire, so it costs one lookup per interval while already
+    // playing — nothing when idle.
     if (menuOpen()) lastActivity = performance.now();
     const idle = performance.now() - lastActivity;
     if (idle < AUTO_HIDE_MS) {

@@ -234,13 +234,16 @@ export type ImageSaveDest =
  *    fault such as an access violation inside a DLL), read from the note it
  *    wrote as it died — shown once, then kept on disk as last-crash.seen.txt.
  *  - `engine`: the WebView2 engine itself stopped and Taroting restarted.
+ *  - `exit`: the previous run ended without writing any note (out of memory,
+ *    or ended from outside); written by the next launch, which found the
+ *    running marker that run never removed.
  *  - `page`: THIS run's page process stopped and was reloaded (in memory only).
  *
  *  `detail` is the whole note text. It can carry file paths (a panic message
  *  may name the file being opened), so it is only ever shown through the
  *  redacting detail pane (`toast.error` → Details), never copied raw. */
 export interface CrashNote {
-  kind: "panic" | "fault" | "engine" | "page";
+  kind: "panic" | "fault" | "engine" | "exit" | "page";
   /** UTC "YYYY-MM-DDTHH:MM:SSZ" from the note, when it has one. */
   at: string | null;
   detail: string;
@@ -550,7 +553,19 @@ export async function pickOpenFiles(): Promise<string[]> {
   return Array.isArray(result) ? result : [result];
 }
 
+/** DEV ONLY — the in-app E2E's stand-in for the native file picker, which the
+ *  off-screen, never-focused autotest window cannot answer. Lets a block hold
+ *  the "picker" open across a navigation and choose when it answers.
+ *  `import.meta.env.DEV` is a build-time false in a release build, so the
+ *  setter does nothing there and the check in pickMediaFiles is compiled
+ *  out. Pass null to restore the real picker. */
+let devMediaPicker: (() => Promise<string[]>) | null = null;
+export function devOverrideMediaPicker(fn: (() => Promise<string[]>) | null): void {
+  if (import.meta.env.DEV) devMediaPicker = fn;
+}
+
 export async function pickMediaFiles(): Promise<string[]> {
+  if (import.meta.env.DEV && devMediaPicker) return devMediaPicker();
   if (!inTauri) return [];
   const { open } = await import("@tauri-apps/plugin-dialog");
   const result = await open({

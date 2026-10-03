@@ -65,10 +65,24 @@ class FakeAudioContext {
 }
 
 class FakeAudio {
+  /** every voice element the graph built, in pool order */
+  static all: FakeAudio[] = [];
   preload = "";
   crossOrigin = "";
-  src = "";
+  error: { code: number } | null = null;
+  srcWrites: string[] = [];
+  private src_ = "";
   paused = true;
+  constructor() {
+    FakeAudio.all.push(this);
+  }
+  get src(): string {
+    return this.src_;
+  }
+  set src(v: string) {
+    this.src_ = v;
+    this.srcWrites.push(v);
+  }
   currentTime = 0;
   playbackRate = 1;
   play(): Promise<void> {
@@ -81,6 +95,7 @@ class FakeAudio {
 }
 
 beforeEach(() => {
+  FakeAudio.all = [];
   vi.stubGlobal("AudioContext", FakeAudioContext);
   vi.stubGlobal("Audio", FakeAudio);
 });
@@ -169,5 +184,56 @@ describe("AudioGraph — an inactive video element", () => {
       ["ramp", 0.6, 61.5],
       ["ramp", 0, 62.5],
     ]);
+  });
+});
+
+describe("AudioGraph — an audio-track voice whose element failed", () => {
+  /** One audio track holding one clip of `m` on [1, 5]. */
+  function audioRig() {
+    const a = videoMedia("speech", 40);
+    let project = projectOf([a], [[]], [[clipOf(a, 1, 0.5, 4.5, 1)]]);
+    const stage = fakeStage();
+    const media = fakeMedia(ready(a));
+    const sched = new Scheduler(stage, () => project, media);
+    const graph = new AudioGraph(() => project, media, sched);
+    return {
+      a,
+      media,
+      graph,
+      setProject: (p: typeof project) => (project = p),
+    };
+  }
+
+  it("reloads when the same file comes back as a new clip under a new media id", () => {
+    // Re-import or Replace media with the same file: a new id, the SAME url.
+    // The pooled voice that played the old clip errored; matched by url alone
+    // it was handed to the new clip without a reload, and played silence.
+    const { a, media, graph, setProject } = audioRig();
+    graph.tick(2, true, 1);
+    const voice = FakeAudio.all.find((v) => v.src === `url:${a.path}`)!;
+    expect(voice.srcWrites).toEqual([`url:${a.path}`]);
+    voice.error = { code: 4 };
+
+    const again: MediaRef = { ...a, id: `${a.id}-reimported` };
+    media.statuses[again.id] = readyStatus(again);
+    setProject(projectOf([a, again], [[]], [[clipOf(again, 1, 0.75, 4.75, 1)]]));
+    graph.tick(2.25, true, 1);
+
+    expect(voice.srcWrites).toEqual([`url:${a.path}`, `url:${a.path}`]);
+    // Once per claim, not per tick: the next frames leave it alone.
+    graph.tick(2.3, true, 1);
+    graph.tick(2.35, true, 1);
+    expect(voice.srcWrites.length).toBe(2);
+  });
+
+  it("does not reload a healthy voice handed to the same file", () => {
+    const { a, media, graph, setProject } = audioRig();
+    graph.tick(2, true, 1);
+    const voice = FakeAudio.all.find((v) => v.src === `url:${a.path}`)!;
+    const again: MediaRef = { ...a, id: `${a.id}-again` };
+    media.statuses[again.id] = readyStatus(again);
+    setProject(projectOf([a, again], [[]], [[clipOf(again, 1, 0.75, 4.75, 1)]]));
+    graph.tick(2.25, true, 1);
+    expect(voice.srcWrites.length).toBe(1);
   });
 });

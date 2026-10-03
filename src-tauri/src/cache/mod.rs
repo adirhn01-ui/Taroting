@@ -319,10 +319,29 @@ impl Cache {
     /// leaves it. Checked and stamped separately, a trim could fall between
     /// the two and hand back a path to a file it had just deleted.
     pub fn existing_file(&self, kind: CacheKind, hash: &str, suffix: &str) -> Option<PathBuf> {
+        self.existing_where(kind, hash, suffix, |m| m.is_file())
+    }
+
+    /// `existing_file` for an entry that is only ready once it holds
+    /// something: a thumbnail. A 0-byte one is what a write cut short used to
+    /// leave at the final name, and it counts as missing (`thumbs::is_ready`).
+    /// Same single hold of the index lock, so the same guarantee against a
+    /// trim running beside it.
+    pub fn existing_nonempty_file(&self, kind: CacheKind, hash: &str, suffix: &str) -> Option<PathBuf> {
+        self.existing_where(kind, hash, suffix, |m| m.is_file() && m.len() > 0)
+    }
+
+    fn existing_where(
+        &self,
+        kind: CacheKind,
+        hash: &str,
+        suffix: &str,
+        ready: impl FnOnce(&std::fs::Metadata) -> bool,
+    ) -> Option<PathBuf> {
         let p = self.file_path(kind, hash, suffix);
         let rel = self.rel(&p);
         let mut index = self.index.lock().unwrap();
-        if !p.is_file() {
+        if !std::fs::metadata(&p).is_ok_and(|m| ready(&m)) {
             return None;
         }
         self.stamp(&mut index, rel);
@@ -638,7 +657,17 @@ pub async fn clear_cache(
 ) -> Result<u64> {
     let cache = Arc::clone(&cache);
     let keep: HashSet<String> = keep_active.iter().map(MediaKey::hash).collect();
-    blocking(move || cache.clear(&keep)).await
+    blocking(move || clear_everything(&cache, &keep)).await
+}
+
+/// What Clear cache does: delete every unprotected file, AND forget which
+/// thumbnails ffmpeg failed to make. Clear cache is the one action a user
+/// takes to say "redo all of it", and a remembered failure would otherwise
+/// keep a card blank for the rest of the session without ever trying again.
+fn clear_everything(cache: &Cache, keep: &HashSet<String>) -> u64 {
+    let freed = cache.clear(keep);
+    crate::media::thumbs::forget_failures(cache.root());
+    freed
 }
 
 #[tauri::command]
@@ -1061,6 +1090,66 @@ mod tests {
         assert!(a.exists() && b.exists() && c.exists());
 
         drop(cache);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Clear cache also forgets the thumbnails ffmpeg failed to make — under
+    /// THIS cache's folder only (the set is process-wide). Without the call, a
+    /// card whose decode failed once stays blank for the session however
+    /// often the user clears.
+    #[test]
+    fn clear_cache_forgets_remembered_thumbnail_failures() {
+        let (root, cache, _) = seeded_cache("forget");
+        let failed = cache.file_path(CacheKind::Thumbs, "ffff", "_0.jpg");
+        let elsewhere = root.with_file_name(format!("{}-other", root.file_name().unwrap().to_string_lossy()))
+            .join("thumbs")
+            .join("ffff_0.jpg");
+        crate::media::thumbs::remember_failure_for_test(&failed);
+        crate::media::thumbs::remember_failure_for_test(&elsewhere);
+
+        clear_everything(&cache, &HashSet::new());
+
+        assert!(!crate::media::thumbs::failed_before_for_test(&failed), "Clear cache kept the failure");
+        assert!(
+            crate::media::thumbs::failed_before_for_test(&elsewhere),
+            "another cache's failure is not this clear's to forget"
+        );
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A cached thumbnail is checked and stamped under one hold of the index
+    /// lock, like every other cache hit. Here the lock is held (as a trim's
+    /// `evict` holds it) while the thumbnail is deleted; the request that was
+    /// waiting must not come back with the deleted path. Checked outside the
+    /// lock and stamped inside it, it saw the file, waited, and returned a
+    /// path to nothing. The source does not exist, so the honest answer here
+    /// is an error.
+    #[test]
+    fn a_cached_thumbnail_deleted_by_a_trim_is_never_handed_back() {
+        let (root, cache, _) = seeded_cache("thumb-race");
+        let cache = Arc::new(cache);
+        let key = MediaKey { path: root.join("gone.mp4").to_string_lossy().into_owned(), size: 7, mtime_ms: 9 };
+        cache.ensure_kind_dir(CacheKind::Thumbs).unwrap();
+        let thumb = cache.file_path(CacheKind::Thumbs, &key.hash(), "_0.jpg");
+        std::fs::write(&thumb, b"jpeg").unwrap();
+
+        let held = cache.index.lock().unwrap();
+        let asking = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                let jobs = crate::jobs::Jobs::default();
+                crate::media::thumbs::ensure_thumb(&cache, &jobs, &key, 0.0)
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        std::fs::remove_file(&thumb).unwrap();
+        drop(held);
+
+        match asking.join().unwrap() {
+            Ok(p) => assert!(p.is_file(), "handed back a thumbnail the trim had deleted: {}", p.display()),
+            Err(_) => {}
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }

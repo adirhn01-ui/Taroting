@@ -7,7 +7,7 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -92,20 +92,48 @@ fn extract(
     duration: f64,
     dst: &std::path::Path,
 ) -> Result<()> {
+    let mut cmd = jobs::ffmpeg::command("ffmpeg")?;
+    cmd.args(decode_args(src));
+    decode_into(handle, cmd, duration, dst, &mut |ev| jobs::emit_progress(app, ev))
+}
+
+fn canceled() -> AppError {
+    AppError::Ffmpeg("canceled".into())
+}
+
+/// `extract`'s body with the command and the progress sink handed in, so a
+/// test can run it without an app.
+///
+/// The child is attached to the job, so `Jobs::cancel` kills it. Checking the
+/// flag between reads is not enough on its own: a read from a source that
+/// stalls (a share that dropped, a cloud file that never arrives) blocks
+/// until ffmpeg writes again, which may be never — and the job held one of
+/// the two Background workers, which every remux shares, for the rest of the
+/// session. Killed, ffmpeg's stdout closes and the blocked read returns.
+fn decode_into(
+    handle: &jobs::JobHandle,
+    mut cmd: Command,
+    duration: f64,
+    dst: &std::path::Path,
+    progress: &mut dyn FnMut(&jobs::ProgressEvent),
+) -> Result<()> {
     // Same guard `execute_ffmpeg` has: a job canceled while still QUEUED must
     // not even start ffmpeg (closing the editor cancels every waveform job, so
     // this is the normal path, not an edge one).
     if handle.is_canceled() {
         return Err(AppError::Ffmpeg("canceled".into()));
     }
-    let mut cmd = jobs::ffmpeg::command("ffmpeg")?;
-    cmd.args(decode_args(src))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
 
     let mut child = jobs::ffmpeg::spawn_owned(&mut cmd)?;
     let mut stdout = child.stdout.take().expect("piped stdout");
+    handle.attach_child(child);
+    // A cancel that landed between the check above and the attach found no
+    // child to kill; honour it now that there is one.
+    if handle.is_canceled() {
+        handle.kill_child();
+        return Err(canceled());
+    }
 
     let mut pairs: Vec<(i8, i8)> = Vec::with_capacity(pairs_capacity_hint(duration) + 16);
 
@@ -115,11 +143,16 @@ fn extract(
 
     loop {
         if handle.is_canceled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AppError::Ffmpeg("canceled".into()));
+            handle.kill_child();
+            return Err(canceled());
         }
-        let n = stdout.read(&mut buf)?;
+        let n = match stdout.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                handle.kill_child();
+                return Err(if handle.is_canceled() { canceled() } else { e.into() });
+            }
+        };
         if n == 0 {
             break;
         }
@@ -136,24 +169,25 @@ fn extract(
         if last_emit.elapsed().as_millis() >= 150 && duration > 0.0 {
             last_emit = std::time::Instant::now();
             let done_secs = pairs.len() as f64 / PAIRS_PER_SEC as f64;
-            jobs::emit_progress(
-                app,
-                &jobs::ProgressEvent {
-                    id: handle.id,
-                    kind: handle.kind,
-                    ratio: Some((done_secs / duration).clamp(0.0, 1.0)),
-                    out_time_ms: (done_secs * 1000.0) as u64,
-                    fps: 0.0,
-                    speed: 0.0,
-                    eta_sec: None,
-                },
-            );
+            progress(&jobs::ProgressEvent {
+                id: handle.id,
+                kind: handle.kind,
+                ratio: Some((done_secs / duration).clamp(0.0, 1.0)),
+                out_time_ms: (done_secs * 1000.0) as u64,
+                fps: 0.0,
+                speed: 0.0,
+                eta_sec: None,
+            });
         }
     }
     if !carry.is_empty() {
         pairs.extend_from_slice(&bucket_s16(&carry, SAMPLES_PER_PAIR));
     }
 
+    // Gone means a cancel took (and killed) it while the last read returned.
+    let Some(mut child) = handle.take_child() else {
+        return Err(canceled());
+    };
     let status = child.wait()?;
     // A cancel that lands during the last read makes the loop exit on EOF with
     // the kill already sent; without this the truncated peaks would be written
@@ -407,6 +441,38 @@ mod tests {
         assert_eq!(allocations.get(), 3);
     }
 
+    /// A decode whose source stalls writes nothing for as long as it stalls:
+    /// here, silence pushed at real-time speed into the null muxer, so ffmpeg
+    /// runs for 30 s and never writes a byte to stdout. A cancel must stop it
+    /// at once. With the child only in a local, `Jobs::cancel` found nothing
+    /// to kill, the read blocked until ffmpeg ended by itself, and the job
+    /// kept its Background worker all that time.
+    #[test]
+    fn a_cancel_stops_a_decode_blocked_on_a_silent_source() {
+        let jobs = Arc::new(Jobs::default());
+        let handle = jobs.allocate(JobKind::Waveform);
+        let mut cmd = jobs::ffmpeg::command("ffmpeg").unwrap();
+        cmd.args(["-v", "error", "-re", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "30", "-f", "null", "-"]);
+        let dst = std::env::temp_dir().join(format!("taroting-waveform-stall-{}.pk", std::process::id()));
+        let _ = std::fs::remove_file(&dst);
+
+        let canceler = {
+            let (jobs, id) = (Arc::clone(&jobs), handle.id);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                jobs.cancel(id)
+            })
+        };
+        let started = std::time::Instant::now();
+        let result = decode_into(&handle, cmd, 30.0, &dst, &mut |_| {});
+        let took = started.elapsed();
+        assert!(canceler.join().unwrap(), "the job was registered");
+
+        assert!(matches!(&result, Err(AppError::Ffmpeg(m)) if m == "canceled"), "{result:?}");
+        assert!(took < std::time::Duration::from_secs(10), "the cancel waited for ffmpeg to end: {took:?}");
+        assert!(!dst.exists(), "a canceled decode wrote its peaks");
+    }
+
     /// `extract` needs an `AppHandle`, so its cancel guards are pinned in the
     /// source, over the code before the test module (the needles appear as
     /// literals here too). Order matters: the first guard must precede the spawn,
@@ -414,7 +480,7 @@ mod tests {
     #[test]
     fn extract_honours_cancel_before_spawn_and_before_writing() {
         let code = include_str!("waveform.rs").split("#[cfg(test)]").next().unwrap();
-        let body_start = code.find("fn extract(").expect("extract exists");
+        let body_start = code.find("fn decode_into(").expect("the decode exists");
         let end = code[body_start..].find("pub enum WaveformResult").expect("extract ends");
         // Whitespace-free, so the check survives a reformat and any line endings.
         let body: String = code[body_start..body_start + end].split_whitespace().collect();

@@ -71,10 +71,41 @@ impl OpenPathQueue {
 /// but it now runs only for a launch that slips into the milliseconds between
 /// that pre-check and the plugin's own check — and that abort is the second
 /// launch's alone; the running app never sees it.
-pub fn capture_launch_arg(queue: &OpenPathQueue) {
-    if let Some(arg) = first_file_arg(std::env::args_os()) {
+///
+/// Not for a process that crash.rs restarted after the display engine died
+/// (`engine_restart`): that restart runs with THIS session's original command
+/// line, so a session begun by double-clicking a clip would open that clip
+/// again — the viewer, or a fresh temporary project — instead of Home, where
+/// the work that was open is offered back.
+pub fn capture_launch_arg(queue: &OpenPathQueue, engine_restart: bool) {
+    if let Some(arg) = launch_file_arg(std::env::args_os(), engine_restart) {
         queue.push_os_if_file(&arg);
     }
+}
+
+/// `capture_launch_arg`'s decision, on an argv it is handed.
+fn launch_file_arg(args: impl Iterator<Item = OsString>, engine_restart: bool) -> Option<OsString> {
+    if engine_restart {
+        return None;
+    }
+    first_file_arg(args)
+}
+
+/// The environment variable crash.rs sets on itself just before it restarts
+/// the app after a dead engine. The restarted process inherits it (a spawned
+/// process gets its parent's environment) and is the only one that ever has
+/// it: `take_engine_restart_marker` removes it at once.
+pub const ENGINE_RESTART_ENV: &str = "TAROTING_ENGINE_RESTART";
+
+/// Whether this process is crash.rs's restart, removing the marker so no
+/// process this one starts (ffmpeg, a later restart) inherits it. Called once,
+/// first thing in `main()`'s launch handling, while only one thread runs.
+pub fn take_engine_restart_marker() -> bool {
+    let restarted = std::env::var_os(ENGINE_RESTART_ENV).is_some();
+    if restarted {
+        std::env::remove_var(ENGINE_RESTART_ENV);
+    }
+    restarted
 }
 
 /// The first argument after argv[0] that is an existing, losslessly-decodable
@@ -228,6 +259,9 @@ fn run_uninstaller(app: &tauri::AppHandle) -> Result<()> {
     if let Some(cache) = app.try_state::<std::sync::Arc<crate::cache::Cache>>() {
         cache.flush();
     }
+    // An orderly exit too, for the same reason: the next launch must not
+    // report it as one that ended without a word (crash.rs).
+    crate::crash::disarm_exit_watch();
 
     // uninstall.exe self-copies to %TEMP% and re-execs from there before it can
     // delete $INSTDIR; give it that beat before we let go of our own exe. The
@@ -794,6 +828,20 @@ mod tests {
 
         let argv = vec![os(r"C:\Users\John"), os(tail), file.clone().into_os_string()];
         assert_eq!(first_file_arg(argv.into_iter()), Some(file.into_os_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restart after a dead engine carries the session's ORIGINAL argv. The
+    /// same argv, naming a real file, opens it on a normal launch and opens
+    /// nothing on the restart.
+    #[test]
+    fn an_engine_restart_never_reopens_the_launch_file() {
+        let dir = temp_dir("argv-restart");
+        let file = dir.join("clip.mp4");
+        std::fs::write(&file, b"x").unwrap();
+        let argv = || vec![os(r"C:\Taroting\taroting.exe"), file.clone().into_os_string()].into_iter();
+        assert_eq!(launch_file_arg(argv(), false), Some(file.clone().into_os_string()), "fixture: a launch file");
+        assert_eq!(launch_file_arg(argv(), true), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

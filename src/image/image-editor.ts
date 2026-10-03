@@ -736,13 +736,23 @@ function mount(
   onClick($("#imged-zoom-in"), () => zoomBy(1));
   onClick(zoomBtn, () => view.fit());
   const menuBtn = $("#imged-menu");
-  // Open FIRST, blur after: the menu records the focused element as the one to
-  // return focus to, so blurring first would hand a keyboard user back to
-  // <body> on Escape. The blur still frees Space for panning after a click.
-  // A keyboard activation (detail 0) opens with the first row focused.
+  // The menu records the focused element as the one to hand focus back to when
+  // it closes, and a mouse pick closes it holding focus (hovering a row
+  // focuses it). So a POINTER open blurs FIRST: had the button been recorded,
+  // a pick that does not move focus itself (Rotate, Flip) would land focus
+  // back on it, the view yields Space to a focused button, and the next hold
+  // to pan would click it instead — reopening the menu on its first row, Crop
+  // canvas, which a second Space would then choose. A KEYBOARD activation
+  // (detail 0) opens first, blurs after: it starts on the first row, focused,
+  // and Escape returns to the button rather than to <body>.
   menuBtn.addEventListener("click", (e) => {
-    openImageMenu(menuBtn, ctx, e.detail === 0);
-    menuBtn.blur();
+    if (e.detail > 0) {
+      menuBtn.blur();
+      openImageMenu(menuBtn, ctx, false);
+    } else {
+      openImageMenu(menuBtn, ctx, true);
+      menuBtn.blur();
+    }
   });
   refreshUndo();
   unsubs.push(mode.subscribe(refreshUndo));
@@ -1142,8 +1152,16 @@ function mount(
       runTeardown(undo);
       if (raf) window.cancelAnimationFrame(raf);
       raf = 0;
-      await writeThumbIfOwed((m) => blobs.get(m.id) ?? null);
+      // Unpublished before the first await, as the video editor does. The
+      // card render below can take up to THUMB_CAP_MS, and a permanent
+      // project's leave (ui/temp-project leavePermanent) navigates only while
+      // `currentSession` is still the screen it was asked from: left set
+      // through that wait, a leave save landing (or "Leave anyway") meanwhile
+      // still navigated Home over a file an Explorer open had just shown. Only
+      // what is still ours is cleared — a newer mount may already own it. The
+      // render reads the session itself, never `currentSession`.
       if (currentSession.get() === session) currentSession.set(null);
+      await writeThumbIfOwed((m) => blobs.get(m.id) ?? null);
       await session.dispose();
     },
   };

@@ -62,7 +62,7 @@ use tauri::utils::config::FrontendDist;
 use tauri::utils::mime_type::MimeType;
 use tauri::{Manager, Runtime, Url};
 
-use crate::media::source::{is_device_path, is_file_namespace};
+use crate::media::source::{is_device_path, is_file_namespace, may_touch};
 
 /// The most bytes one ranged answer carries: the built-in's `MAX_LEN`. A media
 /// element asks again from where the last answer ended, so this bounds each
@@ -276,12 +276,26 @@ fn get_response(
     } else {
         // Bounded by `max_whole` above, and by `take`, so a file that grew
         // since the stat cannot make this read more than was measured.
-        let mut buf = Vec::with_capacity(len as usize);
+        let Some(mut buf) = whole_buffer(len) else {
+            return Ok(empty(StatusCode::SERVICE_UNAVAILABLE, origin));
+        };
         file.seek(SeekFrom::Start(0))?;
         (&mut file).take(len).read_to_end(&mut buf)?;
         buf
     };
     build(ok.header(CONTENT_LENGTH, body.len()), body)
+}
+
+/// Room for a whole-file answer of `len` bytes, or `None` when the memory is
+/// not there. Up to 2 GiB, several at once (each request has its own
+/// thread): `Vec::with_capacity` on a machine short of memory does not fail,
+/// it ABORTS the process (`handle_alloc_error`), with no panic and no note —
+/// the app simply vanished. Refused, one picture fails to load instead.
+fn whole_buffer(len: u64) -> Option<Vec<u8>> {
+    let len = usize::try_from(len).ok()?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len).ok()?;
+    Some(buf)
 }
 
 /// A multi-range request: one `multipart/byteranges` body whose parts carry
@@ -394,7 +408,7 @@ fn plausible_file_path(path: &str) -> bool {
         return false;
     }
     let p = Path::new(path);
-    p.is_absolute() && is_file_namespace(p)
+    p.is_absolute() && is_file_namespace(p) && may_touch(p)
 }
 
 /// `percent_encoding::percent_decode(..).decode_utf8_lossy()`, which the
@@ -520,6 +534,18 @@ fn random_boundary() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A whole-file buffer the allocator cannot give is refused, never an
+    /// abort. `isize::MAX + 1` bytes is more than any allocator can hand out
+    /// (the capacity check refuses it before asking), and is what
+    /// `with_capacity` turns into a panic — an abort in a release build.
+    #[test]
+    fn a_whole_file_buffer_that_does_not_fit_is_refused_not_an_abort() {
+        assert!(whole_buffer(isize::MAX as u64 + 1).is_none());
+        assert!(whole_buffer(u64::MAX).is_none());
+        let small = whole_buffer(4096).expect("a small buffer fits");
+        assert!(small.capacity() >= 4096 && small.is_empty());
+    }
     use std::cell::{Cell, RefCell};
 
     const ORIGIN: &str = "http://tauri.localhost";

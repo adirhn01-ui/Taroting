@@ -198,6 +198,11 @@ fn display_engine_failed<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 /// `RunEvent::Exit` has gone by.
 fn on_run_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: tauri::RunEvent) {
     flush_cache_on(&event, || app.try_state::<Arc<cache::Cache>>().map(|c| c.inner().clone()));
+    // An orderly exit: the next launch must not report this run as one that
+    // ended without a word (crash.rs).
+    if matches!(event, tauri::RunEvent::Exit) {
+        crash::disarm_exit_watch();
+    }
 }
 
 /// On the way out, write the cache index's coalesced last-use stamps. Managed
@@ -238,7 +243,9 @@ fn main() {
     // the frontend can drain it once the settings are ready.
     // The same queue also receives second-launch paths.
     let open_paths = os::OpenPathQueue::default();
-    os::capture_launch_arg(&open_paths);
+    // A restart after a dead display engine (crash.rs) carries this session's
+    // first command line; its file is not opened again.
+    os::capture_launch_arg(&open_paths, os::take_engine_restart_marker());
     // Read now, while the queue is still ours: `.manage()` below moves it.
     let launch_file = os::queued_known_launch(&open_paths);
     // The launch's own file counts as just opened: a second double-click on
@@ -327,6 +334,25 @@ fn main() {
                 return Ok(());
             };
 
+            // The window is created hidden (`"visible": false` in
+            // tauri.conf.json) and shown only here, once this process is known
+            // to be the primary instance and its page exists. Created visible,
+            // a launch that lost the race above flashed an empty window — or
+            // showed it "Not Responding" for up to 20 s while it waited on a
+            // busy primary — before handing over. Under autotest the window is
+            // concealed BEFORE it is ever shown, so it never appears on screen.
+            if autotest_mode() {
+                conceal_autotest_window(&win);
+            }
+            let _ = win.show();
+            // And again once shown: the taskbar exclusion is a call on the
+            // shell's taskbar list, and nothing promises it survives the
+            // ShowWindow that maps the window — re-applied, it holds whatever
+            // ShowWindow did. Idempotent, and autotest only.
+            if autotest_mode() {
+                conceal_autotest_window(&win);
+            }
+
             // Wipe leftover quick-view scratch projects from a prior run. HERE,
             // not at the top of main(): only the primary instance reaches this
             // point (a second launch hands over in main() or just above), and
@@ -338,6 +364,11 @@ fn main() {
                 // projects there), and leaves nothing in the owner's folders.
                 let _ = std::fs::remove_dir_all(debug::autotest_root());
             }
+            // From here on, a run that ends without a word is reported by the
+            // next launch (crash.rs). After the autotest wipe above, and only
+            // in the primary instance: a second launch would find this one's
+            // marker and report a crash that is not one.
+            crash::arm_exit_watch();
             project::store::cleanup_temp_projects();
             // Half-written cache files a dead run left behind, on a thread of
             // its own. Here for the same reason as the sweep above: in a
@@ -347,11 +378,11 @@ fn main() {
             if let Some(cache) = app.try_state::<Arc<cache::Cache>>() {
                 cache::sweep_stale_partials_in_background(&cache);
             }
-            // Autotest only: conceal the window as soon as it exists. A normal
-            // run never enters the branch and launches exactly as before.
-            if autotest_mode() {
-                conceal_autotest_window(&win);
-            }
+            // Export `.part`s an earlier run claimed and never released (a
+            // crash, a kill, an app closed with an export queued), on a thread
+            // of its own. Here for the same reason: only the primary instance,
+            // and before any export of this run can exist.
+            export::claims::sweep_stale_in_background();
             // Reload a page whose process died (with a notice), restart
             // the app if the whole WebView2 engine did (crash.rs).
             crash::watch_webview(&win);
@@ -500,10 +531,50 @@ mod tests {
             .find("cache::sweep_stale_partials_in_background(&cache);")
             .expect("setup must sweep the cache's stale partials");
         assert!(primary < temp && temp < partials, "the sweeps run after the hand-over, temp projects first");
+        let claims = setup
+            .find("export::claims::sweep_stale_in_background();")
+            .expect("setup must sweep the export claims an earlier run left");
+        let wipe = setup.find("debug::autotest_root()").expect("the autotest wipe");
+        assert!(primary < claims && wipe < claims, "the claims sweep runs in the primary, after the autotest wipe");
+        let watch = setup.find("crash::arm_exit_watch();").expect("setup must arm the unclean-exit watch");
+        assert!(primary < watch && wipe < watch, "the exit watch is armed in the primary, after the autotest wipe");
+        // Line endings as checked out (CRLF here) must not decide the search.
+        let code = code.replace('\r', "");
+        let run = &code[code.find("fn on_run_event").expect("the run-loop callback")..];
+        let run = &run[..run.find("\n}\n").unwrap()];
+        assert!(run.contains("crash::disarm_exit_watch();"), "an orderly exit must disarm the watch");
         assert!(
             setup[..partials].contains("app.try_state::<Arc<cache::Cache>>()"),
             "a disabled cache is not managed: look it up with try_state, never state"
         );
+    }
+
+    /// The main window starts hidden and is shown in `.setup()` only after
+    /// the second-launch hand-over (a launch that hands over never shows a
+    /// window) and, under autotest, only after it is concealed. Pinned in the
+    /// source and the config: `.setup()` needs a running app.
+    #[test]
+    fn the_window_is_shown_only_by_the_primary_and_after_the_autotest_conceal() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let main = &conf["app"]["windows"][0];
+        assert_eq!(main["label"], "main");
+        assert_eq!(main["visible"], false, "the window must be created hidden");
+        let code = include_str!("main.rs").split("#[cfg(test)]").next().unwrap();
+        let setup = &code[code.find(".setup(|app| {").expect("the setup hook")..];
+        let handed_over = setup.find("forward.ends_launch()").expect("the second-launch hand-over");
+        let conceal = setup.find("conceal_autotest_window(&win);").expect("the autotest conceal");
+        let show = setup.find("win.show()").expect("setup must show the window");
+        assert!(handed_over < show, "shown before the hand-over was decided");
+        assert!(conceal < show, "shown before the autotest conceal");
+        // Re-applied right after the show, still under autotest only, and
+        // before anything else in setup runs.
+        let after = &setup[show..];
+        let again = after.find("conceal_autotest_window(&win);").expect("the conceal re-applied after show");
+        let next = after.find("crash::arm_exit_watch();").expect("the rest of setup");
+        assert!(again < next, "the re-conceal must come straight after the show");
+        let between = &after[..again];
+        assert!(between.contains("if autotest_mode() {"), "the re-conceal is autotest only");
+        assert!(!between.contains("let "), "nothing runs between the show and the re-conceal");
     }
 
     /// Every input flips the answer on its own in at least one row.

@@ -3,7 +3,7 @@ import type { JobDone, JobEventHandlers, JobFailed, PlaybackPlan, WaveformResult
 import { ipc } from "../../core/ipc";
 import { createProject } from "../../core/project";
 import type { MediaRef, ProjectFile } from "../../core/types";
-import { MediaManager, ORPHAN_KEEP } from "./media";
+import { ABANDON_GRACE_MS, abandonsPlayback, MediaManager, ORPHAN_KEEP } from "./media";
 
 /**
  * WHAT THIS FILE IS ABOUT: which preparation jobs a MediaManager cancels, and
@@ -42,6 +42,13 @@ vi.mock("../../core/ipc", async (importOriginal) => {
 });
 
 afterEach(() => {
+  // Fire any grace timer a test left pending BEFORE the spies go: the
+  // abandoned-job map is module state, and an entry left behind would make a
+  // later test's abandon of the same id a silent no-op.
+  if (vi.isFakeTimers()) {
+    vi.runOnlyPendingTimers();
+    vi.useRealTimers();
+  }
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   handlers = {};
@@ -111,9 +118,11 @@ describe("MediaManager cancel at dispose", () => {
     expect(cancel.mock.calls.map((c) => c[0])).toEqual([78]);
   });
 
-  it("cancels its playback jobs too when the project was discarded", async () => {
-    // A discarded temporary project is deleted right after this dispose: no
-    // open will ever rejoin its proxies, so they go with the waveforms.
+  it("abandons its playback jobs when the project was discarded: canceled after the grace window", async () => {
+    // A discarded temporary project is deleted right after this dispose. Its
+    // proxies are not canceled on the spot (the next editor may want them) but
+    // once nobody has joined them in ABANDON_GRACE_MS. Waveforms go at once.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
     vi.spyOn(ipc, "planPlayback").mockImplementation(
       async (m) => ({ mode: "pending", jobId: m.id === "a" ? 41 : 42, output: "o" }) as PlaybackPlan,
@@ -126,11 +135,48 @@ describe("MediaManager cancel at dispose", () => {
     const m = new MediaManager(() => p);
     m.ensureAll(p);
     await settle();
-    m.dispose({ cancelPlayback: true });
+    m.dispose({ abandonPlayback: true });
+    expect(cancel.mock.calls.map((c) => c[0]).sort()).toEqual([51, 52]);
+    vi.advanceTimersByTime(ABANDON_GRACE_MS - 1);
+    expect(cancel.mock.calls.map((c) => c[0]).sort()).toEqual([51, 52]);
+    vi.advanceTimersByTime(1);
     expect(cancel.mock.calls.map((c) => c[0]).sort()).toEqual([41, 42, 51, 52]);
   });
 
-  it("an explicit cancelPlayback: false is the ordinary dispose", async () => {
+  it("an untouched quick view reopened on the same file keeps its proxy: the next editor claims it", async () => {
+    // The 0.9.1 regression: an untouched temporary project is discarded
+    // without a question, and canceling its proxy at dispose restarted the
+    // transcode the very next editor — showing the same file — was about to
+    // join. Here the second manager joins job 41; job 42 (a file the second
+    // project does not have) is still canceled when the window ends.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
+    vi.spyOn(ipc, "planPlayback").mockImplementation(
+      async (m) => ({ mode: "pending", jobId: m.path.includes("a.mov") ? 41 : 42, output: "o" }) as PlaybackPlan,
+    );
+    vi.spyOn(ipc, "ensureWaveform").mockResolvedValue({ state: "none" });
+    const cancel = vi.spyOn(ipc, "cancelJob").mockResolvedValue(true);
+    const first = projectOf(media("a"), media("b"));
+    const m1 = new MediaManager(() => first);
+    m1.ensureAll(first);
+    await settle();
+    m1.dispose({ abandonPlayback: true });
+
+    // A new project (new media ids) on the same file, partway into the window.
+    vi.advanceTimersByTime(ABANDON_GRACE_MS / 2);
+    const again: MediaRef = { ...media("a"), id: "a-again" };
+    const second = projectOf(again);
+    const m2 = new MediaManager(() => second);
+    m2.ensureAll(second);
+    await settle();
+    expect(m2.status.get()["a-again"]).toEqual({ state: "preparing", ratio: null, jobId: 41 });
+
+    vi.advanceTimersByTime(ABANDON_GRACE_MS);
+    expect(cancel.mock.calls.map((c) => c[0])).toEqual([42]);
+    m2.dispose();
+  });
+
+  it("an explicit abandonPlayback: false is the ordinary dispose", async () => {
     vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
     vi.spyOn(ipc, "planPlayback").mockResolvedValue({ mode: "pending", jobId: 41, output: "o" });
     vi.spyOn(ipc, "ensureWaveform").mockResolvedValue({ state: "pending", jobId: 51, output: "w" });
@@ -139,11 +185,12 @@ describe("MediaManager cancel at dispose", () => {
     const m = new MediaManager(() => p);
     m.ensureAll(p);
     await settle();
-    m.dispose({ cancelPlayback: false });
+    m.dispose({ abandonPlayback: false });
     expect(cancel.mock.calls.map((c) => c[0])).toEqual([51]);
   });
 
-  it("after a discarding dispose, cancels a pending plan that answers late — but not a direct one", async () => {
+  it("after a discarding dispose, abandons a pending plan that answers late — but not a direct one", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
     let ra!: (v: PlaybackPlan) => void;
     let rb!: (v: PlaybackPlan) => void;
@@ -154,11 +201,13 @@ describe("MediaManager cancel at dispose", () => {
     const m = new MediaManager(() => p);
     m.ensureAll(p);
     await settle();
-    m.dispose({ cancelPlayback: true });
+    m.dispose({ abandonPlayback: true });
     expect(cancel).not.toHaveBeenCalled();
     ra({ mode: "pending", jobId: 77, output: "o" });
     rb({ mode: "direct", path: "D:\\b.mov" });
     await settle();
+    expect(cancel).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(ABANDON_GRACE_MS);
     // The pending one was started for this project and is registered nowhere:
     // this is the only chance to stop it. A direct play has no job at all.
     expect(cancel.mock.calls.map((c) => c[0])).toEqual([77]);
@@ -489,5 +538,16 @@ describe("MediaManager when a job's end arrives before the plan names it", () =>
       sourcePath: "C:\\cache\\remux\\c-final.mp4",
     });
     m.dispose();
+  });
+});
+
+describe("abandonsPlayback", () => {
+  it("abandons only a discarded project that is not going back to the viewer", () => {
+    expect(abandonsPlayback(true, false)).toBe(true);
+    // Viewer → Edit → Back: the viewer re-shows the file on the same job and
+    // cannot claim it from the grace timer.
+    expect(abandonsPlayback(true, true)).toBe(false);
+    expect(abandonsPlayback(false, false)).toBe(false);
+    expect(abandonsPlayback(false, true)).toBe(false);
   });
 });

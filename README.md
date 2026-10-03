@@ -82,11 +82,11 @@ The app is not code-signed yet, so Windows SmartScreen may warn on first launch 
 
 Performance is the project's #1 veto criterion: a release may not regress the previous release's cold start or idle RAM. On the reference machine (Windows 11, NVMe, WebView2 Evergreen):
 
-| Metric | v0.6.0 |
+| Metric | v0.9.0 |
 |---|---|
-| Cold start → window (first launch, incl. Defender scan) | ~1.25 s |
-| Cold start → window (warm) | ~0.17 s |
-| Idle RAM, home screen (app + WebView2) | ~358 MB |
+| Start → window, first launch of a new build (incl. Defender scan) | ~0.13 s |
+| Start → window (warm) | under 0.05 s |
+| Idle RAM, home screen (app + WebView2) | ~364 MB |
 
 Every feature runs entirely on your hardware and adds zero resource overhead when unused: unlimited layers, keyframes, markers, generators, and canvas manipulation sit idle for free. Memory only grows when you actually load and decode video (a single H.264 clip in the preview adds ~130 MB for the WebView2 media decoder, which is released when no video element is active). See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the full method and numbers.
 

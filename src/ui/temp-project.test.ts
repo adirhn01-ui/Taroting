@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import { ipc } from "../core/ipc";
 import { addMarkerAt, createProject } from "../core/project";
-import { ProjectSession } from "../core/session";
+import { currentSession, ProjectSession } from "../core/session";
 import {
   createTempExits,
   createTempLeaveGateWith,
@@ -730,6 +730,82 @@ describe("createTempLeaveGateWith — a permanent project with unsaved edits", (
     expect(askLeave).toHaveBeenCalledTimes(1);
     expect([first.dests, first.cancels]).toEqual([0, 1]);
     expect(gate.busy).toBe(false);
+  });
+
+  /* The leave is asynchronous now (the save, or the question), and an Explorer
+   * open that had already passed its own check could replace the screen in
+   * the meantime: Back's dest() then navigated Home over the file just
+   * opened. The screen it was asked from is gone, so the leave cancels. */
+  describe("the screen changes while the save is out", () => {
+    afterEach(() => {
+      currentSession.set(null);
+    });
+
+    /** saveProject held open until the test lets it land. */
+    function heldSave(): () => void {
+      let land: () => void = () => {};
+      vi.spyOn(ipc, "saveProject").mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            land = () => resolve({ modifiedAt: "2026-10-03T10:15:00.000Z" });
+          }),
+      );
+      return () => land();
+    }
+
+    it("a save that lands after another project took the screen cancels instead of navigating", async () => {
+      const land = heldSave();
+      const s = permanentSession();
+      currentSession.set(s);
+      const askLeave = vi.fn(async () => true);
+      const o = outcome();
+      createTempLeaveGateWith(s, async () => "discard", askLeave).confirmLeave(o.dest, o.cancel);
+      await settle();
+      // The open's navigation: the old editor lets go, the new one publishes.
+      const opened = new ProjectSession(TEMP_PATH, createProject("Opened from Explorer"), { temp: true });
+      sessions.push(opened);
+      currentSession.set(opened);
+      land();
+      await settle();
+      await settle();
+      expect([o.dests, o.cancels]).toEqual([0, 1]);
+      expect(askLeave).not.toHaveBeenCalled();
+    });
+
+    it("the same leave with the screen unchanged still goes", async () => {
+      const land = heldSave();
+      const s = permanentSession();
+      currentSession.set(s);
+      const o = outcome();
+      createTempLeaveGateWith(s, async () => "discard", async () => true).confirmLeave(o.dest, o.cancel);
+      await settle();
+      land();
+      await settle();
+      await settle();
+      expect([o.dests, o.cancels]).toEqual([1, 0]);
+    });
+
+    it("Leave anyway answered after the screen changed cancels too", async () => {
+      vi.spyOn(ipc, "saveProject").mockRejectedValue(new Error("Access is denied."));
+      const s = permanentSession();
+      currentSession.set(s);
+      let answer: (v: boolean) => void = () => {};
+      const askLeave = vi.fn(
+        () =>
+          new Promise<boolean>((resolve) => {
+            answer = resolve;
+          }),
+      );
+      const o = outcome();
+      createTempLeaveGateWith(s, async () => "discard", askLeave).confirmLeave(o.dest, o.cancel);
+      await settle();
+      await settle();
+      expect(askLeave).toHaveBeenCalledTimes(1);
+      currentSession.set(null); // the editor disposed under the question
+      answer(true);
+      await settle();
+      expect([o.dests, o.cancels]).toEqual([0, 1]);
+    });
   });
 });
 

@@ -442,6 +442,48 @@ describe("pooled <video> errors", () => {
     expect(media.failed).toEqual([]);
   });
 
+  it("reloads the element when the same file comes back ready under a new id", () => {
+    // Remove the Failed media and re-import the file (or Replace media with
+    // it): a new id, the SAME url. The element kept its error, and assign
+    // skipped the src write because the url had not changed — "Ready" in the
+    // bin over a black stage.
+    const a = videoMedia("flaky", 40);
+    let project = projectOf([a], [[clipOf(a, 0, 1, 3, 1)]]);
+    const stage = fakeStage();
+    const media = fakeMedia(ready(a));
+    const sched = new Scheduler(stage, () => project, media);
+    sched.activate(0.5, false);
+    const set = stage.sets[0]!;
+    expect(set.a.srcWrites).toBe(1);
+    set.a.error = { code: 4 };
+    set.a.fire("error");
+    media.statuses[a.id] = { state: "failed", message: "This file couldn't be played" };
+
+    const again: MediaRef = { ...a, id: `${a.id}-reimported` };
+    project = projectOf([a, again], [[clipOf(again, 0, 2, 6, 1)]]);
+    media.statuses[again.id] = readyStatus(again);
+    sched.activate(0.75, false);
+
+    expect(set.a.src).toBe(`url:${a.path}`);
+    expect(set.a.srcWrites).toBe(2);
+  });
+
+  it("does not reload an element that did not fail", () => {
+    // The other half of the rule: a healthy slot re-shown under a new id with
+    // the same url keeps its loaded element (no black flash, no re-buffer).
+    const a = videoMedia("fine", 40);
+    let project = projectOf([a], [[clipOf(a, 0, 1, 3, 1)]]);
+    const stage = fakeStage();
+    const media = fakeMedia(ready(a));
+    const sched = new Scheduler(stage, () => project, media);
+    sched.activate(0.5, false);
+    const again: MediaRef = { ...a, id: `${a.id}-again` };
+    project = projectOf([a, again], [[clipOf(again, 0, 2, 6, 1)]]);
+    media.statuses[again.id] = readyStatus(again);
+    sched.activate(0.75, false);
+    expect(stage.sets[0]!.a.srcWrites).toBe(1);
+  });
+
   it("stops listening on dispose", () => {
     const { sched, media, set } = setup();
     expect(set.a.listenerCount("error")).toBe(1);

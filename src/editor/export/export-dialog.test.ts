@@ -7,6 +7,7 @@ import {
   EXPORT_RUNNING_REASON,
   codecsForFormat,
   destinationProblem,
+  driveRootFolder,
   exportHasAudio,
   fontHasGlyph,
   HW_FALLBACK_NOTE,
@@ -63,8 +64,26 @@ describe("destinationProblem", () => {
     }
   });
   it("refuses anything that is not a full path", () => {
-    for (const bad of ["Videos", "./out", "..\\out", "C:", "C:Videos", "\\Videos", "\\\\", "/home/me"]) {
+    for (const bad of ["Videos", "./out", "..\\out", "C:Videos", "d:clips", "\\Videos", "\\\\", "/home/me"]) {
       expect(destinationProblem(bad), bad).toBe("Enter a full folder path, like C:\\Videos, or choose one.");
+    }
+  });
+  it("takes a bare drive as that drive's root — the shape 0.9.0 remembered", () => {
+    // A settings.lastExportDir of "D:" from 0.9.0 refused every export after
+    // the upgrade. joinPath restores the separator the folder is missing.
+    expect(destinationProblem("D:")).toBeNull();
+    expect(joinPath("D:", "clip.mp4")).toBe("D:\\clip.mp4");
+  });
+  it("accepts the folder its own Save As hands back for a drive root", () => {
+    // splitPath and the check had never met in a test: the dialog took a
+    // picked "E:\holiday.mp4" apart into "E:" and then refused it. A different
+    // drive and both separators, so this cannot pass on the bare-drive rule
+    // above alone being right for "D:".
+    for (const picked of ["E:\\holiday.mp4", "f:/holiday.webm"]) {
+      const { dir, file } = splitPath(picked);
+      expect(dir, picked).toMatch(/^[A-Za-z]:[\\/]$/);
+      expect(destinationProblem(dir), picked).toBeNull();
+      expect(joinPath(dir, file), picked).toBe(picked);
     }
   });
   it("asks for a folder when there is none", () => {
@@ -511,6 +530,21 @@ describe("splitPath", () => {
   });
   it("handles a bare file name", () => {
     expect(splitPath("out.mp4")).toEqual({ dir: "", file: "out.mp4" });
+  });
+  it("keeps a drive root's separator", () => {
+    expect(splitPath("D:\\video.mp4")).toEqual({ dir: "D:\\", file: "video.mp4" });
+    expect(splitPath("e:/clip.mov")).toEqual({ dir: "e:/", file: "clip.mov" });
+    // One level down is an ordinary cut.
+    expect(splitPath("D:\\Out\\video.mp4")).toEqual({ dir: "D:\\Out", file: "video.mp4" });
+  });
+});
+
+describe("driveRootFolder", () => {
+  it("turns a bare drive into its root and leaves everything else alone", () => {
+    expect(driveRootFolder("G:")).toBe("G:\\");
+    for (const same of ["", "C:\\", "C:\\Videos", "D:Videos", "\\\\nas\\share"]) {
+      expect(driveRootFolder(same), same).toBe(same);
+    }
   });
 });
 

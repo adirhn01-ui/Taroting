@@ -16,7 +16,8 @@
 import { flushOrAsk, type AskAnyway } from "../core/app-close";
 import { describeError, ipc } from "../core/ipc";
 import { isTempProjectPath } from "../core/open-media";
-import type { ProjectSession } from "../core/session";
+import { currentSession, type ProjectSession } from "../core/session";
+import { closeWithScreen, placeOverlay } from "./errors";
 import { focusFirst, trapTab } from "./focus";
 import { icon } from "./icons";
 import { toast } from "./toast";
@@ -41,7 +42,11 @@ export function askKeepTemp(): Promise<KeepChoice> {
           <button class="btn btn--primary" data-act="keep">Keep project</button>
         </div>
       </div>`;
-    document.body.appendChild(backdrop);
+    // Not simply <body>: during theater fullscreen (Ctrl+W, the window's X, an
+    // Explorer open) that is behind the top layer — open, focused on Keep, and
+    // invisible, so the Space pressed out of play/pause habit kept the project
+    // without the user ever seeing the question. See errors.ts `placeOverlay`.
+    const releasePlacement = placeOverlay(backdrop);
 
     const releaseTrap = trapTab(backdrop);
     let closed = false;
@@ -54,6 +59,7 @@ export function askKeepTemp(): Promise<KeepChoice> {
       closed = true;
       releaseTrap();
       document.removeEventListener("keydown", onKey, true);
+      releasePlacement();
       backdrop.remove();
       resolve(choice);
     };
@@ -129,8 +135,9 @@ export async function discardTempSession(session: ProjectSession): Promise<void>
 
 export interface TempLeaveGate {
   /** Busy → onCancel. Already discarded, or permanent with nothing unsaved → dest() now.
-   *  Permanent with unsaved edits → flushOrAsk: landed or "Leave anyway" → dest, Stay →
-   *  onCancel. Temp and never edited → discardTempSession → dest, without asking. Temp and edited →
+   *  Permanent with unsaved edits → flushOrAsk: landed or "Leave anyway" → dest, Stay, or
+   *  `currentSession` changed meanwhile (the screen is already gone) → onCancel. Temp and
+   *  never edited → discardTempSession → dest, without asking. Temp and edited →
    *  askKeepTemp():keep → keepTempSession → dest; discard → discardTempSession →
    *  dest; cancel, re-entrancy bail, or keep failure (toast) → onCancel. EXACTLY ONE
    *  of dest/onCancel fires, on every path. */
@@ -213,6 +220,14 @@ export function createTempLeaveGateWith(
 
   const leavePermanent = async (dest: () => void, onCancel?: () => void): Promise<void> => {
     let proceed = false;
+    // The screen this leave was asked from. The save (up to seconds) or the
+    // question can outlast it: an Explorer open that had already passed its own
+    // check (core/app-close `leaving` holds only during that check) goes on to
+    // probe the file and navigate, and this dest() then navigated Home or to
+    // Settings over the file just opened. Once the screen has changed, the
+    // leave has nothing left to leave and cancels instead. Before 0.9.1 this
+    // branch called dest() at once, so there was no window for it.
+    const screen = currentSession.get();
     try {
       proceed = await flushOrAsk(session, "leave", askLeave);
     } catch (e) {
@@ -221,7 +236,7 @@ export function createTempLeaveGateWith(
     } finally {
       // Released before either callback, as in run(): exactly one fires.
       busy = false;
-      if (proceed) dest();
+      if (proceed && currentSession.get() === screen) dest();
       else onCancel?.();
     }
   };
@@ -389,7 +404,8 @@ export function askCloseAnyway(message: string, verb: "close" | "leave" = "close
       </div>`;
     // textContent, not markup: the message is plain copy from the caller.
     backdrop.querySelector(".modal__text")!.textContent = message;
-    document.body.appendChild(backdrop);
+    // Inside the fullscreen theater when there is one, as in askKeepTemp.
+    const releasePlacement = placeOverlay(backdrop);
 
     const releaseTrap = trapTab(backdrop);
     let closed = false;
@@ -400,9 +416,19 @@ export function askCloseAnyway(message: string, verb: "close" | "leave" = "close
       closed = true;
       releaseTrap();
       document.removeEventListener("keydown", onKey, true);
+      releasePlacement();
+      releaseScreen();
       backdrop.remove();
       resolve(closeAnyway);
     };
+    // A LEAVE question belongs to the screen it asks about. An Explorer open
+    // already past its own check can replace that screen while the question is
+    // up, and the prompt then sat over the NEW screen: Stay meant nothing, and
+    // "Leave anyway" navigated away from the file just opened. The router's
+    // screen change answers it Stay instead (the leave then cancels). Not a
+    // CLOSE question: that one is about the window, and a navigation finishing
+    // under it must not silently turn the user's pending close into a stay.
+    const releaseScreen = verb === "leave" ? closeWithScreen(() => finish(false)) : () => {};
     function onKey(e: KeyboardEvent): void {
       if (e.key === "Escape") {
         e.preventDefault();

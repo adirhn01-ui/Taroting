@@ -432,6 +432,28 @@ describe("layers panel: Add layer > Photo", () => {
   });
 });
 
+describe("layers panel: row options button", () => {
+  it("a pointer open of a row's options blurs the button BEFORE the menu records the focus", async () => {
+    // The menu hands focus back to what was focused when it opened; the view
+    // yields Space to a focused button. Recorded focused, the button would
+    // take the next hold to pan and reopen this menu.
+    const t = mount(1);
+    const more = t.row(t.solidId).find((e) => e.cls.has("imged-layer__more"))!;
+    const blurs: number[] = [];
+    more.blur = () => void blurs.push(menu.items.length);
+    t.list.fire("click", { target: more, detail: 1, stopPropagation() {} });
+    expect(blurs).toEqual([0]); // blurred, while no menu was open yet
+    expect(menu.items.map((i) => i.label)).toContain("Rename");
+    // Control: a keyboard activation keeps the button as the opener.
+    blurs.length = 0;
+    menu.items = [];
+    t.list.fire("click", { target: more, detail: 0, stopPropagation() {} });
+    expect(blurs).toEqual([]);
+    expect(menu.items.map((i) => i.label)).toContain("Rename");
+    t.handle.dispose();
+  });
+});
+
 describe("layers panel: Duplicate", () => {
   const pen = (x: number): Stroke => ({ t: "line", c: "#112233", w: 3, a: [x, 1], b: [x + 5, 9] });
 

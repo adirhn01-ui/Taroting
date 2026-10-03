@@ -503,6 +503,12 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   let savingReport = false;
   /** The Uninstall confirm is up: a second one must never stack on it. */
   let uninstallOpen = false;
+  /** Uninstall was confirmed and the backend has not answered: on success the
+   *  app exits (~300 ms after uninstall.exe starts, plus the cache flush), so
+   *  until then the dialog cannot be left and no second one can open — either
+   *  would let a second Confirm start a second uninstaller. Cleared only by a
+   *  failure. */
+  let uninstalling = false;
   let capturing: ActionId | null = null;
   let captureCleanup: (() => void) | null = null;
   // An open colour picker is anchored to a button inside `inner`, so a full
@@ -1309,7 +1315,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   function confirmUninstall(): void {
     // Nothing new goes onto document.body once the screen is gone: teardown has
     // already run, so there would be no owner left to close it.
-    if (disposed || uninstallOpen) return;
+    if (disposed || uninstallOpen || uninstalling) return;
     uninstallOpen = true;
     const backdrop = document.createElement("div");
     backdrop.className = "modal-backdrop";
@@ -1352,6 +1358,9 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
      *  the dialog (re-queried, a render may have replaced it). Teardown calls
      *  plain `close` — there is no screen left to return to. */
     const dismiss = (): void => {
+      // Escape, the backdrop and Cancel all come here; none of them may close
+      // a dialog whose uninstall is under way (see `uninstalling`).
+      if (uninstalling) return;
       close();
       if (!disposed) inner.querySelector<HTMLElement>("#settings-uninstall")?.focus({ preventScroll: true });
     };
@@ -1366,7 +1375,8 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     backdrop.addEventListener("mousedown", (e) => {
       if (e.target === backdrop) dismiss();
     });
-    backdrop.querySelector("[data-cancel]")!.addEventListener("click", dismiss);
+    const cancelBtn = backdrop.querySelector<HTMLButtonElement>("[data-cancel]")!;
+    cancelBtn.addEventListener("click", dismiss);
     const confirmBtn = backdrop.querySelector<HTMLButtonElement>("[data-confirm]")!;
     confirmBtn.addEventListener("click", () => {
       // The second lock, matching the delete confirms on home: a torn-down
@@ -1376,10 +1386,16 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       if (disposed || confirmBtn.disabled) return;
       // One uninstaller. On success the backend waits ~300 ms for uninstall.exe
       // to re-launch itself before the app exits, and a second click inside
-      // that window used to start a second wizard.
+      // that window used to start a second wizard. Disabling Confirm covers
+      // this dialog; `uninstalling` covers the way round it — Escape, then
+      // Uninstall and Confirm again in a fresh dialog. Cancel is disabled too,
+      // so the dialog does not offer a way out it would then ignore.
+      uninstalling = true;
       confirmBtn.disabled = true;
+      cancelBtn.disabled = true;
       // On success the app process exits before this promise resolves.
       void ipc.uninstallApp().catch((e: unknown) => {
+        uninstalling = false;
         dismiss();
         // A portable copy has no uninstaller: not a failure, just not how this
         // copy is removed — so it is said, not recorded among the errors.

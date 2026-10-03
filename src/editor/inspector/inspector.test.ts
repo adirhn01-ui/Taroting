@@ -155,14 +155,43 @@ function type(field: El, value: string): void {
 
 let mounted: { dispose(): void }[] = [];
 
+/** The document's own listeners (the panel listens there for a press to end). */
+const doc = new Map<string, Set<Handler>>();
+/** The pointer comes up anywhere: what the document hears. */
+function releasePointer(): void {
+  for (const fn of [...(doc.get("pointerup") ?? [])]) fn({});
+}
+
+/** Animation frames requested and not yet run; `frame()` runs them. */
+let frames = new Map<number, () => void>();
+let nextFrame = 1;
+function frame(): void {
+  const due = [...frames.values()];
+  frames = new Map();
+  for (const cb of due) cb();
+}
+
 beforeEach(() => {
   spies.info = [];
   spies.error = [];
   spies.refuse = [];
   spies.scans = [];
   focus.active = null;
+  frames = new Map();
+  vi.stubGlobal("requestAnimationFrame", (cb: () => void) => {
+    const id = nextFrame++;
+    frames.set(id, cb);
+    return id;
+  });
+  vi.stubGlobal("cancelAnimationFrame", (id: number) => void frames.delete(id));
   vi.stubGlobal("HTMLElement", El);
+  doc.clear();
   vi.stubGlobal("document", {
+    addEventListener: (t: string, fn: Handler) => {
+      if (!doc.has(t)) doc.set(t, new Set());
+      doc.get(t)!.add(fn);
+    },
+    removeEventListener: (t: string, fn: Handler) => void doc.get(t)?.delete(fn),
     createElement: (t: string) => new El(t),
     get activeElement() {
       return focus.active;
@@ -386,7 +415,9 @@ describe("C91: an animated edit keys where the playhead is when the edit starts"
     expect(t.clipNow().keyframes!.scale!.map((k) => k.t)).toEqual([1.5, 7.5, 9.5]);
     range.fire("pointerup");
     expect(t.history.length).toBe(1);
-    // The paused panel is rebuilt to describe the frame now on screen.
+    // The paused panel is rebuilt to describe the frame now on screen — on the
+    // next frame, not inside the commit (see the next describe).
+    frame();
     expect(t.host.contains(range)).toBe(false);
   });
 
@@ -612,5 +643,103 @@ describe("the layer flips say what they mirror", () => {
     v.fire("change");
     expect(t.clipNow().transform).toEqual({ ...turned().transform, flipV: true });
     expect(t.history).toHaveLength(1);
+  });
+});
+
+describe("a stale auto-key rebuild never destroys the next control mid-press", () => {
+  // Field A is keyed during playback (the edit pauses, so its gesture is
+  // stale and owes a rebuild). The user then presses slider B directly: B's
+  // pointerdown runs first, THEN focus leaves A and A's blur commit runs. That
+  // commit used to rebuild synchronously, tearing B out from under the press.
+  const keyed = (): Clip =>
+    clip("a", "m-video", { keyframes: { x: [{ t: 1.5, v: 0 }, { t: 9.5, v: 80 }], y: [{ t: 1.5, v: 10 }, { t: 9.5, v: 50 }] } });
+
+  /** A press on `control`: the panel's capture listener, then the control's
+   *  own pointerdown — both before the focus change, as in a browser. */
+  const press = (host: El, control: El): void => {
+    host.fire("pointerdown");
+    control.fire("pointerdown");
+  };
+
+  it("keeps the pressed slider through A's commit, and rebuilds once B lets go", () => {
+    const t = mount(project([keyed()]), "a", { time: 3, playing: true });
+    const x = t.fieldControl("X");
+    const { range } = t.groupSlider("Opacity");
+    t.engine.time = 5;
+    x.focus();
+    type(x, "-12");
+    expect(t.engine.pauses).toBe(1);
+
+    press(t.host, range);
+    x.blur(); // the focus change of B's mousedown: A commits here
+    expect(t.history.length).toBe(1);
+    expect(t.host.contains(range)).toBe(true);
+    // A frame passes while B is still held: the owed rebuild waits.
+    frame();
+    expect(t.host.contains(range)).toBe(true);
+
+    // B's drag still works and lands its own history entry.
+    type(range, "0.35");
+    expect(t.clipNow().transform!.opacity).toBe(0.35);
+    range.fire("pointerup");
+    releasePointer();
+    expect(t.history.length).toBe(2);
+    // The rebuild A owed runs once B's gesture is over.
+    expect(t.host.contains(range)).toBe(true);
+    frame();
+    expect(t.host.contains(range)).toBe(false);
+    // The document listeners went with the press.
+    expect(doc.get("pointerup")?.size ?? 0).toBe(0);
+  });
+
+  it("keeps a pressed button until the pointer comes up, so its click lands", () => {
+    // Not only sliders: any control pressed right after the stale edit — here
+    // the panel's first button, which holds no gesture of its own — was
+    // destroyed during its own mousedown, and its click never reached it.
+    const t = mount(project([keyed()]), "a", { time: 3, playing: true });
+    const x = t.fieldControl("X");
+    x.focus();
+    type(x, "-12");
+    const other = t.host.find((e) => e.tagName === "BUTTON")!;
+    expect(other).toBeDefined();
+    t.host.fire("pointerdown");
+    x.blur();
+    frame(); // a long press: frames pass while the button is held
+    frame();
+    expect(t.host.contains(other)).toBe(true);
+    releasePointer();
+    expect(t.host.contains(other)).toBe(true); // its click fires before the frame
+    frame();
+    expect(t.host.contains(other)).toBe(false);
+  });
+
+  it("keeps the hold of the pressed control when the previous one commits late", async () => {
+    // A's late commit must not release B's hold: with the flag cleared, the
+    // next store notification (an undo, an autosave restamp of the timeline)
+    // rebuilt the panel under B's drag.
+    const t = mount(project([keyed()]), "a", { time: 3, playing: true });
+    const x = t.fieldControl("X");
+    const { range } = t.groupSlider("Opacity");
+    x.focus();
+    type(x, "-12");
+    press(t.host, range);
+    x.blur();
+    // A store change that is not the panel's own, mid-press.
+    t.store.set(touchModified(trimClip(t.store.get(), "a", "out", 5.5)));
+    await flush();
+    expect(t.host.contains(range)).toBe(true);
+    range.fire("pointerup");
+    releasePointer();
+  });
+
+  it("does not rebuild after the editor has closed", () => {
+    const t = mount(project([keyed()]), "a", { time: 3, playing: true });
+    const x = t.fieldControl("X");
+    x.focus();
+    type(x, "-12");
+    x.blur();
+    expect(frames.size).toBe(1);
+    t.handle.dispose();
+    expect(frames.size).toBe(0);
   });
 });

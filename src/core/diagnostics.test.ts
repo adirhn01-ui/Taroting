@@ -814,6 +814,30 @@ describe("redactEntryText", () => {
     expect(redactEntryText(r, "ab.mp4 failed, ab retried", [short])).toBe("<file 1.mp4> failed, ab retried");
   });
 
+  // The swaps used to run one after another over the same text, so a token one
+  // of them wrote was fair game for the next: the stem "file" matched inside
+  // "<file 1.mp4>", and a stem equal to an extension matched the extension.
+  it("never rewrites a token it wrote itself, for a file named file.<ext> or <ext>.<ext>", () => {
+    const fileNamed = "C:\\Videos\\file.mp4";
+    expect(redactEntryText(createRedactor(), "Couldn't import file.mp4: bad", [fileNamed])).toBe(
+      "Couldn't import <file 1.mp4>: bad",
+    );
+    const extNamed = "C:\\Videos\\mov.mov";
+    expect(redactEntryText(createRedactor(), "Couldn't import mov.mov, then mov", [extNamed])).toBe(
+      "Couldn't import <file 1.mov>, then <file 1.mov>",
+    );
+  });
+
+  it("never rewrites another path's token either, and each name keeps its own path's token", () => {
+    // Different folders, stems, extensions and token numbers, so a token that
+    // landed on the wrong name could not line up by accident.
+    const clip = "C:\\Videos\\clip.mp4";
+    const file = "D:\\x\\file.mov";
+    expect(redactEntryText(createRedactor(), "clip.mp4 and file.mov, then clip", [clip, file])).toBe(
+      "<file 1.mp4> and <file 2.mov>, then <file 1.mp4>",
+    );
+  });
+
   it("is exactly r.text when the entry names no paths", () => {
     const line = `could not read ${VIDEO_PATH}`;
     expect(redactEntryText(createRedactor(), line, undefined)).toBe(createRedactor().text(line));

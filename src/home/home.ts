@@ -299,6 +299,11 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
   /** The last read of the recents list failed: the grid says so, with a way
    *  to try again, instead of "No projects yet". */
   let recentsError = false;
+  /** Bumped by every refresh(). The recents read runs off the UI thread and
+   *  is not ordered against the store's writes, so two refreshes issued close
+   *  together can answer out of order; only the newest one may paint, and it
+   *  was issued after the latest mutation it follows had settled. */
+  let refreshGen = 0;
   /** Temporary projects a crash or a logoff left behind with edits in them
    *  (see loadOrphans), in the order their Recover lines show. */
   let orphans: string[] = [];
@@ -598,14 +603,20 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     // here covers all of them instead of one per call site: no recents read for
     // a screen nobody is looking at, and no paint into detached DOM.
     if (disposed) return;
+    const my = ++refreshGen;
     try {
       const index = await ipc.listRecents();
+      // A newer refresh was issued meanwhile: its answer (or its error) is the
+      // one that reflects the latest delete/rename/remove, so this one drops
+      // out entirely — no paint, and no toast for a read that is already stale.
+      if (my !== refreshGen) return;
       recents = index.items;
       // A store that could read neither recents.json nor its backup may say so
       // in the answer rather than reject; with nothing to show, that is the
       // same "couldn't read", not "no projects".
       recentsError = (index as { unreadable?: unknown }).unreadable === true && recents.length === 0;
     } catch (e) {
+      if (my !== refreshGen) return;
       toast.error(`Couldn't read recent projects: ${describeError(e)}`);
       recents = [];
       recentsError = true;
@@ -856,7 +867,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
         toast.refuse("Unsupported file type.");
         return;
       }
-      if (!(await ipc.pathExists(path))) {
+      if (!(await projectOnDisk(path))) {
         toast.error("Project file not found");
         await refresh();
         return;
@@ -874,6 +885,18 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     } finally {
       busy = false;
     }
+  }
+
+  /** Whether a project can still be opened from disk: its `.trt`, or failing
+   *  that its `.bak`. A crash between atomic_write's two renames leaves only
+   *  `<name>.trt.bak` (the primary rotated away, the staged copy never renamed
+   *  in), and the store keeps such a project listed — recents and the orphan
+   *  sweep both test exactly this pair — because load_project recovers the
+   *  work from the `.bak`. A gate that looked at the `.trt` alone refused the
+   *  one open that reaches it, while the list kept offering it. The second
+   *  stat only runs when the first misses. */
+  async function projectOnDisk(path: string): Promise<boolean> {
+    return (await ipc.pathExists(path)) || (await ipc.pathExists(`${path}.bak`));
   }
 
   /* ---------------- recovering orphaned temporary projects ---------------- */
@@ -912,7 +935,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     if (guard()) return;
     let gone = false;
     try {
-      gone = !(await ipc.pathExists(path));
+      gone = !(await projectOnDisk(path));
       if (disposed) return;
       if (gone) {
         toast.error("Temporary project not found");
@@ -1173,7 +1196,11 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       return;
     }
     if (!isSearchChord(e) || renaming) return;
-    if (document.querySelector(".modal-backdrop, .ctx-menu")) return;
+    if (document.querySelector(".modal-backdrop")) return;
+    // The menu host is created once and only HIDDEN when a menu closes, so its
+    // mere presence says nothing: after the first menu of a session it is
+    // always there. Ask whether it is showing (the viewer's own test).
+    if (document.querySelector<HTMLElement>(".ctx-menu")?.style.display === "block") return;
     e.preventDefault();
     search.focus();
     search.select();

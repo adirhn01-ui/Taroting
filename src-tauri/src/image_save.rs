@@ -410,6 +410,17 @@ fn check_user_target(target: &Path, sources: &[String], format: ImageFormat) -> 
 fn refuse_a_source(dest: &Path, sources: &[String], it: &str) -> Result<()> {
     let exists = dest.exists();
     for src in sources {
+        // A share off the local network is never looked at
+        // (`media::source::may_touch`): only its spelling can say it is the
+        // destination.
+        if !crate::media::source::may_touch(Path::new(src)) {
+            if dest.to_string_lossy().replace('/', "\\").eq_ignore_ascii_case(&src.replace('/', "\\")) {
+                return Err(bad(format!(
+                    "{it} is one of this project's originals, which are never overwritten; choose another name"
+                )));
+            }
+            continue;
+        }
         match path_identity(dest, Path::new(src)) {
             PathIdentity::Same => {
                 return Err(bad(format!(

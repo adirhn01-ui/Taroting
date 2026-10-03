@@ -329,3 +329,17 @@
     RMDir /r "$LOCALAPPDATA\com.taroting.app"
   ${EndIf}
 !macroend
+
+; Both run BEFORE the template's CheckIfAppIsRunning, which ends a running
+; Taroting by name. That app never gets to remove its running marker
+; (crash.rs, running.txt), so without this the next launch would report the
+; installer's own close as "Taroting closed unexpectedly". A same-version
+; reinstall keeps the exe's build-time date and size, so the marker's build
+; line alone cannot tell the two apart.
+!macro NSIS_HOOK_PREINSTALL
+  Delete "$LOCALAPPDATA\${PRODUCTNAME}\running.txt"
+!macroend
+
+!macro NSIS_HOOK_PREUNINSTALL
+  Delete "$LOCALAPPDATA\${PRODUCTNAME}\running.txt"
+!macroend

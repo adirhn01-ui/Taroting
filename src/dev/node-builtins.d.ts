@@ -8,6 +8,8 @@ declare module "node:fs" {
   export function existsSync(path: string): boolean;
   /** Every entry under `path`, as paths relative to it (Node ≥ 20). */
   export function readdirSync(path: string, options: { recursive: true }): string[];
+  /** The names directly inside `path`. */
+  export function readdirSync(path: string): string[];
 }
 
 declare module "node:url" {

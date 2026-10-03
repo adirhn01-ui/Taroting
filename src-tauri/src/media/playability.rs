@@ -167,23 +167,34 @@ fn prepared_target(d: &Decision) -> Option<(CacheKind, &'static str)> {
     }
 }
 
-/// Pure CPU plus at most one stat: no job, no ffmpeg, so it is registered
-/// sync. A hit refreshes that file's LRU stamp exactly as `plan_playback`'s
-/// own lookup would — the caller asks because it is about to play it.
+/// No job and no ffmpeg, but not free either: the cache lookup takes the
+/// index lock, which a trim holds across each delete, and a hit refreshes
+/// that file's LRU stamp — which rewrites the whole index.json on the first
+/// hit of a run and then every couple of seconds. The viewer asks on every
+/// step, so all of it runs on a blocking-pool thread, never on the WebView's
+/// UI thread. A hit stamps exactly as `plan_playback`'s own lookup would —
+/// the caller asks because it is about to play it.
 ///
 /// The cache is looked up, never required: main.rs runs without one when
 /// `%LOCALAPPDATA%` is unusable, and a `State` parameter failed this command
 /// before its body ran — so the viewer refused even an MP4 that plays as-is.
-/// No cache simply means nothing is prepared.
+/// No cache simply means nothing is prepared. A lookup that could not run
+/// answers "not prepared" too: the answer is advisory, and the
+/// `plan_playback` that follows looks again.
 #[tauri::command]
-pub fn classify_playback(
+pub async fn classify_playback(
     app: AppHandle,
     media: MediaRef,
     hints: CodecHints,
     force_proxy_large: bool,
 ) -> PlaybackClassInfo {
-    let cache = app.try_state::<Arc<Cache>>();
-    classify_info(cache.as_deref().map(|c| &**c), &media, hints, force_proxy_large)
+    let cache = app.try_state::<Arc<Cache>>().map(|c| Arc::clone(&c));
+    let class = classify(&media, hints, force_proxy_large);
+    tauri::async_runtime::spawn_blocking(move || {
+        classify_info(cache.as_deref(), &media, hints, force_proxy_large)
+    })
+    .await
+    .unwrap_or(PlaybackClassInfo { class, prepared: false })
 }
 
 /// `classify_playback` minus the Tauri handle, so the tests can drive it with
@@ -802,6 +813,24 @@ mod tests {
         assert_eq!(h2.id, second, "the caller gets the NEW job's own handle");
         // And the slot now names the successor, which is live: joined.
         assert_eq!(inflight.claim(&jobs, &out, alloc(JobKind::Proxy)).err(), Some(second));
+    }
+
+    /// `classify_playback` takes the cache index lock and can rewrite
+    /// index.json, so it must not run on the WebView's UI thread: a plain
+    /// `#[tauri::command] fn` does. Pinned in the source because which thread
+    /// a command runs on is decided by tauri at registration. Only the code
+    /// before the test module is searched: the needles appear here too.
+    #[test]
+    fn classify_playback_runs_off_the_ui_thread() {
+        let code = include_str!("playability.rs").split("#[cfg(test)]").next().unwrap();
+        // Line endings as checked out (CRLF here) must not decide the search.
+        let code = code.replace('\r', "");
+        let at = code.find("pub async fn classify_playback(").expect("classify_playback must be an async command");
+        let body = &code[at..];
+        let body = &body[..body.find("
+}
+").expect("the command's end")];
+        assert!(body.contains("spawn_blocking"), "its lookup must run on a blocking-pool thread");
     }
 
     /// No cache at all (main.rs runs without one when %LOCALAPPDATA% is

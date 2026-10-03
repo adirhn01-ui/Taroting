@@ -191,6 +191,15 @@ class LayerScheduler {
     if (err === null || err.code === MEDIA_ERR_ABORTED) return;
     const id = this.slotMedia[slot];
     const url = this.slotSrc[slot];
+    // Forget what the slot holds: an errored element stays errored until its
+    // src is set again, and `assign` sets it only when the URL differs. The
+    // natural recovery — remove the Failed media and re-import the same file,
+    // or Replace media with it — comes back as a new id with the SAME url,
+    // and used to be shown "Ready" over the dead element, black, with no new
+    // error to report it. Cleared, the next assign of any url loads afresh.
+    // No reload loop: a later assign needs the media ready again, and a ready
+    // media whose element fails is stamped below and stops being assigned.
+    this.slotSrc[slot] = null;
     if (id === null || url === null) return;
     const st = this.media.status.get()[id];
     if (st?.state !== "ready" || st.url !== url) return;

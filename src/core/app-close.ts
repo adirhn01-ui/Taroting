@@ -62,7 +62,7 @@ export interface CloseDeps {
 // silently — then the close tasks and the settings queue (1.5 s each). A hung
 // disk costs a pause and a question; it never makes the window unclosable.
 
-/** A final save that has not landed by now is treated as failed: the user decides. */
+/** A final save that has not landed by now is asked about ("still being saved"): the user decides. */
 const FLUSH_CAP_MS = 4000;
 /** Each registered close task (they run side by side, so this is also their total). */
 const TASK_CAP_MS = 1500;
@@ -226,8 +226,9 @@ const leaving = new WeakSet<ProjectSession>();
  * modifiedAt on disk), so skipping it keeps an untouched project from jumping
  * to the top of Home's "Date modified" sort just because it was open — the
  * rule the editor's own dispose follows. A save that has not landed within
- * FLUSH_CAP_MS is treated as failed: the write may yet land, but the user is
- * told it has not, and decides.
+ * FLUSH_CAP_MS asks too, but says what is true: the changes are still being
+ * saved (the write may yet land), not that they couldn't be — and the user
+ * decides.
  *
  * A leave while another leave of the same session is still out stays at once
  * (false), checked before the on-disk shortcut: the first one is about to
@@ -243,10 +244,21 @@ export async function flushOrAsk(
   if (s.saveState.get() === "saved") return true;
   if (latch) leaving.add(s);
   try {
-    const landed = await within(s.save(), FLUSH_CAP_MS);
+    let failed = false;
+    const save = s.save().catch((e: unknown) => {
+      failed = true;
+      throw e;
+    });
+    const landed = await within(save, FLUSH_CAP_MS);
     if (landed && s.saveState.get() !== "error") return true;
-    if (ask) return await ask(SAVE_FAILED);
-    return await (verb === "close" ? closeAnyway(SAVE_FAILED) : leaveAnyway(SAVE_FAILED));
+    // A save still running at the cap has not failed, and saying it had was
+    // a false alarm: on a slow disk, a OneDrive-locked folder or a large image
+    // project the write is merely late, and every leave of a permanent project
+    // now waits for it, not only the close. Only a save that rejected, or one
+    // the session reports as failed, is "couldn't be saved".
+    const message = !landed && !failed && s.saveState.get() !== "error" ? STILL_SAVING : SAVE_FAILED;
+    if (ask) return await ask(message);
+    return await (verb === "close" ? closeAnyway(message) : leaveAnyway(message));
   } finally {
     if (latch) leaving.delete(s);
   }

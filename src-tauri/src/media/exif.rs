@@ -125,7 +125,7 @@ impl Sniff {
 /// (`media::source`): even a stat OPENS its target, and on a `\\.\pipe\`
 /// name that is a connection to whatever serves the pipe.
 fn open_regular(path: &Path) -> Option<std::fs::File> {
-    if !crate::media::source::is_file_namespace(path) {
+    if !crate::media::source::is_file_namespace(path) || !crate::media::source::may_touch(path) {
         return None;
     }
     if !std::fs::metadata(path).ok()?.is_file() {
