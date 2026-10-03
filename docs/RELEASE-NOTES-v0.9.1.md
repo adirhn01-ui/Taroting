@@ -91,8 +91,9 @@ source, as always.
 - **Saving reports success correctly** when only the recent-projects list
   failed to update.
 - **A shared project can no longer make Taroting go online.** Media in a
-  project is read only from files on a drive or a share, and the window
-  cannot navigate away or open web links.
+  project is read only from files on a drive or on a share in your local
+  network (a NAS keeps working), and the window cannot navigate away or open
+  web links.
 - **Diagnostic reports hide more**: folder and file names with spaces, network
   paths and account names with spaces are now removed too.
 
