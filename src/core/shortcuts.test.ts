@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { chordOf, conflictingActions, findConflicts, normalizeChord } from "./shortcuts";
+import {
+  chordOf,
+  conflictingActions,
+  findConflicts,
+  isBrowserChromeKey,
+  normalizeChord,
+} from "./shortcuts";
 
 const ev = (key: string, mods: Partial<Record<"ctrl" | "alt" | "shift" | "meta", boolean>> = {}) => ({
   key,
@@ -32,6 +38,19 @@ describe("normalizeChord", () => {
     expect(normalizeChord("cmd+s")).toBe("Ctrl+S");
     expect(normalizeChord("n")).toBe("N");
     expect(normalizeChord("")).toBe("");
+  });
+
+  // "+" is also the chord separator: before the key was spelled "Plus",
+  // chordOf wrote "Ctrl++" and normalizeChord split it down to the bare
+  // modifier, i.e. "deliberately unbound", so rebinding Zoom in to the numpad
+  // + key (or the German + key) erased the action's chord.
+  it("keeps a binding on the + key instead of unbinding it", () => {
+    expect(chordOf(ev("+", { ctrl: true }))).toBe("Ctrl+Plus"); // what a rebind stores now
+    expect(normalizeChord(chordOf(ev("+", { ctrl: true }))!)).toBe("Ctrl+Plus");
+    expect(normalizeChord("Ctrl++")).toBe("Ctrl+Plus"); // what earlier builds stored
+    expect(normalizeChord("+")).toBe("Plus");
+    expect(normalizeChord("ctrl+plus")).toBe("Ctrl+Plus");
+    expect(normalizeChord("Ctrl+Shift++")).toBe("Ctrl+Shift+Plus");
   });
 });
 
@@ -107,6 +126,7 @@ import {
   REPEATABLE,
   resolveChord,
   ShortcutManager,
+  shortcutBlockers,
   shortcutsBlocked,
 } from "./shortcuts";
 import { ACTION_MODES, DEFAULT_SHORTCUTS } from "./types";
@@ -689,5 +709,53 @@ describe("blockShortcuts", () => {
     expect(shortcutsBlocked()).toBe(true);
     second();
     expect(shortcutsBlocked()).toBe(false);
+  });
+
+  it("counts the tokens out, so a holder can tell its own from another surface on top", () => {
+    expect(shortcutBlockers()).toBe(0);
+    const shell = blockShortcuts();
+    expect(shortcutBlockers()).toBe(1);
+    const menu = blockShortcuts();
+    const dialog = blockShortcuts();
+    expect(shortcutBlockers()).toBe(3);
+    menu();
+    menu();
+    expect(shortcutBlockers()).toBe(2);
+    dialog();
+    expect(shortcutBlockers()).toBe(1);
+    shell();
+    expect(shortcutBlockers()).toBe(0);
+  });
+});
+
+/**
+ * The production-only blocker in main.ts for WebView2's browser accelerators.
+ * It used to compare raw `e.key` with lowercase Latin letters, so Ctrl+Shift+R,
+ * Caps Lock + Ctrl+R and plain Ctrl+R on a Hebrew or Russian layout all reached
+ * the reload accelerator and threw away every unsaved edit.
+ */
+describe("isBrowserChromeKey", () => {
+  it.each<{ why: string; e: ReturnType<typeof kev>; blocked: boolean }>([
+    { why: "Ctrl+R", e: kev("r", "KeyR", { ctrl: true }), blocked: true },
+    { why: "Ctrl+Shift+R (key 'R')", e: kev("R", "KeyR", { ctrl: true, shift: true }), blocked: true },
+    { why: "Caps Lock + Ctrl+P (key 'P', no Shift)", e: kev("P", "KeyP", { ctrl: true }), blocked: true },
+    { why: "Hebrew Ctrl+R ('ר' on KeyR)", e: kev("ר", "KeyR", { ctrl: true }), blocked: true },
+    { why: "Russian Ctrl+F ('а' on KeyF)", e: kev("а", "KeyF", { ctrl: true }), blocked: true },
+    { why: "Russian Ctrl+U ('г' on KeyU)", e: kev("г", "KeyU", { ctrl: true }), blocked: true },
+    { why: "F5 with no modifier", e: kev("F5", "F5"), blocked: true },
+    { why: "the browser refresh key", e: kev("BrowserRefresh", "BrowserRefresh"), blocked: true },
+    { why: "plain R types a letter", e: kev("r", "KeyR"), blocked: false },
+    { why: "AltGr (Ctrl+Alt) on R is typing", e: kev("r", "KeyR", { ctrl: true, alt: true }), blocked: false },
+    { why: "Ctrl+S is the app's own save", e: kev("s", "KeyS", { ctrl: true }), blocked: false },
+    // A Latin layout that puts another letter on the R key (Dvorak: "p" on
+    // KeyR) is judged by its letter, and its "r" sits elsewhere (KeyO).
+    { why: "Dvorak Ctrl+P on the R key is print", e: kev("p", "KeyR", { ctrl: true }), blocked: true },
+    { why: "Dvorak Ctrl+, on the W key stays the app's", e: kev(",", "KeyW", { ctrl: true }), blocked: false },
+    // The ASCII guard: a Latin letter is never re-judged by its physical key,
+    // so Dvorak's "l" on the P key is not print.
+    { why: "Dvorak Ctrl+L on the P key is not print", e: kev("l", "KeyP", { ctrl: true }), blocked: false },
+    { why: "Hebrew Ctrl+S ('ד' on KeyS) is not a chrome key", e: kev("ד", "KeyS", { ctrl: true }), blocked: false },
+  ])("$why", ({ e, blocked }) => {
+    expect(isBrowserChromeKey(e)).toBe(blocked);
   });
 });

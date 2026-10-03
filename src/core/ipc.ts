@@ -362,7 +362,7 @@ export const ipc = {
   screenPickColor: () => call<string | null>("screen_pick_color"),
 
   /* image saves: begin (JSON) → chunk (raw body) ×N → commit, or abort.
-   * The backend writes `<target>.part` and renames it on commit, checking
+   * The backend writes `<target>.taroting-part` and renames it on commit, checking
    * extension, magic bytes and size; see src-tauri/src/image_save.rs. */
   /** Open a save. Resolves the token for the chunks and the path it will land at. */
   imageSaveBegin: (dest: ImageSaveDest, format: ImageExportFormat, totalBytes: number) =>

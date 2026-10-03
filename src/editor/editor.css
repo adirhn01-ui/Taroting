@@ -824,6 +824,16 @@ html[data-rescue-chrome] #ed-settings:focus-visible {
 .editor__preview.theater.theater--hidden {
   cursor: none;
 }
+/* A menu, toast or error dialog raised during fullscreen playback is placed
+ * INSIDE this container (errors.ts placeOverlay — the top layer would hide it
+ * anywhere else), so it inherits the blank cursor above: the pointer vanished
+ * over a dialog the user was trying to read and close. Each surface takes the
+ * ordinary cursor back; the video around it still blanks. */
+.editor__preview.theater.theater--hidden .modal-backdrop,
+.editor__preview.theater.theater--hidden .toast-host,
+.editor__preview.theater.theater--hidden .ctx-menu {
+  cursor: auto;
+}
 
 .editor__preview.theater .theater-bar {
   display: flex;

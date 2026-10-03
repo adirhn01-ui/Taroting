@@ -1258,7 +1258,9 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
           $<HTMLButtonElement>(".export-modal [data-close-btn]")!.click();
           await until(() => !$(".export-modal"), 2_000, () => "the export dialog to close");
           assert(await ipc.pathExists(out), `the export reported success but ${out} does not exist`);
-          for (const ext of [".part", ".bak"]) {
+          // `.taroting-part` is what the save stages to; the plain `.part` is
+          // kept to prove the old name is never written.
+          for (const ext of [".taroting-part", ".part", ".bak"]) {
             assert(!(await ipc.pathExists(out + ext)), `the ${format} export left ${baseName(out)}${ext} behind`);
           }
           return out;
@@ -1311,7 +1313,7 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
         const solid = flat.at(70, 30);
         assert(dist(clear, [255, 255, 255]) <= 6, `the transparent columns export as ${fmt(clear)} in a JPEG, not white (their hidden colour is ${fmt(ALPHA_RGB)})`);
         assert(dist(solid, ALPHA_RGB) <= 6, `the opaque columns export as ${fmt(solid)}, not ${fmt(ALPHA_RGB)}`);
-        return `dialog PNG 100% → ffprobe 641x361, TL ${fmt(tl)} BR ${fmt(br)} TR ${fmt(tr)} BL ${fmt(bl)}; JPEG 50% → 321x181; hold "${HOLD}" while each wrote, released after; no .part/.bak; WebP q100 → ${webpKind}; transparent JPEG → ${fmt(clear)} beside ${fmt(solid)} — ${ms(t0)}`;
+        return `dialog PNG 100% → ffprobe 641x361, TL ${fmt(tl)} BR ${fmt(br)} TR ${fmt(tr)} BL ${fmt(bl)}; JPEG 50% → 321x181; hold "${HOLD}" while each wrote, released after; no .taroting-part/.part/.bak; WebP q100 → ${webpKind}; transparent JPEG → ${fmt(clear)} beside ${fmt(solid)} — ${ms(t0)}`;
       } finally {
         ipc.imageSaveBegin = realBegin;
         await leave(paths);
@@ -1352,9 +1354,10 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
           after.size === before.size && after.mtimeMs === before.mtimeMs,
           `the refused save changed the file: size ${before.size} → ${after.size}, mtime ${before.mtimeMs} → ${after.mtimeMs}`,
         );
+        assert(!(await ipc.pathExists(`${copy}.taroting-part`)), "the refused save left a .taroting-part behind");
         assert(!(await ipc.pathExists(`${copy}.part`)), "the refused save left a .part behind");
         await saveBlob({ kind: "user", path: copy, sources: [fx(GRID)] }, "png", bytes);
-        return `onto a source (upper-case spelling) → ${d.code} "${d.message}"; size ${after.size} and mtime unchanged; no .part; with another source the same save goes through — ${ms(t0)}`;
+        return `onto a source (upper-case spelling) → ${d.code} "${d.message}"; size ${after.size} and mtime unchanged; no .taroting-part/.part; with another source the same save goes through — ${ms(t0)}`;
       } finally {
         if (copy) await removeTestFile(copy).catch(() => {});
       }

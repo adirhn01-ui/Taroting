@@ -274,8 +274,11 @@ impl Inflight {
 /// `.tmp` that was the successor's half-written file. Every recipe writing to
 /// it names its muxer explicitly (`-f mp4` in prepare.rs; the waveform writes
 /// its own bytes), so the extension carries no meaning. A tmp orphaned by a
-/// crash needs no sweep of its own: `Cache::enforce_limit` lists every file in
-/// each kind dir, dating unindexed ones by mtime, so it ages out LRU.
+/// crash is deleted by the next launch's startup sweep
+/// (`cache::sweep_stale_partials_in_background`: older than that run, so no
+/// job of the new run can own it), and until then `Cache::enforce_limit`,
+/// which lists every file in each kind dir and dates unindexed ones by mtime,
+/// ages it out LRU like any entry.
 pub(crate) fn job_tmp_suffix(suffix: &str, id: JobId) -> String {
     format!("{suffix}.{id}.tmp")
 }

@@ -11,6 +11,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Clip, MediaInfo, MediaRef, ProjectFile } from "../core/types";
+import type { InspectorHandle } from "./inspector/inspector";
 
 const m = vi.hoisted(() => ({
   loaded: null as unknown as { project: ProjectFile; missing: string[]; recovered: boolean },
@@ -35,12 +36,16 @@ const m = vi.hoisted(() => ({
   throwOnSeek: false,
   throwOnRefresh: false,
   mediaDispose: [] as unknown[],
+  /** The `missing` argument of every ensureAll call, in order. */
+  ensureAllMissing: [] as (readonly string[] | undefined)[],
+  media: null as unknown as { status: { set(v: Record<string, unknown>): void } },
   timeline: null as unknown as {
     renders: number;
     deps: { onClipMenu(c: Clip, x: number, y: number): void };
   },
   overlayCtx: null as unknown as {
     selection: { get(): string | null; set(v: string | null): void };
+    playbackUrl?(media: MediaRef): string | null;
     onGestureEnd?(): void;
   },
   inspectorCtx: null as unknown as Record<string, unknown>,
@@ -140,8 +145,13 @@ vi.mock("./media/media", async () => {
       status = new Store<Record<string, unknown>>({});
       thumbs = new Store<Record<string, string>>({});
       waveforms = new Store<Record<string, unknown>>({});
+      constructor() {
+        m.media = this as never;
+      }
       async init(): Promise<void> {}
-      ensureAll(): void {}
+      ensureAll(_project: unknown, missing?: readonly string[]): void {
+        m.ensureAllMissing.push(missing);
+      }
       untrack(): void {}
       retrack(): void {}
       dispose(opts?: unknown): void {
@@ -245,13 +255,16 @@ vi.mock("./preview/theater", () => ({
     };
   },
 }));
+// The handle is checked against the real InspectorHandle, so a renamed method
+// is a tsc error here rather than a mock that answers a call the real panel
+// never would (the gesture-end seam once called a `rebuild` only this mock had).
 vi.mock("./inspector/inspector", () => ({
   mountInspector: (_host: unknown, ctx: Record<string, unknown>) => {
     m.inspectorCtx = ctx;
     return {
       dispose: () => void m.disposed.push("inspector"),
-      rebuild: () => void m.inspectorRebuilds++,
-    };
+      overlayGestureEnded: () => void m.inspectorRebuilds++,
+    } satisfies InspectorHandle;
   },
 }));
 vi.mock("./timeline/interactions", () => ({
@@ -432,12 +445,12 @@ async function flush(): Promise<void> {
   for (let i = 0; i < 20; i++) await Promise.resolve();
 }
 
-async function mount(project?: ProjectFile): Promise<{
+async function mount(project?: ProjectFile, missing: string[] = []): Promise<{
   root: FakeEl;
   handle: { dispose(): Promise<void> };
   session: ProjectSession;
 }> {
-  m.loaded = { project: project ?? fixture().project, missing: [], recovered: false };
+  m.loaded = { project: project ?? fixture().project, missing, recovered: false };
   const root = new FakeEl();
   const handle = await mountEditor(
     root as unknown as HTMLElement,
@@ -481,6 +494,7 @@ beforeEach(() => {
   m.throwOnRefresh = false;
   m.throwOnTheaterDispose = false;
   m.mediaDispose = [];
+  m.ensureAllMissing = [];
   m.gesture = false;
   m.disposed = [];
   m.inspectorRebuilds = 0;
@@ -927,5 +941,34 @@ describe("the overlay gesture seams", () => {
     await mount();
     (m.theaterCtx.cancelGesture as () => void)();
     expect(m.overlayCancels).toBe(1);
+  });
+
+  it("the crop ghost decodes the URL the stage plays, and nothing while no plan is ready", async () => {
+    const fx = fixture();
+    await mount(fx.project);
+    const text = fx.project.media.find((x) => x.id !== fx.media.id)!;
+    // The proxy URL differs from the media path on purpose: mediaUrl is the
+    // identity in this file, so an accessor that fell back to the original
+    // would otherwise pass.
+    m.media.status.set({
+      [fx.media.id]: { state: "ready", url: "asset://cache/harbour.proxy.mp4" },
+      [text.id]: { state: "preparing" },
+    });
+    expect(m.overlayCtx.playbackUrl!(fx.media)).toBe("asset://cache/harbour.proxy.mp4");
+    expect(m.overlayCtx.playbackUrl!(text)).toBeNull();
+    m.media.status.set({});
+    expect(m.overlayCtx.playbackUrl!(fx.media)).toBeNull();
+  });
+});
+
+describe("media the load reported missing", () => {
+  it("go to the first ensureAll only; a later re-ensure passes none", async () => {
+    // An id that is neither the video's nor the text's, so the call could not
+    // be confused with one built from the project's own media.
+    await mount(undefined, ["m-gone-from-disk"]);
+    expect(m.ensureAllMissing).toEqual([["m-gone-from-disk"]]);
+    m.drop!.onDrop(["D:/clips/pier.mov"]);
+    await flush();
+    expect(m.ensureAllMissing).toEqual([["m-gone-from-disk"], undefined]);
   });
 });

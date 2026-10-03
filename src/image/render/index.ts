@@ -47,7 +47,10 @@ export interface RenderOpts {
 export interface RenderResources {
   /** adjusted pixels of a photo layer at ≥ `needScale` source-px density, or null while loading/failed */
   photo(l: Layer, needScale: number): CanvasImageSource | null;
-  /** raster of a drawing layer in the CURRENT view, or null → renderer paints strokes directly */
+  /** raster of a drawing layer in the CURRENT view, or null: the renderer
+   *  paints the layer's strokes directly, or, for a layer with no strokes,
+   *  paints nothing at all (an empty layer holds no raster). Asked even for an
+   *  empty layer: that call is what gives back the raster of one erased clean. */
   drawingRaster(l: Layer, view: ViewXf): CanvasImageSource | null;
 }
 
@@ -88,10 +91,15 @@ export class PreviewResources implements RenderResources {
     return this.photos.blobFor(m);
   }
 
-  /** tell the cache the current zoom/stage so it picks working sizes (debounced re-decode) */
+  /** tell the caches the current zoom/stage so they pick working sizes (debounced re-decode) */
   setView(view: ViewXf, stageDevice: { w: number; h: number }): void {
     void view;
     this.drawings.setStage(stageDevice.w, stageDevice.h);
+    // The photo cache sizes a slider drag's proxy by the stage too: without
+    // it the 1920×1080 default stands, so on a 4K or high-DPI stage a photo
+    // that should stay sharp is proxied, and one that should be proxied gets
+    // a proxy far smaller than the stage it is stretched over.
+    this.photos.setStage(stageDevice.w, stageDevice.h);
   }
 
   /** fires when an async decode/adjust finishes → caller requests a render */

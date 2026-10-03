@@ -9,8 +9,11 @@
 // Keep on the editor's Temporary badge is the one way to settle it without
 // leaving; it uses `keepTempSession` below directly. Every exit goes
 // through ONE gate, so the guard cannot be applied to three exits and forgotten
-// on the fourth (the v0.7.3 quick-view gap was exactly that).
+// on the fourth (the v0.7.3 quick-view gap was exactly that). The same gate
+// holds a PERMANENT project's exit until its final save has landed, or the
+// user has agreed to leave without it (core/app-close `flushOrAsk`).
 
+import { flushOrAsk, type AskAnyway } from "../core/app-close";
 import { describeError, ipc } from "../core/ipc";
 import { isTempProjectPath } from "../core/open-media";
 import type { ProjectSession } from "../core/session";
@@ -125,8 +128,9 @@ export async function discardTempSession(session: ProjectSession): Promise<void>
 }
 
 export interface TempLeaveGate {
-  /** Busy → onCancel. Not temp, or already discarded → dest() now. Temp and never
-   *  edited → discardTempSession → dest, without asking. Temp and edited →
+  /** Busy → onCancel. Already discarded, or permanent with nothing unsaved → dest() now.
+   *  Permanent with unsaved edits → flushOrAsk: landed or "Leave anyway" → dest, Stay →
+   *  onCancel. Temp and never edited → discardTempSession → dest, without asking. Temp and edited →
    *  askKeepTemp():keep → keepTempSession → dest; discard → discardTempSession →
    *  dest; cancel, re-entrancy bail, or keep failure (toast) → onCancel. EXACTLY ONE
    *  of dest/onCancel fires, on every path. */
@@ -139,15 +143,17 @@ export interface TempLeaveGate {
 }
 
 export function createTempLeaveGate(session: ProjectSession): TempLeaveGate {
-  return createTempLeaveGateWith(session, askKeepTemp);
+  return createTempLeaveGateWith(session, askKeepTemp, (message) => askCloseAnyway(message, "leave"));
 }
 
-/** The gate with its prompt injected, so the decision logic is testable under
+/** The gate with its prompts injected, so the decision logic is testable under
  *  vitest's node environment (no DOM, no modal). `createTempLeaveGate` is this
- *  with `askKeepTemp`. */
+ *  with `askKeepTemp` and the "Leave anyway?" form of `askCloseAnyway`; without
+ *  `askLeave`, flushOrAsk shows that same prompt itself. */
 export function createTempLeaveGateWith(
   session: ProjectSession,
   ask: () => Promise<KeepChoice>,
+  askLeave?: AskAnyway,
 ): TempLeaveGate {
   // `busy` guards the WHOLE leave lifecycle — from opening the prompt until
   // Keep or Discard has fully settled. It is checked FIRST, before the temp
@@ -178,19 +184,46 @@ export function createTempLeaveGateWith(
       onCancel?.();
       return;
     }
-    if (discarded || !session.temp.get()) {
+    if (discarded || (!session.temp.get() && session.saveState.get() === "saved")) {
       // Synchronous: a throw here reaches the caller's own stack, and no latch
       // has been taken that it could strand.
       dest();
       return;
     }
     busy = true;
+    if (!session.temp.get()) {
+      // A permanent project with edits not yet on disk (a video edit waits up
+      // to the autosave interval) or a write that failed. Leaving used to go
+      // straight to dispose, whose one save reports a failure to nobody; now
+      // the save runs first and a failure asks. Behind the same latch, so a
+      // second Back while the save or the question is out bails instead of
+      // asking twice.
+      void leavePermanent(dest, onCancel).catch((e: unknown) => {
+        console.error("A project exit callback threw", e);
+      });
+      return;
+    }
     // run() cannot reject on its own; only a throwing callback can make it.
     // Reported, not left as an unhandled rejection — by then the latch is
     // already released (see run's `finally`).
     void run(dest, onCancel).catch((e: unknown) => {
       console.error("A temporary-project exit callback threw", e);
     });
+  };
+
+  const leavePermanent = async (dest: () => void, onCancel?: () => void): Promise<void> => {
+    let proceed = false;
+    try {
+      proceed = await flushOrAsk(session, "leave", askLeave);
+    } catch (e) {
+      // flushOrAsk does not reject on its own; a prompt that broke stays.
+      console.error("The leave prompt could not be shown", e);
+    } finally {
+      // Released before either callback, as in run(): exactly one fires.
+      busy = false;
+      if (proceed) dest();
+      else onCancel?.();
+    }
   };
 
   const run = async (dest: () => void, onCancel?: () => void): Promise<void> => {
@@ -333,19 +366,24 @@ export function createTempExits(session: ProjectSession, gate: TempLeaveGate): T
 }
 
 /** Close-gate modal. `message` is the first line; buttons [Stay] (focused) [Close anyway].
- *  true = close anyway. */
-export function askCloseAnyway(message: string): Promise<boolean> {
+ *  true = close anyway. `verb: "leave"` is the same question for leaving a project
+ *  (Back, Ctrl+W, the gear, an OS open): "Leave this project?" / [Leave anyway]. */
+export function askCloseAnyway(message: string, verb: "close" | "leave" = "close"): Promise<boolean> {
+  // Constant copy chosen by the verb; only `message` comes from the caller,
+  // and it goes in as text below.
+  const title = verb === "leave" ? "Leave this project?" : "Close Taroting?";
+  const go = verb === "leave" ? "Leave anyway" : "Close anyway";
   return new Promise<boolean>((resolve) => {
     const backdrop = document.createElement("div");
     backdrop.className = "modal-backdrop";
     backdrop.innerHTML = `
-      <div class="modal" role="dialog" aria-modal="true" aria-label="Close Taroting?">
-        <div class="modal__header"><span>Close Taroting?</span><button class="btn btn--ghost btn--icon btn--sm" data-act="stay" title="Stay" aria-label="Stay">${icon("x", 14)}</button></div>
+      <div class="modal" role="dialog" aria-modal="true" aria-label="${title}">
+        <div class="modal__header"><span>${title}</span><button class="btn btn--ghost btn--icon btn--sm" data-act="stay" title="Stay" aria-label="Stay">${icon("x", 14)}</button></div>
         <div class="modal__body">
           <div class="modal__text"></div>
         </div>
         <div class="modal__footer">
-          <button class="btn" data-act="close">Close anyway</button>
+          <button class="btn" data-act="close">${go}</button>
           <button class="btn btn--primary" data-act="stay">Stay</button>
         </div>
       </div>`;

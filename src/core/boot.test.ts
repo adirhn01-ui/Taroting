@@ -286,3 +286,39 @@ describe("beginBoot with the hint", () => {
     expect(r.log).toEqual(["0:settings", `0:editor:${TRT}`, "0:error:chunk:settings"]);
   });
 });
+
+/**
+ * A plain launch used to install a navigator that dropped the rejection: a
+ * navigation whose mount threw left #app cleared, nothing said, and an
+ * unhandled rejection behind it. Both launch kinds now observe the same way.
+ */
+describe("beginBoot without the hint, when a navigation fails", () => {
+  const TRT = String.raw`H:\Edits\trailer.trt`;
+
+  it("reports the failure and lands on Home", async () => {
+    const r = rig(null, (route) => route.view === "editor");
+    beginBoot(false, r.deps);
+    r.navigate({ view: "editor", projectPath: TRT });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.log).toEqual(["0:home", `0:editor:${TRT}`, `0:error:chunk:editor:${TRT}`, "0:home"]);
+  });
+
+  it("does not pull Home over a newer navigation", async () => {
+    const r = rig(null, (route) => route.view === "settings");
+    beginBoot(false, r.deps);
+    r.navigate({ view: "settings" });
+    r.navigate({ view: "editor", projectPath: TRT });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.log).toEqual(["0:home", "0:settings", `0:editor:${TRT}`, "0:error:chunk:settings"]);
+  });
+
+  it("a Home that fails is reported once and never retried", async () => {
+    const r = rig(null, (route) => route.view === "home");
+    beginBoot(false, r.deps);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.log).toEqual(["0:home", "0:error:chunk:home"]);
+    r.navigate({ view: "home" }); // the Back button, say
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.log).toEqual(["0:home", "0:error:chunk:home", "0:home", "0:error:chunk:home"]);
+  });
+});

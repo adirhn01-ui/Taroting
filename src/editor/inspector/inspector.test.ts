@@ -65,8 +65,15 @@ class El {
   disabled = false;
   focusValue = "";
   private listeners = new Map<string, Set<Handler>>();
+  private attrs = new Map<string, string>();
   constructor(tag: string) {
     this.tagName = tag.toUpperCase();
+  }
+  setAttribute(name: string, value: string): void {
+    this.attrs.set(name, String(value));
+  }
+  getAttribute(name: string): string | null {
+    return this.attrs.get(name) ?? null;
   }
   set className(v: string) {
     this.cls = new Set(v.split(" ").filter(Boolean));
@@ -564,5 +571,46 @@ describe("C94 + toasts", () => {
     t.button("Apply")!.fire("click");
     expect(spies.refuse).toEqual(["Crop must fit inside 1280×720."]);
     expect(spies.error).toHaveLength(0);
+  });
+});
+
+describe("the layer flips say what they mirror", () => {
+  // Turned a quarter, flipped horizontally, and placed off-centre, so a flip
+  // that dropped any other part of the transform shows up in the assertion.
+  const turned = (): Clip =>
+    clip("a", "m-video", {
+      transform: { rotate: 90, flipH: true, flipV: false, scale: 1.5, x: 40, y: -30, opacity: 0.8 },
+    });
+
+  it("is one 'Flip layer' field with Horizontal and Vertical switches, named for a screen reader", () => {
+    const t = mount(project([turned()]), "a");
+    const fieldOf = (label: string): El | undefined =>
+      t.host.find((e) => e.cls.has("insp-field") && e.children[0]?.tagName === "LABEL" && e.children[0].innerHTML === label);
+    expect(fieldOf("Flip H")).toBeUndefined();
+    expect(fieldOf("Flip V")).toBeUndefined();
+    const flip = fieldOf("Flip layer")!;
+    expect(flip).toBeDefined();
+    const h = flip.find((e) => e.getAttribute("aria-label") === "Flip layer horizontally")!;
+    const v = flip.find((e) => e.getAttribute("aria-label") === "Flip layer vertically")!;
+    expect(h.checked).toBe(true);
+    expect(v.checked).toBe(false);
+    // The switches sit under their own visible names inside the field.
+    expect(t.fieldControl("Horizontal")).toBe(h);
+    expect(t.fieldControl("Vertical")).toBe(v);
+    // One explanation, on the field and on each switch, and it does not send
+    // the user to a Canvas panel the video editor does not have.
+    expect(flip.title).toMatch(/along its own sides, before its rotation/);
+    expect(flip.title).not.toMatch(/Canvas/);
+    expect(h.title).toBe(flip.title);
+    expect(v.title).toBe(flip.title);
+  });
+
+  it("flipping one axis keeps the other and the rest of the transform", () => {
+    const t = mount(project([turned()]), "a");
+    const v = t.host.find((e) => e.getAttribute("aria-label") === "Flip layer vertically")!;
+    v.checked = true;
+    v.fire("change");
+    expect(t.clipNow().transform).toEqual({ ...turned().transform, flipV: true });
+    expect(t.history).toHaveLength(1);
   });
 });

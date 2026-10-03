@@ -1,6 +1,7 @@
 // The client half of the chunked image-save protocol (src-tauri/src/image_save.rs):
 // begin (JSON, carries the destination) → 8 MiB raw chunks → commit, and an
-// abort on any error or signal so no `.part` file is left behind.
+// abort on any error or signal so no `<target>.taroting-part` file is left
+// behind.
 //
 // Why chunks at all: a 60-100 MB PNG handed to one invoke would be copied whole
 // on the UI thread (wry reads a body in 1 KiB steps) and held twice in memory.

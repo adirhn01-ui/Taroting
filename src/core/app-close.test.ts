@@ -40,6 +40,7 @@ vi.mock("../ui/temp-project", () => ({
 
 import {
   decideClose,
+  flushOrAsk,
   installCloseGate,
   registerBeforeClose,
   registerCloseTask,
@@ -707,5 +708,78 @@ describe("installCloseGate", () => {
     handler!();
     await flush();
     expect(d.destroy).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * flushOrAsk: the one final-save rule every exit from a permanent project now
+ * shares. The window close already had it; Back, Ctrl+W, the gear and an OS
+ * open went straight to dispose, where a failed save is reported to nobody.
+ */
+describe("flushOrAsk", () => {
+  const failing = (): ProjectSession & { saves: number } =>
+    fakeSession({
+      state: "dirty",
+      save: async (b) => {
+        b.state = "error";
+      },
+    });
+
+  it("writes nothing and asks nothing for a project already on disk", async () => {
+    const s = fakeSession({ state: "saved" });
+    expect(await flushOrAsk(s, "leave")).toBe(true);
+    expect(s.saves).toBe(0);
+    expect(m.askCloseAnyway).not.toHaveBeenCalled();
+  });
+
+  it("leaves without asking once the pending save lands", async () => {
+    const s = fakeSession({ state: "dirty" });
+    expect(await flushOrAsk(s, "leave")).toBe(true);
+    expect(s.saves).toBe(1);
+    expect(m.askCloseAnyway).not.toHaveBeenCalled();
+  });
+
+  it("asks the LEAVE question when leaving, and Stay stays", async () => {
+    m.askCloseAnyway.mockResolvedValue(false);
+    expect(await flushOrAsk(failing(), "leave")).toBe(false);
+    expect(m.askCloseAnyway).toHaveBeenCalledWith("Your latest changes couldn't be saved.", "leave");
+  });
+
+  it("asks the CLOSE question, unchanged, when closing", async () => {
+    m.askCloseAnyway.mockResolvedValue(true);
+    expect(await flushOrAsk(failing(), "close")).toBe(true);
+    expect(m.askCloseAnyway).toHaveBeenCalledWith("Your latest changes couldn't be saved.");
+  });
+
+  it("an injected question replaces the modal", async () => {
+    const ask = vi.fn(async () => true);
+    expect(await flushOrAsk(failing(), "leave", ask)).toBe(true);
+    expect(ask).toHaveBeenCalledWith("Your latest changes couldn't be saved.");
+    expect(m.askCloseAnyway).not.toHaveBeenCalled();
+  });
+
+  it("a leave prompt that cannot be shown stays (a close one closes)", async () => {
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    m.askCloseAnyway.mockRejectedValue(new Error("no dialog"));
+    expect(await flushOrAsk(failing(), "leave")).toBe(false);
+    expect(await flushOrAsk(failing(), "close")).toBe(true);
+    quiet.mockRestore();
+  });
+
+  it("a save still out at the 4 s cap is asked about", async () => {
+    vi.useFakeTimers();
+    const s = fakeSession({
+      state: "dirty",
+      save: (b) => {
+        b.state = "saving";
+        return new Promise<void>(() => {});
+      },
+    });
+    const run = flushOrAsk(s, "leave");
+    await vi.advanceTimersByTimeAsync(3999);
+    expect(m.askCloseAnyway).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(m.askCloseAnyway).toHaveBeenCalledWith("Your latest changes couldn't be saved.", "leave");
+    expect(await run).toBe(false);
   });
 });

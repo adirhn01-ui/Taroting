@@ -67,9 +67,10 @@ pub fn cache_dir() -> Result<PathBuf> {
 /// identity, so keeping it across runs is what spares each run re-deriving
 /// every fixture proxy against the suite's time cap.
 ///
-/// The extra `cache` level is load-bearing: `diagnostics.rs` derives the app
-/// root as this directory's PARENT, and that parent must be a folder of ours,
-/// never `%TEMP%` itself.
+/// The extra `cache` level keeps the real layout's shape: the cache root's
+/// parent is a folder of ours, never `%TEMP%` itself, so nothing that walks
+/// up from the cache can land in the shared temp directory. (Diagnostics no
+/// longer derive from it: they live under `app_local_dir`.)
 fn cache_dir_for(autotest: bool, local_app_data: Option<OsString>, temp: PathBuf) -> Result<PathBuf> {
     if autotest {
         return Ok(temp.join("taroting-autotest-cache").join("cache"));
@@ -81,9 +82,9 @@ fn cache_dir_for(autotest: bool, local_app_data: Option<OsString>, temp: PathBuf
 
 /// %LOCALAPPDATA%\Taroting — the app's local root. Holds the crash note
 /// (`crash.rs`: last-crash.txt, written as the process dies, shown once on the
-/// next launch). Redirected under autotest like every owner-data location: an
-/// E2E run that writes a synthetic note must never leave one for the owner's
-/// next launch to show.
+/// next launch) and saved diagnostic reports (`diagnostics.rs`). Redirected
+/// under autotest like every owner-data location: an E2E run that writes a
+/// synthetic note or saves a report must never leave one for the owner.
 pub fn app_local_dir() -> Result<PathBuf> {
     if let Some(dir) = autotest_redirect("localappdata") {
         return Ok(dir);
@@ -167,8 +168,8 @@ mod tests {
             !e2e.starts_with(temp.join("taroting-autotest")),
             "inside the wiped autotest root the cache would be rebuilt every run: {e2e:?}"
         );
-        // diagnostics.rs takes the cache's parent as the app root: that must be
-        // a folder of ours, not the temp directory itself.
+        // The cache root's parent must be a folder of ours, not the temp
+        // directory itself.
         let parent = e2e.parent().unwrap();
         assert_ne!(parent, temp.as_path());
         assert!(parent.starts_with(&temp), "{parent:?}");

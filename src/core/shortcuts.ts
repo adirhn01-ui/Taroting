@@ -279,6 +279,40 @@ export function conflictingActions(conflicts: readonly ShortcutConflict[]): Set<
   return out;
 }
 
+/** The browser-chrome Ctrl letters a packaged app has no use for: print, reload,
+ *  find, downloads, view-source. */
+const CHROME_CTRL_LETTERS: ReadonlySet<string> = new Set(["p", "r", "f", "j", "u"]);
+
+/**
+ * True for a key press that would reach a WebView2 browser accelerator (print,
+ * reload, find, downloads, view-source, F5 refresh, F3 find-next, F7 caret
+ * browsing). main.ts blocks these in production; a reload throws away every
+ * unsaved edit, strands an edited temporary project until the next start's
+ * sweep, and drops the export dialog while its ffmpeg keeps running.
+ *
+ * The letter is matched in either case and by POSITION on a non-Latin layout.
+ * The old check compared `e.key` with lowercase Latin letters, but WebView2's
+ * accelerators go by the key, not the character: Ctrl+Shift+R and Caps Lock +
+ * Ctrl+R ("R") reloaded anyway, and so did plain Ctrl+R on a Hebrew ("ר") or
+ * Russian ("к") layout. The position is read under the same guard as
+ * `physicalChordOf`: only when the layout typed a NON-ASCII character, so a
+ * Latin layout that puts another letter on the R key is judged by its letter.
+ *
+ * `!altKey` keeps AltGr (reported as Ctrl+Alt) out of it: an AltGr character is
+ * typing, never a command. Blocking Ctrl+Shift+R costs no app binding — the
+ * capture listener only prevents the default, the event still reaches the
+ * shortcut manager.
+ */
+export function isBrowserChromeKey(e: ChordSource): boolean {
+  const k = e.key;
+  if (k === "F5" || k === "F3" || k === "F7" || k === "BrowserRefresh") return true;
+  if (!e.ctrlKey || e.altKey || k.length !== 1) return false;
+  if (CHROME_CTRL_LETTERS.has(k.toLowerCase())) return true;
+  if (k.codePointAt(0)! <= 127) return false;
+  const m = e.code === undefined ? null : /^Key([A-Z])$/.exec(e.code);
+  return m !== null && CHROME_CTRL_LETTERS.has(m[1]!.toLowerCase());
+}
+
 /** True when the event target is a place where typing is expected. */
 export function isTypingTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -338,6 +372,14 @@ export function blockShortcuts(): () => void {
 /** True while any surface holds a `blockShortcuts` token. */
 export function shortcutsBlocked(): boolean {
   return blockers > 0;
+}
+
+/** How many `blockShortcuts` tokens are out. For a surface that holds one
+ *  itself and needs to know whether anything ELSE does: the image shell asks
+ *  "is mine the only one?" (=== 1) where `shortcutsBlocked()` cannot tell its
+ *  own token from a menu or a dialog on top of it. */
+export function shortcutBlockers(): number {
+  return blockers;
 }
 
 export type ActionHandler = (e: KeyboardEvent) => void;

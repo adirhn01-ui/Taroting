@@ -1204,13 +1204,21 @@ export function sanitizeProject(p: ProjectFile): ProjectFile {
     return next;
   });
 
+  // `tempEdited` is exactly `true` or absent — the rule schema.rs reads it by
+  // (`true_or_false`). The file comes through untyped, so a hand-edited
+  // "yes" or 1 would otherwise ride along in the session and be written back.
+  // Only a value that is not `true` is dropped: a real flag is never lost here
+  // (it is what keeps a crash orphan from the startup sweep), and none is ever
+  // invented — whether a project was edited is the session's to say.
+  const badTempEdited = "tempEdited" in p && (p as { tempEdited?: unknown }).tempEdited !== true;
+
   const timelineChanged =
     fps !== t.fps ||
     width !== t.width ||
     height !== t.height ||
     tracksChanged ||
     markers !== t.markers;
-  if (!timelineChanged && !mediaChanged) return p;
+  if (!timelineChanged && !mediaChanged && !badTempEdited) return p;
 
   let timeline = t;
   if (timelineChanged) {
@@ -1219,7 +1227,9 @@ export function sanitizeProject(p: ProjectFile): ProjectFile {
     timeline = { ...t, fps, width, height, tracks };
     if (markers !== t.markers) timeline.markers = markers;
   }
-  return { ...p, media, timeline };
+  const out: ProjectFile = { ...p, media, timeline };
+  if (badTempEdited) delete out.tempEdited;
+  return out;
 }
 
 /* ------------------------------------------------------------------ */

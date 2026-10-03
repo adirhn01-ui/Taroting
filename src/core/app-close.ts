@@ -1,6 +1,9 @@
 // The window-close gate: every close request (X, Alt+F4, taskbar) runs one
 // flow that keeps, discards, flushes or asks before the window goes, and
-// never leaves the window unclosable (every wait is capped).
+// never leaves the window unclosable (every wait is capped). It also owns the
+// one "flush, or ask" rule that every exit from a permanent project shares
+// (`flushOrAsk`), and the leave check an OS open runs before replacing the
+// screen (`confirmLeaveCurrentSession`).
 //
 // Why a flow at all: the editor's own exits (Back, Ctrl+W, the gear) run its
 // teardown, which ends in the final save and the keep/discard prompt. Closing
@@ -11,7 +14,12 @@
 
 import { ipc, onCloseRequested } from "./ipc";
 import { TEARDOWN_WAIT_MS, isTempProjectPath } from "./open-media";
-import { settingsWritesSettled, type ProjectSession } from "./session";
+import {
+  currentSession,
+  leaveBlockedReason,
+  settingsWritesSettled,
+  type ProjectSession,
+} from "./session";
 // ../ui/temp-project (the Keep question, "close anyway?", the scratch-file
 // discard) is imported where it is used, never at the top: this module is in
 // the boot chunk, and those dialogs are needed only once a close actually
@@ -170,6 +178,103 @@ async function closeAnyway(message: string): Promise<boolean> {
   }
 }
 
+/** Ask "leave anyway?". The opposite failure rule from closeAnyway: a prompt
+ *  that cannot be shown STAYS. Staying loses nothing, and the window's own X
+ *  still has its escape hatch, so the user is never trapped by it. */
+async function leaveAnyway(message: string): Promise<boolean> {
+  try {
+    const { askCloseAnyway } = await import("../ui/temp-project");
+    return await askCloseAnyway(message, "leave");
+  } catch (e) {
+    console.error("The leave prompt could not be shown", e);
+    return false;
+  }
+}
+
+/** What flushOrAsk asks when the save did not land: true = go anyway. */
+export type AskAnyway = (message: string) => Promise<boolean>;
+
+// The permanent sessions a LEAVE is already flushing or asking about. A
+// temporary project has one latch for every exit (its gate's `busy`, reached
+// through `leaveGuard` by an OS open too), but a permanent one has no
+// leaveGuard: Back and Ctrl+W go through the gate's latch, while an OS open
+// comes here directly. Without this set both pass at once — their saves
+// coalesce, both resolve true, the open navigates and then Back's dest()
+// navigates over it; with a failing save the user gets two stacked "Leave this
+// project?" prompts, and answering the stale one later sends them away from the
+// screen they just opened. The second leave now stays (an OS open says so).
+//
+// A CLOSE never consults it: a close that bailed while a leave prompt is up
+// would make X do nothing, and the window must never be unclosable. Its prompt
+// stacking over the leave one is the right answer there.
+const leaving = new WeakSet<ProjectSession>();
+
+/**
+ * The final save before a permanent project's screen goes, and the question
+ * when it does not land. true = go on (closing, or leaving); false = stay.
+ *
+ * ONE rule for every exit, because the exits used to disagree. The window close
+ * already asked when its final save failed; Back, Ctrl+W, the gear and an OS
+ * open did not — they went straight to the editor's dispose, whose one save
+ * cannot report a failure to anyone (the badge that would have said "Save
+ * failed" is torn down with the screen). A OneDrive or antivirus lock, a full
+ * disk or an unplugged drive then dropped the user's latest edits without a
+ * word, and in a video session an edit stays unsaved for up to the autosave
+ * interval, so the window for it was wide.
+ *
+ * Already on disk: nothing is written. save() always writes (and restamps
+ * modifiedAt on disk), so skipping it keeps an untouched project from jumping
+ * to the top of Home's "Date modified" sort just because it was open — the
+ * rule the editor's own dispose follows. A save that has not landed within
+ * FLUSH_CAP_MS is treated as failed: the write may yet land, but the user is
+ * told it has not, and decides.
+ *
+ * A leave while another leave of the same session is still out stays at once
+ * (false), checked before the on-disk shortcut: the first one is about to
+ * navigate, and a second true would navigate over it. See `leaving`.
+ */
+export async function flushOrAsk(
+  s: ProjectSession,
+  verb: "close" | "leave",
+  ask?: AskAnyway,
+): Promise<boolean> {
+  const latch = verb === "leave";
+  if (latch && leaving.has(s)) return false;
+  if (s.saveState.get() === "saved") return true;
+  if (latch) leaving.add(s);
+  try {
+    const landed = await within(s.save(), FLUSH_CAP_MS);
+    if (landed && s.saveState.get() !== "error") return true;
+    if (ask) return await ask(SAVE_FAILED);
+    return await (verb === "close" ? closeAnyway(SAVE_FAILED) : leaveAnyway(SAVE_FAILED));
+  } finally {
+    if (latch) leaving.delete(s);
+  }
+}
+
+/**
+ * Ask the open session (if any) to confirm being replaced by a navigation it
+ * did not initiate — today that is only the OS open-path route (core/open-route).
+ * Resolves true when there is nothing to confirm, or the user agreed.
+ *
+ * A running export refuses outright, before any question. A session with a
+ * leave guard (a temporary project) answers through it, so a temporary project
+ * is never flushed to a scratch file the startup sweep deletes. Any other
+ * session is a permanent project, and gets the same flush-or-ask as every other
+ * exit: a failed final save asks "leave anyway?", and Stay cancels the open.
+ *
+ * Lives here rather than beside `currentSession` in core/session: the flush
+ * rule is this module's, and session must not import it back (core has no
+ * import cycles).
+ */
+export async function confirmLeaveCurrentSession(ask?: AskAnyway): Promise<boolean> {
+  if (leaveBlockedReason() !== null) return false;
+  const s = currentSession.get();
+  if (!s) return true;
+  if (s.leaveGuard) return await s.leaveGuard();
+  return flushOrAsk(s, "leave", ask);
+}
+
 /** true = go on closing; false = the user chose to stay. */
 async function confirmForSession(s: ProjectSession): Promise<boolean> {
   const facts = { hasSession: true, temp: s.temp.get(), edited: s.edited, blocked: !!s.blockLeave };
@@ -224,17 +329,8 @@ async function confirmForSession(s: ProjectSession): Promise<boolean> {
 }
 
 /** The final save before the window goes. true = go on closing. */
-async function flushForClose(s: ProjectSession): Promise<boolean> {
-  // Already on disk: nothing to write. save() always writes (and restamps
-  // modifiedAt), so skipping it keeps an untouched project from jumping to
-  // the top of Home's "Date modified" sort just because it was open at
-  // close — the same rule the editor's own dispose follows.
-  if (s.saveState.get() === "saved") return true;
-  const landed = await within(s.save(), FLUSH_CAP_MS);
-  // A timeout is never a silent close: the write may yet land, but the
-  // user is told it has not, and decides.
-  if (!landed || s.saveState.get() === "error") return closeAnyway(SAVE_FAILED);
-  return true;
+function flushForClose(s: ProjectSession): Promise<boolean> {
+  return flushOrAsk(s, "close");
 }
 
 /** Tells the Rust escape hatch this webview is alive and answering. */

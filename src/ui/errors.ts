@@ -89,6 +89,20 @@ export function placeOverlay(node: Element): () => void {
   return () => unfollow(node);
 }
 
+/**
+ * The modal backdrop the user is looking at: the last one in document order,
+ * except under element fullscreen, where the fullscreen element paints above
+ * the whole document. A dialog placed inside it (`placeOverlay`) sits EARLIER
+ * in document order than anything on <body>, yet a backdrop on <body> is the
+ * one hidden behind the top layer — so the fullscreen element's own backdrops
+ * win whenever it has any.
+ */
+function topmostBackdrop(): Element | undefined {
+  const inTopLayer = document.fullscreenElement?.querySelectorAll(".modal-backdrop");
+  const stack = inTopLayer?.length ? inTopLayer : document.querySelectorAll(".modal-backdrop");
+  return stack[stack.length - 1];
+}
+
 /* ---------------- clipboard ---------------- */
 
 /** Copy text, with a fallback for the (unlikely) case the async Clipboard API
@@ -297,8 +311,7 @@ export function openErrorDialog(opts: ErrorDialogOptions): () => void {
     // dialog underneath it — and stopping the event here (window capture runs
     // before the document-level capture handlers the other dialogs use) keeps
     // that dialog open behind us.
-    const stack = document.querySelectorAll(".modal-backdrop");
-    if (stack[stack.length - 1] !== backdrop) return;
+    if (topmostBackdrop() !== backdrop) return;
     e.preventDefault();
     e.stopImmediatePropagation();
     close();

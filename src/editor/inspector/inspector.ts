@@ -853,27 +853,28 @@ export function mountInspector(
     });
     s.appendChild(field("Rotate", rotBtn));
 
-    // Flip switches — not animatable
+    // Flip switches — not animatable. They mirror the layer along ITS sides,
+    // before its rotation (the same convention as the image editor's layer
+    // flips), which keeps each switch meaning one thing however the layer is
+    // turned — so on a quarter-turned layer "Horizontal" mirrors top to bottom
+    // on screen. The labels and the tooltip say so.
+    const flipTip =
+      "Mirrors this layer along its own sides, before its rotation, so on a layer turned 90° or 270° Horizontal flips it top to bottom on screen.";
+    const flipSwitch = (label: string, aria: string, axis: "flipH" | "flipV"): HTMLElement => {
+      const sw = switchToggle(tf[axis], (v) => {
+        const cur = currentTransform(clipId) ?? tf;
+        commit((p) => updateClip(p, clipId, { transform: { ...cur, [axis]: v } }));
+      });
+      sw.setAttribute("aria-label", aria);
+      sw.title = flipTip;
+      return field(label, sw);
+    };
     const flipRow = el("div", "insp-row");
-    flipRow.appendChild(
-      field(
-        "Flip H",
-        switchToggle(tf.flipH, (v) => {
-          const cur = currentTransform(clipId) ?? tf;
-          commit((p) => updateClip(p, clipId, { transform: { ...cur, flipH: v } }));
-        }),
-      ),
-    );
-    flipRow.appendChild(
-      field(
-        "Flip V",
-        switchToggle(tf.flipV, (v) => {
-          const cur = currentTransform(clipId) ?? tf;
-          commit((p) => updateClip(p, clipId, { transform: { ...cur, flipV: v } }));
-        }),
-      ),
-    );
-    s.appendChild(flipRow);
+    flipRow.appendChild(flipSwitch("Horizontal", "Flip layer horizontally", "flipH"));
+    flipRow.appendChild(flipSwitch("Vertical", "Flip layer vertically", "flipV"));
+    const flipField = field("Flip layer", flipRow);
+    flipField.title = flipTip;
+    s.appendChild(flipField);
 
     /* ---- Opacity (animatable) ---- */
     const opacityAnimated = groupAnimated(t.clip.keyframes, "opacity");

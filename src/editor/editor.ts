@@ -364,7 +364,12 @@ function buildEditor(
    *  anything it awaited must leave the session and the screen alone. */
   const disposed = (): boolean => teardown.done;
 
-  media.ensureAll(session.project);
+  // The ids the load reported missing or changed go in with this first call
+  // only: the manager checks each one exists before asking for a thumbnail,
+  // waveform or playback plan, so a file that is not there shows as failed
+  // instead of Ready over a black stage, and a crafted path from the .trt
+  // reaches no ffmpeg work before the relink dialog below has been answered.
+  media.ensureAll(session.project, loaded.missing);
 
   if (loaded.recovered) toast.info("Project restored from its automatic backup.");
 
@@ -530,9 +535,7 @@ function buildEditor(
   // when it ends (onGestureEnd below). Same mutable-ref idiom as engineRef;
   // false until the overlay exists, which is also the truth.
   let overlayRef: CanvasOverlay | null = null;
-  // Built as a variable, not passed as a literal, so the extra field
-  // type-checks against an InspectorCtx that does not declare it yet.
-  const inspectorCtx = {
+  const inspector = mountInspector($("#ed-inspector"), {
     session,
     media,
     engine,
@@ -542,11 +545,7 @@ function buildEditor(
       timeline.requestRender();
     },
     overlayGestureActive: (): boolean => overlayRef?.gestureActive() ?? false,
-  };
-  const inspector: ReturnType<typeof mountInspector> & { rebuild?(): void } = mountInspector(
-    $("#ed-inspector"),
-    inspectorCtx,
-  );
+  });
   teardown.add(() => inspector.dispose());
 
   // Canvas direct manipulation: selection box, drag/scale, and crop mode over
@@ -561,9 +560,17 @@ function buildEditor(
       engine.refresh();
       timeline.requestRender();
     },
+    // The crop ghost decodes what the stage plays — the proxy or remux when
+    // the manager made one — exactly as the scheduler's urlFor resolves it:
+    // the original of a proxied source is the file the WebView cannot decode.
+    // Null while no plan is ready; the overlay then falls back to the original.
+    playbackUrl: (m) => {
+      const s = media.status.get()[m.id];
+      return s?.state === "ready" ? s.url : null;
+    },
     // A committed drag notifies no store subscriber on its way out, so the
     // inspector that sat out the drag is told here.
-    onGestureEnd: () => inspector.rebuild?.(),
+    onGestureEnd: () => inspector.overlayGestureEnded(),
   });
   overlayRef = overlay;
   teardown.add(() => overlay.dispose());
@@ -572,9 +579,8 @@ function buildEditor(
   // lift the whole stage over the editor chrome; the transport button glyph flips
   // to reflect the open/close state via onChange. Entering it drops any canvas
   // drag in flight (cancelGesture), so a drag cannot go on editing the project
-  // under the view-only theater canvas. A variable for the same reason as
-  // inspectorCtx: the callback is new to TheaterCtx.
-  const theaterCtx = {
+  // under the view-only theater canvas.
+  const theater = mountTheater({
     engine,
     container: $("#ed-stage"),
     volume,
@@ -588,8 +594,7 @@ function buildEditor(
     // can race the fixed inset-0 jump).
     refit: (): void => stage.refit(),
     cancelGesture: (): void => overlay.cancelGesture(),
-  };
-  const theater = mountTheater(theaterCtx);
+  });
   teardown.add(() => theater.dispose());
 
   /* ---------------- actions ---------------- */

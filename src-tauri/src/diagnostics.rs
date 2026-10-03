@@ -124,14 +124,14 @@ fn write_report_at(dir: &Path, content: &str, millis: u64) -> Result<String> {
     Err(AppError::BadInput("no free name for the diagnostic report".into()))
 }
 
-/// `%LOCALAPPDATA%\Taroting\diagnostics`, derived from the cache dir's parent so
-/// the app-root location stays defined in exactly one place (`paths.rs`).
+/// `%LOCALAPPDATA%\Taroting\diagnostics`, under the app's local root as
+/// `paths.rs` defines it. That root is redirected under autotest, so an E2E
+/// save lands in the run's own scratch folder (wiped at the next run) and
+/// never among the owner's reports. It used to be the cache folder's parent,
+/// which the autotest redirects somewhere else on purpose: the cache survives
+/// between runs, and every E2E save piled up there.
 fn diagnostics_dir() -> Result<PathBuf> {
-    let cache = paths::cache_dir()?;
-    let root = cache
-        .parent()
-        .ok_or_else(|| AppError::BadInput("cache directory has no parent".into()))?;
-    Ok(root.join("diagnostics"))
+    Ok(paths::app_local_dir()?.join("diagnostics"))
 }
 
 /// Save a diagnostic report and return the path it was written to.
@@ -148,6 +148,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("taroting-diag-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// Reports go under the app's local root (`paths::app_local_dir`, which
+    /// the autotest redirects into its wiped scratch root), never next to the
+    /// cache. Both resolve to `%LOCALAPPDATA%\Taroting` outside autotest, so
+    /// no value comparison here could tell them apart, and the env var that
+    /// flips autotest is process-global: pinned in the source instead. Only
+    /// the code before the test module is searched — the needles appear in
+    /// this test too.
+    #[test]
+    fn reports_live_under_the_app_local_root_never_beside_the_cache() {
+        let code = include_str!("diagnostics.rs").split("#[cfg(test)]").next().unwrap();
+        let body = &code[code.find("fn diagnostics_dir()").expect("diagnostics_dir")..];
+        let body = &body[..body.find("\n}").expect("its end")];
+        assert!(body.contains("paths::app_local_dir()?.join(\"diagnostics\")"), "{body}");
+        assert!(!body.contains("cache_dir"), "derived from the cache again: {body}");
     }
 
     #[test]

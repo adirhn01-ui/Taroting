@@ -40,8 +40,9 @@ vi.mock("../geom", () => ({
 }));
 
 /** Makes the mocked appendStrokeTo refuse (return its input), as the real one
- *  does for a layer that is not a drawing. */
-const appendRefuses = vi.hoisted(() => ({ on: false }));
+ *  does for a layer that is not a drawing (`why` null) or for a stroke past
+ *  the drawing caps (`why` is what the mocked strokeRefusal answers). */
+const appendRefuses = vi.hoisted(() => ({ on: false, why: null as string | null }));
 
 vi.mock("../layers", async (importOriginal) => {
   // The opacity rule is the REAL one: it is the layer model's, and the eraser
@@ -119,6 +120,7 @@ vi.mock("../layers", async (importOriginal) => {
       };
       return { project: { ...p, timeline: { ...p.timeline, tracks }, media: [...p.media, media] } as P, trackId: id };
     },
+    strokeRefusal: (_p: P, _s: Stroke) => (appendRefuses.on ? appendRefuses.why : null),
     appendStrokeTo: (p: P, id: string, s: Stroke) => {
       if (appendRefuses.on) return p;
       const l = findLayer(p, id)!;
@@ -164,6 +166,7 @@ vi.mock("../../ui/toast", () => ({
   toast: {
     info: (m: string) => void toasts.push(`info: ${m}`),
     error: (m: string) => void toasts.push(`error: ${m}`),
+    refuse: (m: string) => void toasts.push(`refuse: ${m}`),
   },
 }));
 
@@ -573,14 +576,35 @@ describe("pen", () => {
 
   it("a stroke that cannot be appended leaves no empty layer behind", () => {
     appendRefuses.on = true;
+    toasts.length = 0;
     try {
       const h = harness(project());
       draw(h, ZIGZAG);
       expect(h.events.commits).toBe(0);
       expect(h.store.get().timeline.tracks.map((t) => t.id)).toEqual(["t-photo"]);
+      // Not a cap refusal (strokeRefusal answers null): nothing to say.
+      expect(toasts).toEqual([]);
       h.handle.dispose();
     } finally {
       appendRefuses.on = false;
+    }
+  });
+
+  it("a stroke past the drawing caps is refused out loud, once, and leaves nothing behind", () => {
+    appendRefuses.on = true;
+    appendRefuses.why = "This stroke is too long to keep. Draw it in shorter pieces.";
+    toasts.length = 0;
+    try {
+      const h = harness(project());
+      draw(h, ZIGZAG);
+      expect(h.events.commits).toBe(0);
+      expect(h.history).toHaveLength(0);
+      expect(h.store.get().timeline.tracks.map((t) => t.id)).toEqual(["t-photo"]);
+      expect(toasts).toEqual(["refuse: This stroke is too long to keep. Draw it in shorter pieces."]);
+      h.handle.dispose();
+    } finally {
+      appendRefuses.on = false;
+      appendRefuses.why = null;
     }
   });
 

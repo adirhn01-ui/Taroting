@@ -102,6 +102,28 @@ function checkBootWiring(src: string): string[] {
   if (!/else if \(siblingOrderHeld\) \{\s*siblingOrderHeld = false;\s*void ipc\.forgetSiblingOrder\(\)/.test(c)) {
     problems.push("the held folder order is not dropped (only) when one is held");
   }
+  // The screen being left is inert while its teardown runs: set before go()
+  // waits on the teardowns, cleared right as #app is emptied. A live old
+  // screen in that window took image edits into a session about to be saved
+  // and closed, and started dialogs for a screen already going away.
+  const inertOn = "app.inert = true;";
+  const inertOff = "app.inert = false;";
+  const waitAt = c.indexOf("await teardowns.settledWithin(");
+  if (c.split(inertOn).length - 1 !== 1) problems.push("the leaving screen is not made inert exactly once");
+  else if (waitAt < 0 || c.indexOf(inertOn) > waitAt) problems.push("the leaving screen is made inert after the teardown wait");
+  if (!/app\.innerHTML = "";\s*app\.inert = false;/.test(c) || c.split(inertOff).length - 1 !== 1) {
+    problems.push("#app is not made live again right as it is cleared");
+  }
+  // The browser-chrome blocker goes through the layout-proof predicate.
+  if (!c.includes("if (isBrowserChromeKey(e)) e.preventDefault();")) {
+    problems.push("the reload/print/find blocker does not use isBrowserChromeKey");
+  }
+  // OS opens go through the tested router, with the leave check that flushes
+  // a permanent project before its screen is replaced.
+  if (!c.includes("const routeOpenPath = createOpenRouter({")) problems.push("routeOpenPath is not the core/open-route router");
+  if (!c.includes("confirmLeave: () => confirmLeaveCurrentSession(),")) {
+    problems.push("the open router does not confirm the leave with confirmLeaveCurrentSession");
+  }
   return problems;
 }
 
@@ -212,6 +234,37 @@ describe("boot wiring (src/main.ts)", () => {
     const awaited = MAIN.replace(line, "  await ipc.takeCrashNotes().then(showCrashNotes).catch(() => {});");
     expect(checkBootWiring(awaited)).toEqual(["the crash notes are awaited or not shown"]);
     expect(checkBootWiring(MAIN.replace(line, ""))).toEqual(["takeCrashNotes is called 0 times in main.ts, expected once"]);
+  });
+
+  it("rejects the leaving screen made inert late, twice, or never made live again", () => {
+    const on = "  app.inert = true;";
+    const wait = "  await teardowns.settledWithin(TEARDOWN_WAIT_MS);";
+    expect(MAIN.split(on).length - 1).toBe(1);
+    expect(MAIN.includes(wait)).toBe(true);
+    const late = MAIN.replace(on, "").replace(wait, `${wait}\n${on}`);
+    expect(checkBootWiring(late)).toEqual(["the leaving screen is made inert after the teardown wait"]);
+    expect(checkBootWiring(MAIN.replace(on, ""))).toEqual(["the leaving screen is not made inert exactly once"]);
+    const off = "  app.inert = false;";
+    expect(MAIN.split(off).length - 1).toBe(1);
+    expect(checkBootWiring(MAIN.replace(off, ""))).toEqual(["#app is not made live again right as it is cleared"]);
+    // Made live again only at the end of go(): every mount would run inert.
+    const endOfGo = "    const unhandled: never = route;";
+    expect(MAIN.includes(endOfGo)).toBe(true);
+    const moved = MAIN.replace(off, "").replace(endOfGo, `${off}\n${endOfGo}`);
+    expect(checkBootWiring(moved)).toEqual(["#app is not made live again right as it is cleared"]);
+  });
+
+  it("rejects the old raw-key blocker and an open route that skips the router or its leave check", () => {
+    const blocker = "if (isBrowserChromeKey(e)) e.preventDefault();";
+    expect(MAIN.includes(blocker)).toBe(true);
+    expect(checkBootWiring(MAIN.replace(blocker, 'if (e.ctrlKey && e.key === "r") e.preventDefault();'))).toEqual([
+      "the reload/print/find blocker does not use isBrowserChromeKey",
+    ]);
+    const leave = "confirmLeave: () => confirmLeaveCurrentSession(),";
+    expect(MAIN.includes(leave)).toBe(true);
+    expect(checkBootWiring(MAIN.replace(leave, "confirmLeave: async () => true,"))).toEqual([
+      "the open router does not confirm the leave with confirmLeaveCurrentSession",
+    ]);
   });
 
   it("ignores a commented-out call", () => {

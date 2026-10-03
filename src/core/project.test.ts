@@ -1225,3 +1225,47 @@ describe("image-project canvas (the kind branch)", () => {
     expect(at(undefined, 641, 360)).toEqual(["timeline width 641 not an even integer in [16, 8192]"]);
   });
 });
+
+/**
+ * `tempEdited` arrives untyped (load_project hands the raw JSON on). It is what
+ * keeps a crash orphan away from the startup sweep, so the loader must never
+ * lose a real `true` — and must not let a hand-edited "yes" ride along into
+ * the session and back onto disk. Whether a project WAS edited is the
+ * session's call, so nothing is ever invented here.
+ */
+describe("sanitizeProject and tempEdited", () => {
+  it("keeps a real flag, and returns the project itself when nothing else needs repair", () => {
+    const p: ProjectFile = { ...createProject("orphan"), tempEdited: true };
+    expect(sanitizeProject(p)).toBe(p);
+  });
+
+  it("invents nothing for a project without one", () => {
+    const p = createProject("plain");
+    const out = sanitizeProject(p);
+    expect(out).toBe(p);
+    expect("tempEdited" in out).toBe(false);
+  });
+
+  it.each<[string, unknown]>([
+    ["a string", "yes"],
+    ["a number", 1],
+    ["false", false],
+    ["null", null],
+  ])("drops %s, leaving everything else as it was", (_why, value) => {
+    const p = { ...createProject("hand-edited"), tempEdited: value } as unknown as ProjectFile;
+    const out = sanitizeProject(p);
+    expect("tempEdited" in out).toBe(false);
+    expect(out.name).toBe("hand-edited");
+    expect(out.timeline).toBe(p.timeline);
+    // The input object itself is never mutated.
+    expect((p as unknown as { tempEdited: unknown }).tempEdited).toBe(value);
+  });
+
+  it("keeps the flag while repairing something else", () => {
+    const p: ProjectFile = { ...createProject("orphan"), tempEdited: true };
+    const broken = { ...p, timeline: { ...p.timeline, width: 0 } };
+    const out = sanitizeProject(broken);
+    expect(out).not.toBe(broken);
+    expect(out.tempEdited).toBe(true);
+  });
+});

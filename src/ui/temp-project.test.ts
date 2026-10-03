@@ -12,7 +12,7 @@ import {
 import { toast } from "./toast";
 
 // The toast host needs a DOM; vitest runs in node. Only the calls matter here.
-vi.mock("./toast", () => ({ toast: { error: vi.fn(), info: vi.fn() } }));
+vi.mock("./toast", () => ({ toast: { error: vi.fn(), info: vi.fn(), refuse: vi.fn() } }));
 
 /**
  * The leave gate every exit from a temporary project goes through: Back, Ctrl+W,
@@ -119,6 +119,9 @@ function fakeRelocate(s: ProjectSession, fail?: Error): void {
     order.push(`relocate:${dest}`);
     if (fail) throw fail;
     (s as unknown as { _path: string })._path = dest;
+    // The real relocate returns only once its write has landed at `dest`, so
+    // the project it leaves behind is a permanent one with nothing unsaved.
+    s.saveState.set("saved");
   });
 }
 
@@ -508,6 +511,7 @@ describe("createTempExits — in-place Keep behind the leave gate", () => {
       });
       if (fail) throw fail;
       (s as unknown as { _path: string })._path = dest;
+      s.saveState.set("saved"); // a landed relocate, as in fakeRelocate
     });
     return () => release();
   }
@@ -639,5 +643,109 @@ describe("createTempExits — in-place Keep behind the leave gate", () => {
     const back = outcome();
     exits.confirmLeave(back.dest, back.cancel);
     expect([back.dests, back.cancels]).toEqual([1, 0]);
+  });
+});
+
+/**
+ * A PERMANENT project leaving through the gate (Back, Ctrl+W, the gear, a
+ * kept project's exits). It used to pass straight through to the editor's
+ * dispose, whose one save reports a failure to nobody — the badge that would
+ * say "Save failed" goes with the screen — so a locked or vanished file lost
+ * the latest edits without a word. Now the save runs first and a failure asks.
+ */
+describe("createTempLeaveGateWith — a permanent project with unsaved edits", () => {
+  const SAVE_FAILED = "Your latest changes couldn't be saved.";
+
+  function permanentSession(): ProjectSession {
+    const s = new ProjectSession(KEPT_PATH, createProject(PROJECT_NAME));
+    s.replace(addMarkerAt(s.project, 1.5).project); // dirty, debounce pending
+    sessions.push(s);
+    return s;
+  }
+
+  it("a failed final save asks, and Stay fires only onCancel", async () => {
+    vi.spyOn(ipc, "saveProject").mockRejectedValue(new Error("Access is denied."));
+    const s = permanentSession();
+    const askLeave = vi.fn(async () => false);
+    const o = outcome();
+    createTempLeaveGateWith(s, async () => "discard", askLeave).confirmLeave(o.dest, o.cancel);
+    await settle();
+    await settle();
+    expect(askLeave).toHaveBeenCalledWith(SAVE_FAILED);
+    expect([o.dests, o.cancels]).toEqual([0, 1]);
+    expect(s.saveState.get()).toBe("error");
+  });
+
+  it("Leave anyway fires only dest", async () => {
+    vi.spyOn(ipc, "saveProject").mockRejectedValue(new Error("Access is denied."));
+    const s = permanentSession();
+    const o = outcome();
+    createTempLeaveGateWith(s, async () => "discard", async () => true).confirmLeave(o.dest, o.cancel);
+    await settle();
+    await settle();
+    expect([o.dests, o.cancels]).toEqual([1, 0]);
+  });
+
+  it("a save that lands leaves without asking, and the edit is on disk first", async () => {
+    vi.spyOn(ipc, "saveProject").mockImplementation(async (path: string) => {
+      order.push(`saveProject:${path}`);
+      return { modifiedAt: "2026-10-03T09:00:00.000Z" };
+    });
+    const s = permanentSession();
+    const askLeave = vi.fn(async (_message: string) => false);
+    const o = outcome();
+    createTempLeaveGateWith(s, async () => "discard", (m) => {
+      order.push("asked");
+      return askLeave(m);
+    }).confirmLeave(() => {
+      order.push("dest");
+      o.dest();
+    }, o.cancel);
+    await settle();
+    expect(order).toEqual([`saveProject:${KEPT_PATH}`, "dest"]);
+    expect([o.dests, o.cancels]).toEqual([1, 0]);
+  });
+
+  it("a second exit while the save or the question is out bails, and never asks twice", async () => {
+    vi.spyOn(ipc, "saveProject").mockRejectedValue(new Error("Access is denied."));
+    const s = permanentSession();
+    let answer: (v: boolean) => void = () => {};
+    const askLeave = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    const gate = createTempLeaveGateWith(s, async () => "discard", askLeave);
+    const first = outcome();
+    gate.confirmLeave(first.dest, first.cancel);
+    expect(gate.busy).toBe(true);
+    const second = outcome();
+    gate.confirmLeave(second.dest, second.cancel);
+    expect([second.dests, second.cancels]).toEqual([0, 1]);
+    await settle();
+    await settle();
+    answer(false);
+    await settle();
+    expect(askLeave).toHaveBeenCalledTimes(1);
+    expect([first.dests, first.cancels]).toEqual([0, 1]);
+    expect(gate.busy).toBe(false);
+  });
+});
+
+describe("tempEdited across a real Keep", () => {
+  it("the scratch file carries the stamp, the kept file never does", async () => {
+    const writes: Array<{ path: string; tempEdited: unknown; has: boolean }> = [];
+    vi.spyOn(ipc, "saveProject").mockImplementation(async (path: string, project) => {
+      writes.push({ path, tempEdited: project.tempEdited, has: "tempEdited" in project });
+      return { modifiedAt: "2026-10-03T09:30:00.000Z" };
+    });
+    const s = tempSession(); // edited
+    await s.save();
+    await keepTempSession(s);
+    expect(writes).toEqual([
+      { path: TEMP_PATH, tempEdited: true, has: true },
+      { path: KEPT_PATH, tempEdited: undefined, has: false },
+    ]);
   });
 });

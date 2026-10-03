@@ -1,8 +1,10 @@
 // The Resize canvas dialog: width × height (integers 1-65535), keep aspect, and
 // a note that it adds or trims space around the picture (layers keep their
 // size) and that scaling the picture lives in Export. Apply is one commit of
-// `resizeCanvas` (anchored at the centre, so every layer keeps its offset from
-// it); the shell refits the view when the canvas size changes.
+// `resizeCanvas`, anchored at the centre rounded to the whole pixel: an even
+// change keeps every layer's offset from the centre, an odd one shifts every
+// layer by −0.5 px on that axis so its edges stay on whole pixels. The shell
+// refits the view when the canvas size changes.
 //
 // The app's modal pattern, whole: .modal-backdrop + .modal, trapTab released
 // on EVERY close path, Escape / backdrop / X cancel, focus seated on the

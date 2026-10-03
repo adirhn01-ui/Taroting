@@ -339,6 +339,14 @@ fn main() {
                 let _ = std::fs::remove_dir_all(debug::autotest_root());
             }
             project::store::cleanup_temp_projects();
+            // Half-written cache files a dead run left behind, on a thread of
+            // its own. Here for the same reason as the sweep above: in a
+            // second launch every partial of the LIVE instance is older than
+            // that process, and would look abandoned. A disabled cache is not
+            // managed, and then there is nothing to sweep.
+            if let Some(cache) = app.try_state::<Arc<cache::Cache>>() {
+                cache::sweep_stale_partials_in_background(&cache);
+            }
             // Autotest only: conceal the window as soon as it exists. A normal
             // run never enters the branch and launches exactly as before.
             if autotest_mode() {
@@ -475,6 +483,27 @@ mod tests {
         for (u, dev_origin, want, why) in rows {
             assert_eq!(navigation_allowed(&url(u), dev_origin), want, "{why}: {u}");
         }
+    }
+
+    /// The startup sweeps run in `.setup()`, where only the primary instance
+    /// gets, and the cache's partials sweep after the temp-projects one.
+    /// Pinned in the source because `.setup()` needs a running app. Only the
+    /// code BEFORE the test module is searched: the needles also appear in
+    /// this test, and a whole-file search would find them here.
+    #[test]
+    fn setup_sweeps_stale_cache_partials_in_the_primary_instance() {
+        let code = include_str!("main.rs").split("#[cfg(test)]").next().unwrap();
+        let setup = &code[code.find(".setup(|app| {").expect("the setup hook")..];
+        let primary = setup.find("forward.ends_launch()").expect("the second-launch hand-over");
+        let temp = setup.find("project::store::cleanup_temp_projects();").expect("the temp sweep");
+        let partials = setup
+            .find("cache::sweep_stale_partials_in_background(&cache);")
+            .expect("setup must sweep the cache's stale partials");
+        assert!(primary < temp && temp < partials, "the sweeps run after the hand-over, temp projects first");
+        assert!(
+            setup[..partials].contains("app.try_state::<Arc<cache::Cache>>()"),
+            "a disabled cache is not managed: look it up with try_state, never state"
+        );
     }
 
     /// Every input flips the answer on its own in at least one row.

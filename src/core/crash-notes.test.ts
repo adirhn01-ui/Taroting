@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CRASH_TITLES, ENGINE_NOT_RESTARTED, crashTitle, showCrashNotes, type CrashNoteSink } from "./crash-notes";
+import { CRASH_TITLES, ENGINE_FAILED_AT_STARTUP, ENGINE_NOT_RESTARTED, crashTitle, showCrashNotes, type CrashNoteSink } from "./crash-notes";
 import type { CrashNote } from "./ipc";
 import type { ToastOptions } from "../ui/toast";
 
@@ -77,6 +77,33 @@ describe("showCrashNotes", () => {
     expect(crashTitle("panic", "restarted: no")).toBe(CRASH_TITLES.panic);
   });
 
+  it("says the engine never started, without promising lost edits, for a startup failure", () => {
+    // The exact lines crash.rs `startup_failure_note_text` writes. It carries a
+    // `restarted: no` line too, so the refused-restart title would match first
+    // and claim edits may be lost — but no page ever loaded in that run.
+    const startup: CrashNote = {
+      kind: "engine",
+      at: "2026-10-02T06:12:40Z",
+      detail:
+        "Taroting 0.9.1\ntime: 2026-10-02T06:12:40Z\nkind: engine\nprocess: engine\n" +
+        "reason: could not be created at startup\nruntime: not found (WebView2 error)\n" +
+        "restarted: no (the display engine could not start)\n",
+    };
+    // A CRLF copy of the same note (a note file touched by an editor) reads the same.
+    const crlf: CrashNote = { ...startup, detail: startup.detail.replace(/\n/g, "\r\n") };
+    const { sink, calls } = recorder();
+    showCrashNotes([startup, crlf], sink);
+    expect(calls.map((c) => c.message)).toEqual([ENGINE_FAILED_AT_STARTUP, ENGINE_FAILED_AT_STARTUP]);
+    expect(ENGINE_FAILED_AT_STARTUP).not.toMatch(/lost/i);
+    expect(calls[0]?.opts?.detail).toBe(startup.detail);
+    // Only that reason, only on its own line, and only for an engine note: an
+    // engine that stopped mid-run keeps its own titles, and a panic quoting the
+    // line is still a panic.
+    expect(crashTitle("engine", `${ENGINE.detail}\nrestarted: no (stopped twice)`)).toBe(ENGINE_NOT_RESTARTED);
+    expect(crashTitle("engine", "message: reason: could not be created at startup")).toBe(CRASH_TITLES.engine);
+    expect(crashTitle("panic", "reason: could not be created at startup")).toBe(CRASH_TITLES.panic);
+  });
+
   it("shows nothing for no notes", () => {
     const { sink, calls } = recorder();
     showCrashNotes([], sink);
@@ -98,7 +125,7 @@ describe("showCrashNotes", () => {
   });
 
   it("titles are sentence case with no trailing ellipsis", () => {
-    for (const t of Object.values(CRASH_TITLES)) {
+    for (const t of [...Object.values(CRASH_TITLES), ENGINE_NOT_RESTARTED, ENGINE_FAILED_AT_STARTUP]) {
       expect(t[0]).toBe(t[0]!.toUpperCase());
       expect(t.endsWith("…") || t.endsWith("...")).toBe(false);
     }

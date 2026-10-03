@@ -1,8 +1,8 @@
 //! Locating and spawning the bundled ffmpeg/ffprobe sidecars.
 //!
 //! Every sidecar child starts through [`spawn_owned`] (directly, or through
-//! [`output_owned`], [`run`] and [`run_with_deadline`], which are built on it).
-//! That is what makes a child end with the app: see `spawn_owned`.
+//! [`run_with_deadline`], which is built on it). That is what makes a child
+//! end with the app: see `spawn_owned`.
 
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -77,25 +77,6 @@ pub fn spawn_owned(cmd: &mut Command) -> io::Result<Child> {
     Ok(child)
 }
 
-/// `Command::output`, through [`spawn_owned`]: stdin from nowhere, stdout and
-/// stderr captured. Those three are SET here (std offers no way to ask what a
-/// caller chose), so any stdio already configured on `cmd` is replaced.
-///
-/// No deadline: a child that never exits blocks the caller forever. Anything
-/// that can meet a hung or hostile input belongs on [`run_with_deadline`].
-pub fn output_owned(cmd: &mut Command) -> io::Result<Output> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    spawn_owned(cmd)?.wait_with_output()
-}
-
-/// Run a sidecar to completion, capturing output. For quick, bounded work
-/// (probing, version checks) — long-running jobs go through the job system.
-pub fn run(name: &str, args: &[&str]) -> Result<Output> {
-    let mut cmd = command(name)?;
-    cmd.args(args);
-    Ok(output_owned(&mut cmd)?)
-}
-
 /// A deadline longer than this is this. It only keeps `Instant + Duration`
 /// from overflowing (a panic, so an abort in release) on an absurd value.
 const MAX_DEADLINE: Duration = Duration::from_secs(24 * 3600);
@@ -104,8 +85,9 @@ const MAX_DEADLINE: Duration = Duration::from_secs(24 * 3600);
 #[cfg(not(windows))]
 const POLL: Duration = Duration::from_millis(50);
 
-/// [`output_owned`] with a deadline: `Ok(None)` when the child was still
-/// running `deadline` after it started — it has then been killed and reaped.
+/// `Command::output` through [`spawn_owned`], with a deadline: `Ok(None)`
+/// when the child was still running `deadline` after it started — it has
+/// then been killed and reaped.
 /// Callers treat `None` as "the probe failed".
 ///
 /// The clock starts at the spawn, not when the caller decided to run it, so
@@ -120,10 +102,6 @@ const POLL: Duration = Duration::from_millis(50);
 /// The wait itself is the OS's (`WaitForSingleObject` on the process with the
 /// time left), so a child that finishes is noticed at once — a 50 ms probe
 /// costs 50 ms, not a poll interval on top. Other platforms poll `try_wait`.
-// The probes, thumbnails and the export's encoder checks move onto it in
-// this same release; until they do, only the tests call it. Drop the allow
-// then.
-#[allow(dead_code)]
 pub fn run_with_deadline(mut cmd: Command, deadline: Duration) -> io::Result<Option<Output>> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = spawn_owned(&mut cmd)?;
@@ -297,6 +275,30 @@ mod job {
             unsafe { AssignProcessToJobObject(job, child.as_raw_handle()) };
         }
     }
+}
+
+/// `Command::output`, through [`spawn_owned`]: stdin from nowhere, stdout and
+/// stderr captured. Those three are SET here (std offers no way to ask what a
+/// caller chose), so any stdio already configured on `cmd` is replaced.
+///
+/// No deadline: a child that never exits blocks the caller forever. Anything
+/// that can meet a hung or hostile input belongs on [`run_with_deadline`] —
+/// and every spawn in the app now does, so this and [`run`] are compiled for
+/// the tests alone. A new caller in the app is a compile error, on purpose.
+#[cfg(test)]
+pub fn output_owned(cmd: &mut Command) -> io::Result<Output> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    spawn_owned(cmd)?.wait_with_output()
+}
+
+/// Run a sidecar to completion, capturing output: the tests' fixture maker
+/// and checker. The app's probes and version checks use
+/// [`run_with_deadline`]; long-running jobs go through the job system.
+#[cfg(test)]
+pub fn run(name: &str, args: &[&str]) -> Result<Output> {
+    let mut cmd = command(name)?;
+    cmd.args(args);
+    Ok(output_owned(&mut cmd)?)
 }
 
 #[cfg(test)]

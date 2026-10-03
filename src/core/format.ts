@@ -1,7 +1,7 @@
 // Formatting helpers: timecode, durations, bytes, dates.
 
 import type { Rational } from "./types";
-import { frameOf } from "./time";
+import { frameOf, frameStart } from "./time";
 
 const pad2 = (n: number): string => String(n).padStart(2, "0");
 
@@ -10,8 +10,20 @@ export function formatTimecode(t: number, fps: Rational): string {
   if (!Number.isFinite(t) || t < 0) t = 0;
   const totalFrames = frameOf(t, fps);
   const fpsRound = Math.round(fps.num / fps.den);
-  const ff = totalFrames % fpsRound;
-  const totalSec = Math.floor(totalFrames / fpsRound);
+  let ff: number;
+  let totalSec: number;
+  if (fpsRound < 2) {
+    // Under 1.5 fps a second holds at most one frame, so there is no frame
+    // field to count and the seconds come from the frame's own start time.
+    // Dividing by the rounded rate instead gave NaN below 0.5 fps (a zero
+    // divisor) and, at 0.5 fps, a readout running at half speed (1/2 rounds
+    // to 1, so frame 6 read as six seconds instead of twelve).
+    ff = 0;
+    totalSec = Math.floor(frameStart(totalFrames, fps) + 1e-9);
+  } else {
+    ff = totalFrames % fpsRound;
+    totalSec = Math.floor(totalFrames / fpsRound);
+  }
   const s = totalSec % 60;
   const m = Math.floor(totalSec / 60) % 60;
   const h = Math.floor(totalSec / 3600);

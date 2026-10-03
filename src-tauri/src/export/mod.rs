@@ -700,17 +700,29 @@ fn plan_export(spec: &ExportSpec, encoders: &hw::EncoderReport) -> Result<BuiltE
 /// frame and then deleted by the failure cleanup. Claiming the name first
 /// makes it ours or refuses the export. The job's cleanup removes the claim
 /// on failure or cancel, and the publish rename consumes it on success.
+///
+/// The file in the way is just as often the user's own: an export killed with
+/// the app (a crash, Task Manager, a power cut) leaves its `.part`, and so does
+/// an app closed while an export was still queued. Nothing on disk tells the
+/// two apart, so the refusal says both, and says what to do.
+///
+/// A folder that is not there is the one OS error worth its own words (the
+/// dialog's folder may have been deleted or renamed since it was chosen); any
+/// other keeps the OS's text, which is the only thing that can name it.
 fn claim_part(part: &Path) -> Result<()> {
+    let folder = || part.parent().map(|p| p.display().to_string()).unwrap_or_default();
     match std::fs::OpenOptions::new().write(true).create_new(true).open(part) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(AppError::BadInput(format!(
-            "A file named {} is in the way. Choose another name, or move that file.",
+            "A file named {} is in the way. It may be left from an export that didn't finish: \
+             delete it if so, or choose another name.",
             builder::display_name(&part.to_string_lossy())
         ))),
-        Err(e) => Err(AppError::BadInput(format!(
-            "Taroting can't write the export to {}: {e}",
-            part.parent().map(|p| p.display().to_string()).unwrap_or_default()
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::BadInput(format!(
+            "The folder {} doesn't exist. Choose another folder.",
+            folder()
         ))),
+        Err(e) => Err(AppError::BadInput(format!("Taroting can't write the export to {}: {e}", folder()))),
     }
 }
 
@@ -1881,9 +1893,11 @@ mod unit {
 
     /// A file already named `<out>.part` (a browser download, someone else's
     /// work) is refused by name and left byte-for-byte alone; ffmpeg's `-y`
-    /// used to truncate it and the failure cleanup then deleted it. Without
-    /// one, the export claims the name, so the job's cleanup has something of
-    /// its own to remove.
+    /// used to truncate it and the failure cleanup then deleted it. The
+    /// refusal names the likelier owner too — an export of the user's own
+    /// that never finished — and what to do about it. Without one, the export
+    /// claims the name, so the job's cleanup has something of its own to
+    /// remove.
     #[test]
     fn a_foreign_part_file_is_refused_and_left_alone() {
         let dir = publish_dir("foreign-part");
@@ -1897,7 +1911,8 @@ mod unit {
         assert!(matches!(err, AppError::BadInput(_)), "{err:?}");
         assert_eq!(
             err.to_string(),
-            "A file named Export final.mp4.part is in the way. Choose another name, or move that file."
+            "A file named Export final.mp4.part is in the way. It may be left from an export that \
+             didn't finish: delete it if so, or choose another name."
         );
         assert_eq!(std::fs::read(&part).unwrap(), b"half of somebody's download");
 
@@ -1907,6 +1922,28 @@ mod unit {
         assert!(part.exists(), "the name is claimed before the job starts");
         assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
         prepared.temps.cleanup();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A destination folder that is gone (deleted or renamed since the dialog
+    /// chose it) is refused in words, before anything is written: no claim,
+    /// no folder created, no raw "(os error 3)".
+    #[test]
+    fn a_missing_destination_folder_is_named_not_reported_as_an_os_error() {
+        let dir = publish_dir("missing-folder");
+        std::fs::write(dir.join("Holiday Clip.mp4"), b"footage").unwrap();
+        std::fs::write(dir.join("Voice Memo.m4a"), b"voice").unwrap();
+        let (mut spec, enc) = spec_over(&dir, false);
+        let gone = dir.join("Renamed since");
+        spec.out_path = gone.join("Export final.mp4").to_string_lossy().into_owned();
+
+        let Err(err) = prepare_export(&spec, &enc, &dir) else { panic!("there is no folder to export into") };
+        assert!(matches!(err, AppError::BadInput(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!("The folder {} doesn't exist. Choose another folder.", gone.display())
+        );
+        assert!(!gone.exists(), "the refusal must not create the folder");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

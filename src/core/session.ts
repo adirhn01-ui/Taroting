@@ -928,7 +928,10 @@ export function sanitizeSettings(raw: unknown): Settings {
     defaultExportDir: asPath(o.defaultExportDir),
     lastExportDir: asPath(o.lastExportDir),
     hardwareAccel: asBool(o.hardwareAccel, DEFAULT_SETTINGS.hardwareAccel),
-    cacheLimitMB: asNum(o.cacheLimitMB, DEFAULT_SETTINGS.cacheLimitMB, 1, 1024 * 1024),
+    // Whole megabytes: the backend reads this as a u64, and serde rejects
+    // 1536.5 outright. Every caller of enforce_cache_limit swallows that error,
+    // so one fractional hand-edit used to switch cache trimming off for good.
+    cacheLimitMB: asInt(o.cacheLimitMB, DEFAULT_SETTINGS.cacheLimitMB, 1, 1024 * 1024),
     proxyMedia: asBool(o.proxyMedia, DEFAULT_SETTINGS.proxyMedia),
     snapCenterGuides: asBool(o.snapCenterGuides, DEFAULT_SETTINGS.snapCenterGuides),
     // 0.8's boolean is read ONCE as a migration hint (true meant "open as a
@@ -1180,12 +1183,25 @@ export function settingsWritesSettled(): Promise<void> {
   return settingsWriteTail;
 }
 
+/** The re-read every unverified write waits on, shared while it is out.
+ *
+ *  Two writes landing inside one get_settings round trip (the debounced volume
+ *  write and a Settings toggle) used to reconcile separately: the second
+ *  re-read reset the store to disk AFTER the first had merged its patch, and
+ *  the first preference was gone from the file. One shared read means both
+ *  patches merge onto the same adopted settings. */
+let reconciling: Promise<boolean> | null = null;
+
 export async function updateSettings(patch: Partial<Settings>): Promise<void> {
   // Only ever true after a boot read that came back empty or failed, and only
   // for the first write of that session — see the block comment above. It is
   // also the one path on which the store is read AFTER an await rather than
   // synchronously, which is the price of not painting over the truth.
-  const adopted = settingsVerified ? false : await reconcileSettings();
+  const adopted = settingsVerified
+    ? false
+    : await (reconciling ??= reconcileSettings().finally(() => {
+        reconciling = null;
+      }));
   const next = { ...settingsStore.get(), ...patch };
   settingsStore.set(next);
   // Either key can change the painted theme: switching TO custom, or editing
@@ -1241,12 +1257,13 @@ export interface SessionOptions {
  * holding the file, a network drive spinning up, a lock from a sync client —
  * never healed.
  *
- * Backed off rather than retried every tick because a retry is not free. Each
- * attempt re-stamps `modifiedAt` and pushes a new project object through the
- * store, which notifies every editor subscriber; against a destination that is
- * permanently gone (the folder was deleted, the drive was unplugged) an
- * every-tick retry is a re-render loop for as long as the editor stays open.
- * At the 3 s default this settles at roughly one attempt a minute.
+ * Backed off rather than retried every tick because a retry is not free: each
+ * attempt serializes the whole project and crosses IPC to a disk write, and
+ * against a destination that is permanently gone (the folder was deleted, the
+ * drive was unplugged) an every-tick retry is that work for as long as the
+ * editor stays open. At the 3 s default this settles at roughly one attempt a
+ * minute. (A write no longer publishes its restamped project through the
+ * store — see `drain` — so a retry repaints nothing.)
  */
 const SAVE_RETRY_MAX_TICKS = 16;
 
@@ -1300,33 +1317,83 @@ export class ProjectSession {
    *  one was held (it runs, debounced, on the last release). */
   private holds = 0;
   private deferred = false;
+  /** The scratch file a TEMPORARY session was opened at, else null. A write
+   *  carries `tempEdited` only when it goes HERE — see `onDisk`. */
+  private readonly tempPath: string | null;
+  /** Set the moment dispose() or discard() starts, so nothing re-arms the
+   *  autosave interval while the final save is still out (`disposed` itself is
+   *  only set once that save has landed). */
+  private stopping = false;
 
   constructor(path: string, initial: ProjectFile, opts?: SessionOptions) {
     this._path = path;
     this.temp = new Store<boolean>(opts?.temp ?? false);
     this.store = new Store(initial);
+    this.tempPath = opts?.temp ? path : null;
+    // A temporary project that was ALREADY edited when it was written (an
+    // orphan a crash left behind, reopened from Home) still holds the user's
+    // work: leaving it must ask Keep or Discard, never discard it unasked as
+    // an untouched scratch file, and its first fix-up write must not drop the
+    // flag that keeps the startup sweep away from it.
+    this._edited = this.tempPath !== null && initial.tempEdited === true;
     const idle = opts?.debounceMs;
     this.idleMs = typeof idle === "number" && Number.isFinite(idle) && idle >= 0 ? idle : null;
+    // No autosave interval yet. It is armed by the first edit (and by a failed
+    // write that schedules a retry) and dropped again once everything is on
+    // disk: an editor left open with nothing to save wakes nothing.
+  }
+
+  /**
+   * Start the autosave interval, unless it is already running.
+   *
+   * NEVER re-armed while running. The debounce restarts on every edit, so a
+   * long slider drag (a replace() every frame, far under 500 ms apart) never
+   * lets it fire; the interval is what saves mid-drag, and restarting it per
+   * edit would starve it exactly the same way.
+   */
+  private armInterval(): void {
+    if (this.intervalTimer !== undefined || this.stopping || this.disposed) return;
     const seconds = Math.max(1, settingsStore.get().autosaveSeconds);
-    this.intervalTimer = window.setInterval(() => {
-      const state = this.saveState.get();
-      // The retry path is gated on `retryTicks > 0` rather than on the countdown
-      // alone so that "error" without a scheduled retry can never fall through
-      // to an every-tick attempt.
-      const due =
-        state === "dirty" ||
-        (state === "error" && this.retryTicks > 0 && --this.retryTicks === 0);
-      if (!due) return;
-      if (this.holds > 0) {
-        this.deferred = true;
-        return;
-      }
-      // The idle rule (image sessions only): an edit whose debounce is still
-      // pending is not idle yet, and that debounce saves it. Keyed on the armed
-      // timer rather than a wall clock, so it cannot drift from the debounce.
-      if (this.idleMs !== null && this.debounceTimer !== undefined) return;
-      void this.save();
-    }, seconds * 1000);
+    this.intervalTimer = window.setInterval(() => this.tick(), seconds * 1000);
+  }
+
+  private clearInterval(): void {
+    window.clearInterval(this.intervalTimer);
+    this.intervalTimer = undefined;
+  }
+
+  /** Drop the interval once nothing can need it: everything is on disk, no
+   *  debounce is pending to write a newer edit, and no hold is waiting to
+   *  release a deferred save. Any later edit arms it again. */
+  private disarmIfIdle(): void {
+    if (this.saveState.get() === "saved" && this.debounceTimer === undefined && this.holds === 0) {
+      this.clearInterval();
+    }
+  }
+
+  private tick(): void {
+    const state = this.saveState.get();
+    // The retry path is gated on `retryTicks > 0` rather than on the countdown
+    // alone so that "error" without a scheduled retry can never fall through
+    // to an every-tick attempt.
+    const due =
+      state === "dirty" || (state === "error" && this.retryTicks > 0 && --this.retryTicks === 0);
+    if (!due) {
+      // A save that finished while a hold was out left the interval running
+      // with nothing to do (the hold's release re-arms a debounce only when
+      // a save was deferred). This is where it stops.
+      this.disarmIfIdle();
+      return;
+    }
+    if (this.holds > 0) {
+      this.deferred = true;
+      return;
+    }
+    // The idle rule (image sessions only): an edit whose debounce is still
+    // pending is not idle yet, and that debounce saves it. Keyed on the armed
+    // timer rather than a wall clock, so it cannot drift from the debounce.
+    if (this.idleMs !== null && this.debounceTimer !== undefined) return;
+    void this.save();
   }
 
   /** Where autosave writes. Changes only through relocate(). (Was `readonly path: string`.) */
@@ -1335,7 +1402,9 @@ export class ProjectSession {
   }
 
   /** True once the USER changed the project: commit/commitFrom/undo/redo that changed state,
-   *  and replace() unless called with { edit: false }. Never reset. Drives the close prompt. */
+   *  and replace() unless called with { edit: false }. Never reset. Drives the close prompt.
+   *  A temporary session opened from a file stamped `tempEdited` starts true: that edit was
+   *  the user's too, made before a crash skipped its Keep question. */
   get edited(): boolean {
     return this._edited;
   }
@@ -1407,6 +1476,7 @@ export class ProjectSession {
   private markDirty(): void {
     this.saveState.set("dirty");
     this.armDebounce();
+    this.armInterval();
   }
 
   /** (Re)start the autosave debounce. `debounceTimer` is undefined exactly when
@@ -1496,21 +1566,48 @@ export class ProjectSession {
     }
   }
 
+  /**
+   * What a write puts on disk at `path`: the store's project, restamped, with
+   * `tempEdited` exactly when the write goes to this session's scratch file
+   * after a real edit.
+   *
+   * The path decides, not the `temp` flag. Keep relocates FIRST and drops the
+   * flag only after its write has landed (ui/temp-project keepTempSession), so
+   * the flag still says "temporary" for the very write that makes the project
+   * permanent; keyed on the scratch path, that write is clean, a failed Keep
+   * that moves the path back stamps again, and no permanent `.trt` ever
+   * carries the flag. A permanent session strips one a file arrived with.
+   */
+  private onDisk(path: string): ProjectFile {
+    const stamped = touchModified(this.store.get());
+    const mark = this._edited && this.tempPath !== null && path === this.tempPath && this.temp.get();
+    if (mark) return stamped.tempEdited === true ? stamped : { ...stamped, tempEdited: true };
+    if (!("tempEdited" in stamped)) return stamped;
+    const { tempEdited: _dropped, ...clean } = stamped;
+    return clean;
+  }
+
   /** One write, then another for as long as edits kept arriving while the last
    *  was in flight. Never throws: a failure is reported through `saveState` and
-   *  retried by the autosave interval. */
+   *  retried by the autosave interval.
+   *
+   *  The restamped project goes to DISK only, never back through the store.
+   *  Publishing it notified every subscriber on every autosave — the bin and
+   *  inspector rebuilt, the timeline re-indexed its media, and the audio graph
+   *  re-armed its envelopes as if the user had seeked, in the middle of
+   *  playback — for a `modifiedAt` nothing reads from the live project. Each
+   *  pass restamps from the store afresh, and Home reads the time from the
+   *  recents entry the save itself updates. */
   private async drain(): Promise<void> {
     do {
       this.pendingSave = false;
       this.saveState.set("saving");
       try {
-        const stamped = touchModified(this.store.get());
-        this.store.set(stamped);
         // Read per PASS, not once per drain: `relocate` moves the path while a
         // write may be out, and the follow-up pass it asks for must land at the
         // new one.
         const path = this.path;
-        await ipc.saveProject(path, stamped);
+        await ipc.saveProject(path, this.onDisk(path));
         this.lastWrittenPath = path;
         this.failedSaves = 0;
         this.retryTicks = 0;
@@ -1521,11 +1618,15 @@ export class ProjectSession {
         this.failedSaves++;
         this.retryTicks = Math.min(2 ** (this.failedSaves - 1), SAVE_RETRY_MAX_TICKS);
         this.saveState.set("error");
+        // The retry rides the interval, which a save with no edit behind it
+        // (an explicit save(), relocate) may not have started.
+        this.armInterval();
       }
       // `discard()` can land mid-write — the quick-view "Discard" gesture
       // deletes the temp file immediately afterwards — so stop rather than
       // resurrect it with a follow-up.
     } while (this.pendingSave && !this.disposed);
+    this.disarmIfIdle();
   }
 
   /** Move autosave to `dest` and write the current state there, coalescing with any in-flight
@@ -1568,8 +1669,9 @@ export class ProjectSession {
 
   /** Flush and stop timers (called when leaving the editor). */
   async dispose(): Promise<void> {
+    this.stopping = true;
     this.clearDebounce();
-    window.clearInterval(this.intervalTimer);
+    this.clearInterval();
     // `save()` now resolves only once the state at the time of this call has
     // actually been written, coalesced follow-up included, so `disposed` is set
     // after the last byte is out rather than while a write is still owed.
@@ -1586,8 +1688,9 @@ export class ProjectSession {
    *  `disposed` makes save() short-circuit, so the later dispose() also skips
    *  its flush. Idempotent. */
   discard(): void {
+    this.stopping = true;
     this.clearDebounce();
-    window.clearInterval(this.intervalTimer);
+    this.clearInterval();
     this.disposed = true;
     this._discarded = true;
   }
@@ -1595,19 +1698,6 @@ export class ProjectSession {
 
 /** The currently open session (null on the home screen). */
 export const currentSession = new Store<ProjectSession | null>(null);
-
-/** Ask the open session (if any) to confirm being replaced by a navigation it
- *  did not initiate — today that is only the OS open-path route in main.ts,
- *  which otherwise walks straight past the quick-view keep/discard prompt and
- *  lets a temporary project be flushed to a path that startup cleanup deletes.
- *  Resolves true when there is nothing to confirm. */
-export async function confirmLeaveCurrentSession(): Promise<boolean> {
-  // A session that must not be torn down (a running export) refuses outright,
-  // before any keep/discard prompt could be shown for it.
-  if (leaveBlockedReason() !== null) return false;
-  const guard = currentSession.get()?.leaveGuard;
-  return guard ? await guard() : true;
-}
 
 /** The open session's blockLeave reason, or null. */
 export function leaveBlockedReason(): string | null {

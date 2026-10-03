@@ -657,6 +657,68 @@ describe("free-text paths the redactor was never told about", () => {
     expect(r.text(`could not read ${SPACED_CLIP} (locked)`)).toBe("could not read <file 1> night.mov (locked)");
   });
 
+  // A slash in the prose after a backslash path is not that path's separator,
+  // so it cannot close a spaced folder. Before, "a.mp4 because H.265/" was read
+  // as one more folder: the prose vanished into the token, the token lost its
+  // extension, and the same file named cleanly earlier got a DIFFERENT token.
+  it("stops at the file when slashed prose follows a backslash path", () => {
+    const r = createRedactor();
+    expect(
+      r.text("Couldn't import D:\\Raw Footage\\harbour.mp4 because H.265/HEVC is unsupported"),
+    ).toBe("Couldn't import <file 1.mp4> because H.265/HEVC is unsupported");
+    expect(r.text("Error at D:\\Raw Footage\\harbour.mp4 (code 5) see the docs/faq")).toBe(
+      "Error at <file 1.mp4> (code 5) see the docs/faq",
+    );
+    // The same file named on its own still reads as the same token.
+    expect(r.text("retrying D:\\Raw Footage\\harbour.mp4")).toBe("retrying <file 1.mp4>");
+    // A UNC path whose share uses forward slashes reads the same way.
+    expect(r.text("Couldn't import \\\\nas-01/Raw Footage/boat.mov because H.265/HEVC is unsupported")).toBe(
+      "Couldn't import <file 2.mov> because H.265/HEVC is unsupported",
+    );
+  });
+
+  // A spaced folder AFTER the glued-on separator is what needs the rule's other
+  // half: the last segment would swallow a lone `Taroting/reel.trt` anyway.
+  it("still follows a path glued together from both separators", () => {
+    const r = createRedactor();
+    expect(r.text("saved C:\\Client Work\\Taroting/Old Cuts\\reel-07.trt today")).toBe("saved <file 1.trt> today");
+    expect(r.text("font C:/Windows Fonts/segoe\\Ui Pack/ui.ttf loaded")).toBe("font <file 2.ttf> loaded");
+  });
+
+  // The fixtures above all close their spaced folders with the path's OWN
+  // separator. These close one with the OTHER separator, which is where a
+  // rule that only trusts the own separator cut the token short and printed
+  // the rest of the path — file name included — in clear.
+  it("keeps a spaced folder closed by the other separator inside the token", () => {
+    const r = createRedactor();
+    const cases: [string, string][] = [
+      ["saved C:\\Client Work/reel.trt today", "saved <file 1.trt> today"],
+      ["open C:\\Users\\John Smith\\My Videos/clip.mp4 failed", "open <file 2.mp4> failed"],
+      ["cannot open \\\\nas-01\\footage\\Client Work/reel.mp4 now", "cannot open <file 3.mp4> now"],
+      ["cannot open \\\\nas-01/footage/Client Work/reel.mp4 now", "cannot open <file 4.mp4> now"],
+      ["saved C:/Client Work\\reel.trt today", "saved <file 5.trt> today"],
+    ];
+    for (const [input, want] of cases) {
+      const out = r.text(input);
+      expect(out).toBe(want);
+      for (const leak of ["Client", "Work", "John", "Smith", "Videos", "reel", "clip", "footage"]) {
+        expect(out).not.toContain(leak);
+      }
+    }
+  });
+
+  // The one case the file-word rule reads the wrong way: a spaced folder that
+  // itself holds a file-like word, closed by the OTHER separator, is taken for
+  // prose. Pinned whole so the residual cannot widen without a test noticing.
+  it("pins the documented residual: a sentence-like folder closed by the other separator", () => {
+    const r = createRedactor();
+    expect(r.text("saved C:\\Docs\\notes.txt backup/reel.mp4 today")).toBe(
+      "saved <file 1.txt> backup/reel.mp4 today",
+    );
+    // A digit-led "extension" is not a file-like word: the folder stays whole.
+    expect(r.text("saved C:\\Proj\\v1.2 final/reel.mp4 today")).toBe("saved <file 2.mp4> today");
+  });
+
   it("tokenises a UNC path", () => {
     const r = createRedactor();
     expect(r.text("cannot open \\\\nas-01\\footage\\Client Work\\reel.mp4: access denied")).toBe(

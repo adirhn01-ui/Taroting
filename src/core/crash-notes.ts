@@ -28,11 +28,20 @@ export const CRASH_TITLES = {
 export const ENGINE_NOT_RESTARTED =
   "Taroting's display engine stopped, so Taroting closed. Edits made since the last autosave may be lost.";
 
+/** An engine note written because the display engine could not be created at
+ *  all (crash.rs `startup_failure_note_text`, `reason: could not be created at
+ *  startup`). No page ever loaded in that run, so nothing could have been
+ *  edited: the "may be lost" sentence the other engine titles carry would be
+ *  untrue, and would send the user looking for work that never existed. */
+export const ENGINE_FAILED_AT_STARTUP = "Taroting's display engine could not start last time, so Taroting closed.";
+
 /** The title for a note's kind. A kind this build does not know (a newer
  *  backend, a damaged note) reads as the plain "closed unexpectedly". The
- *  detail is read only for an engine note, whose `restarted:` line says
- *  whether the restart the default title promises actually happened. */
+ *  detail is read only for an engine note: its `reason:` line says whether the
+ *  engine ever started, and its `restarted:` line whether the restart the
+ *  default title promises actually happened. */
 export function crashTitle(kind: string, detail = ""): string {
+  if (kind === "engine" && /^reason: could not be created at startup\r?$/m.test(detail)) return ENGINE_FAILED_AT_STARTUP;
   if (kind === "engine" && /^restarted: no\b/m.test(detail)) return ENGINE_NOT_RESTARTED;
   return Object.hasOwn(CRASH_TITLES, kind)
     ? CRASH_TITLES[kind as keyof typeof CRASH_TITLES]

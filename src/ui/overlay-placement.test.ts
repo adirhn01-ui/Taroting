@@ -8,9 +8,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * top layer, which paints above everything else in the document whatever its
  * z-index: a dialog appended to <body> there is open, focused and invisible.
  * So it goes inside the fullscreen element — and has to come back OUT when
- * fullscreen ends, because the theater tears its container down on that same
- * change, and a dialog left inside would keep its focus trap and the window
- * Escape capture somewhere nobody can see.
+ * fullscreen ends: the theater's container outlives that change (its exit only
+ * drops a class and its listeners), so a dialog left inside would stay parked
+ * in the preview subtree instead of on <body> with every other overlay.
  *
  * A small fake DOM (vitest runs in node): appends MOVE nodes, connection is
  * "hangs off <body>", and focus is dropped by a move exactly as a real
@@ -66,6 +66,20 @@ class Node_ {
     for (let x: Node_ | null = this; x; x = x.parentNode) if (x === body) return true;
     return false;
   }
+  /** Real children only, by class, in document order — never the lazy
+   *  `picked` map, which would invent nodes. */
+  querySelectorAll(sel: string): Node_[] {
+    const cls = sel.replace(/^\./, "");
+    const out: Node_[] = [];
+    const walk = (n: Node_): void => {
+      for (const c of n.children) {
+        if (c.className.split(" ").includes(cls)) out.push(c);
+        walk(c);
+      }
+    };
+    walk(this);
+    return out;
+  }
   querySelector(sel: string): Node_ {
     let n = this.picked.get(sel);
     if (!n) {
@@ -97,9 +111,21 @@ const doc = {
   removeEventListener(t: string, fn: Handler): void {
     listeners.get(t)?.delete(fn);
   },
-  querySelectorAll: () => [],
+  querySelectorAll: (sel: string): Node_[] => body.querySelectorAll(sel),
 };
-const win = { addEventListener: () => {}, removeEventListener: () => {} };
+const keydown = new Set<Handler>();
+const win = {
+  addEventListener(t: string, fn: Handler): void {
+    if (t === "keydown") keydown.add(fn);
+  },
+  removeEventListener(t: string, fn: Handler): void {
+    if (t === "keydown") keydown.delete(fn);
+  },
+};
+function pressEscape(): void {
+  const e = { key: "Escape", preventDefault() {}, stopImmediatePropagation() {} };
+  for (const fn of [...keydown]) fn(e);
+}
 
 const fsListeners = (): number => listeners.get("fullscreenchange")?.size ?? 0;
 function fireFullscreenChange(): void {
@@ -112,6 +138,7 @@ beforeEach(() => {
   doc.fullscreenElement = null;
   doc.activeElement = body;
   listeners.clear();
+  keydown.clear();
   vi.stubGlobal("document", doc);
   vi.stubGlobal("window", win);
 });
@@ -215,5 +242,34 @@ describe("the error dialog under element fullscreen", () => {
     expect(backdropIn(body)).toBeDefined();
     expect(fsListeners()).toBe(0);
     close();
+  });
+
+  // Inside the fullscreen element the dialog comes EARLIER in document order
+  // than a backdrop on <body>, yet it is the one on screen: the body one is
+  // behind the top layer. Counting by document order alone, Esc did nothing.
+  it("closes on Esc under fullscreen even when a backdrop on <body> comes later in the document", () => {
+    const viewer = fullscreen();
+    const hidden = new Node_();
+    hidden.className = "modal-backdrop";
+    body.appendChild(hidden);
+    openErrorDialog(opts);
+    const shown = backdropIn(viewer)!;
+    expect(shown).toBeDefined();
+
+    pressEscape();
+    expect(backdropIn(viewer)).toBeUndefined();
+    expect(shown.parentNode).toBe(null);
+    expect(hidden.parentNode).toBe(body);
+  });
+
+  it("closes only the last of two dialogs on Esc when nothing is fullscreen", () => {
+    openErrorDialog(opts);
+    openErrorDialog({ ...opts, title: "Export" });
+    const [under, over] = body.children.filter((c) => c.className === "modal-backdrop");
+    pressEscape();
+    expect(over!.parentNode).toBe(null);
+    expect(under!.parentNode).toBe(body);
+    pressEscape();
+    expect(under!.parentNode).toBe(null);
   });
 });

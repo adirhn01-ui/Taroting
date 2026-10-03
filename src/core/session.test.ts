@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ipc, normalizeSettingsRead } from "./ipc";
+import { ipc, normalizeSettingsRead, type SettingsRead } from "./ipc";
 import { createProject } from "./project";
 import {
   CARD_RESCUE_RATIO,
@@ -12,7 +12,6 @@ import {
   needsChromeRescue,
   needsNavRescue,
   normalizeHexColor,
-  confirmLeaveCurrentSession,
   currentSession,
   leaveBlockedReason,
   ProjectSession,
@@ -25,6 +24,8 @@ import {
   settingsWritesSettled,
   updateSettings,
 } from "./session";
+import { confirmLeaveCurrentSession, flushOrAsk } from "./app-close";
+import { createOpenRouter } from "./open-route";
 import { findConflicts, normalizeChord } from "./shortcuts";
 import { Store } from "./store";
 import {
@@ -34,7 +35,7 @@ import {
   TIMELINE_HEIGHT_MAX,
   TIMELINE_HEIGHT_MIN,
 } from "./types";
-import type { ActionId, CustomTheme, Settings } from "./types";
+import type { ActionId, CustomTheme, ProjectFile, Settings } from "./types";
 
 /** Settings are persisted opaquely by the Rust side (serde_json::Value), so the
  *  frontend is the ONLY sanitizer between a hand-edited or corrupted
@@ -2963,19 +2964,25 @@ describe("ProjectSession debounceMs and holdAutosave", () => {
     const video = new ProjectSession(PROJECT_PATH, createProject("video"));
     const image = new ProjectSession(PROJECT_PATH, createProject("image"), { debounceMs: IDLE_MS });
 
-    await vi.advanceTimersByTimeAsync(TICK_MS - 300);
-    video.commit((p) => ({ ...p, name: "video edit" }));
-    image.commit((p) => ({ ...p, name: "image edit" }));
+    // The interval is armed by the first edit, and a stream of edits 450 ms
+    // apart (a slider drag) keeps both debounces from ever firing — so the
+    // tick 300 ms after the last one is the first chance either has to save.
+    for (let at = 0; at <= TICK_MS - 300; at += 450) {
+      if (at > 0) await vi.advanceTimersByTimeAsync(450);
+      video.commit((p) => ({ ...p, name: `video edit ${at}` }));
+      image.commit((p) => ({ ...p, name: `image edit ${at}` }));
+    }
+    expect(written).toEqual([]);
     await vi.advanceTimersByTimeAsync(300); // the interval tick
 
-    // Video: the tick saves the dirty state, as it always has.
-    expect(written).toEqual(["video edit"]);
+    // Video: the tick saves the dirty state mid-drag, as it always has.
+    expect(written).toEqual(["video edit 2700"]);
     video.discard();
     // Image: still inside its idle wait; the debounce saves it, once, on time.
     await vi.advanceTimersByTimeAsync(IDLE_MS - 300 - 1);
-    expect(written).toEqual(["video edit"]);
+    expect(written).toEqual(["video edit 2700"]);
     await vi.advanceTimersByTimeAsync(1);
-    expect(written).toEqual(["video edit", "image edit"]);
+    expect(written).toEqual(["video edit 2700", "image edit 2700"]);
     image.discard();
   });
 
@@ -3104,5 +3111,400 @@ describe("ProjectSession.discarded", () => {
     s.commit((p) => ({ ...p, name: "edited, then kept" }));
     await s.dispose();
     expect(s.discarded).toBe(false);
+  });
+});
+
+/* ======================================================================== */
+/* Sessions and settings: the 0.9.1 fixes                                    */
+/* ======================================================================== */
+
+// The leave prompt is a modal (no DOM under node). Hoisted, so it also stands
+// in for the dynamic import core/app-close makes when a final save fails.
+const leavePrompt = vi.hoisted(() => ({ askCloseAnyway: vi.fn() }));
+vi.mock("../ui/temp-project", () => ({ askCloseAnyway: leavePrompt.askCloseAnyway }));
+
+describe("cacheLimitMB", () => {
+  // The backend reads it as a u64: 1536.5 made serde reject every trim call,
+  // and every caller swallowed the error, so the cache grew without bound.
+  it("is a whole number of megabytes", () => {
+    expect(sanitizeSettings({ cacheLimitMB: 1536.5 }).cacheLimitMB).toBe(1537);
+    expect(sanitizeSettings({ cacheLimitMB: "2047.4" }).cacheLimitMB).toBe(2047);
+    expect(sanitizeSettings({ cacheLimitMB: 0.2 }).cacheLimitMB).toBe(1);
+  });
+});
+
+describe("two writes in a session whose boot read found nothing", () => {
+  beforeEach(() => {
+    installGlobalStubs();
+    settingsStore.set(DEFAULT_SETTINGS);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  // Each write used to run its own re-read. The second one reset the store to
+  // the file AFTER the first had merged its patch, so the first preference was
+  // missing from every write that followed. The values differ from the
+  // defaults AND from the file, so a patch lost to either shows.
+  it("keeps both patches when they land inside one re-read", async () => {
+    const onDisk: Settings = { ...DEFAULT_SETTINGS, defaultExportDir: "E:\\Renders", monitorVolume: 0.35 };
+    let answer!: (r: SettingsRead) => void;
+    const readSettings = vi
+      .spyOn(ipc, "readSettings")
+      .mockResolvedValueOnce({ status: "absent" }) // boot: unverified
+      .mockImplementationOnce(
+        () =>
+          new Promise<SettingsRead>((resolve) => {
+            answer = resolve;
+          }),
+      );
+    const saveSettings = vi.spyOn(ipc, "saveSettings").mockResolvedValue(undefined);
+    await initSettings();
+
+    const volume = updateSettings({ monitorVolume: 0.8 }); // the debounced volume write
+    const toggle = updateSettings({ hardwareAccel: !DEFAULT_SETTINGS.hardwareAccel }); // a Settings switch
+    answer({ status: "ok", settings: onDisk, recovered: false });
+    await Promise.all([volume, toggle]);
+
+    expect(readSettings).toHaveBeenCalledTimes(2); // boot + ONE shared re-read
+    const last = saveSettings.mock.calls.at(-1)![0];
+    expect(last.monitorVolume).toBe(0.8);
+    expect(last.hardwareAccel).toBe(!DEFAULT_SETTINGS.hardwareAccel);
+    expect(last.defaultExportDir).toBe("E:\\Renders"); // adopted from the file
+  });
+});
+
+describe("ProjectSession autosave plumbing", () => {
+  beforeEach(() => {
+    installGlobalStubs();
+    settingsStore.set(DEFAULT_SETTINGS);
+    vi.useFakeTimers(fakeTimerOptions());
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /** Every write that reaches disk, as (path, project). */
+  function recordWrites(): Array<{ path: string; project: ProjectFile }> {
+    const writes: Array<{ path: string; project: ProjectFile }> = [];
+    vi.spyOn(ipc, "saveProject").mockImplementation(async (path, project) => {
+      writes.push({ path, project });
+      return { modifiedAt: project.modifiedAt };
+    });
+    return writes;
+  }
+
+  // A save used to push its restamped project back through the store, which
+  // rebuilt the bin and the inspector and re-armed the audio envelopes on
+  // every autosave, mid-playback included.
+  it("writes a restamped project without notifying the store's subscribers", async () => {
+    const writes = recordWrites();
+    const start = { ...createProject("cut"), modifiedAt: "2026-01-02T03:04:05.000Z" };
+    const s = new ProjectSession(PROJECT_PATH, start);
+    s.commit((p) => ({ ...p, name: "renamed" }));
+    const edited = s.project;
+    await Promise.resolve(); // let the commit's own notification go out first
+    const seen: ProjectFile[] = [];
+    s.store.subscribe((p) => seen.push(p));
+    await s.save();
+    await Promise.resolve(); // store notifications are microtask-batched
+
+    expect(seen).toEqual([]);
+    expect(s.project).toBe(edited);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.project.name).toBe("renamed");
+    expect(writes[0]!.project.modifiedAt).not.toBe("2026-01-02T03:04:05.000Z");
+    s.discard();
+  });
+
+  // An editor left open with nothing to save used to wake a 3 s timer forever.
+  it("runs no autosave interval until an edit, and none once everything is saved", async () => {
+    const writes = recordWrites();
+    const s = new ProjectSession(PROJECT_PATH, createProject("idle"));
+    expect(vi.getTimerCount()).toBe(0);
+
+    s.commit((p) => ({ ...p, name: "one edit" }));
+    expect(vi.getTimerCount()).toBe(2); // the debounce and the interval
+    await vi.advanceTimersByTimeAsync(500); // the debounce saves it
+    expect(writes.map((w) => w.project.name)).toEqual(["one edit"]);
+    expect(s.saveState.get()).toBe("saved");
+    expect(vi.getTimerCount()).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(TICK_MS * 5);
+    expect(writes).toHaveLength(1);
+    s.discard();
+  });
+
+  // The interval is what saves during a long slider drag: the debounce is
+  // re-armed by every input, so it never fires while the drag lasts. Re-arming
+  // the interval per edit would starve it the same way.
+  it("still writes within the autosave period under a stream of edits 400 ms apart", async () => {
+    const writes = recordWrites();
+    const s = new ProjectSession(PROJECT_PATH, createProject("drag"));
+    for (let at = 0; at < TICK_MS + 400; at += 400) {
+      s.replace({ ...s.project, name: `drag ${at}` });
+      await vi.advanceTimersByTimeAsync(400);
+    }
+    // The first tick, TICK_MS after the first input, wrote the state of the
+    // moment (the input at 2800 ms) while the drag was still going.
+    expect(writes.map((w) => w.project.name)).toEqual(["drag 2800"]);
+    s.discard();
+  });
+
+  it("keeps the interval for a retry after a failed write, and stops it once the retry lands", async () => {
+    let attempts = 0;
+    vi.spyOn(ipc, "saveProject").mockImplementation(async (_path, project) => {
+      if (++attempts === 1) throw new Error("locked by a sync client");
+      return { modifiedAt: project.modifiedAt };
+    });
+    const s = new ProjectSession(PROJECT_PATH, createProject("retry"));
+    await s.save(); // an explicit save with no edit behind it, and it fails
+    expect(s.saveState.get()).toBe("error");
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(TICK_MS);
+    expect(attempts).toBe(2);
+    expect(s.saveState.get()).toBe("saved");
+    expect(vi.getTimerCount()).toBe(0);
+    s.discard();
+  });
+
+  it("arms nothing when the final save on dispose fails", async () => {
+    vi.spyOn(ipc, "saveProject").mockRejectedValue(new Error("the drive is gone"));
+    const s = new ProjectSession(PROJECT_PATH, createProject("leaving"));
+    s.commit((p) => ({ ...p, name: "last edit" }));
+    await s.dispose();
+    expect(s.saveState.get()).toBe("error");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  /* ---- tempEdited: what lets the startup sweep keep a crash orphan ---- */
+
+  const KEPT = "C:\\Users\\adirh\\Documents\\Taroting\\Harbour walk.trt";
+
+  it("stamps a temporary project's scratch file only once the user has edited it", async () => {
+    const writes = recordWrites();
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"), { temp: true });
+    s.replace({ ...s.project, name: "decoded-size fix-up" }, { edit: false });
+    await s.save();
+    s.commit((p) => ({ ...p, name: "trimmed" }));
+    await s.save();
+    expect(writes.map((w) => [w.path, w.project.tempEdited])).toEqual([
+      [TEMP_PATH, undefined],
+      [TEMP_PATH, true],
+    ]);
+    expect("tempEdited" in writes[0]!.project).toBe(false);
+    // Disk only: the live project never carries it.
+    expect("tempEdited" in s.project).toBe(false);
+    s.discard();
+  });
+
+  it("drops the stamp on Keep, and stamps again when a failed Keep moves back", async () => {
+    let failNext = false;
+    const writes: Array<{ path: string; project: ProjectFile }> = [];
+    vi.spyOn(ipc, "saveProject").mockImplementation(async (path, project) => {
+      writes.push({ path, project });
+      if (failNext) {
+        failNext = false;
+        throw new Error("disk full");
+      }
+      return { modifiedAt: project.modifiedAt };
+    });
+    const s = new ProjectSession(TEMP_PATH, createProject("clip"), { temp: true });
+    s.commit((p) => ({ ...p, name: "trimmed" }));
+
+    failNext = true;
+    await expect(s.relocate(KEPT)).rejects.toThrow("disk full");
+    await s.save(); // back at the scratch file
+    await s.relocate(KEPT); // the Keep that lands (temp is still true here)
+    expect(writes.map((w) => [w.path, w.project.tempEdited === true])).toEqual([
+      [KEPT, false],
+      [TEMP_PATH, true],
+      [KEPT, false],
+    ]);
+    expect(writes.every((w) => w.path !== KEPT || !("tempEdited" in w.project))).toBe(true);
+    s.discard();
+  });
+
+  it("never stamps a permanent project, and strips a stamp a file arrived with", async () => {
+    const writes = recordWrites();
+    const s = new ProjectSession(KEPT, { ...createProject("cut"), tempEdited: true });
+    expect(s.edited).toBe(false);
+    s.commit((p) => ({ ...p, name: "cut 2" }));
+    await s.save();
+    expect("tempEdited" in writes[0]!.project).toBe(false);
+    s.discard();
+  });
+
+  // A crash orphan reopened from Home is already the user's work: its first
+  // fix-up write must keep the stamp, and leaving must ask, not discard.
+  it("treats a temporary project loaded with the stamp as edited", async () => {
+    const writes = recordWrites();
+    const s = new ProjectSession(TEMP_PATH, { ...createProject("orphan"), tempEdited: true }, { temp: true });
+    expect(s.edited).toBe(true);
+    s.replace({ ...s.project, name: "relinked" }, { edit: false });
+    await s.save();
+    expect(writes[0]!.project.tempEdited).toBe(true);
+    s.discard();
+  });
+});
+
+/**
+ * Leaving a PERMANENT project used to go straight to the editor's dispose,
+ * whose one save cannot tell anyone it failed. An OS open from File Explorer is
+ * the exit this check answers for; the gate's own exits (Back, Ctrl+W, the
+ * gear) are covered in ui/temp-project.test.ts.
+ */
+describe("confirmLeaveCurrentSession on a permanent project", () => {
+  const SAVE_FAILED = "Your latest changes couldn't be saved.";
+
+  beforeEach(() => {
+    installGlobalStubs();
+    settingsStore.set(DEFAULT_SETTINGS);
+    leavePrompt.askCloseAnyway.mockReset();
+  });
+
+  afterEach(() => {
+    currentSession.set(null);
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function failingSession(): ProjectSession {
+    vi.spyOn(ipc, "saveProject").mockRejectedValue(new Error("OneDrive has it locked"));
+    const s = new ProjectSession(PROJECT_PATH, createProject("cut"));
+    s.commit((p) => ({ ...p, name: "unsaved edit" }));
+    currentSession.set(s);
+    return s;
+  }
+
+  it("asks when the final save fails, and Stay cancels the leave", async () => {
+    const s = failingSession();
+    leavePrompt.askCloseAnyway.mockResolvedValue(false);
+    expect(await confirmLeaveCurrentSession()).toBe(false);
+    expect(leavePrompt.askCloseAnyway).toHaveBeenCalledWith(SAVE_FAILED, "leave");
+    expect(s.saveState.get()).toBe("error");
+    s.discard();
+  });
+
+  it("leaves when the user says Leave anyway", async () => {
+    const s = failingSession();
+    leavePrompt.askCloseAnyway.mockResolvedValue(true);
+    expect(await confirmLeaveCurrentSession()).toBe(true);
+    s.discard();
+  });
+
+  it("writes the pending edit first, and leaves without asking when it lands", async () => {
+    const saveProject = vi.spyOn(ipc, "saveProject").mockImplementation(async (_p, project) => ({
+      modifiedAt: project.modifiedAt,
+    }));
+    const s = new ProjectSession(PROJECT_PATH, createProject("cut"));
+    s.commit((p) => ({ ...p, name: "pending" }));
+    currentSession.set(s);
+    expect(await confirmLeaveCurrentSession()).toBe(true);
+    expect(saveProject).toHaveBeenCalledTimes(1);
+    expect(leavePrompt.askCloseAnyway).not.toHaveBeenCalled();
+    s.discard();
+  });
+
+  it("writes nothing for a project that is already on disk", async () => {
+    const saveProject = vi.spyOn(ipc, "saveProject");
+    const s = new ProjectSession(PROJECT_PATH, createProject("untouched"));
+    currentSession.set(s);
+    expect(await confirmLeaveCurrentSession()).toBe(true);
+    expect(saveProject).not.toHaveBeenCalled();
+    s.discard();
+  });
+
+  /** A permanent session whose writes are held until `land()`; every write
+   *  after that lands at once (a coalesced save asks the drain for one more
+   *  pass, which is a second write). */
+  function heldSaveSession(): { s: ProjectSession; land: () => void } {
+    let open = false;
+    const held: (() => void)[] = [];
+    vi.spyOn(ipc, "saveProject").mockImplementation(
+      (_p, project) =>
+        new Promise((resolve) => {
+          const done = () => resolve({ modifiedAt: project.modifiedAt });
+          if (open) done();
+          else held.push(done);
+        }),
+    );
+    const s = new ProjectSession(PROJECT_PATH, createProject("cut"));
+    s.commit((p) => ({ ...p, name: "unsaved edit" }));
+    currentSession.set(s);
+    return {
+      s,
+      land: () => {
+        open = true;
+        for (const done of held.splice(0)) done();
+      },
+    };
+  }
+
+  // Back (the gate's latch) and an OS open (no leaveGuard on a permanent
+  // session, so straight here) used to both pass while one save was out: the
+  // saves coalesced, both resolved true, and Back's navigation home landed
+  // over the screen the open had just shown.
+  it("a second leave while the first is still saving stays at once", async () => {
+    const { s, land } = heldSaveSession();
+    let first: boolean | undefined;
+    let second: boolean | undefined;
+    const run = flushOrAsk(s, "leave").then((v) => (first = v));
+    void flushOrAsk(s, "leave").then((v) => (second = v));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    // Settled, and false, while the first is still waiting on its save.
+    expect(second).toBe(false);
+    expect(first).toBeUndefined();
+    land();
+    await run;
+    expect(first).toBe(true);
+    // Released once settled: a later leave is judged on its own again.
+    expect(await flushOrAsk(s, "leave")).toBe(true);
+    expect(leavePrompt.askCloseAnyway).not.toHaveBeenCalled();
+    s.discard();
+  });
+
+  it("a close is never turned away by a leave in flight", async () => {
+    const { s, land } = heldSaveSession();
+    const leave = flushOrAsk(s, "leave");
+    const close = flushOrAsk(s, "close");
+    land();
+    expect(await leave).toBe(true);
+    expect(await close).toBe(true);
+    s.discard();
+  });
+
+  it("an OS open during Back's final save is not opened, and says so", async () => {
+    const { s, land } = heldSaveSession();
+    const log: string[] = [];
+    const route = createOpenRouter({
+      navigate: (r) => void log.push(`nav:${r.view}`),
+      currentSession: () => currentSession.get(),
+      confirmLeave: () => confirmLeaveCurrentSession(),
+      leaveBlockedReason: () => leaveBlockedReason(),
+      isTempProjectPath: async () => false,
+      openMediaAsProject: async () => "T:\\tmp-projects\\clip-9.trt",
+      openWith: () => "viewer",
+      activeViewer: () => null,
+      toast: {
+        info: (m) => void log.push(`info:${m}`),
+        error: (m) => void log.push(`error:${m}`),
+        refuse: (m) => void log.push(`refuse:${m}`),
+      },
+    });
+    const back = flushOrAsk(s, "leave");
+    let routed = false;
+    void route("E:\\holiday\\clip.mp4").then(() => (routed = true));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(routed).toBe(true);
+    expect(log).toEqual(["info:Still editing. clip.mp4 wasn't opened."]);
+    land();
+    expect(await back).toBe(true);
+    s.discard();
   });
 });

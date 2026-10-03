@@ -1,10 +1,14 @@
 import "./style/tokens.css";
 import "./style/base.css";
 import "./style/components.css";
-import { installCloseGate, runCloseFlow, type CloseDeps } from "./core/app-close";
+import {
+  confirmLeaveCurrentSession,
+  installCloseGate,
+  runCloseFlow,
+  type CloseDeps,
+} from "./core/app-close";
 import { beginBoot, hasLaunchHint } from "./core/boot";
 import { showCrashNotes } from "./core/crash-notes";
-import { fileExt, fileName } from "./core/format";
 import { describeError, destroyWindow, inTauri, ipc, onOpenPath } from "./core/ipc";
 import { navigate, setNavigator, type Route } from "./core/nav";
 import {
@@ -14,14 +18,9 @@ import {
   openMediaAsProject,
   runOnOpenChain,
 } from "./core/open-media";
-import {
-  confirmLeaveCurrentSession,
-  currentSession,
-  initSettings,
-  leaveBlockedReason,
-  settingsStore,
-} from "./core/session";
-import { MEDIA_FILE_EXTENSIONS } from "./core/types";
+import { createOpenRouter } from "./core/open-route";
+import { currentSession, initSettings, leaveBlockedReason, settingsStore } from "./core/session";
+import { isBrowserChromeKey } from "./core/shortcuts";
 import { mountHome } from "./home/home";
 import { closeErrorDialogs } from "./ui/errors";
 import { toast } from "./ui/toast";
@@ -37,21 +36,14 @@ window.addEventListener("contextmenu", (e) => {
 });
 
 // In production only, block browser-chrome shortcuts that make no sense in a
-// packaged desktop app (print, reload, find, downloads, view-source, …).
+// packaged desktop app (print, reload, find, downloads, view-source, …). The
+// letter is matched in any case and on any layout (core/shortcuts): a reload
+// that slips through loses every unsaved edit.
 if (!import.meta.env.DEV) {
   window.addEventListener(
     "keydown",
     (e) => {
-      const k = e.key;
-      const ctrl = e.ctrlKey && !e.altKey;
-      if (
-        (ctrl && (k === "p" || k === "r" || k === "f" || k === "j" || k === "u")) ||
-        k === "F5" ||
-        k === "F3" ||
-        k === "F7"
-      ) {
-        e.preventDefault();
-      }
+      if (isBrowserChromeKey(e)) e.preventDefault();
     },
     true,
   );
@@ -108,6 +100,16 @@ async function go(route: Route): Promise<void> {
   const prev = dispose;
   dispose = null;
   if (prev) teardowns.track(prev);
+  // The screen being left stays painted until its teardown settles, and it
+  // used to stay LIVE too: an image Undo or Rotate clicked in that window
+  // landed in the still-open session and was written by its final save, and
+  // Back, the gear or Export started work for a screen already on its way out.
+  // Inert from here until #app is cleared below, unconditionally — also with
+  // no `prev`, when an earlier navigation's teardown is what is still pending.
+  // Dialogs, toasts and prompts live on document.body and stay usable. The
+  // newest go() always reaches the reset: a superseded one returns before it,
+  // but only because a later go() is already on its way to it.
+  app.inert = true;
   // EVERY navigation waits for every teardown still running, not just its own
   // `prev`. A go() that arrives while an earlier one is mid-dispose finds
   // `dispose` already null; without this it painted over an editor still
@@ -136,6 +138,7 @@ async function go(route: Route): Promise<void> {
   // the next screen, still trapping Tab.
   closeErrorDialogs();
   app.innerHTML = "";
+  app.inert = false;
 
   if (route.view === "home") {
     const view = mountHome(app);
@@ -187,6 +190,22 @@ async function go(route: Route): Promise<void> {
   }
 }
 
+// OS file-open routing (File Explorer "Open with", a second launch): the rules
+// live in core/open-route, where they are unit-tested; this hands them the
+// shell. Serialized on the open chain (core/open-media) so overlapping
+// launches can't interleave two project creations.
+const routeOpenPath = createOpenRouter({
+  navigate,
+  currentSession: () => currentSession.get(),
+  confirmLeave: () => confirmLeaveCurrentSession(),
+  leaveBlockedReason,
+  isTempProjectPath,
+  openMediaAsProject,
+  openWith: () => settingsStore.get().openWith,
+  activeViewer: () => activeViewer,
+  toast,
+});
+
 // A plain launch paints Home right here, synchronously, as it always has. A
 // launch from File Explorer with a media file or a .trt (the Rust-side hint)
 // mounts nothing yet: the first file opens once the settings are in, below,
@@ -199,86 +218,6 @@ const launch = beginBoot(hasLaunchHint(window), {
   enqueue: enqueueOpen,
   reportError: (e) => toast.error(describeError(e)),
 });
-
-// OS file-open routing (File Explorer "Open with", a second launch). A ".trt"
-// opens that project. A media file goes where Settings → Opening files says:
-// the viewer (no project at all), or a TEMPORARY one-clip project in the
-// editor. Neither creates anything permanent — the user keeps a temporary
-// project only by choosing Keep (owner decision; Home's "New project" is the
-// one permanent creation path). Serialized on the open chain (core/open-media)
-// so overlapping launches can't interleave two project creations.
-
-async function routeOpenPath(path: string): Promise<void> {
-  const ext = fileExt(path);
-  const isProject = ext === "trt";
-  if (!isProject && !MEDIA_FILE_EXTENSIONS.has(ext)) return; // unknown type: ignore
-
-  // An OS open-path replaces whatever is on screen WITHOUT going through any of
-  // the editor's own exits (Back, Ctrl+W, the Settings gear), so it has to
-  // honour the same leave gate they do. Without this, opening a second file
-  // while a quick-view project is live disposes the editor past its
-  // keep/discard prompt: the session flushes into the temp scratch file, which
-  // the next launch's temp sweep deletes — and temp projects are excluded from
-  // recents, so there is no way back. Resolves true (no gate installed, or the
-  // user chose Keep/Discard); false cancels this open entirely, before any
-  // project file is created — and false is SAID: a running export refuses by
-  // name, and a Cancel on the Keep prompt (or a prompt already open) used to
-  // drop the open without a word, which reads as "Explorer did nothing".
-  //
-  // Sampled BEFORE the gate: a temporary session only gets through it by Keep
-  // (relocated to a permanent file) or Discard (disposed, its file deleted).
-  // Either way the user has agreed to leave that screen, and the editor left
-  // on it no longer edits what it shows — a Discarded one saves nothing, and a
-  // Kept one still carries the scratch route. See the catch below.
-  const leaving = currentSession.get();
-  // Only a temp editor whose gate actually asked: without a guard the leave
-  // went through unasked, and that editor is still live — never navigate over it.
-  const leavingTemp = leaving?.temp.get() === true && !!leaving.leaveGuard;
-  if (!(await confirmLeaveCurrentSession())) {
-    const why = leaveBlockedReason();
-    const name = fileName(path);
-    toast.info(why ? `${why} ${name} wasn't opened.` : `Still editing. ${name} wasn't opened.`);
-    return; // settles, so the chain moves on to the next open
-  }
-
-  if (isProject) {
-    // A .trt that physically lives in the temp-projects dir is a live quick-view
-    // scratch file: route it as temp so the editor shows the Temporary badge and
-    // applies the keep gate on exit, matching the recents exclusion the backend
-    // already enforces for that dir. Anything outside it is a normal project.
-    const temp = await isTempProjectPath(path);
-    navigate(temp ? { view: "editor", projectPath: path, temp: true } : { view: "editor", projectPath: path });
-    return;
-  }
-
-  if (settingsStore.get().openWith === "viewer") {
-    // A viewer already on screen swaps the file in place: no remount, no
-    // reload of the chunk, and the folder is re-listed for the new file.
-    if (activeViewer) activeViewer.show(path);
-    else navigate({ view: "viewer", path });
-    return;
-  }
-
-  // "editor": a temporary project in tmp-projects (never in recents) until the
-  // user keeps it. Called directly, not through runOnOpenChain: this function
-  // already runs on the chain, and a task that awaits the chain awaits itself.
-  try {
-    const projectPath = await openMediaAsProject(path);
-    navigate({ view: "editor", projectPath, temp: true });
-  } catch (e) {
-    toast.error(describeError(e));
-    // The open the user agreed to leave for has failed. An editor whose temp
-    // session went through the gate (Kept or Discarded above) and is STILL the
-    // screen goes home rather than staying on a dead editor: with Discard its
-    // edits would be silently dropped, and its Keep button toasts "already
-    // closed". Home is where a finished Keep is visible, in the library. A
-    // permanent session (no gate to pass) keeps its editor — nothing happened
-    // to it. Only this branch needs the rule: a .trt has navigated already,
-    // and an editor that cannot load that file routes itself away (mountEditor);
-    // the viewer branches cannot fail here.
-    if (leavingTemp && currentSession.get() === leaving) navigate({ view: "home" });
-  }
-}
 
 /** What the close gate needs from the shell. `settle` is the UNBOUNDED wait on
  *  every screen teardown (an editor's final save included); runCloseFlow puts

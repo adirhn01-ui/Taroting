@@ -173,6 +173,32 @@ const NIX_USER = /(\/(?:home|Users)\/)[^/\s"]+/g;
  * rest of a log line (`… from 'C:\x\a.mp4': Stream #0:0 … avc1 / 0x…`); a colon
  * is illegal in a Windows name past the drive anyway.
  *
+ * The path's OWN separator (the one after its drive; a UNC path counts as
+ * backslash-rooted) always closes a folder. The OTHER separator closes one
+ * only while that folder holds no file-like word followed by whitespace
+ * (`.mp4 `, `.trt `: a dot, a letter, word characters, a space). Every
+ * separator used to close a folder unconditionally, so prose with a slash in
+ * it was read as one more folder: "Couldn't import C:\Videos\a.mp4 because
+ * H.265/HEVC is unsupported" lost "a.mp4 because H.265/" into a token that had
+ * no extension and did not match the same file named anywhere else. Closing
+ * spaced folders at the own separator ONLY was tried and leaked: in
+ * `C:\Client Work/reel.trt` the match stopped at `C:\Client` and printed
+ * "Work/reel.trt" verbatim. The file-word test tells the two apart — a
+ * folder name rarely holds `name.ext ` inside it, and a sentence that names a
+ * file after the path nearly always does.
+ *
+ * What each rule still gets wrong, deliberately in the safe direction except
+ * one case. Slashed prose after a FORWARD-slash path, or after a file with no
+ * extension, still joins the path: the token swallows words and loses its
+ * extension, but no name is printed. The one leak: a spaced folder that itself
+ * contains a file-like word and is closed by the OTHER separator
+ * (`C:\Docs\notes.txt backup/reel.mp4`) is read as prose, so the token stops
+ * at `notes.txt` and "backup/reel.mp4" stays in clear. That takes a folder
+ * named like a sentence AND a path mixing both separators; nothing in the app
+ * builds mixed-separator paths, and a test pins the case so it cannot widen
+ * unnoticed. An extension starting with a digit (`.3gp`, `.264`) is not a
+ * file-like word, which keeps "v1.2 final" an ordinary folder name.
+ *
  * `<user>` is let through as part of a path because the profile sweep runs
  * FIRST (see `text`): `<` and `>` are otherwise excluded, so without it
  * `C:\Users\<user>\Videos\a.mp4` would be cut at `C:\Users\` and everything
@@ -180,8 +206,19 @@ const NIX_USER = /(\/(?:home|Users)\/)[^/\s"]+/g;
  * of its own: `?` cannot start a UNC server name, so it falls through to the
  * drive branch at the `C:\`.
  */
-const PATH_LIKE =
-  /(?:[A-Za-z]:[\\/]|\\\\[^\\/\s"<>|*?]+[\\/]+)(?:(?:<user>|[^\\/:\r\n"<>|*?])*[\\/]+)*(?:<user>|[^\s"<>|*?])*/g;
+const PATH_LIKE = (() => {
+  /** A folder name closed by the path's own separator: spaces and all. */
+  const spaced = String.raw`(?:<user>|[^\\/:\r\n"<>|*?])*`;
+  /** A folder name closed by the OTHER separator: the same, minus any
+   *  file-like word followed by whitespace (that is a sentence, not a folder).
+   *  Each segment is closed by exactly one separator kind, so the two
+   *  alternatives below never compete for the same text: still linear. */
+  const crossed = String.raw`(?:<user>|(?!\.[A-Za-z]\w*\s)[^\\/:\r\n"<>|*?])*`;
+  const last = String.raw`(?:<user>|[^\s"<>|*?])*`;
+  const backslashRooted = String.raw`(?:[A-Za-z]:\\|\\\\[^\\/\s"<>|*?]+[\\/]+)(?:${spaced}\\+|${crossed}/+)*${last}`;
+  const slashRooted = String.raw`[A-Za-z]:/(?:${spaced}/+|${crossed}\\+)*${last}`;
+  return new RegExp(`${backslashRooted}|${slashRooted}`, "g");
+})();
 
 /** Replace the account name inside any user-profile path with `<user>`. */
 export function sweepUsernames(text: string): string {

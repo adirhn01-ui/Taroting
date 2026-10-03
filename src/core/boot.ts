@@ -7,8 +7,8 @@
 //
 // Pure and injectable: main.ts hands in `go`, the navigator hook and the open
 // routing, so every timing rule here is unit-tested without a window. The
-// routing itself is NOT here — the first file goes through main.ts's
-// `routeOpenPath` like any other open (viewer or temporary project by
+// routing itself is NOT here — the first file goes through `routeOpenPath`
+// (core/open-route) like any other open (viewer or temporary project by
 // Settings → Opening files, a .trt's editor), so there is one copy of the rules.
 
 import type { Route } from "./nav";
@@ -79,24 +79,23 @@ export interface LaunchBoot {
 }
 
 /**
- * Start the boot. No hint → install the plain navigator and start Home,
- * synchronously, before any await: today's first two lines of boot, moved
- * here unchanged so a test can hold them to it. Returns null.
+ * Start the boot. Either way the navigator OBSERVES each navigation it starts:
+ * one that REJECTS (a chunk that failed to load, a mount that threw) is
+ * reported and lands on Home instead of leaving #app blank. A plain launch
+ * used to install a navigator that dropped the rejection, so a failed
+ * navigation there was an unhandled rejection over an already-cleared window,
+ * with nothing said and no way back.
  *
- * Hint → nothing is mounted yet. The navigator observes each navigation it
- * starts, so one that REJECTS (a chunk that failed to load) is reported and
- * lands on Home instead of leaving #app blank; a plain launch keeps the plain
- * navigator. The hold timer starts now, so a settings read that hangs — or a
- * boot that throws before `openQueued` — still ends on Home.
+ * No hint → that navigator, and Home started synchronously, before any await:
+ * today's first two lines of boot, so a test can hold them to it. Returns null.
+ *
+ * Hint → nothing is mounted yet. The hold timer starts now, so a settings read
+ * that hangs — or a boot that throws before `openQueued` — still ends on Home.
  */
 export function beginBoot(hint: boolean, deps: BootDeps): LaunchBoot | null {
-  if (!hint) {
-    deps.setNavigator((route) => void deps.go(route));
-    void deps.go({ view: "home" });
-    return null;
-  }
-
-  const home = (): void => void deps.go({ view: "home" });
+  // A Home that itself fails is reported, never retried: Home over a failed
+  // Home is the same failure again, in a loop.
+  const home = (): void => void deps.go({ view: "home" }).catch((e: unknown) => deps.reportError(e));
   deps.setNavigator((route) => {
     const nav = deps.go(route);
     const mine = deps.navCount();
@@ -104,10 +103,15 @@ export function beginBoot(hint: boolean, deps: BootDeps): LaunchBoot | null {
       deps.reportError(e);
       // Only while it is still the latest navigation: one a newer route has
       // superseded is not what is on screen, and Home over the newer one
-      // would cancel it.
-      if (deps.navCount() === mine) home();
+      // would cancel it. Not after a failed Home, for the reason above.
+      if (deps.navCount() === mine && route.view !== "home") home();
     });
   });
+
+  if (!hint) {
+    home();
+    return null;
+  }
 
   let homeShown = false;
   let hold: ReturnType<typeof setTimeout> | null = setTimeout(() => {

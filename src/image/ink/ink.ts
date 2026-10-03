@@ -37,7 +37,7 @@ import { normalizeHexColor } from "../../core/session";
 import { toast } from "../../ui/toast";
 import type { ImageEditorCtx } from "../context";
 import { canvasToLayer } from "../geom";
-import { addDrawingLayer, appendStrokeTo, drawingTarget, eraseStrokes, findLayer, layersOf, opacityOf } from "../layers";
+import { addDrawingLayer, appendStrokeTo, drawingTarget, eraseStrokes, findLayer, layersOf, opacityOf, strokeRefusal } from "../layers";
 import { encodePoints } from "../strokes";
 import { cssToSource, type ToolId } from "../tool-state";
 import { collectStrokeHits } from "./eraser";
@@ -517,7 +517,9 @@ export function mountInk(ctx: ImageEditorCtx): { dispose(): void } {
    */
   const commitMark = (build: (p: ProjectFile, t: Target) => Stroke | null, create = true): void => {
     let landed: string | null = null;
+    let refused: string | null = null;
     ctx.session.commit((p) => {
+      refused = null;
       let t = resolveTarget(p, ctx.selection.get());
       let q = p;
       let id = t.trackId;
@@ -545,11 +547,18 @@ export function mountInk(ctx: ImageEditorCtx): { dispose(): void } {
       }
       if (!s) return p;
       const out = appendStrokeTo(q, id, s);
-      // Not appendable after all: leave no empty layer behind either.
-      if (out === q) return p;
+      // Not appendable after all: leave no empty layer behind either. A
+      // stroke past the drawing caps is said out loud (a mark that vanishes
+      // reads as broken); any other refusal stays the silent no-op it was.
+      if (out === q) {
+        refused = strokeRefusal(q, s);
+        return p;
+      }
       landed = id;
       return out;
     });
+    // Outside the commit: the mutator stays free of side effects.
+    if (refused !== null) toast.refuse(refused);
     // SAME TICK as the commit, before any store notification is delivered: the
     // Layers panel repairs a selection whose layer it cannot find, and must
     // already see the new layer selected when it first sees the new layer.

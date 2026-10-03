@@ -40,9 +40,6 @@ pub enum Lane {
     /// worker, so a backlog of them — and they keep running after the editor
     /// that asked for them closes — never holds up a remux or a waveform
     /// queued behind it on `Background`.
-    // Proxies move here with `media::playability`'s routing; until they do,
-    // nothing submits to it. Drop this allow then.
-    #[allow(dead_code)]
     Transcode,
     Thumb,
     Export,
