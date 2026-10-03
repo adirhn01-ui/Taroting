@@ -1,12 +1,12 @@
 # Taroting 0.9.1
 
-A quality release. It began with a report from a slower PC: a project with a
-video was open, a video was opened from File Explorer at the same moment, and
-Taroting closed itself without a word (the second try worked). Looking into
-it turned into a full review of 0.9.0, and this release is what that review
-found and fixed. There are no new features; everything here makes Taroting
-steadier, safer with your work, and easier on modest hardware. Free and open
-source, as always.
+A quality release. It began with a bug report: a project with a video was
+open, a video was opened from File Explorer at the same moment, and Taroting
+closed itself without a word (the second try worked). Tracing it found a
+mistake in how Taroting was built, explained below, and turned into a full
+review of 0.9.0; this release is what that review found and fixed. There are
+no new features; everything here makes Taroting steadier, lighter while it
+works, and safer with your work. Free and open source, as always.
 
 ## If Taroting ever closes unexpectedly
 
@@ -27,14 +27,23 @@ source, as always.
   the app, and background work runs at a lower priority so the window stays
   responsive while it runs.
 
-## No more freezes on slower PCs
+## The window no longer waits on slow work
 
-- **Slow work no longer runs on the window's own thread.** Opening a project
-  with video, the project pictures on the home screen, saving, reading
-  settings and recent projects, cache clean-up, starting an export and
-  reading media for the preview used to run where the window draws and
-  answers clicks. On a slow PC that could freeze the window for seconds while
-  a project with video opened. All of it now runs in the background.
+Taroting is meant to run well on any PC. The most likely cause of the report
+was a mistake that broke that promise, and the mistake was ours, not the
+computer's.
+
+- **Slow work ran on the window's own thread.** A window has one thread that
+  draws it and answers clicks, and anything slow belongs somewhere else.
+  Taroting ran a lot of slow work there anyway: opening a project with video
+  (which checks every video file), making the project pictures on the home
+  screen, saving, reading settings and recent projects, cache clean-up,
+  starting an export and reading media for the preview. While any of it ran,
+  the window could not draw or respond, on any machine, for as long as the
+  work took: a picture for a large video could hold it for many seconds. A
+  file opened from File Explorer at that moment had to wait on that same
+  thread, which is the situation in the report. All of this work now runs in
+  the background, and the window stays free to answer.
 - **One stuck file can no longer hold up the rest.** Every background step
   has a time limit, a thumbnail that hangs no longer blocks the ones after
   it, and preview copies have a queue of their own, so quick jobs such as
@@ -149,8 +158,8 @@ The 0.9.0 notes said that "if the window ever stops responding, a second
 close a few seconds later still closes it." That holds for the page inside
 the window: if it stops answering, a second close a few seconds later still
 closes the window. If Windows itself reports Taroting as not responding, use
-the close option Windows offers. In 0.9.1 the window's own thread no longer
-does slow work, which is what used to make that happen.
+the close option Windows offers. That state came from the mistake above, slow
+work on the window's own thread, and 0.9.1 removes it.
 
 ---
 
