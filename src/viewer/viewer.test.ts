@@ -100,7 +100,7 @@ interface FakeEl {
   textContent: string;
   [k: string]: unknown;
   querySelector(sel: string): FakeEl;
-  fire(type: string): void;
+  fire(type: string, event?: unknown): void;
   /** Every `src` and `currentTime` assignment, in order ("src=…", "t=…"). */
   log: string[];
   /** The inline style properties set through style.setProperty. */
@@ -110,7 +110,9 @@ interface FakeEl {
 function fakeEl(): FakeEl {
   const attrs = new Map<string, string>();
   const kids = new Map<string, FakeEl>();
-  const listeners = new Map<string, () => void>();
+  // Every listener per type, in order: the viewer and its seek pacer both
+  // listen for `seeked` on the one <video>.
+  const listeners = new Map<string, ((e?: unknown) => void)[]>();
   const styles = new Map<string, string>();
   const log: string[] = [];
   const el: FakeEl = {
@@ -136,10 +138,12 @@ function fakeEl(): FakeEl {
     getAttribute: (k: string) => attrs.get(k) ?? null,
     hasAttribute: (k: string) => attrs.has(k),
     removeAttribute: (k: string) => void attrs.delete(k),
-    addEventListener: (type: string, fn: () => void) => void listeners.set(type, fn),
+    addEventListener: (type: string, fn: (e?: unknown) => void) => void listeners.set(type, [...(listeners.get(type) ?? []), fn]),
     removeEventListener: () => {},
-    /** Run the listener the viewer added for `type` (the tests' click). */
-    fire: (type: string) => listeners.get(type)?.(),
+    /** Run the listeners the viewer added for `type` (the tests' click). */
+    fire: (type: string, event?: unknown) => {
+      for (const fn of listeners.get(type) ?? []) fn(event);
+    },
     appendChild: (c: unknown) => c,
     remove: () => {},
     blur: () => {},
@@ -150,8 +154,11 @@ function fakeEl(): FakeEl {
     play: () => Promise.resolve(),
     getBoundingClientRect: () => ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 }),
     // Memoized per selector: the viewer looks each element up once, and the
-    // tests look up the same one afterwards.
+    // tests look up the same one afterwards. A :hover / :focus-visible query
+    // is a question about the pointer and focus instead: it answers from
+    // `held`, which a test sets.
     querySelector(sel: string): FakeEl {
+      if (/:hover|:focus-visible/.test(sel)) return (el.held === true ? el : null) as FakeEl;
       let k = kids.get(sel);
       if (!k) {
         k = fakeEl();
@@ -484,6 +491,297 @@ describe("a video the WebView refuses", () => {
   });
 });
 
+/* ---------------- seeking ---------------- */
+
+describe("seeking", () => {
+  const CLIP = "D:\\clips\\Replay 2026-10-01 21-09-07.mp4";
+  const SRC = "asset://localhost/D%3A%5Cclips%5CReplay%202026-10-01%2021-09-07.mp4";
+  const ready = (tryingDirect = false): LoadState => ({ state: "ready", element: "video", url: SRC, kind: "video", tryingDirect });
+
+  /** A video on screen, 61 s long, at 0. */
+  function mounted() {
+    const root = mount(CLIP);
+    m.onState!(CLIP, ready());
+    const video = root.querySelector("#vw-video");
+    video.duration = 61;
+    video.seeking = false;
+    video.log.length = 0;
+    return { root, video, knob: root.querySelector(".theater-bar__seek-knob"), time: root.querySelector("#vw-time") };
+  }
+
+  /** The knob's left, as paintReadout writes it for `sec` of 61. */
+  const at = (sec: number): string => `${Math.round((sec / 61) * 1000) / 10}%`;
+
+  it("shows the asked position on the bar and the clock at once, with no event from the element", () => {
+    // The editor's fullscreen bar paints its engine time the moment it seeks;
+    // the viewer painted only on `seeked`/`timeupdate`, so mid-drag the knob
+    // trailed the cursor. No event is fired here at all.
+    const { video, knob, time } = mounted();
+    m.keys.get("seekFwd")!({ repeat: false });
+    expect(video.log).toEqual(["t=5"]);
+    expect(knob.styles.get("left")).toBe(at(5));
+    expect(time.textContent).toBe("0:05 / 1:01");
+  });
+
+  it("asks for every new position while a seek decodes, as the editor's fullscreen bar does", () => {
+    const { video, knob, time } = mounted();
+    m.keys.get("seekFwd")!({ repeat: false });
+    video.seeking = true;
+    m.keys.get("seekFwd")!({ repeat: true });
+    m.keys.get("seekFwd")!({ repeat: true });
+    expect(video.log).toEqual(["t=5", "t=10", "t=15"]);
+    expect(knob.styles.get("left")).toBe(at(15));
+    expect(time.textContent).toBe("0:15 / 1:01");
+    // It lands: the element's own time is the position again. Playback moves
+    // the element on to 15.6, a time nothing asked for, and the bar follows it.
+    video.seeking = false;
+    video.fire("seeked");
+    (video as unknown as { currentTime: number }).currentTime = 15.6;
+    video.fire("timeupdate");
+    expect(knob.styles.get("left")).toBe(at(15.6));
+    expect(video.log).toEqual(["t=5", "t=10", "t=15", "t=15.6"]);
+  });
+
+  it("keeps the asked position on the bar while the element still reports the old one", () => {
+    // Chromium reads the target back at once, but a time not yet asked of it
+    // (a swap holding the old copy's length, a reload) must not pull the knob.
+    const { video, knob } = mounted();
+    m.keys.get("seekFwd")!({ repeat: false });
+    video.seeking = true;
+    // The element is made to read something else mid-seek.
+    (video as unknown as { currentTime: number }).currentTime = 2;
+    video.log.length = 0;
+    m.keys.get("seekFwd")!({ repeat: false });
+    // playhead() is the ASKED 5 + 5, not the element's 2 + 5.
+    expect(video.log).toEqual(["t=10"]);
+    expect(knob.styles.get("left")).toBe(at(10));
+  });
+
+  it("asks nothing for a position within 10 ms of the element's, and asks one 20 ms away", () => {
+    const { root, video } = mounted();
+    const bar = root.querySelector("#vw-seek");
+    // 6100 px for 61 s: 1 px = 10 ms, so the moves below land exactly.
+    bar.getBoundingClientRect = () => ({ left: 0, top: 0, right: 6100, bottom: 10, width: 6100, height: 10 });
+    const ptr = (sec: number) => ({ button: 0, pointerId: 1, clientX: sec * 100, preventDefault: () => {} });
+    bar.fire("pointerdown", ptr(5));
+    video.fire("seeked");
+    bar.fire("pointermove", ptr(5.005));
+    bar.fire("pointermove", ptr(5.02));
+    expect(video.log.map((e) => Math.round(Number(e.slice(2)) * 1000) / 1000)).toEqual([5, 5.02]);
+  });
+
+  it("drags like the editor's fullscreen bar: a seek per move, the knob under the hand", () => {
+    const { root, video, knob } = mounted();
+    const bar = root.querySelector("#vw-seek");
+    bar.getBoundingClientRect = () => ({ left: 100, top: 0, right: 710, bottom: 10, width: 610, height: 10 });
+    const ptr = (sec: number) => ({ button: 0, pointerId: 1, clientX: 100 + (sec / 61) * 610, preventDefault: () => {} });
+    bar.fire("pointerdown", ptr(10));
+    video.seeking = true;
+    for (const sec of [12, 14, 16]) {
+      bar.fire("pointermove", ptr(sec));
+      expect(knob.styles.get("left")).toBe(at(sec));
+    }
+    expect(video.log.map((e) => Math.round(Number(e.slice(2)) * 1000) / 1000)).toEqual([10, 12, 14, 16]);
+    bar.fire("pointerup", ptr(16));
+    video.seeking = false;
+    video.fire("seeked");
+    expect(video.log).toHaveLength(4);
+  });
+
+  it("seeks straight away when nothing is decoding", () => {
+    const { video } = mounted();
+    m.keys.get("seekFwd")!({ repeat: false });
+    m.keys.get("seekFwd")!({ repeat: false });
+    m.keys.get("goStart")!({ repeat: false });
+    expect(video.log).toEqual(["t=5", "t=10", "t=0"]);
+  });
+
+  it("reloads the same source where the user was after a read error, twice, then tells the loader", () => {
+    const { video } = mounted();
+    m.keys.get("seekFwd")!({ repeat: false });
+    video.seeking = true;
+    m.keys.get("seekFwd")!({ repeat: false });
+    // The element reads an older position than the one asked for (10).
+    (video as unknown as { currentTime: number }).currentTime = 5;
+    video.log.length = 0;
+    // Chromium's demuxer lost its place under a burst of seeks: MEDIA_ERR_NETWORK.
+    video.error = { code: 2 };
+    video.fire("error");
+    // The position the user asked for (10 s), not the one that was decoding.
+    expect(video.log).toEqual([`src=${SRC}`, "t=10"]);
+    expect(m.playbackFailed).not.toHaveBeenCalled();
+    video.duration = 61;
+    video.fire("error");
+    expect(m.playbackFailed).not.toHaveBeenCalled();
+    video.duration = 61;
+    video.fire("error");
+    expect(m.playbackFailed.mock.calls).toEqual([[2]]);
+  });
+
+  it("reports a reload that fails the way a missing file does as the read failure it is", () => {
+    // A file deleted while it plays: the next read fails (2), the reload's
+    // first request gets a 404, which Chromium reports as 4 before the
+    // metadata. Told 4, the loader would start a repair of a missing file
+    // and call it damaged; it must hear the read failure.
+    const { video } = mounted();
+    video.error = { code: 2 };
+    video.fire("error"); // reload 1
+    video.error = { code: 4 };
+    video.fire("error"); // reload 1 failed like a missing file: reload 2
+    expect(m.playbackFailed).not.toHaveBeenCalled();
+    video.fire("error"); // reload 2 failed too
+    expect(m.playbackFailed.mock.calls).toEqual([[2]]);
+  });
+
+  it("hears a real refusal after a reload that reached its metadata", () => {
+    const { video } = mounted();
+    video.error = { code: 2 };
+    video.fire("error"); // reload
+    video.duration = 61;
+    video.fire("loadedmetadata"); // it reads again
+    video.error = { code: 3 };
+    video.fire("error");
+    expect(m.playbackFailed.mock.calls).toEqual([[3]]);
+  });
+
+  it("refills the reload allowance after a quiet spell, not during a failure that persists", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("performance", { now: () => Date.now() });
+    const { video } = mounted();
+    video.error = { code: 2 };
+    video.fire("error"); // reload 1
+    video.duration = 61;
+    video.fire("loadedmetadata");
+    video.fire("error"); // reload 2, 0 s later: the same failure going on
+    video.duration = 61;
+    video.fire("loadedmetadata");
+    // 11 s later a fresh hiccup of a long scrub session: reloaded again.
+    await vi.advanceTimersByTimeAsync(11_000);
+    video.fire("error");
+    expect(m.playbackFailed).not.toHaveBeenCalled();
+    video.duration = 61;
+    video.fire("loadedmetadata");
+    video.fire("error"); // and again at once: 2 within the window
+    video.duration = 61;
+    video.fire("loadedmetadata");
+    video.fire("error"); // a third within the window: the loader hears it
+    expect(m.playbackFailed.mock.calls).toEqual([[2]]);
+  });
+
+  it("a new source starts with its retries back", () => {
+    const { root, video } = mounted();
+    video.error = { code: 2 };
+    video.fire("error");
+    video.duration = 61;
+    video.fire("error");
+    m.onState!(CLIP, ready());
+    const again = root.querySelector("#vw-video");
+    again.duration = 61;
+    again.log.length = 0;
+    again.fire("error");
+    expect(again.log[0]).toBe(`src=${SRC}`);
+    expect(m.playbackFailed).not.toHaveBeenCalled();
+  });
+
+  it("leaves a read error before the length is known, or on a container-only attempt, to the loader", () => {
+    const root = mount(CLIP);
+    m.onState!(CLIP, ready());
+    const video = root.querySelector("#vw-video");
+    video.error = { code: 2 };
+    video.fire("error");
+    expect(m.playbackFailed.mock.calls).toEqual([[2]]);
+    m.playbackFailed.mockReset();
+    m.onState!(CLIP, ready(true));
+    video.duration = 61;
+    video.fire("error");
+    expect(m.playbackFailed.mock.calls).toEqual([[2]]);
+  });
+});
+
+/* ---------------- the chrome's auto-hide ---------------- */
+
+describe("the chrome's auto-hide", () => {
+  const CLIP = "D:\\clips\\Replay 2026-10-07 03-29-10.mp4";
+  const SRC = "asset://localhost/D%3A%5Cclips%5CReplay.mp4";
+
+  function playing() {
+    vi.useFakeTimers();
+    vi.stubGlobal("performance", { now: () => Date.now() });
+    const root = mount(CLIP);
+    m.onState!(CLIP, { state: "ready", element: "video", url: SRC, kind: "video", tryingDirect: false });
+    const video = root.querySelector("#vw-video");
+    video.duration = 61;
+    video.paused = false;
+    video.fire("play");
+    const time = root.querySelector("#vw-time");
+    /** The readout repaints on timeupdate only while the chrome shows. */
+    const showing = (at: number): boolean => {
+      video.currentTime = at;
+      video.fire("timeupdate");
+      return time.textContent === `0:${String(at).padStart(2, "0")} / 1:01`;
+    };
+    return { root, showing };
+  }
+
+  it("fades after 1 s of a still mouse while a video plays", async () => {
+    const { showing } = playing();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(showing(10)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(showing(20)).toBe(false);
+  });
+
+  it("never fades from under a pointer resting on it, and fades once it leaves", async () => {
+    // Faded, the chrome goes pointer-events: none, so a click on the button
+    // under a still pointer lands on the video and pauses it instead.
+    const { root, showing } = playing();
+    root.held = true;
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(showing(30)).toBe(true);
+    root.held = false;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(showing(40)).toBe(false);
+  });
+});
+
+/* ---------------- stepping through videos ---------------- */
+
+describe("stepping through videos", () => {
+  const V = "D:\\clips\\";
+  const clips = (from: number, to: number): string[] =>
+    Array.from({ length: to - from + 1 }, (_, k) => `${V}${String(from + k).padStart(3, "0")}.mp4`);
+  const loaded = (): string[] => m.load.mock.calls.map((c) => String(c[0]));
+
+  it("loads a single press at once, and only the file a burst of presses stops on", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("performance", { now: () => Date.now() });
+    const all = clips(1, 10);
+    mount(all[0]!);
+    calls[0]!.resolve({ before: [], after: all.slice(1), index: 1, total: 10, family: "visual" });
+    await flush();
+    const next = m.keys.get("nextFile")!;
+    await vi.advanceTimersByTimeAsync(1000);
+    m.load.mockClear();
+    // One press after a rest: at once, no settle.
+    next({ repeat: false });
+    expect(loaded()).toEqual([all[1]]);
+    // Three more, 60 ms apart (clicks or taps, not a held key): nothing for
+    // the files passed over, then the one the burst stopped on.
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(60);
+      next({ repeat: false });
+    }
+    await vi.advanceTimersByTimeAsync(249);
+    expect(loaded()).toEqual([all[1]]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(loaded()).toEqual([all[1], all[4]]);
+    // After a rest, a single press is at once again.
+    await vi.advanceTimersByTimeAsync(1000);
+    next({ repeat: false });
+    expect(loaded()).toEqual([all[1], all[4], all[5]]);
+  });
+});
+
 /* ---------------- a damaged video ---------------- */
 
 describe("a damaged video", () => {
@@ -659,6 +957,25 @@ describe("a damaged video", () => {
     // Never a status card on the way: not "Preparing", not "Can't show this file".
     expect(v.status.hidden).toBe(true);
     expect(v.statusText()).toBe("");
+  });
+
+  it("gives the full repair its own read-error reloads when it swaps in", () => {
+    const v = mounted();
+    m.onState!(CLIP, ready(QUICK, damage("repairing")));
+    v.video.duration = 170;
+    v.video.error = { code: 2 };
+    for (let i = 0; i < 2; i++) {
+      v.video.fire("error"); // both of the instant copy's reloads, spent
+      v.video.duration = 170;
+      v.video.fire("loadedmetadata");
+    }
+    m.onState!(CLIP, ready(FULL, damage("recovered")));
+    v.video.duration = 170;
+    v.video.fire("loadedmetadata");
+    v.video.log.length = 0;
+    v.video.fire("error");
+    expect(m.playbackFailed).not.toHaveBeenCalled();
+    expect(v.video.log[0]).toBe(`src=${FULL}`);
   });
 
   it("a swap keeps a paused video paused", () => {

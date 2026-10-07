@@ -203,6 +203,6 @@ describe("elementFor", () => {
 describe("constants", () => {
   it("pins the window radius and the dwell times", () => {
     expect(WINDOW_RADIUS).toBe(16);
-    expect(DWELL_MS).toEqual({ image: 0, media: 250, repeat: 150 });
+    expect(DWELL_MS).toEqual({ image: 0, media: 0, burst: 250, repeat: 150 });
   });
 });

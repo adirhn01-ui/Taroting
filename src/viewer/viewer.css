@@ -243,7 +243,8 @@
 
 /* ---------- auto-hide ----------
  * Toggled only on a real flip (viewer.ts). Stills and paused media in a window
- * never get here; a playing file or fullscreen does after 2.5 s of stillness. */
+ * never get here; a playing file or fullscreen does after 1 s of stillness
+ * (AUTO_HIDE_MS; it was 2.5 s, which kept the clip covered too long). */
 .viewer--chrome-hidden .viewer__top,
 .viewer--chrome-hidden .viewer__nav,
 .viewer--chrome-hidden .viewer__bar {

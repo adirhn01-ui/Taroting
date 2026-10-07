@@ -559,6 +559,92 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
     }
   });
 
+  await test("viewer-scrub-follows-cursor", async () => {
+    // The owner's reference is the editor's fullscreen seek bar: the knob
+    // stays under the hand however long a seek decodes, and the frame on
+    // screen ends up where the drag ended. The viewer painted its bar only on
+    // `seeked`/`timeupdate`, so mid-drag the knob trailed the cursor ("the
+    // cursor is ahead of the timeline"). Asserted on what is PAINTED: the
+    // knob's box against the pointer after each frame, and the frame the
+    // compositor presents (requestVideoFrameCallback), never DOM state.
+    const t0 = performance.now();
+    const FILE = `${fixturesDir}\\direct_h264.mp4`;
+    try {
+      assert(await ipc.pathExists(FILE), `fixture ${FILE} is missing — run npm run fixtures`);
+      await setOpenWith("viewer");
+      await ipc.debugPushOpenPath(FILE);
+      const video = await until(
+        () => {
+          const v = vwVideo();
+          return v && !v.hidden && v.readyState >= 2 && baseName(viewerDev()?.path() ?? "") === "direct_h264.mp4" ? v : null;
+        },
+        8_000,
+        () => `direct_h264.mp4 playing in the viewer — ${viewerState()}`,
+      );
+      // Paused, the chrome stays up (it auto-hides only while playing).
+      video.pause();
+      const bar = await until(() => (rendered($("#vw-seek")) ? $("#vw-seek") : null), 2_000, () => `a painted #vw-seek — ${viewerState()}`);
+      const knob = $<HTMLElement>("#vw-seek .theater-bar__seek-knob");
+      assert(knob !== null, "the seek bar has no knob");
+      const box = bar.getBoundingClientRect();
+      assert(box.width > 200, `the seek bar is ${box.width.toFixed(0)} px wide — too narrow to drag across`);
+      const frame = (): Promise<void> => new Promise((r) => requestAnimationFrame(() => r()));
+      let presented = -1;
+      let watching = true;
+      const onFrame: VideoFrameRequestCallback = (_n, meta) => {
+        presented = meta.mediaTime;
+        if (watching) video.requestVideoFrameCallback(onFrame);
+      };
+      video.requestVideoFrameCallback(onFrame);
+      const fire = (type: string, x: number): void => {
+        bar.dispatchEvent(
+          new PointerEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            pointerId: 11,
+            button: 0,
+            buttons: type === "pointerup" ? 0 : 1,
+            clientX: x,
+            clientY: box.top + box.height / 2,
+          }),
+        );
+      };
+      // 40 moves across 10%-70%, one per painted frame, as a hand drags.
+      const xs = Array.from({ length: 40 }, (_, i) => box.left + box.width * (0.1 + (0.6 * i) / 39));
+      let worst = 0;
+      let worstAt = 0;
+      try {
+        fire("pointerdown", xs[0]!);
+        for (const x of xs) {
+          fire("pointermove", x);
+          await frame();
+          const k = knob!.getBoundingClientRect();
+          const off = Math.abs(k.left + k.width / 2 - x);
+          if (off > worst) {
+            worst = off;
+            worstAt = x;
+          }
+        }
+        fire("pointerup", xs[xs.length - 1]!);
+        // Where the drag ended, in source seconds, and the frame there.
+        const want = ((xs[xs.length - 1]! - box.left) / box.width) * video.duration;
+        await until(() => (!video.seeking && Math.abs(presented - want) < 1 / 30 + 0.002) || null, 3_000, () =>
+          `the frame at ${want.toFixed(3)} s on screen after the drag — presented ${presented.toFixed(3)} s, seeking ${String(video.seeking)}`,
+        );
+        assert(
+          worst <= 2,
+          `mid-drag the knob was ${worst.toFixed(1)} px from the pointer (at x=${worstAt.toFixed(0)}) — it must sit under the hand`,
+        );
+        const readout = text("#vw-time");
+        return `knob within ${worst.toFixed(1)} px of the pointer over 40 moves; landed on ${presented.toFixed(3)} s for ${want.toFixed(3)} s; readout "${readout}" — ${ms(t0)}`;
+      } finally {
+        watching = false;
+      }
+    } finally {
+      await backHome();
+    }
+  });
+
   await test("viewer-prepare-preview", async () => {
     const t0 = performance.now();
     try {

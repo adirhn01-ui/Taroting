@@ -4738,7 +4738,11 @@ async function runDamagedVideoBlocks(
       ed.engine.play();
       let cross: Awaited<ReturnType<typeof playbackReading>>;
       try {
-        cross = await playbackReading(xv, 900);
+        // 1400 ms, not 900: the copy has no frame from 1.433 s to the clean
+        // start (ffmpeg dropped what it could not conceal), so 900 ms left
+        // ~0.2 s after 2.0 for the frames `ok` counts, and a decoder that took
+        // that long to resume failed the block in 2 of 5 runs (2026-10-07).
+        cross = await playbackReading(xv, 1400);
       } finally {
         ed.engine.pause();
       }

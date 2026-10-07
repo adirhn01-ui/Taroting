@@ -29,9 +29,15 @@ export type ViewElement = "img" | "video";
 /** Neighbours requested on each side of the shown file. */
 export const WINDOW_RADIUS = 16;
 
-/** How long a step waits before it starts loading: a still loads at once, a
- *  video/audio file after a short settle, a held key's repeat after less. */
-export const DWELL_MS = { image: 0, media: 250, repeat: 150 } as const;
+/** How long a step waits before it starts loading. A single press loads at
+ *  once, a still or a video alike (a video used to wait 250 ms, which read as
+ *  lag on every Next). A video/audio press that comes within `burst` of the
+ *  previous step is part of a burst of clicks or taps: it waits `burst`, and
+ *  each further press re-arms the wait, so only the file the burst stops on
+ *  is probed and loaded (a probe cannot be called back, a remux-class file
+ *  starts an ffmpeg job, and an online-only OneDrive file is downloaded). A
+ *  held key's repeats settle for 150 ms, for the same reason. */
+export const DWELL_MS = { image: 0, media: 0, burst: 250, repeat: 150 } as const;
 
 export function fromWindow(current: string, w: SiblingWindow): StepState {
   // The current file goes in by the name the CALLER holds, not a backend copy:

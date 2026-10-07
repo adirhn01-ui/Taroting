@@ -49,8 +49,11 @@ export interface ViewerHandle {
   dispose(): void;
 }
 
-/** Idle time before the chrome and cursor fade while something plays (ms). */
-const AUTO_HIDE_MS = 2500;
+/** Idle time before the chrome and cursor fade while something plays (ms).
+ *  Was 2500, which the owner timed at "about 2 seconds" of waiting to see the
+ *  clip clear: a viewer's chrome should be gone almost as soon as the mouse
+ *  rests. Any move brings it straight back. */
+const AUTO_HIDE_MS = 1000;
 /** Shift+← / Shift+→ in the viewer (the owner's fixed ±5 s). */
 const SEEK_S = 5;
 /** Steps from the window's edge at which the next window is fetched early. */
@@ -90,6 +93,30 @@ function withChord(label: string, action: ActionId): string {
 }
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(Math.max(v, lo), hi);
+
+/** MediaError.MEDIA_ERR_NETWORK: for a local file, a read the engine lost.
+ *  Spelled out because the node test environment has no MediaError. */
+const MEDIA_ERR_NETWORK = 2;
+
+/** In-place reloads a source gets after read errors before the loader is told. */
+const READ_RETRIES = 2;
+
+/** The reload allowance refills once this long has passed since the last
+ *  reload (ms). A failure that persists — a file gone, a bad sector at the
+ *  playhead — fails again within moments of each reload (the reload goes
+ *  back to the failing position), so it still reaches the loader after two;
+ *  the sporadic demuxer failures of a long scrub session are seconds apart
+ *  and each gets its quiet reload. */
+const READ_RETRY_WINDOW_MS = 10_000;
+
+/** What holds the chrome up at the auto-hide timer (see chromeHeld). */
+const CHROME_HELD =
+  ".viewer__top:hover, .viewer__bar:hover, .viewer__nav:hover, " +
+  ".viewer__top :focus-visible, .viewer__bar :focus-visible, .viewer__nav:focus-visible";
+
+/** A seek to within this of the element's position is not made (seconds):
+ *  the editor's own margin (scheduler.ts activate), so the two seek alike. */
+const SAME_POSITION_S = 0.01;
 
 /** " 40%", or "" while the ratio is unknown. */
 function percentText(r: number | null): string {
@@ -240,6 +267,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   let pendingDir: -1 | 1 | null = null;
   let pendingRepeat = false;
   let dwellTimer: number | undefined;
+  /** When the last step was taken (performance.now()); see DWELL_MS.burst. */
+  let lastStepAt = Number.NEGATIVE_INFINITY;
   /** "Open as project" is running: user stepping and Back wait for it. */
   let busy = false;
   /** The viewer is being left for the project "Open as project" made, whose
@@ -265,10 +294,31 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
    *  know its metadata yet: where playback was and how long the file is, so
    *  the readout, the bar and the cover hold still instead of reading 0. */
   let swapHold: { t: number; d: number } | null = null;
+  /** Where the user asked the <video> to be while that seek is in flight:
+   *  the bar and the clock show this, not the element's time, exactly as the
+   *  editor's fullscreen bar shows its engine time (the owner's reference:
+   *  "perfect ... aligned"). Before, the viewer painted the element's time on
+   *  `seeked`/`timeupdate` only, so mid-drag the knob trailed the cursor. */
+  let asked: number | null = null;
+  /** In-place reloads after a read error on the video on screen (see the
+   *  error listener); reset by every new source. */
+  let readRetries = 0;
+  /** Such a reload is loading and has not reached its metadata yet: an error
+   *  now is the same read failure, whatever code the reload reports — a file
+   *  that went away answers its first request 404, which Chromium reports
+   *  as MEDIA_ERR_SRC_NOT_SUPPORTED, and the loader would take that for a
+   *  damaged stream and start a repair of a missing file. */
+  let rereading = false;
+  /** When the last such reload started (performance.now()). */
+  let lastRereadAt = Number.NEGATIVE_INFINITY;
 
   const hasMedia = (): boolean => videoUrl !== null;
-  /** The position the user is at — the held one while a swap loads. */
-  const playhead = (): number => (swapHold !== null ? swapHold.t : video.currentTime || 0);
+  /** The position the user is at: where they asked to be while that frame is
+   *  not on screen yet, else the held one while a swap loads, else the
+   *  element's. */
+  const playhead = (): number => {
+    return asked !== null ? asked : swapHold !== null ? swapHold.t : video.currentTime || 0;
+  };
   /** The file's length, or the held one while a swap loads (0: unknown). */
   const lengthOf = (): number =>
     Number.isFinite(video.duration) && video.duration > 0 ? video.duration : (swapHold?.d ?? 0);
@@ -422,6 +472,9 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     }
     videoUrl = null;
     swapHold = null;
+    asked = null;
+    readRetries = 0;
+    rereading = false;
     damage = null;
     video.hidden = true;
     audioCard.hidden = true;
@@ -463,6 +516,9 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     videoUrl = s.url;
     videoGen = gen;
     swapHold = null;
+    asked = null;
+    readRetries = 0;
+    rereading = false;
     damage = s.damage ?? null;
     tryingDirect = s.tryingDirect;
     window.clearTimeout(directTimer);
@@ -493,6 +549,10 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     const t = playhead();
     const len = lengthOf();
     const resume = !video.paused;
+    // A seek still waiting is carried in `t`: the new src abandons the one in
+    // flight, so no `seeked` would ever send it.
+    asked = null;
+    rereading = false;
     swapHold = { t, d: len };
     // Before the src: the error guard compares the two.
     videoUrl = url;
@@ -526,7 +586,12 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
           // This load's damaged video is already out: only what the user is
           // told changed (the same url — the element is left alone), or the
           // full repair replaced the instant copy (swapped in where it was).
-          if (s.url !== videoUrl) swapVideo(s.url);
+          if (s.url !== videoUrl) {
+            // A new source (the full repair over the instant copy): its own
+            // reload allowance, not what the instant copy spent.
+            readRetries = 0;
+            swapVideo(s.url);
+          }
           damage = s.damage;
           paintDamage();
           return;
@@ -571,16 +636,38 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   });
   video.addEventListener("error", () => {
     if (disposed || videoUrl === null || videoGen !== gen || video.getAttribute("src") !== videoUrl) return;
+    // A READ error (MEDIA_ERR_NETWORK) on a local file that already played is
+    // the engine losing its place, not the file refusing: a burst of seeks can
+    // fail one inside Chromium's demuxer ("demuxer seek failed"). The same
+    // source is loaded again where the user was, twice at most per source, and
+    // only then does the loader hear of it.
+    const readFailure = video.error?.code === MEDIA_ERR_NETWORK || rereading;
+    const now = performance.now();
+    if (readFailure && !rereading && now - lastRereadAt > READ_RETRY_WINDOW_MS) readRetries = 0;
+    if (readFailure && !tryingDirect && readRetries < READ_RETRIES && lengthOf() > 0) {
+      readRetries++;
+      lastRereadAt = now;
+      swapVideo(videoUrl);
+      // After the swap, which clears it for any other source change.
+      rereading = true;
+      return;
+    }
+    // Out of reloads: the loader hears what happened first, a read failure
+    // (which it never repairs), not the code the last reload ended on.
+    const code = rereading ? MEDIA_ERR_NETWORK : (video.error?.code ?? null);
+    rereading = false;
     tryingDirect = false;
     window.clearTimeout(directTimer);
     directTimer = undefined;
     // The loader decides what the refusal earns — a remux for a container-only
     // attempt, a repair for a video the WebView could not decode, or "Can't
     // show this file" — and paints it through onState like any state.
-    loader.playbackFailed(video.error?.code ?? null);
+    loader.playbackFailed(code);
   });
   video.addEventListener("loadedmetadata", () => {
     if (videoGen !== gen) return;
+    // A reload after a read error got this far: the source reads again.
+    rereading = false;
     window.clearTimeout(directTimer);
     directTimer = undefined;
     const hold = swapHold;
@@ -600,6 +687,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     if (!hidden) paintReadout();
   });
   video.addEventListener("seeked", () => {
+    // The last asked position landed (a newer ask keeps `seeking` true).
+    if (!video.seeking) asked = null;
     if (damage !== null) paintCover();
     if (!hidden) paintReadout();
   });
@@ -811,7 +900,12 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     releaseVideo();
     if (target !== "img") releaseImg();
     setStatus(null);
-    scheduleSettle(repeat ? DWELL_MS.repeat : target === "img" ? DWELL_MS.image : DWELL_MS.media);
+    const now = performance.now();
+    const burst = now - lastStepAt < DWELL_MS.burst;
+    lastStepAt = now;
+    scheduleSettle(
+      repeat ? DWELL_MS.repeat : target === "img" ? DWELL_MS.image : burst ? DWELL_MS.burst : DWELL_MS.media,
+    );
     if (!listBusy && nearEdge(n, dir, PREFETCH_MARGIN)) refresh(cur, false);
   }
 
@@ -900,11 +994,27 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     else video.pause();
   }
 
+  /**
+   * The editor's fullscreen seek, mirrored (theater.ts → engine.seek →
+   * scheduler.activate): every call asks the element for the new position
+   * unless it is within 10 ms of it already, and the bar and the clock show
+   * the asked position at once (`asked`, read by playhead()) until the seek
+   * lands — so the knob sits under the cursor however long decoding takes.
+   */
   function seekTo(t: number): void {
     if (!hasMedia()) return;
     const d = video.duration;
     if (!Number.isFinite(d) || d <= 0) return;
-    video.currentTime = clamp(t, 0, d);
+    const target = clamp(t, 0, d);
+    if (Math.abs(video.currentTime - target) > SAME_POSITION_S) {
+      asked = target;
+      video.currentTime = target;
+    } else if (!video.seeking) {
+      // Already there: nothing asked, the element's time is the position.
+      asked = null;
+    }
+    paintReadout();
+    if (damage !== null) paintCover();
   }
 
   /* ---------------- monitor volume ---------------- */
@@ -985,6 +1095,14 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   const menuOpen = (): boolean =>
     document.querySelector<HTMLElement>(".ctx-menu")?.style.display === "block";
 
+  /** The pointer rests on the chrome, or keyboard focus is on one of its
+   *  controls. Fading it then would take the next click away from the button
+   *  under the pointer — the chrome goes `pointer-events: none`, so the click
+   *  lands on the video and pauses it — and would dismiss the damage pill's
+   *  tooltip as it appears. :focus-visible, not :focus-within: a button keeps
+   *  focus after a mouse click, which must not hold the chrome up for good. */
+  const chromeHeld = (): boolean => el.querySelector(CHROME_HELD) !== null;
+
   function setHidden(v: boolean): void {
     if (v === hidden) return;
     hidden = v;
@@ -1000,7 +1118,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     // activity rather than fade the bar out from under it. Asked only here,
     // at timer fire, so it costs one lookup per interval while already
     // playing — nothing when idle.
-    if (menuOpen()) lastActivity = performance.now();
+    if (menuOpen() || chromeHeld()) lastActivity = performance.now();
     const idle = performance.now() - lastActivity;
     if (idle < AUTO_HIDE_MS) {
       hideTimer = window.setTimeout(onHideTimer, AUTO_HIDE_MS - idle);
@@ -1032,6 +1150,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   }
 
   el.addEventListener("pointermove", activity);
+  el.addEventListener("pointerdown", activity);
   el.addEventListener("focusin", activity);
   const onAnyKey = (): void => activity();
   window.addEventListener("keydown", onAnyKey);
@@ -1213,8 +1332,9 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   keys.setSuppressed(() => !!document.querySelector(".modal-backdrop"));
   keys.on("prevFile", (e) => userStep(-1, e.repeat));
   keys.on("nextFile", (e) => userStep(1, e.repeat));
-  keys.on("seekBack", () => seekTo(video.currentTime - SEEK_S));
-  keys.on("seekFwd", () => seekTo(video.currentTime + SEEK_S));
+  // From playhead(), not the element: presses made while a seek decodes add up.
+  keys.on("seekBack", () => seekTo(playhead() - SEEK_S));
+  keys.on("seekFwd", () => seekTo(playhead() + SEEK_S));
   keys.on("playPause", () => togglePlay());
   keys.on("goStart", () => seekTo(0));
   keys.on("goEnd", () => seekTo(video.duration));
