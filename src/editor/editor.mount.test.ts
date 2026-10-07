@@ -25,7 +25,12 @@ const m = vi.hoisted(() => ({
   shortcutsDetached: 0,
   closeTaskUnreg: 0,
   menu: [] as { label: string; onSelect: () => void }[],
-  toasts: { info: [] as string[], error: [] as string[], refuse: [] as string[] },
+  toasts: {
+    info: [] as string[],
+    error: [] as string[],
+    refuse: [] as string[],
+    notice: [] as Array<[string, string | undefined]>,
+  },
   engine: null as unknown as {
     time: number;
     playing: boolean;
@@ -38,7 +43,17 @@ const m = vi.hoisted(() => ({
   mediaDispose: [] as unknown[],
   /** The `missing` argument of every ensureAll call, in order. */
   ensureAllMissing: [] as (readonly string[] | undefined)[],
-  media: null as unknown as { status: { set(v: Record<string, unknown>): void } },
+  media: null as unknown as {
+    status: { set(v: Record<string, unknown>): void };
+    damage: { set(v: Record<string, unknown>): void };
+  },
+  /** The options the shell constructed its MediaManager with. */
+  mediaOpts: null as unknown as {
+    onDamaged(mediaId: string, state: unknown, quick: boolean): void;
+  },
+  /** The options of every `toast.error`, in order (the messages stay in
+   *  `toasts.error`). */
+  errorOpts: [] as unknown[],
   timeline: null as unknown as {
     renders: number;
     deps: { onClipMenu(c: Clip, x: number, y: number): void };
@@ -123,8 +138,12 @@ vi.mock("../ui/menu", () => ({
 vi.mock("../ui/toast", () => ({
   toast: {
     info: (s: string) => void m.toasts.info.push(s),
-    error: (s: string) => void m.toasts.error.push(s),
+    error: (s: string, o?: unknown) => {
+      m.toasts.error.push(s);
+      m.errorOpts.push(o);
+    },
     refuse: (s: string) => void m.toasts.refuse.push(s),
+    notice: (s: string, d?: string) => void m.toasts.notice.push([s, d]),
   },
 }));
 vi.mock("../ui/temp-project", () => ({
@@ -148,8 +167,10 @@ vi.mock("./media/media", async (importOriginal) => {
       status = new Store<Record<string, unknown>>({});
       thumbs = new Store<Record<string, string>>({});
       waveforms = new Store<Record<string, unknown>>({});
-      constructor() {
+      damage = new Store<Record<string, unknown>>({});
+      constructor(_getProject: unknown, opts: unknown) {
         m.media = this as never;
+        m.mediaOpts = opts as never;
       }
       async init(): Promise<void> {}
       ensureAll(_project: unknown, missing?: readonly string[]): void {
@@ -294,6 +315,7 @@ vi.mock("./timeline/timeline", () => ({
   },
 }));
 
+import { escapeHtml } from "../core/format";
 import { addMedia, createProject, findClip, insertClip, makeClip, removeClip, updateClip } from "../core/project";
 import { currentSession, type ProjectSession } from "../core/session";
 import { mountEditor } from "./editor";
@@ -492,7 +514,8 @@ beforeEach(() => {
   m.shortcutsDetached = 0;
   m.closeTaskUnreg = 0;
   m.menu = [];
-  m.toasts = { info: [], error: [], refuse: [] };
+  m.toasts = { info: [], error: [], refuse: [], notice: [] };
+  m.errorOpts = [];
   m.throwOnSeek = false;
   m.throwOnRefresh = false;
   m.throwOnTheaterDispose = false;
@@ -580,6 +603,111 @@ describe("the media bin rebuilds only when the media change", () => {
   it("names a text element the way the timeline and the inspector do", async () => {
     const { root } = await mount();
     expect(root.querySelector("#media-list").innerHTML).toContain("Text — Hello harbour");
+  });
+});
+
+/**
+ * A damaged video in the bin, and the toast that first says so. The manager
+ * is a recorder here, so the test publishes its status and damage records the
+ * way the real one does. The fixture's video is row 0 of the bin, its text
+ * element row 1; rows are handed to the bin as fakes so the in-place paints
+ * can be read back.
+ */
+describe("a damaged video in the bin", () => {
+  const QUICK = "asset://cache/harbour.quick.mp4";
+  const repairing = (ratio: number | null) => ({ until: 60.6, phase: "repairing", ratio });
+
+  async function bin() {
+    const fx = fixture();
+    const { root } = await mount(fx.project);
+    const list = root.querySelector("#media-list");
+    const rows = [new FakeEl(), new FakeEl()];
+    list.children = rows;
+    return { fx, list, row: rows[0]! };
+  }
+
+  it("says Damaged, amber, with what can't be read and how the repair stands", async () => {
+    const { fx, list } = await bin();
+    m.media.status.set({ [fx.media.id]: { state: "ready", url: QUICK, sourcePath: QUICK } });
+    m.media.damage.set({ [fx.media.id]: repairing(0.4) });
+    await flush();
+    expect(list.innerHTML).toContain(
+      `<span class="media-row__status media-row__status--warn" title="${escapeHtml("0:00-1:00 couldn't be read · repairing 40%")}">Damaged</span>`,
+    );
+    expect(list.innerHTML).toContain(`<div class="media-row__bar">`);
+    expect(list.innerHTML).not.toContain(">Ready<");
+  });
+
+  it("feeds the repair's progress to the bar and tooltip in place, rebuilding no row", async () => {
+    const { fx, list, row } = await bin();
+    m.media.status.set({ [fx.media.id]: { state: "ready", url: QUICK, sourcePath: QUICK } });
+    m.media.damage.set({ [fx.media.id]: repairing(0.4) });
+    await flush();
+    const rebuilt = list.writes.innerHTML;
+    m.media.damage.set({ [fx.media.id]: repairing(0.65) });
+    await flush();
+    expect(list.writes.innerHTML).toBe(rebuilt);
+    expect(row.querySelector(".media-row__bar > div").style.width).toBe("65%");
+    expect(row.querySelector(".media-row__status--warn").title).toBe("0:00-1:00 couldn't be read · repairing 65%");
+  });
+
+  it("keeps saying Damaged while the media waits on its repair, whatever the status ratio does", async () => {
+    // The instant copy failed in the element: the status is Preparing on the
+    // repair's job, and its ratio ticks too. The Preparing repaint must not
+    // write "Preparing 50%" over the Damaged label.
+    const { fx, row } = await bin();
+    m.media.status.set({ [fx.media.id]: { state: "preparing", ratio: 0.3, jobId: 412 } });
+    m.media.damage.set({ [fx.media.id]: repairing(0.3) });
+    await flush();
+    m.media.status.set({ [fx.media.id]: { state: "preparing", ratio: 0.5, jobId: 412 } });
+    await flush();
+    expect(row.querySelector(".media-row__status").writes.textContent).toBe(0);
+  });
+
+  it("drops the bar once the repair has landed", async () => {
+    const { fx, list } = await bin();
+    m.media.status.set({ [fx.media.id]: { state: "ready", url: QUICK, sourcePath: QUICK } });
+    m.media.damage.set({ [fx.media.id]: { until: 60.6, phase: "recovered", ratio: null } });
+    await flush();
+    expect(list.innerHTML).toContain(`title="${escapeHtml("0:00-1:00 couldn't be read · recovered")}">Damaged</span>`);
+    expect(list.innerHTML).not.toContain(`<div class="media-row__bar">`);
+  });
+
+  it("lets Failed win: its message is the more useful fact", async () => {
+    const { fx, list } = await bin();
+    m.media.status.set({ [fx.media.id]: { state: "failed", message: "This file couldn't be played" } });
+    m.media.damage.set({ [fx.media.id]: repairing(0.4) });
+    await flush();
+    expect(list.innerHTML).toContain(">Failed<");
+    expect(list.innerHTML).not.toContain(">Damaged<");
+  });
+
+  it("raises one notice, not an error, whose second line says what can't be read", async () => {
+    const fx = fixture();
+    await mount(fx.project);
+    m.mediaOpts.onDamaged(fx.media.id, repairing(null), true);
+    expect(m.toasts.notice).toEqual([
+      [
+        "This video is damaged",
+        "0:00-1:00 can't be read. The rest plays now; Taroting repairs the damaged part in the background.",
+      ],
+    ]);
+    expect(m.toasts.error).toEqual([]);
+  });
+
+  it("raises nothing when the recovered copy was already there: a reopen is not news", async () => {
+    const fx = fixture();
+    await mount(fx.project);
+    m.mediaOpts.onDamaged(fx.media.id, { until: 60.6, phase: "recovered", ratio: null }, false);
+    expect(m.toasts.notice).toEqual([]);
+    expect(m.toasts.error).toEqual([]);
+  });
+
+  it("raises nothing for a media that has left the project", async () => {
+    await mount();
+    m.mediaOpts.onDamaged("m-gone", repairing(null), true);
+    expect(m.toasts.notice).toEqual([]);
+    expect(m.toasts.error).toEqual([]);
   });
 });
 

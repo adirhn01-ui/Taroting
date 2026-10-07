@@ -100,8 +100,40 @@ function show(
   el.appendChild(btn);
 }
 
+/**
+ * A notice: something the user should know that is NOT a failure — a damaged
+ * video whose preview is being repaired. Amber (`.toast--notice`), never the
+ * red of an error: nothing failed, and the file still plays.
+ *
+ * Never recorded in the recent-errors ring, which is for things that failed:
+ * the ring holds twenty, and news like this would push the real errors out
+ * of Settings → Diagnostics. No role of its own, like an info toast: it can
+ * wait for the screen reader to finish, and the host's polite region reads it
+ * as an addition (see ensureHost) - a child that were its own live region
+ * would arrive already filled and generally not be announced at all, and an
+ * alert would interrupt. Its detail is a quieter second line, not a
+ * Details button: a sentence read in place, nothing to copy out. Longer than
+ * an info toast, for the two lines.
+ */
+function showNotice(message: string, detail: string | undefined, ms: number): void {
+  const el = document.createElement("div");
+  el.className = "toast toast--notice";
+  el.textContent = message;
+  if (detail !== undefined) {
+    const line = document.createElement("div");
+    line.className = "toast__detail";
+    line.textContent = detail;
+    el.appendChild(line);
+  }
+  ensureHost().appendChild(el);
+  window.setTimeout(() => el.remove(), ms);
+}
+
 export const toast = {
   info: (message: string): void => show(message, "info", 3500),
+  /** News that is not a failure (see showNotice): amber, polite, never
+   *  recorded; `detail` is a second, quieter line. */
+  notice: (message: string, detail?: string): void => showNotice(message, detail, 8000),
   /** Something failed. Always recorded in the recent-errors ring. */
   error: (message: string, opts?: ToastOptions): void => show(message, "error", 6500, opts),
   /** The app declined an input — an empty name, a crop that does not fit, a

@@ -349,6 +349,20 @@
 .toast--error {
   border-color: var(--danger);
 }
+/* A notice (`toast.notice`): news that is not a failure, such as a damaged
+ * video being repaired. Amber like the bin's "Damaged" label (--warn is not
+ * themable, so it reads in every theme), never the red of an error. Its
+ * detail is a quieter second line under the message. */
+.toast--notice {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  border-color: var(--warn);
+}
+.toast__detail {
+  color: var(--text-2);
+  font-size: var(--fs-12);
+}
 .toast .btn {
   margin: -2px -6px -2px 0;
 }

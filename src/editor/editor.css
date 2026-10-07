@@ -178,6 +178,28 @@ html[data-rescue-chrome] #ed-settings:focus-visible {
 .preview__overlay.active {
   display: flex;
 }
+/* Inside a damaged video's unreadable range on its instant copy, which holds
+ * its first good frame there: the same card, on the canvas's own black, so
+ * that still is never taken for the video. */
+.preview__overlay--damaged {
+  background: #000;
+}
+/* Inside the range once the recovered copy plays: only a small label in the
+ * corner, over the recovered picture. It must not cover the picture, nor take
+ * the canvas's pointer events (the clip stays draggable under it). Amber like
+ * the bin's "Damaged", which --warn keeps readable on this dark chip in both
+ * themes (it is not themable). */
+.preview__overlay--label {
+  inset: auto;
+  top: var(--sp-3);
+  left: var(--sp-3);
+  padding: 2px var(--sp-2);
+  border-radius: var(--radius-s);
+  background: rgba(0, 0, 0, 0.6);
+  color: var(--warn);
+  font-size: var(--fs-11);
+  pointer-events: none;
+}
 
 /* ---------- timeline panel ---------- */
 
@@ -433,6 +455,11 @@ html[data-rescue-chrome] #ed-settings:focus-visible {
 }
 .media-row__status--bad {
   color: var(--danger);
+}
+/* "Damaged": a video whose preview had to be repaired. Amber, not red — it
+ * plays; the tooltip says what can't be read and how the repair stands. */
+.media-row__status--warn {
+  color: var(--warn);
 }
 
 .media-row__bar {

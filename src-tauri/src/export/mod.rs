@@ -1136,6 +1136,7 @@ mod unit {
                 color: "#000000".into(), bold: false, italic: false,
             }),
             no_autorotate: None,
+            drop_inband_headers: None,
         };
         let clip = Clip {
             id: "c".into(), media_id: "t".into(), timeline_start: 0.0, src_in: 0.0, src_out: 1.0,
@@ -1606,6 +1607,7 @@ mod unit {
             audio_channels: None,
             generator: None,
             no_autorotate: None,
+            drop_inband_headers: None,
         }
     }
 
@@ -2237,6 +2239,7 @@ mod e2e {
             audio_channels: Some(2),
             generator: None,
             no_autorotate: None,
+            drop_inband_headers: None,
         };
         (src, media)
     }
@@ -2510,6 +2513,7 @@ mod e2e {
             bit_depth: None, has_audio: false, audio_rate: None, audio_channels: None,
             generator: Some(Generator::Solid { color: color.into() }),
             no_autorotate: None,
+            drop_inband_headers: None,
         }
     }
 
@@ -2562,6 +2566,7 @@ mod e2e {
             audio_channels: info.audio_channels,
             generator: None,
             no_autorotate: None,
+            drop_inband_headers: None,
         };
         let white = solid_media("white", "#ffffff");
         let slot = info.duration;
@@ -2739,6 +2744,7 @@ mod e2e {
                 italic: false,
             }),
             no_autorotate: None,
+            drop_inband_headers: None,
         };
         let bottom = vtrack("vbot", vec![clip_at("b1", "base", 0.0, 0.0, 2.0)]);
         let toptrack = vtrack("vtop", vec![clip_at("t1", "txt", 0.0, 0.0, 2.0)]);
@@ -3014,6 +3020,7 @@ mod e2e {
             acodec: None, pix_fmt: info.pix_fmt.clone(), bit_depth: Some(8),
             has_audio: false, audio_rate: None, audio_channels: None, generator: None,
             no_autorotate: None,
+            drop_inband_headers: None,
         };
 
         // [top-left, top-right, bottom-left, bottom-right]
@@ -3123,6 +3130,7 @@ mod e2e {
             acodec: None, pix_fmt: info.pix_fmt.clone(), bit_depth: Some(8),
             has_audio: false, audio_rate: None, audio_channels: None, generator: None,
             no_autorotate: None,
+            drop_inband_headers: None,
         };
         // No clip transform at all: every degree of turn here comes from the file.
         let c = clip_at("c1", "m1", 0.0, 0.0, 1.0);
@@ -3330,6 +3338,7 @@ mod e2e {
                 italic: false,
             }),
             no_autorotate: None,
+            drop_inband_headers: None,
         };
         let bottom = vtrack("vbot", vec![clip_at("b1", "base", 0.0, 0.0, 3.0)]);
         let mut t = clip_at("t1", "txt", 0.0, 0.0, 3.0);
@@ -3609,6 +3618,7 @@ mod e2e {
                 color: "#ffffff".into(), bold: true, italic: false,
             }),
             no_autorotate: None,
+            drop_inband_headers: None,
         };
         let tl = Timeline {
             fps: Rational { num: 30, den: 1 }, width: 640, height: 360,

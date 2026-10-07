@@ -114,6 +114,20 @@ export interface MediaRef {
    *  headers by the backend (probe + the load-time repair), by where a tag
    *  could sit, never by reading one. Never set on a JPEG or a BMP. */
   noAutorotate?: true;
+  /** Video only: this file's H.264 stream carries in-band headers that must
+   *  not be believed — a damaged recording whose garbage frames happen to
+   *  parse as parameter sets (SPS/PPS: they re-size ffmpeg's decoder and wreck
+   *  every clean frame after them) or as SEI (a display-orientation SEI turns
+   *  every later frame). Every ffmpeg decode of the file for EXPORT then
+   *  removes the in-band SPS/PPS/SEI (input bitstream filter
+   *  `filter_units=remove_types=6|7|8`), so the header's (`avcC`) parameter
+   *  sets are the only ones in force — what the MP4 spec says an `avc1`
+   *  stream carries anyway. Stamped by the editor only, when the preview's
+   *  repair plan reports `repair.dropsHeaders` (see `RepairNote` in ipc.ts);
+   *  the editor's plan then goes straight to the repair on later opens.
+   *  Cleared by relink and Replace media (a different file). Only a literal
+   *  `true` is the flag. */
+  dropInbandHeaders?: true;
 }
 
 /** What `probe_media` returns — a MediaRef without an assigned id. */

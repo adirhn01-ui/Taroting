@@ -177,6 +177,69 @@ describe("toast and the recent-errors ring", () => {
 });
 
 /**
+ * The notice tone: news that is not a failure (a damaged video being
+ * repaired). It used to go out as an error, so a file that plays fine wrote a
+ * red alert and a Diagnostics entry on every open of its project. Each
+ * property has its own test, so a regression in one names itself.
+ */
+describe("toast.notice", () => {
+  const MESSAGE = "This video is damaged";
+  const DETAIL = "0:00-1:00 can't be read. The rest plays now; Taroting repairs the damaged part in the background.";
+
+  it("is never recorded in the recent-errors ring", async () => {
+    const { toast, recentErrors } = await load();
+    toast.notice(MESSAGE, DETAIL);
+    expect(shown()).toHaveLength(1);
+    expect(recentErrors()).toHaveLength(0);
+  });
+
+  it("has its own tone, not the error's", async () => {
+    const { toast } = await load();
+    toast.notice(MESSAGE, DETAIL);
+    expect(shown()[0]!.className).toBe("toast toast--notice");
+  });
+
+  it("is announced politely, never as an alert", async () => {
+    const { toast } = await load();
+    toast.notice(MESSAGE, DETAIL);
+    // No role of its own: the host's polite region reads it as an addition,
+    // as it reads an info toast. role="alert" would interrupt; a role="status"
+    // child arrives already filled and is generally not announced at all.
+    expect(shown()[0]!.attrs.has("role")).toBe(false);
+  });
+
+  it("shows its detail as a second line under the message, with no Details button", async () => {
+    const { toast } = await load();
+    toast.notice(MESSAGE, DETAIL);
+    const el = shown()[0]!;
+    expect(el.textContent).toBe(MESSAGE);
+    expect(el.children.map((c) => [c.className, c.textContent, c.handlers.size])).toEqual([
+      ["toast__detail", DETAIL, 0],
+    ]);
+  });
+
+  it("has no second line without a detail", async () => {
+    const { toast } = await load();
+    toast.notice(MESSAGE);
+    expect(shown()[0]!.textContent).toBe(MESSAGE);
+    expect(shown()[0]!.children).toEqual([]);
+  });
+
+  it("stays up about 8 s, then goes", async () => {
+    const timers: Array<[() => void, number]> = [];
+    vi.stubGlobal("window", {
+      setTimeout: (fn: () => void, ms: number) => timers.push([fn, ms]),
+      clearTimeout: () => {},
+    });
+    const { toast } = await load();
+    toast.notice(MESSAGE, DETAIL);
+    expect(timers.map(([, ms]) => ms)).toEqual([8000]);
+    timers[0]![0]();
+    expect(shown()).toEqual([]);
+  });
+});
+
+/**
  * A toast that names files hands their WHOLE paths to the ring entry, so the
  * redaction in Settings → Diagnostics and in the report can replace each one
  * whole instead of finding it in free text and cutting it at a space.

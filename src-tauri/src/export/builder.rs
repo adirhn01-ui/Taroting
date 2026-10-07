@@ -21,6 +21,7 @@ use std::ffi::OsString;
 use crate::error::{AppError, Result};
 use crate::export::model::{format_rate, BitratePreset, Container, ExportSpec, FpsPreset, ResolutionPreset};
 use crate::hw::EncoderReport;
+use crate::media::prepare::DROP_INBAND_HEADERS;
 use crate::media::source::INPUT_PROTOCOL_ARGS;
 use crate::project::schema::{
     Clip, Generator, Keyframe, MediaRef, Track,
@@ -818,6 +819,19 @@ fn register_clip_input(
         flags.push(format!("{:.6}", clip.src_in).into());
         flags.push("-to".into());
         flags.push(format!("{:.6}", clip.src_out).into());
+        // A damaged recording whose in-band headers must not be believed
+        // (`MediaRef.drop_inband_headers`, stamped when the preview's repair
+        // copy needed the same): garbage parameter sets would re-size
+        // ffmpeg's decoder to their nonsense and wreck every clean frame after
+        // them, and a garbage display-orientation SEI would turn the picture,
+        // so the export decodes it as the preview's repair copy was decoded —
+        // SEI, SPS and PPS removed, only the header's parameter sets in force.
+        // H.264 only: the filter names H.264 NAL types. The audio input of the
+        // same file (the loop in `build`) never decodes its video, and gets
+        // nothing.
+        if media.drop_inband_headers == Some(true) && media.vcodec.as_deref() == Some("h264") {
+            flags.extend(DROP_INBAND_HEADERS.iter().map(OsString::from));
+        }
     }
     push_file_input(&mut flags);
     inputs.push(InputEntry {
@@ -2055,6 +2069,7 @@ mod tests {
             audio_channels: Some(2),
             generator: None,
             no_autorotate: None,
+            drop_inband_headers: None,
         }
     }
 
@@ -2083,6 +2098,7 @@ mod tests {
             audio_channels: None,
             generator: Some(generator),
             no_autorotate: None,
+            drop_inband_headers: None,
         }
     }
 
@@ -3296,6 +3312,73 @@ mod tests {
             assert_eq!(a[i - 8] == "-noautorotate", raw, "{container}/{vcodec}/{flag:?}: {a:?}");
             let count = a.iter().filter(|s| *s == "-noautorotate").count();
             assert_eq!(count, usize::from(raw), "{container}/{vcodec}/{flag:?}: only the still's input, once: {a:?}");
+        }
+    }
+
+    /// The in-band header filter goes on a video input exactly when its media
+    /// entry is flagged AND the stream is H.264: right before that
+    /// input's own `-protocol_whitelist file -i`, after its `-ss/-to`, and
+    /// nowhere else. One project holds every neighbour that must NOT get it,
+    /// each flagged too where it could be: the same file's audio input, a
+    /// flagged HEVC recording, a flagged still, a flagged generator, and an
+    /// unflagged H.264 recording. With the flag cleared the argv is exactly
+    /// the flagged one minus those two arguments, so nothing else moved.
+    #[test]
+    fn only_a_flagged_h264_video_input_drops_its_inband_headers() {
+        let build_with = |flag: Option<bool>| {
+            let mut rec = media("m1", r"C:\rec\Replay 2026.mp4", 1918, 1078, true);
+            rec.drop_inband_headers = flag;
+            let plain = media("m2", r"C:\v\plain.mp4", 1280, 720, true);
+            let mut hevc = media("m3", r"C:\v\hevc.mp4", 1280, 720, false);
+            hevc.vcodec = Some("hevc".into());
+            hevc.drop_inband_headers = Some(true);
+            let mut still = image_media("m4", r"C:\pics\still.png");
+            still.drop_inband_headers = Some(true);
+            let mut solid = gen_media("m5", Generator::Solid { color: "#336699".into() }, 300, 200);
+            solid.drop_inband_headers = Some(true);
+            let tl = timeline(
+                1280,
+                720,
+                Rational { num: 30, den: 1 },
+                vec![
+                    vtrack_id("top", vec![
+                        clip("c1", "m1", 1.0, 2.5, 4.0),
+                        clip("c4", "m4", 4.0, 0.0, 1.0),
+                        clip("c5", "m5", 5.5, 0.0, 0.5),
+                    ]),
+                    vtrack_id("bot", vec![clip("c2", "m2", 0.0, 0.0, 5.0), clip("c3", "m3", 5.0, 1.0, 3.0)]),
+                ],
+            );
+            let b = build(
+                &spec(vec![rec, plain, hevc, still, solid], tl, preset("mp4", "h264"), r"C:\o.mp4"),
+                &enc(),
+            )
+            .unwrap();
+            argstr(&b)
+        };
+
+        let a = build_with(Some(true));
+        let at: Vec<usize> = (0..a.len()).filter(|&i| a[i] == r"C:\rec\Replay 2026.mp4").collect();
+        assert_eq!(at.len(), 2, "the recording's video input and its audio input: {a:?}");
+        assert_eq!(
+            &a[at[0] - 9..at[0]],
+            ["-ss", "2.500000", "-to", "4.000000", "-bsf:v", "filter_units=remove_types=6|7|8", "-protocol_whitelist", "file", "-i"],
+            "{a:?}"
+        );
+        assert_eq!(
+            &a[at[1] - 7..at[1]],
+            ["-ss", "2.500000", "-to", "4.000000", "-protocol_whitelist", "file", "-i"],
+            "the audio input is untouched: {a:?}"
+        );
+        assert_eq!(a.iter().filter(|s| *s == "-bsf:v").count(), 1, "{a:?}");
+        assert_eq!(a.iter().filter(|s| s.contains("filter_units")).count(), 1, "{a:?}");
+
+        for unflagged in [None, Some(false)] {
+            let b = build_with(unflagged);
+            assert!(!b.iter().any(|s| s.starts_with("-bsf") || s.contains("filter_units")), "{unflagged:?}: {b:?}");
+            let mut without = a.clone();
+            without.drain(at[0] - 5..at[0] - 3);
+            assert_eq!(without, b, "{unflagged:?}: only the two filter arguments differ");
         }
     }
 

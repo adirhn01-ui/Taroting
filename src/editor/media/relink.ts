@@ -138,6 +138,13 @@ const BLANK_OPTIONAL_MEDIA: Partial<MediaRef> = {
   // header. Inherited by a new file whose tag the WebView turns, it would
   // make the export decode that photo unturned against its turned size.
   noAutorotate: undefined,
+  // "Export this file without its in-band SPS/PPS/SEI": learned from the OLD
+  // file's damaged stream by a repair of its preview. Inherited by a healthy
+  // new file — or one whose stream carries the only copy of its parameter
+  // sets, or a real orientation SEI — it would make the export strip what
+  // that file needs to decode and turn. The new file earns the flag itself
+  // if its own preview needs the repair.
+  dropInbandHeaders: undefined,
 };
 
 /** Point `mediaId` at a freshly probed file and repair everything that derives

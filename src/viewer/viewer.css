@@ -1,9 +1,10 @@
 /* The folder viewer: one file on a black stage, glass chrome over it.
  *
  * .viewer is its own stacking context (isolation), exactly like the theater
- * container, so every z-index below is LOCAL: media paints at auto, the status
- * card at --z-stage-status (250), and the top bar, the ‹ › buttons and the
- * player bar at --z-theater-bar (300). No new z tokens.
+ * container, so every z-index below is LOCAL: media paints at auto (the cover
+ * over a damaged file's unreadable part right above it, by document order),
+ * the status card at --z-stage-status (250), and the top bar, the ‹ › buttons
+ * and the player bar at --z-theater-bar (300). No new z tokens.
  *
  * The stage is #000 and not themable — the same rule as .preview__canvas: a
  * picture is judged against black, whatever the theme. Everything painted OVER
@@ -80,8 +81,9 @@
   text-overflow: ellipsis;
 }
 
-/* "Preparing preview 34%", "This video needs a preview copy", "Can't show
- * this file" — centred over the stage, above the media, below the chrome. */
+/* "Preparing preview 34%", "This video needs a preview copy", "Damaged video ·
+ * repairing 34%", "Can't show this file", and the cover's "Damaged section ·
+ * repairing 34%" — centred over the stage, above the media, below the chrome. */
 .viewer__status {
   position: absolute;
   left: 50%;
@@ -107,6 +109,47 @@
   color: var(--text-2);
   overflow-wrap: anywhere;
   user-select: text;
+}
+/* The card as the cover's label: a click on it is a click on the video. */
+.viewer__status--passive {
+  pointer-events: none;
+}
+
+/* ---------- a damaged file ----------
+ * The instant copy of a damaged recording has no picture for its unreadable
+ * part (the element would hold the first sound frame there, which reads as a
+ * frozen video), so the stage shows black under the status card's label while
+ * the playhead is in it. Black like the stage itself, never themed. Clicks
+ * pass through to the video under it. */
+.viewer__cover {
+  position: absolute;
+  inset: 0;
+  background: #000;
+  pointer-events: none;
+}
+
+/* "Damaged video · repairing 40%" beside the file name: the app's .badge in
+ * the warning colour. Two classes so it beats .badge whichever sheet loads
+ * last. The tooltip names the range that couldn't be read. */
+.viewer .viewer__damage {
+  flex: none;
+  white-space: nowrap;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The damaged range [0, until] on the seek track: a quiet --warn tint under
+ * the fill, so the played part still reads in the accent over it. Centred on
+ * the track by the seek row's own alignment, like the fill. */
+.viewer__seek-damage {
+  position: absolute;
+  left: 0;
+  width: 0;
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--warn) 40%, transparent);
+  pointer-events: none;
 }
 
 /* ---------- chrome ---------- */

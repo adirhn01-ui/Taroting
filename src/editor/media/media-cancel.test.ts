@@ -176,6 +176,54 @@ describe("MediaManager cancel at dispose", () => {
     m2.dispose();
   });
 
+  it("a damaged file's quick view reopened on the same file keeps its full repair: the next editor claims it", async () => {
+    // Explorer reopening a damaged recording whose untouched temporary
+    // project was just discarded. The first editor played the instant copy
+    // (ready, no job of its own) while the full repair (93) ran; the second
+    // editor's plan names that same repair as its upgrade. Unclaimed, the
+    // grace timer would cancel it and the repair would start again from 0%.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
+    const note = { dropsHeaders: true, damagedUntil: 61.25, quick: true as const };
+    vi.spyOn(ipc, "planPlayback").mockImplementation(async (m, _hints, _proxy, repair) =>
+      repair
+        ? {
+            mode: "ready",
+            path: "C:\\cache\\a.quick.mp4",
+            repair: note,
+            upgrade: { jobId: 93, output: "C:\\cache\\a.repairh.mp4" },
+          }
+        : { mode: "direct", path: m.path },
+    );
+    vi.spyOn(ipc, "ensureWaveform").mockResolvedValue({ state: "none" });
+    const cancel = vi.spyOn(ipc, "cancelJob").mockResolvedValue(true);
+    // Flagged, as the first editor recorded it: both plans go straight to the
+    // repair.
+    const flagged: MediaRef = { ...media("a", false), dropInbandHeaders: true };
+    const first = projectOf(flagged);
+    const m1 = new MediaManager(() => first);
+    m1.ensureAll(first);
+    await settle();
+    expect(m1.damage.get()["a"]?.phase).toBe("repairing");
+    m1.dispose({ abandonPlayback: true });
+
+    vi.advanceTimersByTime(ABANDON_GRACE_MS / 2);
+    const again: MediaRef = { ...flagged, id: "a-again" };
+    const second = projectOf(again);
+    const m2 = new MediaManager(() => second);
+    await m2.init();
+    m2.ensureAll(second);
+    await settle();
+    expect(m2.damage.get()["a-again"]).toEqual({ until: 61.25, phase: "repairing", ratio: null });
+
+    vi.advanceTimersByTime(ABANDON_GRACE_MS);
+    expect(cancel).not.toHaveBeenCalled();
+    // And it is waiting on 93: the repair's end swaps the full copy in.
+    handlers.onDone!({ id: 93, kind: "proxy", output: { path: "C:\\cache\\a.repairh.mp4" } });
+    expect(m2.status.get()["a-again"]).toMatchObject({ state: "ready", sourcePath: "C:\\cache\\a.repairh.mp4" });
+    m2.dispose();
+  });
+
   it("an explicit abandonPlayback: false is the ordinary dispose", async () => {
     vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
     vi.spyOn(ipc, "planPlayback").mockResolvedValue({ mode: "pending", jobId: 41, output: "o" });
@@ -211,6 +259,32 @@ describe("MediaManager cancel at dispose", () => {
     // The pending one was started for this project and is registered nowhere:
     // this is the only chance to stop it. A direct play has no job at all.
     expect(cancel.mock.calls.map((c) => c[0])).toEqual([77]);
+  });
+
+  it("after a discarding dispose, abandons the full repair behind a late instant copy too", async () => {
+    // A damaged file's repair plan, answering after a discarded project
+    // closed: a ready instant copy (no job of its own) and its full repair
+    // (88), a transcode of the whole file. Registered nowhere, so this is the
+    // only chance to let it go; a pending instant copy (91) goes with its own.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(ipc, "getThumbnail").mockReturnValue(new Promise<string>(() => {}));
+    let ra!: (v: PlaybackPlan) => void;
+    let rb!: (v: PlaybackPlan) => void;
+    vi.spyOn(ipc, "planPlayback").mockImplementation((m) => new Promise((r) => (m.id === "a" ? (ra = r) : (rb = r))));
+    vi.spyOn(ipc, "ensureWaveform").mockResolvedValue({ state: "none" });
+    const cancel = vi.spyOn(ipc, "cancelJob").mockResolvedValue(true);
+    const p = projectOf(media("a"), media("b"));
+    const m = new MediaManager(() => p);
+    m.ensureAll(p);
+    await settle();
+    m.dispose({ abandonPlayback: true });
+    const note = { dropsHeaders: true, damagedUntil: 12.5, quick: true as const };
+    ra({ mode: "ready", path: "C:\\cache\\a.quick.mp4", repair: note, upgrade: { jobId: 88, output: "C:\\cache\\a.repairh.mp4" } });
+    rb({ mode: "pending", jobId: 91, output: "C:\\cache\\b.quick.mp4", repair: note, upgrade: { jobId: 92, output: "C:\\cache\\b.repairh.mp4" } });
+    await settle();
+    expect(cancel).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(ABANDON_GRACE_MS);
+    expect(cancel.mock.calls.map((c) => c[0]).sort()).toEqual([88, 91, 92]);
   });
 
   it("cancels nothing for a direct plan after dispose, and swallows a rejecting cancel", async () => {

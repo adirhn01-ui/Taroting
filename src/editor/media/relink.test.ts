@@ -314,6 +314,24 @@ describe("applyRelink", () => {
     expect(findMedia(applyRelink(p, mediaId, webp.path, webp), mediaId)!.noAutorotate).toBe(true);
   });
 
+  it("drops the old video's dropInbandHeaders: the new file earns its own", () => {
+    // Learned from the OLD file's damaged stream by a repaired preview. A
+    // probe never reports it, so `updateMedia`'s merge would hand it to any
+    // relinked file — and the export would strip the in-band headers from a
+    // stream that may carry the only copy. The replacement is a healthy file
+    // that differs from the original on path, size and length.
+    const damaged: MediaInfo = { ...originalInfo, path: "D:\\captures\\Replay 2026.mp4", dropInbandHeaders: true };
+    const { p, mediaId } = projectWith(damaged);
+    expect(findMedia(p, mediaId)!.dropInbandHeaders).toBe(true);
+
+    const healthy: MediaInfo = { ...originalInfo, path: "E:\\rescued\\replay.mp4", size: 64_000, duration: 58 };
+    const relinked = findMedia(applyRelink(p, mediaId, healthy.path, healthy), mediaId)!;
+    expect(relinked.path).toBe(healthy.path);
+    expect(relinked.dropInbandHeaders).toBeUndefined();
+    // ...and it is not written to the `.trt` either.
+    expect(JSON.parse(JSON.stringify(relinked))).not.toHaveProperty("dropInbandHeaders");
+  });
+
   it("relinking an image to another image never collapses the clip", () => {
     const { p, mediaId, clipId } = projectWith(imageInfo);
     const q = applyRelink(p, mediaId, "D:\\other.jpg", {

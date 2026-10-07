@@ -4,8 +4,9 @@
 // the slice of MediaManager the scheduler reads. Imported only by
 // *.test.ts files beside it; nothing in the app references this module.
 
+import { Store } from "../../core/store";
 import type { Clip, MediaRef, ProjectFile } from "../../core/types";
-import type { MediaManager, MediaState } from "../media/media";
+import type { DamageState, MediaManager, MediaState } from "../media/media";
 import type { LayerSet, Stage } from "../preview/preview";
 
 type Listener = () => void;
@@ -40,6 +41,17 @@ export class FakeVideo {
    * a test can make later seeks faster or slower than the first.
    */
   seekLatency = 0;
+  /**
+   * Model the media element LOAD algorithm on a src write, the way Chromium
+   * runs it: the position goes back to 0, readyState to HAVE_NOTHING, the
+   * element pauses and its rate returns to the default (1); the next
+   * `advance` finishes the load (HAVE_ENOUGH_DATA) without decoding. Off by
+   * default — most tests count loads and never look past them — but a test
+   * about what happens AFTER a src change must turn it on, or an element
+   * that kept its old position and rate would pass for one that was put back.
+   */
+  resetOnLoad = false;
+  private loading = false;
   private seekLeft = 0;
   private ct = 0;
   private rate = 1;
@@ -73,10 +85,27 @@ export class FakeVideo {
     this.src_ = v;
     this.srcWrites++;
     this.srcLog.push({ url: v, at: performance.now() });
+    if (this.resetOnLoad) {
+      this.ct = 0;
+      this.rate = 1;
+      this.readyState = 0;
+      this.paused = true;
+      this.seeking = false;
+      this.seekLeft = 0;
+      this.ended = false;
+      this.error = null;
+      this.loading = true;
+    }
   }
 
   /** `dt` seconds of wall time pass: a playing element decodes dt*rate. */
   advance(dt: number): void {
+    if (this.loading) {
+      // the load takes this frame; decoding starts on the next
+      this.loading = false;
+      this.readyState = 4;
+      return;
+    }
     if (this.seeking && this.seekLeft > 0) {
       // the seek is still in flight: wall time passes, the clock does not
       const spent = Math.min(dt, this.seekLeft);
@@ -173,14 +202,53 @@ function fakeSet(): FakeSet {
   return { set, a, b, gen };
 }
 
+/**
+ * The stage's status overlay: the text and classes `setOverlay` and the
+ * scheduler write, with every text read and WRITE and every class toggle
+ * counted — the zero-overhead tests assert that a playing tick touches none
+ * of them.
+ */
+export class FakeOverlay {
+  textReads = 0;
+  textWrites = 0;
+  toggles = 0;
+  readonly classes = new Set<string>();
+  private text_ = "";
+  readonly classList = {
+    toggle: (name: string, force?: boolean): boolean => {
+      this.toggles++;
+      const on = force ?? !this.classes.has(name);
+      if (on) this.classes.add(name);
+      else this.classes.delete(name);
+      return on;
+    },
+    contains: (name: string): boolean => this.classes.has(name),
+  };
+  get textContent(): string {
+    this.textReads++;
+    return this.text_;
+  }
+  set textContent(v: string) {
+    this.text_ = v;
+    this.textWrites++;
+  }
+  /** What a user sees: the text while the overlay is active, else null.
+   *  Not counted as a read. */
+  shown(): string | null {
+    return this.classes.has("active") ? this.text_ : null;
+  }
+}
+
 /** The stage's pooled layer sets: index i is always the same set object. */
-export function fakeStage(): Stage & { sets: FakeSet[] } {
+export function fakeStage(): Stage & { sets: FakeSet[]; fakeOverlay: FakeOverlay } {
   const sets: FakeSet[] = [];
+  const fakeOverlay = new FakeOverlay();
   const stage = {
     root: {} as HTMLElement,
     canvas: {} as HTMLElement,
     layers: [] as LayerSet[],
-    overlay: { textContent: "", classList: { toggle: () => {} } } as unknown as HTMLElement,
+    overlay: fakeOverlay as unknown as HTMLElement,
+    fakeOverlay,
     scale: 1,
     sets,
     syncLayerCount(n: number): void {
@@ -202,18 +270,34 @@ export function shownVideo(s: FakeSet): FakeVideo | null {
 }
 
 /** The MediaManager surface the scheduler and audio graph read: the status
- *  store, and markFailed (recorded). */
-export function fakeMedia(statuses: Record<string, MediaState>): MediaManager & {
-  failed: Array<[string, string]>;
+ *  store, the damage store (a real Store, so its notifications are
+ *  microtask-batched exactly as the manager's are; `damageReads` counts its
+ *  `get` calls), and playbackFailed (recorded as [id, url, code, message]). */
+export function fakeMedia(
+  statuses: Record<string, MediaState>,
+  damage: Record<string, DamageState> = {},
+): MediaManager & {
+  failed: Array<[string, string, number, string]>;
   statuses: Record<string, MediaState>;
+  damage: Store<Record<string, DamageState>>;
+  damageReads: () => number;
 } {
-  const failed: Array<[string, string]> = [];
+  const failed: Array<[string, string, number, string]> = [];
+  const store = new Store<Record<string, DamageState>>(damage);
+  let reads = 0;
+  const get = store.get.bind(store);
+  store.get = () => {
+    reads++;
+    return get();
+  };
   const m = {
     statuses,
     failed,
     status: { get: () => m.statuses },
-    markFailed(id: string, message: string): void {
-      failed.push([id, message]);
+    damage: store,
+    damageReads: () => reads,
+    playbackFailed(id: string, url: string, code: number, message: string): void {
+      failed.push([id, url, code, message]);
     },
   };
   return m as unknown as MediaManager & typeof m;

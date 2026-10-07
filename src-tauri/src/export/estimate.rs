@@ -162,6 +162,7 @@ mod tests {
             audio_channels: Some(2),
             generator: None,
             no_autorotate: None,
+            drop_inband_headers: None,
         }
     }
 

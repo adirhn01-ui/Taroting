@@ -128,10 +128,41 @@ export interface MediaKey {
   mtimeMs: number;
 }
 
+/** Present on a plan only when it names a REPAIR copy: the preview of a file
+ *  the WebView's own decoder refused (it stops a whole file at the first
+ *  undecodable frame; ffmpeg conceals and carries on). Mirror of `RepairNote`
+ *  in src-tauri/src/media/playability.rs. */
+export interface RepairNote {
+  /** The full repair decodes the file with its in-band H.264 SPS/PPS/SEI
+   *  removed (garbage that parses as parameter sets re-sizes the decoder; as a
+   *  display-orientation SEI it turns every later frame) — the rule
+   *  `MediaRef.dropInbandHeaders` records for export. */
+  dropsHeaders: boolean;
+  /** SOURCE seconds from 0 the file cannot be read for: a damaged PREFIX the
+   *  backend's scan found (H.264 in an MP4/MOV `avc1` track only), ending at
+   *  the first keyframe after which every frame is sound. Absent when no
+   *  such prefix was found (damage elsewhere, or a format the scan does not
+   *  read) — the file is still repaired, just not shown instantly. */
+  damagedUntil?: number;
+  /** This plan names the INSTANT copy: a lossless stream copy whose video
+   *  starts at `damagedUntil` (original timestamps) and whose audio is whole.
+   *  It plays at once; the full repair is the plan's `upgrade`, and its
+   *  `job:done` replaces this copy. */
+  quick?: true;
+}
+
+/** The full repair job running behind an instant copy (`RepairNote.quick`):
+ *  its progress and end arrive as ordinary job events under `jobId`, and its
+ *  `job:done` names the copy that supersedes the instant one. */
+export interface UpgradeJob {
+  jobId: number;
+  output: string;
+}
+
 export type PlaybackPlan =
   | { mode: "direct"; path: string }
-  | { mode: "ready"; path: string }
-  | { mode: "pending"; jobId: number; output: string };
+  | { mode: "ready"; path: string; repair?: RepairNote; upgrade?: UpgradeJob }
+  | { mode: "pending"; jobId: number; output: string; repair?: RepairNote; upgrade?: UpgradeJob };
 
 export type WaveformResult =
   | { state: "ready"; path: string }
@@ -183,6 +214,10 @@ export interface PlaybackClassInfo {
   /** a remux/proxy of this exact file ({path,size,mtimeMs}) is already in the cache, so planning
    *  would return `ready` without starting a job. Always false for `direct`. */
   prepared: boolean;
+  /** a REPAIR copy of this exact file is already in the cache: an earlier preview found it
+   *  undecodable as-is, so `planPlayback(…, repair = true)` would answer `ready` at once.
+   *  Only ever true for a video. */
+  repaired: boolean;
 }
 
 export interface JobProgress {
@@ -314,12 +349,15 @@ export const ipc = {
   },
   saveSettings: (settings: Settings) => call<void>("save_settings", { settings }),
 
-  planPlayback: (media: MediaRef, hints: CodecHints, forceProxyLarge: boolean) =>
-    call<PlaybackPlan>("plan_playback", { media, hints, forceProxyLarge }),
-  /** Pure: one decision + one cache stat, no job, no ffmpeg. */
+  /** `repair`: plan the REPAIR copy instead of the usual decision — for a video the
+   *  WebView refused (a decode error on the file it was handed), or one whose
+   *  `dropInbandHeaders` says it needs one. Answers `ready`/`pending` carrying `repair`. */
+  planPlayback: (media: MediaRef, hints: CodecHints, forceProxyLarge: boolean, repair = false) =>
+    call<PlaybackPlan>("plan_playback", { media, hints, forceProxyLarge, repair }),
+  /** Pure: one decision + cache stats, no job, no ffmpeg. */
   classifyPlayback: (media: MediaRef, hints: CodecHints, forceProxyLarge: boolean) =>
     call<PlaybackClassInfo>("classify_playback", { media, hints, forceProxyLarge },
-      () => ({ class: "direct", prepared: false })),
+      () => ({ class: "direct", prepared: false, repaired: false })),
   /** The folder neighbours of `path` in its own step family (see SiblingWindow),
    *  in the order the File Explorer window showing that folder lists them, or
    *  natural name order when none does. `fresh`: try to read that order from

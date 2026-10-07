@@ -6,22 +6,30 @@
 //    when activate() runs (syncSlaves);
 //  - an ended or errored master element stops being the clock;
 //  - a preloaded element is adopted after a still, a long gap or a loop wrap;
-//  - a <video> error marks its media failed, but only while still current;
+//  - a <video> error reaches the media manager (id, url, code), but only
+//    while still current;
 //  - the text layer keeps the export's 1.25 line height;
-//  - the per-tick queries stop allocating where they safely can.
+//  - the per-tick queries stop allocating where they safely can;
+//  - a damaged video's unreadable section is covered (or labelled) on stage,
+//    at no per-tick cost when nothing damaged is on it;
+//  - a repaired copy swapped in mid-playback reloads at the playhead and
+//    plays on.
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { sourceTime, timelineTime } from "../../core/time";
 import type { Clip, MediaRef } from "../../core/types";
 import { cssFont } from "../media/generators";
-import type { MediaState } from "../media/media";
+import type { DamageState, MediaState } from "../media/media";
+import { PlaybackEngine } from "./engine";
 import { NUDGE_SEC, Scheduler, slaveRate } from "./scheduler";
 import {
   clipOf,
   fakeMedia,
   fakeStage,
+  manualFrames,
   projectOf,
   readyStatus,
+  shownVideo,
   videoMedia,
   type FakeVideo,
 } from "./test-fakes";
@@ -402,11 +410,14 @@ describe("pooled <video> errors", () => {
     return { sched, media, a, b, set: stage.sets[0]! };
   }
 
-  it("marks the slot's media failed", () => {
+  it("reports the slot's media with the url it failed on and the error's code", () => {
+    // The manager decides what the error means (a decode error earns a repair
+    // copy), so the code must arrive as the element reported it — 3 here, the
+    // preload test below uses 4 — and the url must be the one the slot held.
     const { media, a, set } = setup();
-    set.a.error = { code: 4 };
+    set.a.error = { code: 3 };
     set.a.fire("error");
-    expect(media.failed).toEqual([[a.id, "This file couldn't be played"]]);
+    expect(media.failed).toEqual([[a.id, `url:${a.path}`, 3, "This file couldn't be played"]]);
   });
 
   it("attributes a preload slot's error to the preloaded media", () => {
@@ -415,7 +426,7 @@ describe("pooled <video> errors", () => {
     expect(set.b.src).toBe(`url:${b.path}`);
     set.b.error = { code: 4 };
     set.b.fire("error");
-    expect(media.failed).toEqual([[b.id, "This file couldn't be played"]]);
+    expect(media.failed).toEqual([[b.id, `url:${b.path}`, 4, "This file couldn't be played"]]);
   });
 
   it("ignores an error from a file the media no longer points at", () => {
@@ -561,5 +572,258 @@ describe("per-tick queries", () => {
     sched.activate(1, false);
     expect(sched.activeVideoInfos()).toHaveLength(2);
     expect(sched.videoElements()).toHaveLength(4);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* A damaged video's unreadable section on the stage                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One video track: the damaged clip on [4, 28] reads source [52, 100] at
+ * speed 2, so its source time at t is 52 + 2(t - 4) and the unreadable range
+ * (source 0..60.5) ends at t = 8.25. Every mapping axis differs: a stage that
+ * compared TIMELINE time to the range would stay covered to t = 60.5, one that
+ * ignored srcIn would uncover at t = 34.25, one that ignored speed at t = 12.5.
+ */
+describe("a damaged section on the stage", () => {
+  const UNTIL = 60.5;
+  const CROSS = 4 + (UNTIL - 52) / 2; // 8.25
+  const DAMAGED = "preview__overlay--damaged";
+  const LABEL = "preview__overlay--label";
+
+  function rig(damage: DamageState | null, statusOf?: (m: MediaRef) => MediaState) {
+    const dm = videoMedia("genshin", 170);
+    const clip = clipOf(dm, 4, 52, 100, 2);
+    const project = projectOf([dm], [[clip]]);
+    const stage = fakeStage();
+    const media = fakeMedia(
+      { [dm.id]: statusOf ? statusOf(dm) : readyStatus(dm) },
+      damage === null ? {} : { [dm.id]: damage },
+    );
+    const sched = new Scheduler(stage, () => project, media);
+    return { sched, stage, media, dm, overlay: stage.fakeOverlay };
+  }
+
+  it("covers the instant copy on black inside the range, with the repair's progress", () => {
+    const { sched, overlay } = rig({ until: UNTIL, phase: "repairing", ratio: 0.4 });
+    sched.activate(5, false);
+    expect(overlay.shown()).toBe("Damaged section · repairing 40%");
+    expect(overlay.classes.has(DAMAGED)).toBe(true);
+    expect(overlay.classes.has(LABEL)).toBe(false);
+  });
+
+  it("uncovers where the clip's SOURCE time leaves the range, mid-clip, with no activate", () => {
+    const { sched, overlay } = rig({ until: UNTIL, phase: "repairing", ratio: 0.4 });
+    sched.activate(7, true);
+    const seen: Array<[number, string | null]> = [];
+    for (let t = 7; t < 13; t += FRAME) {
+      sched.animate(t);
+      seen.push([t, overlay.shown()]);
+    }
+    for (const [t, shown] of seen) {
+      expect(shown, `t=${t}`).toBe(t < CROSS ? "Damaged section · repairing 40%" : null);
+    }
+    // The black cover goes with the text: the next scrim is the plain one.
+    expect(overlay.classes.has(DAMAGED)).toBe(false);
+  });
+
+  it("is only the corner label over the recovered copy", () => {
+    const { sched, overlay } = rig({ until: UNTIL, phase: "recovered", ratio: null });
+    sched.activate(5, false);
+    expect(overlay.shown()).toBe("Damaged section");
+    expect(overlay.classes.has(LABEL)).toBe(true);
+    expect(overlay.classes.has(DAMAGED)).toBe(false);
+    sched.activate(9, false);
+    expect(overlay.shown()).toBeNull();
+    expect(overlay.classes.has(LABEL)).toBe(false);
+  });
+
+  it("covers an instant copy whose repair failed, saying so", () => {
+    const { sched, overlay } = rig({ until: UNTIL, phase: "unrecovered", ratio: null });
+    sched.activate(5, false);
+    expect(overlay.shown()).toBe("Damaged section · couldn't be recovered");
+    expect(overlay.classes.has(DAMAGED)).toBe(true);
+  });
+
+  it("follows the record while paused: a record that appears, then its progress", async () => {
+    const { sched, media, dm, overlay } = rig(null);
+    sched.activate(6, false);
+    expect(overlay.shown()).toBeNull();
+    media.damage.set({ [dm.id]: { until: UNTIL, phase: "repairing", ratio: null } });
+    await Promise.resolve();
+    expect(overlay.shown()).toBe("Damaged section · repairing");
+    const toggles = overlay.toggles;
+    media.damage.set({ [dm.id]: { until: UNTIL, phase: "repairing", ratio: 0.55 } });
+    await Promise.resolve();
+    expect(overlay.shown()).toBe("Damaged section · repairing 55%");
+    // A new number under the same black cover: the text moves and the cover's
+    // classes are left alone — the one toggle is setOverlay's own "active".
+    expect(overlay.toggles).toBe(toggles + 1);
+  });
+
+  it("leaves a media that isn't ready to the Preparing card", () => {
+    const { sched, overlay } = rig({ until: UNTIL, phase: "repairing", ratio: 0.4 }, () => ({
+      state: "preparing",
+      ratio: 0.4,
+      jobId: 412,
+    }));
+    sched.activate(5, false);
+    expect(overlay.shown()).toBe("Preparing preview");
+    expect(overlay.classes.has(DAMAGED)).toBe(false);
+  });
+
+  it("says nothing for a range it doesn't know", () => {
+    const { sched, overlay } = rig({ until: null, phase: "repairing", ratio: 0.4 });
+    sched.activate(5, false);
+    expect(overlay.shown()).toBeNull();
+  });
+
+  it("says nothing for a damaged clip under an occupied top layer", () => {
+    const top = videoMedia("healthy", 40);
+    const dm = videoMedia("genshin", 170);
+    const project = projectOf([top, dm], [[clipOf(top, 0, 3, 33, 1)], [clipOf(dm, 4, 52, 100, 2)]]);
+    const stage = fakeStage();
+    const sched = new Scheduler(
+      stage,
+      () => project,
+      fakeMedia(ready(top, dm), { [dm.id]: { until: UNTIL, phase: "repairing", ratio: 0.4 } }),
+    );
+    sched.activate(5, false);
+    expect(stage.fakeOverlay.shown()).toBeNull();
+  });
+
+  it("costs a playing tick nothing when nothing damaged is on stage", () => {
+    // A healthy clip under the playhead; the damaged media is in the project
+    // (its record is not empty) but further along the timeline.
+    const healthy = videoMedia("healthy", 40);
+    const dm = videoMedia("genshin", 170);
+    const project = projectOf([healthy, dm], [[clipOf(healthy, 0, 3, 33, 1), clipOf(dm, 40, 52, 100, 2)]]);
+    const stage = fakeStage();
+    const media = fakeMedia(ready(healthy, dm), { [dm.id]: { until: UNTIL, phase: "repairing", ratio: 0.4 } });
+    const sched = new Scheduler(stage, () => project, media);
+    sched.activate(1, true);
+    const reads = media.damageReads();
+    const overlayReads = stage.fakeOverlay.textReads;
+    const writes = stage.fakeOverlay.textWrites;
+    const toggles = stage.fakeOverlay.toggles;
+    for (let t = 1; t < 3; t += FRAME) sched.animate(t);
+    expect(media.damageReads()).toBe(reads);
+    expect(stage.fakeOverlay.textReads).toBe(overlayReads);
+    expect(stage.fakeOverlay.textWrites).toBe(writes);
+    expect(stage.fakeOverlay.toggles).toBe(toggles);
+  });
+
+  it("touches the overlay only when the playhead crosses the range, not every tick", () => {
+    const { sched, overlay } = rig({ until: UNTIL, phase: "repairing", ratio: 0.4 });
+    sched.activate(5, true);
+    const reads = overlay.textReads;
+    const writes = overlay.textWrites;
+    const toggles = overlay.toggles;
+    for (let t = 5; t < 8; t += FRAME) sched.animate(t);
+    expect(overlay.textReads).toBe(reads);
+    expect(overlay.textWrites).toBe(writes);
+    expect(overlay.toggles).toBe(toggles);
+    for (let t = 8; t < 9; t += FRAME) sched.animate(t);
+    expect(overlay.textWrites).toBe(writes + 1);
+    // once on the way out: the cover's two classes, and setOverlay's "active"
+    expect(overlay.toggles).toBe(toggles + 3);
+  });
+
+  it("stops following the record on dispose", async () => {
+    const { sched, media, dm, overlay } = rig(null);
+    sched.activate(6, false);
+    sched.dispose();
+    media.damage.set({ [dm.id]: { until: UNTIL, phase: "repairing", ratio: null } });
+    await Promise.resolve();
+    expect(overlay.shown()).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* The full repair swapped in under the playhead                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The swap is a ready → ready status change with a NEW url: the editor's
+ * status subscription calls `engine.refresh()` for it (statusChange says
+ * "structural"), and nothing else. Driven here through the real engine, with
+ * every element modelling the LOAD algorithm (`resetOnLoad`): a src write
+ * sends it back to 0, paused, at rate 1, with no data — so an element found
+ * at the playhead, playing, at the clip's rate afterwards was PUT there, not
+ * left there. The clip reads source [70, 130] from t = 2 at speed 1.5, so
+ * source and timeline time never coincide.
+ */
+describe("the full repair swapped in under the playhead", () => {
+  let frames: ReturnType<typeof manualFrames> | null = null;
+  afterEach(() => {
+    frames?.restore();
+    frames = null;
+  });
+
+  const QUICK = "url:C:\\cache\\remux\\a17f.quick.mp4";
+  const FULL = "url:C:\\cache\\proxy\\a17f.repairh.mp4";
+
+  function rig() {
+    frames = manualFrames();
+    const dm = videoMedia("genshin", 170);
+    const clip = clipOf(dm, 2, 70, 130, 1.5);
+    const project = projectOf([dm], [[clip]]);
+    const stage = fakeStage();
+    const media = fakeMedia({ [dm.id]: { state: "ready", url: QUICK, sourcePath: QUICK } });
+    const sched = new Scheduler(stage, () => project, media);
+    const set = stage.sets[0]!;
+    set.a.resetOnLoad = true;
+    set.b.resetOnLoad = true;
+    const engine = new PlaybackEngine(() => project, sched);
+    const run = (seconds: number): void => {
+      for (let i = 0; i < Math.round(seconds / FRAME); i++) {
+        frames!.frame(FRAME, (dt) => {
+          set.a.advance(dt);
+          set.b.advance(dt);
+        });
+      }
+    };
+    const swap = (): void => {
+      media.statuses[dm.id] = { state: "ready", url: FULL, sourcePath: FULL };
+      engine.refresh();
+    };
+    return { engine, set, clip, run, swap };
+  }
+
+  it("reloads the element at the playhead and keeps playing", () => {
+    const { engine, set, clip, run, swap } = rig();
+    engine.seek(3);
+    engine.play();
+    run(1);
+    expect(shownVideo(set)!.src).toBe(QUICK);
+    const loads = shownVideo(set)!.srcWrites;
+
+    swap();
+    const at = engine.time;
+    const el = shownVideo(set)!;
+    expect(el.src).toBe(FULL);
+    expect(el.srcWrites).toBe(loads + 1);
+    expect(el.currentTime).toBeCloseTo(sourceTime(clip, at - clip.timelineStart), 9);
+    expect(el.playbackRate).toBe(1.5);
+    expect(el.paused).toBe(false);
+    expect(engine.playing).toBe(true);
+
+    // It loads, then plays on from there; nothing loads it again.
+    run(0.5);
+    expect(el.currentTime).toBeGreaterThan(sourceTime(clip, at - clip.timelineStart) + 0.5);
+    expect(engine.time).toBeGreaterThan(at + 0.3);
+    expect(el.srcWrites).toBe(loads + 1);
+  });
+
+  it("a paused swap shows the same frame, still paused", () => {
+    const { engine, set, clip, swap } = rig();
+    engine.seek(3.7);
+    swap();
+    const el = shownVideo(set)!;
+    expect(el.src).toBe(FULL);
+    expect(el.currentTime).toBeCloseTo(sourceTime(clip, 3.7 - clip.timelineStart), 9);
+    expect(el.paused).toBe(true);
+    expect(engine.time).toBe(3.7);
   });
 });

@@ -27,7 +27,7 @@ import { icon } from "../ui/icons";
 import { closeMenu, showMenu } from "../ui/menu";
 import { toast } from "../ui/toast";
 import { DIRECT_TIMEOUT_MS, createSourceLoader } from "./loader";
-import type { LoadState } from "./loader";
+import type { Damage, LoadState } from "./loader";
 import {
   DWELL_MS,
   WINDOW_RADIUS,
@@ -91,18 +91,65 @@ function withChord(label: string, action: ActionId): string {
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(Math.max(v, lo), hi);
 
+/** " 40%", or "" while the ratio is unknown. */
+function percentText(r: number | null): string {
+  return r === null || !Number.isFinite(r) ? "" : ` ${Math.round(clamp(r, 0, 1) * 100)}%`;
+}
+
+// The damage wording below says what the editor says for the same file and
+// state (src/editor/media/damage.ts: phaseText, damageRange,
+// damageStageText), so the two screens never disagree. Repeated, not
+// imported: an import from src/editor would drag the editor chunk into this
+// one.
+
+/** Where the repair stands, lower-case, for the middle of a sentence. */
+function phaseText(d: Damage): string {
+  switch (d.phase) {
+    case "repairing":
+      return `repairing${percentText(d.ratio)}`;
+    case "recovered":
+      return "recovered";
+    case "unrecovered":
+      return "couldn't be recovered";
+  }
+}
+
+/** The top-bar pill: the user is told the file is damaged in every phase. */
+function pillText(d: Damage): string {
+  return `Damaged video · ${phaseText(d)}`;
+}
+
+/** The pill's tooltip: the range the file could not be read for. The end is
+ *  FLOORED to the whole second, as the player's clock shows it: 60.6 s of
+ *  damage reads "1:00" (the clock still says 1:00 there), where rounding
+ *  would claim "1:01", a second that plays. */
+function pillTip(d: Damage): string {
+  return d.until === null
+    ? "Part of this video couldn't be read"
+    : `${formatDuration(0)}-${formatDuration(Math.floor(d.until))} couldn't be read`;
+}
+
+/** The label on the cover over the instant copy's unreadable part (shown only
+ *  while that copy plays: repairing, or unrecovered when its full repair
+ *  failed). */
+function coverText(d: Damage): string {
+  return d.phase === "recovered" ? "Damaged section" : `Damaged section · ${phaseText(d)}`;
+}
+
 // Static markup only: every file name reaches the DOM through textContent /
 // properties, never through this string. No style attributes (packaged CSP).
 const TEMPLATE = `
   <div class="viewer__stage" id="vw-stage">
     <img class="viewer__img" id="vw-img" decoding="async" draggable="false" alt="" hidden />
     <video class="viewer__video" id="vw-video" playsinline preload="auto" hidden></video>
+    <div class="viewer__cover" id="vw-cover" hidden></div>
     <div class="viewer__audio-card" id="vw-audio" hidden>${icon("music", 48)}<div class="viewer__audio-name"></div></div>
     <div class="viewer__status" id="vw-status" role="status" hidden><div class="viewer__status-text"></div></div>
   </div>
   <div class="viewer__top" id="vw-top">
     <button class="btn btn--ghost btn--icon viewer__chrome-btn" id="vw-back" aria-label="Back">${icon("chevronLeft")}</button>
     <div class="viewer__name" id="vw-name"></div>
+    <span class="badge viewer__damage" id="vw-damage" hidden></span>
     <div class="viewer__count" id="vw-count"></div>
     <button class="btn btn--ghost btn--icon viewer__chrome-btn" id="vw-fullscreen" aria-label="Fullscreen">${icon("fullscreen")}</button>
     <button class="btn btn--ghost btn--icon viewer__chrome-btn" id="vw-more" aria-label="More" title="More" aria-haspopup="menu">${icon("more")}</button>
@@ -113,6 +160,7 @@ const TEMPLATE = `
     <button class="btn btn--ghost btn--icon theater-bar__btn viewer__chrome-btn" id="vw-play" aria-label="Play">${icon("play")}</button>
     <div class="theater-bar__time mono" id="vw-time"></div>
     <div class="theater-bar__seek" id="vw-seek" role="slider" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="-1">
+      <div class="viewer__seek-damage" id="vw-seek-damage" hidden></div>
       <div class="theater-bar__seek-fill"></div>
       <div class="theater-bar__seek-knob"></div>
     </div>
@@ -135,12 +183,14 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   const stage = $("#vw-stage");
   const img = $<HTMLImageElement>("#vw-img");
   const video = $<HTMLVideoElement>("#vw-video");
+  const coverEl = $("#vw-cover");
   const audioCard = $("#vw-audio");
   const audioName = $(".viewer__audio-name");
   const statusEl = $("#vw-status");
   const statusText = $(".viewer__status-text");
   const backBtn = $<HTMLButtonElement>("#vw-back");
   const nameEl = $("#vw-name");
+  const damageEl = $("#vw-damage");
   const countEl = $("#vw-count");
   const fsBtn = $<HTMLButtonElement>("#vw-fullscreen");
   const moreBtn = $<HTMLButtonElement>("#vw-more");
@@ -152,6 +202,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   const seekEl = $("#vw-seek");
   const fillEl = $(".theater-bar__seek-fill");
   const knobEl = $(".theater-bar__seek-knob");
+  const shadeEl = $("#vw-seek-damage");
   const muteBtn = $<HTMLButtonElement>("#vw-mute");
   const volSlider = $<HTMLInputElement>("#vw-volume");
   const liveEl = $("#vw-live");
@@ -207,8 +258,20 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
    *  metadata within DIRECT_TIMEOUT_MS hands it to the loader for a remux. */
   let tryingDirect = false;
   let directTimer: number | undefined;
+  /** What the loader says about the video on screen when it is a damaged
+   *  file's repair; null for a healthy file, and whenever no video is out. */
+  let damage: Damage | null = null;
+  /** The full repair was just swapped in under the instant copy and does not
+   *  know its metadata yet: where playback was and how long the file is, so
+   *  the readout, the bar and the cover hold still instead of reading 0. */
+  let swapHold: { t: number; d: number } | null = null;
 
   const hasMedia = (): boolean => videoUrl !== null;
+  /** The position the user is at — the held one while a swap loads. */
+  const playhead = (): number => (swapHold !== null ? swapHold.t : video.currentTime || 0);
+  /** The file's length, or the held one while a swap loads (0: unknown). */
+  const lengthOf = (): number =>
+    Number.isFinite(video.duration) && video.duration > 0 ? video.duration : (swapHold?.d ?? 0);
 
   /* ---------------- the loader ---------------- */
 
@@ -286,6 +349,63 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     }
   }
 
+  /* ---------------- a damaged file ---------------- */
+
+  // Last written values: a progress stream at one percentage, and the ~4 Hz
+  // timeupdate that drives the cover, write nothing.
+  let damageText = "";
+  let damageTipText = "";
+  let shadePct = -1;
+  let coverShows = false;
+
+  /** The pill, its tooltip, the seek shade and the cover, from `damage`. */
+  function paintDamage(): void {
+    const d = hasMedia() ? damage : null;
+    const text = d === null ? "" : pillText(d);
+    if (text !== damageText) {
+      damageText = text;
+      damageEl.textContent = text;
+      damageEl.hidden = text === "";
+    }
+    const tip = d === null ? "" : pillTip(d);
+    if (tip !== damageTipText) {
+      damageTipText = tip;
+      damageEl.title = tip;
+    }
+    paintShade();
+    paintCover();
+  }
+
+  /** The damaged range [0, until] shaded on the seek track. */
+  function paintShade(): void {
+    const until = hasMedia() && damage !== null ? damage.until : null;
+    const len = lengthOf();
+    // A length not known yet (before the metadata): keep what is painted.
+    if (until !== null && len <= 0) return;
+    const pct = until === null ? 0 : Math.round(clamp(until / len, 0, 1) * 1000) / 10;
+    if (pct === shadePct) return;
+    shadePct = pct;
+    shadeEl.style.setProperty("width", `${pct}%`);
+    shadeEl.hidden = pct <= 0;
+  }
+
+  /** Black over the instant copy while the playhead is in the part it has no
+   *  picture for (the element would hold its first sound frame there, which
+   *  reads as a frozen video), labelled on the status card. Never over the
+   *  full repair: that part is ffmpeg's recovered picture, shown as it is. */
+  function paintCover(): void {
+    const d = hasMedia() ? damage : null;
+    const on = d !== null && d.phase !== "recovered" && d.until !== null && playhead() < d.until;
+    if (on !== coverShows) {
+      coverShows = on;
+      coverEl.hidden = !on;
+      // The card is the cover's label now: clicks go through to the video.
+      statusEl.classList.toggle("viewer__status--passive", on);
+      if (!on) setStatus(null);
+    }
+    if (on && d !== null) setStatus(coverText(d));
+  }
+
   /* ---------------- media elements ---------------- */
 
   /** Empty the <video>: pause, drop the src, load() — the documented way to
@@ -301,10 +421,13 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
       video.load();
     }
     videoUrl = null;
+    swapHold = null;
+    damage = null;
     video.hidden = true;
     audioCard.hidden = true;
     bar.hidden = true;
     scrubbing = false;
+    paintDamage();
     paintPlay();
     syncAutoHide();
   }
@@ -339,6 +462,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     lastPct = -1;
     videoUrl = s.url;
     videoGen = gen;
+    swapHold = null;
+    damage = s.damage ?? null;
     tryingDirect = s.tryingDirect;
     window.clearTimeout(directTimer);
     directTimer = undefined;
@@ -351,12 +476,36 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
         if (disposed || myGen !== gen || videoUrl !== myUrl || !tryingDirect) return;
         if (video.readyState >= HTMLMediaElement.HAVE_METADATA) return;
         tryingDirect = false;
-        loader.directFailed();
+        loader.playbackFailed(null);
       }, DIRECT_TIMEOUT_MS);
     }
     paintReadout();
+    paintDamage();
     // Autoplay; a refusal just leaves the paused glyph showing.
     void video.play().catch(() => {});
+  }
+
+  /** The full repair replaces the instant copy on screen: the same element
+   *  takes the new src and carries playback over — never a release, so no
+   *  status card ("Preparing", "Can't show this file") and no hidden bar in
+   *  between. */
+  function swapVideo(url: string): void {
+    const t = playhead();
+    const len = lengthOf();
+    const resume = !video.paused;
+    swapHold = { t, d: len };
+    // Before the src: the error guard compares the two.
+    videoUrl = url;
+    video.src = url;
+    // Assigned before the metadata, the position becomes the new copy's
+    // default playback start position (HTML), so it starts where the old one
+    // was; loadedmetadata makes sure of it.
+    try {
+      video.currentTime = t;
+    } catch {
+      /* loadedmetadata seeks instead */
+    }
+    if (resume) void video.play().catch(() => {});
   }
 
   /** The last state painted for the file on screen (read by openAsProject's
@@ -373,12 +522,32 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
         setStatus(null);
         return;
       case "ready":
+        if (s.element === "video" && s.damage !== undefined && videoUrl !== null && videoGen === gen) {
+          // This load's damaged video is already out: only what the user is
+          // told changed (the same url — the element is left alone), or the
+          // full repair replaced the instant copy (swapped in where it was).
+          if (s.url !== videoUrl) swapVideo(s.url);
+          damage = s.damage;
+          paintDamage();
+          return;
+        }
         showReady(s);
         return;
       case "preparing":
         releaseVideo();
         releaseImg();
-        setStatus(s.ratio === null ? "Preparing preview" : `Preparing preview ${Math.round(clamp(s.ratio, 0, 1) * 100)}%`);
+        // A repair of a file the WebView refused says so while it runs: the
+        // user is told the file is damaged before anything plays. Until a
+        // repair reports a percent - the plan still being asked, or the
+        // instant copy being made - it reads "preparing", with no number: the
+        // instant copy's own progress is not the repair's, and showing it
+        // would make the percent go backwards once the copy plays. Every
+        // damaged wait therefore reads preparing, then repairing N%.
+        setStatus(
+          s.damaged && (s.quick || s.ratio === null)
+            ? "Damaged video · preparing"
+            : `${s.damaged ? "Damaged video · repairing" : "Preparing preview"}${percentText(s.ratio)}`,
+        );
         return;
       case "needsPrepare":
         releaseVideo();
@@ -402,29 +571,41 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   });
   video.addEventListener("error", () => {
     if (disposed || videoUrl === null || videoGen !== gen || video.getAttribute("src") !== videoUrl) return;
-    if (tryingDirect) {
-      tryingDirect = false;
-      window.clearTimeout(directTimer);
-      directTimer = undefined;
-      loader.directFailed();
-      return;
-    }
-    releaseVideo();
-    setStatus("Can't show this file");
+    tryingDirect = false;
+    window.clearTimeout(directTimer);
+    directTimer = undefined;
+    // The loader decides what the refusal earns — a remux for a container-only
+    // attempt, a repair for a video the WebView could not decode, or "Can't
+    // show this file" — and paints it through onState like any state.
+    loader.playbackFailed(video.error?.code ?? null);
   });
   video.addEventListener("loadedmetadata", () => {
     if (videoGen !== gen) return;
     window.clearTimeout(directTimer);
     directTimer = undefined;
+    const hold = swapHold;
+    if (hold !== null) {
+      swapHold = null;
+      // In case the engine dropped the early assignment: a swap must never
+      // restart the file from 0.
+      if (Math.abs((video.currentTime || 0) - hold.t) > 0.5) {
+        video.currentTime = Math.min(hold.t, lengthOf() || hold.t);
+      }
+    }
     paintReadout();
+    paintDamage();
   });
   video.addEventListener("durationchange", () => {
+    if (damage !== null) paintShade();
     if (!hidden) paintReadout();
   });
   video.addEventListener("seeked", () => {
+    if (damage !== null) paintCover();
     if (!hidden) paintReadout();
   });
   video.addEventListener("timeupdate", () => {
+    // Not chrome: the cover follows the playhead while the bar is hidden too.
+    if (damage !== null) paintCover();
     // Hidden chrome: remember, repaint once on reveal.
     if (hidden) readoutDirty = true;
     else paintReadout();
@@ -695,8 +876,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   let readoutDirty = false;
   function paintReadout(): void {
     readoutDirty = false;
-    const d = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
-    const t = hasMedia() ? video.currentTime || 0 : 0;
+    const d = lengthOf();
+    const t = hasMedia() ? playhead() : 0;
     // m:ss, not a frame timecode: the viewer never learns a frame rate, and a
     // player readout does not want one.
     const text = hasMedia() ? `${formatDuration(Math.floor(t))} / ${formatDuration(Math.floor(d))}` : "";
@@ -899,14 +1080,19 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
         // attempt afterwards would start a job the loader believes the editor
         // owns, and dispose() would leave it running for nobody. Only a
         // settled picture or video (not a direct attempt) is left alone
-        // rather than restarted from 0; a failure card has nothing to lose.
+        // rather than restarted from 0: the one job a settled video can still
+        // start is a repair, and the loader withdraws the claim when a refusal
+        // starts one. Not the instant copy of a damaged file while its full
+        // repair runs: that job is under the claim (or the hand-off canceled
+        // it), and only a fresh load re-plans it as the viewer's own. A
+        // failure card has nothing to lose.
         if (
           handedOff &&
           !disposed &&
           myGen === gen &&
           loadingPath === target &&
           shownState !== "failed" &&
-          !(shownState === "ready" && !tryingDirect)
+          !(shownState === "ready" && !tryingDirect && damage?.phase !== "repairing")
         ) {
           startLoad(target);
         }

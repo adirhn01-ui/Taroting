@@ -6,13 +6,15 @@
 //   node scripts/make-fixtures.mjs --soak   # + 30-min A/V sync soak file
 //   node scripts/make-fixtures.mjs --big    # + ~4GB Range-seek stress file
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const ffmpeg = path.join(root, "src-tauri", "binaries", "ffmpeg-x86_64-pc-windows-msvc.exe");
+const ffprobe = path.join(root, "src-tauri", "binaries", "ffprobe-x86_64-pc-windows-msvc.exe");
 const outDir = path.join(root, "tests", "fixtures");
 fs.mkdirSync(outDir, { recursive: true });
 
@@ -101,6 +103,310 @@ run("web_vp9.webm", [
 run("anim.gif", [
   "-f", "lavfi", "-i", "testsrc2=size=480x270:rate=12:duration=5",
 ]);
+
+/* --- a damaged recording in miniature: the shape of a real NVIDIA Instant
+   Replay file whose first minute is scrambled. H.264 'avc1' in MP4 with its
+   parameter sets ONLY in the avcC header, AAC audio intact; the first 60
+   samples keep their 4-byte length prefixes but carry garbage (forced
+   nal_unit_type 1, xorshift payload) and stay flagged sync; from sample 60
+   (2.0 s) the stream is clean, an IDR every 30 frames, no in-band SPS/PPS.
+   One garbage sample (10) instead holds a VALID SPS and PPS taken from a
+   16x32 encode's avcC, padded out with a filler NAL: the parameter-set trap.
+   ffmpeg believes them, so every clean slice after them (they all name PPS 0)
+   decodes as 16x32. Both are needed: ffmpeg 8 binds a PPS to the SPS it was
+   parsed against, so an SPS alone re-sizes nothing (measured: no trap).
+   512x384, not smaller: Chromium picks its first H.264 decoder by height.
+   Under 360 lines it tries FFmpegVideoDecoder first and falls back to D3D11,
+   which swallowed the garbage silently (0 frames, NO error: a preview that
+   never learns the file is broken, so nothing to repair); from 360 up it tries
+   D3D11 first, which fails reconfiguring for the 16x32 SPS, falls back to
+   FFmpegVideoDecoder, and that rejects packet #2 — PIPELINE_ERROR_DECODE,
+   MediaError 3, the real file's exact sequence (Chrome 154, measured).
+   Rewritten IN PLACE (no sample changes size, so stsz/stco stay true) from
+   one fixed seed. Both x264 encodes run with ONE thread: x264's output follows
+   its thread count, and the default follows the core count (measured: 8 and
+   2 cores gave different bytes and a different trap tally), so another
+   machine would get video Chromium was never measured on. Single-threaded,
+   with the ffmpeg build fetch-ffmpeg pins, the video samples came out the
+   same at x264's SSE4.2, AVX2 and AVX-512 levels (measured on one AMD CPU).
+   The AAC packets do not: they differ on a CPU without AVX2/FMA3 (measured
+   by masking them off), so there the file differs while its video does not.
+   So the E2E's refusal guard, not the sha256 this prints, is what proves a
+   regenerated fixture still reproduces.
+   One more garbage sample (43) opens with a well-formed SEI carrying a
+   display-orientation message (payload 47: 90 degrees anticlockwise,
+   repeating), the real file's second trap: ffmpeg attaches the display matrix
+   to the frame that slice conceals and to EVERY frame after it, and its
+   autorotate turns them all, so a repair that keeps in-band SEI comes out
+   sideways (the owner's copy came out turned and sheared; from this fixture
+   ffmpeg scales the turned frames back into 512x384, so the size of the
+   repair alone never shows it — measured).
+   The SEI must sit in front of a slice in the same sample: alone in a sample,
+   or beside the donor's SPS/PPS, it turned nothing (measured, ffmpeg 8.1).
+   The slice keeps the random bytes the sample had, and the generator draws
+   exactly as many as before, so every other sample is byte-for-byte the
+   previous fixture's — the first 43, which Chromium refuses, included.
+   Checked on creation and refused unless (a) x264's own options SEI says
+   both encodes ran single-threaded, (b) a plain decode falls into the
+   parameter-set trap, (c) a decode through filter_units=remove_types=7|8
+   (SPS/PPS gone, the SEI kept) gives every one of the 60 clean-tail frames
+   turned, 384x512, and (d) the repair decode — remove_types=6|7|8 — gives
+   every frame at 512x384 and all 60 frames of the clean tail. */
+const DAMAGED_W = 512;
+const DAMAGED_H = 384;
+const DAMAGED_SAMPLES = 60;
+const DAMAGED_DONOR_AT = 10;
+const DAMAGED_SEI_AT = 43;
+/** An H.264 SEI NAL (type 6, nal_ref_idc 0) holding one display_orientation
+ *  message (payloadType 47, payloadSize 3): cancel 0, hor_flip 0, ver_flip 0,
+ *  anticlockwise_rotation 0x4000 (90 degrees), repetition_period ue(1) = 010,
+ *  extension 0, then the payload's alignment 1-bit — 0x08 0x00 0x09 — and the
+ *  rbsp stop bit. No emulation-prevention byte is needed (no 00 00 0x run). */
+const ORIENTATION_SEI = Buffer.from([0x06, 0x2f, 0x03, 0x08, 0x00, 0x09, 0x80]);
+
+/** The ISO-BMFF boxes directly inside [start, end) of `buf`. */
+function mp4Boxes(buf, start, end) {
+  const out = [];
+  for (let i = start; i + 8 <= end; ) {
+    let size = buf.readUInt32BE(i);
+    const type = buf.toString("latin1", i + 4, i + 8);
+    let head = 8;
+    if (size === 1) {
+      size = Number(buf.readBigUInt64BE(i + 8));
+      head = 16;
+    } else if (size === 0) size = end - i;
+    if (size < head || i + size > end) throw new Error(`bad ${type} box at ${i}`);
+    out.push({ type, body: i + head, end: i + size });
+    i += size;
+  }
+  return out;
+}
+function mp4Child(buf, box, type) {
+  const b = mp4Boxes(buf, box.body, box.end).find((c) => c.type === type);
+  if (!b) throw new Error(`no ${type} box inside ${box.type}`);
+  return b;
+}
+/** The video track of an MP4 in `buf`: its avcC parameter sets and NAL length
+ *  size, and every sample's file offset and size (stsz + stco/co64 + stsc). */
+function mp4VideoSamples(buf) {
+  const moov = mp4Boxes(buf, 0, buf.length).find((b) => b.type === "moov");
+  if (!moov) throw new Error("no moov box");
+  for (const trak of mp4Boxes(buf, moov.body, moov.end).filter((b) => b.type === "trak")) {
+    const mdia = mp4Child(buf, trak, "mdia");
+    const hdlr = mp4Child(buf, mdia, "hdlr");
+    if (buf.toString("latin1", hdlr.body + 8, hdlr.body + 12) !== "vide") continue;
+    const stbl = mp4Child(buf, mp4Child(buf, mdia, "minf"), "stbl");
+    const stsd = mp4Child(buf, stbl, "stsd");
+    // The repair is spec-safe only for avc1 (parameter sets in avcC); an avc3
+    // stream carries them in-band only, so this fixture must be avc1.
+    const entry = mp4Boxes(buf, stsd.body + 8, stsd.end)[0];
+    if (entry?.type !== "avc1") throw new Error(`sample entry ${entry?.type}, not avc1`);
+    // A VisualSampleEntry's fixed fields take 78 bytes before its child boxes.
+    const avcC = mp4Boxes(buf, entry.body + 78, entry.end).find((b) => b.type === "avcC");
+    if (!avcC) throw new Error("no avcC box");
+    const c = buf.subarray(avcC.body, avcC.end);
+    let p = 6;
+    const sets = (n) =>
+      Array.from({ length: n }, () => {
+        const len = c.readUInt16BE(p);
+        const unit = Buffer.from(c.subarray(p + 2, p + 2 + len));
+        p += 2 + len;
+        return unit;
+      });
+    const sps = sets(c[5] & 0x1f);
+    const pps = sets(c[p++]);
+    const stsz = mp4Child(buf, stbl, "stsz");
+    const fixed = buf.readUInt32BE(stsz.body + 4);
+    const count = buf.readUInt32BE(stsz.body + 8);
+    const sizes = Array.from({ length: count }, (_, i) => fixed || buf.readUInt32BE(stsz.body + 12 + 4 * i));
+    const stco = mp4Boxes(buf, stbl.body, stbl.end).find((b) => b.type === "stco" || b.type === "co64");
+    if (!stco) throw new Error("no stco/co64 box");
+    const chunkAt = (i) =>
+      stco.type === "stco" ? buf.readUInt32BE(stco.body + 8 + 4 * i) : Number(buf.readBigUInt64BE(stco.body + 8 + 8 * i));
+    const stsc = mp4Child(buf, stbl, "stsc");
+    const runs = Array.from({ length: buf.readUInt32BE(stsc.body + 4) }, (_, i) => ({
+      first: buf.readUInt32BE(stsc.body + 8 + 12 * i),
+      per: buf.readUInt32BE(stsc.body + 12 + 12 * i),
+    }));
+    const offsets = [];
+    const chunks = buf.readUInt32BE(stco.body + 4);
+    for (let chunk = 1, r = 0; chunk <= chunks; chunk++) {
+      while (r + 1 < runs.length && runs[r + 1].first <= chunk) r++;
+      let at = chunkAt(chunk - 1);
+      for (let k = 0; k < runs[r].per && offsets.length < count; k++) {
+        offsets.push(at);
+        at += sizes[offsets.length - 1];
+      }
+    }
+    if (offsets.length !== count) throw new Error(`${offsets.length} sample offsets for ${count} samples`);
+    return { lengthSize: (c[4] & 3) + 1, sps, pps, sizes, offsets };
+  }
+  throw new Error("no video track");
+}
+/** Every decoded video frame of `file` (showinfo), optionally through input
+ *  bitstream filters given BEFORE -i, the way the repair decode applies them. */
+function decodedFrames(file, inputBsf) {
+  const r = spawnSync(
+    ffmpeg,
+    [
+      "-hide_banner", "-nostats",
+      ...(inputBsf ? ["-bsf:v", inputBsf] : []),
+      "-i", file, "-map", "0:v", "-vf", "showinfo", "-f", "null", "-",
+    ],
+    { encoding: "utf8", maxBuffer: 64 << 20 },
+  );
+  if (r.status !== 0) throw new Error(`ffmpeg could not decode ${file}: ${r.stderr.slice(-400)}`);
+  return Array.from(r.stderr.matchAll(/pts_time:\s*([\d.]+).*? s:(\d+)x(\d+)/g), (m) => ({
+    t: Number(m[1]),
+    size: `${m[2]}x${m[3]}`,
+  }));
+}
+/** The thread count a libx264 encode in `buf` actually ran with, read from the
+ *  options string x264 writes into its first access unit; null without one. */
+function x264Threads(buf) {
+  const m = buf.toString("latin1").match(/ threads=(\d+) lookahead_threads=\d+ /);
+  return m ? Number(m[1]) : null;
+}
+const damaged = path.join(outDir, "damaged_h264.mp4");
+if (fs.existsSync(damaged)) {
+  console.log("skip   damaged_h264.mp4");
+} else {
+  console.log("create damaged_h264.mp4");
+  const clean = path.join(outDir, "damaged_h264.clean.mp4");
+  const donorFile = path.join(outDir, "damaged_h264.donor.mp4");
+  try {
+    // -g/-keyint_min/-sc_threshold pin an IDR at every 30th sample, so 60 is
+    // one; -bf 0 keeps decode order == display order, so "the tail from
+    // 2.0 s" is exactly samples 60-119.
+    execFileSync(ffmpeg, [
+      "-y", "-hide_banner", "-loglevel", "error",
+      "-f", "lavfi", "-i", `testsrc2=size=${DAMAGED_W}x${DAMAGED_H}:rate=30:duration=4`,
+      "-f", "lavfi", "-i", "sine=frequency=587:duration=4",
+      "-c:v", "libx264", "-threads", "1", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+      "-g", "30", "-keyint_min", "30", "-sc_threshold", "0", "-bf", "0",
+      "-c:a", "aac", "-shortest", clean,
+    ]);
+    // x264's default already runs a frame only 32 lines tall on one thread
+    // (measured); the flag keeps that true if the donor ever grows.
+    execFileSync(ffmpeg, [
+      "-y", "-hide_banner", "-loglevel", "error",
+      "-f", "lavfi", "-i", "testsrc2=size=16x32:rate=30:duration=0.2",
+      "-c:v", "libx264", "-threads", "1", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-g", "30", "-bf", "0",
+      donorFile,
+    ]);
+    const donorBuf = fs.readFileSync(donorFile);
+    const donor = mp4VideoSamples(donorBuf);
+    const buf = fs.readFileSync(clean);
+    // Read before the rewrite below: sample 0, which carries x264's options
+    // string, is one of the samples it overwrites.
+    for (const [which, b] of [["clean", buf], ["donor", donorBuf]]) {
+      const threads = x264Threads(b);
+      if (threads !== 1) {
+        throw new Error(`damaged_h264.mp4: the ${which} encode ran x264 with threads=${threads ?? "?"}, not 1, so its bytes follow this machine's core count`);
+      }
+    }
+    const track = mp4VideoSamples(buf);
+    const L = track.lengthSize;
+    let seed = 0x7a2f;
+    const nextByte = () => {
+      seed ^= seed << 13;
+      seed >>>= 0;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      seed >>>= 0;
+      return seed & 0xff;
+    };
+    for (let i = 0; i < DAMAGED_SAMPLES; i++) {
+      const at = track.offsets[i];
+      const end = at + track.sizes[i];
+      if (i === DAMAGED_DONOR_AT) {
+        let p = at;
+        for (const unit of [donor.sps[0], donor.pps[0]]) {
+          buf.writeUIntBE(unit.length, p, L);
+          unit.copy(buf, p + L);
+          p += L + unit.length;
+        }
+        // Filler data (type 12): 0xff bytes and the rbsp stop bit.
+        const fill = end - p - L;
+        if (fill < 2) throw new Error(`sample ${i} is too small to carry the donor parameter sets`);
+        buf.writeUIntBE(fill, p, L);
+        buf[p + L] = 0x0c;
+        buf.fill(0xff, p + L + 1, end - 1);
+        buf[end - 1] = 0x80;
+        continue;
+      }
+      for (let p = at, first = true; p < end; first = false) {
+        const len = buf.readUIntBE(p, L);
+        if (len < 1 || p + L + len > end) throw new Error(`sample ${i}: NAL length ${len} overruns the sample`);
+        // Drawn whole even where fewer are written, so the generator stays in
+        // step and every later sample keeps the previous fixture's bytes.
+        const noise = Array.from({ length: len - 1 }, nextByte);
+        let slice = p;
+        let sliceLen = len;
+        if (i === DAMAGED_SEI_AT && first) {
+          // The SEI first, then the slice it rides on in the rest of the
+          // NAL's space: the SEI turns frames only when a slice follows it.
+          sliceLen = len - L - ORIENTATION_SEI.length;
+          if (sliceLen < 2) throw new Error(`sample ${i}: its first NAL is too small to carry the orientation SEI`);
+          buf.writeUIntBE(ORIENTATION_SEI.length, p, L);
+          ORIENTATION_SEI.copy(buf, p + L);
+          slice = p + L + ORIENTATION_SEI.length;
+          buf.writeUIntBE(sliceLen, slice, L);
+        }
+        buf[slice + L] = 0x41; // forbidden 0, nal_ref_idc 2, nal_unit_type 1
+        for (let k = 1; k < sliceLen; k++) buf[slice + L + k] = noise[k - 1];
+        p += L + len;
+      }
+    }
+    fs.writeFileSync(damaged, buf);
+    const want = `${DAMAGED_W}x${DAMAGED_H}`;
+    const turned = `${DAMAGED_H}x${DAMAGED_W}`;
+    // The clean tail is samples 60-119: 2.0 s on, one frame each.
+    const tailAt = (frames, size) => frames.filter((f) => f.t >= 2 - 1e-3 && f.size === size).length;
+    const tally = (frames) => {
+      const by = {};
+      for (const f of frames) by[f.size] = (by[f.size] ?? 0) + 1;
+      return Object.entries(by).map(([s, n]) => `${n} at ${s}`).join(", ");
+    };
+    const plain = decodedFrames(damaged, null);
+    const keptSei = decodedFrames(damaged, "filter_units=remove_types=7|8");
+    const repaired = decodedFrames(damaged, "filter_units=remove_types=6|7|8");
+    const problems = [];
+    if (!plain.some((f) => f.size !== want) || tailAt(plain, want) >= 60) {
+      problems.push(`a plain decode does not fall into the parameter-set trap (${tally(plain)}; ${tailAt(plain, want)} tail frames at ${want})`);
+    }
+    if (tailAt(keptSei, turned) !== 60) {
+      problems.push(`a decode that keeps the SEI does not turn the clean tail (${tally(keptSei)}; ${tailAt(keptSei, turned)} of 60 tail frames at ${turned})`);
+    }
+    if (repaired.some((f) => f.size !== want) || tailAt(repaired, want) !== 60) {
+      problems.push(`the repair decode is not whole and upright (${tally(repaired)}; ${tailAt(repaired, want)} of 60 tail frames at ${want})`);
+    }
+    // The first clean IDR, read back from the container: the time the backend's
+    // damage scan must answer and the instant copy's video starts from.
+    const packets = execFileSync(ffprobe, [
+      "-v", "error", "-select_streams", "v:0",
+      "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", damaged,
+      // stderr captured, not inherited: ffprobe's stream probe decodes the
+      // garbage and would print a screen of decoder complaints on every create.
+    ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim().split(/\r?\n/);
+    const [idrPts, idrFlags] = (packets[DAMAGED_SAMPLES] ?? "").split(",");
+    if (!idrFlags?.startsWith("K")) {
+      problems.push(`packet ${DAMAGED_SAMPLES} is "${packets[DAMAGED_SAMPLES] ?? "missing"}", not the keyframe the clean tail starts with`);
+    }
+    if (problems.length) {
+      fs.rmSync(damaged);
+      throw new Error(`damaged_h264.mp4: ${problems.join("; ")}`);
+    }
+    const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
+    console.log(`       plain decode: ${tally(plain)}, ${tailAt(plain, want)}/60 tail frames at ${want}`);
+    console.log(`       SEI kept (7|8): ${tally(keptSei)}, ${tailAt(keptSei, turned)}/60 tail frames turned to ${turned}`);
+    console.log(`       repaired (6|7|8): ${tally(repaired)}, ${tailAt(repaired, want)}/60 tail frames at ${want}`);
+    console.log(`       first clean IDR: packet ${DAMAGED_SAMPLES}, pts ${idrPts} s; sha256 ${sha256}`);
+  } finally {
+    fs.rmSync(clean, { force: true });
+    fs.rmSync(donorFile, { force: true });
+  }
+}
 
 /* --- audio --- */
 run("tone.mp3", ["-f", "lavfi", "-i", "sine=frequency=440:duration=30", "-c:a", "libmp3lame", "-q:a", "4"]);

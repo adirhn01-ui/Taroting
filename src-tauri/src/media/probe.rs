@@ -31,6 +31,11 @@ const FRAME_PROBE_DEADLINE: Duration = Duration::from_secs(15);
 /// so it gets longer; past it the file is refused as having no length.
 const DURATION_SCAN_DEADLINE: Duration = Duration::from_secs(60);
 
+/// The header probe's bound (`h264_param_sets_in_header`). Header fields only,
+/// like the frame probe's one frame; its failure is survivable too (the
+/// repair copy is made without the filter).
+const HEADER_PROBE_DEADLINE: Duration = Duration::from_secs(15);
+
 /// Run a sidecar with `args` under `deadline`. `Ok(None)`: it was still
 /// running at the deadline and has been killed.
 fn run_bounded(name: &str, args: Vec<OsString>, deadline: Duration) -> Result<Option<Output>> {
@@ -85,6 +90,23 @@ fn duration_scan_args(path: &Path) -> Vec<OsString> {
     let mut args = strs(&["-v", "error", "-nostats", "-progress", "pipe:1"]);
     push_input(&mut args, path);
     args.extend(strs(&["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-f", "null", "-"]));
+    args
+}
+
+/// The first video stream's codec, sample-entry tag and header size, as JSON
+/// (`h264_param_sets_in_header`).
+fn header_args(path: &Path) -> Vec<OsString> {
+    let mut args = strs(&[
+        "-v",
+        "quiet",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name,codec_tag_string,extradata_size",
+        "-of",
+        "json",
+    ]);
+    push_input(&mut args, path);
     args
 }
 
@@ -511,6 +533,59 @@ fn still_turn(
     }
 }
 
+#[derive(Deserialize)]
+struct FfHeaderStream {
+    codec_name: Option<String>,
+    codec_tag_string: Option<String>,
+    extradata_size: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct FfHeaderOut {
+    #[serde(default)]
+    streams: Vec<FfHeaderStream>,
+}
+
+/// `h264_param_sets_in_header`'s verdict on the header probe's JSON. Pure, so
+/// every row of the rule is testable without a file that produces it.
+///
+/// All three, or no: H.264, in an `avc1` sample entry (ISO/IEC 14496-15: its
+/// parameter sets live in the `avcC` record — an `avc3` entry, Matroska's
+/// `[0][0][0][0]` and a raw Annex-B stream may carry them in-band only), and a
+/// header record that is actually there. Anything unreadable is "no".
+fn header_carries_param_sets(json: &[u8]) -> bool {
+    let Ok(parsed) = serde_json::from_slice::<FfHeaderOut>(json) else {
+        return false;
+    };
+    parsed.streams.first().is_some_and(|s| {
+        s.codec_name.as_deref() == Some("h264")
+            && s.codec_tag_string.as_deref() == Some("avc1")
+            && s.extradata_size.is_some_and(|n| n > 0)
+    })
+}
+
+/// Whether `path`'s first video stream is H.264 whose parameter sets the
+/// header carries — the one shape where removing the in-band SPS/PPS/SEI
+/// (`prepare::DROP_INBAND_HEADERS`) is safe: the decoder still has the
+/// header's parameter sets. Asked once, when a video the WebView refused is
+/// planned for a repair copy (`playability`); never on the normal playback
+/// path.
+///
+/// One ffprobe of header fields, owned and bounded like every probe here. The
+/// path is checked as every other sink checks it (`media::source`): anything
+/// that is not a file, a failure and a timeout are all "no", which only means
+/// the repair copy keeps its in-band headers — the plain proxy recipe.
+pub fn h264_param_sets_in_header(path: &Path) -> bool {
+    let Some(src) = path.to_str().and_then(|p| source_file(p).ok()) else {
+        return false;
+    };
+    let deadline = deadline_for_path(HEADER_PROBE_DEADLINE, src);
+    let Ok(Some(out)) = run_bounded("ffprobe", header_args(src), deadline) else {
+        return false;
+    };
+    out.status.success() && header_carries_param_sets(&out.stdout)
+}
+
 pub fn probe_sync(path: &str) -> Result<MediaInfo> {
     // Every caller's path is untrusted to some degree (a `.trt`'s, on relink
     // and the load-time repair): refused unless it names a real file, so a URL
@@ -673,7 +748,8 @@ mod tests {
         assert!(code.contains("deadline_for(PROBE_DEADLINE,&meta)"), "the stream probe");
         assert!(code.contains("deadline_for_path(FRAME_PROBE_DEADLINE,src)"), "the frame probe");
         assert!(code.contains("deadline_for_path(DURATION_SCAN_DEADLINE,path)"), "the duration scan");
-        for bare in [",PROBE_DEADLINE)", ",FRAME_PROBE_DEADLINE)", ",DURATION_SCAN_DEADLINE)"] {
+        assert!(code.contains("deadline_for_path(HEADER_PROBE_DEADLINE,src)"), "the header probe");
+        for bare in [",PROBE_DEADLINE)", ",FRAME_PROBE_DEADLINE)", ",DURATION_SCAN_DEADLINE)", ",HEADER_PROBE_DEADLINE)"] {
             assert!(!code.contains(bare), "a sidecar bounded by {bare} alone");
         }
     }
@@ -682,7 +758,7 @@ mod tests {
     #[test]
     fn every_probe_opens_its_input_as_a_file_only() {
         let path = Path::new(r"C:\media\clip one.mkv");
-        for args in [probe_args(path), frame_args(path), duration_scan_args(path)] {
+        for args in [probe_args(path), frame_args(path), duration_scan_args(path), header_args(path)] {
             crate::media::source::assert_inputs_whitelisted(&args);
         }
         // The scan's progress options are GLOBAL, so they come before the
@@ -701,6 +777,7 @@ mod tests {
         for path in ["https://example.com/clip.mp4", r"\\.\pipe\clip.mp4", "clip.mp4", ""] {
             assert!(matches!(probe_sync(path), Err(AppError::BadInput(_))), "{path:?}");
             assert_eq!(frame_transposes(path), None, "{path:?}");
+            assert!(!h264_param_sets_in_header(Path::new(path)), "{path:?}");
         }
         // A relative name that DOES resolve against the working directory
         // (the crate root under `cargo test`) to a picture ffprobe would read
@@ -711,6 +788,40 @@ mod tests {
         assert_eq!(frame_transposes(absolute.to_str().unwrap()), Some(false), "fixture: it decodes");
         assert_eq!(frame_transposes(relative), None);
         assert!(matches!(probe_sync(relative), Err(AppError::BadInput(_))));
+    }
+
+    /// The header rule, one row per way it can say no: each "no" row differs
+    /// from the "yes" row in exactly one field, so a rule that skips any one
+    /// check passes that row and fails here. The JSON is the bundled ffprobe's
+    /// own shape (measured: `avc1`/37 for an mp4, `[0][0][0][0]`/37 for the
+    /// same stream in Matroska, `[0][0][0][0]`/33 for a raw .h264).
+    #[test]
+    fn only_h264_in_an_avc1_entry_with_a_header_record_carries_its_param_sets() {
+        let row = |codec: &str, tag: &str, size: serde_json::Value| {
+            serde_json::to_vec(&serde_json::json!({
+                "programs": [], "stream_groups": [],
+                "streams": [{ "codec_name": codec, "codec_tag_string": tag, "extradata_size": size }]
+            }))
+            .unwrap()
+        };
+        assert!(header_carries_param_sets(&row("h264", "avc1", 37.into())), "the yes row");
+        for (name, json) in [
+            ("not h264", row("hevc", "avc1", 37.into())),
+            ("avc3 entry", row("h264", "avc3", 37.into())),
+            ("matroska", row("h264", "[0][0][0][0]", 37.into())),
+            ("empty header", row("h264", "avc1", 0.into())),
+            ("size not a number", row("h264", "avc1", "37".into())),
+        ] {
+            assert!(!header_carries_param_sets(&json), "{name}");
+        }
+        let no_size = serde_json::to_vec(&serde_json::json!({
+            "streams": [{ "codec_name": "h264", "codec_tag_string": "avc1" }]
+        }))
+        .unwrap();
+        assert!(!header_carries_param_sets(&no_size), "no size reported");
+        assert!(!header_carries_param_sets(br#"{"programs":[],"streams":[]}"#), "no video stream");
+        assert!(!header_carries_param_sets(b""), "no output");
+        assert!(!header_carries_param_sets(b"{\"streams\":[{"), "cut short");
     }
 
     /// The last progress block's time, in seconds; N/A, zero and an

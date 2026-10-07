@@ -90,10 +90,33 @@ pub struct MediaRef {
         skip_serializing_if = "Option::is_none"
     )]
     pub no_autorotate: Option<bool>,
+    /// Video only: this file's H.264 stream carries in-band headers that must
+    /// not be believed — a damaged recording whose garbage frames happen to
+    /// parse as parameter sets (SPS/PPS: they re-size ffmpeg's decoder and
+    /// wreck every clean frame after them) or as SEI (a display-orientation
+    /// SEI turns every frame it rides on). Every ffmpeg decode of the file for
+    /// EXPORT then removes the in-band SPS/PPS/SEI (the input bitstream filter
+    /// `prepare::DROP_INBAND_HEADERS`), so the header's (`avcC`) parameter
+    /// sets are the only ones in force — what the MP4 spec says an `avc1`
+    /// stream carries anyway. Stamped by the editor only, when the preview's
+    /// repair plan reports `repair.dropsHeaders` (`playability::RepairNote`);
+    /// planning then goes straight to the repair on later opens. The export
+    /// builder applies it only to an H.264 video input.
+    ///
+    /// Only a literal `true` is the flag, read by the same lenient rule as
+    /// `no_autorotate`: 0.9.1 ignored this key as unknown, and a value it would
+    /// have opened must not become "invalid project file" now.
+    #[serde(
+        default,
+        deserialize_with = "true_or_none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub drop_inband_headers: Option<bool>,
 }
 
 /// `Some(true)` for a JSON `true`, `None` for anything else — a flag that is
-/// only ever written as `true` (`MediaRef.noAutorotate?: true`).
+/// only ever written as `true` (`MediaRef.noAutorotate?: true`,
+/// `MediaRef.dropInbandHeaders?: true`).
 fn true_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<bool>, D::Error> {
     Ok((Value::deserialize(d)? == Value::Bool(true)).then_some(true))
 }
@@ -785,6 +808,50 @@ mod tests {
         assert_eq!(serde_json::to_value(&m).unwrap()["noAutorotate"], true);
         m.no_autorotate = None;
         assert!(serde_json::to_value(&m).unwrap().get("noAutorotate").is_none());
+    }
+
+    /// `dropInbandHeaders` by the same rule: only a literal `true` is the
+    /// flag, every other value a hand-edited `.trt` can hold reads as absent
+    /// rather than failing the project's parse, and it is written camelCase
+    /// only while set. The fixture also carries `noAutorotate: true`, so a
+    /// field wired to the wrong key reads the wrong answer in one direction.
+    #[test]
+    fn drop_inband_headers_is_only_ever_a_literal_true() {
+        let with = |v: Option<Value>| {
+            let mut m = serde_json::json!({
+                "id": "m1", "path": "C:\\rec.mp4", "size": 7, "mtimeMs": 3,
+                "kind": "video", "duration": 4.5, "hasAudio": true, "noAutorotate": true
+            });
+            if let Some(v) = v {
+                m["dropInbandHeaders"] = v;
+            }
+            serde_json::from_value::<MediaRef>(m).map(|m| m.drop_inband_headers)
+        };
+        assert_eq!(with(Some(Value::Bool(true))).unwrap(), Some(true));
+        assert_eq!(with(None).unwrap(), None);
+        for odd in [
+            Value::Bool(false),
+            Value::from("yes"),
+            Value::from("true"),
+            Value::from(1),
+            Value::Null,
+            serde_json::json!({ "v": true }),
+            serde_json::json!([true]),
+        ] {
+            assert_eq!(with(Some(odd.clone())).unwrap_or_else(|e| panic!("{odd}: {e}")), None, "{odd}");
+        }
+
+        let mut m: MediaRef = serde_json::from_value(serde_json::json!({
+            "id": "m1", "path": "C:\\rec.mp4", "size": 7, "mtimeMs": 3,
+            "kind": "video", "duration": 4.5, "hasAudio": true, "dropInbandHeaders": true
+        }))
+        .unwrap();
+        assert_eq!(m.no_autorotate, None, "the other flag is untouched");
+        let out = serde_json::to_value(&m).unwrap();
+        assert_eq!(out["dropInbandHeaders"], true);
+        assert!(out.get("drop_inband_headers").is_none(), "camelCase on the wire");
+        m.drop_inband_headers = None;
+        assert!(serde_json::to_value(&m).unwrap().get("dropInbandHeaders").is_none());
     }
 
     fn clip_at(id: &str, start: f64, src_in: f64, src_out: f64, speed: f64) -> Clip {

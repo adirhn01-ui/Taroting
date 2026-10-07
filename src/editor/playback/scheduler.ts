@@ -13,6 +13,7 @@ import { mediaUrl } from "../../core/ipc";
 import { KfCursor } from "../../core/anim";
 import { clipEnd, sourceTime, timelineTime } from "../../core/time";
 import type { Clip, Generator, MediaRef, ProjectFile, Track } from "../../core/types";
+import { damageStageText } from "../media/damage";
 import { cssFont } from "../media/generators";
 import type { MediaManager } from "../media/media";
 import { setOverlay, type LayerSet, type Stage } from "../preview/preview";
@@ -63,6 +64,20 @@ const PLAYBACK_FAILED = "This file couldn't be played";
  *  re-pointed, or the element was torn down), which says nothing about the
  *  file. Spelled out because the node test environment has no MediaError. */
 const MEDIA_ERR_ABORTED = 1;
+
+/**
+ * How the stage's status overlay is drawn. "scrim" is the "Preparing preview"
+ * card it always was. "damaged" covers the picture on black: the playhead is
+ * inside a damaged video's unreadable range while the instant copy plays,
+ * which holds its first good frame there — a still that would read as the
+ * video itself. "label" is a small corner label over a picture that is the
+ * recovered damage, so it is never mistaken for the video's own look.
+ */
+type OverlayTone = "scrim" | "damaged" | "label";
+
+/** The modifier classes (editor.css) for the two damage tones. */
+const TONE_DAMAGED = "preview__overlay--damaged";
+const TONE_LABEL = "preview__overlay--label";
 
 export type Segment =
   | { type: "video"; clip: Clip; media: MediaRef; ready: boolean }
@@ -182,10 +197,13 @@ class LayerScheduler {
     set.videoB.media.removeEventListener("error", this.onErrorB);
   }
 
-  /** Stamp the slot's media failed — but only while the error still describes
-   *  what the media manager currently calls ready. A slot re-pointed since (a
-   *  relink, a different clip) or a media already marked otherwise is not this
-   *  error's business; markFailed itself ignores an id it does not track. */
+  /** Report the slot's failure to the media manager — but only while the error
+   *  still describes what the manager currently calls ready. A slot re-pointed
+   *  since (a relink, a different clip) or a media already marked otherwise is
+   *  not this error's business; playbackFailed itself ignores an id it does not
+   *  track. The manager decides what the error means: a decode or
+   *  not-supported code may earn the file a repaired copy, anything else fails
+   *  it as before — so the code travels with the report. */
   private reportError(slot: Slot): void {
     const err = this.video(slot).error;
     if (err === null || err.code === MEDIA_ERR_ABORTED) return;
@@ -198,12 +216,13 @@ class LayerScheduler {
     // and used to be shown "Ready" over the dead element, black, with no new
     // error to report it. Cleared, the next assign of any url loads afresh.
     // No reload loop: a later assign needs the media ready again, and a ready
-    // media whose element fails is stamped below and stops being assigned.
+    // media whose element fails leaves "ready" below — failed, or preparing
+    // the one repair copy it may get, whose own failure is final.
     this.slotSrc[slot] = null;
     if (id === null || url === null) return;
     const st = this.media.status.get()[id];
     if (st?.state !== "ready" || st.url !== url) return;
-    this.media.markFailed(id, PLAYBACK_FAILED);
+    this.media.playbackFailed(id, url, err.code, PLAYBACK_FAILED);
   }
 
   /** Drop the element listeners. The pooled elements outlive this scheduler
@@ -703,12 +722,40 @@ export class Scheduler {
    *  wins over an in-flight play() promise. */
   private playing = false;
 
+  /**
+   * The topmost occupied layer's clip while it is a READY video of a damaged
+   * media with a known unreadable range (`MediaManager.damage`); null
+   * otherwise. Decided by `updateOverlay` — on every activate, and when the
+   * damage record changes — so the per-tick half (`animate`) only has to ask
+   * which side of the range the playhead is on. Null is the normal case, and
+   * then the tick pays this one comparison and nothing else.
+   */
+  private damagedClip: Clip | null = null;
+  /** Where `damagedClip`'s unreadable range ends, in SOURCE seconds. */
+  private damagedUntil = 0;
+  /** The overlay `damagedClip` shows inside its range — built once per
+   *  decision, so a playing tick concatenates nothing. */
+  private damagedText = "";
+  private damagedTone: OverlayTone = "damaged";
+  /** The last time the overlay was decided for, so a damage change can
+   *  decide it again with no tick or activate to hand it one. */
+  private lastT = 0;
+  /** What the overlay shows now; every write goes through `paintOverlay`. */
+  private overlayText: string | null = null;
+  private overlayTone: OverlayTone = "scrim";
+  private readonly unsubDamage: () => void;
+
   constructor(
     private stage: Stage,
     private getProject: () => ProjectFile,
     private media: MediaManager,
   ) {
     this.syncLayers();
+    // A damage record appearing, changing phase or reporting progress moves
+    // the overlay with no activate behind it — paused, nothing else would
+    // ever repaint "repairing 40%". A healthy project never writes the
+    // store, so this never runs for one.
+    this.unsubDamage = media.damage.subscribe(() => this.updateOverlay(this.lastT));
   }
 
   /** The video tracks, memoised on the identity of the project's `tracks`
@@ -804,28 +851,83 @@ export class Scheduler {
     return { boundary };
   }
 
+  /**
+   * Decide the stage's status overlay for time t — the ONE place it is
+   * decided, so the activate path and the per-tick path can never disagree.
+   * Only the topmost occupied layer counts (mirrors the old single-track
+   * behavior): a video whose media isn't ready shows "Preparing preview" or
+   * why it is unavailable; a ready video of a damaged media with a known
+   * range hands over to `paintDamage`, which `animate` then re-asks every
+   * tick; anything else clears it.
+   */
   private updateOverlay(t: number): void {
-    // Show "preparing/failed" only when the topmost occupied layer is a video
-    // whose media isn't ready yet (mirrors the old single-track behavior).
+    this.lastT = t;
+    this.damagedClip = null;
     for (const layer of this.activeLayers()) {
       const seg = layer.resolve(t);
       if (seg.type === "gap") continue;
-      if (seg.type === "video" && !seg.ready) {
-        const st = this.media.status.get()[seg.media.id];
-        setOverlay(
-          this.stage,
-          st?.state === "failed" ? `Preview unavailable: ${st.message}` : "Preparing preview",
-        );
-        return;
+      if (seg.type === "video") {
+        if (!seg.ready) {
+          const st = this.media.status.get()[seg.media.id];
+          this.paintOverlay(
+            st?.state === "failed" ? `Preview unavailable: ${st.message}` : "Preparing preview",
+            "scrim",
+          );
+          return;
+        }
+        const d = this.media.damage.get()[seg.media.id];
+        if (d !== undefined && d.until !== null) {
+          this.damagedClip = seg.clip;
+          this.damagedUntil = d.until;
+          this.damagedText = damageStageText(d);
+          // Ready and still repairing (or unrepairable) is the instant copy,
+          // whose damaged range has no picture to show: covered. Recovered
+          // is the full copy, whose recovered picture IS what is left.
+          this.damagedTone = d.phase === "recovered" ? "label" : "damaged";
+          this.paintDamage(t);
+          return;
+        }
       }
       break; // first occupied layer is fine
     }
-    setOverlay(this.stage, null);
+    this.paintOverlay(null, "scrim");
+  }
+
+  /** The damaged clip's overlay at t: shown while the clip's SOURCE time is
+   *  inside the unreadable range, cleared past it. Allocation-free. */
+  private paintDamage(t: number): void {
+    const clip = this.damagedClip!;
+    const inside = sourceTime(clip, t - clip.timelineStart) < this.damagedUntil;
+    this.paintOverlay(inside ? this.damagedText : null, this.damagedTone);
+  }
+
+  /** Every overlay write, skipped when nothing changes: the per-tick path
+   *  lands here every frame while a damaged clip is on stage. A hidden
+   *  overlay always drops the damage tones, so the next scrim is the plain
+   *  one whatever came before. */
+  private paintOverlay(text: string | null, tone: OverlayTone): void {
+    if (text === null) tone = "scrim";
+    if (text === this.overlayText && tone === this.overlayTone) return;
+    if (tone !== this.overlayTone) {
+      const classes = this.stage.overlay.classList;
+      classes.toggle(TONE_DAMAGED, tone === "damaged");
+      classes.toggle(TONE_LABEL, tone === "label");
+      this.overlayTone = tone;
+    }
+    this.overlayText = text;
+    setOverlay(this.stage, text);
   }
 
   /** Re-evaluate keyframe poses on every layer for the given tick time. */
   animate(t: number): void {
     for (const layer of this.activeLayers()) layer.animate(t);
+    // The playhead crosses the end of a damaged range INSIDE one clip, with
+    // no activate to notice; this is the one place that sees every tick.
+    // Nothing damaged on stage (the normal case) costs this one test.
+    if (this.damagedClip !== null) {
+      this.lastT = t;
+      this.paintDamage(t);
+    }
   }
 
   /** Master clock: timeline time from the topmost ready-video layer, or null. */
@@ -979,6 +1081,7 @@ export class Scheduler {
 
   dispose(): void {
     this.pauseAll();
+    this.unsubDamage();
     for (const layer of this.layers) layer.dispose();
   }
 }

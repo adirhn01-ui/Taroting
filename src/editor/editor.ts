@@ -30,6 +30,7 @@ import {
   topVideoTrack,
   uid,
   updateClip,
+  updateMedia,
   videoTracks,
 } from "../core/project";
 import { registerCloseTask } from "../core/app-close";
@@ -55,6 +56,7 @@ import { closeMenu, showMenu } from "../ui/menu";
 import { toast } from "../ui/toast";
 import { openExportDialog } from "./export/export-dialog";
 import { mountInspector } from "./inspector/inspector";
+import { damageChange, damageNotice, damageTooltip } from "./media/damage";
 import { openGeneratorDialog } from "./media/generators";
 import { abandonsPlayback, MediaManager } from "./media/media";
 import { openRelinkDialog } from "./media/relink";
@@ -223,7 +225,40 @@ export async function mountEditor(
   // mid-relocate. paintKeep clears the guard once the project is kept.
   const exits = createTempExits(session, createTempLeaveGate(session));
   if (session.temp.get()) session.leaveGuard = () => exits.confirm();
-  const media = new MediaManager(() => session.project);
+  const media = new MediaManager(() => session.project, {
+    // A repaired preview learned that this file's in-band headers are
+    // garbage: record it on the media so the export decodes it the same way.
+    // Learned as soon as the instant copy plays, so an export started while
+    // the full repair still runs already gets the recovered frames.
+    // A fixup the user did not make (edit: false), like the image editor's
+    // decoded-size record — an untouched temporary project still closes
+    // without a question. Skipped for media gone or already flagged.
+    onDropHeaders: (mediaId) => {
+      const m = findMedia(session.project, mediaId);
+      if (m === undefined || m.dropInbandHeaders === true) return;
+      session.replace(updateMedia(session.project, mediaId, { dropInbandHeaders: true }), { edit: false });
+    },
+    // Being outside history, that record is lost to anything that puts back a
+    // project from before it — an undo or redo across it, a cancelled canvas
+    // drag — so the manager watches the project and records it again. It
+    // holds this subscription and drops it in dispose, which every exit
+    // below reaches (a superseded mount, a mount that throws, the screen's
+    // own dispose).
+    watchProject: (onChange) => session.store.subscribe(onChange),
+    // A video found damaged (once per media per session): say so at once,
+    // but only while a repair has to run (`damageNotice` answers null for a
+    // reopen that finds the recovered copy cached — old news). The notice
+    // tone, amber and polite, not an error: the file plays, nothing the user
+    // did failed, and a Diagnostics entry on every open of the project would
+    // push the real failures out of that ring. The detail (what can't be
+    // read, what Taroting is doing) is its second line. The bin's "Damaged"
+    // and the stage's "Damaged section" keep saying it after it is gone.
+    onDamaged: (mediaId, state, quick) => {
+      if (findMedia(session.project, mediaId) === undefined) return;
+      const notice = damageNotice(state, quick);
+      if (notice !== null) toast.notice(notice.message, notice.detail);
+    },
+  });
   await media.init();
   // The second await. Nothing shared has been touched yet, so a superseded
   // mount unwinds privately: the session has no edits (dispose writes nothing,
@@ -1115,6 +1150,16 @@ function buildEditor(
   function statusHtml(m: MediaRef): string {
     const s = media.status.get()[m.id];
     if (!s || s.state === "checking") return `<span class="media-row__status">Checking</span>`;
+    // A damaged video says so for as long as it is in the bin, whether it
+    // plays (an instant copy, the recovered copy) or waits on its repair —
+    // the tooltip says what can't be read and how the repair stands. Failed
+    // still wins: its message is the more useful fact then. The bar, emitted
+    // empty for the reason given under "preparing", follows the repair.
+    const d = s.state === "failed" ? undefined : media.damage.get()[m.id];
+    if (d !== undefined) {
+      const bar = d.phase === "repairing" ? `<div class="media-row__bar"><div></div></div>` : "";
+      return `<span class="media-row__status media-row__status--warn" title="${escapeHtml(damageTooltip(d))}">Damaged</span>${bar}`;
+    }
     switch (s.state) {
       case "ready":
         return `<span class="media-row__status media-row__status--ok">Ready</span>`;
@@ -1206,6 +1251,7 @@ function buildEditor(
    */
   function paintMediaRows(items: MediaRef[]): void {
     const status = media.status.get();
+    const damage = media.damage.get();
     const rows = mediaList.children;
     items.forEach((m, i) => {
       const row = rows[i];
@@ -1216,9 +1262,15 @@ function buildEditor(
         if (swatch) swatch.style.background = gen.color;
       }
       const s = status[m.id];
-      if (s?.state === "preparing") {
+      // A damaged row's bar is the REPAIR's (see statusHtml); any other bar
+      // is a Preparing row's. Undefined: this row has no bar.
+      const d = s?.state === "failed" ? undefined : damage[m.id];
+      let ratio: number | null | undefined;
+      if (d !== undefined) ratio = d.phase === "repairing" ? d.ratio : undefined;
+      else if (s?.state === "preparing") ratio = s.ratio;
+      if (ratio !== undefined) {
         const fill = row.querySelector<HTMLElement>(".media-row__bar > div");
-        if (fill) fill.style.width = `${Math.round((s.ratio ?? 0.05) * 100)}%`;
+        if (fill) fill.style.width = `${Math.round((ratio ?? 0.05) * 100)}%`;
       }
     });
   }
@@ -1237,16 +1289,18 @@ function buildEditor(
    * while the bar underneath it kept filling.
    *
    * The bar element is also the proof that the row on screen is the Preparing
-   * row this media rendered as — no other status emits one. If it is missing,
-   * the DOM has not caught up with a project edit yet, and the rebuild that edit
-   * already scheduled owns the row.
+   * row this media rendered as — no other status emits one but a Damaged row,
+   * which is skipped here (its bar and label are the repair's; see
+   * `paintDamageProgress`). If it is missing, the DOM has not caught up with a
+   * project edit yet, and the rebuild that edit already scheduled owns the row.
    */
   function paintMediaProgress(items: MediaRef[]): void {
     const status = media.status.get();
+    const damage = media.damage.get();
     const rows = mediaList.children;
     for (let i = 0; i < items.length; i++) {
       const s = status[items[i]!.id];
-      if (s?.state !== "preparing") continue;
+      if (s?.state !== "preparing" || damage[items[i]!.id] !== undefined) continue;
       const row = rows[i];
       if (!(row instanceof HTMLElement)) continue;
       const fill = row.querySelector<HTMLElement>(".media-row__bar > div");
@@ -1259,6 +1313,43 @@ function buildEditor(
       }
     }
   }
+
+  /**
+   * `paintMediaProgress` for Damaged rows: a full repair's bar width and the
+   * tooltip that carries its percentage, written in place. A repair reports
+   * ~10 times a second for as long as it runs (half a minute on a fast PC,
+   * far longer on a slow one), and must not rebuild the bin for it. The bar
+   * is the proof the row is the repairing Damaged row; without one, the
+   * rebuild already scheduled owns the row.
+   */
+  function paintDamageProgress(items: MediaRef[]): void {
+    const status = media.status.get();
+    const damage = media.damage.get();
+    const rows = mediaList.children;
+    for (let i = 0; i < items.length; i++) {
+      const id = items[i]!.id;
+      const d = damage[id];
+      if (d?.phase !== "repairing" || status[id]?.state === "failed") continue;
+      const row = rows[i];
+      if (!(row instanceof HTMLElement)) continue;
+      const fill = row.querySelector<HTMLElement>(".media-row__bar > div");
+      if (!fill) continue;
+      fill.style.width = `${Math.round((d.ratio ?? 0.05) * 100)}%`;
+      const label = row.querySelector<HTMLElement>(".media-row__status--warn");
+      if (label) label.title = damageTooltip(d);
+    }
+  }
+
+  // The bin's half of the damage record (the stage's is the scheduler's own
+  // subscription). A healthy project never writes it, so this never runs.
+  teardown.add(
+    media.damage.subscribe((next, prev) => {
+      const change = damageChange(prev, next);
+      if (change === "none") return;
+      if (change === "progress") paintDamageProgress(session.project.media);
+      else renderMedia();
+    }),
+  );
 
   function paintSaveBadge(): void {
     const s = session.saveState.get();

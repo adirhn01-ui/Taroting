@@ -4,7 +4,8 @@
 // split/undo, playback advancement) against the actual video elements.
 // Results are written to %TEMP%\taroting-autotest-report.json.
 
-import { appVersion, ipc } from "../core/ipc";
+import { invoke } from "@tauri-apps/api/core";
+import { appVersion, codecHints, ipc, type PlaybackClass, type RepairNote } from "../core/ipc";
 import { navigate } from "../core/nav";
 import {
   addGeneratedMedia,
@@ -17,10 +18,23 @@ import {
 } from "../core/project";
 import type { ProjectSession } from "../core/session";
 import { frameCenter } from "../core/time";
+import type { MediaInfo, MediaRef } from "../core/types";
 import { measureText, openGeneratorDialog } from "../editor/media/generators";
 import type { AudioGraph } from "../editor/playback/audio-graph";
 import type { MediaManager } from "../editor/media/media";
 import type { PlaybackEngine } from "../editor/playback/engine";
+import {
+  holdJobDone,
+  holdsFullRepair,
+  isFullCopy,
+  isHeaderFreeCopy,
+  isQuickCopy,
+  lastName,
+  recordPlans,
+  repairFamily,
+  type JobDoneHold,
+  type PlanCall,
+} from "./repair-hold";
 
 export interface DevHook {
   engine: PlaybackEngine;
@@ -3961,10 +3975,1241 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     await (await import("./autotest-viewer")).runViewerBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-image")).runImageBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-home")).runHomeBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await runDamagedVideoBlocks(test, fixturesDir);
   } catch (e) {
     results.push({ name: "setup", pass: false, detail: String(e) });
   }
 
   clearTimeout(hardTimeout);
   await finish();
+}
+
+/* ------------------------------------------------------------------ */
+/* A damaged recording, as the user meets it: a video the probe calls */
+/* clean H.264 whose first seconds the WebView's decoder refuses      */
+/* (Chromium stops the whole file at the first one). Nothing to       */
+/* press: the INSTANT copy (a lossless stream copy from the first     */
+/* clean keyframe, its audio whole) plays at once, the user is told   */
+/* the file is damaged, and the FULL repair (decoded with the in-band */
+/* SPS, PPS and SEI removed) runs behind it and swaps in. The fixture */
+/* is make-fixtures.mjs's damaged_h264.mp4: 512x384, 2 s of garbage   */
+/* that hides a 16x32 SPS/PPS and a 90-degree display-orientation     */
+/* SEI, then 2 s clean from the IDR at 2.000 s — measured there to    */
+/* fail in Chromium as the reported recording did (D3D11 →            */
+/* FFmpegVideoDecoder → PIPELINE_ERROR_DECODE, MediaError 3). Both    */
+/* blocks prove the refusal happened in THIS WebView before crediting */
+/* the repair: a runtime that plays the fixture directly would make   */
+/* them pass while exercising nothing, so they fail then.             */
+/*                                                                    */
+/* The full repair of this 4 s fixture takes ~130 ms, so the instant  */
+/* phase would be over before anything could look at it. Each block  */
+/* HOLDS the full repair's job:done from the moment the repair plan   */
+/* is asked for — that done can beat the answer naming it — keyed on  */
+/* the file it wrote (recordPlans + holdJobDone, repair-hold.ts),     */
+/* measures the instant phase, then releases it: the swap a slow PC   */
+/* meets half a minute in, on demand. Both start                      */
+/* from a cache holding none of the fixture's copies                  */
+/* (clearCachedRepair) and leave none behind, so every run takes both */
+/* phases. Estimated from the neighbours (a mount ~0.3 s, a seek      */
+/* ~0.1 s, the playback readings as timed): ~4 s for the editor       */
+/* block, ~3 s for the viewer's.                                      */
+/* ------------------------------------------------------------------ */
+
+/** The fixture's own size: both copies keep it (the repair scales only past
+ *  720 lines), and no other fixture is 512x384, so a <video> showing these
+ *  numbers is showing this file. */
+const DAMAGED_W = 512;
+const DAMAGED_H = 384;
+/** The fixture's first clean IDR (sample 60), as make-fixtures.mjs reads it
+ *  back from the container: what the backend's damage scan must answer, and
+ *  where the instant copy's video starts. */
+const DAMAGED_UNTIL = 2.0;
+/** Mid-frame times (30 fps) inside the damage, just before the full repair's
+ *  last recovered frame (1.433 s), past the damage and in the clean tail, so
+ *  no seek lands on a frame boundary two decoders could round apart. */
+const IN_DAMAGE_T = 1 + 1 / 60;
+const CROSS_FROM_T = 1.3 + 1 / 60;
+const CLEAN_T = 2.3 + 1 / 60;
+const REF_T = 3 + 1 / 60;
+/** Mean luma distance (0-255 over 16x12 blocks) under which two frames show
+ *  the same picture. Calibrated with ffmpeg on this fixture: the full repair
+ *  against the instant copy 0.1, frames one apart 0.9-2.5, five apart
+ *  3.9-9.6 — and the clean tail decoded with the orientation SEI kept
+ *  (turned, then scaled back into 512x384 — the owner's copy came out turned
+ *  and sheared) 62-70. */
+const SAME_PICTURE = 25;
+/** The editor's toast for a video first found damaged. */
+const DAMAGED_TOAST = "This video is damaged";
+/** "0:00-0:02" (a hyphen or an en dash): the unreadable range as m:ss. */
+const DAMAGED_RANGE = /0:00\s*[-–]\s*0:02/;
+
+const isDamagedFixture = (p: string): boolean => /(^|[\\/])damaged_h264\.mp4$/i.test(p);
+/** An asset url back to the path it names (convertFileSrc percent-encodes it). */
+function urlPath(u: string): string {
+  try {
+    return decodeURIComponent(u);
+  } catch {
+    return u;
+  }
+}
+/** Which of the fixture's files `p` is, for messages. */
+const copyName = (p: string): string =>
+  isQuickCopy(p) ? "instant copy" : isFullCopy(p) ? "full repair" : isDamagedFixture(p) ? "raw file" : lastName(p) || "nothing";
+const textOf = (el: Element | null): string => (el?.textContent ?? "").trim();
+
+/** `v`, or a throw carrying `detail` — the narrowing `assert` cannot give. */
+function must<T>(v: T | null | undefined, detail: string): T {
+  if (v === null || v === undefined) throw new Error(detail);
+  return v;
+}
+
+/** Delete files this run made in the derived-file cache. The DEV-only
+ *  command refuses anything outside the run's scratch root and that cache,
+ *  and treats "already gone" as done. Retried: a <video> that has just let go
+ *  of a file can still hold it for a moment. Answers what could not go. */
+async function removeCacheFiles(paths: Iterable<string>): Promise<string[]> {
+  const failed: string[] = [];
+  for (const p of new Set(paths)) {
+    let last: unknown = null;
+    for (let i = 0; i < 5; i++) {
+      try {
+        await invoke<void>("debug_remove_test_file", { path: p });
+        last = null;
+        break;
+      } catch (e) {
+        last = e;
+        await sleep(60);
+      }
+    }
+    if (last !== null) failed.push(`${lastName(p)}: ${String(last)}`);
+  }
+  return failed;
+}
+
+/** Leave no repair copy of `media` in the cache, so the block after it meets
+ *  the instant phase. The cache outlives runs (%TEMP%\taroting-autotest-cache)
+ *  and a run that died before its own cleanup leaves copies behind, but their
+ *  names hash the file's identity (xxh3, out of reach here) — so the backend
+ *  is asked: with a full copy cached, a repair plan answers `ready` on it at
+ *  once, starting nothing. An instant copy left without its full copy is not
+ *  found this way; it only makes the instant phase start `ready`, which the
+ *  blocks accept. Answers what it did, for the block's detail. */
+async function clearCachedRepair(media: MediaRef): Promise<string> {
+  const hints = codecHints();
+  if (!(await ipc.classifyPlayback(media, hints, false)).repaired) return "cold cache";
+  const plan = await ipc.planPlayback(media, hints, false, true);
+  if (plan.mode !== "ready") {
+    if (plan.mode === "pending") {
+      await ipc.cancelJob(plan.jobId).catch(() => false);
+      if (plan.upgrade) await ipc.cancelJob(plan.upgrade.jobId).catch(() => false);
+    }
+    throw new Error(`a repair copy of damaged_h264.mp4 is cached, but its plan answered ${plan.mode}, not ready`);
+  }
+  const family = repairFamily(plan.path);
+  const failed = await removeCacheFiles(family);
+  assert(failed.length === 0, `could not clear the cached repair copies, so the instant phase cannot run: ${failed.join("; ")}`);
+  assert(
+    !(await ipc.classifyPlayback(media, hints, false)).repaired,
+    `${lastName(plan.path)} was removed, yet the backend still reports a cached repair of damaged_h264.mp4`,
+  );
+  return `cleared ${family.map(lastName).join(", ")}`;
+}
+
+const describeNote = (n: RepairNote | undefined): string =>
+  n === undefined
+    ? ""
+    : ` (dropsHeaders ${String(n.dropsHeaders)}${n.damagedUntil !== undefined ? `, damagedUntil ${n.damagedUntil}` : ""}${n.quick ? ", quick" : ""})`;
+const describePlans = (calls: readonly PlanCall[]): string =>
+  calls.length === 0
+    ? "none"
+    : calls
+        .map(
+          (c) =>
+            `${c.repair ? "repair" : "plain"} → ${c.answer}${describeNote(c.note)}${c.upgrade ? ` + upgrade ${lastName(c.upgrade.output)}` : ""}`,
+        )
+        .join(", ");
+/** Every cache file the recorded plans named: instant copies and full repairs. */
+const plannedFiles = (calls: readonly PlanCall[]): string[] =>
+  calls.flatMap((c) => [
+    ...(c.repair && c.file !== null ? [c.file] : []),
+    ...(c.upgrade ? [c.upgrade.output] : []),
+  ]);
+
+/** A block's one hold on the full repair's job:done, or why there is none. */
+interface RepairHold {
+  hold: JobDoneHold | null;
+  error: string;
+}
+/** recordPlans' `beforeRepair` for the blocks: the FIRST repair plan for the
+ *  fixture makes the hold; a later one (a reopen, a revisit) finds it made
+ *  and leaves it, so a released hold is never re-armed. */
+function holdFirstFullRepair(held: RepairHold): void {
+  if (held.hold !== null || held.error !== "") return;
+  const h = holdJobDone(window, holdsFullRepair);
+  if (typeof h === "string") held.error = h;
+  else held.hold = h;
+}
+/** Why the full repair could reach the page before any instant copy. */
+const holdMissed = (held: RepairHold): string =>
+  held.error || (held.hold ? "the hold did not catch its job:done" : "no repair plan had been asked for, so nothing held it");
+/** The hold is keyed on the file a done wrote, before any answer gives the
+ *  full repair's id, so this checks it caught THAT job: a done held for any
+ *  other id is a full repair the plan did not name. "" when it is only that. */
+const heldOtherThan = (hold: JobDoneHold, jobId: number): string =>
+  hold.heldIds.every((id) => id === jobId)
+    ? ""
+    : `the hold caught the job:done of job(s) ${hold.heldIds.join(", ")}, but the plan's full repair is job ${jobId}`;
+
+interface Refusal {
+  code: number;
+  src: string;
+  message: string;
+  at: number;
+}
+
+/** Every MediaError any <video>/<audio> in the page raises, from a CAPTURE
+ *  listener on document: a media `error` does not bubble, but the capture
+ *  phase passes every ancestor, so the editor's pooled elements and the
+ *  viewer's are all seen without touching either. This is the evidence that
+ *  the WebView itself refused the raw file. */
+function recordRefusals(): { list: Refusal[]; stop(): void } {
+  const list: Refusal[] = [];
+  const on = (e: Event): void => {
+    const el = e.target;
+    if (!(el instanceof HTMLMediaElement) || el.error === null) return;
+    list.push({
+      code: el.error.code,
+      src: urlPath(el.currentSrc || el.getAttribute("src") || ""),
+      message: el.error.message,
+      at: performance.now(),
+    });
+  };
+  document.addEventListener("error", on, true);
+  return { list, stop: () => document.removeEventListener("error", on, true) };
+}
+const describeRefusals = (list: readonly Refusal[]): string =>
+  list.length === 0 ? "none" : list.map((r) => `${r.code} on ${lastName(r.src)} ("${r.message.slice(0, 90)}")`).join(", ");
+/** A refusal of the RAW fixture with a code that earns a repair (3 decode, 4 not supported). */
+const rawRefusal = (list: readonly Refusal[]): Refusal | undefined =>
+  list.find((r) => isDamagedFixture(r.src) && (r.code === 3 || r.code === 4));
+
+/** Every `.toast` (the app's one toast component) whose text starts with
+ *  `prefix`, each counted once from the moment it appears — even if it is
+ *  gone again by the time a block looks. */
+function watchToasts(prefix: string): { list: HTMLElement[]; stop(): void } {
+  const list: HTMLElement[] = [];
+  const counted = new WeakSet<Element>();
+  const scan = (): void => {
+    for (const t of Array.from(document.querySelectorAll<HTMLElement>(".toast"))) {
+      if (!counted.has(t) && textOf(t).startsWith(prefix)) {
+        counted.add(t);
+        list.push(t);
+      }
+    }
+  };
+  const observer = new MutationObserver(scan);
+  observer.observe(document.body, { childList: true, subtree: true });
+  scan();
+  return { list, stop: () => observer.disconnect() };
+}
+
+/** Does `el` really decode while it plays for `ms`? Three readings: frames
+ *  the decoder produced (getVideoPlaybackQuality), frames presented
+ *  (requestVideoFrameCallback, with the first and last media time), and the
+ *  clock. A <video> holding only metadata has its size but none of the first
+ *  two; one refused mid-way has an error. */
+async function playbackReading(
+  el: HTMLVideoElement,
+  ms: number,
+): Promise<{ decoded: number; presented: number; first: number; last: number; advanced: number; ok: boolean; text: string }> {
+  const q0 = el.getVideoPlaybackQuality().totalVideoFrames;
+  const t0 = el.currentTime;
+  let presented = 0;
+  let first = -1;
+  let last = -1;
+  let watching = true;
+  const onFrame: Parameters<HTMLVideoElement["requestVideoFrameCallback"]>[0] = (_now, meta) => {
+    presented++;
+    if (first < 0) first = meta.mediaTime;
+    last = meta.mediaTime;
+    if (watching) handle = el.requestVideoFrameCallback(onFrame);
+  };
+  let handle = el.requestVideoFrameCallback(onFrame);
+  await sleep(ms);
+  watching = false;
+  el.cancelVideoFrameCallback(handle);
+  const decoded = el.getVideoPlaybackQuality().totalVideoFrames - q0;
+  const mediaSpan = last - first;
+  const advanced = el.currentTime - t0;
+  // Either frame count alone proves decoding; the clock alone does not (it
+  // runs on the audio track too), so it is required on top, never instead.
+  const ok = el.error === null && advanced >= 0.25 && (decoded >= 5 || (presented >= 3 && mediaSpan > 0));
+  const text = `${decoded} frames decoded, ${presented} presented (media ${first.toFixed(2)}-${last.toFixed(2)} s), clock +${advanced.toFixed(2)} s in ${ms} ms${el.error ? `, ERROR ${el.error.code}` : ""}`;
+  return { decoded, presented, first, last, advanced, ok, text };
+}
+
+/** The picture `el` shows now, as mean luma over 16x12 blocks of a 64x48
+ *  draw. Coarse on purpose: two decodes of one frame agree to ~0.1, while a
+ *  turned or distorted picture is ~60 away (see SAME_PICTURE). Needs a CORS-
+ *  clean source (crossOrigin + the asset protocol's ACAO), or the read throws. */
+function frameSignature(el: HTMLVideoElement): number[] {
+  const W = 64;
+  const H = 48;
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const g = must(c.getContext("2d", { willReadFrequently: true }), "no 2D context for a frame signature");
+  g.imageSmoothingEnabled = true;
+  g.imageSmoothingQuality = "high";
+  g.drawImage(el, 0, 0, W, H);
+  let d: Uint8ClampedArray;
+  try {
+    d = g.getImageData(0, 0, W, H).data;
+  } catch (e) {
+    throw new Error(`could not read ${copyName(urlPath(el.currentSrc))}'s frame back (${String(e)}) — the canvas is tainted, so its pixels cannot be compared`);
+  }
+  const out: number[] = [];
+  for (let by = 0; by < H; by += 4) {
+    for (let bx = 0; bx < W; bx += 4) {
+      let s = 0;
+      for (let y = by; y < by + 4; y++) {
+        for (let x = bx; x < bx + 4; x++) {
+          const i = (y * W + x) * 4;
+          s += 0.299 * (d[i] ?? 0) + 0.587 * (d[i + 1] ?? 0) + 0.114 * (d[i + 2] ?? 0);
+        }
+      }
+      out.push(s / 16);
+    }
+  }
+  return out;
+}
+const pictureDistance = (a: readonly number[], b: readonly number[]): number =>
+  a.reduce((s, v, i) => s + Math.abs(v - (b[i] ?? 0)), 0) / Math.max(1, a.length);
+/** How much a signature varies: a flat (black, grey) frame is ~0, the
+ *  fixture's test pattern ~55. */
+function pictureSpread(a: readonly number[]): number {
+  const mean = a.reduce((s, v) => s + v, 0) / Math.max(1, a.length);
+  return Math.sqrt(a.reduce((s, v) => s + (v - mean) ** 2, 0) / Math.max(1, a.length));
+}
+
+/** The frame `url` shows at `t`, read through a probe <video> of the page's
+ *  own — CORS-clean, where the viewer's element is not — and released after.
+ *  In the document (off to the side, transparent) so the engine decodes it
+ *  like any shown element. */
+async function probeFrame(url: string, t: number): Promise<{ sig: number[]; w: number; h: number; at: number }> {
+  const v = document.createElement("video");
+  v.crossOrigin = "anonymous";
+  v.muted = true;
+  v.preload = "auto";
+  Object.assign(v.style, { position: "fixed", left: "0", top: "0", width: "64px", height: "48px", opacity: "0", pointerEvents: "none" });
+  document.body.appendChild(v);
+  const name = copyName(urlPath(url));
+  // Read through a call: the element's error changes under us, which a
+  // narrowed `v.error` would not admit.
+  const failure = (): MediaError | null => v.error;
+  try {
+    v.src = url;
+    await until(() => failure() !== null || v.readyState >= 1, 4_000, () => `the ${name} to load in a probe <video>`);
+    const loadErr = failure();
+    if (loadErr) throw new Error(`a probe <video> could not load the ${name}: error ${loadErr.code}`);
+    v.currentTime = t;
+    await until(
+      () => failure() !== null || (!v.seeking && v.readyState >= 2 && Math.abs(v.currentTime - t) < 0.05),
+      3_000,
+      () => `a probe <video> on the ${name} to settle at ${t.toFixed(3)} s (at ${v.currentTime.toFixed(3)}, readyState ${v.readyState})`,
+    );
+    const seekErr = failure();
+    if (seekErr) throw new Error(`a probe <video> failed seeking the ${name}: error ${seekErr.code}`);
+    return { sig: frameSignature(v), w: v.videoWidth, h: v.videoHeight, at: v.currentTime };
+  } finally {
+    v.removeAttribute("src");
+    v.load();
+    v.remove();
+  }
+}
+
+/** A CSS colour as [r, g, b, alpha] (0-255, 0-1): "rgb()", "rgba()" and the
+ *  "color(srgb …)" that color-mix() computes to. Null for anything else. */
+function cssRgb(s: string): [number, number, number, number] | null {
+  const alpha = (a: string | undefined): number => (a === undefined ? 1 : a.endsWith("%") ? parseFloat(a) / 100 : parseFloat(a));
+  let m = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/.exec(s.trim());
+  if (m) return [Number(m[1]), Number(m[2]), Number(m[3]), alpha(m[4])];
+  m = /^color\(srgb\s+([-\d.e]+)\s+([-\d.e]+)\s+([-\d.e]+)(?:\s*\/\s*([\d.]+%?))?\s*\)$/.exec(s.trim());
+  if (m) return [Number(m[1]) * 255, Number(m[2]) * 255, Number(m[3]) * 255, alpha(m[4])];
+  return null;
+}
+const sameRgb = (a: readonly number[] | null, b: readonly number[] | null): boolean =>
+  a !== null && b !== null && [0, 1, 2].every((i) => Math.abs((a[i] ?? 0) - (b[i] ?? 0)) <= 3);
+/** The app's --warn as it computes inside `scope` (themes redefine tokens). */
+function warnRgb(scope: Element): [number, number, number, number] | null {
+  const probe = document.createElement("span");
+  probe.style.color = "var(--warn)";
+  scope.appendChild(probe);
+  try {
+    return cssRgb(getComputedStyle(probe).color);
+  } finally {
+    probe.remove();
+  }
+}
+
+/** The deepest element under `scope` whose own text passes `test` (none of
+ *  its children's does), in document order. */
+function innermostWithText(scope: Element | null, test: (text: string) => boolean): HTMLElement | null {
+  if (!scope) return null;
+  const all = Array.from(scope.querySelectorAll<HTMLElement>("*")).filter((el) => test(textOf(el)));
+  return all.find((el) => !Array.from(el.children).some((c) => test(textOf(c)))) ?? null;
+}
+/** The tooltip `el` shows: its own title or its nearest titled ancestor below
+ *  `stop` (a bin row's own title is the file path, not the status's). */
+function titleWithin(el: HTMLElement, stop: Element | null): string {
+  for (let e: HTMLElement | null = el; e !== null && e !== stop; e = e.parentElement) if (e.title) return e.title;
+  return "";
+}
+/** The topmost element of `scope` at (x, y). Chrome laid over it from outside
+ *  — a toast, the viewer's arrows and bars — is not what covers its picture,
+ *  so the hit stack is read down to the first element of `scope`. */
+function topWithin(scope: Element, x: number, y: number): Element | null {
+  return document.elementsFromPoint(x, y).find((el) => el === scope || scope.contains(el)) ?? null;
+}
+const describeHit = (el: Element | null): string =>
+  el === null ? "nothing" : `${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""}${el.className && typeof el.className === "string" ? `.${el.className.trim().replace(/\s+/g, ".")}` : ""}`;
+
+/** Poll every 20 ms; `what` is read on timeout, so it says what was there THEN. */
+async function until<T>(get: () => T | null | undefined | false, ms: number, what: () => string): Promise<T> {
+  const start = performance.now();
+  for (;;) {
+    const v = get();
+    if (v) return v;
+    if (performance.now() - start > ms) throw new Error(`timed out after ${ms} ms waiting for ${what()}`);
+    await sleep(20);
+  }
+}
+
+function paints(el: Element | null): el is HTMLElement {
+  return (
+    el instanceof HTMLElement && el.isConnected && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden"
+  );
+}
+
+/** What the viewer publishes on window while mounted (S19); see autotest-viewer.ts. */
+interface ViewerDevHook {
+  loads: number;
+  lastClass: PlaybackClass | null;
+  jobId: number | null;
+  path(): string;
+}
+
+async function runDamagedVideoBlocks(
+  test: (name: string, fn: () => Promise<string> | string) => Promise<void>,
+  fixturesDir: string,
+): Promise<void> {
+  const FILE = `${fixturesDir}\\damaged_h264.mp4`;
+  const missing = (): string => `fixture ${FILE} is missing — run npm run fixtures`;
+  const editorHook = (): DevHook | undefined => (window as unknown as { __tarotingDev?: DevHook }).__tarotingDev;
+  const viewerHook = (): ViewerDevHook | undefined =>
+    (window as unknown as { __tarotingViewerDev?: ViewerDevHook }).__tarotingViewerDev;
+  const $ = <E extends Element = HTMLElement>(sel: string): E | null => document.querySelector<E>(sel);
+  const onScreen = (): string =>
+    $(".editor") ? "editor" : $("#vw") ? "viewer" : $(".home") ? "home" : $("#settings-inner") ? "settings" : "?";
+  /** The fixture as a project's media entry — the identity the cache keys. */
+  const fixtureMedia = async (): Promise<{ info: MediaInfo; media: MediaRef }> => {
+    assert(await ipc.pathExists(FILE), missing());
+    const info = await ipc.probeMedia(FILE);
+    assert(
+      info.kind === "video" && info.width === DAMAGED_W && info.height === DAMAGED_H,
+      `damaged_h264.mp4 probed as ${info.kind} ${String(info.width)}x${String(info.height)}, not a ${DAMAGED_W}x${DAMAGED_H} video`,
+    );
+    const media = must(importMediaAsClip(createProject("Autotest damaged video"), info).project.media[0], "importing the fixture made no media entry");
+    return { info, media };
+  };
+
+  /** Mount the editor on `path` and wait for ITS hook (the previous mount's is
+   *  still on window and would resolve at once). Back to Home on a timeout, so
+   *  a mount that lands late cannot park the run in an editor. */
+  const openEditor = async (path: string, what: string): Promise<DevHook> => {
+    const prev = editorHook();
+    navigate({ view: "editor", projectPath: path });
+    try {
+      return await until(
+        () => {
+          const h = editorHook();
+          return h && h !== prev && $(".editor") ? h : null;
+        },
+        10_000,
+        () => `the editor to mount on ${what} (on screen: ${onScreen()})`,
+      );
+    } catch (e) {
+      navigate({ view: "home" });
+      throw e;
+    }
+  };
+  const toHome = async (): Promise<void> => {
+    navigate({ view: "home" });
+    await until(() => $(".home") && !$(".editor") && !$("#vw"), 5_000, () => `Home (on screen: ${onScreen()})`);
+  };
+
+  // The editor: nothing to press. Asserted in the order the mechanism runs —
+  // the plain plan says Direct (the probe sees clean H.264: the trap), the
+  // WebView refuses the raw file, THEN a repair plan answers with the instant
+  // copy and the full repair behind it. While that repair is held: the clip
+  // plays the instant copy, the bin says "Damaged", the stage covers the part
+  // the copy has no picture for, and a quiet notice (not the error tone: the
+  // file is damaged, nothing in the app failed) says it once. Released: the
+  // full repair swaps in where the playhead stands, UPRIGHT (the orientation
+  // SEI regression: a copy that kept it is turned and scaled back into
+  // 512x384, so its size alone would pass), decodes on both sides of the
+  // clean start, carries the flag into the session and the .trt — and a
+  // reopen goes straight to it, with no notice: no repair runs then.
+  await test("damaged-video-editor-repair", async () => {
+    const t0 = performance.now();
+    let path = "";
+    let plans: ReturnType<typeof recordPlans> | null = null;
+    const held: RepairHold = { hold: null, error: "" };
+    const refusals = recordRefusals();
+    const toasts = watchToasts(DAMAGED_TOAST);
+    const unwatch: Array<() => void> = [];
+    try {
+      const { info, media: fixture } = await fixtureMedia();
+      const cache = await clearCachedRepair(fixture);
+      path = await ipc.newProjectPath("Autotest damaged video");
+      await ipc.saveProject(path, importMediaAsClip(createProject("Autotest damaged video"), info).project);
+      plans = recordPlans(ipc, isDamagedFixture, () => holdFirstFullRepair(held));
+      const calls = plans.calls;
+
+      const ed = await openEditor(path, "the damaged-video project");
+      const mediaId = ed.session.project.media[0]?.id ?? "";
+      assert(mediaId !== "", "the project mounted without its media");
+      // The sequences as they happen: each Tauri event is its own task, so
+      // the instant ready and the full ready are separate notifications.
+      const states: string[] = [];
+      const phases: string[] = [];
+      const logState = (): void => {
+        const st = ed.media.status.get()[mediaId];
+        const s = st === undefined ? "none" : st.state === "ready" ? `ready on the ${copyName(st.sourcePath)}` : st.state === "failed" ? `failed "${st.message}"` : st.state;
+        if (states[states.length - 1] !== s) states.push(s);
+      };
+      const logPhase = (): void => {
+        const d = ed.media.damage.get()[mediaId];
+        const s = d === undefined ? "healthy" : d.phase;
+        if (phases[phases.length - 1] !== s) phases.push(s);
+      };
+      logState();
+      logPhase();
+      unwatch.push(ed.media.status.subscribe(logState), ed.media.damage.subscribe(logPhase));
+      const evidence = (): string =>
+        `states: ${states.join(" → ")}; damage: ${phases.join(" → ")}; plans: ${describePlans(calls)}; media errors: ${describeRefusals(refusals.list)}`;
+      const stageVideo = (): string => {
+        const v = ed.activeVideo();
+        return v
+          ? `the stage's <video> is on the ${copyName(urlPath(v.currentSrc))} at ${v.currentTime.toFixed(3)} s, readyState ${v.readyState}${v.seeking ? ", seeking" : ""}${v.error ? `, error ${v.error.code}` : ""}`
+          : "the stage has no active <video>";
+      };
+      /** The stage's <video> on a copy, settled at the playhead `t`. */
+      const settled = (isCopy: (p: string) => boolean, t: number) => (): HTMLVideoElement | null => {
+        const v = ed.activeVideo();
+        return v && isCopy(urlPath(v.currentSrc)) && !v.seeking && v.readyState >= 2 && Math.abs(v.currentTime - t) < 0.05 ? v : null;
+      };
+      const scrim = must($(".preview__overlay"), "no .preview__overlay status overlay in the stage");
+      const canvas = must(scrim.parentElement, "the stage overlay has no canvas around it");
+      const scrimSays = (): string => (paints(scrim) ? textOf(scrim) : "");
+      const row = (): HTMLElement | null => $(`.media-row[data-id="${CSS.escape(mediaId)}"]`);
+      const binLabel = (): HTMLElement | null => innermostWithText(row(), (t) => t === "Damaged");
+      const binSays = (): string => textOf(row()?.querySelector(".media-row__status") ?? row());
+
+      /* ---- 1. the instant copy plays, unasked ---- */
+      // A "failed" that holds is final, no refusal within 3 s means this
+      // WebView played the raw fixture, and the full repair arriving first
+      // means the hold missed it: each fails at once, for its own reason.
+      const tMount = performance.now();
+      let failedAt = 0;
+      await until(
+        () => {
+          const st = ed.media.status.get()[mediaId];
+          if (st?.state === "failed") {
+            failedAt ||= performance.now();
+            if (performance.now() - failedAt > 500) throw new Error(`the damaged clip failed instead of playing an instant copy — ${evidence()}`);
+          } else failedAt = 0;
+          if (rawRefusal(refusals.list) === undefined && performance.now() - tMount > 3_000) {
+            throw new Error(
+              `this WebView raised no MediaError 3/4 on the raw damaged_h264.mp4 within 3 s — it plays the fixture directly (or refused it some other way), so nothing here exercises the repair — ${evidence()}`,
+            );
+          }
+          if (st?.state === "ready" && isFullCopy(st.sourcePath)) {
+            throw new Error(
+              `the full repair played before any instant copy (${holdMissed(held)}) — ${evidence()}`,
+            );
+          }
+          return st?.state === "ready" && isQuickCopy(st.sourcePath) ? st : null;
+        },
+        8_000,
+        () => `the clip ready on its instant .quick.mp4 copy — ${evidence()}`,
+      );
+      const quickMs = Math.round(performance.now() - tMount);
+
+      const first = calls[0];
+      assert(
+        first !== undefined && !first.repair && first.answer === "direct",
+        `the first plan was not a plain one answered Direct (the probe calling the file clean): ${describePlans(calls)}`,
+      );
+      const refused = must(rawRefusal(refusals.list), `no MediaError 3/4 on the raw damaged_h264.mp4 — media errors: ${describeRefusals(refusals.list)}`);
+      const repairCall = must(calls.find((c) => c.repair), `no repair plan was asked for — plans: ${describePlans(calls)}`);
+      assert(repairCall.at >= refused.at, `the repair was planned before the WebView refused the file — ${evidence()}`);
+      const note = must(repairCall.note, `the repair plan answered ${describePlans([repairCall])} with no repair note`);
+      assert(
+        note.quick === true && note.dropsHeaders === true && repairCall.file !== null && isQuickCopy(repairCall.file),
+        `the repair plan answered ${describePlans([repairCall])} — expected the instant .quick.mp4 copy (quick) of a recipe that drops in-band headers (dropsHeaders)`,
+      );
+      assert(
+        typeof note.damagedUntil === "number" && Math.abs(note.damagedUntil - DAMAGED_UNTIL) < 0.01,
+        `the backend's scan put the damage until ${String(note.damagedUntil)} s, not at the fixture's first clean IDR, ${DAMAGED_UNTIL.toFixed(3)} s`,
+      );
+      const upgrade = must(repairCall.upgrade, `the instant copy's plan names no full repair behind it — ${describePlans([repairCall])}`);
+      assert(
+        isHeaderFreeCopy(upgrade.output),
+        `the upgrade writes ${lastName(upgrade.output)}, not the .repairh.mp4 full repair of the header-dropping recipe its note names`,
+      );
+      assert(held.error === "", `the full repair's job:done could not be held: ${held.error}`);
+      const hold = must(held.hold, "no hold was set on the full repair");
+      const stray = heldOtherThan(hold, upgrade.jobId);
+      assert(stray === "", stray);
+
+      const dmg = must(ed.media.damage.get()[mediaId], `no damage record for the clip on its instant copy — ${evidence()}`);
+      assert(
+        dmg.phase === "repairing" && dmg.until !== null && Math.abs(dmg.until - DAMAGED_UNTIL) < 0.01,
+        `the clip's damage record is ${JSON.stringify(dmg)} on the instant copy — expected repairing, until ${DAMAGED_UNTIL} s`,
+      );
+
+      // The bin says so, in the app's warning colour, with the range.
+      const label = await until(
+        () => {
+          const l = binLabel();
+          return paints(l) ? l : null;
+        },
+        1_500,
+        () => `a rendered "Damaged" in the clip's bin row — it says "${binSays()}"`,
+      );
+      const tip = titleWithin(label, row());
+      assert(
+        DAMAGED_RANGE.test(tip) && /couldn't be read/.test(tip) && /repairing/.test(tip),
+        `the bin's "Damaged" tooltip says "${tip}" — expected the unreadable range 0:00-0:02 and that it is repairing`,
+      );
+      const warn = warnRgb(label.parentElement ?? label);
+      assert(
+        sameRgb(cssRgb(getComputedStyle(label).color), warn),
+        `the bin's "Damaged" is ${getComputedStyle(label).color}, not the app's --warn (${String(warn)})`,
+      );
+      // Told once, in the notice tone (src/ui/toast.ts): the file is damaged,
+      // nothing in the app failed. The error tone (red, an alert, a
+      // Diagnostics entry) on every open of a file that plays read as a fault.
+      const toastEl = await until(() => toasts.list[0] ?? null, 1_500, () => `the "${DAMAGED_TOAST}" notice (none appeared)`);
+      assert(paints(toastEl), `the "${DAMAGED_TOAST}" notice ${toastEl.isConnected ? "is in the page but not rendered" : "was gone before the instant copy played"}`);
+      assert(
+        toastEl.classList.contains("toast--notice") && !toastEl.classList.contains("toast--error"),
+        `"${DAMAGED_TOAST}" is shown as class "${toastEl.className}" — expected the notice tone (toast--notice), not the error tone`,
+      );
+
+      // Playback is measured from here on: a video wired into the audio graph
+      // (this fixture has a sound track) advances only while the graph PULLS
+      // its audio — its clock is the audio renderer's. Under this harness
+      // nothing does by default (master is left unconnected from the speakers
+      // for silent runs, see audio-graph.ts, and a fresh mount has no
+      // AudioContext activation): PLAYING, readyState 4, clock frozen. The
+      // analyser tap is what pulls a silent graph. A release build connects
+      // master to the destination, so a user's Play never meets this.
+      assert(await ed.audioGraph.devEnsureRunning(), "the editor's AudioContext would not run, so no playback could be measured");
+      ed.audioGraph.devMasterAnalyser();
+
+      // Inside the damage the instant copy has no picture (it holds its first
+      // good frame there, which reads as a frozen video): covered, on black.
+      ed.engine.seek(IN_DAMAGE_T);
+      const covered = await until(
+        () => (/^Damaged section/.test(scrimSays()) ? scrimSays() : null),
+        1_500,
+        () => `the stage's "Damaged section" at ${IN_DAMAGE_T.toFixed(3)} s on the instant copy — the overlay ${paints(scrim) ? `says "${scrimSays()}"` : "is not shown"}`,
+      );
+      assert(/repairing/.test(covered), `the stage says "${covered}" while the full repair has not landed — expected that it is repairing`);
+      const cr = canvas.getBoundingClientRect();
+      for (const [fx, fy] of [[0.5, 0.5], [0.08, 0.5], [0.92, 0.92]] as const) {
+        const hit = topWithin(canvas, cr.left + cr.width * fx, cr.top + cr.height * fy);
+        assert(
+          hit === scrim || scrim.contains(hit),
+          `the instant copy's held frame is not covered at (${fx}, ${fy}) of the stage: ${describeHit(hit)} paints on top of "Damaged section"`,
+        );
+      }
+      const coverBg = getComputedStyle(scrim).backgroundColor;
+      assert((cssRgb(coverBg)?.[3] ?? 0) >= 0.99, `the "Damaged section" cover is ${coverBg}: not opaque, so the instant copy's frozen frame shows through`);
+
+      // Past the damage the instant copy is the video itself: nothing over it,
+      // and it decodes.
+      ed.engine.seek(CLEAN_T);
+      const qv = await until(settled(isQuickCopy, CLEAN_T), 3_000, () => `the instant copy settled at ${CLEAN_T.toFixed(3)} s — ${stageVideo()}`);
+      assert(!/Damaged section|Preview unavailable/.test(scrimSays()), `at ${CLEAN_T.toFixed(3)} s, past the damage, the stage still says "${scrimSays()}"`);
+      const quickDims = `${qv.videoWidth}x${qv.videoHeight}`;
+      assert(qv.videoWidth === DAMAGED_W && qv.videoHeight === DAMAGED_H, `the instant copy plays at ${quickDims}, not ${DAMAGED_W}x${DAMAGED_H}`);
+      ed.engine.play();
+      let quickReading: Awaited<ReturnType<typeof playbackReading>>;
+      try {
+        quickReading = await playbackReading(qv, 500);
+      } finally {
+        ed.engine.pause();
+      }
+      assert(quickReading.ok, `the instant copy does not decode past the damage: ${quickReading.text}`);
+
+      // The picture the full repair must match, from the lossless copy of the
+      // clean tail, at a playhead nothing touches until the swap has landed.
+      ed.engine.seek(REF_T);
+      const rv = await until(settled(isQuickCopy, REF_T), 2_000, () => `the instant copy settled at ${REF_T.toFixed(3)} s — ${stageVideo()}`);
+      await sleep(40);
+      const ref = frameSignature(rv);
+      assert(pictureSpread(ref) > 20, `the instant copy's frame at ${REF_T.toFixed(3)} s is flat (spread ${pictureSpread(ref).toFixed(1)}): nothing to compare the full repair against`);
+
+      /* ---- 2. the full repair lands ---- */
+      assert(
+        !states.some((s) => s.endsWith("full repair")),
+        `the full repair reached the editor while its job:done was held (a second plan answered it?) — ${evidence()}`,
+      );
+      const strayAtRelease = heldOtherThan(hold, upgrade.jobId);
+      assert(strayAtRelease === "", strayAtRelease);
+      const heldDones = hold.held;
+      const tRelease = performance.now();
+      hold.release();
+      await until(
+        () => {
+          const st = ed.media.status.get()[mediaId];
+          return st?.state === "ready" && isFullCopy(st.sourcePath) && ed.media.damage.get()[mediaId]?.phase === "recovered" ? st : null;
+        },
+        4_000,
+        () => `ready on the full repair with the damage recovered — ${evidence()}`,
+      );
+      const swapMs = Math.round(performance.now() - tRelease);
+      assert(toasts.list.length === 1, `"${DAMAGED_TOAST}" was shown ${toasts.list.length} times for one file in one session`);
+
+      // The swap kept the playhead's frame, and that frame is upright.
+      const fv = await until(
+        settled(isFullCopy, REF_T),
+        3_000,
+        () => `the full repair on the stage at the playhead's ${REF_T.toFixed(3)} s after the swap — ${stageVideo()}`,
+      );
+      const fullDims = `${fv.videoWidth}x${fv.videoHeight}`;
+      assert(fv.videoWidth === DAMAGED_W && fv.videoHeight === DAMAGED_H, `the full repair plays at ${fullDims}, not ${DAMAGED_W}x${DAMAGED_H}`);
+      await sleep(40);
+      const upright = pictureDistance(ref, frameSignature(fv));
+      assert(
+        upright < SAME_PICTURE,
+        `the full repair's frame at ${REF_T.toFixed(3)} s is not the instant copy's picture (mean luma distance ${upright.toFixed(1)}, limit ${SAME_PICTURE}): turned or distorted — the orientation SEI reached the repair's decoder`,
+      );
+
+      const recovered = await until(
+        () => {
+          const l = binLabel();
+          return paints(l) && /recovered/.test(titleWithin(l, row())) ? l : null;
+        },
+        1_500,
+        () => `the bin's "Damaged" saying recovered — it says "${binSays()}", tooltip "${binLabel() ? titleWithin(binLabel()!, row()) : ""}"`,
+      );
+      const recoveredTip = titleWithin(recovered, row());
+
+      // Inside the damage only a small label sits over the full repair: its
+      // picture there is ffmpeg's recovered one, shown as it is.
+      ed.engine.seek(IN_DAMAGE_T);
+      await until(settled(isFullCopy, IN_DAMAGE_T), 2_000, () => `the full repair settled at ${IN_DAMAGE_T.toFixed(3)} s — ${stageVideo()}`);
+      await until(
+        () => scrimSays() === "Damaged section" || null,
+        1_000,
+        () => `the stage's "Damaged section" label over the recovered picture at ${IN_DAMAGE_T.toFixed(3)} s — the overlay ${paints(scrim) ? `says "${scrimSays()}"` : "is not shown"}`,
+      );
+      const lr = scrim.getBoundingClientRect();
+      const cr2 = canvas.getBoundingClientRect();
+      const share = (lr.width * lr.height) / Math.max(1, cr2.width * cr2.height);
+      const cx = cr2.left + cr2.width / 2;
+      const cy = cr2.top + cr2.height / 2;
+      assert(
+        share < 0.25 && !(cx >= lr.left && cx <= lr.right && cy >= lr.top && cy <= lr.bottom),
+        `over the recovered picture "Damaged section" covers ${Math.round(share * 100)}% of the stage${share < 0.25 ? " and its centre" : ""} — it must be a small label, not a cover`,
+      );
+
+      // Played from just before its last recovered frame, it presents that
+      // frame (1.433 s; ffmpeg concealed the garbage into flat frames, so a
+      // still could not tell one from black) and then the clean ones: it
+      // decodes on both sides of the clean start, where the instant copy has
+      // no frame before it at all.
+      ed.engine.seek(CROSS_FROM_T);
+      const xv = await until(settled(isFullCopy, CROSS_FROM_T), 2_000, () => `the full repair settled at ${CROSS_FROM_T.toFixed(3)} s — ${stageVideo()}`);
+      ed.engine.play();
+      let cross: Awaited<ReturnType<typeof playbackReading>>;
+      try {
+        cross = await playbackReading(xv, 900);
+      } finally {
+        ed.engine.pause();
+      }
+      assert(
+        cross.ok && cross.first >= 0 && cross.first < DAMAGED_UNTIL - 0.01 && cross.last >= DAMAGED_UNTIL,
+        `the full repair, played from ${CROSS_FROM_T.toFixed(3)} s, did not present frames on both sides of the clean start at ${DAMAGED_UNTIL} s: ${cross.text}`,
+      );
+      assert(!/Damaged section/.test(scrimSays()), `paused past the damage the stage still says "${scrimSays()}"`);
+
+      // The flag, in the session and on disk: the export reads the .trt, so
+      // this is the half that reaches it.
+      const m0 = (): MediaRef | undefined => ed.session.project.media[0];
+      await until(
+        () => m0()?.dropInbandHeaders === true || null,
+        2_000,
+        () => `dropInbandHeaders on the session's media (it is ${String(m0()?.dropInbandHeaders)})`,
+      );
+      const oldKeys = (m: MediaRef | undefined): string[] => Object.keys(m ?? {}).filter((k) => /paramsets/i.test(k));
+      assert(oldKeys(m0()).length === 0, `the session's media also carries ${oldKeys(m0()).join(", ")} — a key from before the rename`);
+      await ed.session.save();
+      const disk = await ipc.loadProject(path);
+      assert(
+        disk.project.media[0]?.dropInbandHeaders === true,
+        `the .trt on disk does not carry dropInbandHeaders (${String(disk.project.media[0]?.dropInbandHeaders)}) — the session stamped it, the save dropped it`,
+      );
+      assert(oldKeys(disk.project.media[0]).length === 0, `the .trt carries ${oldKeys(disk.project.media[0]).join(", ")} — a key from before the rename`);
+
+      /* ---- 3. a later open goes straight to the full repair ---- */
+      for (const u of unwatch.splice(0)) u();
+      await toHome();
+      const callsBefore = calls.length;
+      const refusedBefore = refusals.list.length;
+      const toastsBefore = toasts.list.length;
+      const again = await openEditor(path, "the damaged-video project, reopened");
+      const tReopen = performance.now();
+      await until(
+        () => {
+          const st = again.media.status.get()[mediaId];
+          return st?.state === "ready" && isFullCopy(st.sourcePath) && again.media.damage.get()[mediaId]?.phase === "recovered" ? st : null;
+        },
+        5_000,
+        () => `the reopened clip ready on its full repair, damage recovered — status ${JSON.stringify(again.media.status.get()[mediaId] ?? null)}, damage ${JSON.stringify(again.media.damage.get()[mediaId] ?? null)}; plans since the reopen: ${describePlans(calls.slice(callsBefore))}`,
+      );
+      const reopenMs = Math.round(performance.now() - tReopen);
+      const reopenCalls = calls.slice(callsBefore);
+      assert(
+        reopenCalls.length > 0 &&
+          reopenCalls.every((c) => c.repair && c.file !== null && isHeaderFreeCopy(c.file) && c.note?.quick !== true && c.upgrade === undefined),
+        `the reopen planned [${describePlans(reopenCalls)}] — a flagged file whose .repairh.mp4 full repair is cached must plan that copy only`,
+      );
+      const rerefused = refusals.list.slice(refusedBefore).filter((r) => isDamagedFixture(r.src));
+      assert(rerefused.length === 0, `the reopen handed the WebView the raw file again: ${describeRefusals(rerefused)}`);
+      const reopenLabel = await until(
+        () => {
+          const l = binLabel();
+          return paints(l) ? l : null;
+        },
+        1_500,
+        () => `a rendered "Damaged" in the reopened bin row — it says "${binSays()}"`,
+      );
+      // No repair runs on this open, so there is nothing to tell: the bin and
+      // the stage still say "Damaged", and a notice on every open of a file
+      // that plays would be noise. Counted after the clip went ready — the
+      // manager tells it in the same task as the plan's answer.
+      const reopenToasts = toasts.list.length - toastsBefore;
+      assert(reopenToasts === 0, `the reopen, which found the recovered copy and ran no repair, showed "${DAMAGED_TOAST}" ${reopenToasts} time(s)`);
+
+      return `${cache}; plain plan → Direct; WebView refused the raw file (${refused.code}: "${refused.message.slice(0, 60)}"); repair plan → ${describePlans([repairCall])}; instant copy ready ${quickMs} ms after mount (${quickDims}), its full repair held (${heldDones} job:done); bin "Damaged" in --warn, tooltip "${tip}"; a notice once, not in the error tone; stage "${covered}" on black over ${IN_DAMAGE_T.toFixed(2)} s; instant copy past the damage: ${quickReading.text}; released → full repair in ${swapMs} ms at the playhead (${fullDims}, luma distance ${upright.toFixed(1)} from the instant copy's frame: upright); bin "${recoveredTip}"; a ${Math.round(share * 100)}% "Damaged section" label over its recovered part; played across ${DAMAGED_UNTIL} s: ${cross.text}; dropInbandHeaders in session + .trt; reopen → ${describePlans(reopenCalls)} in ${reopenMs} ms, raw file untouched, bin "${textOf(reopenLabel)}", no notice on the reopen — ${Math.round(performance.now() - t0)} ms`;
+    } finally {
+      for (const u of unwatch) u();
+      // Handed over before leaving: a held done must not outlive the block.
+      held.hold?.release();
+      plans?.restore();
+      refusals.stop();
+      toasts.stop();
+      try {
+        await toHome();
+      } catch (e) {
+        console.error("damaged-video autotest: cleanup did not reach Home", e);
+      }
+      if (path) {
+        await ipc.deleteProject(path).catch(() => {});
+        await ipc.removeRecent(path).catch(() => {});
+      }
+      // The next block (and the next run) must meet the instant phase again.
+      const left = await removeCacheFiles(plannedFiles(plans?.calls ?? []));
+      if (left.length) console.error("damaged-video autotest: repair copies left in the cache", left);
+    }
+  });
+
+  // The viewer: nothing to press either. The WebView refuses the raw file,
+  // the instant copy plays unasked under a "Damaged video" pill, the seek bar
+  // shades the unreadable range, and the part the copy has no picture for is
+  // covered and labelled. Released, the full repair swaps in WHILE PLAYING —
+  // no "Can't show this file", no loading state, no src dropped between the
+  // two, the video still playing from where it was — upright, with nothing
+  // over its recovered part. A revisit plays the cached full repair at once.
+  // The viewer is mounted on a still first and files are opened through the
+  // real Explorer route (debugPushOpenPath), which swaps the shown file in place.
+  await test("damaged-video-viewer-repair", async () => {
+    const t0 = performance.now();
+    const STILL = `${fixturesDir}\\photo.png`;
+    const { currentSession, settingsStore, updateSettings } = await import("../core/session");
+    const openWithBefore = settingsStore.get().openWith;
+    let plans: ReturnType<typeof recordPlans> | null = null;
+    const held: RepairHold = { hold: null, error: "" };
+    const refusals = recordRefusals();
+    let observer: MutationObserver | null = null;
+    const vwVideo = (): HTMLVideoElement | null => $<HTMLVideoElement>("#vw-video");
+    const stage = (): HTMLElement | null => $("#vw-stage");
+    const pill = (): HTMLElement | null => innermostWithText($("#vw-top"), (t) => t.startsWith("Damaged video"));
+    const coverLabel = (): HTMLElement | null => {
+      const l = innermostWithText(stage(), (t) => t.startsWith("Damaged section"));
+      return paints(l) ? l : null;
+    };
+    /** What paints topmost at a point of the stage. The viewer's cover and its
+     *  label opt out of pointer events on purpose (a click must reach the
+     *  video), which hides them from elementFromPoint — so every stage child
+     *  but the media is made hit-testable for the probe, and put back. */
+    const topmostInStage = (x: number, y: number): Element | null => {
+      const s = must(stage(), "#vw-stage is gone");
+      const media = [vwVideo(), $("#vw-img")];
+      const touched: Array<[HTMLElement, string]> = [];
+      for (const el of Array.from(s.querySelectorAll<HTMLElement>("*"))) {
+        if (media.some((m) => m !== null && (m === el || m.contains(el)))) continue;
+        if (getComputedStyle(el).pointerEvents === "none") {
+          touched.push([el, el.style.pointerEvents]);
+          el.style.pointerEvents = "auto";
+        }
+      }
+      try {
+        return topWithin(s, x, y);
+      } finally {
+        for (const [el, v] of touched) el.style.pointerEvents = v;
+      }
+    };
+    /** The picture shows at a point of the video: nothing of the stage over it. */
+    const pictureAt = (v: HTMLVideoElement, fx: number, fy: number): { shows: boolean; hit: Element | null } => {
+      const r = v.getBoundingClientRect();
+      const hit = topmostInStage(r.left + r.width * fx, r.top + r.height * fy);
+      return { shows: hit === v || hit === stage(), hit };
+    };
+    const viewerState = (): string => {
+      const d = viewerHook();
+      const v = vwVideo();
+      return [
+        `#vw ${$("#vw") ? "mounted" : "ABSENT"}`,
+        `dev ${d ? `on ${lastName(d.path())}, class ${String(d.lastClass)}, job ${String(d.jobId)}, loads ${d.loads}` : "ABSENT"}`,
+        `status "${paints($("#vw-status")) ? textOf($("#vw-status")) : ""}"`,
+        `pill "${paints(pill()) ? textOf(pill()) : ""}"`,
+        `video ${v ? `${v.videoWidth}x${v.videoHeight} rs${v.readyState} at ${v.currentTime.toFixed(2)} on the ${copyName(urlPath(v.currentSrc))}${v.paused ? ", paused" : ""}${v.error ? ` error ${v.error.code}` : ""}` : "none"}`,
+        `plans: ${describePlans(plans?.calls ?? [])}`,
+        `media errors: ${describeRefusals(refusals.list)}`,
+      ].join("; ");
+    };
+    /** Seek `v` and wait for it to land. A frame is required only where the
+     *  file has one: the instant copy's video starts at the clean IDR, so
+     *  before it the element can stop at metadata (what WebView2 shows there,
+     *  the held first frame, is not this block's question — the cover is). */
+    const settledAt = async (v: HTMLVideoElement, t: number, what: string): Promise<void> => {
+      const minReady = t < DAMAGED_UNTIL && isQuickCopy(urlPath(v.currentSrc)) ? 1 : 2;
+      v.currentTime = t;
+      await until(() => !v.seeking && v.readyState >= minReady && Math.abs(v.currentTime - t) < 0.05, 2_000, () => `${what} to settle at ${t.toFixed(3)} s — ${viewerState()}`);
+    };
+    // What the viewer did, as it did it: an offer it must no longer make, the
+    // status card's every text, and every src/hidden change of the <video>
+    // (old values, so a drop and a re-set within one task both show).
+    const offers: string[] = [];
+    const statusTexts: string[] = [];
+    /** When each of statusTexts was seen (performance.now()). */
+    const statusAt: number[] = [];
+    const videoChanges: string[] = [];
+    /** The status card's text while it is shown, "" while it is not - and ""
+     *  while the card is the COVER's label (viewer__status--passive: "Damaged
+     *  section · ..." over the picture of the instant copy), which is painted
+     *  the moment the copy is handed over and is asserted on its own below. */
+    const cardText = (): string => {
+      const card = $("#vw-status");
+      if (!paints(card) || card.classList.contains("viewer__status--passive")) return "";
+      return textOf($("#vw-status .viewer__status-text") ?? card);
+    };
+    const record = (list: MutationRecord[]): void => {
+      if ($("#vw-prepare") && offers.length === 0) offers.push(`Prepare preview under "${textOf($("#vw-status"))}"`);
+      const s = cardText();
+      if (s !== "" && statusTexts[statusTexts.length - 1] !== s) {
+        statusTexts.push(s);
+        statusAt.push(performance.now());
+      }
+      const runs = new Map<string, Array<string | null>>();
+      for (const r of list) {
+        if (r.type !== "attributes" || r.target !== vwVideo() || r.attributeName === null) continue;
+        const key = r.attributeName;
+        if (!runs.has(key)) runs.set(key, []);
+        runs.get(key)!.push(r.oldValue);
+      }
+      for (const [attr, olds] of runs) {
+        const now = vwVideo()?.getAttribute(attr) ?? null;
+        const values = [...olds, now];
+        for (let i = 1; i < values.length; i++) {
+          const shown = (x: string | null): string => (x === null ? "none" : attr === "src" ? copyName(urlPath(x)) : JSON.stringify(x));
+          videoChanges.push(`${attr} ${shown(values[i - 1] ?? null)} → ${shown(values[i] ?? null)}`);
+        }
+      }
+    };
+    const showStill = async (dev: ViewerDevHook): Promise<void> => {
+      await ipc.debugPushOpenPath(STILL);
+      await until(
+        () => {
+          const img = $<HTMLImageElement>("#vw-img");
+          return lastName(dev.path()) === "photo.png" && img?.complete && img.naturalWidth === 1920 && paints(img);
+        },
+        4_000,
+        () => `photo.png shown — ${viewerState()}`,
+      );
+    };
+    try {
+      const { media: fixture } = await fixtureMedia();
+      assert(await ipc.pathExists(STILL), `fixture ${STILL} is missing — run npm run fixtures`);
+      const cache = await clearCachedRepair(fixture);
+      plans = recordPlans(ipc, isDamagedFixture, () => holdFirstFullRepair(held));
+      const calls = plans.calls;
+      if (openWithBefore !== "viewer") await updateSettings({ openWith: "viewer" });
+      await ipc.debugPushOpenPath(STILL);
+      const dev = await until(
+        () => {
+          const d = viewerHook();
+          return $("#vw") && d && lastName(d.path()) === "photo.png" ? d : null;
+        },
+        5_000,
+        () => `the viewer on photo.png (on screen: ${onScreen()})`,
+      );
+      observer = new MutationObserver(record);
+      observer.observe(must($("#vw"), "#vw is gone"), {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+        attributeOldValue: true,
+        attributeFilter: ["src", "hidden"],
+      });
+
+      /* ---- 1. the instant copy plays, unasked ---- */
+      const tOpen = performance.now();
+      // What the card SHOWS once the plan has named the instant copy, sampled
+      // by the poll below: a card left as it was (the same text set again is
+      // no mutation, so the recorder above never sees it) shows only here.
+      const cardWhileMade: string[] = [];
+      await ipc.debugPushOpenPath(FILE);
+      const v = await until(
+        () => {
+          const asked = calls.find((c) => c.repair);
+          const shown = cardText();
+          const made = asked !== undefined && asked.answeredAt !== null && asked.note?.quick === true;
+          if (made && shown !== "" && !cardWhileMade.includes(shown)) cardWhileMade.push(shown);
+          if (offers.length) throw new Error(`the viewer offered ${offers[0]} for a damaged file — ${viewerState()}`);
+          if (rawRefusal(refusals.list) === undefined && performance.now() - tOpen > 3_000) {
+            throw new Error(`this WebView raised no MediaError 3/4 on the raw damaged_h264.mp4 within 3 s, so nothing here exercises the repair — ${viewerState()}`);
+          }
+          const x = vwVideo();
+          if (x && isFullCopy(urlPath(x.currentSrc))) {
+            throw new Error(`the full repair played before any instant copy (${holdMissed(held)}) — ${viewerState()}`);
+          }
+          // Metadata, not a frame: the copy autoplays from 0, where its video
+          // has no sample yet (see settledAt).
+          return isDamagedFixture(dev.path()) && x && isQuickCopy(urlPath(x.currentSrc)) && x.readyState >= 1 ? x : null;
+        },
+        6_000,
+        () => `the instant .quick.mp4 copy in #vw-video — ${viewerState()}`,
+      );
+      const quickMs = Math.round(performance.now() - tOpen);
+      // The card's every text until the instant copy played (checked below).
+      const preparingTexts = statusTexts.slice();
+      const preparingAt = statusAt.slice();
+      assert(dev.lastClass === "direct", `damaged_h264.mp4 classified ${String(dev.lastClass)}, not direct — the repair must come from the WebView's refusal, not the classifier`);
+      const refused = must(rawRefusal(refusals.list), `the instant copy plays with no MediaError 3/4 on the raw file — media errors: ${describeRefusals(refusals.list)}`);
+      const repairCall = must(calls.find((c) => c.repair), `no repair plan was asked for — ${viewerState()}`);
+      assert(repairCall.at >= refused.at, `the repair was planned before the WebView refused the file — ${viewerState()}`);
+      const note = repairCall.note;
+      assert(
+        note?.quick === true && note.dropsHeaders === true && typeof note.damagedUntil === "number" && Math.abs(note.damagedUntil - DAMAGED_UNTIL) < 0.01,
+        `the repair plan answered ${describePlans([repairCall])} — expected the instant copy (quick) of a header-dropping recipe, damaged until ${DAMAGED_UNTIL} s`,
+      );
+      const upgrade = must(repairCall.upgrade, `the instant copy's plan names no full repair behind it — ${describePlans([repairCall])}`);
+      assert(
+        isHeaderFreeCopy(upgrade.output),
+        `the upgrade writes ${lastName(upgrade.output)}, not the .repairh.mp4 full repair of the header-dropping recipe its note names`,
+      );
+      assert(held.error === "", `the full repair's job:done could not be held: ${held.error}`);
+      const hold = must(held.hold, "no hold was set on the full repair");
+      const stray = heldOtherThan(hold, upgrade.jobId);
+      assert(stray === "", stray);
+      // Until the instant copy played the card named the damage and gave no
+      // number: "preparing" and nothing else, from the refusal (the plan still
+      // being asked) through the copy being made - a percent there would be
+      // the stream copy's own, and it ran backwards when the full repair's
+      // began. No card at all is accepted — a copy already cached (see
+      // clearCachedRepair), or one whose job:done beat the plan's answer.
+      const answeredAt = must(repairCall.answeredAt, `the repair plan has no answer recorded — ${describePlans([repairCall])}`);
+      const unnamed = preparingTexts.filter((t) => !/^Damaged video\s*·\s*preparing$/.test(t));
+      assert(
+        unnamed.length === 0,
+        `before the instant copy played the card said ${unnamed.map((t) => `"${t}"`).join(", ")} — expected "Damaged video" and what is happening, with no percent`,
+      );
+      const whileMade = [...preparingTexts.filter((_, i) => (preparingAt[i] ?? 0) >= answeredAt), ...cardWhileMade].filter(
+        (t, i, all) => all.indexOf(t) === i && !/^Damaged video\s*·\s*preparing$/.test(t),
+      );
+      assert(
+        whileMade.length === 0,
+        `while the instant copy was made the card said ${whileMade.map((t) => `"${t}"`).join(", ")} — expected "Damaged video · preparing"`,
+      );
+      const quickDims = `${v.videoWidth}x${v.videoHeight}`;
+      assert(v.videoWidth === DAMAGED_W && v.videoHeight === DAMAGED_H, `the instant copy shows at ${quickDims}, not ${DAMAGED_W}x${DAMAGED_H}`);
+
+      // The pill, beside the name: damaged, repairing, and the range.
+      const p = await until(() => (paints(pill()) ? pill() : null), 1_500, () => `a rendered "Damaged video" pill in the top bar — ${viewerState()}`);
+      const pillRepairing = textOf(p);
+      assert(/^Damaged video\s*·\s*repairing/.test(pillRepairing), `the pill says "${pillRepairing}" while the full repair has not landed`);
+      const pillTip = titleWithin(p, $("#vw"));
+      assert(DAMAGED_RANGE.test(pillTip) && /couldn't be read/.test(pillTip), `the pill's tooltip says "${pillTip}" — expected the unreadable range 0:00-0:02`);
+
+      // Paused inside the damage: the bar shades [0, 2 s] and the stage covers
+      // the part the copy has no picture for.
+      v.pause();
+      await settledAt(v, 0.5, "the instant copy");
+      const seek = must($("#vw-seek"), "no #vw-seek bar");
+      assert(paints($("#vw-bar")) && paints(seek), "the seek bar is not rendered over the instant copy");
+      const sr = seek.getBoundingClientRect();
+      const wantW = (sr.width * DAMAGED_UNTIL) / v.duration;
+      const shades = Array.from(seek.querySelectorAll<HTMLElement>("*")).filter((el) => {
+        if (!paints(el)) return false;
+        const r = el.getBoundingClientRect();
+        return Math.abs(r.left - sr.left) <= 2 && Math.abs(r.width - wantW) <= 4 && r.height > 0;
+      });
+      const warn = warnRgb(seek);
+      const shade = must(
+        shades.find((el) => sameRgb(cssRgb(getComputedStyle(el).backgroundColor), warn)) ?? shades[0],
+        `nothing on the seek bar spans the damaged ${DAMAGED_UNTIL} s of ${v.duration.toFixed(2)} s (${wantW.toFixed(1)} of ${sr.width.toFixed(1)} px from its left edge) — the bar holds ${Array.from(seek.querySelectorAll<HTMLElement>("*")).map((el) => { const r = el.getBoundingClientRect(); return `${describeHit(el)} ${(r.left - sr.left).toFixed(1)}+${r.width.toFixed(1)} px`; }).join(", ")}`,
+      );
+      const shadeBg = getComputedStyle(shade).backgroundColor;
+      assert(sameRgb(cssRgb(shadeBg), warn), `the damaged range on the seek bar is ${shadeBg}, not a tint of the app's --warn (${String(warn)})`);
+      const shadeText = `${shade.getBoundingClientRect().width.toFixed(1)} of ${sr.width.toFixed(1)} px (${DAMAGED_UNTIL} of ${v.duration.toFixed(3)} s)`;
+      const label = await until(coverLabel, 1_000, () => `a "Damaged section" label over the instant copy at 0.5 s — ${viewerState()}`);
+      assert(/repairing/.test(textOf(label)), `the stage says "${textOf(label)}" while the full repair has not landed`);
+      for (const [fx, fy] of [[0.5, 0.5], [0.1, 0.5], [0.9, 0.9]] as const) {
+        const at = pictureAt(v, fx, fy);
+        assert(!at.shows, `the instant copy's held frame shows at (${fx}, ${fy}) under "${textOf(label)}" (${describeHit(at.hit)} is on top)`);
+      }
+      const edge = pictureAt(v, 0.1, 0.5).hit;
+      let coverEl: Element | null = edge;
+      while (coverEl !== null && coverEl !== stage() && (cssRgb(getComputedStyle(coverEl).backgroundColor)?.[3] ?? 0) < 0.99) coverEl = coverEl.parentElement;
+      assert(coverEl !== null && coverEl !== stage(), `what covers the instant copy (${describeHit(edge)}) is not opaque: its frozen frame shows through`);
+
+      // Past the damage: no cover, the copy is the picture.
+      await settledAt(v, CLEAN_T, "the instant copy");
+      assert(coverLabel() === null, `past the damage the stage still says "${textOf(coverLabel())}"`);
+      const clear = pictureAt(v, 0.1, 0.5);
+      assert(clear.shows, `past the damage the instant copy is still covered by ${describeHit(clear.hit)}`);
+      const ref = await probeFrame(v.currentSrc, REF_T);
+      assert(pictureSpread(ref.sig) > 20, `the instant copy's frame at ${REF_T.toFixed(3)} s is flat (spread ${pictureSpread(ref.sig).toFixed(1)}): nothing to compare the full repair against`);
+
+      /* ---- 2. the full repair swaps in while it plays ---- */
+      const swapFrom = 2.05;
+      await settledAt(v, swapFrom, "the instant copy");
+      void v.play().catch(() => {});
+      await until(() => !v.paused && v.currentTime > swapFrom + 0.03, 1_500, () => `the instant copy playing from ${swapFrom} s — ${viewerState()}`);
+      const textsBefore = statusTexts.length;
+      const changesBefore = videoChanges.length;
+      const strayAtRelease = heldOtherThan(hold, upgrade.jobId);
+      assert(strayAtRelease === "", strayAtRelease);
+      const heldDones = hold.held;
+      const tRelease = performance.now();
+      hold.release();
+      const fv = await until(
+        () => {
+          const x = vwVideo();
+          if (x?.ended) throw new Error(`the instant copy played to its end before the full repair swapped in — ${viewerState()}`);
+          return x && isFullCopy(urlPath(x.currentSrc)) && x.readyState >= 2 ? x : null;
+        },
+        3_000,
+        () => `the full repair in #vw-video — ${viewerState()}`,
+      );
+      await until(() => !fv.paused || null, 1_000, () => `the full repair to keep playing after the swap — ${viewerState()}`);
+      const swapMs = Math.round(performance.now() - tRelease);
+      const swapAt = fv.currentTime;
+      assert(swapAt >= swapFrom, `the swap restarted the video: the full repair is at ${swapAt.toFixed(2)} s, the instant copy was past ${swapFrom} s`);
+      const swapTexts = statusTexts.slice(textsBefore);
+      assert(swapTexts.length === 0, `the swap flashed ${swapTexts.map((t) => `"${t}"`).join(", ")} over a playing video`);
+      const swapChanges = videoChanges.slice(changesBefore);
+      assert(
+        !swapChanges.some((c) => /^src .* → none$/.test(c) || /^hidden .* → ""$/.test(c)),
+        `the swap emptied or hid the <video> on the way: ${swapChanges.join(", ")}`,
+      );
+      await until(
+        () => /^Damaged video\s*·\s*recovered/.test(paints(pill()) ? textOf(pill()) : "") || null,
+        1_000,
+        () => `the pill saying recovered — ${viewerState()}`,
+      );
+      const fullDims = `${fv.videoWidth}x${fv.videoHeight}`;
+      assert(fv.videoWidth === DAMAGED_W && fv.videoHeight === DAMAGED_H, `the full repair shows at ${fullDims}, not ${DAMAGED_W}x${DAMAGED_H}`);
+      const fullFrame = await probeFrame(fv.currentSrc, REF_T);
+      const upright = pictureDistance(ref.sig, fullFrame.sig);
+      assert(
+        upright < SAME_PICTURE,
+        `the full repair's frame at ${REF_T.toFixed(3)} s is not the instant copy's picture (mean luma distance ${upright.toFixed(1)}, limit ${SAME_PICTURE}): turned or distorted — the orientation SEI reached the repair's decoder`,
+      );
+      fv.pause();
+      await settledAt(fv, CLEAN_T, "the full repair");
+      void fv.play().catch(() => {});
+      const reading = await playbackReading(fv, 400);
+      assert(reading.ok, `the full repair does not decode in the viewer: ${reading.text}`);
+
+      // Its recovered part is shown as it is: nothing covers it.
+      fv.pause();
+      await settledAt(fv, 0.5, "the full repair");
+      assert(coverLabel() === null, `the recovered part is still labelled "${textOf(coverLabel())}"`);
+      const shown = pictureAt(fv, 0.1, 0.5);
+      assert(shown.shows, `the full repair's recovered part is covered by ${describeHit(shown.hit)}`);
+
+      /* ---- 3. a revisit plays the cached full repair at once ---- */
+      await showStill(dev);
+      const callsBefore = calls.length;
+      const refusedBefore = refusals.list.length;
+      const tRevisit = performance.now();
+      await ipc.debugPushOpenPath(FILE);
+      const again = await until(
+        () => {
+          const x = vwVideo();
+          return isDamagedFixture(dev.path()) && x && isFullCopy(urlPath(x.currentSrc)) && x.readyState >= 2 ? x : null;
+        },
+        4_000,
+        () => `damaged_h264.mp4 straight back as its cached full repair — ${viewerState()}`,
+      );
+      const revisitMs = Math.round(performance.now() - tRevisit);
+      assert(dev.jobId === null, `revisiting a repaired file started job ${String(dev.jobId)}`);
+      const revisitCalls = calls.slice(callsBefore);
+      assert(
+        revisitCalls.length > 0 && revisitCalls.every((c) => c.repair && c.file !== null && isHeaderFreeCopy(c.file) && c.upgrade === undefined),
+        `the revisit planned [${describePlans(revisitCalls)}] — expected the cached .repairh.mp4 full repair only`,
+      );
+      const rerefused = refusals.list.slice(refusedBefore).filter((x) => isDamagedFixture(x.src));
+      assert(rerefused.length === 0, `the revisit handed the WebView the raw file again: ${describeRefusals(rerefused)}`);
+      const revisitPill = await until(() => (paints(pill()) ? textOf(pill()) : null), 1_000, () => `the "Damaged video" pill on the revisit — ${viewerState()}`);
+      assert(offers.length === 0, `the viewer offered ${offers[0] ?? ""} for a damaged file`);
+
+      /* ---- 4. out, cleanly ---- */
+      const back = must($<HTMLButtonElement>("#vw-back"), "no #vw-back");
+      assert(paints(back), "#vw-back is not rendered");
+      back.click();
+      await until(() => $(".home") && !$("#vw"), 4_000, () => `Home after #vw-back (on screen: ${onScreen()})`);
+      assert(!again.hasAttribute("src"), "the closed viewer's <video> still holds the full repair (decoder + file handle kept)");
+      assert(viewerHook() === undefined, "__tarotingViewerDev survived the viewer's dispose");
+      assert(currentSession.get() === null, `a project session is current after the viewer closed (${currentSession.get()?.path ?? ""})`);
+      return `${cache}; photo.png → damaged_h264.mp4: class direct, WebView refused it (${refused.code}), no offer; repair plan → ${describePlans([repairCall])}; card ${preparingTexts.length ? preparingTexts.map((t) => `"${t}"`).join(" → ") : "never shown"}; instant copy (${quickDims}) up ${quickMs} ms after the open, its full repair held (${heldDones} job:done); pill "${pillRepairing}" ("${pillTip}"); seek bar shaded ${shadeText} in ${shadeBg}; "${textOf(label)}" covering it at 0.5 s, nothing at ${CLEAN_T.toFixed(2)} s; released while playing → full repair in ${swapMs} ms, still playing at ${swapAt.toFixed(2)} s, no status flash, <video> changes: ${swapChanges.join(", ") || "none"}; ${fullDims}, luma distance ${upright.toFixed(1)} from the instant copy's frame (upright); ${reading.text}; nothing over the recovered part; revisit → ${describePlans(revisitCalls)} in ${revisitMs} ms, pill "${revisitPill}", no job, raw file untouched; #vw-back → Home, src released — ${Math.round(performance.now() - t0)} ms`;
+    } finally {
+      observer?.disconnect();
+      held.hold?.release();
+      plans?.restore();
+      refusals.stop();
+      try {
+        if (settingsStore.get().openWith !== openWithBefore) await updateSettings({ openWith: openWithBefore });
+      } catch {
+        // A failed settings write must not mask the block's own failure.
+      }
+      try {
+        await toHome();
+      } catch (e) {
+        console.error("damaged-video autotest: cleanup did not reach Home", e);
+      }
+      // The next run must meet the instant phase again.
+      const left = await removeCacheFiles(plannedFiles(plans?.calls ?? []));
+      if (left.length) console.error("damaged-video autotest: repair copies left in the cache", left);
+    }
+  });
 }
