@@ -25,19 +25,22 @@ the viewer's seek bar works the way the editor's does.
   (`filter_units=remove_types=6|7|8`), so scrambled data can no longer
   re-size the picture or turn it sideways.
 
-## The viewer's seek bar follows the pointer
-
-- **What went wrong.** The viewer drew its seek bar from the video's
-  position, which only moves when a seek finishes. While you dragged, each
-  new seek replaced the one still decoding, so the knob trailed the pointer.
-- **Now it seeks like the editor's fullscreen seek bar:** the knob and the
-  clock are where you put them at once, and the picture follows.
-- **Next and Previous load at once** (a 250 ms wait is gone). Clicking or
-  holding the key through a folder still loads only the file you stop on.
-- **The controls fade after 1 second** of a still mouse while a video plays
-  (was 2.5), and never while the pointer rests on them.
-- **Dragging hard on a damaged video** no longer drops the viewer into a
-  "repairing" card: a read error mid-seek reloads the video where you were.
-
 **Known limit:** a damaged file the player does not report as an error (it
 just stays black) is not detected yet.
+
+## Viewer fixes
+
+- **Seek bar lag.** While you dragged, the knob trailed the pointer: it was
+  redrawn only when a seek finished, and each new seek replaced the one in
+  progress. It now follows the pointer as in the editor's fullscreen player,
+  and the picture follows each completed seek.
+- **Delay on Next/Previous.** A video waited 250 ms before it started
+  loading. It now loads on the press; a burst of presses still loads only
+  the last file.
+- **Controls stayed up too long.** During playback they stayed on screen for
+  2.5 s after the mouse stopped. Now it's 1 s, and they stay while the
+  pointer is over them.
+- **"Repairing" card while seeking.** Rapid seeking in a damaged video could
+  cause a read error (`MEDIA_ERR_NETWORK`) that was handled as an
+  undecodable file, replacing playback with a "repairing" card. The video
+  now reloads where you were.
