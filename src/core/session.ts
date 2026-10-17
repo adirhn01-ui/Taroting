@@ -6,13 +6,14 @@ import { describeError, ipc, type SettingsRead } from "./ipc";
 import { touchModified } from "./project";
 import { normalizeChord } from "./shortcuts";
 import { Store } from "./store";
-import type { ActionId, CustomTheme, ProjectFile, Settings } from "./types";
+import type { ActionId, CustomTheme, PdfSignature, ProjectFile, Settings } from "./types";
 import {
   ACTION_MODES,
   DEFAULT_CUSTOM_THEME,
   DEFAULT_SETTINGS,
   DEFAULT_SHORTCUTS,
   LEGACY_BASE_COLORS,
+  PDF_SIGNATURES_MAX,
   TIMELINE_HEIGHT_MAX,
   TIMELINE_HEIGHT_MIN,
 } from "./types";
@@ -865,6 +866,31 @@ function asInkColors(v: unknown): string[] {
   return out;
 }
 
+/** Saved PDF signatures: always a FRESH array of at most PDF_SIGNATURES_MAX
+ *  entries. A stroke string must be base64 (standard alphabet, no padding) of
+ *  a whole number of 12-byte points and at most 400k characters; a signature
+ *  keeps 1..500 such strokes and a finite aspect clamped to 0.1..20, else it
+ *  is dropped whole. Only the first few entries are looked at, for the same
+ *  reason as `asInkColors`. */
+const SIG_STROKE = /^[A-Za-z0-9+/]+$/;
+function asPdfSignatures(v: unknown): PdfSignature[] {
+  if (!Array.isArray(v)) return [];
+  const out: PdfSignature[] = [];
+  for (let i = 0; i < v.length && i < 16 && out.length < PDF_SIGNATURES_MAX; i++) {
+    const e = v[i] as { strokes?: unknown; aspect?: unknown } | null;
+    if (typeof e !== "object" || e === null || !Array.isArray(e.strokes)) continue;
+    const aspect = typeof e.aspect === "number" && Number.isFinite(e.aspect) ? e.aspect : NaN;
+    if (Number.isNaN(aspect) || e.strokes.length === 0 || e.strokes.length > 500) continue;
+    const strokes = e.strokes.filter(
+      (p): p is string =>
+        typeof p === "string" && p.length > 0 && p.length <= 400_000 && p.length % 16 === 0 && SIG_STROKE.test(p),
+    );
+    if (strokes.length !== e.strokes.length) continue;
+    out.push({ strokes, aspect: Math.min(Math.max(aspect, 0.1), 20) });
+  }
+  return out;
+}
+
 /** Rebuild a stored shortcut map over every known action. A stored STRING wins. An action the
  *  stored map does not mention gets its DEFAULT chord UNLESS that chord (normalizeChord) is
  *  already bound, IN THE STORED MAP, to an action sharing a mode; then it is left unbound (""):
@@ -956,6 +982,7 @@ export function sanitizeSettings(raw: unknown): Settings {
     ),
     shortcuts,
     inkColors: asInkColors(o.inkColors),
+    pdfSignatures: asPdfSignatures(o.pdfSignatures),
   };
 }
 

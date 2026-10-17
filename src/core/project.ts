@@ -1092,7 +1092,7 @@ function sanitizeClip(c: Clip): Clip {
  *  `den` (which `u32` happily accepts) is `speed: 0` wearing a different hat:
  *  `frameOf` returns ±Infinity and `snapToFrame` returns NaN, which is the
  *  playhead, the ruler and the exporter's `-r` all at once. */
-function sanitizeFps(fps: Rational): Rational {
+export function sanitizeFps(fps: Rational): Rational {
   const rate = fps.num / fps.den;
   const ok =
     Number.isFinite(fps.num) &&
@@ -1108,14 +1108,21 @@ function sanitizeFps(fps: Rational): Rational {
  *  reaches ffmpeg directly as the `duration` argument of the waveform job,
  *  where a non-finite value serialises to JSON `null` and the `f64` parameter
  *  rejects it. */
-function sanitizeMediaRef(m: MediaRef): MediaRef {
+export function sanitizeMediaRef(m: MediaRef): MediaRef {
   const duration = finMin(m.duration, 0, 0);
   return duration === m.duration ? m : { ...m, duration };
 }
 
 /**
- * Repair the numeric fields of a freshly loaded project. Total: never throws,
- * and returns `p` itself when nothing needed repair.
+ * Repair the numeric fields of a freshly loaded project. Total for a video or
+ * image project: never throws, and returns `p` itself when nothing needed
+ * repair.
+ *
+ * A PDF project (`kind: "pdf"`) takes its own branch, `sanitizePdfProject`:
+ * its whole `pdf` block is rebuilt from scratch (so the result is always a new
+ * object), and it is the ONE path here that throws — a `ProjectFileError`
+ * (`code: "bad_input"`, the backend's own code for an unusable file) when no
+ * page survives, since a document without pages cannot be opened at all.
  *
  * Called from `ipc.loadProject`, which is the single point at which a `.trt`
  * becomes app state — putting it there rather than in the editor means every
@@ -1124,6 +1131,7 @@ function sanitizeMediaRef(m: MediaRef): MediaRef {
  * cannot disagree, and the session's next write puts them on disk.
  */
 export function sanitizeProject(p: ProjectFile): ProjectFile {
+  if (p.kind === "pdf") return pdfHooks().sanitize(p);
   const t = p.timeline;
 
   const fps = sanitizeFps(t.fps);
@@ -1332,5 +1340,53 @@ export function checkInvariants(p: ProjectFile): string[] {
       prevStart = c.timelineStart;
     }
   }
+  if (p.kind === "pdf") errors.push(...pdfHooks().check(p));
   return errors;
+}
+
+/* ------------------------------------------------------------------ */
+/* PDF projects: load-time sanitation + invariants                     */
+/* ------------------------------------------------------------------ */
+//
+// A `.trt` is plain JSON that `load_project` hands over RAW, and it is the
+// file people share — so everything in a PDF project's `pdf` block is read as
+// hostile: wrong types, absurd numbers, ids that are prototype keys, paths
+// that are URLs. Unlike the video/image repair above (which fixes values and
+// never structure), a PDF block is REBUILT field by field: a mark that cannot
+// be drawn is dropped on its own, never the file. The one thing that cannot
+// be dropped around is a document with no page left — that is unusable, and
+// throws `ProjectFileError`.
+//
+// The rules live in core/pdf-sanitize.ts, a LAZY module: this file is on the
+// boot path (Home), and a launch that never opens a PDF must not parse them.
+// ipc.loadProject imports it before sanitizing a `kind: "pdf"` file, and the
+// module registers itself here on import; sanitizeProject/checkInvariants then
+// dispatch through `pdfHooks()`. Reaching a PDF project with nothing
+// registered is a wiring bug and throws.
+
+/** An unusable project file. Shaped like the backend's `AppError` as the
+ *  frontend sees it (`{ code, message }` — what `describeError` and
+ *  `errorDetail` read), with the backend's own code for a file it refuses. */
+export class ProjectFileError extends Error {
+  readonly code = "bad_input";
+  constructor(message: string) {
+    super(message);
+    this.name = "ProjectFileError";
+  }
+}
+
+/** What core/pdf-sanitize.ts registers when it is imported. */
+export interface PdfProjectHooks {
+  sanitize(p: ProjectFile): ProjectFile;
+  check(p: ProjectFile): string[];
+}
+let pdfHookImpl: PdfProjectHooks | null = null;
+export function registerPdfProjectHooks(h: PdfProjectHooks): void {
+  pdfHookImpl = h;
+}
+function pdfHooks(): PdfProjectHooks {
+  if (!pdfHookImpl) {
+    throw new ProjectFileError("PDF support is not loaded (import core/pdf-sanitize first)");
+  }
+  return pdfHookImpl;
 }

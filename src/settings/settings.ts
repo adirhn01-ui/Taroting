@@ -69,20 +69,25 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   nextFile: "Next file (viewer)",
   seekBack: "Back 5s (viewer)",
   seekFwd: "Forward 5s (viewer)",
-  imgSelect: "Select / move (image)",
-  imgPen: "Pen (image)",
-  imgPencil: "Pencil (image)",
-  imgMarker: "Marker (image)",
-  imgEraser: "Eraser (image)",
-  imgShape: "Shapes (image)",
-  imgRuler: "Show or hide ruler (image)",
-  imgSizeDown: "Smaller brush (image)",
-  imgSizeUp: "Larger brush (image)",
-  imgZoomIn: "Zoom in (image)",
-  imgZoomOut: "Zoom out (image)",
-  imgZoomFit: "Fit to window (image)",
-  imgZoom100: "Actual size (image)",
-  imgPanHold: "Hold to pan (image)",
+  imgSelect: "Select / move (image, PDF)",
+  imgPen: "Pen (image, PDF)",
+  imgPencil: "Pencil (image, PDF)",
+  imgMarker: "Marker (image, PDF)",
+  imgEraser: "Eraser (image, PDF)",
+  imgShape: "Shapes (image, PDF)",
+  imgRuler: "Show or hide ruler (image, PDF)",
+  imgSizeDown: "Smaller brush (image, PDF)",
+  imgSizeUp: "Larger brush (image, PDF)",
+  imgZoomIn: "Zoom in (image, PDF)",
+  imgZoomOut: "Zoom out (image, PDF)",
+  imgZoomFit: "Fit to window (image, PDF)",
+  imgZoom100: "Actual size (image, PDF)",
+  imgPanHold: "Hold to pan (image, PDF)",
+  pdfHighlight: "Highlight (PDF)",
+  pdfText: "Text box (PDF)",
+  pdfWhiteout: "Whiteout (PDF)",
+  pdfFillForms: "Fill forms on/off (PDF)",
+  find: "Find in PDF",
 };
 
 /** The screens that have a ShortcutManager. The conflict warning names a mode,
@@ -90,7 +95,7 @@ export const ACTION_LABELS: Record<ActionId, string> = {
  *  "Ctrl+Z (image)" must never point at a screen the user cannot open. The
  *  image editor mounts `new ShortcutManager("image")`, so image clashes are
  *  real and shown. */
-export const LIVE_MODES: readonly ShortcutMode[] = ["editor", "viewer", "image"];
+export const LIVE_MODES: readonly ShortcutMode[] = ["editor", "viewer", "image", "pdf"];
 
 /** `findConflicts` restricted to LIVE_MODES — the one result the Shortcuts card
  *  reads for both its row marks and its warning. */
@@ -141,6 +146,11 @@ export const ACTION_ORDER: ActionId[] = [
   "imgZoomFit",
   "imgZoom100",
   "imgPanHold",
+  "pdfHighlight",
+  "pdfText",
+  "pdfWhiteout",
+  "pdfFillForms",
+  "find",
 ];
 
 /** The three user-settable colours of the custom theme, in the order they are
@@ -321,9 +331,32 @@ export function selectHtml(
  *  "Ctrl+Z" (the same key does the same thing), while an action the loader
  *  emptied because its default chord was taken does not. */
 export function shortcutsAtDefaults(shortcuts: Record<string, string>): boolean {
-  return ACTION_ORDER.every(
-    (a) => normalizeChord(shortcuts[a] ?? "") === normalizeChord(DEFAULT_SHORTCUTS[a]),
-  );
+  return ACTION_ORDER.every((a) => shortcutAtDefault(shortcuts, a));
+}
+
+/** True when this one action is bound as shipped — the per-row test behind
+ *  the row's reset control, and the same comparison `shortcutsAtDefaults`
+ *  makes for every row. */
+export function shortcutAtDefault(shortcuts: Record<string, string>, action: ActionId): boolean {
+  return normalizeChord(shortcuts[action] ?? "") === normalizeChord(DEFAULT_SHORTCUTS[action]);
+}
+
+/** ↺ — the same drawing as the image editor's Rotate left (src/image/icons.ts),
+ *  inside the exact wrapper `icon()` builds. Kept here rather than imported:
+ *  that module is the image editor's own chunk. */
+const RESET_GLYPH =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>';
+
+/** The small ↺ beside a row whose binding differs from the default, or "" for
+ *  a row that is already at its default. Its name says what the row will show
+ *  afterwards, in the row's own spelling ("Reset to Ctrl+Z"), or "Reset to
+ *  none" for an action that ships unbound. A separate button, never inside the
+ *  row: the row itself is the key-capture control. */
+export function shortcutResetButton(shortcuts: Record<string, string>, action: ActionId): string {
+  if (shortcutAtDefault(shortcuts, action)) return "";
+  const label = `Reset to ${normalizeChord(DEFAULT_SHORTCUTS[action]) || "none"}`;
+  const attr = escapeHtml(label);
+  return `<button class="btn btn--ghost btn--icon btn--sm settings__shortcut-reset" data-reset-action="${action}" title="${attr}" aria-label="${attr}">${RESET_GLYPH}</button>`;
 }
 
 /**
@@ -764,10 +797,16 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       } else {
         valueHtml = `<span class="settings__hint">Not set</span>`;
       }
+      // The reset slot is always there, empty on a default row, so a ↺
+      // appearing or going never moves the chord. Hidden on the row being
+      // captured: that row is waiting for a key, not offering a way out.
       return `
-        <div class="settings__shortcut ${isConflict ? "settings__shortcut--conflict" : ""} ${isCapturing ? "settings__shortcut--capturing" : ""}" data-action="${action}" role="button" tabindex="0">
-          <span class="settings__shortcut-label">${escapeHtml(ACTION_LABELS[action])}</span>
-          <span class="settings__shortcut-chord">${valueHtml}</span>
+        <div class="settings__shortcut-line">
+          <div class="settings__shortcut ${isConflict ? "settings__shortcut--conflict" : ""} ${isCapturing ? "settings__shortcut--capturing" : ""}" data-action="${action}" role="button" tabindex="0">
+            <span class="settings__shortcut-label">${escapeHtml(ACTION_LABELS[action])}</span>
+            <span class="settings__shortcut-chord">${valueHtml}</span>
+          </div>
+          <span class="settings__shortcut-reset-slot">${isCapturing ? "" : shortcutResetButton(s.shortcuts, action)}</span>
         </div>`;
     }).join("");
 
@@ -998,6 +1037,16 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
           e.preventDefault();
           beginCapture(action);
         }
+      });
+    });
+
+    // Per-row ↺ → that one action back to its default. A sibling of the row,
+    // not inside it, so neither its click nor its Enter/Space reaches the
+    // row's capture listeners.
+    inner.querySelectorAll<HTMLButtonElement>("[data-reset-action]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        resetShortcut(btn.dataset.resetAction as ActionId);
       });
     });
   }
@@ -1308,6 +1357,27 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     }
     disarmResetConfirm();
     persist({ shortcuts: { ...DEFAULT_SHORTCUTS } });
+  }
+
+  /** One row's ↺: no confirm — it changes one binding, and the row shows the
+   *  result at once. Written exactly as a capture writes a chord (the whole map
+   *  with this one action replaced, through `persist`), so a default chord that
+   *  another action now holds is kept on both and flagged as a duplicate, the
+   *  way pressing that chord in capture would leave it. */
+  function resetShortcut(action: ActionId): void {
+    // A capture under way on another row ends here, as clicking another row
+    // would end it; otherwise the store change below would not re-render.
+    const wasCapturing = capturing !== null;
+    endCapture();
+    const current = settingsStore.get().shortcuts;
+    if (shortcutAtDefault(current, action)) {
+      if (wasCapturing) render();
+      return;
+    }
+    // Focus the row BEFORE the write: the re-render carries focus over by the
+    // row's data-action, while the ↺ itself is about to disappear.
+    restoreFocus(inner, { attr: "data-action", value: action });
+    persist({ shortcuts: { ...current, [action]: DEFAULT_SHORTCUTS[action] } });
   }
 
   /* ---------------- uninstall ---------------- */

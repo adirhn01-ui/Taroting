@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Route } from "./nav";
+import { PDF_PROTECTED_MESSAGE, PdfProtectedError } from "./open-media";
 import { createOpenRouter, type OpenRouteDeps } from "./open-route";
 import type { ProjectSession } from "./session";
 
@@ -21,6 +22,7 @@ const TEMP_TRT = String.raw`T:\tmp-projects\b.trt`;
 const MP4 = String.raw`E:\v\c.mp4`;
 const PNG = String.raw`F:\p\d.png`;
 const TXT = String.raw`G:\n\e.txt`;
+const PDF = String.raw`H:\docs\f.pdf`;
 const OPENED = String.raw`T:\tmp-projects\c-1f3a.trt`;
 
 type SessionKind = "none" | "permanent" | "temp-unedited" | "temp-edited" | "temp-unguarded";
@@ -34,8 +36,8 @@ interface Row {
   openWith: "viewer" | "editor";
   viewerUp?: boolean;
   path: string;
-  /** what openMediaAsProject does */
-  open?: "ok" | "throws";
+  /** what openMediaAsProject does ("protected": a password-protected PDF) */
+  open?: "ok" | "throws" | "protected";
   /** the gate replaced the screen's session before the open failed */
   sessionGoneAfterGate?: boolean;
   /** expected: navigations, viewer swaps and toasts, in order */
@@ -78,6 +80,7 @@ function rig(row: Row): { route: (path: string) => Promise<void>; log: string[];
     isTempProjectPath: async (p) => p.startsWith("T:\\tmp-projects\\"),
     openMediaAsProject: async (p) => {
       if (row.open === "throws") throw new Error(`ffprobe could not read ${p}`);
+      if (row.open === "protected") throw new PdfProtectedError(p);
       return OPENED;
     },
     openWith: () => row.openWith,
@@ -209,6 +212,68 @@ describe("routeOpenPath", () => {
       path: PNG,
       open: "throws",
       log: [`error:ffprobe could not read ${PNG}`],
+      asked: 1,
+    },
+    {
+      why: "a PDF in viewer mode with no viewer: the viewer route",
+      session: "none",
+      gate: "proceed",
+      openWith: "viewer",
+      path: PDF,
+      open: "ok",
+      log: [`nav:viewer:${PDF}`],
+      asked: 1,
+    },
+    {
+      why: "a PDF in viewer mode with a viewer up: the file swaps in place",
+      session: "permanent",
+      gate: "proceed",
+      openWith: "viewer",
+      viewerUp: true,
+      path: PDF,
+      open: "ok",
+      log: [`show:${PDF}`],
+      asked: 1,
+    },
+    {
+      why: "a PDF in editor mode: a temporary PDF project",
+      session: "temp-unedited",
+      gate: "proceed",
+      openWith: "editor",
+      path: PDF,
+      open: "ok",
+      log: [`nav:editor:${OPENED}(temp)`],
+      asked: 1,
+    },
+    {
+      why: "a password-protected PDF in editor mode, over a let-go temp editor: the viewer and news, never an error or Home",
+      session: "temp-edited",
+      gate: "proceed",
+      openWith: "editor",
+      path: PDF,
+      open: "protected",
+      log: [`nav:viewer:${PDF}`, `info:${PDF_PROTECTED_MESSAGE}`],
+      asked: 1,
+    },
+    {
+      why: "a password-protected PDF in editor mode with a viewer up: it swaps in there",
+      session: "none",
+      gate: "proceed",
+      openWith: "editor",
+      viewerUp: true,
+      path: PDF,
+      open: "protected",
+      log: [`show:${PDF}`, `info:${PDF_PROTECTED_MESSAGE}`],
+      asked: 1,
+    },
+    {
+      why: "a PDF the leave gate held back: nothing opens, and it is said",
+      session: "temp-edited",
+      gate: "cancel",
+      openWith: "editor",
+      path: PDF,
+      open: "ok",
+      log: ["info:Still editing. f.pdf wasn't opened."],
       asked: 1,
     },
     {

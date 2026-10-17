@@ -268,10 +268,12 @@ export interface ExportPreset {
  *  refuses 3 without `kind: "image"`, and `kind: "image"` below 3. A video
  *  project never carries `kind`, stays 2, and is byte-identical on disk. */
 export interface ProjectFile {
-  /** 3 = image project (requires kind === "image"). Video projects stay 2. */
-  schema: 1 | 2 | 3;
-  /** present → image project (schema 3). Absent → video project. */
-  kind?: "image";
+  /** 3 = image project (requires kind === "image"), 4 = PDF project
+   *  (requires kind === "pdf"). Video projects stay 2. */
+  schema: 1 | 2 | 3 | 4;
+  /** "image" → image project (schema 3); "pdf" → PDF project (schema 4).
+   *  Absent → video project. */
+  kind?: "image" | "pdf";
   app: "taroting";
   id: string;
   name: string;
@@ -283,6 +285,9 @@ export interface ProjectFile {
   export: ExportPreset;
   /** image projects only */
   image?: ImageMeta;
+  /** PDF projects only (schema 4). `media` then holds only the pictures its
+   *  image marks use; `timeline` is the empty one every project carries. */
+  pdf?: PdfMeta;
   /** A TEMPORARY project the user has edited (mirrors schema.rs
    *  `temp_edited`). Set on the first save after a real edit, dropped on
    *  Keep, never present on a permanent file. Lets the startup sweep keep an
@@ -290,6 +295,98 @@ export interface ProjectFile {
    *  back, while untouched ones are still cleared. */
   tempEdited?: true;
 }
+
+/* ---------------------------------------------------------------------------
+ * PDF projects (schema 4, kind "pdf"). The source PDFs are never modified:
+ * the project records which pages to show in which order, how each is turned,
+ * the marks drawn on them and the form values typed in. Export writes a NEW
+ * file. Every coordinate is in PAGE SPACE: PDF points (1/72 in) of the page as
+ * the source stores it — UNROTATED, origin at the top-left of its crop box,
+ * y growing DOWN. Turning a page never moves its marks relative to its text.
+ * ------------------------------------------------------------------------- */
+
+/** One source PDF. `size` + `mtimeMs` are the identity used to notice a
+ *  changed or missing file (like MediaRef). `pages` = its page count when
+ *  added (a changed file is re-checked on open). */
+export interface PdfSource {
+  id: string;
+  path: string;
+  size: number;
+  mtimeMs: number;
+  pages: number;
+}
+
+export type PdfRotation = 0 | 90 | 180 | 270;
+
+/** One page of the document, in output order. `src` + `page` (0-based) name a
+ *  source page; `src: null` is a blank page of `w`×`h` points. `rotate` is
+ *  ADDED to the source page's own /Rotate (clockwise, like the viewer). */
+export interface PdfPage {
+  id: string;
+  src: string | null;
+  page: number;
+  rotate: PdfRotation;
+  /** blank pages only (src === null), points, 1..14400 */
+  w?: number;
+  h?: number;
+}
+
+/** A text box's font: the same whitelist as text generators (all ship with
+ *  Windows), so export embeds a real system font file. */
+export interface PdfTextStyle {
+  font: FontFamily;
+  /** points, 4..288 */
+  size: number;
+  c: string;
+  bold: boolean;
+  italic: boolean;
+  align: "left" | "center" | "right";
+}
+
+/** A mark on a page (page space, see above). Colours are lowercase #rrggbb.
+ *  `o` = opacity 0..1. Ink reuses the image editor's Stroke point encoding
+ *  (`p` = base64 Float32 [x, y, pressure] triples) so its input, smoothing and
+ *  outline code serve both editors. */
+export type PdfAnnot =
+  | { id: string; t: "ink"; kind: InkKind; c: string; w: number; o: number; p: string }
+  | { id: string; t: "highlight"; c: string; o: number; rects: [number, number, number, number][] }
+  | ({ id: string; t: "text"; x: number; y: number; w: number; h: number; text: string } & PdfTextStyle)
+  | { id: string; t: ShapeKind; c: string; w: number; a: [number, number]; b: [number, number] }
+  /** an opaque cover box (default white) — typically with a text box on top */
+  | { id: string; t: "whiteout"; x: number; y: number; w: number; h: number; c: string }
+  /** a picture: `media` is a ProjectFile.media id (kind "image"), so relink works */
+  | { id: string; t: "image"; x: number; y: number; w: number; h: number; media: string }
+  /** a signature: vector strokes normalised to a 0..1 box, drawn into x,y,w,h */
+  | { id: string; t: "signature"; x: number; y: number; w: number; h: number; c: string; strokes: string[] };
+
+export type PdfAnnotKind = PdfAnnot["t"];
+
+/** A typed form value: text / choice (selected export values) / checkbox or
+ *  radio (on = true). Keyed per SOURCE by the pdf.js annotation id of the
+ *  widget ("12R"), which is what pdf.js renders and saves by. */
+export type PdfFormValue = string | boolean | string[];
+
+export interface PdfExportPreset {
+  /** draw marks into the page instead of writing them as annotations */
+  flattenMarks: boolean;
+  /** turn filled form fields into plain page content (no longer fillable) */
+  flattenForms: boolean;
+}
+
+export interface PdfMeta {
+  sources: PdfSource[];
+  pages: PdfPage[];
+  /** by PdfPage.id; absent / empty = no marks */
+  annots: Record<string, PdfAnnot[]>;
+  /** by PdfSource.id, then pdf.js widget annotation id */
+  forms: Record<string, Record<string, PdfFormValue>>;
+  export?: PdfExportPreset;
+}
+
+export const PDF_SCHEMA = 4;
+/** Guards for crafted .trt files (load-time; never a user refusal). */
+export const PDF_MAX_PAGES = 10_000;
+export const PDF_MAX_ANNOTS_PER_PAGE = 5_000;
 
 export type ImageExportFormat = "png" | "jpeg" | "webp";
 export interface ImageExportPreset {
@@ -347,7 +444,12 @@ export type ActionId =
   | "imgZoomOut"
   | "imgZoomFit"
   | "imgZoom100"
-  | "imgPanHold";
+  | "imgPanHold"
+  | "pdfHighlight"
+  | "pdfText"
+  | "pdfWhiteout"
+  | "pdfFillForms"
+  | "find";
 
 /** The three user-settable colours of the "custom" theme.
  *
@@ -419,7 +521,20 @@ export interface Settings {
    *  #rrggbb. Sanitized on read like every field (`asInkColors` in
    *  core/session.ts); diagnostics report only how many there are. */
   inkColors: string[];
+  /** PDF editor: saved signatures, newest first, ≤ PDF_SIGNATURES_MAX. Each is
+   *  vector strokes normalised to a 0..1 box (`strokes` = Stroke-style base64
+   *  Float32 [x, y, pressure] triples) and the box's width/height `aspect`.
+   *  Sanitized on read (`asPdfSignatures` in core/session.ts). Local only:
+   *  never in a project file except as a placed mark. */
+  pdfSignatures: PdfSignature[];
 }
+
+export interface PdfSignature {
+  strokes: string[];
+  /** width / height of the box the strokes were drawn in, 0.1..20 */
+  aspect: number;
+}
+export const PDF_SIGNATURES_MAX = 3;
 
 /** The one clamp for `timelineHeight`, shared by the sanitizer and the drag
  *  handle so the two can never disagree about what a legal height is. The
@@ -438,8 +553,8 @@ export interface RecentItem {
   sizeBytes: number;
   /** ISO 8601; stamped when the project is opened (absent until first open) */
   openedAt?: string;
-  /** "image" for image projects; absent for video projects */
-  kind?: "image";
+  /** "image" / "pdf" for those project types; absent for video projects */
+  kind?: "image" | "pdf";
 }
 
 export interface RecentsIndex {
@@ -498,6 +613,14 @@ export const DEFAULT_SHORTCUTS: Record<ActionId, string> = {
   // Resolved by the image editor's own keydown/keyup pair through
   // `resolveChord`, never by a ShortcutManager handler: holding needs keyup.
   imgPanHold: "Space",
+  // The PDF editor's own tools (pdf mode). The ink tools, ruler, brush size and
+  // zoom are the image editor's actions, widened to pdf mode in ACTION_MODES.
+  pdfHighlight: "L",
+  pdfText: "T",
+  pdfWhiteout: "W",
+  pdfFillForms: "F",
+  // Search the PDF's text (viewer showing a PDF, and the PDF editor).
+  find: "Ctrl+F",
 };
 
 /** Which screens an action lives on. A chord conflicts only with an action that shares a
@@ -508,7 +631,7 @@ export const DEFAULT_SHORTCUTS: Record<ActionId, string> = {
  *  Why seekBack/seekFwd are their own actions rather than jumpBack/jumpFwd in the viewer:
  *  the viewer seeks ±5 s while the editor's jump is ±1 s ("Jump forward 1s"), one action
  *  cannot mean both, and both must stay rebindable. */
-export type ShortcutMode = "editor" | "viewer" | "image";
+export type ShortcutMode = "editor" | "viewer" | "image" | "pdf";
 export const ACTION_MODES: Readonly<Record<ActionId, readonly ShortcutMode[]>> = {
   playPause: ["editor", "viewer"],
   stop: ["editor"],
@@ -520,12 +643,12 @@ export const ACTION_MODES: Readonly<Record<ActionId, readonly ShortcutMode[]>> =
   goEnd: ["editor", "viewer"],
   split: ["editor"],
   // Delete / Copy mean "the selected layer" / "the whole image" in image mode.
-  delete: ["editor", "image"],
+  delete: ["editor", "image", "pdf"],
   rippleDelete: ["editor"],
-  undo: ["editor", "image"],
-  redo: ["editor", "image"],
-  redoAlt: ["editor", "image"],
-  save: ["editor", "image"],
+  undo: ["editor", "image", "pdf"],
+  redo: ["editor", "image", "pdf"],
+  redoAlt: ["editor", "image", "pdf"],
+  save: ["editor", "image", "pdf"],
   copy: ["editor", "image"],
   // Editor-only ON PURPOSE: a bound chord is preventDefault()ed by the
   // ShortcutManager, which would kill the DOM `paste` event the image editor
@@ -534,27 +657,32 @@ export const ACTION_MODES: Readonly<Record<ActionId, readonly ShortcutMode[]>> =
   toggleSnap: ["editor"],
   toggleLoop: ["editor"],
   addMarker: ["editor"],
-  export: ["editor", "image"],
-  goHome: ["editor", "viewer", "image"],
+  export: ["editor", "image", "pdf"],
+  goHome: ["editor", "viewer", "image", "pdf"],
   fullscreen: ["editor", "viewer"],
   prevFile: ["viewer"],
   nextFile: ["viewer"],
   seekBack: ["viewer"],
   seekFwd: ["viewer"],
-  imgSelect: ["image"],
-  imgPen: ["image"],
-  imgPencil: ["image"],
-  imgMarker: ["image"],
-  imgEraser: ["image"],
-  imgShape: ["image"],
-  imgRuler: ["image"],
-  imgSizeDown: ["image"],
-  imgSizeUp: ["image"],
-  imgZoomIn: ["image"],
-  imgZoomOut: ["image"],
-  imgZoomFit: ["image"],
-  imgZoom100: ["image"],
-  imgPanHold: ["image"],
+  imgSelect: ["image", "pdf"],
+  imgPen: ["image", "pdf"],
+  imgPencil: ["image", "pdf"],
+  imgMarker: ["image", "pdf"],
+  imgEraser: ["image", "pdf"],
+  imgShape: ["image", "pdf"],
+  imgRuler: ["image", "pdf"],
+  imgSizeDown: ["image", "pdf"],
+  imgSizeUp: ["image", "pdf"],
+  imgZoomIn: ["image", "pdf"],
+  imgZoomOut: ["image", "pdf"],
+  imgZoomFit: ["image", "pdf"],
+  imgZoom100: ["image", "pdf"],
+  imgPanHold: ["image", "pdf"],
+  pdfHighlight: ["pdf"],
+  pdfText: ["pdf"],
+  pdfWhiteout: ["pdf"],
+  pdfFillForms: ["pdf"],
+  find: ["viewer", "pdf"],
 };
 
 /** The stock DARK palette's --bg-app, --accent and --text-1 — so switching to
@@ -591,32 +719,47 @@ export const DEFAULT_SETTINGS: Settings = {
   timelineHeight: 280,
   shortcuts: DEFAULT_SHORTCUTS,
   inkColors: [],
+  pdfSignatures: [],
 };
 
-/** Which family a media extension belongs to (see media-extensions.json). */
-export type MediaFamily = "video" | "gif" | "image" | "audio";
-/** What the viewer steps through together: video+gif+image, or audio alone. */
-export type StepFamily = "visual" | "audio";
+/** Which family an openable extension belongs to (see media-extensions.json).
+ *  "document" (PDF) is openable — viewer, Explorer, Home — but it is NOT media:
+ *  it never goes on a video timeline or into an image project. */
+export type MediaFamily = "video" | "gif" | "image" | "audio" | "document";
+/** What the viewer steps through together: video+gif+image, audio alone, or
+ *  documents alone. */
+export type StepFamily = "visual" | "audio" | "document";
 
-/** The ONE list of media extensions, shared with the backend: the Rust side
+/** The ONE list of openable extensions, shared with the backend: the Rust side
  *  reads the same JSON with `include_str!` (src-tauri/src/media/extensions.rs),
  *  so the picker, drop, open-with and the viewer's folder stepping can never
  *  disagree about what counts as media. Lowercase, no dots, no extension in two
  *  families, and never `trt` — src/dev/media-extensions.test.ts pins all four. */
 export const MEDIA_EXTENSIONS: Readonly<Record<MediaFamily, readonly string[]>> = MEDIA_EXT;
-/** Every importable media extension. Derived: never hand-edit a copy. */
-export const MEDIA_FILE_EXTENSIONS: ReadonlySet<string> = new Set(Object.values(MEDIA_EXT).flat());
+/** Every importable MEDIA extension (what a video or image project can take
+ *  in) — documents excluded. Derived: never hand-edit a copy. */
+export const MEDIA_FILE_EXTENSIONS: ReadonlySet<string> = new Set(
+  (["video", "gif", "image", "audio"] as const).flatMap((f) => MEDIA_EXTENSIONS[f]),
+);
+/** PDF documents: open in the viewer or as a PDF project. */
+export const DOCUMENT_FILE_EXTENSIONS: ReadonlySet<string> = new Set(MEDIA_EXTENSIONS.document);
+/** Everything the app OPENS (Explorer, Home drop/Open, viewer stepping):
+ *  media plus documents. */
+export const OPENABLE_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
+  ...MEDIA_FILE_EXTENSIONS,
+  ...DOCUMENT_FILE_EXTENSIONS,
+]);
 
 /** `ext` lowercased, no dot (core/format.ts `fileExt` returns exactly that). */
 export function mediaFamilyOf(ext: string): MediaFamily | null {
-  for (const f of ["video", "gif", "image", "audio"] as const) {
+  for (const f of ["video", "gif", "image", "audio", "document"] as const) {
     if (MEDIA_EXTENSIONS[f].includes(ext)) return f;
   }
   return null;
 }
 export function stepFamilyOf(ext: string): StepFamily | null {
   const f = mediaFamilyOf(ext);
-  return f === null ? null : f === "audio" ? "audio" : "visual";
+  return f === null ? null : f === "audio" ? "audio" : f === "document" ? "document" : "visual";
 }
 
 /** Crafted-.trt guard for image canvases (load-time only; never a user refusal). */

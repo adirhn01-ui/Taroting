@@ -1,6 +1,35 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MediaInfo, ProjectFile } from "./types";
 
+// The PDF branch's two lazy modules. The loader pulls pdf.js (never in a unit
+// test) and pdf-project is another module's contract: both are stood in for
+// here, and one holder decides per test what they do. vi.mock registrations
+// survive the resetModules() in fresh() below.
+const pdf = vi.hoisted(() => ({
+  countPages: async (_path: string): Promise<number> => 0,
+  calls: [] as string[],
+  created: [] as Array<{ name: string; source: unknown }>,
+}));
+vi.mock("../pdf/view/loader", () => ({
+  countPages: (path: string) => {
+    pdf.calls.push(`countPages:${path}`);
+    return pdf.countPages(path);
+  },
+}));
+vi.mock("./pdf-project", () => ({
+  createPdfProject: (name: string, source: { path: string; size: number; mtimeMs: number; pages: number }) => {
+    pdf.calls.push(`createPdfProject:${name}`);
+    pdf.created.push({ name, source });
+    return {
+      schema: 4,
+      kind: "pdf",
+      app: "taroting",
+      name,
+      pdf: { sources: [{ id: "s1", ...source }], pages: [], annots: {}, forms: {} },
+    } as unknown as ProjectFile;
+  },
+}));
+
 // open-media keeps module state (the chain, the cached temp-dir lookup), so
 // every test gets a FRESH copy of it — and of the `ipc` object it calls, which
 // a reset module graph re-creates, so the spies must go on that same copy.
@@ -432,5 +461,131 @@ describe("stillSizeProblem", () => {
   it.each(bad)("names the photo when the %s", async (_label, over) => {
     const { om } = await fresh();
     expect(om.stillSizeProblem(still(over))).toBe("Couldn't read the size of harbour.");
+  });
+});
+
+describe("openMediaAsProject with a PDF", () => {
+  const TMP = "C:\\Users\\Ana\\AppData\\Local\\Taroting\\tmp-projects";
+  const PDF = "E:\\Papers\\lease.pdf";
+  const STAT = { size: 734_003, mtimeMs: 1_727_000_000_123 };
+
+  type Pages = number | { kind: "password" | "invalid" | "missing" | "other"; message?: string };
+
+  async function harness(stat: { size: number; mtimeMs: number } | null, pages: Pages) {
+    const { om, ipc } = await fresh();
+    pdf.calls.length = 0;
+    pdf.created.length = 0;
+    pdf.countPages = async () => {
+      if (typeof pages === "number") return pages;
+      throw pages;
+    };
+    const calls = pdf.calls;
+    const saved: Array<{ path: string; project: ProjectFile }> = [];
+    vi.spyOn(ipc, "tempProjectPath").mockImplementation(async (name) => {
+      calls.push(`tempProjectPath:${name}`);
+      return `${TMP}\\${name} (2).trt`;
+    });
+    const probe = vi.spyOn(ipc, "probeMedia").mockImplementation(async (p) => {
+      calls.push(`probeMedia:${p}`);
+      throw new Error("ffprobe has nothing to say about a PDF");
+    });
+    vi.spyOn(ipc, "fileStat").mockImplementation(async (p) => {
+      calls.push(`fileStat:${p}`);
+      return stat;
+    });
+    const save = vi.spyOn(ipc, "saveProject").mockImplementation(async (path, project) => {
+      calls.push(`saveProject:${path}`);
+      saved.push({ path, project });
+      return { modifiedAt: new Date().toISOString() };
+    });
+    const del = vi.spyOn(ipc, "deleteProject").mockImplementation(async (p) => {
+      calls.push(`deleteProject:${p}`);
+    });
+    return { om, calls, saved, probe, save, del };
+  }
+
+  it("makes a temporary PDF project of the file's identity and page count, never probing it", async () => {
+    const h = await harness(STAT, 37);
+    const out = await h.om.openMediaAsProject(PDF);
+    expect(out).toBe(`${TMP}\\lease (2).trt`);
+    expect(h.calls).toEqual([
+      "tempProjectPath:lease",
+      `fileStat:${PDF}`,
+      `countPages:${PDF}`,
+      "createPdfProject:lease (2)",
+      `saveProject:${TMP}\\lease (2).trt`,
+    ]);
+    expect(h.probe).not.toHaveBeenCalled();
+    expect(pdf.created).toEqual([
+      { name: "lease (2)", source: { path: PDF, size: 734_003, mtimeMs: 1_727_000_000_123, pages: 37 } },
+    ]);
+    const p = h.saved[0]!.project;
+    expect(p.schema).toBe(4);
+    expect(p.kind).toBe("pdf");
+    expect(p.pdf!.sources[0]).toMatchObject({ path: PDF, size: 734_003, mtimeMs: 1_727_000_000_123, pages: 37 });
+    expect(h.del).not.toHaveBeenCalled();
+  });
+
+  it("takes an upper-case .PDF down the same path", async () => {
+    const h = await harness(STAT, 2);
+    await h.om.openMediaAsProject("E:\\Papers\\SCAN.PDF");
+    expect(h.probe).not.toHaveBeenCalled();
+    expect(pdf.created[0]!.source).toMatchObject({ path: "E:\\Papers\\SCAN.PDF", pages: 2 });
+  });
+
+  it("refuses a missing PDF as a missing file, before pdf.js is ever fetched", async () => {
+    const h = await harness(null, 5);
+    await expect(h.om.openMediaAsProject(PDF)).rejects.toThrow("This PDF is missing or can't be read.");
+    expect(h.calls).toEqual(["tempProjectPath:lease", `fileStat:${PDF}`]);
+    expect(h.probe).not.toHaveBeenCalled();
+    expect(h.save).not.toHaveBeenCalled();
+    expect(h.del).not.toHaveBeenCalled();
+  });
+
+  it("makes no project of a password-protected PDF: it says so, for the viewer to show it", async () => {
+    const h = await harness(STAT, { kind: "password" });
+    const failure = await h.om.openMediaAsProject(PDF).catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(h.om.PdfProtectedError);
+    expect((failure as Error).message).toBe(
+      "This PDF is password-protected — it opens in the viewer (editing protected PDFs isn't supported).",
+    );
+    expect((failure as { path: string }).path).toBe(PDF);
+    expect(pdf.created).toEqual([]);
+    expect(h.probe).not.toHaveBeenCalled();
+    expect(h.save).not.toHaveBeenCalled();
+    expect(h.del).not.toHaveBeenCalled();
+  });
+
+  it("refuses a file that is not a readable PDF, like an unreadable media file", async () => {
+    const h = await harness(STAT, { kind: "invalid" });
+    const failure = await h.om.openMediaAsProject(PDF).catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(h.om.PdfProtectedError);
+    expect((failure as Error).message).toBe("Couldn't read lease as a PDF.");
+    expect(pdf.created).toEqual([]);
+    expect(h.probe).not.toHaveBeenCalled();
+    expect(h.save).not.toHaveBeenCalled();
+  });
+
+  it("names a file that vanished between the stat and pdf.js as missing", async () => {
+    const h = await harness(STAT, { kind: "missing" });
+    await expect(h.om.openMediaAsProject(PDF)).rejects.toThrow("This PDF is missing or can't be read.");
+    expect(h.save).not.toHaveBeenCalled();
+  });
+
+  it("turns pdf.js's other failures into an Error carrying their words", async () => {
+    const h = await harness(STAT, { kind: "other", message: "The PDF worker stopped." });
+    const failure = await h.om.openMediaAsProject(PDF).catch((e: unknown) => e);
+    // An Error, not the loader's plain object: describeError prints its words.
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("The PDF worker stopped.");
+    expect(h.save).not.toHaveBeenCalled();
+  });
+
+  it("rethrows a failed save without deleting a file it never wrote", async () => {
+    const h = await harness(STAT, 3);
+    h.save.mockRejectedValueOnce(new Error("disk full"));
+    await expect(h.om.openMediaAsProject(PDF)).rejects.toThrow("disk full");
+    expect(h.del).not.toHaveBeenCalled();
   });
 });

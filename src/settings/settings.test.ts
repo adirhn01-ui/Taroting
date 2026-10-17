@@ -14,6 +14,8 @@ import {
   liveConflicts,
   resetShortcutsButton,
   selectHtml,
+  shortcutAtDefault,
+  shortcutResetButton,
   shortcutsAtDefaults,
   uninstallRefusal,
 } from "./settings";
@@ -43,8 +45,9 @@ describe("ACTION_ORDER", () => {
 
 describe("liveConflicts", () => {
   it("reports a clash on every screen that binds both actions", () => {
-    // undo and redo share the editor AND image modes, and both screens exist,
-    // so one clash is two rows — one per screen the user can meet it on.
+    // undo and redo share the editor, image AND PDF modes, and all three
+    // screens exist, so one clash is three rows — one per screen the user can
+    // meet it on.
     const shortcuts = { ...DEFAULT_SHORTCUTS, redo: "Ctrl+Z" };
     expect(ACTION_MODES.undo).toContain("image");
     expect(LIVE_MODES).toContain("image");
@@ -53,6 +56,7 @@ describe("liveConflicts", () => {
     expect(live).toEqual([
       { chord: "Ctrl+Z", mode: "editor", actions: ["undo", "redo"] },
       { chord: "Ctrl+Z", mode: "image", actions: ["undo", "redo"] },
+      { chord: "Ctrl+Z", mode: "pdf", actions: ["undo", "redo"] },
     ]);
   });
 
@@ -200,6 +204,51 @@ describe("shortcutsAtDefaults", () => {
   it("is false for a rebound action, and for one emptied because its default was taken", () => {
     expect(shortcutsAtDefaults({ ...DEFAULT_SHORTCUTS, split: "Ctrl+K" })).toBe(false);
     expect(shortcutsAtDefaults({ ...DEFAULT_SHORTCUTS, stop: "" })).toBe(false);
+  });
+});
+
+describe("shortcutAtDefault", () => {
+  it("compares one action through normalizeChord", () => {
+    expect(shortcutAtDefault({ ...DEFAULT_SHORTCUTS }, "undo")).toBe(true);
+    expect(shortcutAtDefault({ ...DEFAULT_SHORTCUTS, undo: "ctrl+z" }, "undo")).toBe(true);
+    expect(shortcutAtDefault({ ...DEFAULT_SHORTCUTS, undo: "Ctrl+Q" }, "undo")).toBe(false);
+    expect(shortcutAtDefault({ ...DEFAULT_SHORTCUTS, stop: "" }, "stop")).toBe(false);
+  });
+
+  it("looks only at its own action", () => {
+    expect(shortcutAtDefault({ ...DEFAULT_SHORTCUTS, split: "Ctrl+K" }, "undo")).toBe(true);
+  });
+
+  it("treats a missing entry as unbound", () => {
+    const { split: _drop, ...rest } = DEFAULT_SHORTCUTS;
+    expect(shortcutAtDefault(rest, "split")).toBe(false);
+  });
+});
+
+describe("shortcutResetButton", () => {
+  it("is empty on a row at its default", () => {
+    expect(shortcutResetButton({ ...DEFAULT_SHORTCUTS }, "undo")).toBe("");
+    expect(shortcutResetButton({ ...DEFAULT_SHORTCUTS, undo: "ctrl+z" }, "undo")).toBe("");
+  });
+
+  it("names the default in the row's own spelling, as tooltip and accessible name", () => {
+    const html = shortcutResetButton({ ...DEFAULT_SHORTCUTS, redo: "Ctrl+Q" }, "redo");
+    expect(html).toContain('title="Reset to Ctrl+Shift+Z"');
+    expect(html).toContain('aria-label="Reset to Ctrl+Shift+Z"');
+    expect(html).toContain('data-reset-action="redo"');
+    expect(html).toContain("btn--icon");
+  });
+
+  it("says 'none' for an action that ships unbound", () => {
+    const shipped = DEFAULT_SHORTCUTS.split;
+    (DEFAULT_SHORTCUTS as Record<ActionId, string>).split = "";
+    try {
+      const html = shortcutResetButton({ ...DEFAULT_SHORTCUTS, split: "Ctrl+K" }, "split");
+      expect(html).toContain('title="Reset to none"');
+      expect(html).toContain('aria-label="Reset to none"');
+    } finally {
+      (DEFAULT_SHORTCUTS as Record<ActionId, string>).split = shipped;
+    }
   });
 });
 

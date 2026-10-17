@@ -56,12 +56,13 @@ describe("normalizeChord", () => {
 
 describe("findConflicts", () => {
   it("reports a duplicate once per mode the two actions share", () => {
-    // undo and redo live on the editor AND the image screen, so one clash is
-    // two conflicts; `ctrl+z` is normalized before comparing; playPause sits
+    // undo and redo live on the editor, image AND PDF screens, so one clash
+    // is three conflicts; `ctrl+z` is normalized before comparing; playPause sits
     // alone on its chord and is not reported.
     expect(findConflicts({ undo: "Ctrl+Z", redo: "ctrl+z", playPause: "Space" })).toEqual([
       { chord: "Ctrl+Z", mode: "editor", actions: ["undo", "redo"] },
       { chord: "Ctrl+Z", mode: "image", actions: ["undo", "redo"] },
+      { chord: "Ctrl+Z", mode: "pdf", actions: ["undo", "redo"] },
     ]);
     expect(findConflicts({ undo: "Ctrl+Z", redo: "Ctrl+Shift+Z" })).toEqual([]);
   });

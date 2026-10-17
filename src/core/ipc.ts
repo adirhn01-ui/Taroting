@@ -5,8 +5,9 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { EncoderSummary, FfmpegFailure } from "./diagnostics";
 import { sanitizeProject } from "./project";
-import { MEDIA_EXTENSIONS, MEDIA_FILE_EXTENSIONS } from "./types";
+import { MEDIA_EXTENSIONS, MEDIA_FILE_EXTENSIONS, OPENABLE_FILE_EXTENSIONS } from "./types";
 import type {
+  FontFamily,
   ImageExportFormat,
   MediaInfo,
   MediaRef,
@@ -307,6 +308,10 @@ export const ipc = {
    *  computed a different one. */
   loadProject: async (path: string): Promise<LoadedProject> => {
     const loaded = await call<LoadedProject>("load_project", { path });
+    // A PDF project's rules are a lazy module (core/pdf-sanitize registers
+    // them with sanitizeProject on import), so a launch that never opens a PDF
+    // never parses them.
+    if ((loaded.project as { kind?: unknown } | null)?.kind === "pdf") await import("./pdf-sanitize");
     return { ...loaded, project: sanitizeProject(loaded.project) };
   },
   saveProject: (path: string, project: ProjectFile) =>
@@ -421,6 +426,23 @@ export const ipc = {
     call<{ token: number; path: string }>("image_save_commit", { token }),
   /** Drop an open save and its partial file. Idempotent. */
   imageSaveAbort: (token: number) => call<void>("image_save_abort", { token }),
+
+  /* PDF export rides the same begin → chunk → commit path as images, with
+   * format "pdf": the backend checks the `.pdf` extension and the `%PDF-`
+   * magic, and refuses to write over any of `sources` (every source PDF and
+   * picture the project reads). Chunks and commit/abort are the image calls. */
+  pdfSaveBegin: (dest: { kind: "user"; path: string; sources: string[] }, totalBytes: number) =>
+    call<{ token: number; path: string }>("image_save_begin", { dest, format: "pdf", totalBytes }),
+  /** Size and modification time of a file (a PDF source's identity, like
+   *  MediaRef's), or null when it does not exist. */
+  fileStat: (path: string) =>
+    call<{ size: number; mtimeMs: number } | null>("file_stat", { path }, () => null),
+  /** The file of one whitelisted system font face (the text-generator fonts:
+   *  Segoe UI, Arial, Georgia, Times New Roman, Courier New, Impact), or null
+   *  when that face is not installed. PDF export embeds it; never an arbitrary
+   *  path. */
+  systemFontPath: (family: FontFamily, bold: boolean, italic: boolean) =>
+    call<string | null>("system_font_path", { family, bold, italic }, () => null),
 
   /* diagnostics — all three are on-demand only; nothing is buffered, probed
    * or written unless the user asked for a report. */
@@ -579,13 +601,13 @@ export function mediaUrl(path: string): string {
 /* ---------------- dialogs ---------------- */
 
 /** Home's Open picker: one project, or any number of media files (which Home
- *  then asks to open as a video or an image project). One filter. */
+ *  then asks to open as a video or an image project) or PDFs. One filter. */
 export async function pickOpenFiles(): Promise<string[]> {
   if (!inTauri) return [];
   const { open } = await import("@tauri-apps/plugin-dialog");
   const result = await open({
     multiple: true,
-    filters: [{ name: "Projects and media", extensions: ["trt", ...MEDIA_FILE_EXTENSIONS] }],
+    filters: [{ name: "Projects, media and PDFs", extensions: ["trt", ...OPENABLE_FILE_EXTENSIONS] }],
   });
   if (result === null) return [];
   return Array.isArray(result) ? result : [result];
@@ -628,6 +650,19 @@ export async function pickImageFile(): Promise<string | null> {
     filters: [{ name: "Images", extensions: [...MEDIA_EXTENSIONS.image] }],
   });
   return typeof result === "string" ? result : null;
+}
+
+/** PDF documents (the document family of media-extensions.json): a new PDF
+ *  project, or pages to insert into one. */
+export async function pickPdfFiles(multiple: boolean): Promise<string[]> {
+  if (!inTauri) return [];
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const result = await open({
+    multiple,
+    filters: [{ name: "PDF documents", extensions: [...MEDIA_EXTENSIONS.document] }],
+  });
+  if (result === null) return [];
+  return Array.isArray(result) ? result : [result];
 }
 
 /* ---------------- window drag & drop ---------------- */

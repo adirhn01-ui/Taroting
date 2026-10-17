@@ -334,6 +334,31 @@ html[data-rescue-appearance] .settings__card--appearance {
   flex-direction: column;
 }
 
+/* A row and its reset slot. The slot is always laid out (empty on a default
+   row), so the ↺ coming or going never moves the chord beside it. */
+.settings__shortcut-line {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+.settings__shortcut-line > .settings__shortcut {
+  flex: 1;
+  min-width: 0;
+}
+.settings__shortcut-reset-slot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 26px;
+}
+.settings__shortcut-reset {
+  color: var(--text-3);
+}
+.settings__shortcut-reset:hover {
+  color: var(--text-1);
+}
+
 .settings__shortcut {
   display: flex;
   align-items: center;

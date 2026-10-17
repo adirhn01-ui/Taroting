@@ -234,7 +234,7 @@ export function normalizeChord(stored: string): string {
 
 /** Every ShortcutMode, once. A Record so the compiler demands an entry when a
  *  mode is added: a mode missing here would silently never report a conflict. */
-const MODE_SET: Record<ShortcutMode, true> = { editor: true, viewer: true, image: true };
+const MODE_SET: Record<ShortcutMode, true> = { editor: true, viewer: true, image: true, pdf: true };
 const MODES = Object.keys(MODE_SET) as ShortcutMode[];
 
 /** One chord bound to two or more actions that share a screen. */

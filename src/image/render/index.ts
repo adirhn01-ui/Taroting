@@ -2,8 +2,8 @@
 // `renderComposite` draws a ProjectFile through a `RenderResources` provider.
 // The preview hands it working-resolution resources sized to the stage's
 // device pixels (`PreviewResources`); export hands it full-resolution ones on
-// an OffscreenCanvas (render/export.ts). No Web Worker anywhere (the CSP says
-// `worker-src 'none'`).
+// an OffscreenCanvas (render/export.ts). No Web Worker here (the CSP's
+// `worker-src 'self'` exists only for pdf.js's own worker, PDF chunk only).
 //
 // Nothing here runs until an image project is open: this module is only
 // reachable through the lazily loaded image chunk, and it allocates no canvas

@@ -33,6 +33,9 @@ export interface ExportSpec {
   timeline: Timeline;
   preset: ExportPreset;
   outPath: string;
+  /** the project's kind, so the backend can refuse a project this exporter
+   *  does not make (a PDF project) with its own message */
+  kind?: "image" | "pdf";
 }
 
 /**

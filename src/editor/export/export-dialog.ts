@@ -1442,6 +1442,7 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
       timeline: live.timeline,
       preset: runPreset(),
       outPath: target,
+      ...(live.kind ? { kind: live.kind } : {}),
     };
 
     exporting = true;

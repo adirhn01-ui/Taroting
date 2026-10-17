@@ -195,6 +195,7 @@ mod tests {
             hidden: None,
         };
         ExportSpec {
+            kind: None,
             media: vec![media()],
             timeline: Timeline {
                 fps: Rational { num: 30, den: 1 },

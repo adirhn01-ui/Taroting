@@ -1,0 +1,411 @@
+/* PDF page view: the continuous strip, its pages and their layers, and the
+ * thumbnail rail.
+ *
+ * Pages paint as authored — white paper, no inversion — on the app's panel
+ * background, with the app's own shadow. Inside a page every layer is an
+ * absolutely positioned sibling and stacks by DOM order (no z-index: the
+ * ladder in tokens.css stays the only one): canvas < search hits < text layer
+ * < annotation layer (links, form widgets) < the host's overlay. Each page is
+ * its own stacking context, so pdf.js's inline z-indexes stay inside it.
+ *
+ * The .textLayer / .annotationLayer rules are the essentials of pdf.js 6's
+ * web/pdf_viewer.css its layout maths depends on (sizes come from
+ * --total-scale-factor, spans are placed in page-percent units), via
+ * Tarotalking's reader/pdf-view.css; widget styling is the app's. */
+
+/* Fills its host (any block or flex child with a definite height): the strip
+   is its own scroll container, and everything it renders is decided from its
+   client height — a strip that grew to its content would render nothing. */
+.pdfv {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--bg-app);
+  outline: none;
+}
+
+.pdfv__sizer {
+  position: relative;
+}
+
+.pdfv-page {
+  position: absolute;
+  isolation: isolate;
+  background: #fff;
+  box-shadow: var(--shadow-2);
+  color-scheme: only light;
+  contain: layout paint;
+}
+
+.pdfv-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.pdfv-page--error {
+  background: var(--bg-raised);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.pdfv-page__error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-4);
+  text-align: center;
+  font-family: var(--font-ui);
+  font-size: var(--fs-12);
+  color: var(--text-3);
+  pointer-events: none;
+  user-select: none;
+}
+
+/* ---------- search hits ---------- */
+
+.pdfv-hits {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.pdfv-hit {
+  position: absolute;
+  background: rgba(255, 196, 0, 0.35);
+  border-radius: 2px;
+}
+.pdfv-hit--active {
+  background: rgba(255, 140, 0, 0.55);
+  box-shadow: 0 0 0 1px rgba(200, 90, 0, 0.8);
+}
+
+/* ---------- the host's overlay ---------- */
+
+.pdfv-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* ---------- pdf.js text layer ---------- */
+
+.pdfv-page .textLayer {
+  --min-font-size: 1;
+  --total-scale-factor: calc(var(--scale-factor, 1) * var(--user-unit, 1));
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-align: initial;
+  text-size-adjust: none;
+  -webkit-text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.pdfv-page .textLayer :is(span, br) {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.pdfv-page .textLayer > :not(.markedContent),
+.pdfv-page .textLayer .markedContent span:not(.markedContent) {
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+.pdfv-page .textLayer .markedContent {
+  display: contents;
+}
+.pdfv-page .textLayer span[role="img"] {
+  user-select: none;
+  cursor: default;
+}
+.pdfv-page .textLayer ::selection {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+  color: transparent;
+}
+.pdfv-page .textLayer br::selection {
+  background: transparent;
+}
+.pdfv-page .textLayer .endOfContent {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  cursor: default;
+  user-select: none;
+}
+.pdfv-page .textLayer.selecting .endOfContent {
+  top: 0;
+}
+
+/* pdf.js stamps the page's display turn on both layers and expects these */
+.pdfv-page [data-main-rotation="90"] {
+  transform: rotate(90deg) translateY(-100%);
+}
+.pdfv-page [data-main-rotation="180"] {
+  transform: rotate(180deg) translate(-100%, -100%);
+}
+.pdfv-page [data-main-rotation="270"] {
+  transform: rotate(270deg) translateX(-100%);
+}
+
+/* ---------- pdf.js annotation layer: links + form widgets ---------- */
+
+.pdfv-page .annotationLayer {
+  --total-scale-factor: calc(var(--scale-factor, 1) * var(--user-unit, 1));
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+  position: absolute;
+  top: 0;
+  left: 0;
+  isolation: isolate;
+  pointer-events: none;
+  transform-origin: 0 0;
+}
+.pdfv-page .annotationLayer[data-main-rotation="90"] .norotate {
+  transform: rotate(270deg) translateX(-100%);
+}
+.pdfv-page .annotationLayer[data-main-rotation="180"] .norotate {
+  transform: rotate(180deg) translate(-100%, -100%);
+}
+.pdfv-page .annotationLayer[data-main-rotation="270"] .norotate {
+  transform: rotate(90deg) translateY(-100%);
+}
+.pdfv-page .annotationLayer section {
+  position: absolute;
+  text-align: initial;
+  pointer-events: auto;
+  box-sizing: border-box;
+  transform-origin: 0 0;
+  user-select: none;
+}
+.pdfv-page .annotationLayer .annotationContent {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.pdfv-page .annotationLayer section .overlaidText {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  display: inline-block;
+  overflow: hidden;
+}
+/* comments/popups from the file are not part of this view */
+.pdfv-page .annotationLayer .popupAnnotation,
+.pdfv-page .annotationLayer .popup {
+  display: none;
+}
+/* while text is being selected, nothing above it steals the drag */
+.pdfv-page .textLayer.selecting ~ .annotationLayer section {
+  pointer-events: none;
+}
+
+.pdfv-page .annotationLayer :is(.linkAnnotation, .buttonWidgetAnnotation.pushButton) > a {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  font-size: 1em;
+}
+.pdfv-page .annotationLayer .linkAnnotation > a:hover {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 2px;
+}
+/* an external link is shown, never followed: its URL is the tooltip */
+.pdfv-page .annotationLayer .linkAnnotation > a.pdfv-extlink {
+  cursor: help;
+}
+
+/* form widgets (Fill forms mode) */
+.pdfv-page .annotationLayer .textWidgetAnnotation :is(input, textarea),
+.pdfv-page .annotationLayer .choiceWidgetAnnotation select,
+.pdfv-page .annotationLayer .buttonWidgetAnnotation:is(.checkBox, .radioButton) input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  vertical-align: top;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: #000;
+  font: calc(9px * var(--total-scale-factor)) sans-serif;
+  outline: none;
+}
+.pdfv-page .annotationLayer .textWidgetAnnotation textarea {
+  resize: none;
+}
+.pdfv-page .annotationLayer .choiceWidgetAnnotation select option {
+  padding: 0;
+}
+.pdfv-page .annotationLayer .textWidgetAnnotation :is(input, textarea):hover,
+.pdfv-page .annotationLayer .choiceWidgetAnnotation select:hover,
+.pdfv-page .annotationLayer .buttonWidgetAnnotation:is(.checkBox, .radioButton) input:hover {
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+}
+.pdfv-page .annotationLayer .textWidgetAnnotation :is(input, textarea):focus,
+.pdfv-page .annotationLayer .choiceWidgetAnnotation select:focus,
+.pdfv-page .annotationLayer .buttonWidgetAnnotation:is(.checkBox, .radioButton) input:focus {
+  background: transparent;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.pdfv-page .annotationLayer :is(input, textarea, select)[disabled] {
+  background: none;
+  border-color: transparent;
+  cursor: not-allowed;
+}
+.pdfv-page .annotationLayer .textWidgetAnnotation input.comb {
+  --comb-width: 0px;
+  --comb-letter-spacing: calc(var(--comb-width) - 1ch);
+  font-family: monospace;
+  letter-spacing: var(--comb-letter-spacing);
+  overflow-x: hidden;
+  padding: 0;
+  text-indent: calc(var(--comb-offset, 0) * var(--comb-width) + var(--comb-letter-spacing) / 2);
+}
+/* checkboxes and radios: pdf.js paints their on/off look into small canvases
+   (data-canvas-name); the input on top is the transparent hit target */
+.pdfv-page .annotationLayer .buttonWidgetAnnotation:is(.checkBox, .radioButton) input {
+  appearance: none;
+  -webkit-appearance: none;
+}
+.pdfv-page .annotationLayer .buttonWidgetAnnotation.radioButton input {
+  border-radius: 50%;
+}
+.pdfv-page .annotationLayer .buttonWidgetAnnotation:is(.checkBox, .radioButton):has([data-canvas-name]) input {
+  background: transparent;
+}
+.pdfv-page .annotationLayer .buttonWidgetAnnotation:is(.checkBox, .radioButton) [data-canvas-name="checked"]:has(~ input:not(:checked)),
+.pdfv-page .annotationLayer .buttonWidgetAnnotation:is(.checkBox, .radioButton) [data-canvas-name="unchecked"]:has(~ input:checked) {
+  display: none;
+}
+/* no appearance canvases (a field without its own look): draw the state */
+.pdfv-page .annotationLayer .buttonWidgetAnnotation:is(.checkBox, .radioButton):not(:has([data-canvas-name])) input:checked {
+  background: var(--accent);
+  box-shadow: inset 0 0 0 2px #fff;
+}
+.pdfv-page .annotationLayer .hasOwnCanvas:not(.sandboxModified) :is(input, textarea) {
+  display: none;
+}
+.pdfv-page .annotationLayer section:has(div.annotationContent) canvas.annotationContent {
+  display: none;
+}
+.pdfv-page .annotationLayer canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* ---------- thumbnail rail ---------- */
+
+.pdfv-rail {
+  position: relative;
+  overflow-y: auto;
+  overflow-x: hidden;
+  outline: none;
+  background: var(--bg-panel);
+  user-select: none;
+}
+.pdfv-rail__list {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-2);
+}
+.pdfv-thumb {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1);
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+.pdfv-thumb__img {
+  position: relative;
+  width: 120px;
+  background: #fff;
+  box-shadow: var(--shadow-1);
+  outline: 1px solid var(--border);
+  overflow: hidden;
+  color-scheme: only light;
+}
+.pdfv-thumb__canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.pdfv-thumb__num {
+  font-family: var(--font-ui);
+  font-size: var(--fs-11);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+.pdfv-thumb:hover .pdfv-thumb__img {
+  outline-color: var(--border-strong);
+}
+.pdfv-thumb--selected {
+  background: var(--accent-dim);
+}
+.pdfv-thumb--current .pdfv-thumb__img {
+  outline: 2px solid var(--accent);
+}
+.pdfv-thumb--current .pdfv-thumb__num {
+  color: var(--accent);
+  font-weight: 600;
+}
+.pdfv-rail:focus-visible .pdfv-thumb--focus {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.pdfv-thumb--error .pdfv-thumb__img {
+  background: var(--bg-raised);
+}
+.pdfv-rail--dragging,
+.pdfv-rail--dragging .pdfv-thumb {
+  cursor: grabbing;
+}
+.pdfv-rail__drop {
+  position: absolute;
+  left: var(--sp-3);
+  right: var(--sp-3);
+  height: 2px;
+  margin-top: -1px;
+  border-radius: 1px;
+  background: var(--accent);
+  pointer-events: none;
+}

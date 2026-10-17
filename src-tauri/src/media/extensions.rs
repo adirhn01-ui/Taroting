@@ -3,6 +3,10 @@
 //! about what counts as media: what the picker offers, what drop and
 //! open-with accept, and what the viewer steps through in a folder.
 //!
+//! The table also lists DOCUMENTS (`"document": ["pdf"]`): openable — the
+//! viewer, Explorer, Home — but NOT media. A document never goes on a video
+//! timeline or into an image project, and `probe_media` refuses one.
+//!
 //! Parsed once, on the first lookup: the first `list_siblings`, or
 //! `os::queued_known_launch` when a launch carries a file. A plain launch
 //! never parses it.
@@ -10,21 +14,25 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-/// A media family, one per key of media-extensions.json.
+/// A family, one per key of media-extensions.json (TS `MediaFamily`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
     Video,
     Gif,
     Image,
     Audio,
+    /// PDF: openable, but not media (see the module comment).
+    Document,
 }
 
-/// What the viewer steps through together: video + gif + image, or audio alone.
+/// What the viewer steps through together: video + gif + image, audio alone,
+/// or documents alone (TS `StepFamily`: "visual" | "audio" | "document").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StepFamily {
     Visual,
     Audio,
+    Document,
 }
 
 const TABLE_JSON: &str = include_str!("../../../src/core/media-extensions.json");
@@ -35,11 +43,12 @@ const TABLE_JSON: &str = include_str!("../../../src/core/media-extensions.json")
 /// table is built in this order and the first family to claim an extension
 /// keeps it. Iterating the parsed map instead would go alphabetically
 /// (audio first) and quietly disagree with the frontend.
-const KEYS: [(&str, Family); 4] = [
+const KEYS: [(&str, Family); 5] = [
     ("video", Family::Video),
     ("gif", Family::Gif),
     ("image", Family::Image),
     ("audio", Family::Audio),
+    ("document", Family::Document),
 ];
 
 /// Build the table from `json`. Unknown keys are ignored; entries are
@@ -75,16 +84,18 @@ pub fn family_of_ext(ext: &str) -> Option<Family> {
         .map(|(_, f)| *f)
 }
 
-/// Audio steps only through audio; everything with a picture steps together.
+/// Audio steps only through audio, documents only through documents;
+/// everything with a picture steps together.
 pub fn step_family(f: Family) -> StepFamily {
     match f {
         Family::Audio => StepFamily::Audio,
+        Family::Document => StepFamily::Document,
         Family::Video | Family::Gif | Family::Image => StepFamily::Visual,
     }
 }
 
 /// Every `(extension, family)` in the table, lowercase: family by family in
-/// `mediaFamilyOf`'s order (video, gif, image, audio), each family's
+/// `mediaFamilyOf`'s order (video, gif, image, audio, document), each family's
 /// extensions in file order.
 pub fn all() -> &'static [(String, Family)] {
     static TABLE: OnceLock<Vec<(String, Family)>> = OnceLock::new();
@@ -137,6 +148,23 @@ mod tests {
         assert_eq!(step_family(Family::Gif), StepFamily::Visual);
         assert_eq!(step_family(Family::Image), StepFamily::Visual);
         assert_eq!(step_family(Family::Audio), StepFamily::Audio);
+    }
+
+    /// The document family: `.pdf` in any case, stepping on its own, and
+    /// "document" on the wire exactly as TS `StepFamily` spells it.
+    #[test]
+    fn pdf_is_a_document_that_steps_alone() {
+        assert_eq!(family_of_ext("pdf"), Some(Family::Document));
+        assert_eq!(family_of_ext("PDF"), Some(Family::Document));
+        assert_eq!(step_family(Family::Document), StepFamily::Document);
+        assert_eq!(serde_json::to_value(StepFamily::Document).unwrap(), "document");
+        assert_eq!(serde_json::to_value(StepFamily::Visual).unwrap(), "visual");
+        assert_eq!(serde_json::to_value(StepFamily::Audio).unwrap(), "audio");
+        // Last in the precedence, like `mediaFamilyOf`: a document key never
+        // takes an extension a media family already claims.
+        assert_eq!(KEYS.last().map(|(k, _)| *k), Some("document"));
+        let t = parse(r#"{"document": ["pdf", "png"], "image": ["png"]}"#);
+        assert_eq!(t, vec![("png".to_string(), Family::Image), ("pdf".to_string(), Family::Document)]);
     }
 
     #[test]

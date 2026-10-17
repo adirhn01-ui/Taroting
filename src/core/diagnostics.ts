@@ -13,6 +13,9 @@
 //   * a drawing never appears — only how many strokes and points it has, never
 //     a colour or a coordinate (a drawing can be a signature or handwriting)
 //   * the image editor's recent ink colours appear only as a count
+//   * a PDF project appears only as counts (sources, pages, marks, form
+//     values) — never a source path, a mark's text, a form value or a
+//     coordinate; its source paths seed the redactor like media paths do
 //   * free text (ffmpeg argv, log lines, messages) is swept for the user name
 //   * a recent error that names its files (`paths`) loses those paths whole,
 //     and its message loses their bare file names and stems as well
@@ -115,9 +118,23 @@ export interface RedactedMedia {
   generator?: RedactedGenerator;
 }
 
+/** A PDF project in a report: counts only (see the privacy rules). */
+export interface PdfShape {
+  sources: number;
+  pages: number;
+  blankPages: number;
+  /** marks across every page */
+  marks: number;
+  /** form fields with a typed-in value, across every source */
+  formValues: number;
+}
+
 export interface ProjectShape {
-  /** "image" for an image project, else "video" — a fixed word, never file text */
-  kind: "image" | "video";
+  /** "image" / "pdf" for those projects, else "video" — a fixed word, never
+   *  file text */
+  kind: "image" | "video" | "pdf";
+  /** PDF projects only */
+  pdf?: PdfShape;
   canvas: string;
   timebase: string;
   durationSec: number;
@@ -433,6 +450,47 @@ function drawingCounts(chunks: unknown): { strokes: number; points: number } {
   return { strokes, points };
 }
 
+/** Counts of a PDF project's `pdf` block. Defensive about shape for the same
+ *  reason as `drawingCounts`: a report must never throw, least of all on the
+ *  project that went wrong. Own keys only (`Object.keys`), never text. */
+function pdfCounts(pdf: unknown): PdfShape {
+  const out: PdfShape = { sources: 0, pages: 0, blankPages: 0, marks: 0, formValues: 0 };
+  if (pdf === null || typeof pdf !== "object") return out;
+  const { sources, pages, annots, forms } = pdf as Record<string, unknown>;
+  if (Array.isArray(sources)) out.sources = sources.length;
+  if (Array.isArray(pages)) {
+    out.pages = pages.length;
+    for (const pg of pages) {
+      if (pg !== null && typeof pg === "object" && (pg as { src?: unknown }).src === null) out.blankPages++;
+    }
+  }
+  if (annots !== null && typeof annots === "object") {
+    for (const k of Object.keys(annots)) {
+      const list = (annots as Record<string, unknown>)[k];
+      if (Array.isArray(list)) out.marks += list.length;
+    }
+  }
+  if (forms !== null && typeof forms === "object") {
+    for (const k of Object.keys(forms)) {
+      const rec = (forms as Record<string, unknown>)[k];
+      if (rec !== null && typeof rec === "object") out.formValues += Object.keys(rec).length;
+    }
+  }
+  return out;
+}
+
+/** Every source path of a PDF project (none for any other), defensively. */
+function pdfSourcePathsOf(project: ProjectFile): string[] {
+  const sources = (project.pdf as { sources?: unknown } | undefined)?.sources;
+  if (!Array.isArray(sources)) return [];
+  const out: string[] = [];
+  for (const s of sources) {
+    const path = (s as { path?: unknown } | null)?.path;
+    if (typeof path === "string") out.push(path);
+  }
+  return out;
+}
+
 /**
  * Counters + redacted media for a project. Never returns the project name, a
  * file path, or the content of a text generator — media *properties* are kept
@@ -465,8 +523,10 @@ export function redactProjectShape(
   }
 
   const shown = project.media.slice(0, MAX_MEDIA_ROWS);
+  const isPdf = project.kind === "pdf";
   return {
-    kind: project.kind === "image" ? "image" : "video",
+    kind: project.kind === "image" ? "image" : isPdf ? "pdf" : "video",
+    ...(isPdf ? { pdf: pdfCounts(project.pdf) } : {}),
     canvas: `${t.width}x${t.height}`,
     timebase: `${t.fps.num}/${t.fps.den}`,
     durationSec: round3(timelineDuration(t)),
@@ -557,6 +617,7 @@ export function buildReport(ctx: ReportContext): string {
   // Diagnostics) with nothing known at all.
   const redactor = createRedactor([
     ...(ctx.project ? ctx.project.media.map((m) => m.path) : []),
+    ...(ctx.project ? pdfSourcePathsOf(ctx.project) : []),
     ...recent.flatMap((e) => e.paths ?? []),
   ]);
 
@@ -638,6 +699,13 @@ export function buildReport(ctx: ReportContext): string {
     const shape = redactProjectShape(ctx.project, redactor.path);
     out.push(head("Project shape"));
     out.push(row("Project kind", shape.kind));
+    if (shape.pdf) {
+      out.push(row("PDF sources", shape.pdf.sources));
+      out.push(row("PDF pages", shape.pdf.pages));
+      out.push(row("Blank pages", shape.pdf.blankPages));
+      out.push(row("PDF marks", shape.pdf.marks));
+      out.push(row("Form values", shape.pdf.formValues));
+    }
     out.push(row("Canvas", shape.canvas));
     out.push(row("Timebase", shape.timebase));
     out.push(row("Duration", `${shape.durationSec}s`));

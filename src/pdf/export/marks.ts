@@ -1,0 +1,611 @@
+// Marks (PdfAnnot) → PDF. Every mark becomes ONE appearance: a Form XObject
+// whose /BBox is the mark's rectangle in the page's user space, drawn with an
+// identity /Matrix. Then either
+//   - written as a real annotation (/AP /N = that form, /Rect = /BBox — the
+//     spike found a BBox larger than the Rect gets SCALED into it by
+//     Chromium/PDFium), with the subtype a viewer lists and lets the user
+//     delete; or
+//   - flattened: the same form painted into the page with `Do`, so both modes
+//     share one geometry.
+//
+// Geometry is converted point by point (page space is y-down from the crop
+// box's top-left; user space y-up from the origin), never with a mirroring
+// `cm`, which would flip glyphs and pictures. Page space is the UNROTATED
+// page, so marks need nothing extra on a turned page: they turn with it.
+//
+// Ink shares the image editor's geometry: the same `outlinePolygon` (pen and
+// pencil are one filled variable-width outline) and the same arrow wings.
+
+import {
+  PDFArray,
+  PDFDict,
+  PDFHexString,
+  PDFName,
+  PDFNumber,
+  PDFString,
+  type PDFDocument,
+  type PDFFont,
+  type PDFImage,
+  type PDFPage,
+  type PDFRef,
+} from "pdf-lib";
+import fontkit from "@pdf-lib/fontkit";
+import type { FontFamily, MediaRef, PdfAnnot, PdfTextStyle, ProjectFile } from "../../core/types";
+import { decodePoints } from "../../image/strokes";
+import { outlinePolygon, penHalfWidth, pencilHalfWidth, type HalfWidth } from "../../image/ink/outline";
+import { arrowWings } from "../../image/ink/shapes";
+import { hasArabic, paragraphBidi, visualLine } from "./bidi";
+import type { ExportDeps } from "./deps";
+import { PdfExportError, baseName } from "./errors";
+import { displayedOf, prepareImage, type Orientation } from "./images";
+import { LINE_HEIGHT, wrapParagraph } from "./layout";
+
+/* ---------------- numbers, colours, boxes ---------------- */
+
+/** A content-stream number: at most 3 decimals, never exponent notation, never "-0". */
+export function num(v: number): string {
+  if (!Number.isFinite(v)) return "0";
+  const r = Math.round(v * 1000) / 1000;
+  if (r === 0) return "0";
+  return r.toFixed(3).replace(/\.?0+$/, "");
+}
+
+export function hexRgb(c: string, fallback: [number, number, number] = [0, 0, 0]): [number, number, number] {
+  const m = /^#([0-9a-f]{6})$/i.exec(typeof c === "string" ? c : "");
+  if (!m) return fallback;
+  const v = parseInt(m[1]!, 16);
+  return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255];
+}
+
+const rgbOps = (c: [number, number, number], op: "rg" | "RG"): string => `${num(c[0])} ${num(c[1])} ${num(c[2])} ${op}`;
+
+/** The page's crop box (intersected with its media box), user space. */
+export interface PageGeom {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+function boxOf(arr: PDFArray | undefined): PageGeom | null {
+  if (!arr || arr.size() < 4) return null;
+  const v: number[] = [];
+  for (let i = 0; i < 4; i++) {
+    const n = arr.lookup(i);
+    if (!(n instanceof PDFNumber)) return null;
+    v.push(n.asNumber());
+  }
+  const x0 = Math.min(v[0]!, v[2]!);
+  const x1 = Math.max(v[0]!, v[2]!);
+  const y0 = Math.min(v[1]!, v[3]!);
+  const y1 = Math.max(v[1]!, v[3]!);
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+export function pageGeom(page: PDFPage): PageGeom {
+  const media = boxOf(page.node.MediaBox()) ?? { x: 0, y: 0, w: 612, h: 792 };
+  const crop = boxOf(page.node.CropBox());
+  if (!crop) return media;
+  const x0 = Math.max(crop.x, media.x);
+  const y0 = Math.max(crop.y, media.y);
+  const x1 = Math.min(crop.x + crop.w, media.x + media.w);
+  const y1 = Math.min(crop.y + crop.h, media.y + media.h);
+  return x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : media;
+}
+
+type Rect = [number, number, number, number];
+
+class Bounds {
+  x0 = Infinity;
+  y0 = Infinity;
+  x1 = -Infinity;
+  y1 = -Infinity;
+  add(x: number, y: number): void {
+    if (x < this.x0) this.x0 = x;
+    if (x > this.x1) this.x1 = x;
+    if (y < this.y0) this.y0 = y;
+    if (y > this.y1) this.y1 = y;
+  }
+  rect(pad: number): Rect | null {
+    if (!(this.x1 >= this.x0) || !(this.y1 >= this.y0)) return null;
+    return [this.x0 - pad, this.y0 - pad, this.x1 + pad, this.y1 + pad];
+  }
+}
+
+const finite = (...v: number[]): boolean => v.every((n) => typeof n === "number" && Number.isFinite(n));
+
+/* ---------------- the appearance a mark becomes ---------------- */
+
+export interface Appearance {
+  rect: Rect;
+  ops: string;
+  /** resources of the appearance form (pdf-lib literal) */
+  resources: Record<string, unknown>;
+  /** subtype-specific annotation entries (pdf-lib literal), Subtype included */
+  annot: Record<string, unknown>;
+}
+
+/** An embedded face plus its vertical metrics in em (ascent up, descent
+ *  down, both positive) — read from the font itself: pdf-lib's
+ *  heightAtSize(…, {descender:false}) subtracts an UNSCALED descent and is
+ *  ~0.22 em short for every 2048-unit font (Arial: 683 instead of 905). */
+export interface EmbeddedFont {
+  font: PDFFont;
+  ascent: number;
+  descent: number;
+}
+
+/** What building a mark may need from the document being written. */
+export interface MarkCtx {
+  doc: PDFDocument;
+  project: ProjectFile;
+  deps: ExportDeps;
+  font(family: FontFamily, bold: boolean, italic: boolean): Promise<EmbeddedFont>;
+  image(mediaId: string): Promise<{ img: PDFImage; orientation: Orientation }>;
+}
+
+const KAPPA = 0.5522847498;
+
+function ellipseOps(cx: number, cy: number, rx: number, ry: number): string {
+  const ox = rx * KAPPA;
+  const oy = ry * KAPPA;
+  return (
+    `${num(cx + rx)} ${num(cy)} m ` +
+    `${num(cx + rx)} ${num(cy + oy)} ${num(cx + ox)} ${num(cy + ry)} ${num(cx)} ${num(cy + ry)} c ` +
+    `${num(cx - ox)} ${num(cy + ry)} ${num(cx - rx)} ${num(cy + oy)} ${num(cx - rx)} ${num(cy)} c ` +
+    `${num(cx - rx)} ${num(cy - oy)} ${num(cx - ox)} ${num(cy - ry)} ${num(cx)} ${num(cy - ry)} c ` +
+    `${num(cx + ox)} ${num(cy - ry)} ${num(cx + rx)} ${num(cy - oy)} ${num(cx + rx)} ${num(cy)} c h`
+  );
+}
+
+function gs(o: number | undefined, multiply = false): { ops: string; res: Record<string, unknown> } {
+  const a = o === undefined || !Number.isFinite(o) ? 1 : Math.min(Math.max(o, 0), 1);
+  if (a >= 1 && !multiply) return { ops: "", res: {} };
+  const g: Record<string, unknown> = { Type: "ExtGState", CA: a, ca: a };
+  if (multiply) g["BM"] = "Multiply";
+  return { ops: "/GS0 gs ", res: { ExtGState: { GS0: g } } };
+}
+
+/** Filled outline rings of points ([x, y, p]* in page space) as user-space ops. */
+function outlineOps(pts: Float32Array, half: HalfWidth, U: (x: number, y: number) => [number, number], b: Bounds): string {
+  const o = outlinePolygon(pts, pts.length / 3, half);
+  if (o.dot) {
+    if (!(o.dot.r > 0)) return "";
+    const [x, y] = U(o.dot.x, o.dot.y);
+    b.add(x - o.dot.r, y - o.dot.r);
+    b.add(x + o.dot.r, y + o.dot.r);
+    return ellipseOps(x, y, o.dot.r, o.dot.r) + " ";
+  }
+  const parts: string[] = [];
+  let from = 0;
+  for (const to of o.ends) {
+    if (to - from >= 3) {
+      for (let i = from; i < to; i++) {
+        const [x, y] = U(o.ring[i * 2]!, o.ring[i * 2 + 1]!);
+        b.add(x, y);
+        parts.push(`${num(x)} ${num(y)} ${i === from ? "m" : "l"}`);
+      }
+      parts.push("h");
+    }
+    from = to;
+  }
+  return parts.length ? parts.join(" ") + " " : "";
+}
+
+function inkList(pts: Float32Array, U: (x: number, y: number) => [number, number]): number[] {
+  const out: number[] = [];
+  for (let i = 0; i + 2 < pts.length; i += 3) {
+    const [x, y] = U(pts[i]!, pts[i + 1]!);
+    out.push(Math.round(x * 1000) / 1000, Math.round(y * 1000) / 1000);
+  }
+  return out;
+}
+
+/** Signature strokes are a pen of this fraction of the box's smaller side
+ *  (min 0.5 pt). Must match the PDF editor's signature preview. */
+export const SIGNATURE_WIDTH_FRACTION = 0.03;
+
+export async function buildAppearance(a: PdfAnnot, geom: PageGeom, cx: MarkCtx): Promise<Appearance | null> {
+  const U = (x: number, y: number): [number, number] => [geom.x + x, geom.y + geom.h - y];
+  /** a page-space box → user-space Rect */
+  const boxRect = (x: number, y: number, w: number, h: number): Rect => {
+    const [x0, y1] = U(x, y);
+    return [x0, y1 - h, x0 + w, y1];
+  };
+  switch (a.t) {
+    case "ink": {
+      const pts = decodePoints(a.p);
+      if (!pts || pts.length < 3 || !finite(a.w, a.o) || !(a.w > 0)) return null;
+      const c = hexRgb(a.c);
+      const b = new Bounds();
+      let ops: string;
+      const marker = a.kind === "marker";
+      const g = gs(a.o, marker);
+      if (marker) {
+        // constant width, round caps and joins — the editor strokes it so
+        const pl = inkList(pts, U);
+        const dot = pl.every((v, i) => v === pl[i % 2]);
+        if (dot) {
+          ops = `${g.ops}${rgbOps(c, "rg")} ${ellipseOps(pl[0]!, pl[1]!, a.w / 2, a.w / 2)} f`;
+        } else {
+          const path: string[] = [];
+          for (let i = 0; i < pl.length; i += 2) path.push(`${num(pl[i]!)} ${num(pl[i + 1]!)} ${i ? "l" : "m"}`);
+          ops = `${g.ops}${rgbOps(c, "RG")} ${num(a.w)} w 1 J 1 j ${path.join(" ")} S`;
+        }
+        for (let i = 0; i < pl.length; i += 2) b.add(pl[i]!, pl[i + 1]!);
+        const rect = b.rect(a.w / 2 + 1);
+        if (!rect) return null;
+        return { rect, ops, resources: g.res, annot: { Subtype: "Ink", InkList: [pl], C: c, BS: { W: a.w } } };
+      }
+      const half = a.kind === "pencil" ? pencilHalfWidth(a.w) : penHalfWidth(a.w);
+      const body = outlineOps(pts, half, U, b);
+      if (!body) return null;
+      ops = `${g.ops}${rgbOps(c, "rg")} ${body}f`;
+      const rect = b.rect(1);
+      if (!rect) return null;
+      return { rect, ops, resources: g.res, annot: { Subtype: "Ink", InkList: [inkList(pts, U)], C: c, BS: { W: a.w } } };
+    }
+    case "highlight": {
+      const c = hexRgb(a.c, [1, 1, 0]);
+      const g = gs(a.o, true);
+      const b = new Bounds();
+      const quads: number[] = [];
+      const body: string[] = [];
+      for (const r of a.rects ?? []) {
+        if (!Array.isArray(r) || !finite(...r) || !(r[2] > 0) || !(r[3] > 0)) continue;
+        const [x0, y0, x1, y1] = boxRect(r[0], r[1], r[2], r[3]);
+        b.add(x0, y0);
+        b.add(x1, y1);
+        quads.push(x0, y1, x1, y1, x0, y0, x1, y0);
+        body.push(`${num(x0)} ${num(y0)} ${num(x1 - x0)} ${num(y1 - y0)} re`);
+      }
+      const rect = b.rect(0);
+      if (!rect || !body.length) return null;
+      return {
+        rect,
+        ops: `${g.ops}${rgbOps(c, "rg")} ${body.join(" ")} f`,
+        resources: g.res,
+        annot: { Subtype: "Highlight", QuadPoints: quads, C: c },
+      };
+    }
+    case "line":
+    case "arrow":
+    case "rect":
+    case "ellipse": {
+      if (!finite(a.w, ...a.a, ...a.b) || !(a.w > 0)) return null;
+      const c = hexRgb(a.c);
+      const [ax, ay] = U(a.a[0], a.a[1]);
+      const [bx, by] = U(a.b[0], a.b[1]);
+      const b = new Bounds();
+      b.add(ax, ay);
+      b.add(bx, by);
+      const stroke = `${rgbOps(c, "RG")} ${num(a.w)} w 1 J 1 j `;
+      if (a.t === "line" || a.t === "arrow") {
+        let path = `${num(ax)} ${num(ay)} m ${num(bx)} ${num(by)} l`;
+        if (a.t === "arrow") {
+          const wings = arrowWings(a.a, a.b, a.w);
+          if (wings) {
+            const [w0x, w0y] = U(wings[0][0], wings[0][1]);
+            const [w1x, w1y] = U(wings[1][0], wings[1][1]);
+            b.add(w0x, w0y);
+            b.add(w1x, w1y);
+            path += ` ${num(w0x)} ${num(w0y)} m ${num(bx)} ${num(by)} l ${num(w1x)} ${num(w1y)} l`;
+          }
+        }
+        const rect = b.rect(a.w / 2 + 1)!;
+        return {
+          rect,
+          ops: `${stroke}${path} S`,
+          resources: {},
+          annot: {
+            Subtype: "Line",
+            L: [ax, ay, bx, by],
+            LE: ["None", a.t === "arrow" ? "OpenArrow" : "None"],
+            C: c,
+            BS: { W: a.w },
+          },
+        };
+      }
+      const rect = b.rect(a.w / 2)!;
+      const x0 = Math.min(ax, bx);
+      const y0 = Math.min(ay, by);
+      const w = Math.abs(bx - ax);
+      const h = Math.abs(by - ay);
+      const path =
+        a.t === "rect" ? `${num(x0)} ${num(y0)} ${num(w)} ${num(h)} re` : ellipseOps(x0 + w / 2, y0 + h / 2, w / 2, h / 2);
+      const inset = a.w / 2;
+      return {
+        rect,
+        ops: `${stroke}${path} S`,
+        resources: {},
+        annot: { Subtype: a.t === "rect" ? "Square" : "Circle", C: c, BS: { W: a.w }, RD: [inset, inset, inset, inset] },
+      };
+    }
+    case "whiteout": {
+      if (!finite(a.x, a.y, a.w, a.h) || !(a.w > 0) || !(a.h > 0)) return null;
+      const c = hexRgb(a.c, [1, 1, 1]);
+      const rect = boxRect(a.x, a.y, a.w, a.h);
+      return {
+        rect,
+        ops: `${rgbOps(c, "rg")} ${num(rect[0])} ${num(rect[1])} ${num(a.w)} ${num(a.h)} re f`,
+        resources: {},
+        annot: { Subtype: "Square", IC: c, BS: { W: 0 } },
+      };
+    }
+    case "text":
+      return textAppearance(a, boxRect, cx);
+    case "image": {
+      if (!finite(a.x, a.y, a.w, a.h) || !(a.w > 0) || !(a.h > 0)) return null;
+      const { img, orientation } = await cx.image(a.media);
+      const rect = boxRect(a.x, a.y, a.w, a.h);
+      return {
+        rect,
+        ops: `q ${imageMatrix(rect, orientation)} cm /Im0 Do Q`,
+        resources: { XObject: { Im0: img.ref } },
+        annot: { Subtype: "Stamp", Name: "Image" },
+      };
+    }
+    case "signature": {
+      if (!finite(a.x, a.y, a.w, a.h) || !(a.w > 0) || !(a.h > 0)) return null;
+      const c = hexRgb(a.c);
+      const width = Math.max(0.5, Math.min(a.w, a.h) * SIGNATURE_WIDTH_FRACTION);
+      const half = penHalfWidth(width);
+      const b = new Bounds();
+      const lists: number[][] = [];
+      let body = "";
+      for (const s of a.strokes ?? []) {
+        const norm = decodePoints(s);
+        if (!norm) continue;
+        const pts = new Float32Array(norm.length);
+        for (let i = 0; i + 2 < norm.length; i += 3) {
+          pts[i] = a.x + norm[i]! * a.w;
+          pts[i + 1] = a.y + norm[i + 1]! * a.h;
+          pts[i + 2] = norm[i + 2]!;
+        }
+        body += outlineOps(pts, half, U, b);
+        lists.push(inkList(pts, U));
+      }
+      const rect = b.rect(1);
+      if (!rect || !body) return null;
+      return { rect, ops: `${rgbOps(c, "rg")} ${body}f`, resources: {}, annot: { Subtype: "Ink", InkList: lists, C: c, BS: { W: width } } };
+    }
+  }
+  return null;
+}
+
+/** `cm` operands mapping the image's unit square into `rect`, turned by `o`. */
+export function imageMatrix(rect: Rect, o: Orientation): string {
+  const [x0, y0, x1, y1] = rect;
+  const P = (u: number, v: number): [number, number] => {
+    const [X, Y] = displayedOf(o, u, v);
+    return [x0 + X * (x1 - x0), y1 - Y * (y1 - y0)];
+  };
+  const [ex, ey] = P(0, 0);
+  const [ax, ay] = P(1, 0);
+  const [cx, cy] = P(0, 1);
+  return `${num(ax - ex)} ${num(ay - ey)} ${num(cx - ex)} ${num(cy - ey)} ${num(ex)} ${num(ey)}`;
+}
+
+/* ---------------- text boxes ---------------- */
+
+/** How many canvas px per point the Arabic fallback draws at. */
+export const RASTER_SCALE = 4;
+
+type TextAnnot = Extract<PdfAnnot, { t: "text" }>;
+
+async function textAppearance(
+  a: TextAnnot,
+  boxRect: (x: number, y: number, w: number, h: number) => Rect,
+  cx: MarkCtx,
+): Promise<Appearance | null> {
+  if (!finite(a.x, a.y, a.w, a.h, a.size) || !(a.w > 0) || !(a.h > 0) || !(a.size > 0)) return null;
+  const text = typeof a.text === "string" ? a.text : "";
+  const rect = boxRect(a.x, a.y, a.w, a.h);
+  const c = hexRgb(a.c);
+  const size = a.size;
+  const lh = size * LINE_HEIGHT;
+  const clip = `${num(rect[0])} ${num(rect[1])} ${num(a.w)} ${num(a.h)} re W n`;
+  const annot: Record<string, unknown> = {
+    Subtype: "FreeText",
+    Contents: PDFHexString.fromText(text),
+    DA: PDFString.of(`${rgbOps(c, "rg")} /Helv ${num(size)} Tf`),
+    BS: { W: 0 },
+  };
+
+  if (hasArabic(text)) {
+    // No shaping here: the browser draws it (see raster.ts).
+    const png = await cx.deps.rasterizeText({
+      text,
+      font: a.font,
+      bold: !!a.bold,
+      italic: !!a.italic,
+      size,
+      color: `#${[...c].map((v) => Math.round(v * 255).toString(16).padStart(2, "0")).join("")}`,
+      align: a.align,
+      w: a.w,
+      h: a.h,
+      scale: RASTER_SCALE,
+      lineHeight: lh,
+    });
+    const img = await cx.doc.embedPng(png);
+    return {
+      rect,
+      ops: `q ${clip} ${num(a.w)} 0 0 ${num(a.h)} ${num(rect[0])} ${num(rect[1])} cm /Im0 Do Q`,
+      resources: { XObject: { Im0: img.ref } },
+      annot,
+    };
+  }
+
+  const { font, ascent, descent } = await cx.font(a.font, !!a.bold, !!a.italic);
+  const asc = ascent * size;
+  const desc = descent * size;
+  const lines: string[] = [];
+  let row = 0;
+  for (const para of text.split(/\r\n|\r|\n/)) {
+    const bidi = paragraphBidi(para);
+    for (const [s, e] of wrapParagraph(para, a.w, (t) => font.widthOfTextAtSize(t, size))) {
+      const baseline = row * lh + (lh - (asc + desc)) / 2 + asc;
+      row++;
+      if (baseline - asc > a.h) break; // fully below the box: clipped anyway
+      const visual = visualLine(bidi, s, e);
+      if (!visual) continue;
+      const lw = font.widthOfTextAtSize(visual, size);
+      const lx = alignX(a.align, a.w, lw);
+      lines.push(`1 0 0 1 ${num(rect[0] + lx)} ${num(rect[3] - baseline)} Tm ${encodeVisual(font, visual)} Tj`);
+    }
+  }
+  const ops = lines.length ? `q ${clip} BT /F0 ${num(size)} Tf ${rgbOps(c, "rg")} ${lines.join(" ")} ET Q` : "";
+  return { rect, ops, resources: { Font: { F0: font.ref } }, annot };
+}
+
+/** Right-to-left script characters: fontkit's layout (inside pdf-lib's
+ *  encodeText) REVERSES the whole glyph run when a string's first
+ *  script-bearing character is one of these (measured: "שלום" encodes as
+ *  ם,ו,ל,ש), which would undo the bidi pass. */
+const RTL_SCRIPT = /[֐-ࣿיִ-﷿ﹰ-﻿]/;
+
+/** Hex glyph string of an already-VISUAL-order string, in exactly that order:
+ *  runs without right-to-left script letters are encoded whole (they keep
+ *  their substitutions), right-to-left letters one at a time (a single glyph
+ *  cannot be reversed). Hebrew needs no shaping, so nothing is lost. */
+export function encodeVisual(font: PDFFont, visual: string): string {
+  if (!RTL_SCRIPT.test(visual)) return font.encodeText(visual).toString();
+  let hex = "";
+  let run = "";
+  const flush = (): void => {
+    if (run) hex += font.encodeText(run).toString().slice(1, -1);
+    run = "";
+  };
+  for (const ch of visual) {
+    if (RTL_SCRIPT.test(ch)) {
+      flush();
+      hex += font.encodeText(ch).toString().slice(1, -1);
+    } else {
+      run += ch;
+    }
+  }
+  flush();
+  return `<${hex}>`;
+}
+
+function alignX(align: PdfTextStyle["align"], boxW: number, lineW: number): number {
+  if (align === "center") return (boxW - lineW) / 2;
+  if (align === "right") return boxW - lineW;
+  return 0;
+}
+
+/* ---------------- writing them out ---------------- */
+
+/** Write `apps` onto `page`: as annotations, or painted into its content. */
+export function placeAppearances(
+  doc: PDFDocument,
+  page: PDFPage,
+  items: { id: string; app: Appearance }[],
+  flatten: boolean,
+  now: Date,
+): void {
+  if (!items.length) return;
+  const ctx = doc.context;
+  const forms: PDFRef[] = [];
+  for (const { app } of items) {
+    const dict: Record<string, unknown> = { Type: "XObject", Subtype: "Form", FormType: 1, BBox: app.rect };
+    if (Object.keys(app.resources).length) dict["Resources"] = app.resources;
+    forms.push(ctx.register(ctx.flateStream(app.ops, dict as never)));
+  }
+  if (flatten) {
+    const ops: string[] = [];
+    for (const ref of forms) {
+      const name = page.node.newXObject("TrtMark", ref);
+      ops.push(`q ${name.asString()} Do Q`);
+    }
+    // Wrap what is already there in q/Q so a content stream that leaves its
+    // graphics state changed (an unbalanced cm) cannot move ours.
+    const start = ctx.register(ctx.stream("q\n"));
+    const end = ctx.register(ctx.stream("\nQ\n"));
+    page.node.wrapContentStreams(start, end);
+    page.node.addContentStream(ctx.register(ctx.flateStream(ops.join("\n"))));
+    return;
+  }
+  const date = PDFString.fromDate(now);
+  items.forEach(({ id, app }, i) => {
+    const annot = ctx.obj({
+      Type: "Annot",
+      ...app.annot,
+      Rect: app.rect,
+      F: 4,
+      M: date,
+      NM: PDFHexString.fromText(`taroting-${id}`),
+      P: page.ref,
+      AP: { N: forms[i]! },
+    } as never);
+    page.node.addAnnot(ctx.register(annot));
+  });
+}
+
+export async function embedWithMetrics(doc: PDFDocument, bytes: Uint8Array): Promise<EmbeddedFont> {
+  const face = fontkit.create(bytes) as unknown as { ascent: number; descent: number; unitsPerEm: number };
+  const upm = face.unitsPerEm > 0 ? face.unitsPerEm : 1000;
+  const font = await doc.embedFont(bytes, { subset: true });
+  return { font, ascent: Math.abs(face.ascent) / upm, descent: Math.abs(face.descent) / upm };
+}
+
+/** Load, cache and embed fonts and pictures for one document. */
+export function markContext(doc: PDFDocument, project: ProjectFile, deps: ExportDeps): MarkCtx {
+  const fonts = new Map<string, Promise<EmbeddedFont>>();
+  const images = new Map<string, Promise<{ img: PDFImage; orientation: Orientation }>>();
+  const style = (bold: boolean, italic: boolean): string =>
+    bold && italic ? " (bold italic)" : bold ? " (bold)" : italic ? " (italic)" : "";
+  return {
+    doc,
+    project,
+    deps,
+    font(family, bold, italic) {
+      const key = `${family}|${bold}|${italic}`;
+      let p = fonts.get(key);
+      if (!p) {
+        p = (async () => {
+          const bytes = await deps.fontBytes(family, bold, italic).catch(() => null);
+          if (!bytes) {
+            throw new PdfExportError(
+              "font-missing",
+              `The font ${family}${style(bold, italic)} is not installed on this PC, so a text box that uses it cannot be exported. Pick another font for it and export again.`,
+            );
+          }
+          return embedWithMetrics(doc, bytes);
+        })();
+        fonts.set(key, p);
+      }
+      return p;
+    },
+    image(mediaId) {
+      let p = images.get(mediaId);
+      if (!p) {
+        p = (async () => {
+          const m: MediaRef | undefined = project.media.find((x) => x.id === mediaId);
+          if (!m) throw new PdfExportError("image-missing", "A picture on a page is missing from the project.");
+          const st = await deps.fileStat(m.path).catch(() => null);
+          if (!st) {
+            throw new PdfExportError("image-missing", `The picture ${baseName(m.path)} is missing. Relink it or remove it from the page, then export again.`, m.path);
+          }
+          let prepared;
+          try {
+            prepared = await prepareImage(m, await deps.readBytes(m.path), deps);
+            const img = prepared.kind === "jpg" ? await doc.embedJpg(prepared.bytes) : await doc.embedPng(prepared.bytes);
+            return { img, orientation: prepared.orientation };
+          } catch (e) {
+            if (e instanceof PdfExportError) throw e;
+            throw new PdfExportError("image-invalid", `The picture ${baseName(m.path)} could not be read.`, m.path);
+          }
+        })();
+        images.set(mediaId, p);
+      }
+      return p;
+    },
+  };
+}
+
+/** True when the dictionary is a widget annotation (used by flatten.ts too). */
+export function isSubtype(d: PDFDict, subtype: string): boolean {
+  const s = d.get(PDFName.of("Subtype"));
+  return s instanceof PDFName && s.asString() === `/${subtype}`;
+}

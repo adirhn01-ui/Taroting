@@ -8,17 +8,18 @@
 ; See the gate comment on NSIS_HOOK_POSTUNINSTALL before touching that.
 ; User content in Documents\Taroting is NEVER touched.
 ;
-; TAROTING NEVER CLAIMS A MEDIA DEFAULT. The only default it owns is .trt (the
-; template's APP_ASSOCIATE, from tauri.conf.json's one fileAssociations entry).
-; Media gets exactly two things, neither of which changes what a double-click
-; opens: an OpenWithProgids value per extension (Explorer's "Open with" list)
-; and a Capabilities\FileAssociations row (Settings -> Default apps lists
-; Taroting as a CHOICE). Only the user's own pick in Windows' UI (UserChoice)
-; can make Taroting the default for a video, photo or song.
+; TAROTING NEVER CLAIMS A MEDIA (OR PDF) DEFAULT. The only default it owns is
+; .trt (the template's APP_ASSOCIATE, from tauri.conf.json's one
+; fileAssociations entry). Media and .pdf get exactly two things, neither of
+; which changes what a double-click opens: an OpenWithProgids value per
+; extension (Explorer's "Open with" list) and a Capabilities\FileAssociations
+; row (Settings -> Default apps lists Taroting as a CHOICE). Only the user's own
+; pick in Windows' UI (UserChoice) can make Taroting the default for a video,
+; photo, song or PDF.
 ;
-; The ProgIDs Taroting.Video / Taroting.Image / Taroting.Audio and
-; "Taroting Project" are FOREVER names: a UserChoice may reference them, so a
-; rename orphans it. All new keys are written through SHCTX, which is HKCU while
+; The ProgIDs Taroting.Video / Taroting.Image / Taroting.Audio /
+; Taroting.Document and "Taroting Project" are FOREVER names: a UserChoice may
+; reference them, so a rename orphans it. All new keys are written through SHCTX, which is HKCU while
 ; installMode is currentUser (media-extensions.test.ts pins that pairing, and
 ; the literal HKCU lines below rely on it).
 ;
@@ -29,8 +30,8 @@
 ; "Do not uninstall", same-version "Add/Reinstall", /UPDATE and silent /S all
 ; install OVER the old keys (only the GUI default radio uninstalls first).
 
-; A Taroting media ProgID: its Explorer "Type" text, the exe icon and a quoted
-; open command. No verb label: Windows localises "Open" itself. Install only.
+; A Taroting media (or document) ProgID: its Explorer "Type" text, the exe
+; icon and a quoted open command. No verb label: Windows localises "Open" itself. Install only.
 !macro TRT_PROGID PROGID DESC
   WriteRegStr SHCTX "Software\Classes\${PROGID}" "" "${DESC}"
   WriteRegStr SHCTX "Software\Classes\${PROGID}\DefaultIcon" "" "$INSTDIR\${MAINBINARYNAME}.exe,0"
@@ -145,6 +146,8 @@
   !insertmacro TRT_PROGID "Taroting.Video" "Taroting video"
   !insertmacro TRT_PROGID "Taroting.Image" "Taroting image"
   !insertmacro TRT_PROGID "Taroting.Audio" "Taroting audio"
+  ; PDFs (the "document" family): Open with + Default apps only, like media.
+  !insertmacro TRT_PROGID "Taroting.Document" "Taroting document"
 
   ; "Open with -> Taroting", one line per media-extensions.json entry, in its
   ; order (media-extensions.test.ts holds this list to the JSON).
@@ -172,6 +175,7 @@
   !insertmacro TRT_OPENWITH_ADD "aac" "Taroting.Audio"
   !insertmacro TRT_OPENWITH_ADD "m4a" "Taroting.Audio"
   !insertmacro TRT_OPENWITH_ADD "ogg" "Taroting.Audio"
+  !insertmacro TRT_OPENWITH_ADD "pdf" "Taroting.Document"
 
   ; Settings -> Default apps listing. Software\Taroting is also the template's
   ; MANUKEY (Software\${MANUFACTURER}, from bundle.publisher — the test pins it
@@ -204,6 +208,7 @@
   !insertmacro TRT_CAPABILITY "aac" "Taroting.Audio"
   !insertmacro TRT_CAPABILITY "m4a" "Taroting.Audio"
   !insertmacro TRT_CAPABILITY "ogg" "Taroting.Audio"
+  !insertmacro TRT_CAPABILITY "pdf" "Taroting.Document"
   WriteRegStr SHCTX "Software\RegisteredApplications" "Taroting" "Software\Taroting\Capabilities"
 
   ; Tell Explorer associations changed (the template defines this macro but
@@ -263,8 +268,8 @@
   ${If} $UpdateMode <> 1
     ; Remove the desktop shortcut we created.
     Delete "$DESKTOP\${PRODUCTNAME}.lnk"
-    ; Association residue (see TRT_CLEAN_EXT above). Media has no default to
-    ; clean: Taroting never claims one (header).
+    ; Association residue (see TRT_CLEAN_EXT above). Media and .pdf have no
+    ; default to clean: Taroting never claims one (header).
     !insertmacro TRT_CLEAN_EXT "trt" "Taroting Project"
     ; .trt is Taroting's own extension — if nothing else claimed it, remove the
     ; emptied key entirely. The template's restore writes an empty-string default
@@ -300,9 +305,11 @@
     !insertmacro TRT_OPENWITH_REMOVE "aac" "Taroting.Audio"
     !insertmacro TRT_OPENWITH_REMOVE "m4a" "Taroting.Audio"
     !insertmacro TRT_OPENWITH_REMOVE "ogg" "Taroting.Audio"
+    !insertmacro TRT_OPENWITH_REMOVE "pdf" "Taroting.Document"
     DeleteRegKey SHCTX "Software\Classes\Taroting.Video"
     DeleteRegKey SHCTX "Software\Classes\Taroting.Image"
     DeleteRegKey SHCTX "Software\Classes\Taroting.Audio"
+    DeleteRegKey SHCTX "Software\Classes\Taroting.Document"
 
     ; Default-apps listing. Capabilities is wholly ours; its parent is the
     ; template's MANUKEY, whose Taroting subkey (install dir, installer

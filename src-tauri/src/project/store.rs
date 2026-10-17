@@ -417,13 +417,14 @@ pub struct RecentItem {
     /// last time this project was opened (ISO 8601 UTC); stamped by `load_project`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened_at: Option<String>,
-    /// `Some("image")` for an image project; absent for a video project (TS
-    /// `RecentItem.kind`). Only the literal string "image" reads as the kind:
-    /// anything else in the index is treated as absent rather than failing the
-    /// parse, since one unparseable field would blank the whole home screen.
+    /// `Some("image")` / `Some("pdf")` for those project types; absent for a
+    /// video project (TS `RecentItem.kind`). Only those literal strings read
+    /// as the kind: anything else in the index is treated as absent rather
+    /// than failing the parse, since one unparseable field would blank the
+    /// whole home screen.
     #[serde(
         default,
-        deserialize_with = "schema::image_kind_or_none",
+        deserialize_with = "schema::project_kind_or_none",
         skip_serializing_if = "Option::is_none"
     )]
     pub kind: Option<String>,
@@ -549,11 +550,11 @@ fn upsert_recent(mut item: RecentItem) -> Result<()> {
             if item.opened_at.is_none() {
                 item.opened_at = prev.opened_at.clone();
             }
-            // An image project's card is a RENDERED picture the image editor
+            // An image or PDF project's card is a RENDERED picture its editor
             // writes (`set_recent_thumb`), never a frame the backend can look
             // up, so a save, which knows no thumbnail, must not blank the one
             // the card already has.
-            if item.kind.as_deref() == Some("image") && item.thumb.is_none() {
+            if has_rendered_card(item.kind.as_deref()) && item.thumb.is_none() {
                 item.thumb = prev.thumb.clone();
             }
         }
@@ -1531,15 +1532,27 @@ fn load_project_now(path: &str) -> Result<LoadedProject> {
     })
 }
 
-/// The recents `kind` of a project: `Some("image")` for an image project, and
-/// `None` — no key written — for a video one, whatever else its `kind` holds.
+/// The recents `kind` of a project: `Some("image")` / `Some("pdf")` for those
+/// project types, and `None` — no key written — for a video one, whatever
+/// else its `kind` holds.
 fn recent_kind(typed: &ProjectFile) -> Option<String> {
-    (typed.kind.as_deref() == Some("image")).then(|| "image".to_string())
+    typed
+        .kind
+        .as_deref()
+        .filter(|k| schema::PROJECT_KINDS.contains(k))
+        .map(str::to_string)
+}
+
+/// Whether a project of this recents `kind` has a card its own editor
+/// RENDERS (image and PDF projects: `image_save`'s `ProjectThumb`), rather
+/// than a frame the backend looks up in the cache (video projects).
+fn has_rendered_card(kind: Option<&str>) -> bool {
+    matches!(kind, Some("image" | "pdf"))
 }
 
 /// The duration a recents card shows. An image project has none: its layers
 /// are one-unit clips (`srcOut 1`), so the timeline arithmetic would put a
-/// "0:01" on a picture's card.
+/// "0:01" on a picture's card. A PDF project has none either.
 fn recent_duration(typed: &ProjectFile) -> f64 {
     if recent_kind(typed).is_some() {
         0.0
@@ -1790,7 +1803,7 @@ fn save_project_within(
     image_rules::refuse_misplaced_drawings(&typed).map_err(refuse)?;
     image_rules::check_schema_kind(&typed).map_err(refuse)?;
     image_rules::validate_image_project(&project, &typed).map_err(refuse)?;
-    let image = recent_kind(&typed).is_some();
+    let rendered_card = has_rendered_card(recent_kind(&typed).as_deref());
 
     // Sized BEFORE the file is touched: a refusal leaves the previous save
     // (and its `.bak`) exactly as they were.
@@ -1802,13 +1815,13 @@ fn save_project_within(
     // upsert. Skip both the thumb lookup and the upsert for temp-dir paths.
     if !is_temp_project_path(&path) {
         // Thumbnail for the recents grid: the cached card frame of the first
-        // clip's media. Never for an image project: its card is the rendered
-        // picture the image editor writes, and the raw first photo would
+        // clip's media. Never for an image or PDF project: its card is the rendered
+        // picture its editor writes, and the raw first photo would
         // overwrite it (`upsert_recent` keeps the card's current thumb
         // instead). Never for a generator or audio first clip either: neither
         // has a frame in the cache (the same rule as `thumb_source_for`), so
         // looking would only ever be a full directory listing that misses.
-        let thumb = (!image)
+        let thumb = (!rendered_card)
             .then(|| first_clip_media(&typed))
             .flatten()
             .filter(|m| m.generator.is_none() && m.kind != "audio")
@@ -1847,10 +1860,10 @@ fn save_project_within(
 fn thumb_source_for(path: &str) -> Option<(crate::cache::MediaKey, f64)> {
     let (raw, _) = read_project_value(Path::new(path)).ok()?;
     let typed: ProjectFile = serde_json::from_value(schema::migrate(raw).ok()?.value).ok()?;
-    // An image project's card is the rendered picture its editor writes; a
+    // An image or PDF project's card is the rendered picture its editor writes; a
     // frame of its first photo would replace it on every Home mount (and
     // after a cache eviction, until the next edit renders a new one).
-    if typed.kind.as_deref() == Some("image") {
+    if has_rendered_card(typed.kind.as_deref()) {
         return None;
     }
 
@@ -2049,6 +2062,38 @@ pub async fn path_exists(path: String) -> Result<bool> {
 /// metadata read `exists()` makes.
 fn path_exists_now(path: &Path) -> bool {
     may_touch(path) && media_stat(path).is_ok()
+}
+
+/// A file's identity as a `.trt` records it: size in bytes and modified time
+/// in ms since the Unix epoch (TS `{ size, mtimeMs }`). `mtimeMs` is a JS
+/// number on the wire; its value is `mtime_ms_of`'s, the SAME rule
+/// `probe_sync` stamps a `MediaRef` with and `identity_intact` compares
+/// against, so a PDF source's identity is decided exactly like a media file's.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStat {
+    pub size: u64,
+    pub mtime_ms: f64,
+}
+
+/// Size + modified time of a file, or `null` when there is none to stat. One
+/// stat, off the UI thread like `path_exists` (a sleeping share is an SMB
+/// timeout).
+#[tauri::command]
+pub async fn file_stat(path: String) -> Result<Option<FileStat>> {
+    off_ui(move || Ok(file_stat_now(Path::new(&path)))).await
+}
+
+/// `file_stat`'s body, with `path_exists_now`'s hygiene: the path is a `.trt`
+/// field (a PDF source), so a share off the local network answers `None`
+/// without being looked at (`media::source::may_touch`; a local-network UNC
+/// share stays allowed). A folder is not a file and answers `None` too.
+fn file_stat_now(path: &Path) -> Option<FileStat> {
+    if !may_touch(path) {
+        return None;
+    }
+    let meta = media_stat(path).ok()?;
+    meta.is_file().then(|| FileStat { size: meta.len(), mtime_ms: mtime_ms_of(&meta) as f64 })
 }
 
 /// Whether a project name is in use: by its `.trt`, or by a `.bak` the `.trt`
@@ -2730,10 +2775,10 @@ fn duplicate_project_now(path: &str, new_name: String, new_id: String) -> Result
     let src_recent = read_recents().items.into_iter().find(|r| r.path == *path);
     // From the copied file itself, not the source's recents entry: the file is
     // what Home will open, and an entry can be missing or stale.
-    let image = value.get("kind").and_then(Value::as_str) == Some("image");
+    let kind = value.get("kind").and_then(schema::project_kind_of);
     let src_thumb = src_recent.as_ref().and_then(|r| r.thumb.clone());
-    let thumb = if image {
-        // An image card is a rendered file named after the project id and
+    let thumb = if has_rendered_card(kind) {
+        // An image or PDF card is a rendered file named after the project id and
         // path, which the SOURCE keeps rewriting as it is edited. Sharing that
         // file would make the copy's card follow the original's edits, so the
         // copy gets its own (under its own id and path) or no card picture.
@@ -2754,7 +2799,7 @@ fn duplicate_project_now(path: &str, new_name: String, new_id: String) -> Result
         thumb,
         size_bytes,
         opened_at: None,
-        kind: image.then(|| "image".to_string()),
+        kind: kind.map(str::to_string),
     }) {
         eprintln!("Taroting: duplicated to {new_path_str}, but the recent projects list was not updated ({e})");
     }
@@ -5776,11 +5821,14 @@ mod tests {
                 entry(Some("video".into())),
                 entry(Some(7.into())),
                 entry(Some(Value::Null)),
+                entry(Some("pdf".into())),
+                entry(Some("PDF".into())),
             ]
         }))
         .expect("an odd kind must not fail the index");
         let kinds: Vec<Option<&str>> = index.items.iter().map(|i| i.kind.as_deref()).collect();
-        assert_eq!(kinds, [Some("image"), None, None, None, None]);
+        assert_eq!(kinds, [Some("image"), None, None, None, None, Some("pdf"), None]);
+        assert_eq!(serde_json::to_value(&index.items[5]).unwrap()["kind"], "pdf");
 
         let out = serde_json::to_value(&index.items[0]).unwrap();
         assert_eq!(out["kind"], "image");
@@ -6079,6 +6127,102 @@ mod tests {
             write_json(&vpath, &video);
             let (key, _) = thumb_source_for(&vpath.to_string_lossy()).expect("the photo resolves");
             assert!(key.path.ends_with("ph.png"));
+        });
+    }
+
+    /// A PDF project: schema 4, kind pdf, its opaque `pdf` object, one
+    /// picture an image mark uses, and the empty timeline (`tracks`).
+    fn pdf_project(id: &str, media: Value, tracks: Value) -> Value {
+        serde_json::json!({
+            "schema": 4, "kind": "pdf", "app": "taroting", "id": id, "name": "Lease",
+            "createdAt": "2026-10-01T00:00:00Z", "modifiedAt": "2026-10-02T00:00:00Z",
+            "media": media,
+            "timeline": { "fps": { "num": 30, "den": 1 }, "width": 1920, "height": 1080, "tracks": tracks },
+            "export": {},
+            "pdf": { "sources": [], "pages": [], "annots": {}, "forms": {} }
+        })
+    }
+
+    /// A PDF project is a rendered-card project like an image one: it saves
+    /// and opens, its card is kind pdf with no duration, the rendered card
+    /// survives a save that brings none, the frame backfill never replaces
+    /// it, and a duplicate carries the kind and its own copy of the card.
+    #[test]
+    fn a_pdf_project_is_a_rendered_card_project() {
+        with_isolated("pdf-proj", |dir| {
+            let cache = crate::cache::Cache::new_at(dir.join("cache"));
+            let photo = photo_media(dir, "ph");
+            let project = pdf_project("p-8", serde_json::json!([photo.clone()]), serde_json::json!([]));
+            let path = dir.join("Lease.trt").to_string_lossy().into_owned();
+            save_project_at(Some(&cache), path.clone(), project.clone()).expect("a PDF project saves");
+            let card = recent(&path).unwrap();
+            assert_eq!((card.kind.as_deref(), card.duration_sec, card.thumb.as_deref()), (Some("pdf"), 0.0, None));
+
+            let thumbs = cache.ensure_kind_dir(crate::cache::CacheKind::Thumbs).unwrap();
+            let rendered = thumbs.join("imgproj-p-8.jpg");
+            std::fs::write(&rendered, b"rendered card of p-8").unwrap();
+            set_recent_thumb(&path, &rendered.to_string_lossy());
+            save_project_at(Some(&cache), path.clone(), project.clone()).unwrap();
+            assert_eq!(
+                recent(&path).unwrap().thumb.as_deref(),
+                Some(rendered.to_string_lossy().as_ref()),
+                "a save keeps the rendered card"
+            );
+
+            let loaded = load_project(path.clone()).expect("a PDF project opens");
+            assert_eq!(loaded.project["kind"], "pdf");
+            assert_eq!(loaded.project["pdf"], project["pdf"], "the pdf object reaches the editor intact");
+            assert!(loaded.missing.is_empty());
+            assert_eq!(recent(&path).unwrap().kind.as_deref(), Some("pdf"));
+
+            // Refused on save: a clip on its timeline, or no pdf object.
+            let mut clipped = project.clone();
+            clipped["timeline"]["tracks"] = serde_json::json!([layer("t1", "Photo", "ph")]);
+            let err = save_project_at(Some(&cache), path.clone(), clipped.clone()).unwrap_err().to_string();
+            assert!(err.contains("a PDF project has no timeline clips"), "{err}");
+            let mut bare = project.clone();
+            bare.as_object_mut().unwrap().remove("pdf");
+            let err = save_project_at(Some(&cache), path.clone(), bare).unwrap_err().to_string();
+            assert!(err.contains("must carry its pdf object"), "{err}");
+
+            // The frame backfill: a (crafted) PDF project whose first clip is
+            // a real photo still resolves to no frame — the card is rendered.
+            let crafted = dir.join("Crafted.trt");
+            write_json(&crafted, &clipped);
+            assert!(thumb_source_for(&crafted.to_string_lossy()).is_none());
+
+            let copy = duplicate_project(path.clone(), "Lease copy".into(), "q-8".into()).unwrap();
+            let entry = recent(&copy).unwrap();
+            assert_eq!(entry.kind.as_deref(), Some("pdf"));
+            let own = thumbs.join(crate::image_save::card_file_name("q-8", &copy).unwrap());
+            assert_eq!(entry.thumb.as_deref(), Some(own.to_string_lossy().as_ref()), "its own card, not the original's");
+            assert_eq!(std::fs::read(&own).unwrap(), b"rendered card of p-8");
+        });
+    }
+
+    /// `file_stat`: an existing file answers its size and the SAME mtime rule
+    /// a MediaRef is stamped with; a missing path and a folder answer None;
+    /// a share off the local network answers None without being statted.
+    #[test]
+    fn file_stat_reports_identity_or_none() {
+        with_isolated("file-stat", |dir| {
+            let file = dir.join("Lease.pdf");
+            std::fs::write(&file, b"%PDF-1.7 twenty-one").unwrap();
+            let meta = std::fs::metadata(&file).unwrap();
+            let got = file_stat_now(&file).expect("an existing file");
+            assert_eq!(got, FileStat { size: 19, mtime_ms: mtime_ms_of(&meta) as f64 });
+            assert!(got.mtime_ms > 0.0);
+            assert_eq!(
+                serde_json::to_value(&got).unwrap(),
+                serde_json::json!({ "size": 19, "mtimeMs": mtime_ms_of(&meta) as f64 })
+            );
+            assert_eq!(file_stat_now(&dir.join("Missing.pdf")), None);
+            assert_eq!(file_stat_now(dir), None, "a folder is not a file");
+
+            STATTED.with(|s| s.borrow_mut().clear());
+            let remote = Path::new(r"\\files.example.com\share\Lease.pdf");
+            assert_eq!(file_stat_now(remote), None);
+            assert!(STATTED.with(|s| s.borrow().is_empty()), "a remote share is never looked at");
         });
     }
 

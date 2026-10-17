@@ -830,6 +830,21 @@ mod tests {
         );
     }
 
+    /// A PDF steps only among PDFs (any case of the extension), and a picture
+    /// beside them never steps onto one.
+    #[test]
+    fn documents_walk_only_documents() {
+        let s = Scratch::new("documents");
+        s.files(&["a.pdf", "B.PDF", "c.png", "d.mp4", "e.mp3", "f.txt"]);
+        let w = s.list("a.pdf", 16);
+        assert!(w.before.is_empty());
+        assert_eq!(names(&w.after), ["B.PDF"]);
+        assert_eq!((w.index, w.total, w.family), (Some(1), 2, StepFamily::Document));
+        let w = s.list("c.png", 16);
+        assert_eq!(names(&w.after), ["d.mp4"]);
+        assert_eq!((w.total, w.family), (2, StepFamily::Visual));
+    }
+
     #[test]
     fn unusual_names_round_trip_exactly() {
         let s = Scratch::new("unusual");

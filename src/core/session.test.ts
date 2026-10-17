@@ -125,6 +125,33 @@ describe("sanitizeSettings", () => {
     expect(sanitizeSettings({}).inkColors).not.toBe(DEFAULT_SETTINGS.inkColors);
   });
 
+  it("keeps at most three valid saved PDF signatures, dropping a damaged one whole", () => {
+    const pt = "AAAAAAAAAAAAAAAA"; // one 12-byte point, base64 without padding
+    const s = sanitizeSettings({
+      pdfSignatures: [
+        { strokes: [pt, pt + pt], aspect: 3 },
+        { strokes: [pt, "not base64!"], aspect: 2 }, // one bad stroke drops the signature
+        { strokes: [pt], aspect: 1000 }, // aspect clamped, not dropped
+        { strokes: [], aspect: 1 }, // no strokes
+        { strokes: [pt + "A"], aspect: 1 }, // not a whole number of points
+        { strokes: [pt], aspect: Number.NaN },
+        "#e5484d",
+        null,
+        { strokes: [pt], aspect: 0.01 },
+        { strokes: [pt], aspect: 1 }, // the fourth valid one: over the cap
+      ],
+    });
+    expect(s.pdfSignatures).toEqual([
+      { strokes: [pt, pt + pt], aspect: 3 },
+      { strokes: [pt], aspect: 20 },
+      { strokes: [pt], aspect: 0.1 },
+    ]);
+    for (const raw of [undefined, null, "x", { 0: { strokes: [pt], aspect: 1 } }, 42]) {
+      expect(sanitizeSettings({ pdfSignatures: raw }).pdfSignatures, String(raw)).toEqual([]);
+    }
+    expect(sanitizeSettings({}).pdfSignatures).not.toBe(DEFAULT_SETTINGS.pdfSignatures);
+  });
+
   it("drops non-string and unknown shortcut entries, keeping valid rebinds", () => {
     const s = sanitizeSettings(hostile);
     expect(s.shortcuts.playPause).toBe("Ctrl+Space");
@@ -2515,10 +2542,13 @@ const ADDED_IN_090 = [
   ...IMAGE_ACTIONS_090,
 ] as const;
 
+/** The PDF editor's actions and Find, new in 0.9.3. */
+const ADDED_IN_093 = ["pdfHighlight", "pdfText", "pdfWhiteout", "pdfFillForms", "find"] as const;
+
 /** A shortcut map exactly as a 0.8.1 settings.json stores it. */
 function shortcuts081(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const m: Record<string, unknown> = { ...DEFAULT_SHORTCUTS };
-  for (const a of ADDED_IN_090) delete m[a];
+  for (const a of [...ADDED_IN_090, ...ADDED_IN_093]) delete m[a];
   return { ...m, ...overrides };
 }
 

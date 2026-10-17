@@ -25,7 +25,7 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::schema::{Generator, ProjectFile, Stroke, IMAGE_SCHEMA};
+use super::schema::{Generator, ProjectFile, Stroke, CURRENT_SCHEMA, IMAGE_SCHEMA, PDF_SCHEMA};
 use crate::error::{AppError, Result};
 
 /// Largest `.trt` any read accepts. A real project — even an image project
@@ -114,7 +114,9 @@ fn read_capped_with(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Refuse a drawing layer anywhere but an image project.
+/// Refuse a drawing layer anywhere but an image project — a video project
+/// and a PDF project alike (a PDF project's `media` holds only the pictures
+/// its image marks use).
 pub fn refuse_misplaced_drawings(p: &ProjectFile) -> Result<()> {
     if p.kind.as_deref() == Some("image") {
         return Ok(());
@@ -132,25 +134,47 @@ pub fn refuse_misplaced_drawings(p: &ProjectFile) -> Result<()> {
 /// project stamped 3 (or an image project stamped 2) would save fine and then
 /// refuse to open — exactly the "never persist something we can't read back"
 /// rule the save path exists to keep.
+///
+/// Per kind, exactly `migrate()`'s pairs: an image project is
+/// `IMAGE_SCHEMA`, a PDF project `PDF_SCHEMA`, and a video project (no kind)
+/// at most `CURRENT_SCHEMA`.
 pub fn check_schema_kind(p: &ProjectFile) -> Result<()> {
-    let image = p.kind.as_deref() == Some("image");
-    if image && p.schema != IMAGE_SCHEMA {
-        return Err(AppError::BadInput(format!(
+    match p.kind.as_deref() {
+        Some("image") if p.schema != IMAGE_SCHEMA => Err(AppError::BadInput(format!(
             "an image project must be schema {IMAGE_SCHEMA}, not {}",
             p.schema
-        )));
-    }
-    if !image && p.schema >= IMAGE_SCHEMA {
-        return Err(AppError::BadInput(format!(
-            "schema {} is only valid for an image project",
+        ))),
+        Some("pdf") if p.schema != PDF_SCHEMA => Err(AppError::BadInput(format!(
+            "a PDF project must be schema {PDF_SCHEMA}, not {}",
             p.schema
-        )));
+        ))),
+        // Worded as `migrate()` words the same refusal on load.
+        None if p.schema > CURRENT_SCHEMA => Err(AppError::BadInput(match p.schema {
+            IMAGE_SCHEMA => format!("schema {IMAGE_SCHEMA} is only valid for an image project"),
+            PDF_SCHEMA => format!("schema {PDF_SCHEMA} is only valid for a PDF project"),
+            n => format!("schema {n} is not one this build writes"),
+        })),
+        _ => Ok(()),
+    }
+}
+
+/// What a PDF project must be before it is written: its `pdf` object present
+/// (as an object — its contents are the PDF editor's to sanitize), and a
+/// timeline with no clips (TS: "the empty one every project carries"), so no
+/// clip of one can ever reach the video pipeline. Cheap: no walk of `pdf`.
+fn validate_pdf_project(typed: &ProjectFile) -> Result<()> {
+    check_schema_kind(typed)?;
+    if !typed.pdf.as_ref().is_some_and(Value::is_object) {
+        return Err(AppError::BadInput("a PDF project must carry its pdf object".into()));
+    }
+    if typed.timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
+        return Err(AppError::BadInput("a PDF project has no timeline clips".into()));
     }
     Ok(())
 }
 
-/// Everything an image project must be before it is written. A no-op for a
-/// video project. `raw` is the value `save_project` is about to write and
+/// Everything an image project must be before it is written — or a PDF
+/// project (`validate_pdf_project`). A no-op for a video project. `raw` is the value `save_project` is about to write and
 /// `typed` its (lenient) parse; the stroke rules read `raw`, see the module
 /// comment.
 pub fn validate_image_project(raw: &Value, typed: &ProjectFile) -> Result<()> {
@@ -158,8 +182,10 @@ pub fn validate_image_project(raw: &Value, typed: &ProjectFile) -> Result<()> {
 }
 
 fn validate_with(raw: &Value, typed: &ProjectFile, caps: Caps) -> Result<()> {
-    if typed.kind.as_deref() != Some("image") {
-        return Ok(());
+    match typed.kind.as_deref() {
+        Some("image") => {}
+        Some("pdf") => return validate_pdf_project(typed),
+        _ => return Ok(()),
     }
     check_schema_kind(typed)?;
     let (w, h) = (typed.timeline.width, typed.timeline.height);
@@ -535,6 +561,11 @@ mod tests {
         video["media"].as_array_mut().unwrap().remove(1);
         video["schema"] = 3.into();
         assert!(check_schema_kind(&typed(video.clone())).is_err(), "a video project stamped 3");
+        video["schema"] = 4.into();
+        assert!(
+            check_schema_kind(&typed(video.clone())).unwrap_err().to_string().contains("only valid for a PDF project"),
+            "a video project stamped 4"
+        );
         video["schema"] = 2.into();
         check_schema_kind(&typed(video.clone())).unwrap();
         video["schema"] = 1.into();
@@ -595,5 +626,105 @@ mod tests {
             Err(e) => panic!("expected BadInput, got {e:?}"),
             Ok(_) => panic!("an image project reached the ffmpeg plan"),
         }
+    }
+
+    /// A valid PDF project: schema 4, kind pdf, an opaque `pdf` object, one
+    /// picture in `media` (an image mark's), and the empty timeline.
+    fn pdf_project() -> Value {
+        json!({
+            "schema": 4, "kind": "pdf", "app": "taroting", "id": "p-4",
+            "name": "Lease", "createdAt": "a", "modifiedAt": "b",
+            "media": [
+                { "id": "sig", "path": "C:\\In\\stamp.png", "size": 4, "mtimeMs": 5, "kind": "image",
+                  "duration": 0.0, "hasAudio": false, "width": 120, "height": 40 }
+            ],
+            "timeline": { "fps": { "num": 30, "den": 1 }, "width": 1920, "height": 1080, "tracks": [] },
+            "export": {},
+            "pdf": { "sources": [], "pages": [], "annots": {}, "forms": {} }
+        })
+    }
+
+    #[test]
+    fn a_well_formed_pdf_project_is_accepted_and_its_rules_name_what_is_wrong() {
+        check(&pdf_project()).expect("the PDF fixture is valid");
+        // An empty video track is still "no clips".
+        let mut p = pdf_project();
+        p["timeline"]["tracks"] = json!([{ "id": "t1", "kind": "video", "name": "V", "muted": false, "clips": [] }]);
+        check(&p).expect("an empty track holds no clips");
+
+        let mut p = pdf_project();
+        p.as_object_mut().unwrap().remove("pdf");
+        assert_eq!(refusal(&p), "a PDF project must carry its pdf object");
+        for odd in [json!([]), json!("x"), json!(4), Value::Null] {
+            let mut p = pdf_project();
+            p["pdf"] = odd.clone();
+            assert_eq!(refusal(&p), "a PDF project must carry its pdf object", "{odd}");
+        }
+        let mut p = pdf_project();
+        p["timeline"]["tracks"] = json!([{ "id": "t1", "kind": "video", "name": "V", "muted": false,
+                                           "clips": [clip("c1", "sig")] }]);
+        assert_eq!(refusal(&p), "a PDF project has no timeline clips");
+        let mut p = pdf_project();
+        p["schema"] = 3.into();
+        assert!(refusal(&p).contains("a PDF project must be schema 4, not 3"));
+        // A drawing layer has no place in a PDF project either.
+        let mut p = pdf_project();
+        p["media"] = json!([image_project()["media"][1].clone()]);
+        assert!(refusal(&p).contains("drawing layers"));
+        // An image project is not mistaken for a PDF one: no `pdf` needed.
+        check(&image_project()).expect("still valid");
+    }
+
+    #[test]
+    fn schema_and_pdf_kind_must_agree_on_save_too() {
+        let typed = |v: &Value| serde_json::from_value::<ProjectFile>(v.clone()).unwrap();
+        let mut p = pdf_project();
+        check_schema_kind(&typed(&p)).unwrap();
+        for wrong in [1, 2, 3, 5] {
+            p["schema"] = wrong.into();
+            let err = check_schema_kind(&typed(&p)).unwrap_err().to_string();
+            assert!(err.contains("a PDF project must be schema 4"), "{wrong}: {err}");
+        }
+        // An image project stamped 4 is refused as an image project.
+        let mut i = image_project();
+        i["schema"] = 4.into();
+        assert!(check_schema_kind(&typed(&i)).unwrap_err().to_string().contains("an image project must be schema 3"));
+    }
+
+    /// The video exporter refuses a PDF project by its kind, before anything
+    /// else (its empty timeline would otherwise answer for it) — reached the
+    /// way the editor's export spec would carry it, with an Err, never a
+    /// panic. Only the literal kind "pdf" does it.
+    #[test]
+    fn the_video_exporter_refuses_a_pdf_project_by_its_kind() {
+        let p = pdf_project();
+        let spec_of = |kind: Value, timeline: &Value| -> crate::export::model::ExportSpec {
+            serde_json::from_value(json!({
+                "media": p["media"], "timeline": timeline, "outPath": "C:\\o.mp4", "kind": kind,
+                "preset": { "format": "mp4", "vcodec": "h264", "resolution": "original", "fps": "original",
+                            "videoBitrate": "auto", "audioBitrate": "auto", "useHardware": false }
+            }))
+            .expect("the spec parses")
+        };
+        let enc = crate::hw::EncoderReport {
+            h264: "libx264".into(),
+            hevc: "libx265".into(),
+            av1: "libsvtav1".into(),
+            detail: vec![],
+        };
+        let refusal = |spec: crate::export::model::ExportSpec| match crate::export::builder::build(&spec, &enc) {
+            Err(AppError::BadInput(m)) => m,
+            Err(e) => panic!("expected BadInput, got {e:?}"),
+            Ok(_) => panic!("a PDF project reached the ffmpeg plan"),
+        };
+        assert_eq!(refusal(spec_of("pdf".into(), &p["timeline"])), "PDF projects are exported from the PDF editor");
+        // Even one holding a clip (a crafted file): the kind decides first.
+        let mut with_clip = p["timeline"].clone();
+        with_clip["tracks"] = json!([{ "id": "t1", "kind": "video", "name": "V", "muted": false,
+                                       "clips": [clip("c1", "sig")] }]);
+        assert_eq!(refusal(spec_of("pdf".into(), &with_clip)), "PDF projects are exported from the PDF editor");
+        // Any other kind value is no kind: the ordinary rules answer.
+        assert!(refusal(spec_of("PDF".into(), &p["timeline"])).contains("empty timeline"));
+        assert!(spec_of(Value::Null, &p["timeline"]).kind.is_none());
     }
 }

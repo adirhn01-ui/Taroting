@@ -907,3 +907,109 @@ describe("buildReport and the paths recent errors name", () => {
     expect(text).toContain("export failed: encoder busy");
   });
 });
+/* ------------------------------------------------------------------ */
+/* PDF projects                                                        */
+/* ------------------------------------------------------------------ */
+
+describe("PDF projects in a report", () => {
+  const PDF_PATH = "D:\\Contracts\\Tenant Moshe Levi\\lease agreement.pdf";
+  const MARK_TEXT = "Signed under protest by Moshe";
+  const FORM_TEXT = "passport 31415926";
+
+  function pdfProject(): ProjectFile {
+    return {
+      schema: 4,
+      kind: "pdf",
+      app: "taroting",
+      id: "proj-pdf",
+      name: "Lease for Moshe",
+      createdAt: "2026-01-02T03:04:05.000Z",
+      modifiedAt: "2026-01-02T03:04:05.000Z",
+      media: [],
+      timeline: {
+        fps: { num: 30, den: 1 },
+        width: 1920,
+        height: 1080,
+        tracks: [{ id: "t", kind: "video", name: "Video", muted: false, clips: [] }],
+      },
+      export: DEFAULT_EXPORT_PRESET,
+      pdf: {
+        sources: [
+          { id: "s1", path: PDF_PATH, size: 1, mtimeMs: 1, pages: 4 },
+          { id: "s2", path: "D:\\Contracts\\annex.pdf", size: 1, mtimeMs: 1, pages: 1 },
+        ],
+        pages: [
+          { id: "p1", src: "s1", page: 0, rotate: 0 },
+          { id: "p2", src: "s1", page: 1, rotate: 90 },
+          { id: "p3", src: null, page: 0, rotate: 0, w: 612, h: 792 },
+        ],
+        annots: {
+          p1: [
+            {
+              id: "a1",
+              t: "text",
+              x: 123.456,
+              y: 654.321,
+              w: 100,
+              h: 20,
+              text: MARK_TEXT,
+              font: "Arial",
+              size: 12,
+              c: "#123abc",
+              bold: false,
+              italic: false,
+              align: "left",
+            },
+            { id: "a2", t: "whiteout", x: 1, y: 1, w: 1, h: 1, c: "#ffffff" },
+          ],
+          p3: [{ id: "a3", t: "line", c: "#000000", w: 1, a: [0, 0], b: [5, 5] }],
+        },
+        forms: { s1: { "12R": FORM_TEXT, "13R": true } },
+      },
+    };
+  }
+
+  it("calls it a pdf project and counts its parts", () => {
+    const shape = redactProjectShape(pdfProject());
+    expect(shape.kind).toBe("pdf");
+    expect(shape.pdf).toEqual({ sources: 2, pages: 3, blankPages: 1, marks: 3, formValues: 2 });
+    const text = buildReport(baseCtx({ project: pdfProject() }));
+    expect(text).toContain("Project kind    pdf\n");
+    expect(text).toContain("PDF sources     2\n");
+    expect(text).toContain("PDF pages       3\n");
+    expect(text).toContain("Blank pages     1\n");
+    expect(text).toContain("PDF marks       3\n");
+    expect(text).toContain("Form values     2\n");
+  });
+
+  it("gives no PDF counts for a video or image project", () => {
+    expect(redactProjectShape(makeProject()).pdf).toBeUndefined();
+    expect(buildReport(baseCtx({ project: makeProject() }))).not.toContain("PDF pages");
+  });
+
+  it("never prints a source path, a mark's text, a form value, a colour or a coordinate", () => {
+    const text = buildReport(baseCtx({ project: pdfProject() }));
+    for (const secret of [PDF_PATH, "Moshe", "lease agreement", "annex", MARK_TEXT, FORM_TEXT, "31415926", "#123abc", "123.456", "654.321"]) {
+      expect(text).not.toContain(secret);
+    }
+  });
+
+  it("redacts a source path an error message names, though no media lists it", () => {
+    const text = buildReport(
+      baseCtx({
+        project: pdfProject(),
+        recentErrors: [{ at: 0, op: "Export", message: `Couldn't read ${PDF_PATH} as a PDF.` }],
+      }),
+    );
+    expect(text).not.toContain("Moshe");
+    expect(text).toContain("<file 1.pdf>");
+  });
+
+  it("never throws on a damaged pdf block", () => {
+    for (const pdf of [null, "x", { sources: 5, pages: [null, 7], annots: { p: "x" }, forms: { s: null } }]) {
+      const p = { ...pdfProject(), pdf } as unknown as ProjectFile;
+      expect(() => buildReport(baseCtx({ project: p }))).not.toThrow();
+      expect(redactProjectShape(p).pdf).toMatchObject({ formValues: 0 });
+    }
+  });
+});

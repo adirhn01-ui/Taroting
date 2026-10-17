@@ -43,6 +43,24 @@ import {
 import { EPS_KF } from "./anim";
 import { clipDuration, clipEnd, fpsValue, rat, snapToFrame, timelineDuration } from "./time";
 import type { Clip, Generator, MediaInfo, ProjectFile } from "./types";
+import { ProjectFileError } from "./project";
+import {
+  PDF_COORD_MAX,
+  PDF_STROKE_MAX_POINTS,
+  PDF_TOTAL_MAX_POINTS,
+  checkPdfInvariants,
+  decodePdfPoints,
+  emptyPdfTimeline,
+  pdfHexColor,
+  sanitizePdfAnnot,
+  sanitizePdfMeta,
+} from "./pdf-sanitize";
+import { createPdfProject } from "./pdf-project";
+import { errorDetail } from "./ipc";
+import { normalizeHexColor } from "./session";
+import { decodePoints, MAX_STROKE_POINTS, MAX_TOTAL_POINTS } from "../image/strokes";
+import type { MediaRef, PdfAnnot, PdfMeta } from "./types";
+import { PDF_MAX_ANNOTS_PER_PAGE, PDF_MAX_PAGES } from "./types";
 
 const videoInfo = (duration = 60): MediaInfo => ({
   path: "C:\\media\\test video.mp4",
@@ -1267,5 +1285,631 @@ describe("sanitizeProject and tempEdited", () => {
     const out = sanitizeProject(broken);
     expect(out).not.toBe(broken);
     expect(out.tempEdited).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* PDF projects: sanitizePdfMeta, the PDF branch of sanitizeProject,   */
+/* checkPdfInvariants. Every case crafts the raw JSON a hostile .trt   */
+/* could carry (load_project hands it over untyped).                   */
+/* ------------------------------------------------------------------ */
+
+/** [x, y, pressure]* → the stored `p` (unpadded base64 of Float32LE). */
+function pdfPts(...v: number[]): string {
+  const bytes = new Uint8Array(new Float32Array(v).buffer);
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/=+$/, "");
+}
+
+const PIC: MediaRef = {
+  id: "pic1",
+  path: "C:\\Pics\\stamp.png",
+  size: 10,
+  mtimeMs: 20,
+  kind: "image",
+  duration: 0,
+  width: 100,
+  height: 50,
+  hasAudio: false,
+};
+
+/** One valid mark of every kind, ids a1..a10. */
+function everyKind(): Record<string, unknown>[] {
+  return [
+    { id: "a1", t: "ink", kind: "pen", c: "#112233", w: 2, o: 1, p: pdfPts(1, 2, 0.5, 3, 4, 1) },
+    { id: "a2", t: "highlight", c: "#ffff00", o: 0.4, rects: [[10, 10, 50, 12]] },
+    {
+      id: "a3",
+      t: "text",
+      x: 5,
+      y: 6,
+      w: 100,
+      h: 20,
+      text: "hello",
+      font: "Arial",
+      size: 12,
+      c: "#000000",
+      bold: false,
+      italic: true,
+      align: "left",
+    },
+    { id: "a4", t: "line", c: "#ff0000", w: 1, a: [0, 0], b: [10, 10] },
+    { id: "a5", t: "rect", c: "#ff0000", w: 1, a: [0, 0], b: [10, 10] },
+    { id: "a6", t: "ellipse", c: "#ff0000", w: 1, a: [0, 0], b: [10, 10] },
+    { id: "a7", t: "arrow", c: "#ff0000", w: 1, a: [0, 0], b: [10, 10] },
+    { id: "a8", t: "whiteout", x: 1, y: 1, w: 10, h: 10, c: "#ffffff" },
+    { id: "a9", t: "image", x: 1, y: 1, w: 10, h: 10, media: "pic1" },
+    { id: "a10", t: "signature", x: 1, y: 1, w: 10, h: 5, c: "#000080", strokes: [pdfPts(0, 0, 1, 1, 1, 1)] },
+  ];
+}
+
+/** A healthy raw PDF project as JSON would hand it over: one source "s1" of
+ *  4 pages, pages p1..p3 (p3 blank), marks on p1. */
+function rawPdf(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schema: 4,
+    kind: "pdf",
+    app: "taroting",
+    id: "proj",
+    name: "Doc",
+    createdAt: "2026-10-17T00:00:00.000Z",
+    modifiedAt: "2026-10-17T00:00:00.000Z",
+    media: [PIC],
+    timeline: emptyPdfTimeline("track1"),
+    export: { ...createProject("x").export },
+    pdf: {
+      sources: [{ id: "s1", path: "C:\\Docs\\a.pdf", size: 100, mtimeMs: 200, pages: 4 }],
+      pages: [
+        { id: "p1", src: "s1", page: 0, rotate: 0 },
+        { id: "p2", src: "s1", page: 3, rotate: 90 },
+        { id: "p3", src: null, page: 0, rotate: 0, w: 612, h: 792 },
+      ],
+      annots: { p1: everyKind() },
+      forms: { s1: { "12R": "Dana", "13R": true, "14R": ["a", "b"] } },
+      ...over,
+    },
+  };
+}
+
+/** sanitizeProject over a raw project, through a JSON round trip first. */
+function loadRaw(raw: Record<string, unknown>): ProjectFile {
+  return sanitizeProject(JSON.parse(JSON.stringify(raw)) as ProjectFile);
+}
+
+/** Sanitize a pdf block whose only page p1 (of source s1) carries `marks`. */
+function marksAfterLoad(marks: unknown[], media: MediaRef[] = [PIC]): PdfAnnot[] {
+  const meta = sanitizePdfMeta(
+    JSON.parse(
+      JSON.stringify({
+        sources: [{ id: "s1", path: "C:\\a.pdf", size: 1, mtimeMs: 1, pages: 1 }],
+        pages: [{ id: "p1", src: "s1", page: 0, rotate: 0 }],
+        annots: { p1: marks },
+        forms: {},
+      }),
+    ),
+    media,
+  );
+  return meta.annots.p1 ?? [];
+}
+const ids = (list: { id: string }[]) => list.map((a) => a.id);
+
+describe("PDF project load: the healthy file", () => {
+  it("keeps every field of a healthy file and passes the invariants", () => {
+    const raw = rawPdf();
+    const out = loadRaw(raw);
+    expect(checkInvariants(out)).toEqual([]);
+    expect(out.pdf).toEqual((raw as { pdf: PdfMeta }).pdf);
+    expect(ids(out.pdf!.annots.p1!)).toEqual(ids(everyKind() as { id: string }[]));
+  });
+
+  it("keeps the empty timeline by reference and returns a new project", () => {
+    const p = JSON.parse(JSON.stringify(rawPdf())) as ProjectFile;
+    const out = sanitizeProject(p);
+    expect(out).not.toBe(p);
+    expect(out.timeline).toBe(p.timeline);
+  });
+
+  it("builds annots, forms and each form record without a prototype", () => {
+    const pdf = loadRaw(rawPdf()).pdf!;
+    expect(Object.getPrototypeOf(pdf.annots)).toBeNull();
+    expect(Object.getPrototypeOf(pdf.forms)).toBeNull();
+    expect(Object.getPrototypeOf(pdf.forms.s1)).toBeNull();
+  });
+
+  it("strips fields a mark's kind does not have", () => {
+    const [a] = marksAfterLoad([{ id: "w", t: "whiteout", x: 1, y: 1, w: 1, h: 1, c: "#fff", evil: "x", p: "AAAA" }]);
+    expect(a).toEqual({ id: "w", t: "whiteout", x: 1, y: 1, w: 1, h: 1, c: "#ffffff" });
+  });
+
+  it("leaves a video project with a stray pdf field alone, by reference", () => {
+    const { p } = baseProject();
+    const q = { ...p, pdf: { pages: "junk" } } as unknown as ProjectFile;
+    expect(sanitizeProject(q)).toBe(q);
+  });
+});
+
+describe("PDF project load: an unusable file", () => {
+  it("throws a bad_input ProjectFileError when the pdf block is missing", () => {
+    const raw = rawPdf();
+    delete raw.pdf;
+    expect(() => loadRaw(raw)).toThrow(ProjectFileError);
+    try {
+      loadRaw(raw);
+    } catch (e) {
+      // the shape the app's error paths read off a backend AppError
+      expect(errorDetail(e).code).toBe("bad_input");
+      expect(errorDetail(e).message).toMatch(/no page/);
+    }
+  });
+
+  it("throws when no page survives", () => {
+    expect(() => loadRaw(rawPdf({ pages: [] }))).toThrow(ProjectFileError);
+    expect(() => loadRaw(rawPdf({ pages: "p1" }))).toThrow(ProjectFileError);
+    expect(() => loadRaw(rawPdf({ pages: [{ id: "p1", src: "nope", page: 0, rotate: 0 }] }))).toThrow(
+      ProjectFileError,
+    );
+  });
+
+  it("treats a non-object pdf block as empty", () => {
+    for (const pdf of [null, 7, "x", []]) {
+      expect(() => sanitizePdfMeta(pdf)).toThrow(ProjectFileError);
+    }
+  });
+});
+
+describe("PDF project load: sources", () => {
+  const src = (over: Record<string, unknown>) => ({ id: "s9", path: "C:\\b.pdf", size: 1, mtimeMs: 1, pages: 2, ...over });
+  /** source ids kept when `extra` is added after the healthy s1 */
+  const keptSources = (extra: Record<string, unknown>): string[] => {
+    const raw = rawPdf();
+    const pdf = raw.pdf as { sources: unknown[] };
+    pdf.sources.push(extra);
+    return loadRaw(raw).pdf!.sources.map((s) => s.id);
+  };
+
+  it("keeps a valid second source", () => {
+    expect(keptSources(src({}))).toEqual(["s1", "s9"]);
+  });
+
+  it("drops a source with an invalid or reserved id", () => {
+    for (const id of ["", "a b", "x".repeat(65), 5, null, "__proto__", "constructor", "prototype"]) {
+      expect(keptSources(src({ id }))).toEqual(["s1"]);
+    }
+  });
+
+  it("drops a later source reusing an id", () => {
+    expect(keptSources(src({ id: "s1", path: "C:\\other.pdf" }))).toEqual(["s1"]);
+    expect(loadRaw(rawPdf()).pdf!.sources[0]!.path).toBe("C:\\Docs\\a.pdf");
+  });
+
+  it("drops a path that is empty, has control characters, or is a URL", () => {
+    for (const path of ["", "C:\\a\u0000.pdf", "C:\\a\n.pdf", "http://evil/x.pdf", "file:///C:/x.pdf", "smb://h/x", 7]) {
+      expect(keptSources(src({ path }))).toEqual(["s1"]);
+    }
+    // a drive letter is not a scheme, and UNC paths stay allowed (owner call)
+    expect(keptSources(src({ path: "D:\\x.pdf" }))).toEqual(["s1", "s9"]);
+    expect(keptSources(src({ path: "\\\\nas\\share\\x.pdf" }))).toEqual(["s1", "s9"]);
+  });
+
+  it("drops a size or mtime that is negative or not a number", () => {
+    for (const bad of [{ size: -1 }, { size: "1" }, { mtimeMs: -5 }, { mtimeMs: null }]) {
+      expect(keptSources(src(bad))).toEqual(["s1"]);
+    }
+  });
+
+  it("drops a page count outside 1..PDF_MAX_PAGES or not an integer", () => {
+    for (const pages of [0, -1, 1.5, PDF_MAX_PAGES + 1, "3"]) {
+      expect(keptSources(src({ pages }))).toEqual(["s1"]);
+    }
+    expect(keptSources(src({ pages: PDF_MAX_PAGES }))).toEqual(["s1", "s9"]);
+  });
+
+  it("drops the pages of a dropped source", () => {
+    const raw = rawPdf({
+      sources: [{ id: "s1", path: "http://x/a.pdf", size: 1, mtimeMs: 1, pages: 4 }],
+    });
+    // p1 and p2 named s1; only the blank p3 survives
+    expect(loadRaw(raw).pdf!.pages.map((p) => p.id)).toEqual(["p3"]);
+  });
+});
+
+describe("PDF project load: pages", () => {
+  const pagesAfter = (pages: unknown[]) => loadRaw(rawPdf({ pages, annots: {} })).pdf!.pages;
+  const ok = { id: "p1", src: "s1", page: 0, rotate: 0 };
+
+  it("reads an unknown rotation as 0 and keeps the four real ones", () => {
+    const out = pagesAfter([
+      { ...ok, id: "a", rotate: 45 },
+      { ...ok, id: "b", rotate: "90" },
+      { ...ok, id: "c", rotate: 270 },
+      { ...ok, id: "d", rotate: 180 },
+      { ...ok, id: "e", rotate: 360 },
+    ]);
+    expect(out.map((p) => p.rotate)).toEqual([0, 0, 270, 180, 0]);
+  });
+
+  it("drops a page index outside its source or not an integer", () => {
+    const out = pagesAfter([
+      { ...ok, id: "a", page: 3 },
+      { ...ok, id: "b", page: 4 },
+      { ...ok, id: "c", page: -1 },
+      { ...ok, id: "d", page: 1.5 },
+      { ...ok, id: "e", page: "0" },
+    ]);
+    expect(out.map((p) => p.id)).toEqual(["a"]);
+  });
+
+  it("drops a page naming an unknown source, or with no src at all", () => {
+    const out = pagesAfter([ok, { ...ok, id: "x", src: "s2" }, { id: "y", page: 0, rotate: 0 }]);
+    expect(out.map((p) => p.id)).toEqual(["p1"]);
+  });
+
+  it("keeps a blank page of 1..14400 points and drops any other size", () => {
+    const blank = (id: string, w: unknown, h: unknown) => ({ id, src: null, page: 7, rotate: 0, w, h });
+    const out = pagesAfter([
+      blank("a", 612, 792),
+      blank("b", 1, 14400),
+      blank("c", 0, 792),
+      blank("d", 612, 14401),
+      blank("e", "612", 792),
+      blank("f", undefined, 792),
+    ]);
+    expect(out.map((p) => p.id)).toEqual(["a", "b"]);
+    // a blank page's `page` is meaningless and normalised
+    expect(out[0]).toEqual({ id: "a", src: null, page: 0, rotate: 0, w: 612, h: 792 });
+  });
+
+  it("drops a page with an invalid, reserved or repeated id", () => {
+    const out = pagesAfter([ok, { ...ok }, { ...ok, id: "__proto__" }, { ...ok, id: "" }, { ...ok, id: 3 }]);
+    expect(out.map((p) => p.id)).toEqual(["p1"]);
+  });
+
+  it("caps the document at PDF_MAX_PAGES pages", () => {
+    const many = Array.from({ length: PDF_MAX_PAGES + 5 }, (_, i) => ({ ...ok, id: `p${i}` }));
+    const meta = sanitizePdfMeta({
+      sources: [{ id: "s1", path: "C:\\a.pdf", size: 1, mtimeMs: 1, pages: 1 }],
+      pages: many,
+    });
+    expect(meta.pages).toHaveLength(PDF_MAX_PAGES);
+    expect(meta.pages[PDF_MAX_PAGES - 1]!.id).toBe(`p${PDF_MAX_PAGES - 1}`);
+  });
+});
+
+describe("PDF project load: marks", () => {
+  it("keeps every valid kind", () => {
+    expect(ids(marksAfterLoad(everyKind()))).toEqual(ids(everyKind() as { id: string }[]));
+  });
+
+  it("drops marks keyed by a page that does not exist, keeping the real page's", () => {
+    const out = loadRaw(rawPdf({ annots: { p1: everyKind().slice(0, 1), ghost: everyKind().slice(1, 2) } }));
+    expect(Object.keys(out.pdf!.annots)).toEqual(["p1"]);
+  });
+
+  it("does not let a __proto__ key pollute or survive", () => {
+    const json =
+      '{"sources":[{"id":"s1","path":"C:\\\\a.pdf","size":1,"mtimeMs":1,"pages":1}],' +
+      '"pages":[{"id":"p1","src":"s1","page":0,"rotate":0},{"id":"__proto__","src":"s1","page":0,"rotate":0}],' +
+      '"annots":{"__proto__":[{"id":"z","t":"whiteout","x":0,"y":0,"w":1,"h":1,"c":"#fff"}],"constructor":[]},' +
+      '"forms":{"__proto__":{"polluted":"yes"},"s1":{"__proto__":"x","constructor":"y","1R":"ok"}}}';
+    const meta = sanitizePdfMeta(JSON.parse(json));
+    expect(meta.pages.map((p) => p.id)).toEqual(["p1"]);
+    expect(Object.keys(meta.annots)).toEqual([]);
+    expect(Object.keys(meta.forms)).toEqual(["s1"]);
+    expect(Object.keys(meta.forms.s1!)).toEqual(["1R"]);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    expect(meta.annots.constructor).toBeUndefined();
+  });
+
+  it("drops a mark list that is not a list", () => {
+    expect(Object.keys(loadRaw(rawPdf({ annots: { p1: { 0: everyKind()[0] } } })).pdf!.annots)).toEqual([]);
+    expect(Object.keys(loadRaw(rawPdf({ annots: [everyKind()] })).pdf!.annots)).toEqual([]);
+  });
+
+  it("drops a mark whose id is invalid or already used anywhere in the document", () => {
+    const [ink] = everyKind();
+    const out = loadRaw(
+      rawPdf({
+        annots: {
+          p1: [ink, { ...ink }, { ...ink, id: "__proto__" }, { ...ink, id: "" }],
+          p2: [{ ...ink }],
+        },
+      }),
+    );
+    expect(ids(out.pdf!.annots.p1!)).toEqual(["a1"]);
+    expect(out.pdf!.annots.p2).toBeUndefined();
+  });
+
+  it("drops an unknown kind", () => {
+    expect(marksAfterLoad([{ id: "x", t: "erase", w: 1, p: pdfPts(0, 0, 1) }, { id: "y", c: "#fff" }])).toEqual([]);
+  });
+
+  it("caps marks at PDF_MAX_ANNOTS_PER_PAGE per page", () => {
+    const many = Array.from({ length: PDF_MAX_ANNOTS_PER_PAGE + 3 }, (_, i) => ({
+      id: `w${i}`,
+      t: "whiteout",
+      x: 0,
+      y: 0,
+      w: 1,
+      h: 1,
+      c: "#fff",
+    }));
+    const kept = marksAfterLoad(many);
+    expect(kept).toHaveLength(PDF_MAX_ANNOTS_PER_PAGE);
+    expect(kept[0]!.id).toBe("w0");
+  });
+
+  /** The single mark `base` with `patch` applied survives the load? */
+  const survives = (base: Record<string, unknown>, patch: Record<string, unknown>): boolean =>
+    marksAfterLoad([{ ...base, ...patch }]).length === 1;
+  const kinds = everyKind();
+  const K = (id: string) => kinds.find((k) => k.id === id)!;
+
+  it("normalises a colour and drops an unreadable one", () => {
+    const [w] = marksAfterLoad([{ ...K("a8"), c: " #ABC " }]);
+    expect((w as { c: string }).c).toBe("#aabbcc");
+    for (const id of ["a1", "a2", "a3", "a4", "a8", "a10"]) {
+      for (const c of ["#ggg", "red", "", 0, "#1234567", "#aaaaaÀa"]) expect(survives(K(id), { c })).toBe(false);
+    }
+  });
+
+  it("holds every coordinate to |v| <= 1e6 and box sides to >= 0", () => {
+    expect(survives(K("a8"), { x: PDF_COORD_MAX })).toBe(true);
+    expect(survives(K("a8"), { x: PDF_COORD_MAX + 1 })).toBe(false);
+    expect(survives(K("a8"), { y: -PDF_COORD_MAX - 1 })).toBe(false);
+    expect(survives(K("a8"), { w: -1 })).toBe(false);
+    expect(survives(K("a9"), { h: -0.5 })).toBe(false);
+    expect(survives(K("a3"), { x: "5" })).toBe(false);
+    expect(survives(K("a10"), { w: null })).toBe(false);
+    expect(survives(K("a4"), { a: [0, PDF_COORD_MAX + 1] })).toBe(false);
+    expect(survives(K("a5"), { b: [0] })).toBe(false);
+    expect(survives(K("a2"), { rects: [[0, 0, -1, 1]] })).toBe(false);
+    expect(survives(K("a2"), { rects: [[0, 2e6, 1, 1]] })).toBe(false);
+    expect(survives(K("a2"), { rects: [[0, 0, 1]] })).toBe(false);
+  });
+
+  it("holds stroke widths to (0, 1000]", () => {
+    for (const id of ["a1", "a4", "a5", "a6", "a7"]) {
+      expect(survives(K(id), { w: 1000 })).toBe(true);
+      for (const w of [0, -1, 1000.5, "2", null]) expect(survives(K(id), { w })).toBe(false);
+    }
+  });
+
+  it("clamps a finite opacity into [0, 1] and drops a missing one", () => {
+    expect((marksAfterLoad([{ ...K("a1"), o: 2 }])[0] as { o: number }).o).toBe(1);
+    expect((marksAfterLoad([{ ...K("a2"), o: -1 }])[0] as { o: number }).o).toBe(0);
+    for (const o of [undefined, "1", null]) {
+      expect(survives(K("a1"), { o })).toBe(false);
+      expect(survives(K("a2"), { o })).toBe(false);
+    }
+  });
+
+  it("checks ink: kind, and points that decode within page space", () => {
+    expect(survives(K("a1"), { kind: "erase" })).toBe(false);
+    expect(survives(K("a1"), { kind: "pencil" })).toBe(true);
+    for (const p of ["", "AAAA", pdfPts(0, 0, 1).slice(0, 15), pdfPts(0, 0, 1) + "=", "!".repeat(16), 5]) {
+      expect(survives(K("a1"), { p })).toBe(false);
+    }
+    expect(survives(K("a1"), { p: pdfPts(0, 0, 2) })).toBe(false); // pressure > 1
+    expect(survives(K("a1"), { p: pdfPts(2e6, 0, 1) })).toBe(false); // off any page
+    expect(survives(K("a1"), { p: pdfPts(NaN, 0, 1) })).toBe(false);
+  });
+
+  it("checks a highlight's rect count: 1..1000", () => {
+    const r = [0, 0, 1, 1];
+    expect(survives(K("a2"), { rects: Array(1000).fill(r) })).toBe(true);
+    expect(survives(K("a2"), { rects: Array(1001).fill(r) })).toBe(false);
+    expect(survives(K("a2"), { rects: [] })).toBe(false);
+  });
+
+  it("checks text: length, font whitelist, size, booleans, alignment", () => {
+    expect(survives(K("a3"), { text: "x".repeat(20_000) })).toBe(true);
+    expect(survives(K("a3"), { text: "x".repeat(20_001) })).toBe(false);
+    expect(survives(K("a3"), { text: 5 })).toBe(false);
+    for (const font of ["Comic Sans MS", "arial", "", "toString", "__proto__"]) expect(survives(K("a3"), { font })).toBe(false);
+    expect(survives(K("a3"), { font: "Times New Roman" })).toBe(true);
+    for (const size of [4, 288]) expect(survives(K("a3"), { size })).toBe(true);
+    for (const size of [3.9, 289, "12", null]) expect(survives(K("a3"), { size })).toBe(false);
+    expect(survives(K("a3"), { bold: "true" })).toBe(false);
+    expect(survives(K("a3"), { italic: 1 })).toBe(false);
+    expect(survives(K("a3"), { align: "justify" })).toBe(false);
+    expect(survives(K("a3"), { align: "right" })).toBe(true);
+  });
+
+  it("keeps an image mark only when its media is a real image in the project", () => {
+    expect(marksAfterLoad([K("a9")], [])).toEqual([]);
+    expect(marksAfterLoad([K("a9")], [{ ...PIC, kind: "video" }])).toEqual([]);
+    expect(marksAfterLoad([K("a9")], [{ ...PIC, generator: { type: "solid", color: "#fff" } }])).toEqual([]);
+    expect(survives(K("a9"), { media: "other" })).toBe(false);
+    expect(survives(K("a9"), { media: 1 })).toBe(false);
+  });
+
+  it("checks a signature: 1..1000 strokes that each decode", () => {
+    const s = pdfPts(0, 0, 1);
+    expect(survives(K("a10"), { strokes: [] })).toBe(false);
+    expect(survives(K("a10"), { strokes: Array(1000).fill(s) })).toBe(true);
+    expect(survives(K("a10"), { strokes: Array(1001).fill(s) })).toBe(false);
+    expect(survives(K("a10"), { strokes: [s, "AAAA"] })).toBe(false);
+    expect(survives(K("a10"), { strokes: [s, pdfPts(0, 0, 5)] })).toBe(false);
+    expect(survives(K("a10"), { strokes: s })).toBe(false);
+  });
+
+  it("refuses ink over the remaining point budget, before decoding", () => {
+    const two = { ...K("a1"), p: pdfPts(0, 0, 1, 1, 1, 1) };
+    expect(sanitizePdfAnnot(two, new Set(), 2)).not.toBeNull();
+    expect(sanitizePdfAnnot(two, new Set(), 1)).toBeNull();
+    const sig = { ...K("a10"), strokes: [pdfPts(0, 0, 1), pdfPts(0, 0, 1)] };
+    expect(sanitizePdfAnnot(sig, new Set(), 2)).not.toBeNull();
+    expect(sanitizePdfAnnot(sig, new Set(), 1)).toBeNull();
+  });
+
+  it("refuses a stroke over PDF_STROKE_MAX_POINTS by its length alone", () => {
+    // 1e6 + 1 points of "A" would decode to zeros; the length check must come
+    // first (a crafted file can carry many of these). The document-wide
+    // PDF_TOTAL_MAX_POINTS budget reaches each mark through the same
+    // `maxPoints` argument tested above.
+    const big = { ...K("a1"), id: "big", p: "A".repeat((PDF_STROKE_MAX_POINTS + 1) * 16) };
+    expect(sanitizePdfAnnot(big, new Set())).toBeNull();
+    expect(ids(marksAfterLoad([big, K("a8")]))).toEqual(["a8"]);
+  });
+});
+
+describe("PDF project load: forms and export options", () => {
+  const formsAfter = (forms: unknown) => loadRaw(rawPdf({ forms })).pdf!.forms;
+
+  it("keeps string, boolean and string-list values", () => {
+    expect({ ...formsAfter({ s1: { "12R": "Dana", "13R": true, "14R": ["a"] } }).s1 }).toEqual({
+      "12R": "Dana",
+      "13R": true,
+      "14R": ["a"],
+    });
+  });
+
+  it("drops values of the wrong type or past the bounds", () => {
+    const rec = formsAfter({
+      s1: {
+        ok: "x",
+        n: 5,
+        nul: null,
+        obj: { a: 1 },
+        long: "x".repeat(20_001),
+        list501: Array(501).fill("a"),
+        mixed: ["a", 1],
+        longItem: ["x".repeat(20_001)],
+        list500: Array(500).fill("a"),
+      },
+    }).s1!;
+    expect(Object.keys(rec)).toEqual(["ok", "list500"]);
+  });
+
+  it("drops field ids that are not ids", () => {
+    // pdf.js widget ids: "<num>R", "<num>R<gen>", or "annot_..." — all kept
+    expect(
+      Object.keys(formsAfter({ s1: { "a b": "x", "": "y", "1R": "z", "12R3": "g", annot_p1_2: "a" } }).s1!),
+    ).toEqual(["1R", "12R3", "annot_p1_2"]);
+  });
+
+  it("drops forms keyed by an unknown source, and a source with no value left", () => {
+    const forms = formsAfter({ s2: { "1R": "x" }, s1: { bad: 1 } });
+    expect(Object.keys(forms)).toEqual([]);
+    expect(Object.keys(formsAfter([{ "1R": "x" }]))).toEqual([]);
+  });
+
+  it("keeps an absent export block absent", () => {
+    expect("export" in loadRaw(rawPdf()).pdf!).toBe(false);
+    expect("export" in loadRaw(rawPdf({ export: "yes" })).pdf!).toBe(false);
+  });
+
+  it("reads an export flag as true only when it is literally true", () => {
+    expect(loadRaw(rawPdf({ export: { flattenMarks: "true", flattenForms: true } })).pdf!.export).toEqual({
+      flattenMarks: false,
+      flattenForms: true,
+    });
+    expect(loadRaw(rawPdf({ export: {} })).pdf!.export).toEqual({ flattenMarks: false, flattenForms: false });
+  });
+});
+
+describe("PDF project load: media, timeline, tempEdited", () => {
+  const withProject = (over: Record<string, unknown>) => loadRaw({ ...rawPdf(), ...over });
+
+  it("keeps only real still images on disk, once each", () => {
+    const out = withProject({
+      media: [
+        PIC,
+        { ...PIC },
+        { ...PIC, id: "v", kind: "video" },
+        { ...PIC, id: "g", generator: { type: "solid", color: "#fff" } },
+        { ...PIC, id: "u", path: "https://x/y.png" },
+        { ...PIC, id: "w", width: 0 },
+        { ...PIC, id: "s", size: -1 },
+        "junk",
+      ],
+    });
+    expect(out.media.map((m) => m.id)).toEqual(["pic1"]);
+  });
+
+  it("reads a media list that is not a list as empty, dropping image marks with it", () => {
+    const out = withProject({ media: "junk" });
+    expect(out.media).toEqual([]);
+    expect(ids(out.pdf!.annots.p1!)).not.toContain("a9");
+  });
+
+  it("replaces a timeline with clips, markers or a bad shape by the empty one", () => {
+    const { p } = baseProject();
+    for (const timeline of [
+      p.timeline,
+      { ...emptyPdfTimeline(), markers: [{ id: "m", t: 1, color: 0 }] },
+      { ...emptyPdfTimeline(), width: 641 },
+      { ...emptyPdfTimeline(), tracks: [] },
+      { ...emptyPdfTimeline(), fps: { num: 30, den: 0 } },
+      "junk",
+    ]) {
+      const out = withProject({ timeline });
+      expect(out.timeline.tracks).toHaveLength(1);
+      expect(out.timeline.tracks[0]!.clips).toEqual([]);
+      expect(checkInvariants(out)).toEqual([]);
+    }
+  });
+
+  it("applies the tempEdited rule to a PDF project too", () => {
+    expect("tempEdited" in withProject({ tempEdited: "yes" })).toBe(false);
+    expect(withProject({ tempEdited: true }).tempEdited).toBe(true);
+  });
+});
+
+describe("PDF sanitizer mirrors (core cannot import their originals)", () => {
+  it("pdfHexColor answers exactly as normalizeHexColor(v, '')", () => {
+    for (const v of ["#abc", "#ABCDEF", " #a1b2c3 ", "a1b2c3", "#abcd", "#ggg", "", "#1234567", "x".repeat(13), 5, null, "#aaaaaÀa"]) {
+      expect(pdfHexColor(v) ?? "").toBe(normalizeHexColor(v, ""));
+    }
+  });
+
+  it("decodePdfPoints agrees with decodePoints inside page space", () => {
+    for (const p of [pdfPts(1, 2, 0.5), pdfPts(0, 0, 2), pdfPts(NaN, 0, 1), "AAAA", "", pdfPts(1, 2, 0.5) + "=", "!".repeat(16)]) {
+      expect(decodePdfPoints(p)).toEqual(decodePoints(p));
+    }
+    // …and adds the page-space bound decodePoints does not have
+    expect(decodePoints(pdfPts(2e6, 0, 1))).not.toBeNull();
+    expect(decodePdfPoints(pdfPts(2e6, 0, 1))).toBeNull();
+  });
+
+  it("keeps the point caps equal to the image editor's", () => {
+    expect(PDF_STROKE_MAX_POINTS).toBe(MAX_STROKE_POINTS);
+    expect(PDF_TOTAL_MAX_POINTS).toBe(MAX_TOTAL_POINTS);
+  });
+});
+
+describe("checkPdfInvariants", () => {
+  const fresh = () => createPdfProject("x", { path: "C:\\a.pdf", size: 1, mtimeMs: 1, pages: 2 });
+  const withPdf = (p: ProjectFile, over: Partial<PdfMeta>): ProjectFile => ({ ...p, pdf: { ...p.pdf!, ...over } });
+
+  it("holds for a new project and is reached through checkInvariants", () => {
+    const p = fresh();
+    expect(checkPdfInvariants(p)).toEqual([]);
+    expect(checkInvariants({ ...p, schema: 3 })).toContain("pdf project has schema 3, expected 4");
+  });
+
+  it("reports what the sanitizer would have dropped", () => {
+    const p = fresh();
+    const [pg] = p.pdf!.pages;
+    const ink = everyKind()[0] as unknown as PdfAnnot;
+    expect(checkPdfInvariants({ ...p, pdf: undefined })).toEqual(["pdf project has no pdf block"]);
+    expect(checkPdfInvariants(withPdf(p, { pages: [] }))).toContain("pdf project has no pages");
+    expect(checkPdfInvariants(withPdf(p, { pages: [{ ...pg!, src: "nope" }] }))).toContain(`page ${pg!.id}: invalid`);
+    expect(checkPdfInvariants(withPdf(p, { pages: [pg!, pg!] }))).toContain(`page ${pg!.id}: duplicate id`);
+    const badSrc = withPdf(p, { sources: [{ ...p.pdf!.sources[0]!, path: "http://x/a.pdf" }] });
+    expect(checkPdfInvariants(badSrc)).toEqual(expect.arrayContaining([`page ${pg!.id}: invalid`]));
+    expect(checkPdfInvariants(withPdf(p, { annots: { ghost: [ink] } }))).toContain("annots keyed by unknown page ghost");
+    expect(checkPdfInvariants(withPdf(p, { annots: { [pg!.id]: [ink, ink] } }))).toContain("mark a1: duplicate id");
+    expect(checkPdfInvariants(withPdf(p, { annots: { [pg!.id]: [{ ...ink, w: 0 } as PdfAnnot] } }))).toContain(
+      "mark a1: invalid",
+    );
+    expect(checkPdfInvariants(withPdf(p, { forms: { nope: { "1R": "x" } } }))).toContain(
+      "forms keyed by unknown source nope",
+    );
+    const { p: video } = baseProject();
+    expect(checkPdfInvariants({ ...p, timeline: video.timeline })).toContain(
+      "pdf project timeline is not the empty one",
+    );
   });
 });

@@ -177,9 +177,24 @@ class El {
   removeEventListener(t: string, fn: Handler): void {
     this.listeners.get(t)?.delete(fn);
   }
+  /** Dispatch `t` here and bubble it up the ancestors, as the engine does,
+   *  until a listener calls stopPropagation — so a control nested inside a row
+   *  would reach the row's listeners too. */
   fire(t: string, extra: Record<string, unknown> = {}): void {
-    const ev = { target: this, currentTarget: this, preventDefault() {}, stopPropagation() {}, ...extra };
-    for (const fn of [...(this.listeners.get(t) ?? [])]) fn(ev);
+    let stopped = false;
+    const ev: Record<string, unknown> = {
+      target: this,
+      currentTarget: this,
+      preventDefault() {},
+      stopPropagation() {
+        stopped = true;
+      },
+      ...extra,
+    };
+    for (let n: El | null = this; n && !stopped; n = n.parentNode) {
+      ev.currentTarget = n;
+      for (const fn of [...(n.listeners.get(t) ?? [])]) fn(ev);
+    }
   }
   /** A click as the engine delivers it: nothing at all on a disabled control. */
   click(): void {
@@ -289,12 +304,32 @@ function pressKey(key: string): void {
   for (const fn of [...(docListeners.get("keydown") ?? [])]) fn(ev);
 }
 
+// Window listeners are kept so a shortcut capture (a capture-phase keydown on
+// window) can be driven exactly as the engine would.
+const winListeners = new Map<string, Set<Handler>>();
+function pressOnWindow(key: string): void {
+  const ev = {
+    key,
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    shiftKey: false,
+    getModifierState: () => false,
+    preventDefault() {},
+    stopPropagation() {},
+  };
+  for (const fn of [...(winListeners.get("keydown") ?? [])]) fn(ev);
+}
+
 vi.stubGlobal("document", doc);
 vi.stubGlobal("window", {
   setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms),
   clearTimeout: (id: ReturnType<typeof setTimeout>) => clearTimeout(id),
-  addEventListener: () => {},
-  removeEventListener: () => {},
+  addEventListener: (t: string, fn: Handler) => {
+    if (!winListeners.has(t)) winListeners.set(t, new Set());
+    winListeners.get(t)!.add(fn);
+  },
+  removeEventListener: (t: string, fn: Handler) => void winListeners.get(t)?.delete(fn),
 });
 
 const { settingsStore } = await import("../core/session");
@@ -443,6 +478,98 @@ describe("Reset to defaults", () => {
     q("#settings-reset-shortcuts").click();
     await flush();
     expect(doc.activeElement).toBe(q('[data-action="playPause"]'));
+  });
+});
+
+/* ---------------- one row's reset ---------------- */
+
+describe("Reset one shortcut", () => {
+  const capturingRows = (): El[] => inner().querySelectorAll(".settings__shortcut--capturing");
+  const captureListening = (): number => winListeners.get("keydown")?.size ?? 0;
+
+  it("shows a ↺ naming the default only on a row that differs from it", async () => {
+    settingsStore.set({
+      ...settingsStore.get(),
+      shortcuts: { ...DEFAULT_SHORTCUTS, split: "Ctrl+K", undo: "Ctrl+Q" },
+    });
+    mount();
+    await flush();
+    const split = q('[data-reset-action="split"]');
+    expect(split.getAttribute("title")).toBe("Reset to S");
+    expect(split.getAttribute("aria-label")).toBe("Reset to S");
+    expect(q('[data-reset-action="undo"]').getAttribute("title")).toBe("Reset to Ctrl+Z");
+    expect(inner().querySelectorAll('[data-reset-action="redo"]')).toEqual([]);
+    expect(inner().querySelectorAll("[data-reset-action]").length).toBe(2);
+    // Every row keeps its slot, ↺ or not, so one appearing never moves a chord.
+    expect(inner().querySelectorAll(".settings__shortcut-reset-slot").length).toBe(
+      inner().querySelectorAll(".settings__shortcut").length,
+    );
+  });
+
+  it("one click restores the default through the settings write, without starting a capture", async () => {
+    settingsStore.set({ ...settingsStore.get(), shortcuts: { ...DEFAULT_SHORTCUTS, split: "Ctrl+K" } });
+    mount();
+    await flush();
+    q('[data-reset-action="split"]').focus();
+    q('[data-reset-action="split"]').click();
+    expect(m.writes).toEqual([{ shortcuts: { ...DEFAULT_SHORTCUTS } }]);
+    await flush();
+    expect(settingsStore.get().shortcuts.split).toBe("S");
+    expect(inner().querySelectorAll("[data-reset-action]")).toEqual([]);
+    expect(capturingRows()).toEqual([]);
+    expect(captureListening()).toBe(0);
+    // Focus lands on the row the ↺ belonged to, not on <body>.
+    expect(doc.activeElement).toBe(q('[data-action="split"]'));
+    // Nothing left to reset, so "Reset to defaults" disables, as it does
+    // whenever the shortcuts are the defaults.
+    expect(q("#settings-reset-shortcuts").disabled).toBe(true);
+  });
+
+  it("Enter on the ↺ is not taken as a chord for the row", async () => {
+    settingsStore.set({ ...settingsStore.get(), shortcuts: { ...DEFAULT_SHORTCUTS, split: "Ctrl+K" } });
+    mount();
+    await flush();
+    const btn = q('[data-reset-action="split"]');
+    btn.focus();
+    btn.fire("keydown", { key: "Enter" });
+    expect(capturingRows()).toEqual([]);
+    expect(captureListening()).toBe(0);
+    expect(m.writes).toEqual([]);
+  });
+
+  it("restoring a default another action holds keeps both, flagged, exactly as a capture of that chord does", async () => {
+    const start = { ...DEFAULT_SHORTCUTS, split: "Ctrl+K", toggleSnap: "S" };
+
+    // The capture flow: press S on the Split row.
+    settingsStore.set({ ...settingsStore.get(), shortcuts: { ...start } });
+    mount();
+    await flush();
+    q('[data-action="split"]').click();
+    expect(capturingRows().length).toBe(1);
+    pressOnWindow("s");
+    await flush();
+    const captured = settingsStore.get().shortcuts;
+    view?.dispose();
+    view = null;
+    root.remove();
+    m.writes.length = 0;
+
+    // The ↺ on the same row, from the same start.
+    settingsStore.set({ ...settingsStore.get(), shortcuts: { ...start } });
+    mount();
+    await flush();
+    q('[data-reset-action="split"]').click();
+    await flush();
+    expect(m.writes).toEqual([{ shortcuts: { ...start, split: "S" } }]);
+    expect(settingsStore.get().shortcuts).toEqual(captured);
+    // Neither action was unbound to make room; both rows say they clash.
+    expect(settingsStore.get().shortcuts.toggleSnap).toBe("S");
+    expect(q('[data-action="split"]').classes).toContain("settings__shortcut--conflict");
+    expect(q('[data-action="toggleSnap"]').classes).toContain("settings__shortcut--conflict");
+    expect(q(".settings__conflict-warn").textContent).toContain("S (editor)");
+    // Toggle snapping still differs, so its ↺ and "Reset to defaults" stay.
+    expect(q('[data-reset-action="toggleSnap"]').getAttribute("title")).toBe("Reset to N");
+    expect(q("#settings-reset-shortcuts").disabled).toBe(false);
   });
 });
 

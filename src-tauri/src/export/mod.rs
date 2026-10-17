@@ -1086,12 +1086,78 @@ fn done_output(path: &str, hw_fallback: bool) -> serde_json::Value {
 }
 
 /* ------------------------------------------------------------------ */
+/* System fonts (PDF export)                                           */
+/* ------------------------------------------------------------------ */
+
+/// The file of one WHITELISTED system font face — the text generators'
+/// families (`builder::font_path`: Segoe UI, Arial, Georgia, Times New Roman,
+/// Courier New, Impact) — for the PDF editor to embed in an export. `None`
+/// for any other family, and when that face's file is not installed. The
+/// family only ever selects from the hardcoded table: nothing the caller
+/// sends becomes part of a path, so this can never name an arbitrary file.
+/// One stat of the Fonts folder, on the blocking pool like every fs call.
+#[tauri::command]
+pub async fn system_font_path(family: String, bold: bool, italic: bool) -> Option<String> {
+    tauri::async_runtime::spawn_blocking(move || system_font_path_now(&family, bold, italic))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// `system_font_path`'s body.
+fn system_font_path_now(family: &str, bold: bool, italic: bool) -> Option<String> {
+    system_font_path_in(builder::fonts_dir(), family, bold, italic)
+}
+
+/// `system_font_path_now` against a given Fonts folder (the tests' scratch).
+fn system_font_path_in(dir: &Path, family: &str, bold: bool, italic: bool) -> Option<String> {
+    builder::font_path_in(dir, family, bold, italic).filter(|p| Path::new(p).is_file())
+}
+
+/* ------------------------------------------------------------------ */
 /* Unit: path escaping + redaction                                     */
 /* ------------------------------------------------------------------ */
 
 #[cfg(test)]
 mod unit {
     use super::*;
+
+    /// Only the six whitelisted families map to a file, and only a file that
+    /// is there; anything else — another family, a path, a case variant — is
+    /// `None`. Arial and Times New Roman ship with every Windows, so their
+    /// regular faces must resolve on the machine running the tests.
+    #[test]
+    fn system_font_path_answers_only_for_whitelisted_installed_faces() {
+        for odd in ["Comic Sans MS", "arial", "", r"C:\Windows\Fonts\arial.ttf", "..\\..\\x", "Arial "] {
+            assert_eq!(system_font_path_now(odd, false, false), None, "{odd:?}");
+        }
+        let arial = system_font_path_now("Arial", false, false).expect("Arial ships with Windows");
+        assert!(arial.to_ascii_lowercase().ends_with(r"\fonts\arial.ttf"), "{arial}");
+        let times_bi = system_font_path_now("Times New Roman", true, true).expect("installed");
+        assert!(times_bi.to_ascii_lowercase().ends_with("timesbi.ttf"), "{times_bi}");
+        // Against a scratch Fonts folder holding only arial.ttf: that face
+        // resolves there, a whitelisted face whose file is absent answers
+        // None (`font_path` alone would still name it), and a family that is
+        // not whitelisted stays None even when a file of its name is present.
+        let dir = std::env::temp_dir().join(format!(
+            "taroting-fonts-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("arial.ttf"), b"font").unwrap();
+        std::fs::write(dir.join("comic.ttf"), b"font").unwrap();
+        assert_eq!(
+            system_font_path_in(&dir, "Arial", false, false).as_deref(),
+            Some(dir.join("arial.ttf").to_string_lossy().as_ref())
+        );
+        assert!(builder::font_path_in(&dir, "Arial", true, false).is_some());
+        assert_eq!(system_font_path_in(&dir, "Arial", true, false), None, "arialbd.ttf is absent");
+        assert_eq!(system_font_path_in(&dir, "Georgia", false, false), None);
+        assert_eq!(system_font_path_in(&dir, "comic", false, false), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Machine-specific sweep terms, injected so the tests stay pure (no env
     /// mutation, no dependency on whoever is running them).
@@ -1145,6 +1211,7 @@ mod unit {
             keyframes: None, adjust: None,
         };
         let spec = ExportSpec {
+            kind: None,
             media: vec![text],
             timeline: Timeline {
                 fps: Rational { num: 30, den: 1 }, width: 640, height: 360,
@@ -1398,6 +1465,9 @@ mod unit {
                 Family::Video | Family::Gif => "video",
                 Family::Audio => "audio",
                 Family::Image => "image",
+                // A PDF is never an ffmpeg input (probe_media refuses it), so
+                // the redactor knows it only as a file that keeps its extension.
+                Family::Document => "file",
             };
             assert_eq!(kind_for(ext), want, "{ext} ({family:?}) redacts as the wrong kind");
         }
@@ -1842,6 +1912,7 @@ mod unit {
         title.generator = Some(Generator::Solid { color: "#123456".into() });
         let unused = source("m4", &dir.join("Unused B-roll.mp4"));
         let spec = ExportSpec {
+            kind: None,
             media: vec![holiday, voice, title, unused],
             timeline: Timeline {
                 fps: Rational { num: 30, den: 1 },
@@ -2579,6 +2650,7 @@ mod e2e {
             tracks: vec![bottom], markers: vec![],
         };
         let spec = ExportSpec {
+            kind: None,
             media: vec![media, white], timeline: tl, preset: preset_640(30.0),
             out_path: dir.join("held.mp4").to_string_lossy().into_owned(),
         };
@@ -2625,6 +2697,7 @@ mod e2e {
             tracks: vec![top, bottom], markers: vec![],
         };
         let spec = ExportSpec {
+            kind: None,
             media: vec![media, white], timeline: tl, preset: preset_640(30.0),
             out_path: dir.join("composite.mp4").to_string_lossy().into_owned(),
         };
@@ -2668,6 +2741,7 @@ mod e2e {
             tracks: vec![toptrack, bottom], markers: vec![],
         };
         let spec = ExportSpec {
+            kind: None,
             media: vec![base, box_media], timeline: tl, preset: preset_640(30.0),
             out_path: dir.join("animpos.mp4").to_string_lossy().into_owned(),
         };
@@ -2704,6 +2778,7 @@ mod e2e {
             tracks: vec![toptrack, bottom], markers: vec![],
         };
         let spec = ExportSpec {
+            kind: None,
             media: vec![base, white], timeline: tl, preset: preset_640(30.0),
             out_path: dir.join("animop.mp4").to_string_lossy().into_owned(),
         };
@@ -2753,6 +2828,7 @@ mod e2e {
             tracks: vec![toptrack, bottom], markers: vec![],
         };
         let spec = ExportSpec {
+            kind: None,
             media: vec![base, text], timeline: tl, preset: preset_640(30.0),
             out_path: dir.join("textsolid.mp4").to_string_lossy().into_owned(),
         };
@@ -2809,6 +2885,7 @@ mod e2e {
         let out = dir.join("two clip out.mp4");
         let out_s = out.to_string_lossy().into_owned();
         let spec = ExportSpec {
+            kind: None,
             media: vec![media], timeline: tl, preset, out_path: out_s.clone(),
         };
 
@@ -2856,7 +2933,7 @@ mod e2e {
         };
         let out = dir.join("slice out.gif");
         let out_s = out.to_string_lossy().into_owned();
-        let spec = ExportSpec { media: vec![media], timeline: tl, preset, out_path: out_s.clone() };
+        let spec = ExportSpec { kind: None, media: vec![media], timeline: tl, preset, out_path: out_s.clone() };
         let built = builder::build(&spec, &enc()).unwrap();
         let part = dir.join("slice out.gif.part");
         run_built(&built, &out_s, &part);
@@ -2909,6 +2986,7 @@ mod e2e {
             use_hardware: false,
         };
         let spec = ExportSpec {
+            kind: None,
             media: vec![wide], timeline: tl, preset,
             out_path: dir.join("widemask.mp4").to_string_lossy().into_owned(),
         };
@@ -2962,6 +3040,7 @@ mod e2e {
             };
             let name = format!("avi-{vcodec}.avi");
             let spec = ExportSpec {
+                kind: None,
                 media: vec![media.clone()], timeline: tl, preset,
                 out_path: dir.join(&name).to_string_lossy().into_owned(),
             };
@@ -3052,6 +3131,7 @@ mod e2e {
             };
             let name = format!("rot{rotate}.mp4");
             let spec = ExportSpec {
+                kind: None,
                 media: vec![media.clone()], timeline: tl, preset,
                 out_path: dir.join(&name).to_string_lossy().into_owned(),
             };
@@ -3147,6 +3227,7 @@ mod e2e {
             use_hardware: false,
         };
         let spec = ExportSpec {
+            kind: None,
             media: vec![media], timeline: tl, preset,
             out_path: dir.join("meta.mp4").to_string_lossy().into_owned(),
         };
@@ -3229,6 +3310,7 @@ mod e2e {
             };
             let name = format!("{enc_name}.mp4");
             let spec = ExportSpec {
+                kind: None,
                 media: vec![media.clone()], timeline: tl, preset,
                 out_path: dir.join(&name).to_string_lossy().into_owned(),
             };
@@ -3299,7 +3381,7 @@ mod e2e {
             audio_bitrate: BitratePreset::Kbps(160),
             use_hardware: false,
         };
-        let spec = ExportSpec { media: vec![media], timeline: tl, preset, out_path: r"C:\o.mp4".into() };
+        let spec = ExportSpec { kind: None, media: vec![media], timeline: tl, preset, out_path: r"C:\o.mp4".into() };
         let est = estimate::estimate(&spec);
         assert!(est.exact);
         // (4000+160)*1000/8*10 = 5,200,000
@@ -3351,6 +3433,7 @@ mod e2e {
             tracks: vec![vtrack("vtop", vec![t]), bottom], markers: vec![],
         };
         let spec = ExportSpec {
+            kind: None,
             media: vec![base, text], timeline: tl, preset: preset_640(30.0),
             out_path: dir.join("textalpha.mp4").to_string_lossy().into_owned(),
         };
@@ -3383,7 +3466,7 @@ mod e2e {
         };
         let out = dir.join("script.mp4");
         let out_s = out.to_string_lossy().into_owned();
-        let spec = ExportSpec { media, timeline: tl, preset: preset_640(30.0), out_path: out_s.clone() };
+        let spec = ExportSpec { kind: None, media, timeline: tl, preset: preset_640(30.0), out_path: out_s.clone() };
         let built = builder::build(&spec, &enc()).unwrap();
         assert!(built.filter_complex.len() > INLINE_FILTER_LIMIT, "premise: {} chars", built.filter_complex.len());
         let plan = compose(&built, &out_s, &dir).unwrap();
@@ -3421,7 +3504,7 @@ mod e2e {
         preset.resolution = ResolutionPreset::Custom { w: 320, h: 180 };
         let out = dir.join("two.gif");
         let out_s = out.to_string_lossy().into_owned();
-        let spec = ExportSpec { media: vec![media], timeline: tl, preset, out_path: out_s.clone() };
+        let spec = ExportSpec { kind: None, media: vec![media], timeline: tl, preset, out_path: out_s.clone() };
         let built = builder::build(&spec, &enc()).unwrap();
         let part = dir.join("two.gif.part");
         run_built_in(&built, &out_s, &part, &dir);
@@ -3465,6 +3548,7 @@ mod e2e {
         let mut preset = preset_640(30.0);
         preset.use_hardware = true;
         ExportSpec {
+            kind: None,
             media: vec![media], timeline: tl, preset,
             out_path: dir.join("hw.mp4").to_string_lossy().into_owned(),
         }
@@ -3630,7 +3714,7 @@ mod e2e {
         };
         let out = dir.join("text.mp4");
         let out_s = out.to_string_lossy().into_owned();
-        let spec = ExportSpec { media: vec![base, text], timeline: tl, preset: preset_640(30.0), out_path: out_s.clone() };
+        let spec = ExportSpec { kind: None, media: vec![base, text], timeline: tl, preset: preset_640(30.0), out_path: out_s.clone() };
         let built = builder::build(&spec, &enc()).unwrap();
         let part = dir.join("text.mp4.part");
         run_built_in(&built, &out_s, &part, &dir);

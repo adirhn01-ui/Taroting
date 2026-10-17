@@ -807,3 +807,6 @@ imageFixture(
 );
 
 console.log("fixtures ready at", outDir);
+
+/* --- PDF documents (scripts/make-pdf-fixtures.mjs): the PDF viewer/editor/export tests --- */
+await import("./make-pdf-fixtures.mjs");

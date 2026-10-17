@@ -13,11 +13,14 @@ pub const CURRENT_SCHEMA: u32 = 2;
 
 /// The schema an IMAGE project is stamped with, and only an image project.
 /// CURRENT_SCHEMA stays 2: bumping it would make `migrate()` reject every
-/// schema-2 file and stamp schema-1 VIDEO files as 3. A video project never
-/// carries `kind`, stays 2, and is byte-identical on disk.
+/// schema-2 file and stamp schema-1 VIDEO files as 3 (or 4). A video project
+/// never carries `kind`, stays 2, and is byte-identical on disk.
 pub const IMAGE_SCHEMA: u32 = 3;
+/// The schema a PDF project is stamped with, and only a PDF project
+/// (`kind: "pdf"`), by the same rule as `IMAGE_SCHEMA`.
+pub const PDF_SCHEMA: u32 = 4;
 /// Highest schema this build opens.
-pub const MAX_ACCEPTED_SCHEMA: u32 = 3;
+pub const MAX_ACCEPTED_SCHEMA: u32 = 4;
 
 /// The first schema version whose `media[].width`/`height` are rotation-aware.
 ///
@@ -121,20 +124,31 @@ fn true_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<O
     Ok((Value::deserialize(d)? == Value::Bool(true)).then_some(true))
 }
 
-/// `Some("image")` for a JSON `"image"`, `None` for anything else: the only
-/// kind a project (`ProjectFile.kind?: "image"`) or a recents entry
-/// (`RecentItem.kind?: "image"`) carries. Same reasoning as `true_or_none`:
-/// 0.8.1 ignored `kind` as unknown, so a value there it would have opened must
-/// not turn the file into "invalid project file" now — and `migrate()` reads
-/// the kind by exactly this rule, so the two can never disagree.
-pub(crate) fn image_kind_or_none<'de, D: serde::Deserializer<'de>>(
+/// The project kinds a `.trt` (`ProjectFile.kind?: "image" | "pdf"`) or a
+/// recents entry (`RecentItem.kind`) can carry. Absent = a video project.
+pub(crate) const PROJECT_KINDS: [&str; 2] = ["image", "pdf"];
+
+/// `kind` as `migrate()` and the typed parse read it: `Some` only for a JSON
+/// string that is exactly one of `PROJECT_KINDS`, `None` for anything else.
+pub(crate) fn project_kind_of(v: &Value) -> Option<&'static str> {
+    let s = v.as_str()?;
+    PROJECT_KINDS.into_iter().find(|k| *k == s)
+}
+
+/// `Some("image")` / `Some("pdf")` for exactly those JSON strings, `None` for
+/// anything else (`"PDF"`, `"video"`, a number…). Same reasoning as
+/// `true_or_none`: 0.8.1 ignored `kind` as unknown, so a value there it would
+/// have opened must not turn the file into "invalid project file" now — and
+/// `migrate()` reads the kind by exactly this rule (`project_kind_of`), so the
+/// two can never disagree.
+pub(crate) fn project_kind_or_none<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<Option<String>, D::Error> {
-    Ok((Value::deserialize(d)? == Value::from("image")).then(|| "image".to_string()))
+    Ok(project_kind_of(&Value::deserialize(d)?).map(str::to_string))
 }
 
 /// `tempEdited` as written by the app: exactly `true`, else false. Lenient for
-/// the same reason as `image_kind_or_none` — a hand-edited or damaged value
+/// the same reason as `project_kind_or_none` — a hand-edited or damaged value
 /// must not make the whole project unreadable; it only means "not known to be
 /// edited", which at worst lets the startup sweep clear an orphan sooner.
 pub(crate) fn true_or_false<'de, D: serde::Deserializer<'de>>(
@@ -543,12 +557,13 @@ pub struct ProjectFile {
     pub media: Vec<MediaRef>,
     pub timeline: Timeline,
     pub export: Value, // opaque to Rust until the export milestone
-    /// `Some("image")` → an image project (schema `IMAGE_SCHEMA`). Absent → a
-    /// video project. `migrate()` refuses any other pairing of the two; any
-    /// other value here reads as absent (`image_kind_or_none`).
+    /// `Some("image")` → an image project (schema `IMAGE_SCHEMA`);
+    /// `Some("pdf")` → a PDF project (schema `PDF_SCHEMA`). Absent → a video
+    /// project. `migrate()` refuses any other pairing of the two; any other
+    /// value here reads as absent (`project_kind_or_none`).
     #[serde(
         default,
-        deserialize_with = "image_kind_or_none",
+        deserialize_with = "project_kind_or_none",
         skip_serializing_if = "Option::is_none"
     )]
     pub kind: Option<String>,
@@ -556,6 +571,12 @@ pub struct ProjectFile {
     /// `background` and `export` on read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<Value>,
+    /// PDF projects only (TS `PdfMeta`: sources, pages, marks, form values).
+    /// Opaque to Rust like `image`: the PDF editor sanitizes it on read, and
+    /// `save_project` only checks that a PDF project carries one, as an
+    /// object (`image_rules::validate_image_project`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf: Option<Value>,
     /// A TEMPORARY project (tmp-projects) the user has edited. Set by the
     /// frontend on the first save after a real edit and dropped when the user
     /// keeps the project, so it never reaches a permanent file. The startup
@@ -607,33 +628,43 @@ pub fn migrate(mut value: Value) -> Result<Migrated> {
     }
     let from = version as u32;
     // Schema and kind must agree, both ways. A schema-3 file without the image
-    // kind would reach the VIDEO pipeline holding whatever an image project
-    // holds, and an image kind on a video schema would open a video project in
-    // the image editor. No build writes either shape, so either one is a
-    // crafted or damaged file: refused, never guessed at. Only the literal
-    // string "image" is the kind; any other string there reads as "not an
-    // image project" — refused at schema 3, a plain video project at 1 or 2.
-    let is_image = value.get("kind").and_then(Value::as_str) == Some("image");
+    // kind (or a schema-4 one without the PDF kind) would reach the VIDEO
+    // pipeline holding whatever those projects hold, and an image or PDF kind
+    // on another schema would open a project in the wrong editor. No build
+    // writes any such shape, so each is a crafted or damaged file: refused,
+    // never guessed at. Only the literal strings "image" and "pdf" are kinds
+    // (`project_kind_of`); any other value there reads as "no kind" — refused
+    // at schema 3 and 4, a plain video project at 1 or 2.
+    let kind = value.get("kind").and_then(project_kind_of);
+    let wrong_schema = |k: &str| {
+        let (what, schema) = if k == "pdf" { ("a PDF", PDF_SCHEMA) } else { ("an image", IMAGE_SCHEMA) };
+        AppError::BadInput(format!("{what} project must be schema {schema}"))
+    };
     match from {
+        PDF_SCHEMA => {
+            if kind != Some("pdf") {
+                return Err(AppError::BadInput("schema 4 is only valid for a PDF project".into()));
+            }
+        }
         IMAGE_SCHEMA => {
-            if !is_image {
+            if kind != Some("image") {
                 return Err(AppError::BadInput(
                     "schema 3 is only valid for an image project".into(),
                 ));
             }
         }
         CURRENT_SCHEMA => {
-            if is_image {
-                return Err(AppError::BadInput("an image project must be schema 3".into()));
+            if let Some(k) = kind {
+                return Err(wrong_schema(k));
             }
         }
         // 1 → 2: nothing in the JSON changes, because nothing in the JSON CAN.
         // The stamp is the entire migration — see `ROTATION_REPAIR_SCHEMA` for
-        // what it records and who acts on it. No image project was ever
+        // what it records and who acts on it. No image or PDF project was ever
         // schema 1, so one claiming to be is refused rather than stamped.
         1 => {
-            if is_image {
-                return Err(AppError::BadInput("an image project must be schema 3".into()));
+            if let Some(k) = kind {
+                return Err(wrong_schema(k));
             }
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("schema".into(), Value::from(CURRENT_SCHEMA));
@@ -1076,7 +1107,8 @@ mod tests {
             .contains("only valid for an image project"));
         assert!(msg(serde_json::json!({"schema": 2, "kind": "image"})).contains("must be schema 3"));
         assert!(msg(serde_json::json!({"schema": 1, "kind": "image"})).contains("must be schema 3"));
-        assert!(msg(serde_json::json!({"schema": 4, "kind": "image"})).contains("newer Taroting"));
+        assert!(msg(serde_json::json!({"schema": 4, "kind": "image"})).contains("only valid for a PDF project"));
+        assert!(msg(serde_json::json!({"schema": 5, "kind": "image"})).contains("newer Taroting"));
 
         // Video files are exactly what they were: 2 passes, 1 is stamped 2.
         let v2 = migrate(serde_json::json!({"schema": 2})).unwrap();
@@ -1168,5 +1200,83 @@ mod tests {
         assert_eq!(out["image"], image["image"]);
         assert_eq!(out["timeline"]["tracks"][0]["hidden"], true);
         assert_eq!(out["timeline"]["tracks"][0]["clips"][0]["adjust"]["hue"], -40.0);
+    }
+
+    /// Schema 4 and `kind: "pdf"` come as a pair or not at all, exactly like
+    /// the image pair. Each refusal is told apart by its message.
+    #[test]
+    fn schema_and_pdf_kind_must_agree() {
+        let msg = |v: Value| match migrate(v) {
+            Err(AppError::BadInput(m)) => m,
+            other => panic!("expected BadInput, got {other:?}"),
+        };
+        let ok = migrate(serde_json::json!({"schema": 4, "kind": "pdf", "name": "doc"})).unwrap();
+        assert_eq!(ok.from, PDF_SCHEMA);
+        assert!(ok.from >= ROTATION_REPAIR_SCHEMA, "no rotation re-probe for a PDF project");
+        assert_eq!(ok.value["schema"], 4, "a PDF project is never re-stamped");
+        assert_eq!(ok.value["kind"], "pdf");
+
+        assert!(msg(serde_json::json!({"schema": 4})).contains("only valid for a PDF project"));
+        for odd in [Value::from("PDF"), Value::from("Pdf"), Value::from("document"), Value::Bool(true), Value::Null] {
+            assert!(
+                msg(serde_json::json!({"schema": 4, "kind": odd.clone()})).contains("only valid for a PDF project"),
+                "{odd}"
+            );
+        }
+        for schema in [1, 2] {
+            assert!(
+                msg(serde_json::json!({"schema": schema, "kind": "pdf"})).contains("a PDF project must be schema 4"),
+                "schema {schema}"
+            );
+        }
+        assert!(msg(serde_json::json!({"schema": 3, "kind": "pdf"})).contains("only valid for an image project"));
+        assert!(msg(serde_json::json!({"schema": 5, "kind": "pdf"})).contains("newer Taroting"));
+        // Any other string in `kind` is "no kind": a plain video project at 2.
+        let v = migrate(serde_json::json!({"schema": 2, "kind": "PDF"})).unwrap();
+        assert_eq!(v.from, 2);
+    }
+
+    /// The kind deserializer: exactly "image" or "pdf", anything else absent —
+    /// never a parse failure. A PDF project's `pdf` object round-trips intact
+    /// and camelCase, and a video project gains no `pdf` key.
+    #[test]
+    fn a_pdf_project_round_trips_with_its_pdf_object() {
+        let base = serde_json::json!({
+            "schema": 4, "kind": "pdf", "app": "taroting", "id": "p", "name": "Contract",
+            "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-02T00:00:00Z",
+            "media": [],
+            "timeline": {"fps": {"num": 30, "den": 1}, "width": 1920, "height": 1080, "tracks": []},
+            "export": {},
+            "pdf": {
+                "sources": [{"id": "s1", "path": "C:\\Docs\\a.pdf", "size": 1234, "mtimeMs": 1700000000123u64, "pages": 3}],
+                "pages": [{"id": "pg1", "src": "s1", "page": 0, "rotate": 90}, {"id": "pg2", "src": null, "page": 0, "rotate": 0, "w": 612, "h": 792}],
+                "annots": {"pg1": [{"id": "a1", "t": "whiteout", "x": 1, "y": 2, "w": 3, "h": 4, "c": "#ffffff"}]},
+                "forms": {"s1": {"12R": "Jane", "13R": true}}
+            }
+        });
+        let typed: ProjectFile = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(typed.kind.as_deref(), Some("pdf"));
+        assert!(typed.image.is_none());
+        assert_eq!(serde_json::to_value(&typed).unwrap(), base, "byte-for-byte the same JSON back");
+
+        let kind_of = |k: Value| {
+            let mut v = base.clone();
+            v["kind"] = k;
+            serde_json::from_value::<ProjectFile>(v).map(|p| p.kind)
+        };
+        assert_eq!(kind_of("image".into()).unwrap().as_deref(), Some("image"));
+        assert_eq!(kind_of("pdf".into()).unwrap().as_deref(), Some("pdf"));
+        for odd in [Value::from("PDF"), Value::from(" pdf"), Value::from("video"), Value::from(4), Value::Null, serde_json::json!(["pdf"])] {
+            assert_eq!(kind_of(odd.clone()).unwrap_or_else(|e| panic!("{odd}: {e}")), None, "{odd}");
+        }
+
+        let mut video = base.clone();
+        video["schema"] = 2.into();
+        let obj = video.as_object_mut().unwrap();
+        obj.remove("kind");
+        obj.remove("pdf");
+        let typed: ProjectFile = serde_json::from_value(video.clone()).unwrap();
+        assert!(typed.pdf.is_none());
+        assert_eq!(serde_json::to_value(&typed).unwrap(), video, "no pdf key appears on a video project");
     }
 }

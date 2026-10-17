@@ -1,7 +1,9 @@
 // OS file-open routing: File Explorer "Open with", a second launch, and the
 // launch file itself (core/boot hands it here). A ".trt" opens that project. A
-// media file goes where Settings → Opening files says: the viewer (no project
-// at all), or a TEMPORARY one-clip project in the editor. Neither creates
+// media file or a PDF goes where Settings → Opening files says: the viewer (no
+// project at all), or a TEMPORARY project in the editor (one clip, a photo's
+// image project, or a PDF project). A password-protected PDF has no project:
+// it goes to the viewer whatever the setting says. Neither creates
 // anything permanent — the user keeps a temporary project only by choosing
 // Keep (owner decision; Home's "New project" is the one permanent creation
 // path).
@@ -15,8 +17,9 @@
 import { describeError } from "./ipc";
 import { fileExt, fileName } from "./format";
 import type { Route } from "./nav";
+import { PdfProtectedError } from "./open-media";
 import type { ProjectSession } from "./session";
-import { MEDIA_FILE_EXTENSIONS } from "./types";
+import { OPENABLE_FILE_EXTENSIONS } from "./types";
 
 export interface OpenRouteDeps {
   navigate(route: Route): void;
@@ -27,7 +30,8 @@ export interface OpenRouteDeps {
   /** core/session `leaveBlockedReason`: why a session refuses to be left. */
   leaveBlockedReason(): string | null;
   isTempProjectPath(path: string): Promise<boolean>;
-  /** core/open-media: writes a temporary project for a media file, returns its path. */
+  /** core/open-media: writes a temporary project for a media file or a PDF, returns its
+   *  path. Throws PdfProtectedError (creating nothing) for a password-protected PDF. */
   openMediaAsProject(path: string): Promise<string>;
   /** Settings → Opening files, read at the moment of the open. */
   openWith(): "viewer" | "editor";
@@ -46,7 +50,7 @@ export function createOpenRouter(deps: OpenRouteDeps): (path: string) => Promise
   return async function routeOpenPath(path: string): Promise<void> {
     const ext = fileExt(path);
     const isProject = ext === "trt";
-    if (!isProject && !MEDIA_FILE_EXTENSIONS.has(ext)) return; // unknown type: ignore
+    if (!isProject && !OPENABLE_FILE_EXTENSIONS.has(ext)) return; // unknown type: ignore
 
     // An OS open-path replaces whatever is on screen WITHOUT going through any
     // of the editor's own exits (Back, Ctrl+W, the Settings gear), so it has to
@@ -91,12 +95,16 @@ export function createOpenRouter(deps: OpenRouteDeps): (path: string) => Promise
       return;
     }
 
-    if (deps.openWith() === "viewer") {
-      // A viewer already on screen swaps the file in place: no remount, no
-      // reload of the chunk, and the folder is re-listed for the new file.
+    // A viewer already on screen swaps the file in place: no remount, no
+    // reload of the chunk, and the folder is re-listed for the new file.
+    const toViewer = (): void => {
       const viewer = deps.activeViewer();
       if (viewer) viewer.show(path);
       else deps.navigate({ view: "viewer", path });
+    };
+
+    if (deps.openWith() === "viewer") {
+      toViewer();
       return;
     }
 
@@ -107,6 +115,14 @@ export function createOpenRouter(deps: OpenRouteDeps): (path: string) => Promise
       const projectPath = await deps.openMediaAsProject(path);
       deps.navigate({ view: "editor", projectPath, temp: true });
     } catch (e) {
+      // A password-protected PDF: no project was made, and nothing failed — it
+      // is shown in the viewer instead, with the reason as news. Not the Home
+      // fallback below: the viewer IS the screen now.
+      if (e instanceof PdfProtectedError) {
+        toViewer();
+        deps.toast.info(e.message);
+        return;
+      }
       deps.toast.error(describeError(e));
       // The open the user agreed to leave for has failed. An editor whose temp
       // session went through the gate (Kept or Discarded above) and is STILL

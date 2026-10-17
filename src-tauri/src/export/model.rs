@@ -15,6 +15,17 @@ pub struct ExportSpec {
     pub timeline: Timeline,
     pub preset: ExportPreset,
     pub out_path: String,
+    /// The project's `kind` (`ProjectFile.kind`), read by the same lenient
+    /// rule (`project_kind_or_none`): `Some("pdf")` makes `build()` refuse the
+    /// export outright — a PDF project is exported from the PDF editor, and
+    /// its media (plain pictures) carry no other mark of it. Absent for a
+    /// video project and from every caller that predates the field.
+    #[serde(
+        default,
+        deserialize_with = "crate::project::schema::project_kind_or_none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub kind: Option<String>,
 }
 
 /// The input to `estimate_export` — everything the size estimate reads, and

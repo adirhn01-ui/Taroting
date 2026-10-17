@@ -586,7 +586,26 @@ pub fn h264_param_sets_in_header(path: &Path) -> bool {
     out.status.success() && header_carries_param_sets(&out.stdout)
 }
 
+/// Refuse a file the shared table calls a DOCUMENT (a PDF): openable — the
+/// viewer and the PDF editor take it — but never media, so it must not
+/// become a clip, a layer or a bin entry. Checked on the name alone, before
+/// the disk or ffprobe is touched: ffprobe has nothing to say about a PDF,
+/// and running it on one would only spend a process to fail less plainly.
+fn refuse_document(path: &str) -> Result<()> {
+    let family = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(extensions::family_of_ext);
+    if family == Some(extensions::Family::Document) {
+        return Err(AppError::BadInput(
+            "This is a PDF document, not a video, picture or sound. Open it as a PDF instead.".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn probe_sync(path: &str) -> Result<MediaInfo> {
+    refuse_document(path)?;
     // Every caller's path is untrusted to some degree (a `.trt`'s, on relink
     // and the load-time repair): refused unless it names a real file, so a URL
     // or a device never reaches ffprobe (`media::source`).
@@ -1155,6 +1174,35 @@ mod tests {
         // Only a PICTURE name is held to it: a one-frame .mp4 stays a video.
         assert!(!refused(Some(Family::Video), mov));
         assert!(!refused(None, mov));
+    }
+
+    /// A PDF is never probed as media: refused by name, in plain words, before
+    /// the disk or ffprobe is touched — a real PDF on disk and a missing one
+    /// get the same BadInput (a stat would make the missing one an Io error,
+    /// and ffprobe on the real one an Ffmpeg error).
+    #[test]
+    fn a_pdf_is_refused_without_running_ffprobe() {
+        let dir = std::env::temp_dir().join(format!(
+            "taroting-probe-pdf-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("Lease.pdf");
+        std::fs::write(&real, b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n").unwrap();
+        let want = "This is a PDF document, not a video, picture or sound. Open it as a PDF instead.";
+        for path in [real.clone(), dir.join("Missing.PDF")] {
+            match probe_sync(&path.to_string_lossy()) {
+                Err(AppError::BadInput(m)) => assert_eq!(m, want, "{path:?}"),
+                other => panic!("{path:?}: expected the PDF refusal, got {:?}", other.map(|i| i.kind)),
+            }
+        }
+        // Media names pass the check untouched.
+        refuse_document(r"C:\In\clip.mp4").unwrap();
+        refuse_document(r"C:\In\pdf.png").unwrap();
+        refuse_document(r"C:\In\noext").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// End to end with a real AVIF saved under a `.jpg` name: refused, where

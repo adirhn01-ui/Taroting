@@ -1,5 +1,7 @@
 //! Writing an image project's output — an export the user named, the Home card
-//! thumbnail, a pasted image — through one chunked save protocol.
+//! thumbnail, a pasted image — through one chunked save protocol. A PDF
+//! project's export rides the same protocol (format "pdf", a user-named
+//! destination only), under every rule below.
 //!
 //! **The protocol.** `image_save_begin` (JSON: the destination, the format, the
 //! declared byte count) opens `<target>.taroting-part` (called "the `.part`"
@@ -98,13 +100,17 @@ pub enum ImageSaveDest {
     Pasted { project_name: String },
 }
 
-/// The output format, as TS `ImageExportFormat` names it.
+/// The output format, as TS `ImageExportFormat` names it — plus "pdf", which
+/// `ipc.pdfSaveBegin` sends for a PDF project's export.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageFormat {
     Png,
     Jpeg,
     Webp,
+    /// A PDF document. Only ever an export the user named (`User`): a card is
+    /// JPEG and a paste PNG, and their resolvers refuse anything else.
+    Pdf,
 }
 
 impl ImageFormat {
@@ -114,6 +120,15 @@ impl ImageFormat {
             ImageFormat::Png => "PNG",
             ImageFormat::Jpeg => "JPEG",
             ImageFormat::Webp => "WebP",
+            ImageFormat::Pdf => "PDF",
+        }
+    }
+
+    /// The largest file one user-named save of this format may declare.
+    fn max_user_bytes(self) -> u64 {
+        match self {
+            ImageFormat::Pdf => MAX_PDF_BYTES,
+            ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Webp => MAX_IMAGE_BYTES,
         }
     }
 }
@@ -128,6 +143,10 @@ pub struct SaveBegun {
 
 /// Largest file one save may declare.
 pub const MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+/// Largest PDF export one save may declare. A PDF that embeds every page of a
+/// large scanned source can run to hundreds of megabytes; this only stops a
+/// runaway or crafted declaration.
+pub const MAX_PDF_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 /// Largest Home card thumbnail.
 pub const MAX_THUMB_BYTES: u64 = 1024 * 1024;
 /// Largest single chunk body.
@@ -323,6 +342,8 @@ fn check_magic(format: ImageFormat, head: &[u8]) -> bool {
         ImageFormat::Png => head.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
         ImageFormat::Jpeg => head.starts_with(&[0xFF, 0xD8, 0xFF]),
         ImageFormat::Webp => head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP",
+        // The header line every PDF writer puts at offset 0 ("%PDF-1.7").
+        ImageFormat::Pdf => head.starts_with(b"%PDF-"),
     }
 }
 
@@ -376,6 +397,7 @@ fn check_user_target(target: &Path, sources: &[String], format: ImageFormat) -> 
         ImageFormat::Png => ext == "png",
         ImageFormat::Jpeg => ext == "jpg" || ext == "jpeg",
         ImageFormat::Webp => ext == "webp",
+        ImageFormat::Pdf => ext == "pdf",
     };
     if !ext_ok {
         return Err(bad(format!(
@@ -385,6 +407,7 @@ fn check_user_target(target: &Path, sources: &[String], format: ImageFormat) -> 
                 ImageFormat::Png => "png",
                 ImageFormat::Jpeg => "jpg or .jpeg",
                 ImageFormat::Webp => "webp",
+                ImageFormat::Pdf => "pdf",
             }
         )));
     }
@@ -467,7 +490,13 @@ fn pasted_name(dir: &Path, project: &str) -> Result<PathBuf> {
 fn resolve_user(path: &str, sources: &[String], format: ImageFormat) -> Result<Resolved> {
     let target = PathBuf::from(path);
     check_user_target(&target, sources, format)?;
-    Ok(Resolved { target, part: PartOpen::Replace, supersede: false, max_bytes: MAX_IMAGE_BYTES, thumb_recent: None })
+    Ok(Resolved {
+        target,
+        part: PartOpen::Replace,
+        supersede: false,
+        max_bytes: format.max_user_bytes(),
+        thumb_recent: None,
+    })
 }
 
 fn resolve_pasted(dir: &Path, project_name: &str, format: ImageFormat) -> Result<Resolved> {
@@ -920,7 +949,8 @@ mod tests {
         assert_eq!(fmt("png").unwrap(), ImageFormat::Png);
         assert_eq!(fmt("jpeg").unwrap(), ImageFormat::Jpeg);
         assert_eq!(fmt("webp").unwrap(), ImageFormat::Webp);
-        for odd in ["jpg", "PNG", "Webp", "gif", ""] {
+        assert_eq!(fmt("pdf").unwrap(), ImageFormat::Pdf);
+        for odd in ["jpg", "PNG", "Webp", "gif", "", "PDF", "Pdf"] {
             assert!(fmt(odd).is_err(), "{odd}");
         }
     }
@@ -946,6 +976,7 @@ mod tests {
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R'];
     const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F', 0];
     const WEBP: &[u8] = b"RIFF\x24\0\0\0WEBPVP8L";
+    const PDF: &[u8] = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n";
 
     fn names_in(dir: &Path) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(dir)
@@ -994,8 +1025,8 @@ mod tests {
     #[test]
     fn magic_bytes_are_checked_per_format() {
         use ImageFormat::*;
-        for (f, ok) in [(Png, PNG), (Jpeg, JPEG), (Webp, WEBP)] {
-            for (g, other) in [(Png, PNG), (Jpeg, JPEG), (Webp, WEBP)] {
+        for (f, ok) in [(Png, PNG), (Jpeg, JPEG), (Webp, WEBP), (Pdf, PDF)] {
+            for (g, other) in [(Png, PNG), (Jpeg, JPEG), (Webp, WEBP), (Pdf, PDF)] {
                 assert_eq!(check_magic(f, &other[..12.min(other.len())]), f == g, "{f:?} vs {g:?}");
             }
             assert!(!check_magic(f, &ok[..2]), "{f:?}: a truncated head");
@@ -1494,6 +1525,120 @@ mod tests {
         assert!(names_in(&dir).is_empty());
         assert!(saves.entry(b.token).is_none());
         assert!(msg(chunk_body(&saves, b.token, owned_body(&InvokeBody::Raw(PNG.to_vec())))).contains("unknown"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ------------------------------ PDF -------------------------------- */
+
+    /// A PDF export's target: `.pdf` in any case, nothing else; and the
+    /// image formats never accept `.pdf`.
+    #[test]
+    fn a_pdf_target_must_be_named_pdf() {
+        let dir = scratch("pdf-ext");
+        check_user_target(&dir.join("Lease (signed).pdf"), &[], ImageFormat::Pdf).unwrap();
+        check_user_target(&dir.join("Lease (signed).PDF"), &[], ImageFormat::Pdf).unwrap();
+        check_user_target(&dir.join("Lease.Pdf"), &[], ImageFormat::Pdf).unwrap();
+        for wrong in ["Lease.png", "Lease.pdf.txt", "Lease", "Lease.pd"] {
+            assert_eq!(
+                msg(check_user_target(&dir.join(wrong), &[], ImageFormat::Pdf)),
+                "a PDF file must be named .pdf",
+                "{wrong}"
+            );
+        }
+        assert!(msg(check_user_target(&dir.join("x.pdf"), &[], ImageFormat::Png)).contains(".png"));
+        // The device-path and stream rules hold for a PDF too.
+        assert!(msg(check_user_target(Path::new(r"\\.\X\a.pdf"), &[], ImageFormat::Pdf)).contains("device path"));
+        let stream = PathBuf::from(format!("{}:s.pdf", dir.join("a.pdf").display()));
+        assert_eq!(msg(check_user_target(&stream, &[], ImageFormat::Pdf)), "the save location isn't a plain file path");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole PDF flow: a `%PDF-` body lands; a body that is not one (a
+    /// PNG, or text) is refused at commit, its `.part` removed and the
+    /// previous export untouched. The size cap is the PDF one.
+    #[test]
+    fn a_pdf_save_checks_its_magic_at_commit() {
+        let dir = scratch("pdf-flow");
+        let target = dir.join("Lease.pdf");
+        let saves = ImageSaves::default();
+        let body: Vec<u8> = PDF.iter().copied().chain(*b"1 0 obj\n<<>>\nendobj\n%%EOF\n").collect();
+        let b = begin_user(&saves, &target, ImageFormat::Pdf, body.len() as u64).unwrap();
+        // Chunks of 3 and the rest: the magic straddles the boundary.
+        saves.chunk(b.token, &body[..3]).unwrap();
+        saves.chunk(b.token, &body[3..]).unwrap();
+        saves.commit(b.token).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+
+        for bad_body in [PNG, b"%PDX-1.7 not a pdf".as_slice(), b" %PDF-1.7".as_slice()] {
+            let b = begin_user(&saves, &target, ImageFormat::Pdf, bad_body.len() as u64).unwrap();
+            saves.chunk(b.token, bad_body).unwrap();
+            assert_eq!(msg(saves.commit(b.token)), "the image data is not a PDF file");
+            assert_eq!(names_in(&dir), ["Lease.pdf"], "the .part is gone");
+            assert_eq!(std::fs::read(&target).unwrap(), body, "the previous export is untouched");
+        }
+        // A PNG save is not satisfied by PDF bytes either.
+        let png_target = dir.join("page.png");
+        let b = begin_user(&saves, &png_target, ImageFormat::Png, PDF.len() as u64).unwrap();
+        saves.chunk(b.token, PDF).unwrap();
+        assert_eq!(msg(saves.commit(b.token)), "the image data is not a PNG file");
+
+        assert_eq!(MAX_PDF_BYTES, 2 * 1024 * 1024 * 1024);
+        assert_eq!(ImageFormat::Pdf.max_user_bytes(), MAX_PDF_BYTES);
+        assert!(msg(begin_user(&saves, &target, ImageFormat::Pdf, MAX_PDF_BYTES + 1)).contains("1 to"));
+        assert!(msg(begin_user(&saves, &target, ImageFormat::Pdf, 0)).contains("1 to"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "pdf" is for a user-named export only: a project card and a paste
+    /// refuse it before anything is opened.
+    #[test]
+    fn a_pdf_is_never_a_card_or_a_paste() {
+        let dir = scratch("pdf-dest");
+        let saves = ImageSaves::default();
+        assert!(msg(saves.begin(ImageFormat::Pdf, 16, || resolve_thumb(&dir, r"C:\P\Doc.trt", "p-9", ImageFormat::Pdf)))
+            .contains("JPEG"));
+        let pasted = dir.join("Pasted images");
+        assert!(msg(saves.begin(ImageFormat::Pdf, 16, || resolve_pasted(&pasted, "Doc", ImageFormat::Pdf)))
+            .contains("PNG"));
+        assert!(!pasted.exists(), "a refused paste creates nothing");
+        assert!(names_in(&dir).is_empty());
+        // The wire shape pdfSaveBegin sends deserializes as a user export.
+        let wire = json!({ "kind": "user", "path": r"C:\Out\a.pdf", "sources": [r"C:\In\a.pdf", r"C:\In\stamp.png"] });
+        match serde_json::from_value::<ImageSaveDest>(wire).unwrap() {
+            ImageSaveDest::User { path, sources } => {
+                assert_eq!(path, r"C:\Out\a.pdf");
+                assert_eq!(sources.len(), 2);
+            }
+            other => panic!("expected User, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PDF export never overwrites a source PDF or a picture its marks use
+    /// — in any spelling — nor writes its `.part` over one.
+    #[test]
+    fn a_pdf_export_never_overwrites_a_source() {
+        let dir = scratch("pdf-source");
+        let src_pdf = dir.join("Lease.pdf");
+        let stamp = dir.join("stamp.png");
+        std::fs::write(&src_pdf, PDF).unwrap();
+        std::fs::write(&stamp, PNG).unwrap();
+        let sources = vec![src_pdf.to_string_lossy().into_owned(), stamp.to_string_lossy().into_owned()];
+        for target in [src_pdf.clone(), dir.join("LEASE.PDF")] {
+            let t = target.to_string_lossy().into_owned();
+            let saves = ImageSaves::default();
+            let err = msg(saves.begin(ImageFormat::Pdf, 64, || resolve_user(&t, &sources, ImageFormat::Pdf)));
+            assert!(err.contains("originals"), "{target:?}: {err}");
+        }
+        // Its `.part` name is held to the same rule.
+        let part_src = dir.join("Out.pdf.taroting-part");
+        std::fs::write(&part_src, PDF).unwrap();
+        let with_part = vec![part_src.to_string_lossy().into_owned()];
+        assert!(msg(check_user_target(&dir.join("Out.pdf"), &with_part, ImageFormat::Pdf)).contains("originals"));
+        // A new name beside them is fine.
+        check_user_target(&dir.join("Lease (signed).pdf"), &sources, ImageFormat::Pdf).unwrap();
+        assert_eq!(std::fs::read(&src_pdf).unwrap(), PDF, "the source is untouched");
+        assert_eq!(std::fs::read(&stamp).unwrap(), PNG);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -190,8 +190,13 @@ fn font_file(family: &str, bold: bool, italic: bool) -> Option<&'static str> {
 
 /// Full path to a mapped font file.
 pub fn font_path(family: &str, bold: bool, italic: bool) -> Option<String> {
-    font_file(family, bold, italic)
-        .map(|f| fonts_dir().join(format!("{f}.ttf")).to_string_lossy().into_owned())
+    font_path_in(fonts_dir(), family, bold, italic)
+}
+
+/// `font_path` against a given Fonts folder, so a test can point it at a
+/// scratch folder without touching the process environment.
+pub(crate) fn font_path_in(dir: &std::path::Path, family: &str, bold: bool, italic: bool) -> Option<String> {
+    font_file(family, bold, italic).map(|f| dir.join(format!("{f}.ttf")).to_string_lossy().into_owned())
 }
 
 /// FreeType's line height as a fraction of font size, per whitelisted family.
@@ -999,6 +1004,14 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
     let preset = &spec.preset;
 
     // --- validation -------------------------------------------------
+    // A PDF project never reaches ffmpeg: it is exported from the PDF editor.
+    // First, so no other refusal (its timeline is empty) speaks for it. The
+    // image-project counterpart is the drawing refusal below.
+    if spec.kind.as_deref() == Some("pdf") {
+        return Err(AppError::BadInput(
+            "PDF projects are exported from the PDF editor".into(),
+        ));
+    }
     // The format first: every later container decision (the gif palette
     // pipeline, audio on/off, codec and muxer flags) is taken from `container`,
     // so an unknown one must stop here rather than reach a default. The string
@@ -2160,7 +2173,7 @@ mod tests {
     }
 
     fn spec(media: Vec<MediaRef>, tl: Timeline, preset: ExportPreset, out: &str) -> ExportSpec {
-        ExportSpec { media, timeline: tl, preset, out_path: out.into() }
+        ExportSpec { kind: None, media, timeline: tl, preset, out_path: out.into() }
     }
 
     fn argstr(b: &BuiltExport) -> Vec<String> {

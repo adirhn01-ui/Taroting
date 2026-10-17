@@ -165,7 +165,7 @@ fn launch_path_in(cwd: &Path, arg: &OsStr) -> Option<PathBuf> {
 }
 
 /// Whether the FIRST queued path is a file the frontend opens on its own —
-/// media (the shared extension table) or a `.trt` project. It decides one
+/// media or a PDF document (the shared extension table) or a `.trt` project. It decides one
 /// thing: whether the webview boots straight into that file instead of
 /// mounting Home first (`window.__tarotingLaunchFile`, main.rs).
 ///
@@ -946,8 +946,9 @@ mod tests {
     /// catches a substring match. Nothing is drained.
     #[test]
     fn queued_known_launch_peeks_the_first_path() {
-        let rows: [(&[&str], bool, &str); 9] = [
+        let rows: [(&[&str], bool, &str); 10] = [
             (&[r"C:\v\CLIP.MP4", r"C:\n\notes.txt"], true, "upper-case media"),
+            (&[r"C:\d\Lease.PDF", r"C:\n\notes.txt"], true, "a PDF document is openable too"),
             (&[r"C:\p\Cut.Trt", r"C:\n\notes.txt"], true, "a project, any case"),
             (&[r"C:\p\.trt", r"C:\n\notes.txt"], true, "a bare .trt, like fileExt"),
             (&[r"D:/a/photo.webp"], true, "forward slashes"),

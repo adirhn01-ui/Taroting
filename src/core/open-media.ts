@@ -2,16 +2,16 @@
 // launch, the viewer's "Open as project"): the one serialized chain every
 // open/creation step runs on, the record of screen teardowns an open has to
 // wait for, the temp-projects path test, and the one place a media file
-// becomes a temporary project (a photo an image project, anything else a
-// one-clip video project).
+// becomes a temporary project (a photo an image project, a PDF a PDF project,
+// anything else a one-clip video project).
 //
 // core, not ui: nothing here toasts or navigates. Callers own both, so the same
 // creation step can serve main.ts's open routing and a screen's own menu.
 
-import { fileStem } from "./format";
+import { fileExt, fileStem } from "./format";
 import { ipc } from "./ipc";
 import { createProject, importMediaAsClip } from "./project";
-import type { MediaInfo, ProjectFile } from "./types";
+import { DOCUMENT_FILE_EXTENSIONS, type MediaInfo, type ProjectFile } from "./types";
 
 /* ------------------------------------------------------------------ */
 /* The open chain                                                      */
@@ -168,8 +168,10 @@ export async function isTempProjectPath(path: string): Promise<boolean> {
  *  probeMedia → a still (kind "image", no generator) becomes an IMAGE project
  *  (createPhotoImageProject: schema 3, canvas = the photo, one photo layer); anything else
  *  becomes the one-clip VIDEO project it always was (createProject → importMediaAsClip) →
- *  saveProject. Returns the .trt path. Does NOT navigate. NOT chain-wrapped: callers outside
- *  the chain wrap it in runOnOpenChain. Throws on failure after best-effort deleting a .trt
+ *  saveProject. A PDF skips the probe: fileStat → page count → a PDF project (schema 4,
+ *  createPdfProject); a password-protected one creates nothing and throws
+ *  PdfProtectedError (the caller shows it in the viewer). Returns the .trt path. Does NOT
+ *  navigate. NOT chain-wrapped: callers outside the chain wrap it in runOnOpenChain. Throws on failure after best-effort deleting a .trt
  *  it already wrote. */
 export async function openMediaAsProject(path: string): Promise<string> {
   const projectPath = await ipc.tempProjectPath(fileStem(path));
@@ -177,14 +179,10 @@ export async function openMediaAsProject(path: string): Promise<string> {
   // a free name), so a failure before it has nothing to clean up.
   let written = false;
   try {
-    const info = await ipc.probeMedia(path);
-    // `info` is a probe result, so `generator` is never set — tested anyway,
-    // the same way every other `kind === "image"` check in the tree tests it
-    // first: a generator is not a photo and has no file to paint.
-    const project =
-      info.kind === "image" && !info.generator
-        ? await photoProject(fileStem(projectPath), info)
-        : importMediaAsClip(createProject(fileStem(projectPath)), info).project;
+    // A PDF is never probed: ffprobe has nothing to say about one.
+    const project = DOCUMENT_FILE_EXTENSIONS.has(fileExt(path))
+      ? await pdfProject(fileStem(projectPath), path)
+      : await mediaProject(fileStem(projectPath), path);
     await ipc.saveProject(projectPath, project);
     written = true;
     // Any step added after the save goes HERE, inside the try: the catch below
@@ -194,6 +192,17 @@ export async function openMediaAsProject(path: string): Promise<string> {
     if (written) await ipc.deleteProject(projectPath).catch(() => {});
     throw e;
   }
+}
+
+/** probeMedia → a photo's IMAGE project, or the one-clip VIDEO project of anything else. */
+async function mediaProject(name: string, path: string): Promise<ProjectFile> {
+  const info = await ipc.probeMedia(path);
+  // `info` is a probe result, so `generator` is never set — tested anyway,
+  // the same way every other `kind === "image"` check in the tree tests it
+  // first: a generator is not a photo and has no file to paint.
+  return info.kind === "image" && !info.generator
+    ? photoProject(name, info)
+    : importMediaAsClip(createProject(name), info).project;
 }
 
 /** Why a probed still cannot become an image project's canvas, or null when it can: its
@@ -222,4 +231,61 @@ async function photoProject(name: string, info: MediaInfo): Promise<ProjectFile>
   if (problem) throw new Error(problem);
   const { createPhotoImageProject } = await import("./image-project");
   return createPhotoImageProject(name, info);
+}
+
+/* ------------------------------------------------------------------ */
+/* PDF → temporary project                                             */
+/* ------------------------------------------------------------------ */
+
+/** What a password-protected PDF opened "as a project" says: it goes to the
+ *  viewer instead (the PDF editor does not take protected files). */
+export const PDF_PROTECTED_MESSAGE =
+  "This PDF is password-protected — it opens in the viewer (editing protected PDFs isn't supported).";
+
+/** Thrown by openMediaAsProject for a password-protected PDF, INSTEAD of creating a
+ *  project. Not a failure: core/open-route catches it and shows the file in the viewer
+ *  with `message` as news. Anything else that catches it (the viewer's own "Open as
+ *  project", already showing the file) prints `message` like any error. */
+export class PdfProtectedError extends Error {
+  readonly path: string;
+  constructor(path: string) {
+    super(PDF_PROTECTED_MESSAGE);
+    this.name = "PdfProtectedError";
+    this.path = path;
+  }
+}
+
+/** The words a missing media file gets from the backend (media/source.rs), for a PDF. */
+const PDF_MISSING = "This PDF is missing or can't be read.";
+
+/** The PDF a temporary PDF project is made of: identity from the backend's stat (a
+ *  missing file stops here, before pdf.js is ever fetched), page count from pdf.js.
+ *
+ *  Both modules are fetched HERE, like core/image-project for a photo: the loader pulls
+ *  pdf.js, which must never be in the boot chunk, and pdf-project is only needed on this
+ *  path. */
+async function pdfProject(name: string, path: string): Promise<ProjectFile> {
+  const stat = await ipc.fileStat(path);
+  if (!stat) throw new Error(PDF_MISSING);
+  let pages: number;
+  try {
+    const { countPages } = await import("../pdf/view/loader");
+    pages = await countPages(path);
+  } catch (e) {
+    const kind = e && typeof e === "object" && "kind" in e ? (e as { kind: unknown }).kind : null;
+    if (kind === "password") throw new PdfProtectedError(path);
+    if (kind === "missing") throw new Error(PDF_MISSING);
+    // "other" is a plain object with the reason in words (an object, so it is
+    // made an Error here); anything else (a chunk that failed to load) is
+    // already an Error and goes up as it is.
+    const unreadable = `Couldn't read ${fileStem(path)} as a PDF.`;
+    if (kind === "invalid") throw new Error(unreadable);
+    if (kind === "other") {
+      const message = (e as { message?: unknown }).message;
+      throw new Error(typeof message === "string" && message ? message : unreadable);
+    }
+    throw e;
+  }
+  const { createPdfProject } = await import("./pdf-project");
+  return createPdfProject(name, { path, size: stat.size, mtimeMs: stat.mtimeMs, pages });
 }

@@ -8,7 +8,8 @@
 // association (.trt) and hooks.nsh's per-extension Open-with, Default-apps and
 // legacy-migration lines, hand-kept lists by necessity (NSIS cannot read the
 // JSON). The installer rule these checks exist for: Taroting NEVER claims a
-// media default. Every check is a pure function over file TEXT with its own
+// media default — nor the .pdf one (the "document" family: Open with and
+// Default apps list Taroting there, nothing more). Every check is a pure function over file TEXT with its own
 // self-test on a corrupted copy, so a checker that can no longer fail is
 // caught here too, without ever touching the real files. They read SOURCES:
 // a stale generated installer.nsi is invisible here, so the release build
@@ -19,8 +20,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  DOCUMENT_FILE_EXTENSIONS,
   MEDIA_EXTENSIONS,
   MEDIA_FILE_EXTENSIONS,
+  OPENABLE_FILE_EXTENSIONS,
   mediaFamilyOf,
   stepFamilyOf,
   type MediaFamily,
@@ -29,9 +32,12 @@ import {
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const read = (rel: string): string => readFileSync(resolve(root, rel), "utf8");
 
-const FAMILIES: readonly MediaFamily[] = ["video", "gif", "image", "audio"];
+const FAMILIES: readonly MediaFamily[] = ["video", "gif", "image", "audio", "document"];
+/** The families a video or image project can import. "document" (PDF) is
+ *  openable but never media. */
+const MEDIA_FAMILIES: readonly MediaFamily[] = ["video", "gif", "image", "audio"];
 
-/** Problems with a parsed media-extensions table: exactly the four families,
+/** Problems with a parsed media-extensions table: exactly the five families,
  *  each a non-empty list of lowercase, dot-free ASCII names, no name twice
  *  (within a family or across two), and never the project extension. */
 function checkFamilies(table: unknown): string[] {
@@ -112,19 +118,21 @@ interface Association {
   description?: unknown;
 }
 
-/** The media families' ProgIDs. FOREVER names: a user's UserChoice may point
- *  at one, so a rename orphans it. gif is video (it has motion). */
+/** The families' ProgIDs. FOREVER names: a user's UserChoice may point at one,
+ *  so a rename orphans it. gif is video (it has motion). */
 const FAMILY_PROGID: Readonly<Record<MediaFamily, string>> = {
   video: "Taroting.Video",
   gif: "Taroting.Video",
   image: "Taroting.Image",
   audio: "Taroting.Audio",
+  document: "Taroting.Document",
 };
 /** Each ProgID's Explorer "Type" text (its default value). */
 const PROGID_DESC: ReadonlyMap<string, string> = new Map([
   ["Taroting.Video", "Taroting video"],
   ["Taroting.Image", "Taroting image"],
   ["Taroting.Audio", "Taroting audio"],
+  ["Taroting.Document", "Taroting document"],
 ]);
 /** What 0.6.0-0.8.1 claimed as "Media file" DEFAULTS. FROZEN: this is history,
  *  not the current media set, so it must never be derived from the JSON. */
@@ -228,7 +236,8 @@ function once(lines: readonly string[], literal: string, where: string): string[
   return n === 1 ? [] : [`${where}: ${n} lines of ${literal}, expected exactly 1`];
 }
 
-/** ext → ProgID for every media extension, in media-extensions.json order. */
+/** ext → ProgID for every openable extension (media and pdf), in
+ *  media-extensions.json order. */
 function mediaProgids(table: Readonly<Record<MediaFamily, readonly string[]>>): Map<string, string> {
   return new Map(FAMILIES.flatMap((f) => table[f].map((ext): [string, string] => [ext, FAMILY_PROGID[f]])));
 }
@@ -240,7 +249,7 @@ function mediaProgids(table: Readonly<Record<MediaFamily, readonly string[]>>): 
  *  installMode must stay currentUser (hooks.nsh treats HKCU and SHCTX as one
  *  hive) and the publisher "Taroting" (it names the template's
  *  Software\Taroting key, the parent of our Capabilities key). */
-function checkConfAssociations(confText: string, media: ReadonlySet<string> = MEDIA_FILE_EXTENSIONS): string[] {
+function checkConfAssociations(confText: string, media: ReadonlySet<string> = OPENABLE_FILE_EXTENSIONS): string[] {
   let conf: {
     bundle?: { publisher?: unknown; fileAssociations?: unknown; windows?: { nsis?: { installMode?: unknown } } };
   };
@@ -346,7 +355,7 @@ const EXT_KEY_DELETE = /^DeleteRegKey (?!\/ifempty )(?:\/\S+ )?\S+ (["']?)(?:Sof
 
 /** Our uninstall registry work, by pattern — anything matching must sit INSIDE
  *  the `$UpdateMode <> 1` block (it points into $INSTDIR, like .trt). */
-const OURS = /TRT_OPENWITH_REMOVE|UPDATEFILEASSOC|Taroting\.(?:Video|Image|Audio)|RegisteredApplications|Software\\Taroting/i;
+const OURS = /TRT_OPENWITH_REMOVE|UPDATEFILEASSOC|Taroting\.(?:Video|Image|Audio|Document)|RegisteredApplications|Software\\Taroting/i;
 
 /** Problems with NSIS_HOOK_POSTUNINSTALL: inside the `$UpdateMode <> 1` block,
  *  our Open-with value off every media ext, each Taroting.* ProgID deleted, the
@@ -562,7 +571,7 @@ const confText = read("src-tauri/tauri.conf.json");
 const nshText = read("src-tauri/windows/hooks.nsh").replace(/\r\n/g, "\n");
 
 describe("media-extensions.json", () => {
-  it("has four well-formed, disjoint families and never names trt", () => {
+  it("has five well-formed, disjoint families and never names trt", () => {
     expect(checkFamilies(JSON.parse(jsonText))).toEqual([]);
   });
 
@@ -585,12 +594,27 @@ describe("media-extensions.json", () => {
     }
   });
 
-  it("MEDIA_FILE_EXTENSIONS is exactly the union of the JSON families", () => {
+  it("MEDIA_FILE_EXTENSIONS is exactly the union of the JSON's media families", () => {
     const raw = JSON.parse(jsonText) as Record<MediaFamily, string[]>;
-    const union = FAMILIES.flatMap((f) => raw[f]);
+    const union = MEDIA_FAMILIES.flatMap((f) => raw[f]);
     expect([...MEDIA_FILE_EXTENSIONS].sort()).toEqual([...union].sort());
     expect(MEDIA_FILE_EXTENSIONS.size).toBe(union.length);
     for (const f of FAMILIES) expect([...MEDIA_EXTENSIONS[f]]).toEqual(raw[f]);
+  });
+
+  it("a PDF is openable but never importable media", () => {
+    const raw = JSON.parse(jsonText) as Record<MediaFamily, string[]>;
+    // Media never takes a PDF in (no video or image project imports one)...
+    expect(MEDIA_FILE_EXTENSIONS.has("pdf")).toBe(false);
+    for (const ext of raw.document) expect(MEDIA_FILE_EXTENSIONS.has(ext), ext).toBe(false);
+    // ...but every way of OPENING a file (Explorer, Home, the viewer) does.
+    expect([...DOCUMENT_FILE_EXTENSIONS].sort()).toEqual([...raw.document].sort());
+    expect(DOCUMENT_FILE_EXTENSIONS.has("pdf")).toBe(true);
+    expect(OPENABLE_FILE_EXTENSIONS.has("pdf")).toBe(true);
+    const all = FAMILIES.flatMap((f) => raw[f]);
+    expect([...OPENABLE_FILE_EXTENSIONS].sort()).toEqual([...all].sort());
+    expect(OPENABLE_FILE_EXTENSIONS.size).toBe(all.length);
+    expect(OPENABLE_FILE_EXTENSIONS.has("trt")).toBe(false);
   });
 
   it("every extension maps back to its own family and step family", () => {
@@ -598,7 +622,7 @@ describe("media-extensions.json", () => {
     for (const f of FAMILIES) {
       for (const ext of raw[f]) {
         expect(mediaFamilyOf(ext), ext).toBe(f);
-        expect(stepFamilyOf(ext), ext).toBe(f === "audio" ? "audio" : "visual");
+        expect(stepFamilyOf(ext), ext).toBe(f === "audio" ? "audio" : f === "document" ? "document" : "visual");
       }
     }
     expect(mediaFamilyOf("trt")).toBeNull();
@@ -675,6 +699,11 @@ describe("the installer never claims a media default", () => {
         "a media ext back in the project entry",
         edited((c) => (c.bundle.fileAssociations[0]!.ext = ["trt", "mp4"])),
         ['"mp4" in fileAssociations would claim the default'],
+      ],
+      [
+        "a pdf in the project entry (Taroting never claims the PDF default either)",
+        edited((c) => (c.bundle.fileAssociations[0]!.ext = ["trt", "pdf"])),
+        ['"pdf" in fileAssociations would claim the default'],
       ],
       [
         "an ext that is neither media nor the project",
@@ -799,12 +828,24 @@ describe("the installer never claims a media default", () => {
       ["Open with registered outside the install hook", `${drop(openWith("mp4", "Taroting.Video"))}\n${openWith("mp4", "Taroting.Video")}\n`, [
         'TRT_OPENWITH_ADD "mp4": 0 lines, expected exactly 1',
       ]],
+      ["a PDF missing from Explorer's Open with", drop(openWith("pdf", "Taroting.Document")), [
+        'TRT_OPENWITH_ADD "pdf": 0 lines, expected exactly 1',
+      ]],
+      ["a PDF registered under a media ProgID", swap(openWith("pdf", "Taroting.Document"), openWith("pdf", "Taroting.Image")), [
+        'TRT_OPENWITH_ADD "pdf" is "Taroting.Image", expected "Taroting.Document"',
+      ]],
+      ["no Default-apps row for a PDF", drop(capability("pdf", "Taroting.Document")), [
+        'TRT_CAPABILITY "pdf": 0 lines, expected exactly 1',
+      ]],
+      ["the document ProgID never defined", drop('!insertmacro TRT_PROGID "Taroting.Document" "Taroting document"'), [
+        'TRT_PROGID "Taroting.Document": 0 lines, expected exactly 1',
+      ]],
     ];
     for (const [what, text, expected] of rows) expect(checkInstallHook(text, table), what).toEqual(expected);
   });
 
   it("the legacy list is frozen history, never derived from the current media set", () => {
-    // Rewrite the migration to cover today's 24 exts: every extra is refused,
+    // Rewrite the migration to cover today's openable exts: every extra is refused,
     // which a checker comparing against the JSON could never do.
     const legacyLines = LEGACY_MEDIA.map((e) => `!insertmacro TRT_MIGRATE_LEGACY "${e}"`);
     const current = FAMILIES.flatMap((f) => table[f]);
@@ -862,6 +903,14 @@ describe("the installer never claims a media default", () => {
       ["a .ext key deleted outright, unquoted", swap(CAPABILITIES_DELETE, `${CAPABILITIES_DELETE}\n    DeleteRegKey SHCTX Software\\Classes\\.png`), [
         `DeleteRegKey SHCTX Software\\Classes\\.png would delete another app's .ext default or Open-with entries; only /ifempty may delete a .ext key`,
       ]],
+      ["a PDF's Open-with value never removed", drop(remove("pdf", "Taroting.Document")), [
+        'TRT_OPENWITH_REMOVE "pdf": 0 lines, expected exactly 1',
+      ]],
+      ["the document ProgID deleted on the app-data gate instead (kept on an ordinary uninstall)", swap(purgeEnd, `${purgeEnd}\n    DeleteRegKey SHCTX "Software\\Classes\\Taroting.Document"`, drop('DeleteRegKey SHCTX "Software\\Classes\\Taroting.Document"')), [
+        `${outside}: 0 lines of DeleteRegKey SHCTX "Software\\Classes\\Taroting.Document", expected exactly 1`,
+        `DeleteRegKey SHCTX "Software\\Classes\\Taroting.Document" sits outside ${outside}`,
+        `the app-data purge block changed: ${JSON.stringify([...APP_DATA_PURGE, 'DeleteRegKey SHCTX "Software\\Classes\\Taroting.Document"'])}`,
+      ]],
       ["Explorer never notified", swap("!insertmacro UPDATEFILEASSOC\n  ${EndIf}", "${EndIf}"), [
         `${outside}: 0 UPDATEFILEASSOC lines, expected exactly 1`,
       ]],
@@ -899,7 +948,10 @@ describe("the installer never claims a media default", () => {
       ["a literal default write in the install hook", swap(REGISTERED_APP_WRITE, `${REGISTERED_APP_WRITE}\n  WriteRegStr SHCTX "Software\\Classes\\.png" "" "Taroting.Image"`), [
         'WriteRegStr SHCTX "Software\\Classes\\.png" "" "Taroting.Image" writes a .ext default value',
       ]],
-      ["a default write through HKCR in the install hook", swap(REGISTERED_APP_WRITE, `${REGISTERED_APP_WRITE}\n  WriteRegStr HKCR ".png" "" "Taroting.Image"`), [
+      ["the PDF default claimed in the install hook (Open with only, never the default)", swap(REGISTERED_APP_WRITE, `${REGISTERED_APP_WRITE}\n  WriteRegStr SHCTX "Software\\Classes\\.pdf" "" "Taroting.Document"`), [
+        'WriteRegStr SHCTX "Software\\Classes\\.pdf" "" "Taroting.Document" writes a .ext default value',
+      ]],
+      ["a default write through HKCR in the install hook",swap(REGISTERED_APP_WRITE, `${REGISTERED_APP_WRITE}\n  WriteRegStr HKCR ".png" "" "Taroting.Image"`), [
         'WriteRegStr HKCR ".png" "" "Taroting.Image" writes a .ext default value',
       ]],
       ["TRT_OPENWITH_ADD touching another .ext subkey through HKCR", swap(openWithDef, `${openWithDef}\n  WriteRegStr HKCR ".\${EXT}\\ShellNew" "NullFile" ""`), [
