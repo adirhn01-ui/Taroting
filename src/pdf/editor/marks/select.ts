@@ -133,11 +133,17 @@ function moveGesture(env: Env, key: string, start: { x: number; y: number }, bef
   const zoom = env.zoom();
   let moved = false;
   let written: ProjectFile = before;
-  const apply = (dx: number, dy: number): void => {
-    if (!sameEdit(session.project, written)) return; // someone else wrote
-    const next = mapSelected(before, marks, (a) => translateAnnot(a, dx, dy));
+  let want: [number, number] = [0, 0];
+  let queued = false;
+  let ended = false; // a frame queued by the last move must not write after up/cancel
+  // a preview, not yet the user's edit (the release commits it; a cancel
+  // leaves the project as it was, unedited)
+  const apply = (): void => {
+    queued = false;
+    if (ended || !sameEdit(session.project, written)) return; // someone else wrote
+    const next = mapSelected(before, marks, (a) => translateAnnot(a, want[0], want[1]));
     written = next;
-    session.replace(next);
+    session.replace(next, { edit: false });
   };
   const track = (ev: PointerEvent): void => {
     const q = env.pt(key, ev);
@@ -146,12 +152,19 @@ function moveGesture(env: Env, key: string, start: { x: number; y: number }, bef
     const dy = q.y - start.y;
     if (!moved && Math.hypot(dx, dy) * zoom < DRAG_CSS) return;
     moved = true;
-    apply(dx, dy);
+    want = [dx, dy];
+    // one project write per frame, however fast the pointer reports
+    if (!queued) {
+      queued = true;
+      env.frame(apply);
+    }
   };
   return {
     move: track,
     up(ev) {
       track(ev);
+      if (moved) apply(); // the final position, now
+      ended = true;
       if (!moved || !sameEdit(session.project, written)) return;
       // dropped on another page: the marks go there
       const drop = ctx.view.clientToPage(ev.clientX, ev.clientY);
@@ -165,13 +178,14 @@ function moveGesture(env: Env, key: string, start: { x: number; y: number }, bef
           next = updateAnnot(next, drop.key, m.a.id, geometryPatch(t) as PdfAnnotPatch);
         }
         if (next !== before) {
-          session.replace(next);
+          session.replace(next, { edit: false });
           ctx.selection.set(marks.map((m) => ({ key: drop.key, id: m.a.id })));
         }
       }
       session.commitFrom(before);
     },
     cancel() {
+      ended = true;
       if (moved && sameEdit(session.project, written)) session.replace(before, { edit: false });
     },
   };
@@ -184,22 +198,36 @@ function resizeGesture(env: Env, key: string, from: Box, h: Handle, before: Proj
   const aspect = keepsAspect(marks);
   let written: ProjectFile = before;
   let moved = false;
+  let to: Box = from;
+  let queued = false;
+  let ended = false; // see moveGesture
+  const apply = (): void => {
+    queued = false;
+    if (ended || !sameEdit(session.project, written)) return;
+    const next = mapSelected(before, marks, (a) => scaleAnnot(a, from, to));
+    written = next;
+    session.replace(next, { edit: false });
+  };
   const track = (ev: PointerEvent): void => {
     const q = env.pt(key, ev);
     if (!q || !sameEdit(session.project, written)) return;
-    const to = resizeBox(from, h, q.x, q.y, aspect || ev.shiftKey);
+    to = resizeBox(from, h, q.x, q.y, aspect || ev.shiftKey);
     moved = true;
-    const next = mapSelected(before, marks, (a) => scaleAnnot(a, from, to));
-    written = next;
-    session.replace(next);
+    if (!queued) {
+      queued = true;
+      env.frame(apply);
+    }
   };
   return {
     move: track,
     up(ev) {
       track(ev);
+      if (moved) apply();
+      ended = true;
       if (moved && sameEdit(session.project, written)) session.commitFrom(before);
     },
     cancel() {
+      ended = true;
       if (moved && sameEdit(session.project, written)) session.replace(before, { edit: false });
     },
   };
@@ -310,7 +338,8 @@ export function paintChrome(env: Env, showHandles: boolean): void {
   const sel = ctx.selection.get();
   const zoom = env.zoom();
   const hb = showHandles ? handleBox(p, sel) : null;
-  const ruler = ctx.tools.get().ruler;
+  // the ruler is a marking aid: hidden (not dropped) in Fill forms mode
+  const ruler = ctx.mode.get() === "forms" ? null : ctx.tools.get().ruler;
   for (const f of env.layer.frames()) {
     const g = f.chrome;
     while (g.firstChild) g.removeChild(g.firstChild);

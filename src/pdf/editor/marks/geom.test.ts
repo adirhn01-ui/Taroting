@@ -4,6 +4,7 @@ import { decodePoints, encodePoints } from "../../../image/strokes";
 import { pageToBox, boxSize } from "../../view/math";
 import { LINE_HEIGHT as EXPORT_LINE_HEIGHT, wrapParagraph } from "../../export/layout";
 import { SIGNATURE_WIDTH_FRACTION as EXPORT_SIG_FRACTION } from "../../export/marks";
+import { firstStrongRtl as exportFirstStrongRtl } from "../../export/bidi";
 import { annotBounds, scaleAnnot } from "../../model";
 import {
   LINE_HEIGHT,
@@ -14,6 +15,16 @@ import {
   clampSize,
   cssToPt,
   fitCentered,
+  firstStrongRtl,
+  frameOf,
+  frameRect,
+  frameRoom,
+  frameTransform,
+  boxForFrame,
+  cssFont,
+  withFrameH,
+  screenToPageDelta,
+  rotField,
   handleAt,
   layoutText,
   lineBaseline,
@@ -243,5 +254,98 @@ describe("text layout matches the export", () => {
     const desc = 0.212 * size;
     const lh = size * EXPORT_LINE_HEIGHT;
     for (const row of [0, 1, 5]) expect(lineBaseline(row, size, asc, desc)).toBeCloseTo(row * lh + (lh - (asc + desc)) / 2 + asc, 9);
+  });
+});
+
+describe("turned pages: screen directions and upright frames", () => {
+  const ROTS: PdfRotation[] = [0, 90, 180, 270];
+  it("screenToPageDelta inverts the page turn (a screen step, back through the turn, is that step)", () => {
+    for (const rot of ROTS) {
+      for (const [dx, dy] of [[1, 0], [0, 1], [-3, 7]] as const) {
+        const d = screenToPageDelta(dx, dy, rot);
+        const o = pageToBox(0, 0, 612, 792, rot, 1);
+        const q = pageToBox(d.x, d.y, 612, 792, rot, 1);
+        expect([q.x - o.x, q.y - o.y], `${rot} ${dx},${dy}`).toEqual([dx, dy]);
+      }
+    }
+  });
+
+  it("a turned box's frame is its box with w/h swapped, centred, turned by -r", () => {
+    const a = { x: 100, y: 100, w: 40, h: 200, r: 90 as const };
+    expect(frameOf(a)).toEqual({ W: 200, H: 40 });
+    expect(frameRect(a)).toEqual([20, 180, 200, 40]);
+    expect(frameTransform(a)).toBe("rotate(-90 120 200)");
+    expect(frameTransform({ x: 1, y: 2, w: 3, h: 4 })).toBe("");
+    expect(frameOf({ w: 40, h: 200, r: 180 })).toEqual({ W: 40, H: 200 });
+    expect(boxForFrame(200, 40, 270)).toEqual({ w: 40, h: 200 });
+    expect(rotField(0)).toEqual({});
+    expect(rotField(90)).toEqual({ r: 90 });
+  });
+
+  it("the frame's top-left corner, through -r and the page's +r, is the top-left on screen", () => {
+    for (const rot of ROTS) {
+      const a = { x: 100, y: 150, w: rot % 180 ? 40 : 200, h: rot % 180 ? 200 : 40, ...rotField(rot) };
+      const [fx, fy] = frameRect(a);
+      // -r about the centre, then the page turn: the corner is the box's top-left on screen
+      const cx = a.x + a.w / 2;
+      const cy = a.y + a.h / 2;
+      const t = (-rot * Math.PI) / 180;
+      const px = cx + (fx - cx) * Math.cos(t) - (fy - cy) * Math.sin(t);
+      const py = cy + (fx - cx) * Math.sin(t) + (fy - cy) * Math.cos(t);
+      const s = pageToBox(px, py, 612, 792, rot, 1);
+      const corners = [[a.x, a.y], [a.x + a.w, a.y], [a.x, a.y + a.h], [a.x + a.w, a.y + a.h]].map(([x, y]) => pageToBox(x!, y!, 612, 792, rot, 1));
+      expect(s.x, String(rot)).toBeCloseTo(Math.min(...corners.map((c) => c.x)), 6);
+      expect(s.y, String(rot)).toBeCloseTo(Math.min(...corners.map((c) => c.y)), 6);
+    }
+  });
+
+  it("a text box grows down ON SCREEN: its frame's top edge stays put", () => {
+    const base = { x: 100, y: 100, w: 40, h: 200 };
+    expect(withFrameH({ ...base }, 60)).toEqual({ x: 100, y: 100, w: 40, h: 60 });
+    expect(withFrameH({ ...base, r: 90 }, 60)).toEqual({ x: 100, y: 100, w: 60, h: 200 });
+    expect(withFrameH({ ...base, r: 180 }, 260)).toEqual({ x: 100, y: 40, w: 40, h: 260 });
+    expect(withFrameH({ ...base, r: 270 }, 60)).toEqual({ x: 80, y: 100, w: 60, h: 200 });
+    expect(frameRoom({ ...base }, 612, 792)).toBe(692);
+    expect(frameRoom({ ...base, r: 90 }, 612, 792)).toBe(512);
+    expect(frameRoom({ ...base, r: 180 }, 612, 792)).toBe(300);
+    expect(frameRoom({ ...base, r: 270 }, 612, 792)).toBe(140);
+  });
+});
+
+describe("text direction and faces", () => {
+  it("firstStrongRtl mirrors the export's", () => {
+    for (const s of ["", "abc", "שלום", "123 שלום abc", "  abc שלום", "مرحبا", "1234", "(«ﭐ»)"]) {
+      expect(firstStrongRtl(s), s).toBe(exportFirstStrongRtl(s));
+    }
+  });
+  it("every line takes its PARAGRAPH's direction, as the export decides it", () => {
+    const lines = layoutText("abc שלום עולם\nשלום abc", 30, (s) => [...s].length * 6);
+    expect(lines.map((l) => [l.text, l.rtl])).toEqual([
+      ["abc", false],
+      ["שלום", false],
+      ["עולם", false],
+      ["שלום", true],
+      ["abc", true],
+    ]);
+  });
+  it("Impact is measured plain (the export embeds its regular face only)", () => {
+    expect(cssFont("Impact", 12, true, true)).toBe('12px "Impact"');
+    expect(cssFont("Arial", 12, true, true)).toBe('italic bold 12px "Arial"');
+  });
+});
+
+describe("ink strokes stay within what a project can hold", () => {
+  it("thins a stroke past PDF_STROKE_MAX_POINTS, keeping its ends", async () => {
+    const { capPoints } = await import("./draw");
+    const { PDF_STROKE_MAX_POINTS } = await import("../../../core/pdf-sanitize");
+    const n = PDF_STROKE_MAX_POINTS * 2 + 7;
+    const pts = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) pts.set([i, i * 2, 0.5], i * 3);
+    const out = capPoints(pts);
+    expect(out.length / 3).toBeLessThanOrEqual(PDF_STROKE_MAX_POINTS);
+    expect(Array.from(out.slice(0, 3))).toEqual([0, 0, 0.5]);
+    expect(Array.from(out.slice(-3))).toEqual([n - 1, (n - 1) * 2, 0.5]);
+    const small = new Float32Array([1, 2, 1, 3, 4, 1]);
+    expect(capPoints(small)).toBe(small);
   });
 });

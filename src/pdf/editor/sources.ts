@@ -25,6 +25,10 @@ export type SourceProblem = "missing" | "changed" | "password" | "unreadable";
 export interface SourceIssue {
   source: PdfSource;
   problem: SourceProblem;
+  /** "changed" because the file opened with fewer pages than the project
+   *  shows from it: its page count, and how many the project needs. On
+   *  Continue the pages past the end are dropped (the shell's onContinue). */
+  short?: { has: number; need: number };
 }
 
 /** What a source's file looks like now. */
@@ -88,8 +92,11 @@ function openProblem(e: unknown): SourceProblem {
 /* ------------------------------ opening ------------------------------ */
 
 /** Stat and open one source. A changed file that still opens is returned
- *  WITH its issue, so its pages show while the dialog asks about it. */
-export async function openSource(src: PdfSource): Promise<{ doc: PdfDoc | null; issue: SourceIssue | null }> {
+ *  WITH its issue, so its pages show while the dialog asks about it. `need`
+ *  is how many pages the project shows from it (maxPageUsed + 1): the
+ *  project's recorded page count is not trusted (a crafted .trt can claim
+ *  any), the opened document's is — fewer than `need` is a "changed" file. */
+export async function openSource(src: PdfSource, need = 0): Promise<{ doc: PdfDoc | null; issue: SourceIssue | null }> {
   let stat: SourceStat | null;
   try {
     stat = await ipc.fileStat(src.path);
@@ -100,17 +107,19 @@ export async function openSource(src: PdfSource): Promise<{ doc: PdfDoc | null; 
   if (changed === "missing") return { doc: null, issue: { source: src, problem: "missing" } };
   try {
     const doc = await openPdf(src.id, src.path);
+    if (doc.numPages < need) return { doc, issue: { source: src, problem: "changed", short: { has: doc.numPages, need } } };
     return { doc, issue: changed ? { source: src, problem: changed } : null };
   } catch (e) {
     return { doc: null, issue: { source: src, problem: openProblem(e) } };
   }
 }
 
-/** Open every source at once. */
+/** Open every source at once; `project` gives the pages each must hold. */
 export async function openSources(
   sources: readonly PdfSource[],
+  project?: ProjectFile,
 ): Promise<{ docs: Map<string, PdfDoc>; issues: SourceIssue[] }> {
-  const results = await Promise.all(sources.map((s) => openSource(s)));
+  const results = await Promise.all(sources.map((s) => openSource(s, project ? maxPageUsed(project, s.id) + 1 : 0)));
   const docs = new Map<string, PdfDoc>();
   const issues: SourceIssue[] = [];
   for (const r of results) {
@@ -136,6 +145,10 @@ export interface SourcesDialogOpts {
   onRelinked(srcId: string, doc: PdfDoc): void;
   /** "Close project": the shell leaves through its exits */
   onCloseProject(): void;
+  /** Continue (also Esc, X, the backdrop): the user edits on. The shell drops
+   *  the pages a short source does not have. Not called on Close project nor
+   *  when the editor closes the dialog itself. */
+  onContinue?(): void;
 }
 
 /**
@@ -176,19 +189,29 @@ export function openSourcesDialog(opts: SourcesDialogOpts): () => void {
     releaseTrap();
     backdrop.remove();
   }
+  /** Esc, the X and a click outside just close: removing pages is a real
+   *  edit, so only the Continue button (which says it removes them) does it. */
+  function dismiss(): void {
+    close();
+  }
+  function carryOn(): void {
+    if (closed) return;
+    close();
+    opts.onContinue?.();
+  }
   function onKeydown(e: KeyboardEvent): void {
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
-      close();
+      dismiss();
     }
   }
   document.addEventListener("keydown", onKeydown, true);
   backdrop.addEventListener("mousedown", (e) => {
-    if (e.target === backdrop) close();
+    if (e.target === backdrop) dismiss();
   });
-  closeX.addEventListener("click", close);
-  cont.addEventListener("click", close);
+  closeX.addEventListener("click", dismiss);
+  cont.addEventListener("click", carryOn);
   closeProject.addEventListener("click", () => {
     close();
     opts.onCloseProject();
@@ -259,7 +282,10 @@ export function openSourcesDialog(opts: SourcesDialogOpts): () => void {
   let resolvedCount = 0;
   for (const issue of opts.issues) {
     const src = issue.source;
-    const status = el("div", { className: "relink-row__status relink-row__status--bad", text: PROBLEM_TEXT[issue.problem] });
+    const text = issue.short
+      ? `Changed: it now has ${issue.short.has} ${issue.short.has === 1 ? "page" : "pages"}; this project uses ${issue.short.need}. Continue removes the missing pages`
+      : PROBLEM_TEXT[issue.problem];
+    const status = el("div", { className: "relink-row__status relink-row__status--bad", text });
     const locateBtn = button("btn--sm", { icon: icon("folder", 14), text: "Locate", attrs: { "data-locate": "" } });
     const row = el("div", { className: "relink-row" }, [
       el("div", { className: "relink-row__info" }, [

@@ -7,7 +7,8 @@ import { firstStrongRtl, hasArabic, paragraphBidi, visualLine } from "./bidi";
 import { PdfExportError } from "./errors";
 import { flattenForms, widgetPlacement } from "./flatten";
 import { displayedOf, exifOrientation } from "./images";
-import { wrapParagraph } from "./layout";
+import { RASTER_SCALE, rasterScale, wrapParagraph } from "./layout";
+import { CANVAS_MAX_AREA, CANVAS_MAX_SIDE } from "../view/math";
 import { embedWithMetrics, encodeVisual, hexRgb, imageMatrix, num } from "./marks";
 import { readFileSync } from "node:fs";
 import fontkit from "@pdf-lib/fontkit";
@@ -80,6 +81,41 @@ describe("wrapParagraph", () => {
 
   it("an empty paragraph is one empty line", () => {
     expect(wrapParagraph("", 10, mono)).toEqual([[0, 0]]);
+  });
+
+  it("measures each piece once: the work grows with the text, not with its square", () => {
+    let chars = 0;
+    const counting = (t: string): number => {
+      chars += t.length;
+      return t.length;
+    };
+    // 4000 characters of distinct words, and one 4000-character word
+    const words = Array.from({ length: 800 }, (_, i) => `w${i.toString(36).padStart(3, "0")}`).join(" ");
+    const long = "x".repeat(4000);
+    for (const text of [words, long]) {
+      chars = 0;
+      const out = wrapParagraph(text, 40, counting);
+      expect(out.length).toBeGreaterThan(90);
+      expect(chars, `measured ${chars} chars for ${text.length}`).toBeLessThan(3 * text.length);
+    }
+    // the same lines a whole-line measure gives
+    expect(lines("aa bb cc dd ee ff gg", 8)).toEqual(["aa bb cc", "dd ee ff", "gg"]);
+    expect(lines("  lead word", 6)).toEqual(["  lead", "word"]);
+    expect(lines("ab   cd", 4)).toEqual(["ab", "cd"]);
+  });
+});
+
+describe("rasterScale", () => {
+  it("is RASTER_SCALE for an ordinary box and shrinks to keep the canvas within limits", () => {
+    expect(rasterScale(300, 80)).toBe(RASTER_SCALE);
+    for (const [w, h] of [[4000, 4000], [8000, 10], [1e6, 1e6], [3000, 2000]] as [number, number][]) {
+      const s = rasterScale(w, h);
+      const cw = Math.ceil(w * s);
+      const ch = Math.ceil(h * s);
+      expect(Math.max(cw, ch), `${w}x${h}`).toBeLessThanOrEqual(CANVAS_MAX_SIDE);
+      expect(cw * ch, `${w}x${h}`).toBeLessThanOrEqual(CANVAS_MAX_AREA);
+      expect(s).toBeGreaterThan(0);
+    }
   });
 });
 

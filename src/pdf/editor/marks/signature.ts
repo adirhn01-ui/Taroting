@@ -178,6 +178,13 @@ const PAD_PEN = 3;
 
 export const SIGNATURE_PAD_TITLE = "New signature";
 
+/** The most strokes one signature keeps. MIRRORS the `> 500` in
+ *  asPdfSignatures (src/core/session.ts), which drops a longer signature
+ *  whole on the next launch — so the pad stops taking strokes there. */
+export const SIGNATURE_STROKES_MAX = 500;
+const PAD_NOTE = "Draw with a pen, a mouse or a finger. Saved signatures stay on this PC.";
+export const PAD_FULL_NOTE = "That's as many strokes as a signature can keep. Save it, or Clear to start again.";
+
 let closePadNow: (() => void) | null = null;
 
 export function openSignaturePad(ctx: PdfEditorCtx, hooks: SignatureMenuHooks): void {
@@ -217,7 +224,7 @@ export function openSignaturePad(ctx: PdfEditorCtx, hooks: SignatureMenuHooks): 
   pad.append(baseline, ink);
   const note = document.createElement("div");
   note.className = "pdfmk-sigpad__note";
-  note.textContent = "Draw with a pen, a mouse or a finger. Saved signatures stay on this PC.";
+  note.textContent = PAD_NOTE;
   body.append(pad, note);
 
   const footer = document.createElement("div");
@@ -257,6 +264,11 @@ export function openSignaturePad(ctx: PdfEditorCtx, hooks: SignatureMenuHooks): 
   const onDown = (e: PointerEvent): void => {
     palm.note(e.pointerType, e.timeStamp);
     if (cur || e.button !== 0 || e.defaultPrevented || !palm.mayDraw(e.pointerType, e.timeStamp)) return;
+    if (strokes.length >= SIGNATURE_STROKES_MAX) {
+      // quietly full: what is saved must survive the next launch
+      note.textContent = PAD_FULL_NOTE;
+      return;
+    }
     e.preventDefault();
     const sampler = new StrokeSampler(e.pointerType === "pen" ? EMA_PEN : EMA_OTHER, 0.5);
     const path = document.createElementNS(SVG_NS, "path");
@@ -330,6 +342,7 @@ export function openSignaturePad(ctx: PdfEditorCtx, hooks: SignatureMenuHooks): 
     strokes.length = 0;
     while (ink.firstChild) ink.removeChild(ink.firstChild);
     save.disabled = true;
+    note.textContent = PAD_NOTE;
   });
   save.addEventListener("click", () => {
     const sig = normalizeSignature(strokes, 0.5);

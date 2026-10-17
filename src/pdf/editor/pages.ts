@@ -10,7 +10,8 @@
 import { fileName } from "../../core/format";
 import { ipc, pickPdfFiles } from "../../core/ipc";
 import { PDF_MAX_PAGES } from "../../core/types";
-import type { PdfSource, ProjectFile } from "../../core/types";
+import { Store } from "../../core/store";
+import type { PdfPage, PdfSource, ProjectFile } from "../../core/types";
 import { imgIcon } from "../../image/icons";
 import { icon } from "../../ui/icons";
 import { closeMenu, showMenu } from "../../ui/menu";
@@ -69,6 +70,37 @@ export interface PageOps {
 }
 
 const pagesOf = (p: ProjectFile) => p.pdf?.pages ?? [];
+
+/**
+ * The rail's selection (ctx.pageSelection): slots to its readers, but held
+ * as PAGE IDS underneath. Every set() reads its slots against the project's
+ * pages at that moment and remembers the ids behind them; `remap` (the
+ * shell's page sync, after any page change) turns those ids back into slots.
+ * So a drag-reorder or an undo/redo keeps the same pages selected, and Delete
+ * never removes a page that merely moved into a selected slot.
+ */
+export class PageSelection extends Store<number[]> {
+  private ids: string[] = [];
+  private readonly pages: () => readonly PdfPage[];
+  constructor(pages: () => readonly PdfPage[]) {
+    super([]);
+    this.pages = pages;
+  }
+  override set(slots: number[]): void {
+    const pages = this.pages();
+    this.ids = slots.map((s) => pages[s]?.id).filter((id): id is string => id !== undefined);
+    super.set(slots);
+  }
+  /** Re-map the remembered ids onto `pages` (pages gone drop out). */
+  remap(pages: readonly PdfPage[]): void {
+    const at = new Map(pages.map((pg, i) => [pg.id, i] as const));
+    const kept = this.ids.filter((id) => at.has(id));
+    const slots = kept.map((id) => at.get(id)!);
+    this.ids = kept;
+    const cur = this.get();
+    if (slots.length !== cur.length || slots.some((s, i) => s !== cur[i])) super.set(slots);
+  }
+}
 
 const clampSide = (v: number): number => Math.min(SIDE_MAX, Math.max(SIDE_MIN, v));
 

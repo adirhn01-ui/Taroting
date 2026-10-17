@@ -70,9 +70,23 @@ describe("liveConflicts", () => {
   it("is empty for the defaults", () => {
     expect(liveConflicts(DEFAULT_SHORTCUTS)).toEqual([]);
   });
+
+  it("names a viewer binding that a zoom chord now shares (a 0.9.2 custom binding) as a viewer clash", () => {
+    // The zoom keys joined the viewer in 0.9.3: a viewer action the user put
+    // on Ctrl+= before then is a duplicate there now, and only there.
+    const live = liveConflicts({ ...DEFAULT_SHORTCUTS, nextFile: "Ctrl+=" });
+    expect(live).toEqual([{ chord: "Ctrl+=", mode: "viewer", actions: ["nextFile", "imgZoomIn"] }]);
+  });
 });
 
 describe("ACTION_LABELS", () => {
+  it("names the viewer on the zoom keys, which act there too", () => {
+    for (const id of ["imgZoomIn", "imgZoomOut", "imgZoomFit", "imgZoom100"] as const) {
+      expect(ACTION_MODES[id]).toContain("viewer");
+      expect(ACTION_LABELS[id]).toMatch(/\(image, PDF, viewer\)$/);
+    }
+  });
+
   it("has a label for every ActionId", () => {
     const actionIds = Object.keys(DEFAULT_SHORTCUTS) as ActionId[];
     for (const id of actionIds) {

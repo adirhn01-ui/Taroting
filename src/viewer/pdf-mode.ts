@@ -56,6 +56,8 @@ export interface PdfMode {
   open(path: string, live: () => boolean): Promise<void>;
   /** Home / End */
   goPage(which: "first" | "last"): void;
+  /** Space / Shift+Space: the strip one screen down (1) or up (-1) */
+  scrollPage(dir: 1 | -1): void;
   /** Ctrl+F: open (or refocus) the find box */
   find(): void;
   /** the zoom shortcuts (imgZoomIn/Out/Fit/100, shared with the editors) */
@@ -176,6 +178,17 @@ export function mountPdfMode(host: PdfHost, memory: PdfMemory): PdfMode {
 
   if (memory.fit) view.fit(memory.fit);
   else view.setZoom(memory.zoom);
+
+  // DEV only (the E2E, src/dev/autotest-pdf.ts): the strip and the shown
+  // document, live. Removed by dispose.
+  if (import.meta.env.DEV) {
+    const devWin = window as unknown as Record<string, unknown>;
+    const hook = { view, doc: (): PdfDoc | null => doc };
+    devWin.__tarotingPdfViewDev = hook;
+    unbind.push(() => {
+      if (devWin.__tarotingPdfViewDev === hook) delete devWin.__tarotingPdfViewDev;
+    });
+  }
 
   /* ---------------- top bar: rail toggle, page indicator ---------------- */
 
@@ -318,31 +331,36 @@ export function mountPdfMode(host: PdfHost, memory: PdfMemory): PdfMode {
     view.scrollToPage(page);
   }
 
-  unbind.push(
-    bindScrub(scrub, {
-      enabled: () => doc !== null,
-      at: (r) => {
-        const p = pageAtRatio(r, view.state.get().count);
-        if (p === dragPage) return;
-        dragPage = p;
-        goTo(p);
-        paintPages();
-      },
-      end: () => {
-        dragPage = null;
-        paintPages();
-      },
-    }),
-  );
+  const scrubDrag = bindScrub(scrub, {
+    enabled: () => doc !== null,
+    at: (r) => {
+      const p = pageAtRatio(r, view.state.get().count);
+      if (p === dragPage) return;
+      dragPage = p;
+      goTo(p);
+      paintPages();
+    },
+    end: () => {
+      dragPage = null;
+      paintPages();
+    },
+  });
+  unbind.push(scrubDrag.dispose);
   listen<KeyboardEvent>(scrub, "keydown", (e) => {
     const s = view.state.get();
+    const plain = !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey;
     let to: number | null = null;
     if (e.key === "PageDown") to = s.current + 1;
     else if (e.key === "PageUp") to = s.current - 1;
     else if (e.key === "Home") to = 0;
     else if (e.key === "End") to = s.count - 1;
+    // A focused slider's arrows move it (ARIA): a page, never the viewer's
+    // previous / next FILE that ArrowLeft / ArrowRight are bound to.
+    else if (plain && (e.key === "ArrowRight" || e.key === "ArrowDown")) to = s.current + 1;
+    else if (plain && (e.key === "ArrowLeft" || e.key === "ArrowUp")) to = s.current - 1;
     if (to === null) return;
-    // Home/End are also the viewer's own chords: answered here, once.
+    // Home/End and the arrows are also the viewer's own chords: answered
+    // here, once.
     e.preventDefault();
     e.stopPropagation();
     goTo(Math.min(Math.max(to, 0), Math.max(0, s.count - 1)));
@@ -624,13 +642,15 @@ export function mountPdfMode(host: PdfHost, memory: PdfMemory): PdfMode {
     pages = Array.from({ length: next.numPages }, (_, i) => ({ key: `p${i}`, doc: next, index: i, rotate: 0 as const }));
     // Through an empty strip: the new file starts at page 1, never at the
     // old one's page under the same key.
+    // Shown BEFORE the pages go in: a hidden strip measures 0×0, lays out and
+    // renders at the wrong size, then does it all again once it is shown.
+    wrap.hidden = false;
+    bar.hidden = false;
     view.setPages([]);
     view.setPages(pages);
     rail.setPages(pages);
     railShown = -1;
     view.scrollToPage(0);
-    wrap.hidden = false;
-    bar.hidden = false;
     shownPage = -1;
     paintPages();
     // A find box left open searches the new file for the same words.
@@ -693,6 +713,12 @@ export function mountPdfMode(host: PdfHost, memory: PdfMemory): PdfMode {
     goPage(which): void {
       const n = view.state.get().count;
       if (doc && n > 0) goTo(which === "first" ? 0 : n - 1);
+    },
+    scrollPage(dir): void {
+      if (!doc) return;
+      // A screen less a little overlap, as the browser's own Space does.
+      const el = view.el;
+      el.scrollTop += dir * Math.max(1, Math.round(el.clientHeight * 0.875));
     },
     find: openFind,
     zoom(step): void {

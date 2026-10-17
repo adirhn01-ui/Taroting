@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { isPdfOpenError, toOpenError } from "./loader";
 import { countingWorker, fixture, hasFixtures, testLoader } from "./fixtures.test-util";
@@ -78,5 +81,18 @@ describe.skipIf(!hasFixtures)("openPdf against the fixtures (pdf.js legacy build
     // a missing file never takes one
     await expect(l.openPdf("m", fixture("nope.pdf"))).rejects.toBeTruthy();
     expect(w.acquired).toBe(3);
+  });
+});
+
+describe("startup cost", () => {
+  // core/ipc is on the boot path already: a dynamic import() of it only splits
+  // it into its own chunk (plus a runtime chunk) at startup. pdfjs.ts must stay
+  // dynamic — open-media imports this module just to count pages.
+  const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "loader.ts"), "utf8");
+  it("imports core/ipc statically and pdf.js only on demand", () => {
+    expect(src).not.toMatch(/import\(\s*["']\.\.\/\.\.\/core\/ipc["']\s*\)/);
+    expect(src).toMatch(/^import \{[^}]*\bipc\b[^}]*\} from "\.\.\/\.\.\/core\/ipc";$/m);
+    expect(src).not.toMatch(/^import [^;]*from "\.\/pdfjs"/m);
+    expect(src).not.toMatch(/^import [^;]*from "pdfjs-dist/m);
   });
 });

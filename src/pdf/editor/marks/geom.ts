@@ -55,6 +55,111 @@ export function applyPageTransform(x: number, y: number, w: number, h: number, r
   }
 }
 
+/** A display rotation from any multiple of 90 (normalised to 0..270). */
+export function normRot(deg: number): PdfRotation {
+  return ((((Math.round((Number.isFinite(deg) ? deg : 0) / 90) % 4) + 4) % 4) * 90) as PdfRotation;
+}
+
+/** A SCREEN-direction vector (dx right, dy down) on a page shown turned by
+ *  `rot`, in page space: the inverse turn of `applyPageTransform`'s linear
+ *  part (arrow-key nudges, placing a box beside the click). */
+export function screenToPageDelta(dx: number, dy: number, rot: PdfRotation): { x: number; y: number } {
+  switch (rot) {
+    case 90:
+      return { x: dy, y: -dx };
+    case 180:
+      return { x: -dx, y: -dy };
+    case 270:
+      return { x: -dy, y: dx };
+    default:
+      return { x: dx, y: dy };
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Upright content in a page-space box (`r` on text, image, signature) */
+/* ------------------------------------------------------------------ */
+//
+// THE CONVENTION (shared with the export, src/pdf/export/**): a box mark's
+// x/y/w/h stay in page space; its content is drawn in a W×H FRAME where
+// (W, H) = (w, h) for r ∈ {0, 180} and (h, w) for r ∈ {90, 270}. The frame's
+// top-left sits at (x + w/2 − W/2, y + h/2 − H/2) and the frame is turned by
+// −r degrees (clockwise-positive, like /Rotate) about the box centre
+// (x + w/2, y + h/2). The page's own turn (+r) then shows it upright. Text
+// wraps to W, aligns within W, its rows descend H; a text box grows along the
+// frame's DOWN direction (page h for 0/180, page w for 90/270), keeping the
+// frame's top edge where it is.
+
+/** The mark's content turn (0 when absent or invalid). */
+export function markRot(a: { r?: unknown }): PdfRotation {
+  return typeof a.r === "number" ? normRot(a.r) : 0;
+}
+
+/** The upright frame size of a box mark (see the convention above). */
+export function frameOf(a: { w: number; h: number; r?: unknown }): { W: number; H: number } {
+  const r = markRot(a);
+  return r === 90 || r === 270 ? { W: a.h, H: a.w } : { W: a.w, H: a.h };
+}
+
+/** The frame's page-space rect before its turn, [x, y, W, H] (= the box when r = 0). */
+export function frameRect(a: { x: number; y: number; w: number; h: number; r?: unknown }): Box {
+  const { W, H } = frameOf(a);
+  const cx = a.x + a.w / 2;
+  const cy = a.y + a.h / 2;
+  return [cx - W / 2, cy - H / 2, W, H];
+}
+
+/** The SVG transform turning the frame into the box ("" for r = 0). */
+export function frameTransform(a: { x: number; y: number; w: number; h: number; r?: unknown }): string {
+  const r = markRot(a);
+  if (r === 0) return "";
+  const n = (v: number): string => String(Math.round(v * 100) / 100);
+  return `rotate(${-r} ${n(a.x + a.w / 2)} ${n(a.y + a.h / 2)})`;
+}
+
+/** A page-space box for an upright W×H frame at display turn `rot`. */
+export function boxForFrame(W: number, H: number, rot: PdfRotation): { w: number; h: number } {
+  return rot === 90 || rot === 270 ? { w: H, h: W } : { w: W, h: H };
+}
+
+/** The geometry patch that makes a box mark's frame `H` tall, growing along
+ *  the frame's down direction (its top edge stays put on screen). */
+export function withFrameH(a: { x: number; y: number; w: number; h: number; r?: unknown }, H: number): { x: number; y: number; w: number; h: number } {
+  const r = markRot(a);
+  switch (r) {
+    case 90:
+      return { x: a.x, y: a.y, w: H, h: a.h };
+    case 180:
+      return { x: a.x, y: a.y + a.h - H, w: a.w, h: H };
+    case 270:
+      return { x: a.x + a.w - H, y: a.y, w: H, h: a.h };
+    default:
+      return { x: a.x, y: a.y, w: a.w, h: H };
+  }
+}
+
+/** How far the frame of a box mark may extend DOWN (on screen) before it
+ *  leaves a pw×ph page: the in-place text editor's room to grow. */
+export function frameRoom(a: { x: number; y: number; w: number; h: number; r?: unknown }, pw: number, ph: number): number {
+  switch (markRot(a)) {
+    case 90:
+      return pw - a.x;
+    case 180:
+      return a.y + a.h;
+    case 270:
+      return a.x + a.w;
+    default:
+      return ph - a.y;
+  }
+}
+
+/** `{ r }` for a mark placed on a page shown turned by `rot`; `{}` at 0, so
+ *  an unturned mark carries no key at all. */
+export function rotField(rot: PdfRotation): { r?: PdfRotation } {
+  const r = normRot(rot);
+  return r === 0 ? {} : { r };
+}
+
 /* ------------------------------------------------------------------ */
 /* Sizes                                                               */
 /* ------------------------------------------------------------------ */
@@ -476,10 +581,32 @@ export function snapToRuler(r: RulerPose, edge: 1 | -1, half: number, x: number,
 
 export { LINE_HEIGHT };
 
-/** One laid-out line: its text (logical order) and its row. */
+/** One laid-out line: its text (logical order), its row, and its
+ *  PARAGRAPH's direction (the export decides per paragraph, not per line). */
 export interface TextLine {
   text: string;
   row: number;
+  rtl: boolean;
+}
+
+/** MIRRORS `firstStrongRtl` in src/pdf/export/bidi.ts (which imports bidi-js,
+ *  reachable only from the lazy export chunk); a test pins the two. Is the
+ *  paragraph right-to-left by its first strong character (UBA P2/P3)? */
+const STRONG_RTL = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufeff]/;
+const LETTER = /\p{L}/u;
+export function firstStrongRtl(s: string): boolean {
+  for (const ch of s) {
+    if (STRONG_RTL.test(ch)) return true;
+    if (LETTER.test(ch)) return false;
+  }
+  return false;
+}
+
+/** Fonts the export embeds with a regular face only (bold / italic fall back
+ *  to it — src-tauri export/builder.rs font_file): the editor shows them
+ *  plain too, so the screen is the file. */
+export function plainOnly(font: string): boolean {
+  return font === "Impact";
 }
 
 /**
@@ -492,7 +619,8 @@ export function layoutText(text: string, w: number, measure: (s: string) => numb
   const out: TextLine[] = [];
   let row = 0;
   for (const para of text.split(/\r\n|\r|\n/)) {
-    for (const [s, e] of wrapParagraph(para, w, measure)) out.push({ text: para.slice(s, e), row: row++ });
+    const rtl = firstStrongRtl(para);
+    for (const [s, e] of wrapParagraph(para, w, measure)) out.push({ text: para.slice(s, e), row: row++, rtl });
   }
   return out;
 }
@@ -511,6 +639,7 @@ export function textHeight(lines: number, size: number): number {
 
 /** The CSS font shorthand of a text style (size in points = CSS px in page space). */
 export function cssFont(font: string, size: number, bold: boolean, italic: boolean): string {
+  if (plainOnly(font)) bold = italic = false;
   return `${italic ? "italic " : ""}${bold ? "bold " : ""}${size}px "${font}"`;
 }
 

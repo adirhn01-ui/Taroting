@@ -3,6 +3,7 @@
 // files and fonts through the asset protocol, pictures decoded and text
 // rasterized by the WebView's own canvas.
 
+import { ipc, mediaUrl } from "../../core/ipc";
 import type { FontFamily } from "../../core/types";
 
 /* ---------------- the slice of pdf.js export uses ---------------- */
@@ -19,6 +20,8 @@ export interface PdfjsDocLike {
   annotationStorage: { setValue(key: string, value: Record<string, unknown>): void };
   saveDocument(): Promise<Uint8Array>;
   extractPages(entries: PdfjsExtractEntry[]): Promise<Uint8Array | null>;
+  /** `info.EncryptFilterName` is set when the file is encrypted */
+  getMetadata(): Promise<{ info: unknown }>;
 }
 
 export interface PdfjsTaskLike {
@@ -122,9 +125,9 @@ function canvasToPng(canvas: OffscreenCanvas): Promise<Uint8Array> {
   return canvas.convertToBlob({ type: "image/png" }).then(async (b) => new Uint8Array(await b.arrayBuffer()));
 }
 
-/** The desktop app's dependencies. Imported lazily with the export chunk. */
+/** The desktop app's dependencies. Imported lazily with the export chunk;
+ *  core/ipc is on the boot path already, so it is imported statically. */
 export async function appDeps(): Promise<ExportDeps> {
-  const { ipc, mediaUrl } = await import("../../core/ipc");
   return {
     pdfjs: appPdfjs,
     fileStat: (path) => ipc.fileStat(path),

@@ -112,11 +112,18 @@ describe("PDFs on Open and drop", () => {
     expect(routeDrop(["C:\\Docs\\Report.pdf"])).toEqual({ kind: "pdf", pdfs: ["C:\\Docs\\Report.pdf"], skipped: 0 });
   });
 
-  it("keep several PDFs in the order they came, never name-sorted like media", () => {
-    const picked = ["C:\\d\\cover 10.pdf", "C:\\d\\body.pdf", "C:\\d\\appendix 2.pdf"];
-    expect(routeOpenPicks(picked)).toEqual({ kind: "pdf", pdfs: picked, skipped: 0 });
-    const reversed = [...picked].reverse();
-    expect(routeDrop(reversed)).toEqual({ kind: "pdf", pdfs: reversed, skipped: 0 });
+  it("put several PDFs in natural name order, picked or dropped, like media", () => {
+    // A shift-click pick (or a drop) hands the focused file first: b, then a, c.
+    const sorted = ["C:\\d\\a.pdf", "C:\\d\\b.pdf", "C:\\d\\c.pdf"];
+    expect(routeOpenPicks(["C:\\d\\b.pdf", "C:\\d\\a.pdf", "C:\\d\\c.pdf"])).toEqual({ kind: "pdf", pdfs: sorted, skipped: 0 });
+    expect(routeDrop(["C:\\d\\c.pdf", "C:\\d\\b.pdf", "C:\\d\\a.pdf"])).toEqual({ kind: "pdf", pdfs: sorted, skipped: 0 });
+    // Numbers by value and case ignored, as for media: "2" before "10".
+    const parts = ["C:\\d\\Part 10.pdf", "C:\\x\\part 2.PDF", "C:\\d\\Part 1.pdf"];
+    expect(routeOpenPicks(parts)).toEqual({
+      kind: "pdf",
+      pdfs: ["C:\\d\\Part 1.pdf", "C:\\x\\part 2.PDF", "C:\\d\\Part 10.pdf"],
+      skipped: 0,
+    });
   });
 
   it("skip unsupported files among PDFs with the usual one toast", () => {

@@ -350,14 +350,20 @@ export interface PdfTextStyle {
 export type PdfAnnot =
   | { id: string; t: "ink"; kind: InkKind; c: string; w: number; o: number; p: string }
   | { id: string; t: "highlight"; c: string; o: number; rects: [number, number, number, number][] }
-  | ({ id: string; t: "text"; x: number; y: number; w: number; h: number; text: string } & PdfTextStyle)
+  | ({ id: string; t: "text"; x: number; y: number; w: number; h: number; text: string; r?: PdfRotation } & PdfTextStyle)
   | { id: string; t: ShapeKind; c: string; w: number; a: [number, number]; b: [number, number] }
   /** an opaque cover box (default white) — typically with a text box on top */
   | { id: string; t: "whiteout"; x: number; y: number; w: number; h: number; c: string }
   /** a picture: `media` is a ProjectFile.media id (kind "image"), so relink works */
-  | { id: string; t: "image"; x: number; y: number; w: number; h: number; media: string }
+  | { id: string; t: "image"; x: number; y: number; w: number; h: number; media: string; r?: PdfRotation }
   /** a signature: vector strokes normalised to a 0..1 box, drawn into x,y,w,h */
-  | { id: string; t: "signature"; x: number; y: number; w: number; h: number; c: string; strokes: string[] };
+  | { id: string; t: "signature"; x: number; y: number; w: number; h: number; c: string; strokes: string[]; r?: PdfRotation };
+
+/* `r` on text, image and signature marks: the page's DISPLAY turn when the
+ * mark was placed (source /Rotate + PdfPage.rotate, clockwise). The mark's
+ * content is drawn turned by -r inside its page-space box, so it reads upright
+ * on screen on a page stored sideways (a landscape scan with /Rotate 90), and
+ * in the exported file. Absent = 0. A box's x/y/w/h stay in page space. */
 
 export type PdfAnnotKind = PdfAnnot["t"];
 

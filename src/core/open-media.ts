@@ -179,9 +179,11 @@ export async function openMediaAsProject(path: string): Promise<string> {
   // a free name), so a failure before it has nothing to clean up.
   let written = false;
   try {
-    // A PDF is never probed: ffprobe has nothing to say about one.
+    // A PDF is never probed: ffprobe has nothing to say about one. Its whole
+  // path (stat, page count, the failures in words, the project) is the lazy
+  // core/pdf-open chunk, fetched here and never at boot.
     const project = DOCUMENT_FILE_EXTENSIONS.has(fileExt(path))
-      ? await pdfProject(fileStem(projectPath), path)
+      ? await (await import("./pdf-open")).pdfTempProject(fileStem(projectPath), path, (p) => new PdfProtectedError(p))
       : await mediaProject(fileStem(projectPath), path);
     await ipc.saveProject(projectPath, project);
     written = true;
@@ -245,7 +247,8 @@ export const PDF_PROTECTED_MESSAGE =
 /** Thrown by openMediaAsProject for a password-protected PDF, INSTEAD of creating a
  *  project. Not a failure: core/open-route catches it and shows the file in the viewer
  *  with `message` as news. Anything else that catches it (the viewer's own "Open as
- *  project", already showing the file) prints `message` like any error. */
+ *  project", already showing the file) prints `message` like any error. Kept here, not
+ *  in core/pdf-open, so those two can test `instanceof` without the PDF chunk at boot. */
 export class PdfProtectedError extends Error {
   readonly path: string;
   constructor(path: string) {
@@ -253,39 +256,4 @@ export class PdfProtectedError extends Error {
     this.name = "PdfProtectedError";
     this.path = path;
   }
-}
-
-/** The words a missing media file gets from the backend (media/source.rs), for a PDF. */
-const PDF_MISSING = "This PDF is missing or can't be read.";
-
-/** The PDF a temporary PDF project is made of: identity from the backend's stat (a
- *  missing file stops here, before pdf.js is ever fetched), page count from pdf.js.
- *
- *  Both modules are fetched HERE, like core/image-project for a photo: the loader pulls
- *  pdf.js, which must never be in the boot chunk, and pdf-project is only needed on this
- *  path. */
-async function pdfProject(name: string, path: string): Promise<ProjectFile> {
-  const stat = await ipc.fileStat(path);
-  if (!stat) throw new Error(PDF_MISSING);
-  let pages: number;
-  try {
-    const { countPages } = await import("../pdf/view/loader");
-    pages = await countPages(path);
-  } catch (e) {
-    const kind = e && typeof e === "object" && "kind" in e ? (e as { kind: unknown }).kind : null;
-    if (kind === "password") throw new PdfProtectedError(path);
-    if (kind === "missing") throw new Error(PDF_MISSING);
-    // "other" is a plain object with the reason in words (an object, so it is
-    // made an Error here); anything else (a chunk that failed to load) is
-    // already an Error and goes up as it is.
-    const unreadable = `Couldn't read ${fileStem(path)} as a PDF.`;
-    if (kind === "invalid") throw new Error(unreadable);
-    if (kind === "other") {
-      const message = (e as { message?: unknown }).message;
-      throw new Error(typeof message === "string" && message ? message : unreadable);
-    }
-    throw e;
-  }
-  const { createPdfProject } = await import("./pdf-project");
-  return createPdfProject(name, { path, size: stat.size, mtimeMs: stat.mtimeMs, pages });
 }

@@ -23,7 +23,7 @@ import { normalizeHexColor } from "../../../core/session";
 import { decodePoints } from "../../../image/strokes";
 import { outlinePolygon, penHalfWidth, pencilHalfWidth, type HalfWidth } from "../../../image/ink/outline";
 import { arrowWings } from "../../../image/ink/shapes";
-import { LINE_HEIGHT, cssFont, inkPoints, layoutText, signatureWidth } from "./geom";
+import { LINE_HEIGHT, cssFont, frameOf, frameRect, frameTransform, inkPoints, layoutText, plainOnly, signatureWidth } from "./geom";
 
 export const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -94,17 +94,19 @@ export function shapeD(t: "line" | "arrow" | "rect", a: [number, number], b: [nu
   return d;
 }
 
-/** Path data of a signature's strokes drawn into its box. */
+/** Path data of a signature's strokes drawn into its upright frame (its box
+ *  when it has no turn; the node then gets `frameTransform`). */
 export function signatureD(a: Extract<PdfAnnot, { t: "signature" }>): string {
   const half = penHalfWidth(signatureWidth(a.w, a.h));
+  const [fx, fy, fw, fh] = frameRect(a);
   let d = "";
   for (const s of a.strokes) {
     const norm = decodePoints(s);
     if (!norm) continue;
     const pts = new Float32Array(norm.length);
     for (let i = 0; i + 2 < norm.length; i += 3) {
-      pts[i] = a.x + norm[i]! * a.w;
-      pts[i + 1] = a.y + norm[i + 1]! * a.h;
+      pts[i] = fx + norm[i]! * fw;
+      pts[i + 1] = fy + norm[i + 1]! * fh;
       pts[i + 2] = norm[i + 2]!;
     }
     d += outlineD(pts, pts.length / 3, half);
@@ -154,11 +156,12 @@ export function textMeasurer(): TextMeasurer {
   return measurer;
 }
 
-/** The lines a text mark shows (export's breaks). */
+/** The lines a text mark shows (export's breaks), wrapped to its upright
+ *  frame's width (the box's h on a page turned 90 / 270). */
 export function textLines(a: Extract<PdfAnnot, { t: "text" }>): ReturnType<typeof layoutText> {
   const font = cssFont(a.font, a.size, a.bold, a.italic);
   const m = measurer;
-  return layoutText(a.text, a.w, (s) => m.width(font, s));
+  return layoutText(a.text, frameOf(a).W, (s) => m.width(font, s));
 }
 
 /* ------------------------------------------------------------------ */
@@ -180,8 +183,10 @@ export function styleTextBox(el: HTMLElement, a: Pick<Extract<PdfAnnot, { t: "te
   const s = el.style;
   s.fontFamily = `"${a.font}"`;
   s.fontSize = `${a.size}px`;
-  s.fontWeight = a.bold ? "bold" : "normal";
-  s.fontStyle = a.italic ? "italic" : "normal";
+  // a regular-only font (Impact) exports plain whatever the toggles say
+  const plain = plainOnly(a.font);
+  s.fontWeight = a.bold && !plain ? "bold" : "normal";
+  s.fontStyle = a.italic && !plain ? "italic" : "normal";
   s.lineHeight = `${a.size * LINE_HEIGHT}px`;
   s.color = col(a.c);
   s.textAlign = a.align;
@@ -246,13 +251,16 @@ export function markNode(a: PdfAnnot, media: readonly MediaRef[], urlOf: (path: 
         node = svg("rect", { x: n2(a.x), y: n2(a.y), width: n2(a.w), height: n2(a.h), class: "pdfmk-mark--missing" });
         break;
       }
-      node = svg("image", { x: n2(a.x), y: n2(a.y), width: n2(a.w), height: n2(a.h), preserveAspectRatio: "none", href: urlOf(m.path) });
+      const [fx, fy, fw, fh] = frameRect(a);
+      node = svg("image", { x: n2(fx), y: n2(fy), width: n2(fw), height: n2(fh), preserveAspectRatio: "none", href: urlOf(m.path) });
+      turn(node, a);
       break;
     }
     case "signature": {
       const d = signatureD(a);
       if (!d) return null;
       node = svg("path", { d, fill: col(a.c), "fill-rule": "nonzero" });
+      turn(node, a);
       break;
     }
     case "text":
@@ -263,9 +271,19 @@ export function markNode(a: PdfAnnot, media: readonly MediaRef[], urlOf: (path: 
   return node;
 }
 
-/** A text mark: a foreignObject clipped to its box, one div per laid-out line. */
+/** Turn a box mark's frame-drawn node into its box (`r`; nothing at 0). */
+function turn(node: SVGElement, a: { x: number; y: number; w: number; h: number; r?: unknown }): void {
+  const t = frameTransform(a);
+  if (t) node.setAttribute("transform", t);
+}
+
+/** A text mark: a foreignObject clipped to its upright frame and turned into
+ *  its box, one div per laid-out line; every line takes its PARAGRAPH's
+ *  direction (the export's per-paragraph bidi, not the line's own). */
 export function textNode(a: Extract<PdfAnnot, { t: "text" }>): SVGElement {
-  const fo = svg("foreignObject", { x: n2(a.x), y: n2(a.y), width: n2(Math.max(a.w, 0)), height: n2(Math.max(a.h, 0)) });
+  const [fx, fy, fw, fh] = frameRect(a);
+  const fo = svg("foreignObject", { x: n2(fx), y: n2(fy), width: n2(Math.max(fw, 0)), height: n2(Math.max(fh, 0)) });
+  turn(fo, a);
   const box = document.createElement("div");
   box.className = "pdfmk-text";
   styleTextBox(box, a);
@@ -273,7 +291,7 @@ export function textNode(a: Extract<PdfAnnot, { t: "text" }>): SVGElement {
   for (const line of textLines(a)) {
     const div = document.createElement("div");
     div.className = "pdfmk-text__line";
-    div.setAttribute("dir", "auto");
+    div.setAttribute("dir", line.rtl ? "rtl" : "ltr");
     div.style.top = `${line.row * lh}px`;
     div.style.height = `${lh}px`;
     div.textContent = line.text;

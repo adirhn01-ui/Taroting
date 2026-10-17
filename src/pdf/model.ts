@@ -46,6 +46,7 @@ import {
   PDF_PAGE_SIDE_MAX,
   PDF_PAGE_SIDE_MIN,
   isPdfFilePath,
+  isPdfFieldId,
   isPdfId,
   sanitizePdfFormValue,
 } from "../core/pdf-sanitize";
@@ -454,7 +455,7 @@ export function setFormValue(
   value: PdfFormValue,
 ): ProjectFile {
   const pdf = pdfOf(p);
-  if (!pdf || !pdf.sources.some((s) => s.id === srcId) || !isPdfId(annotId)) return p;
+  if (!pdf || !pdf.sources.some((s) => s.id === srcId) || !isPdfFieldId(annotId)) return p;
   const clean = sanitizePdfFormValue(value);
   if (clean === null || sameValue(formValue(p, srcId, annotId), clean)) return p;
   const rec = formValues(p, srcId) ?? (Object.create(null) as Record<string, PdfFormValue>);

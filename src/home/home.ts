@@ -10,7 +10,7 @@ import {
   formatDuration,
   formatRelative,
 } from "../core/format";
-import { describeError, ipc, mediaUrl, onDragDrop, pickOpenFiles, pickPdfFiles } from "../core/ipc";
+import { describeError, ipc, mediaUrl, onDragDrop, pickOpenFiles } from "../core/ipc";
 import { navigate } from "../core/nav";
 import { isTempProjectPath, runOnOpenChain } from "../core/open-media";
 import { addMedia, createProject } from "../core/project";
@@ -85,9 +85,14 @@ export type OpenRoute =
    *  supported and how many PDFs came along (left aside: PDFs and media do
    *  not go into one project) */
   | { kind: "media"; media: string[]; skipped: number; pdfs: number }
-  /** PDFs only (besides unsupported files): ONE new PDF project, its pages in
-   *  the order the files came */
+  /** PDFs only (besides unsupported files): ONE new PDF project, the files
+   *  in natural name order, as media are */
   | { kind: "pdf"; pdfs: string[]; skipped: number };
+
+/** compareNames on the file names: the order Open and drops hand files on in. */
+function byFileName(a: string, b: string): number {
+  return compareNames(fileName(a), fileName(b));
+}
 
 /** The allowlist, then natural name order ("2" before "10"): the pickers hand
  *  files back in no particular order, and the first file names the project
@@ -95,9 +100,11 @@ export type OpenRoute =
  *  pickers' filters can be typed around ("*.*"), so the allowlist is applied
  *  here too, as it is on every other way in.
  *
- *  PDFs are told apart first. PDFs alone make a PDF project, in the order
- *  they came (the order of pages is the user's, and a name sort would
- *  reshuffle a dropped "cover, body, appendix"). PDFs with media keep the
+ *  PDFs are told apart first. PDFs alone make a PDF project, sorted the same
+ *  way, picked or dropped: neither order is the user's. The picker's is none
+ *  in particular, and a drop (like a shift-click pick) puts the file under the
+ *  pointer first — so "a, b, c" chosen while b had focus started at b. The
+ *  pages can be rearranged in the editor. PDFs with media keep the
  *  media's flow and leave the PDFs aside, said in the notice: one project
  *  cannot be both, and guessing which the user meant is worse than asking
  *  them to open the PDFs on their own. */
@@ -107,9 +114,9 @@ function mediaRoute(paths: readonly string[]): OpenRoute {
   const skipped = paths.length - media.length - pdfs.length;
   if (media.length === 0) {
     if (pdfs.length === 0) return { kind: "unsupported", count: skipped };
-    return { kind: "pdf", pdfs, skipped };
+    return { kind: "pdf", pdfs: pdfs.sort(byFileName), skipped };
   }
-  media.sort((a, b) => compareNames(fileName(a), fileName(b)));
+  media.sort(byFileName);
   return { kind: "media", media, skipped, pdfs: pdfs.length };
 }
 
@@ -862,7 +869,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
           label: "PDF project",
           icon: documentIcon(18),
           hint: "Arrange, mark up and fill in a PDF",
-          onSelect: () => void openNewPdf(),
+          onSelect: () => void makePdfProject(null),
         },
       ],
       r.top - 4,
@@ -901,40 +908,27 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     }
   }
 
-  /* "New project > PDF project": one PDF from the picker, straight into a new
-     library project. Nothing is held busy while the picker is up (the user
-     may take as long as they like, or cancel); the making runs under
-     makePdfProject's own guard. */
-  async function openNewPdf(): Promise<void> {
-    if (busy) return;
-    let paths: string[];
-    try {
-      paths = await pickPdfFiles(false);
-    } catch (e) {
-      if (!disposed) toast.error(describeError(e));
-      return;
-    }
-    // See createNew for why a disposed screen must not act.
-    if (disposed || paths.length === 0) return;
-    await makePdfProject(paths.slice(0, 1));
-  }
-
   /** PDFs to ONE new PDF project, a real library project like createNew's,
-   *  pages in the order given. The work is its own small chunk (it fetches
-   *  pdf.js and the PDF model only once there is a PDF to read), never at
-   *  boot. */
-  async function makePdfProject(pdfs: string[]): Promise<void> {
-    if (guard()) return;
+   *  pages in the order given. `null`: "New project > PDF project", where the
+   *  user picks one PDF first, with nothing held busy while the picker is up
+   *  (they may take as long as they like, or cancel). The picker and the
+   *  making are their own small chunk (it fetches pdf.js and the PDF model only
+   *  once there is a PDF to read), never at boot. */
+  async function makePdfProject(pdfs: string[] | null): Promise<void> {
+    if (busy) return;
     try {
-      const { createPdfProjectFrom } = await import("./pdf-project-from");
-      if (disposed) return;
-      const projectPath = await createPdfProjectFrom(pdfs, () => disposed);
-      // See createNew for why a disposed screen must not navigate.
-      if (projectPath && !disposed) navigate({ view: "editor", projectPath });
+      const m = await import("./pdf-project-from");
+      pdfs ??= await m.pickNewPdf();
+      // See createNew for why a disposed screen must not act.
+      if (disposed || pdfs.length === 0 || guard()) return;
+      try {
+        const projectPath = await m.createPdfProjectFrom(pdfs, () => disposed);
+        if (projectPath && !disposed) navigate({ view: "editor", projectPath });
+      } finally {
+        busy = false;
+      }
     } catch (e) {
       if (!disposed) toast.error(describeError(e));
-    } finally {
-      busy = false;
     }
   }
 

@@ -143,11 +143,13 @@ describe("off the boot path", () => {
   // and the export run hold are used by lazy screens alone (open-media awaits
   // the former; both export dialogs import the latter), and one static import
   // from a boot module would put them back on every launch unnoticed.
-  it("no boot module statically imports image-project, pdf-project, export-hold or the PDF chunk", () => {
+  it("no boot module statically imports image-project, pdf-project, pdf-open, pdf-project-from, export-hold or the PDF chunk", () => {
     for (const f of BOOT_PATH) {
       const src = read(f);
       expect(src, f).not.toMatch(staticImportOf("image-project"));
       expect(src, f).not.toMatch(staticImportOf("pdf-project"));
+      expect(src, f).not.toMatch(staticImportOf("pdf-open"));
+      expect(src, f).not.toMatch(staticImportOf("pdf-project-from"));
       expect(src, f).not.toMatch(staticImportOf("export-hold"));
       expect(src, f).not.toMatch(/^\s*import\s+(?!type\b)[^;]*?from\s+["'](?:\.\.?\/)+pdf\//m);
     }
@@ -155,5 +157,25 @@ describe("off the boot path", () => {
 
   it("open-media reaches image-project only through the awaited dynamic import", () => {
     expect(read("src/core/open-media.ts")).toContain('await import("./image-project")');
+  });
+
+  // A PDF opened as a project costs the boot chunk one dynamic import: the
+  // stat, the page count, the failure words and the project are all in the
+  // lazy core/pdf-open, which Home's lazy pdf-project-from shares. open-media
+  // fetching pdf.js or pdf-project itself (even lazily) means that body moved
+  // back onto the boot path.
+  it("open-media hands a PDF to the lazy pdf-open and holds none of its body", () => {
+    const src = read("src/core/open-media.ts");
+    expect(src).toContain('await import("./pdf-open")');
+    expect(src).not.toMatch(/["'](?:\.\.\/)+pdf\//);
+    expect(src).not.toMatch(/["']\.\/pdf-project["']/);
+    expect(src).not.toContain("countPages");
+  });
+
+  it("Home reaches its PDF projects, picker included, only through pdf-project-from", () => {
+    const src = read("src/home/home.ts");
+    expect(src).toContain('await import("./pdf-project-from")');
+    expect(src).not.toContain("pickPdfFiles");
+    expect(src).not.toMatch(/["'](?:\.\.\/)+core\/pdf-open["']/);
   });
 });

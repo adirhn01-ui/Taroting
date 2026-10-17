@@ -196,6 +196,22 @@ describe("render window and current page", () => {
     expect(currentSlot(L, 416 * 19 + 1000, 600)).toBe(19); // past the end
   });
 
+  it("at the very top the first page is current, at the very bottom the last", () => {
+    // 25%: pages 198 tall + 16 gap — the centre line at the top sits in page 2
+    const Z = layoutStrip(slotsOf(20), 0.25, 16, 1000);
+    expect(currentSlot(Z, 0, 600)).toBe(0);
+    expect(currentSlot(Z, 1, 600)).toBe(1); // scrolled at all: the centre line again
+    // at max scroll the centre line is ~1.5 pages above the end
+    const max = Z.height - 600;
+    expect(currentSlot(Z, max, 600)).toBe(19);
+    expect(currentSlot(Z, max - 0.5, 600)).toBe(19); // fractional scrollTop
+    expect(currentSlot(Z, max - 214, 600)).toBe(17);
+    // a document that fits the viewport: page 1
+    const S = layoutStrip(slotsOf(2), 0.25, 16, 1000);
+    expect(currentSlot(S, 0, 600)).toBe(0);
+    expect(currentSlot(layoutStrip([], 1, 16, 100), 0, 600)).toBe(-1);
+  });
+
   it("in a gap, the nearer page owns the line", () => {
     const gapTop = L.tops[1]! - 16; // bottom of page 0
     expect(slotAtY(L, gapTop + 3)).toBe(0);

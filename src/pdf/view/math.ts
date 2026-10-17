@@ -204,9 +204,18 @@ export function slotAtY(L: StripLayout, y: number): number {
   return above <= below ? i - 1 : i;
 }
 
-/** The current page: the slot owning the viewport's centre line. */
+/** The current page: the slot owning the viewport's centre line — except at
+ *  the very top (the first slot) and the very bottom (the last): zoomed out,
+ *  the centre line at the top already sits in page 2, and pages in the last
+ *  half viewport could never become current. 1 px of slack at the bottom for
+ *  a fractional scrollTop. */
 export function currentSlot(L: StripLayout, scrollTop: number, viewH: number): number {
-  return slotAtY(L, scrollTop + Math.max(0, viewH) / 2);
+  const n = L.tops.length;
+  if (n === 0) return -1;
+  const h = Math.max(0, viewH);
+  if (scrollTop <= 0) return 0;
+  if (scrollTop + h >= L.height - 1) return n - 1;
+  return slotAtY(L, scrollTop + h / 2);
 }
 
 /** Content px → page space of slot i (may fall outside the page: drags). */

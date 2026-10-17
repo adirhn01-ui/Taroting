@@ -454,41 +454,32 @@ function drawingCounts(chunks: unknown): { strokes: number; points: number } {
  *  reason as `drawingCounts`: a report must never throw, least of all on the
  *  project that went wrong. Own keys only (`Object.keys`), never text. */
 function pdfCounts(pdf: unknown): PdfShape {
-  const out: PdfShape = { sources: 0, pages: 0, blankPages: 0, marks: 0, formValues: 0 };
-  if (pdf === null || typeof pdf !== "object") return out;
-  const { sources, pages, annots, forms } = pdf as Record<string, unknown>;
-  if (Array.isArray(sources)) out.sources = sources.length;
-  if (Array.isArray(pages)) {
-    out.pages = pages.length;
-    for (const pg of pages) {
-      if (pg !== null && typeof pg === "object" && (pg as { src?: unknown }).src === null) out.blankPages++;
-    }
-  }
-  if (annots !== null && typeof annots === "object") {
-    for (const k of Object.keys(annots)) {
-      const list = (annots as Record<string, unknown>)[k];
-      if (Array.isArray(list)) out.marks += list.length;
-    }
-  }
-  if (forms !== null && typeof forms === "object") {
-    for (const k of Object.keys(forms)) {
-      const rec = (forms as Record<string, unknown>)[k];
-      if (rec !== null && typeof rec === "object") out.formValues += Object.keys(rec).length;
-    }
-  }
-  return out;
+  const { sources, pages, annots, forms } = (pdf ?? {}) as Record<string, unknown>;
+  const pg = listOf(pages);
+  return {
+    sources: listOf(sources).length,
+    pages: pg.length,
+    blankPages: pg.filter((p) => (p as { src?: unknown } | null)?.src === null).length,
+    marks: valuesOf(annots).reduce<number>((n, list) => n + listOf(list).length, 0),
+    formValues: valuesOf(forms).reduce<number>((n, rec) => n + valuesOf(rec).length, 0),
+  };
+}
+
+/** `v` when it is an array, else none. */
+function listOf(v: unknown): unknown[] {
+  return Array.isArray(v) ? v : [];
+}
+
+/** An object's own values, else none. */
+function valuesOf(v: unknown): unknown[] {
+  return v !== null && typeof v === "object" ? Object.values(v) : [];
 }
 
 /** Every source path of a PDF project (none for any other), defensively. */
 function pdfSourcePathsOf(project: ProjectFile): string[] {
-  const sources = (project.pdf as { sources?: unknown } | undefined)?.sources;
-  if (!Array.isArray(sources)) return [];
-  const out: string[] = [];
-  for (const s of sources) {
-    const path = (s as { path?: unknown } | null)?.path;
-    if (typeof path === "string") out.push(path);
-  }
-  return out;
+  return listOf((project.pdf as { sources?: unknown } | undefined)?.sources)
+    .map((s) => (s as { path?: unknown } | null)?.path)
+    .filter((p): p is string => typeof p === "string");
 }
 
 /**
@@ -699,12 +690,15 @@ export function buildReport(ctx: ReportContext): string {
     const shape = redactProjectShape(ctx.project, redactor.path);
     out.push(head("Project shape"));
     out.push(row("Project kind", shape.kind));
-    if (shape.pdf) {
-      out.push(row("PDF sources", shape.pdf.sources));
-      out.push(row("PDF pages", shape.pdf.pages));
-      out.push(row("Blank pages", shape.pdf.blankPages));
-      out.push(row("PDF marks", shape.pdf.marks));
-      out.push(row("Form values", shape.pdf.formValues));
+    const c = shape.pdf;
+    if (c) {
+      out.push(
+        row("PDF sources", c.sources),
+        row("PDF pages", c.pages),
+        row("Blank pages", c.blankPages),
+        row("PDF marks", c.marks),
+        row("Form values", c.formValues),
+      );
     }
     out.push(row("Canvas", shape.canvas));
     out.push(row("Timebase", shape.timebase));

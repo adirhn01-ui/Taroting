@@ -4,6 +4,7 @@
 // error mapping and the worker refcount are tested under Node with pdf.js's
 // legacy build and real fixtures.
 
+import { ipc, mediaUrl } from "../../core/ipc";
 import type { PdfRotation } from "../../core/types";
 import type { PdfDoc, PdfOpenError } from "../types";
 import { displayRotation, normRotation, backingSize } from "./math";
@@ -201,7 +202,6 @@ export async function renderPageToBlob(
 
 /** Bytes over the asset protocol; null when the file does not exist. */
 async function readBytes(path: string): Promise<Uint8Array | null> {
-  const { ipc, mediaUrl } = await import("../../core/ipc");
   const stat = await ipc.fileStat(path);
   if (!stat) return null;
   const res = await fetch(mediaUrl(path));
@@ -226,7 +226,9 @@ function loader(): Loader {
 
 // pdfjs.ts is reached through import() so this module stays cheap to load
 // (open-media imports it just to count pages); by the time params/worker are
-// needed, deps.pdfjs() has resolved it.
+// needed, deps.pdfjs() has resolved it. core/ipc, by contrast, is imported
+// statically: it is on the boot path already, and an import() of it only
+// split it into a chunk of its own at startup.
 let pdfjsMod: typeof import("./pdfjs") | null = null;
 const pdfjsModReady = import("./pdfjs").then((m) => (pdfjsMod = m));
 function documentParamsNow(): Record<string, unknown> {

@@ -42,25 +42,49 @@ export const PDF_FONT_SIZE_MIN = 4;
 export const PDF_FONT_SIZE_MAX = 288;
 export const PDF_HIGHLIGHT_MAX_RECTS = 1000;
 export const PDF_SIGNATURE_MAX_STROKES = 1000;
-/** Points in one ink stroke / across the whole document. The SAME numbers as
- *  the image editor's MAX_STROKE_POINTS / MAX_TOTAL_POINTS
- *  (src/image/strokes.ts) — copied, not imported: core never imports
- *  src/image. A test pins them equal. */
-export const PDF_STROKE_MAX_POINTS = 1_000_000;
-export const PDF_TOTAL_MAX_POINTS = 20_000_000;
+/** Points in one ink stroke / across the whole document. Lower than the image
+ *  editor's MAX_STROKE_POINTS / MAX_TOTAL_POINTS (src/image/strokes.ts; a
+ *  test pins them no higher): every PDF point becomes vector text in the
+ *  exported file (outline ring + InkList), and at the image editor's 20M a
+ *  crafted `.trt` made an export run for minutes and take GBs (2M points
+ *  measured 58 s / 3.5 GB before the build became cancellable).
+ *  Real use: a pointer reports ~120-240 points a second, so one 100k-point
+ *  stroke is 7-14 minutes of drawing without lifting the pen; a page of
+ *  dense handwriting is ~30k points, so 2M is ~65 such pages. */
+export const PDF_STROKE_MAX_POINTS = 100_000;
+export const PDF_TOTAL_MAX_POINTS = 2_000_000;
 /** Filled-in form fields kept per source, and selected options per field. */
 export const PDF_FORM_MAX_FIELDS = 10_000;
 export const PDF_FORM_MAX_CHOICES = 500;
 /** Longest path Windows can name (the \\?\ form). */
 export const PDF_PATH_MAX_CHARS = 32_767;
 
-/** Every id in a PDF block (source, page, mark, form field): what `uid()` and
- *  pdf.js ("12R") produce, and nothing that can name a prototype slot. */
+/** Every id in a PDF block (source, page, mark): what `uid()` produces. The
+ *  three keys that can REWRITE a prototype are refused; other built-in names
+ *  ("toString", "valueOf", "hasOwnProperty"…) still pass, so every lookup by
+ *  one of these ids must be an own-property read, a Map or a null-prototype
+ *  record — never a plain `{}[id]`. */
 const PDF_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const RESERVED_KEYS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
 
 export function isPdfId(v: unknown): v is string {
   return typeof v === "string" && PDF_ID_RE.test(v) && !RESERVED_KEYS.has(v);
+}
+
+/** A form field key: a pdf.js widget annotation id — its object reference
+ *  ("12R", or "12R3" for generation 3) or, for a widget written inline in
+ *  /Annots, "annot_p<page>_<n>". Nothing else: pdf.js reads a storage key
+ *  starting "pdfjs_internal_editor_" as a NEW annotation, and a form value
+ *  there breaks the export. */
+const PDF_FIELD_ID_RE = /^(?:\d{1,10}R(?:\d{1,5})?|annot_p\d{1,6}_\d{1,9})$/;
+
+export function isPdfFieldId(v: unknown): v is string {
+  return typeof v === "string" && PDF_FIELD_ID_RE.test(v);
+}
+
+/** The turn of a text, image or signature mark (`r`), or null for none. */
+function markTurnOf(v: unknown): 90 | 180 | 270 | null {
+  return v === 90 || v === 180 || v === 270 ? v : null;
 }
 
 /** The FontFamily whitelist as a value. Typed `Record<FontFamily, true>` so
@@ -210,6 +234,7 @@ const ALIGNS: ReadonlySet<string> = new Set(["left", "center", "right"]);
  *  - highlight: 1..1000 rects of [x, y, w, h]
  *  - text: string <= 20k chars, font on the whitelist, size 4..288, bold and
  *    italic booleans, align left/center/right
+ *  - text, image, signature: `r` kept only when 90, 180 or 270 (else absent)
  *  - image: `media` names an image in `imageMedia`
  *  - signature: 1..1000 strokes, each decodes
  *  - ink + signature points of this mark at most `maxPoints` (the caller's
@@ -229,10 +254,13 @@ export function sanitizePdfAnnot(
   if (t === "whiteout" || t === "image" || t === "signature" || t === "text") {
     const b = boxOf(raw);
     if (!b) return null;
+    // whiteout has no turn; any other value than 90/180/270 is no turn
+    const r = t === "whiteout" ? null : markTurnOf(raw.r);
+    const turn = r === null ? {} : { r };
     if (t === "image") {
       const media = raw.media;
       if (typeof media !== "string" || !imageMedia.has(media)) return null;
-      return { id, t, ...b, media };
+      return { id, t, ...b, media, ...turn };
     }
     const c = pdfHexColor(raw.c);
     if (c === null) return null;
@@ -249,7 +277,7 @@ export function sanitizePdfAnnot(
         budget -= str.length / 16;
         out.push(str);
       }
-      return { id, t, ...b, c, strokes: out };
+      return { id, t, ...b, c, strokes: out, ...turn };
     }
     // text
     const { text, font, size, bold, italic, align } = raw;
@@ -270,6 +298,7 @@ export function sanitizePdfAnnot(
       bold,
       italic,
       align: align as "left" | "center" | "right",
+      ...turn,
     };
   }
 
@@ -372,14 +401,16 @@ function sanitizePdfPage(raw: unknown, sources: ReadonlyMap<string, PdfSource>):
  *  - annots: only under kept page ids, each mark per `sanitizePdfAnnot`, ids
  *    unique across the document, at most PDF_MAX_ANNOTS_PER_PAGE per page and
  *    PDF_TOTAL_MAX_POINTS ink points in all; an empty list is left out
- *  - forms: only under kept source ids, field ids valid, values per
+ *  - forms: only under kept source ids, field ids pdf.js widget ids
+ *    (`isPdfFieldId`), values per
  *    `sanitizePdfFormValue`, at most PDF_FORM_MAX_FIELDS per source
  *  - export: absent stays absent; otherwise each flag is true only when it is
  *    literally `true`
  *
  * `annots`, `forms` and every per-source form record are created with
  * `Object.create(null)`, and every read of the raw input goes through an own-
- * property check after the key has passed `isPdfId` — a "__proto__" key can
+ * property check after the key has passed `isPdfId` / `isPdfFieldId` — a
+ * "__proto__" key can
  * neither be read through to Object.prototype nor written onto one.
  */
 export function sanitizePdfMeta(raw: unknown, media: readonly MediaRef[] = []): PdfMeta {
@@ -448,7 +479,7 @@ export function sanitizePdfMeta(raw: unknown, media: readonly MediaRef[] = []): 
       let n = 0;
       for (const key of Object.keys(rec)) {
         if (n >= PDF_FORM_MAX_FIELDS) break;
-        if (!isPdfId(key)) continue;
+        if (!isPdfFieldId(key)) continue;
         const v = sanitizePdfFormValue(rec[key]);
         if (v === null) continue;
         out[key] = v;
@@ -595,7 +626,7 @@ export function checkPdfInvariants(p: ProjectFile): string[] {
       continue;
     }
     for (const field of Object.keys(rec)) {
-      if (!isPdfId(field)) errors.push(`form field ${field}: invalid id`);
+      if (!isPdfFieldId(field)) errors.push(`form field ${field}: invalid id`);
       else if (sanitizePdfFormValue(rec[field]) === null)
         errors.push(`form field ${field}: invalid value`);
     }

@@ -14,7 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fontkit from "@pdf-lib/fontkit";
-import { PDFDocument, PDFName, PDFString, StandardFonts, degrees, rgb } from "pdf-lib";
+import { PDFBool, PDFDocument, PDFHexString, PDFName, PDFString, StandardFonts, degrees, rgb } from "pdf-lib";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const ffmpeg = path.join(root, "src-tauri", "binaries", "ffmpeg-x86_64-pc-windows-msvc.exe");
@@ -75,7 +75,7 @@ await make("large_300p.pdf", async () => {
 });
 
 /* form: text, checkbox, radio group, dropdown (AcroForm) */
-await make("form_acro.pdf", async () => {
+async function acroFormDoc() {
   const doc = await PDFDocument.create();
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const page = doc.addPage(A4);
@@ -92,7 +92,89 @@ await make("form_acro.pdf", async () => {
   const dd = form.createDropdown("colour");
   dd.addOptions(["Red", "Green", "Blue"]);
   dd.addToPage(page, { x: 160, y: 600, width: 150, height: 22 });
-  return doc.save();
+  return doc;
+}
+await make("form_acro.pdf", async () => (await acroFormDoc()).save());
+
+/* need_appearances: values filled in by another app that wrote NO appearance
+   streams and set /NeedAppearances true (the viewer is to draw them): a text
+   field "name" = "Filled elsewhere", a multi-line "notes" = "Line one" /
+   "Line two", a dropdown "colour" = "Green" */
+await make("need_appearances.pdf", async () => {
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const page = doc.addPage(A4);
+  const form = doc.getForm();
+  page.drawText("Name", { x: 60, y: 760, size: 12, font });
+  const name = form.createTextField("name");
+  name.setText("Filled elsewhere");
+  name.addToPage(page, { x: 160, y: 750, width: 300, height: 22 });
+  page.drawText("Notes", { x: 60, y: 710, size: 12, font });
+  const notes = form.createTextField("notes");
+  notes.enableMultiline();
+  notes.setText("Line one\nLine two");
+  notes.addToPage(page, { x: 160, y: 650, width: 300, height: 70 });
+  page.drawText("Colour", { x: 60, y: 610, size: 12, font });
+  const dd = form.createDropdown("colour");
+  dd.addOptions(["Red", "Green", "Blue"]);
+  dd.select("Green");
+  dd.addToPage(page, { x: 160, y: 600, width: 150, height: 22 });
+  for (const f of form.getFields()) {
+    for (const w of f.acroField.getWidgets()) w.dict.delete(PDFName.of("AP"));
+  }
+  form.acroForm.dict.set(PDFName.of("NeedAppearances"), PDFBool.True);
+  return doc.save({ updateFieldAppearances: false });
+});
+
+/* form_text_kinds: empty fields of every layout a value can need, for the
+   export's own field appearances (src/pdf/export/fields.ts):
+   "notes"  multi-line, auto size (DA size 0)
+   "fixed"  one line, 14 pt blue, right-aligned (Q 2)
+   "auto"   one line, auto size (DA size 0)
+   "code"   comb of 6 cells
+   "turned" one line turned 90 (/MK /R 90): a tall box read bottom to top
+   "pick"   list box: Red / אדום / Синий */
+await make("form_text_kinds.pdf", async () => {
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const page = doc.addPage(A4);
+  const form = doc.getForm();
+  const da = (field, s) => field.acroField.dict.set(PDFName.of("DA"), PDFString.of(s));
+  const label = (t, y) => page.drawText(t, { x: 60, y, size: 12, font });
+  label("Notes", 760);
+  const notes = form.createTextField("notes");
+  notes.enableMultiline();
+  notes.addToPage(page, { x: 160, y: 700, width: 300, height: 70 });
+  da(notes, "0 g /Helv 0 Tf");
+  label("Fixed", 660);
+  const fixed = form.createTextField("fixed");
+  fixed.addToPage(page, { x: 160, y: 650, width: 300, height: 24 });
+  da(fixed, "0 0 1 rg /Helv 14 Tf");
+  fixed.acroField.dict.set(PDFName.of("Q"), doc.context.obj(2));
+  label("Auto", 610);
+  const auto = form.createTextField("auto");
+  auto.addToPage(page, { x: 160, y: 600, width: 300, height: 30 });
+  da(auto, "0 g /Helv 0 Tf");
+  label("Code", 560);
+  const code = form.createTextField("code");
+  code.setMaxLength(6);
+  code.enableCombing();
+  code.addToPage(page, { x: 160, y: 550, width: 180, height: 24 });
+  da(code, "0 g /Helv 12 Tf");
+  label("Turned", 500);
+  const turned = form.createTextField("turned");
+  turned.addToPage(page, { x: 180, y: 360, width: 140, height: 24, rotate: degrees(90) });
+  da(turned, "0 g /Helv 12 Tf");
+  label("Pick", 340);
+  const pick = form.createOptionList("pick");
+  pick.addToPage(page, { x: 160, y: 270, width: 150, height: 60 });
+  da(pick, "0 g /Helv 12 Tf");
+  // set after addToPage: pdf-lib would try to draw the options in Helvetica
+  pick.acroField.dict.set(
+    PDFName.of("Opt"),
+    doc.context.obj(["Red", "אדום", "Синий"].map((t) => PDFHexString.fromText(t))),
+  );
+  return doc.save({ updateFieldAppearances: false });
 });
 
 /* rotated: page 2 carries /Rotate 90 */
@@ -268,3 +350,18 @@ await make("encrypted.pdf", async () => encryptRc4(await (async () => {
   textPage(doc, font, 1, 1, "secret");
   return doc.save({ useObjectStreams: false });
 })(), "taroting"));
+
+/* owner-only: encrypted with an EMPTY user password, so it opens without one
+   while its permissions stay locked (the common "protected" PDF) - the export
+   must still write a plain file from it */
+await make("owner_only.pdf", async () => encryptRc4(await (async () => {
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  for (let i = 1; i <= 3; i++) textPage(doc, font, i, 3);
+  doc.setTitle("Owner only");
+  return doc.save({ useObjectStreams: false });
+})(), ""));
+
+/* owner-only form: the form_acro document behind an empty user password */
+await make("owner_form.pdf", async () =>
+  encryptRc4(await (await acroFormDoc()).save({ useObjectStreams: false }), ""));

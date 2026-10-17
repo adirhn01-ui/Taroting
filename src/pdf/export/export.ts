@@ -13,12 +13,15 @@
 // bidi-js are reachable from nowhere else.
 
 import fontkit from "@pdf-lib/fontkit";
-import { PDFDocument, degrees } from "pdf-lib";
+import { PDFDict, PDFDocument, PDFName, degrees } from "pdf-lib";
+import { ipc } from "../../core/ipc";
 import type { PdfExportPreset, ProjectFile } from "../../core/types";
-import { assemble } from "./assemble";
+import { assemble, drawFieldAppearances, type Assembled } from "./assemble";
+import { checkpoints, throwIfAborted } from "./cancel";
 import { appDeps, type ExportDeps } from "./deps";
-import { PdfExportError, baseName } from "./errors";
-import { flattenForms } from "./flatten";
+import { PdfExportError, baseName, own } from "./errors";
+import { clearNeedAppearances, drawMissingFieldAppearances } from "./fields";
+import { fieldsNeedingAppearance, flattenForms, separateDuplicateFields } from "./flatten";
 import { buildAppearance, markContext, pageGeom, placeAppearances, type Appearance } from "./marks";
 import { planExtract } from "./plan";
 import type { PdfSaveIpc } from "./write";
@@ -33,6 +36,10 @@ export interface PdfExportOptions extends PdfExportPreset {
   /** by PdfSource.id, for a source that needs one (none in v1: projects with
    *  a password-protected source are refused when it is added) */
   passwords?: Record<string, string>;
+  /** cancels the build (checked between pages and marks, with the event loop
+   *  given a turn every few ms) — it rejects with a DOMException named
+   *  "AbortError". The write is cancelled through the save IPC. */
+  signal?: AbortSignal;
 }
 
 /** A4 portrait, for a blank page whose size did not survive. */
@@ -72,13 +79,38 @@ export async function buildPdf(project: ProjectFile, opts: PdfExportOptions, dep
     }
   }
 
-  const assembled = await assemble(pdf, plan, async (id) => bytes.get(id)!, deps, opts.passwords);
+  const signal = opts.signal;
+  const tick = checkpoints(signal);
+  const assembled = await assemble(pdf, plan, async (id) => bytes.get(id)!, deps, opts.passwords, signal);
   bytes.clear();
+  throwIfAborted(signal);
 
-  const doc = assembled
-    ? await PDFDocument.load(assembled, { updateMetadata: false })
-    : await PDFDocument.create({ updateMetadata: false });
+  let doc = assembled ? await loadAssembled(assembled) : await PDFDocument.create({ updateMetadata: false });
+  await tick();
+  // A value the file holds no appearance for (or whose form asks the viewer
+  // to draw them all — /NeedAppearances) would vanish with a flattened form,
+  // and shows only in viewers that honour the flag in a kept one: have pdf.js
+  // draw those first, on a copy without the flag (pdf.js writes no appearance
+  // while it is set). The flag is checked first so a kept form without it
+  // costs nothing.
+  if (!opts.flattenForms) separateDuplicateFields(doc);
+  const acro0 = doc.catalog.lookup(PDFName.of("AcroForm"));
+  const flagged = acro0 instanceof PDFDict && acro0.has(PDFName.of("NeedAppearances"));
+  if (opts.flattenForms || flagged) {
+    const missing = fieldsNeedingAppearance(doc);
+    if (missing.size) {
+      doc.catalog.lookup(PDFName.of("AcroForm"), PDFDict).delete(PDFName.of("NeedAppearances"));
+      const plain = await doc.save({ updateFieldAppearances: false, useObjectStreams: false });
+      await tick();
+      doc = await PDFDocument.load(await drawFieldAppearances(deps, plain, missing), { updateMetadata: false });
+      await tick();
+    }
+  }
   doc.registerFontkit(fontkit);
+  // What pdf.js could not draw (a value its font cannot encode: Hebrew,
+  // Cyrillic, Greek…) gets an appearance of ours (fields.ts).
+  const { left } = await drawMissingFieldAppearances(doc, deps, tick);
+  if (!opts.flattenForms && left === 0) clearNeedAppearances(doc);
 
   plan.pages.forEach((p, i) => {
     if (p.src === null) doc.insertPage(i, blankSize(p.w, p.h));
@@ -103,20 +135,55 @@ export async function buildPdf(project: ProjectFile, opts: PdfExportOptions, dep
   const cx = markContext(doc, project, deps);
   const now = deps.now();
   for (let i = 0; i < plan.pages.length; i++) {
-    const marks = pdf.annots?.[plan.pages[i]!.id];
-    if (!marks?.length) continue;
+    const marks = own(pdf.annots, plan.pages[i]!.id);
+    if (!Array.isArray(marks) || !marks.length) continue;
     const page = pages[i]!;
     const geom = pageGeom(page);
     const items: { id: string; app: Appearance }[] = [];
     for (const a of marks) {
+      await tick();
       const app = await buildAppearance(a, geom, cx);
       if (app && app.ops) items.push({ id: a.id, app });
     }
+    await tick();
     placeAppearances(doc, page, items, opts.flattenMarks, now);
   }
 
+  await tick();
   doc.setModificationDate(now);
-  return doc.save({ updateFieldAppearances: false, useObjectStreams: true });
+  const out = await doc.save({ updateFieldAppearances: false, useObjectStreams: true });
+  throwIfAborted(signal);
+  return out;
+}
+
+/** pdf-lib's document of what pdf.js assembled: the sentinel page removed and
+ *  the information it cost put back (see assemble.ts). */
+async function loadAssembled(a: Assembled): Promise<PDFDocument> {
+  let doc: PDFDocument;
+  try {
+    doc = await PDFDocument.load(a.bytes, { updateMetadata: false });
+  } catch (e) {
+    // pdf.js writes a plain file (the sentinel sees to that); anything else is
+    // a defect of ours, said plainly rather than in pdf-lib's words
+    const encrypted = e instanceof Error && /encrypted/i.test(e.message);
+    throw new PdfExportError(
+      "source-invalid",
+      encrypted ? "The pages could not be put together: the PDF is encrypted." : "The pages could not be put together.",
+    );
+  }
+  if (a.sentinel) {
+    // through the catalog: pdf-lib's removePage leaves its page cache stale
+    // (getPages() would still list the removed page)
+    doc.catalog.removeLeafNode(doc.catalog.Pages().Count().asNumber() - 1);
+  }
+  const info = a.info;
+  if (info) {
+    if (info.Title) doc.setTitle(info.Title);
+    if (info.Author) doc.setAuthor(info.Author);
+    if (info.Subject) doc.setSubject(info.Subject);
+    if (info.Keywords) doc.setKeywords([info.Keywords]);
+  }
+  return doc;
 }
 
 /** Every file the project reads — the backend refuses to write over one. */
@@ -138,8 +205,7 @@ export async function exportPdf(
 ): Promise<{ path: string; pages: number; bytes: number }> {
   const d = deps ?? (await appDeps());
   const out = await buildPdf(project, opts, d);
-  const saver = io ?? (await import("../../core/ipc")).ipc;
-  const path = await writePdf(saver, target, projectSources(project), out, onProgress);
+  const path = await writePdf(io ?? ipc, target, projectSources(project), out, onProgress);
   const pages = planExtract(project.pdf!.pages, opts.range).pages.length;
   return { path, pages, bytes: out.length };
 }

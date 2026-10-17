@@ -9,13 +9,25 @@
 // rotating /Matrix, so this covers it. Widgets live in page /Annots however
 // deeply their fields nest (/Kids), so a per-page walk reaches all of them.
 
-import { PDFArray, PDFDict, PDFName, PDFNumber, PDFRef, PDFStream, type PDFDocument } from "pdf-lib";
+import {
+  PDFArray,
+  PDFBool,
+  PDFDict,
+  PDFHexString,
+  PDFName,
+  PDFNumber,
+  PDFRef,
+  PDFStream,
+  PDFString,
+  type PDFDocument,
+  type PDFObject,
+} from "pdf-lib";
 import { isSubtype, num } from "./marks";
 
 /** Annotation flags that keep a widget off the page (Hidden 2, NoView 32). */
-const HIDDEN = 2 | 32;
+export const HIDDEN = 2 | 32;
 
-function numbers(arr: unknown, n: number): number[] | null {
+export function numbers(arr: unknown, n: number): number[] | null {
   if (!(arr instanceof PDFArray) || arr.size() < n) return null;
   const out: number[] = [];
   for (let i = 0; i < n; i++) {
@@ -57,7 +69,7 @@ export function widgetPlacement(rect: number[], bbox: number[], matrix: number[]
 }
 
 /** The widget's normal appearance stream ref for its current state. */
-function normalAppearance(doc: PDFDocument, w: PDFDict): PDFRef | null {
+export function normalAppearance(doc: PDFDocument, w: PDFDict): PDFRef | null {
   const ap = w.lookup(PDFName.of("AP"));
   if (!(ap instanceof PDFDict)) return null;
   let n = ap.get(PDFName.of("N"));
@@ -121,4 +133,117 @@ export function flattenForms(doc: PDFDocument): number {
   }
   doc.catalog.delete(PDFName.of("AcroForm"));
   return painted;
+}
+
+/* ---------------- values with no appearance ---------------- */
+
+/** pdf.js's id of the widget at `ref` (its annotation id / storage key). */
+export function pdfjsId(ref: PDFRef): string {
+  return ref.generationNumber === 0 ? `${ref.objectNumber}R` : `${ref.objectNumber}R${ref.generationNumber}`;
+}
+
+/** A field entry from the dictionary or its /Parent chain (a field's /FT and
+ *  /V are inheritable). Bounded: a crafted /Parent loop ends. */
+export function inherited(d: PDFDict, key: string): PDFObject | undefined {
+  let cur: PDFDict | undefined = d;
+  for (let depth = 0; cur && depth < 64; depth++) {
+    const v = cur.lookup(PDFName.of(key));
+    if (v !== undefined) return v;
+    const p: PDFObject | undefined = cur.lookup(PDFName.of("Parent"));
+    cur = p instanceof PDFDict ? p : undefined;
+  }
+  return undefined;
+}
+
+export function hasValue(v: PDFObject | undefined): boolean {
+  if (v instanceof PDFString || v instanceof PDFHexString) return v.decodeText().trim() !== "";
+  if (v instanceof PDFArray) return v.size() > 0;
+  return v instanceof PDFName;
+}
+
+/** The widget's turn as pdf.js reads it (/MK /R, else /Rotate): a multiple of
+ *  90 in 0..270, else 0. */
+export function widgetTurn(w: PDFDict): number {
+  const mk = w.lookup(PDFName.of("MK"));
+  const r = mk instanceof PDFDict ? mk.lookup(PDFName.of("R")) : w.lookup(PDFName.of("Rotate"));
+  if (!(r instanceof PDFNumber)) return 0;
+  const a = ((Math.trunc(r.asNumber()) % 360) + 360) % 360;
+  return a % 90 === 0 ? a : 0;
+}
+
+/** The text and choice widgets whose value a flattened export would lose:
+ *  a value and no normal appearance — or every valued one when the form sets
+ *  /NeedAppearances (the viewer is to draw them; what is there may be stale).
+ *  pdf.js id → the widget's turn. Buttons are left alone (pdf.js draws no
+ *  check box, and a check box without its on/off appearances is rare). */
+export function fieldsNeedingAppearance(doc: PDFDocument): Map<string, number> {
+  const out = new Map<string, number>();
+  const acro = doc.catalog.lookup(PDFName.of("AcroForm"));
+  if (!(acro instanceof PDFDict)) return out;
+  const flag = acro.lookup(PDFName.of("NeedAppearances"));
+  const all = flag instanceof PDFBool && flag.asBoolean();
+  const ctx = doc.context;
+  for (const page of doc.getPages()) {
+    const annots = page.node.Annots();
+    if (!annots) continue;
+    for (let i = 0; i < annots.size(); i++) {
+      const raw = annots.get(i);
+      if (!(raw instanceof PDFRef)) continue; // pdf.js cannot save an inline widget
+      const a = ctx.lookup(raw);
+      if (!(a instanceof PDFDict) || !isSubtype(a, "Widget")) continue;
+      const flags = a.lookup(PDFName.of("F"));
+      if (flags instanceof PDFNumber && flags.asNumber() & HIDDEN) continue;
+      const ft = inherited(a, "FT");
+      if (!(ft instanceof PDFName) || (ft.asString() !== "/Tx" && ft.asString() !== "/Ch")) continue;
+      if (!hasValue(inherited(a, "V"))) continue;
+      if (all || !normalAppearance(doc, a)) out.set(pdfjsId(raw), widgetTurn(a));
+    }
+  }
+  return out;
+}
+
+/* ---------------- merged forms ---------------- */
+
+/** Rename the later of two top-level form fields with the same name
+ *  ("name" → "name_2"): pdf.js merges every source's fields as they are, and a
+ *  viewer treats fields of one name as ONE field — two copies of a form filled
+ *  in differently would show one copy's values in both. Each copy keeps its
+ *  own values; the names of nested fields follow their renamed parent.
+ *  Returns how many were renamed. */
+export function separateDuplicateFields(doc: PDFDocument): number {
+  const acro = doc.catalog.lookup(PDFName.of("AcroForm"));
+  if (!(acro instanceof PDFDict)) return 0;
+  const fields = acro.lookup(PDFName.of("Fields"));
+  if (!(fields instanceof PDFArray)) return 0;
+  const T = PDFName.of("T");
+  const nameOf = (d: PDFDict): string | null => {
+    const t = d.lookup(T);
+    return t instanceof PDFString || t instanceof PDFHexString ? t.decodeText() : null;
+  };
+  const dicts: PDFDict[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < fields.size(); i++) {
+    const d = fields.lookup(i);
+    if (!(d instanceof PDFDict) || dicts.includes(d)) continue;
+    dicts.push(d);
+    const n = nameOf(d);
+    if (n !== null) seen.add(n);
+  }
+  const taken = new Set<string>();
+  let renamed = 0;
+  for (const d of dicts) {
+    const n = nameOf(d);
+    if (n === null) continue;
+    if (!taken.has(n)) {
+      taken.add(n);
+      continue;
+    }
+    let k = 2;
+    while (seen.has(`${n}_${k}`) || taken.has(`${n}_${k}`)) k++;
+    const fresh = `${n}_${k}`;
+    d.set(T, PDFHexString.fromText(fresh));
+    taken.add(fresh);
+    renamed++;
+  }
+  return renamed;
 }

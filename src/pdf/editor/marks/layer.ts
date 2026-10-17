@@ -5,9 +5,10 @@
 // its CSS size changes.
 //
 // Inside the turned group, bottom to top:
-//   marks  — the saved marks (render.ts), rebuilt for a page only when that
+//   marks  — the saved marks (render.ts), repainted for a page only when that
 //            page's mark list (`pdf.annots[pageId]`, an immutable array)
-//            changes reference, or its page turns;
+//            changes reference; a repaint builds nodes only for the mark
+//            objects it has not drawn before (one node per mark object);
 //   chrome — selection outlines, handles and the ruler (the tools own it);
 //   live   — the mark a pointer is drawing, and the text editor.
 //
@@ -16,7 +17,7 @@
 // `pagevisible` and `pagehidden` for its page; pages already visible when the
 // layer mounts are picked up at once. Nothing runs at rest.
 
-import type { PdfPage, PdfRotation, ProjectFile } from "../../../core/types";
+import type { PdfAnnot, PdfPage, PdfRotation, ProjectFile } from "../../../core/types";
 import { mediaUrl } from "../../../core/ipc";
 import { pageAnnots } from "../../model";
 import type { PdfEditorCtx } from "../../types";
@@ -68,6 +69,8 @@ export function createMarkLayer(ctx: PdfEditorCtx): MarkLayer {
   const frames = new Map<string, PageFrame>();
   /** what each frame last painted: the page object and its mark list */
   const painted = new Map<string, { page: PdfPage; annots: readonly unknown[]; media: readonly unknown[] }>();
+  /** each frame's node per (immutable) mark object; null = draws nothing */
+  const nodeCache = new Map<string, Map<PdfAnnot, SVGElement | null>>();
   /** measured source sizes, by "src|index" */
   const srcInfo = new Map<string, { w: number; h: number; rotate: PdfRotation }>();
   const pending = new Map<string, Promise<{ w: number; h: number; rotate: PdfRotation } | null>>();
@@ -123,14 +126,31 @@ export function createMarkLayer(ctx: PdfEditorCtx): MarkLayer {
     else f.root.removeAttribute("transform");
   }
 
+  /** Bring a page's mark nodes up to `p`: marks are immutable, so a mark
+   *  object seen before keeps its node (only new or changed marks are built;
+   *  pictures are rebuilt when the media list changed — a relink moves their
+   *  file). Nodes are then put in draw order. */
   function paintMarks(f: PageFrame, p: ProjectFile): void {
     const page = pageOf(p, f.key);
     const annots = pageAnnots(p, f.key);
+    const last = painted.get(f.key);
+    const mediaChanged = !!last && last.media !== p.media;
     painted.set(f.key, { page: page!, annots, media: p.media });
-    while (f.marks.firstChild) f.marks.removeChild(f.marks.firstChild);
+    const prev = nodeCache.get(f.key) ?? new Map<PdfAnnot, SVGElement | null>();
+    const next = new Map<PdfAnnot, SVGElement | null>();
+    const want: SVGElement[] = [];
     for (const a of annots) {
-      const node = markNode(a, p.media, mediaUrl);
-      if (node) f.marks.appendChild(node);
+      const node = prev.has(a) && !(mediaChanged && a.t === "image") ? prev.get(a)! : markNode(a, p.media, mediaUrl);
+      next.set(a, node);
+      if (node) want.push(node);
+    }
+    nodeCache.set(f.key, next);
+    // drop the nodes no longer wanted, then order the rest (moves, no builds)
+    const keep = new Set<Node>(want);
+    for (const n of Array.from(f.marks.childNodes)) if (!keep.has(n)) f.marks.removeChild(n);
+    const kids = f.marks.childNodes; // live
+    for (let i = 0; i < want.length; i++) {
+      if (kids[i] !== want[i]) f.marks.insertBefore(want[i]!, kids[i] ?? null);
     }
   }
 
@@ -159,6 +179,7 @@ export function createMarkLayer(ctx: PdfEditorCtx): MarkLayer {
     if (!f) return;
     frames.delete(key);
     painted.delete(key);
+    nodeCache.delete(key);
     f.svg.remove();
     if (tell) emit(key, null);
   }

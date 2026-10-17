@@ -319,9 +319,10 @@ describe.skipIf(!hasFixture("form_acro.pdf", "plain_3p.pdf"))("forms", () => {
     expect(byName["agree"]!.fieldValue).not.toBe("Off");
     expect(byName["colour"]!.fieldValue).toEqual(["Blue"]);
     expect(fields?.get("size")?.some((f) => f["value"] === "large" || f["exportValues"] === "large")).toBe(true);
-    // a value pdf.js could not draw here is left to the viewer (see below)
+    // the value pdf.js could not draw got an appearance of ours (fields.ts),
+    // so the form no longer asks the viewer to draw its fields
     const lib0 = await PDFDocument.load(out);
-    expect(lib0.catalog.lookup(PDFName.of("AcroForm"))?.toString()).toContain("/NeedAppearances true");
+    expect(lib0.catalog.lookup(PDFName.of("AcroForm"))?.toString()).not.toContain("/NeedAppearances");
     // pdf-lib sees the same value
     const lib = await PDFDocument.load(out);
     expect((lib.getForm().getField("name") as PDFTextField).getText()).toBe("Adir שלום");
@@ -346,10 +347,9 @@ describe.skipIf(!hasFixture("form_acro.pdf", "plain_3p.pdf"))("forms", () => {
     expect(names).toEqual(expect.arrayContaining(["name", "agree", "size", "colour", "other"]));
   });
 
-  // pdf.js draws a non-Latin field value with its FakeUnicodeFont, which
-  // measures with OffscreenCanvas — present in the app's worker, absent in
-  // node (there pdf.js leaves the field without an appearance and sets
-  // NeedAppearances). So the node check of flattened values is Latin.
+  // A value pdf.js cannot encode (Hebrew here) gets NO appearance from its
+  // save path, in the app's worker as in node — export draws it itself
+  // (fields.ts, tested in fields.test.ts). This one checks a Latin value.
   it("flattening forms leaves no AcroForm and no widgets, and keeps the values on the page", async () => {
     const form = source("form_acro.pdf");
     const p = project([form], [pg(form, 0)], {}, { [form.id]: { ...VALUES, "9R": "Adir Latin" } });

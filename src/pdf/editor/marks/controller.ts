@@ -13,7 +13,7 @@
 // The text layer follows the tool: ON for Select and Highlight (and in Fill
 // forms mode), OFF while any other tool owns the pointer.
 
-import type { PdfSignature } from "../../../core/types";
+import type { PdfRotation, PdfSignature } from "../../../core/types";
 import type { PdfToolId } from "../../types";
 import { normalizeHexColor } from "../../../core/session";
 import { shortcutsBlocked } from "../../../core/shortcuts";
@@ -23,12 +23,58 @@ import type { PdfEditorCtx } from "../../types";
 import type { Env, Gesture } from "./env";
 import { HIT_CSS, onNativeTarget, paintChrome, selectedMarks, startRuler, startSelect, type SelRef } from "./select";
 import { highlightSelection, startBox, startEraser, startInk, startShape } from "./draw";
-import { clampFont, geometryPatch, stepSize, topmostAt } from "./geom";
-import type { MarkLayer } from "./layer";
+import { boxForFrame, boxPoints, clampFont, geometryPatch, rotField, screenToPageDelta, stepSize, topmostAt } from "./geom";
+import type { MarkLayer, PageInfo } from "./layer";
 import { openTextEditor, type TextEditor } from "./text";
 
 /** A placed signature's default width, points (aspect kept). */
 export const SIGNATURE_W = 160;
+
+/**
+ * A placed signature's box, centred on the click (x, y): SIGNATURE_W wide ON
+ * SCREEN at its aspect — upright on a page shown turned (`r`, see geom.ts) —
+ * scaled down (aspect kept) to fit the page, and kept on it. Pure.
+ */
+export function signatureBox(
+  info: PageInfo | null,
+  x: number,
+  y: number,
+  aspect: number,
+): { x: number; y: number; w: number; h: number; r?: PdfRotation } {
+  const rot = info?.rot ?? 0;
+  const a = aspect > 0 && Number.isFinite(aspect) ? aspect : 1;
+  let W = SIGNATURE_W;
+  let H = W / a;
+  if (info) {
+    const shown = boxPoints(info.w, info.h, rot);
+    const k = Math.min(1, shown.W / W, shown.H / H);
+    W *= k;
+    H *= k;
+  }
+  const { w, h } = boxForFrame(W, H, rot);
+  let bx = x - w / 2;
+  let by = y - h / 2;
+  if (info) {
+    bx = Math.max(0, Math.min(bx, info.w - w));
+    by = Math.max(0, Math.min(by, info.h - h));
+  }
+  return { x: bx, y: by, w, h, ...rotField(rot) };
+}
+
+/** Is a key event's target a form control (or inside the inspector), where
+ *  arrow keys belong to the control? Duck-typed (no HTMLElement in tests). */
+function onFormControl(target: EventTarget | null): boolean {
+  const t = target as { tagName?: unknown; closest?: (s: string) => unknown } | null;
+  if (!t) return false;
+  const tag = typeof t.tagName === "string" ? t.tagName.toUpperCase() : "";
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || tag === "BUTTON") return true;
+  return typeof t.closest === "function" && !!t.closest(".inspector");
+}
+
+/** Is a modal dialog open (the Export dialog, the signature pad)? */
+function modalOpen(): boolean {
+  return typeof document !== "undefined" && !!document.querySelector(".modal-backdrop");
+}
 
 /** Does this tool want the text layer (native text selection)? */
 export function wantsTextLayer(tool: PdfToolId, mode: "annotate" | "forms"): boolean {
@@ -279,12 +325,11 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
 
   function placeSignature(key: string, x: number, y: number, sig: PdfSignature): void {
     const info = layer.info(key);
-    const w = info ? Math.min(SIGNATURE_W, info.w) : SIGNATURE_W;
-    const h = w / sig.aspect;
+    const box = signatureBox(info, x, y, sig.aspect);
     const c = normalizeHexColor(ctx.tools.get().colors.pen, "#000000");
     const id = newId();
     const before = session.project;
-    session.commit((p) => addAnnot(p, key, { id, t: "signature", x: x - w / 2, y: y - h / 2, w, h, c, strokes: [...sig.strokes] }));
+    session.commit((p) => addAnnot(p, key, { id, t: "signature", ...box, c, strokes: [...sig.strokes] }));
     if (session.project !== before) {
       armed = null;
       ctx.tools.update((s) => ({ ...s, tool: "select" }));
@@ -396,6 +441,16 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
     }),
   );
   cleanup.push(view.on("layout", repaintChrome));
+  // Fill forms mode hides the ruler (paintChrome skips it) and leaving the
+  // mode shows it again where it was
+  let chromeMode = ctx.mode.get();
+  cleanup.push(
+    ctx.mode.subscribe((m) => {
+      if (m === chromeMode) return;
+      chromeMode = m;
+      repaintChrome();
+    }),
+  );
   cleanup.push(
     layer.onFrame((key, f) => {
       if (!f && editor && editor.key === key) editor.commit();
@@ -432,18 +487,21 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
     return true;
   }
 
+  /** Move the selection by a SCREEN step: each mark's page turns it into its
+   *  own page-space step, so Right moves right on screen on a turned page. */
   function nudge(sel: readonly SelRef[], dx: number, dy: number): void {
     session.commit((p) => {
       let next = p;
       for (const m of selectedMarks(p, sel)) {
-        next = updateAnnot(next, m.key, m.a.id, geometryPatch(translateAnnot(m.a, dx, dy)) as PdfAnnotPatch);
+        const d = screenToPageDelta(dx, dy, layer.info(m.key)?.rot ?? 0);
+        next = updateAnnot(next, m.key, m.a.id, geometryPatch(translateAnnot(m.a, d.x, d.y)) as PdfAnnotPatch);
       }
       return next;
     });
   }
 
   const onKey = (e: KeyboardEvent): void => {
-    if (blocked() || e.defaultPrevented || ctx.isTyping(e.target) || shortcutsBlocked()) return;
+    if (blocked() || e.defaultPrevented || ctx.isTyping(e.target) || shortcutsBlocked() || modalOpen()) return;
     if (e.ctrlKey || e.altKey || e.metaKey) return;
     const sel = ctx.selection.get();
     if (e.key === "Escape") {
@@ -457,7 +515,8 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
       }
       return;
     }
-    if (!sel.length) return;
+    // a focused slider / select / button owns its arrow keys
+    if (!sel.length || onFormControl(e.target)) return;
     const step = e.shiftKey ? 10 : 1;
     let dx = 0;
     let dy = 0;

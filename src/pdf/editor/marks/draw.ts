@@ -10,6 +10,7 @@
 
 import type { PdfAnnot, ShapeKind } from "../../../core/types";
 import { normalizeHexColor } from "../../../core/session";
+import { PDF_STROKE_MAX_POINTS } from "../../../core/pdf-sanitize";
 import { encodePoints } from "../../../image/strokes";
 import {
   EMA_OTHER,
@@ -22,7 +23,8 @@ import {
   simplifyStroke,
 } from "../../../image/ink/input";
 import { constrainShape, shapeLongEnough, type Pt } from "../../../image/ink/shapes";
-import { addAnnot, newId, pageAnnots, removeAnnots, type AnnotRef } from "../../model";
+import { toast } from "../../../ui/toast";
+import { addAnnot, canAddAnnots, newId, pageAnnots, removeAnnots, type AnnotRef } from "../../model";
 import type { Env, Gesture } from "./env";
 import { sameEdit } from "./env";
 import {
@@ -45,6 +47,31 @@ export const WHITEOUT_COLOR = "#ffffff";
 /** How near (screen px) outside a ruler edge a pen must land to follow it. */
 export const RULER_CATCH_CSS = 16;
 
+/** The page-full refusal (PDF_MAX_ANNOTS_PER_PAGE). */
+export const PAGE_FULL = "This page has the most marks a page can hold.";
+
+/** True when one more mark fits on page `key`; else says so (a gesture that
+ *  could not land is never started). */
+function roomFor(env: Env, key: string): boolean {
+  if (canAddAnnots(env.ctx.session.project, key, 1)) return true;
+  toast.refuse(PAGE_FULL);
+  return false;
+}
+
+/** A stroke the project validator keeps (PDF_STROKE_MAX_POINTS): past the
+ *  cap, every k-th point (and the last) — a stroke that long is minutes of
+ *  continuous drawing, and dropping it whole on the next load would be worse. */
+export function capPoints(pts: Float32Array): Float32Array {
+  const n = Math.floor(pts.length / 3);
+  if (n <= PDF_STROKE_MAX_POINTS) return pts;
+  const k = Math.ceil(n / (PDF_STROKE_MAX_POINTS - 1));
+  const out: number[] = [];
+  for (let i = 0; i < n; i += k) out.push(pts[i * 3]!, pts[i * 3 + 1]!, pts[i * 3 + 2]!);
+  const last = (n - 1) * 3;
+  if ((n - 1) % k !== 0) out.push(pts[last]!, pts[last + 1]!, pts[last + 2]!);
+  return Float32Array.from(out);
+}
+
 function liveNode(env: Env, key: string, node: SVGElement | null, prev: SVGElement | null): SVGElement | null {
   prev?.remove();
   const f = env.layer.frame(key);
@@ -66,7 +93,7 @@ export function rulerOn(env: Env, key: string): RulerPose | null {
 export function startInk(env: Env, e: PointerEvent, key: string, kind: "pen" | "pencil" | "marker"): Gesture | null {
   const { ctx } = env;
   const at = env.pt(key, e);
-  if (!at) return null;
+  if (!at || !roomFor(env, key)) return null;
   const s = ctx.tools.get();
   const zoom = env.zoom();
   const color = normalizeHexColor(s.colors[kind], "#000000");
@@ -135,7 +162,7 @@ export function startInk(env: Env, e: PointerEvent, key: string, kind: "pen" | "
       path?.remove();
       path = null;
       if (sampler.count < 1) return;
-      const pts = simplifyStroke(sampler.points, sampler.count, SIMPLIFY_CSS / zoom);
+      const pts = capPoints(simplifyStroke(sampler.points, sampler.count, SIMPLIFY_CSS / zoom));
       const o = kind === "marker" ? MARKER_OPACITY : kind === "pencil" ? pencilOpacity(sampler.meanPressure()) : 1;
       const annot: PdfAnnot = { id: newId(), t: "ink", kind, c: color, w, o, p: encodePoints(pts) };
       ctx.session.commit((p) => addAnnot(p, key, annot));
@@ -155,7 +182,7 @@ export function startInk(env: Env, e: PointerEvent, key: string, kind: "pen" | "
 export function startShape(env: Env, e: PointerEvent, key: string): Gesture | null {
   const { ctx } = env;
   const at = env.pt(key, e);
-  if (!at) return null;
+  if (!at || !roomFor(env, key)) return null;
   const s = ctx.tools.get();
   const kind: ShapeKind = s.shape;
   const zoom = env.zoom();
@@ -207,7 +234,7 @@ export function startShape(env: Env, e: PointerEvent, key: string): Gesture | nu
 export function startBox(env: Env, e: PointerEvent, key: string, kind: "whiteout" | "highlight"): Gesture | null {
   const { ctx } = env;
   const at = env.pt(key, e);
-  if (!at) return null;
+  if (!at || !roomFor(env, key)) return null;
   const zoom = env.zoom();
   const s = ctx.tools.get();
   const color = kind === "whiteout" ? WHITEOUT_COLOR : normalizeHexColor(s.colors.highlight, "#ffd400");

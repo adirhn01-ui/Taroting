@@ -111,7 +111,58 @@ describe("saved marks as SVG", () => {
     const lines = box.children;
     expect(lines.map((l) => l.textContent)).toEqual(textLines(a as Extract<PdfAnnot, { t: "text" }>).map((l) => l.text));
     expect(lines.map((l) => l.textContent)).toEqual(["שלום עולם", "hello", "world"]);
-    expect(lines.every((l) => l.getAttribute("dir") === "auto")).toBe(true);
+    expect(lines.map((l) => l.getAttribute("dir"))).toEqual(["rtl", "ltr", "ltr"]);
     expect(lines[2]!.style.top).toBe(`${2 * 10 * LINE_HEIGHT}px`);
+  });
+
+  it("a wrapped line takes its PARAGRAPH's direction, not its own (the export's bidi)", () => {
+    const a: PdfAnnot = { id: "t", t: "text", x: 0, y: 0, w: 30, h: 100, text: "abc שלום\nשלום abc", font: "Arial", size: 10, c: "#000000", bold: false, italic: false, align: "left" };
+    const lines = node(a).children[0]!.children;
+    expect(lines.map((l) => [l.textContent, l.getAttribute("dir")])).toEqual([
+      ["abc", "ltr"],
+      ["שלום", "ltr"],
+      ["שלום", "rtl"],
+      ["abc", "rtl"],
+    ]);
+  });
+
+  it("Impact draws plain whatever its Bold / Italic say (the export has no such faces)", () => {
+    const a: PdfAnnot = { id: "t", t: "text", x: 0, y: 0, w: 100, h: 20, text: "x", font: "Impact", size: 10, c: "#000000", bold: true, italic: true, align: "left" };
+    const box = node(a).children[0]!;
+    expect([box.style.fontWeight, box.style.fontStyle]).toEqual(["normal", "normal"]);
+  });
+});
+
+describe("marks placed on a turned page (r)", () => {
+  const text = (r?: 90 | 180 | 270): Extract<PdfAnnot, { t: "text" }> => ({
+    id: "t", t: "text", x: 100, y: 100, w: 40, h: 200, text: "hello world", font: "Arial", size: 10, c: "#000000", bold: false, italic: false, align: "left", ...(r ? { r } : {}),
+  });
+
+  it("text: drawn in its upright frame (w/h swapped), turned by -r about the box centre, wrapped to the frame's width", () => {
+    const fo = node(text(90));
+    expect([fo.getAttribute("x"), fo.getAttribute("y"), fo.getAttribute("width"), fo.getAttribute("height")]).toEqual(["20", "180", "200", "40"]);
+    expect(fo.getAttribute("transform")).toBe("rotate(-90 120 200)");
+    // 200 wide: one line (a 40-wide wrap would break it)
+    expect(fo.children[0]!.children.map((l) => l.textContent)).toEqual(["hello world"]);
+    expect(textLines(text(90)).map((l) => l.text)).toEqual(["hello world"]);
+    // unturned: exactly as before, no transform
+    const plain = node(text());
+    expect([plain.getAttribute("x"), plain.getAttribute("width")]).toEqual(["100", "40"]);
+    expect(plain.getAttribute("transform")).toBeNull();
+    expect(node(text(180)).getAttribute("transform")).toBe("rotate(-180 120 200)");
+  });
+
+  it("a picture and a signature turn the same way", () => {
+    const m = { id: "m1", path: "C:\\p.png" } as MediaRef;
+    const img = node({ id: "p", t: "image", x: 100, y: 100, w: 40, h: 200, media: "m1", r: 270 }, [m]);
+    expect([img.getAttribute("x"), img.getAttribute("y"), img.getAttribute("width"), img.getAttribute("height")]).toEqual(["20", "180", "200", "40"]);
+    expect(img.getAttribute("transform")).toBe("rotate(-270 120 200)");
+    const sig: PdfAnnot = { id: "s", t: "signature", x: 100, y: 100, w: 40, h: 200, c: "#000000", strokes: [encodePoints(new Float32Array([0, 0, 1, 1, 1, 1]))], r: 90 };
+    const n = node(sig);
+    expect(n.getAttribute("transform")).toBe("rotate(-90 120 200)");
+    // strokes span the 200-wide frame (x 20..220), not the 40-wide box
+    const xs = [...signatureD(sig as Extract<PdfAnnot, { t: "signature" }>).matchAll(/[ML](-?[\d.]+) (-?[\d.]+)/g)].map((q) => Number(q[1]));
+    expect(Math.min(...xs)).toBeLessThan(25);
+    expect(Math.max(...xs)).toBeGreaterThan(215);
   });
 });

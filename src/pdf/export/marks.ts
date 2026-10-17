@@ -13,6 +13,15 @@
 // `cm`, which would flip glyphs and pictures. Page space is the UNROTATED
 // page, so marks need nothing extra on a turned page: they turn with it.
 //
+// A text, image or signature mark with a turn `r` (core/types.ts) is laid out
+// as the editor does (src/pdf/editor/marks/geom.ts frameOf/frameRect): in an
+// upright W×H frame centred on its box — (W, H) = (w, h) for 0/180, (h, w)
+// for 90/270 — then turned counter-clockwise by r about the box centre, so
+// it reads upright on a page displayed turned clockwise by r. Text and
+// pictures get that turn as a `cm` inside the appearance stream (BBox and
+// Rect stay the box); signature points are turned numerically, so their
+// InkList is where the ink is.
+//
 // Ink shares the image editor's geometry: the same `outlinePolygon` (pen and
 // pencil are one filled variable-width outline) and the same arrow wings.
 
@@ -38,7 +47,9 @@ import { hasArabic, paragraphBidi, visualLine } from "./bidi";
 import type { ExportDeps } from "./deps";
 import { PdfExportError, baseName } from "./errors";
 import { displayedOf, prepareImage, type Orientation } from "./images";
-import { LINE_HEIGHT, wrapParagraph } from "./layout";
+import { LINE_HEIGHT, rasterScale, wrapParagraph } from "./layout";
+
+export { RASTER_SCALE } from "./layout";
 
 /* ---------------- numbers, colours, boxes ---------------- */
 
@@ -113,6 +124,36 @@ class Bounds {
 }
 
 const finite = (...v: number[]): boolean => v.every((n) => typeof n === "number" && Number.isFinite(n));
+
+/* ---------------- a box mark's turn ---------------- */
+
+type Turn = 0 | 90 | 180 | 270;
+const COS_SIN: Record<Turn, [number, number]> = { 0: [1, 0], 90: [0, 1], 180: [-1, 0], 270: [0, -1] };
+
+export function turnOf(a: { r?: unknown }): Turn {
+  return a.r === 90 || a.r === 180 || a.r === 270 ? a.r : 0;
+}
+
+/** A turned box mark's upright frame, page space: [x, y, W, H]. */
+export function frameOf(a: { x: number; y: number; w: number; h: number; r?: unknown }): [number, number, number, number] {
+  const r = turnOf(a);
+  const [W, H] = r === 90 || r === 270 ? [a.h, a.w] : [a.w, a.h];
+  return [a.x + a.w / 2 - W / 2, a.y + a.h / 2 - H / 2, W, H];
+}
+
+/** `cm` operands (with a trailing " cm ") turning user space counter-
+ *  clockwise by `r` about (cx, cy); "" for no turn. */
+export function turnCm(r: Turn, cx: number, cy: number): string {
+  if (r === 0) return "";
+  const [c, s] = COS_SIN[r];
+  return `${num(c)} ${num(s)} ${num(-s)} ${num(c)} ${num(cx - c * cx + s * cy)} ${num(cy - s * cx - c * cy)} cm `;
+}
+
+/** The same turn applied to one user-space point. */
+function turnPoint(r: Turn, cx: number, cy: number): (p: [number, number]) => [number, number] {
+  const [c, s] = COS_SIN[r];
+  return ([x, y]) => [cx + c * (x - cx) - s * (y - cy), cy + s * (x - cx) + c * (y - cy)];
+}
 
 /* ---------------- the appearance a mark becomes ---------------- */
 
@@ -338,9 +379,11 @@ export async function buildAppearance(a: PdfAnnot, geom: PageGeom, cx: MarkCtx):
       if (!finite(a.x, a.y, a.w, a.h) || !(a.w > 0) || !(a.h > 0)) return null;
       const { img, orientation } = await cx.image(a.media);
       const rect = boxRect(a.x, a.y, a.w, a.h);
+      const [fx, fy, fw, fh] = frameOf(a);
+      const turn = turnCm(turnOf(a), (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2);
       return {
         rect,
-        ops: `q ${imageMatrix(rect, orientation)} cm /Im0 Do Q`,
+        ops: `q ${turn}${imageMatrix(boxRect(fx, fy, fw, fh), orientation)} cm /Im0 Do Q`,
         resources: { XObject: { Im0: img.ref } },
         annot: { Subtype: "Stamp", Name: "Image" },
       };
@@ -353,17 +396,23 @@ export async function buildAppearance(a: PdfAnnot, geom: PageGeom, cx: MarkCtx):
       const b = new Bounds();
       const lists: number[][] = [];
       let body = "";
+      // drawn into the upright frame, then turned point by point
+      const [fx, fy, fw, fh] = frameOf(a);
+      const r = turnOf(a);
+      const box = boxRect(a.x, a.y, a.w, a.h);
+      const turnPt = turnPoint(r, (box[0] + box[2]) / 2, (box[1] + box[3]) / 2);
+      const UT = r === 0 ? U : (x: number, y: number): [number, number] => turnPt(U(x, y));
       for (const s of a.strokes ?? []) {
         const norm = decodePoints(s);
         if (!norm) continue;
         const pts = new Float32Array(norm.length);
         for (let i = 0; i + 2 < norm.length; i += 3) {
-          pts[i] = a.x + norm[i]! * a.w;
-          pts[i + 1] = a.y + norm[i + 1]! * a.h;
+          pts[i] = fx + norm[i]! * fw;
+          pts[i + 1] = fy + norm[i + 1]! * fh;
           pts[i + 2] = norm[i + 2]!;
         }
-        body += outlineOps(pts, half, U, b);
-        lists.push(inkList(pts, U));
+        body += outlineOps(pts, half, UT, b);
+        lists.push(inkList(pts, UT));
       }
       const rect = b.rect(1);
       if (!rect || !body) return null;
@@ -388,9 +437,6 @@ export function imageMatrix(rect: Rect, o: Orientation): string {
 
 /* ---------------- text boxes ---------------- */
 
-/** How many canvas px per point the Arabic fallback draws at. */
-export const RASTER_SCALE = 4;
-
 type TextAnnot = Extract<PdfAnnot, { t: "text" }>;
 
 async function textAppearance(
@@ -401,10 +447,18 @@ async function textAppearance(
   if (!finite(a.x, a.y, a.w, a.h, a.size) || !(a.w > 0) || !(a.h > 0) || !(a.size > 0)) return null;
   const text = typeof a.text === "string" ? a.text : "";
   const rect = boxRect(a.x, a.y, a.w, a.h);
+  // laid out in the upright frame (= the box without a turn), then turned
+  const [fx, fy, W, H] = frameOf(a);
+  const frame = boxRect(fx, fy, W, H);
+  const turn = turnCm(turnOf(a), (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2);
   const c = hexRgb(a.c);
   const size = a.size;
   const lh = size * LINE_HEIGHT;
-  const clip = `${num(rect[0])} ${num(rect[1])} ${num(a.w)} ${num(a.h)} re W n`;
+  // Impact has no bold or italic face: drawn plain, as the editor shows it
+  const plain = a.font === "Impact";
+  const bold = !plain && !!a.bold;
+  const italic = !plain && !!a.italic;
+  const clip = `${num(frame[0])} ${num(frame[1])} ${num(W)} ${num(H)} re W n`;
   const annot: Record<string, unknown> = {
     Subtype: "FreeText",
     Contents: PDFHexString.fromText(text),
@@ -417,44 +471,44 @@ async function textAppearance(
     const png = await cx.deps.rasterizeText({
       text,
       font: a.font,
-      bold: !!a.bold,
-      italic: !!a.italic,
+      bold,
+      italic,
       size,
       color: `#${[...c].map((v) => Math.round(v * 255).toString(16).padStart(2, "0")).join("")}`,
       align: a.align,
-      w: a.w,
-      h: a.h,
-      scale: RASTER_SCALE,
+      w: W,
+      h: H,
+      scale: rasterScale(W, H),
       lineHeight: lh,
     });
     const img = await cx.doc.embedPng(png);
     return {
       rect,
-      ops: `q ${clip} ${num(a.w)} 0 0 ${num(a.h)} ${num(rect[0])} ${num(rect[1])} cm /Im0 Do Q`,
+      ops: `q ${turn}${clip} ${num(W)} 0 0 ${num(H)} ${num(frame[0])} ${num(frame[1])} cm /Im0 Do Q`,
       resources: { XObject: { Im0: img.ref } },
       annot,
     };
   }
 
-  const { font, ascent, descent } = await cx.font(a.font, !!a.bold, !!a.italic);
+  const { font, ascent, descent } = await cx.font(a.font, bold, italic);
   const asc = ascent * size;
   const desc = descent * size;
   const lines: string[] = [];
   let row = 0;
   for (const para of text.split(/\r\n|\r|\n/)) {
     const bidi = paragraphBidi(para);
-    for (const [s, e] of wrapParagraph(para, a.w, (t) => font.widthOfTextAtSize(t, size))) {
+    for (const [s, e] of wrapParagraph(para, W, (t) => font.widthOfTextAtSize(t, size))) {
       const baseline = row * lh + (lh - (asc + desc)) / 2 + asc;
       row++;
-      if (baseline - asc > a.h) break; // fully below the box: clipped anyway
+      if (baseline - asc > H) break; // fully below the frame: clipped anyway
       const visual = visualLine(bidi, s, e);
       if (!visual) continue;
       const lw = font.widthOfTextAtSize(visual, size);
-      const lx = alignX(a.align, a.w, lw);
-      lines.push(`1 0 0 1 ${num(rect[0] + lx)} ${num(rect[3] - baseline)} Tm ${encodeVisual(font, visual)} Tj`);
+      const lx = alignX(a.align, W, lw);
+      lines.push(`1 0 0 1 ${num(frame[0] + lx)} ${num(frame[3] - baseline)} Tm ${encodeVisual(font, visual)} Tj`);
     }
   }
-  const ops = lines.length ? `q ${clip} BT /F0 ${num(size)} Tf ${rgbOps(c, "rg")} ${lines.join(" ")} ET Q` : "";
+  const ops = lines.length ? `q ${turn}${clip} BT /F0 ${num(size)} Tf ${rgbOps(c, "rg")} ${lines.join(" ")} ET Q` : "";
   return { rect, ops, resources: { Font: { F0: font.ref } }, annot };
 }
 

@@ -29,3 +29,9 @@ export function baseName(path: string): string {
   const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   return i >= 0 ? path.slice(i + 1) : path;
 }
+
+/** An own value of a record keyed by ids from a `.trt` — never one inherited
+ *  from Object.prototype ("toString", "valueOf"… are valid ids). */
+export function own<T>(rec: Readonly<Record<string, T>> | null | undefined, key: string): T | undefined {
+  return rec && Object.prototype.hasOwnProperty.call(rec, key) ? rec[key] : undefined;
+}

@@ -13,9 +13,20 @@ export interface ScrubHandlers {
   end?(): void;
 }
 
-/** Wires the drag on `track`; returns the unbind. */
-export function bindScrub(track: HTMLElement, h: ScrubHandlers): () => void {
+/** A wired track. */
+export interface ScrubBinding {
+  /** End a drag in progress as if the button were let go (end() runs); a
+   *  no-op when nothing is held. The viewer calls it when the media under the
+   *  bar goes away, so a held bar never seeks the NEXT file. */
+  cancel(): void;
+  /** Remove the listeners. */
+  dispose(): void;
+}
+
+/** Wires the drag on `track`. */
+export function bindScrub(track: HTMLElement, h: ScrubHandlers): ScrubBinding {
   let held = false;
+  let heldPointer = -1;
   const fromX = (clientX: number): void => {
     const box = track.getBoundingClientRect();
     if (box.width <= 0) return;
@@ -25,6 +36,7 @@ export function bindScrub(track: HTMLElement, h: ScrubHandlers): () => void {
     if (e.button !== 0 || !h.enabled()) return;
     e.preventDefault();
     held = true;
+    heldPointer = e.pointerId;
     try {
       track.setPointerCapture(e.pointerId);
     } catch {
@@ -36,24 +48,28 @@ export function bindScrub(track: HTMLElement, h: ScrubHandlers): () => void {
   const move = (e: PointerEvent): void => {
     if (held) fromX(e.clientX);
   };
-  const up = (e: PointerEvent): void => {
+  const release = (pointerId: number): void => {
     if (!held) return;
     held = false;
     try {
-      track.releasePointerCapture(e.pointerId);
+      track.releasePointerCapture(pointerId);
     } catch {
       /* not captured */
     }
     h.end?.();
   };
+  const up = (e: PointerEvent): void => release(e.pointerId);
   track.addEventListener("pointerdown", down);
   track.addEventListener("pointermove", move);
   track.addEventListener("pointerup", up);
   track.addEventListener("pointercancel", up);
-  return () => {
-    track.removeEventListener("pointerdown", down);
-    track.removeEventListener("pointermove", move);
-    track.removeEventListener("pointerup", up);
-    track.removeEventListener("pointercancel", up);
+  return {
+    cancel: () => release(heldPointer),
+    dispose: () => {
+      track.removeEventListener("pointerdown", down);
+      track.removeEventListener("pointermove", move);
+      track.removeEventListener("pointerup", up);
+      track.removeEventListener("pointercancel", up);
+    },
   };
 }

@@ -797,7 +797,7 @@ describe("Open and drop with PDFs", () => {
     expect(m.navigations).toEqual([{ view: "editor", projectPath: "C:\\Docs\\Taroting\\b cover.trt" }]);
   });
 
-  it("makes ONE project of several dropped PDFs, every page in the dropped order", async () => {
+  it("makes ONE project of several dropped PDFs, every page in name order, named after the first", async () => {
     readable(A, 1, 10);
     readable(B, 2, 20);
     // The drop hook (the same handler a real window drop runs) is published
@@ -811,13 +811,15 @@ describe("Open and drop with PDFs", () => {
     expect(m.saved).toHaveLength(1);
     const meta = m.saved[0]!.project.pdf!;
     const pathOf = new Map(meta.sources.map((s) => [s.id, s.path]));
-    // Dropped order ("b cover" before "a body"), NOT name order.
+    // Dropped "b cover" first, but name order wins, as it does for media: a
+    // drop hands the file under the pointer first, which is not an order the
+    // user chose.
     expect(meta.pages.map((p) => [pathOf.get(p.src!), p.page])).toEqual([
-      [A, 0],
       [B, 0],
       [B, 1],
+      [A, 0],
     ]);
-    expect(m.navigations).toHaveLength(1);
+    expect(m.navigations).toEqual([{ view: "editor", projectPath: "C:\\Docs\\Taroting\\a body.trt" }]);
   });
 
   it("with media: the media go to Open as unchanged, the PDFs make nothing, one toast says why", async () => {

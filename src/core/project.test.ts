@@ -49,6 +49,7 @@ import {
   PDF_STROKE_MAX_POINTS,
   PDF_TOTAL_MAX_POINTS,
   checkPdfInvariants,
+  isPdfFieldId,
   decodePdfPoints,
   emptyPdfTimeline,
   pdfHexColor,
@@ -1716,6 +1717,23 @@ describe("PDF project load: marks", () => {
     expect(survives(K("a3"), { align: "right" })).toBe(true);
   });
 
+  it("keeps a turn of 90/180/270 on text, image and signature marks, and no other", () => {
+    for (const k of ["a3", "a9", "a10"]) {
+      for (const r of [90, 180, 270]) {
+        const out = marksAfterLoad([{ ...K(k), r }], [PIC]);
+        expect((out[0] as { r?: number }).r, `${k} r=${r}`).toBe(r);
+      }
+      for (const r of [0, 45, -90, 360, "90", null, NaN]) {
+        const out = marksAfterLoad([{ ...K(k), r }], [PIC]);
+        expect(out.length, `${k} r=${String(r)} keeps the mark`).toBe(1);
+        expect("r" in out[0]!, `${k} r=${String(r)} is no turn`).toBe(false);
+      }
+    }
+    // the other kinds never carry one
+    const w = marksAfterLoad([{ ...K("a8"), r: 90 }]);
+    expect("r" in w[0]!).toBe(false);
+  });
+
   it("keeps an image mark only when its media is a real image in the project", () => {
     expect(marksAfterLoad([K("a9")], [])).toEqual([]);
     expect(marksAfterLoad([K("a9")], [{ ...PIC, kind: "video" }])).toEqual([]);
@@ -1768,25 +1786,34 @@ describe("PDF project load: forms and export options", () => {
   it("drops values of the wrong type or past the bounds", () => {
     const rec = formsAfter({
       s1: {
-        ok: "x",
-        n: 5,
-        nul: null,
-        obj: { a: 1 },
-        long: "x".repeat(20_001),
-        list501: Array(501).fill("a"),
-        mixed: ["a", 1],
-        longItem: ["x".repeat(20_001)],
-        list500: Array(500).fill("a"),
+        "1R": "x", // ok
+        "2R": 5,
+        "3R": null,
+        "4R": { a: 1 },
+        "5R": "x".repeat(20_001),
+        "6R": Array(501).fill("a"),
+        "7R": ["a", 1],
+        "8R": ["x".repeat(20_001)],
+        "9R": Array(500).fill("a"), // ok
       },
     }).s1!;
-    expect(Object.keys(rec)).toEqual(["ok", "list500"]);
+    expect(Object.keys(rec)).toEqual(["1R", "9R"]);
   });
 
   it("drops field ids that are not ids", () => {
-    // pdf.js widget ids: "<num>R", "<num>R<gen>", or "annot_..." — all kept
+    // pdf.js widget ids: "<num>R", "<num>R<gen>", or "annot_p<page>_<n>" — all kept
     expect(
       Object.keys(formsAfter({ s1: { "a b": "x", "": "y", "1R": "z", "12R3": "g", annot_p1_2: "a" } }).s1!),
     ).toEqual(["1R", "12R3", "annot_p1_2"]);
+  });
+
+  it("drops a key that is an id but not a pdf.js widget id", () => {
+    // pdf.js reads a "pdfjs_internal_editor_" storage key as a NEW annotation
+    // and the export breaks on it; built-in names are no field either
+    const keys = ["pdfjs_internal_editor_0", "toString", "R", "12", "12R3x", "annot_", "annot_x", "x1R", "7R"];
+    expect(Object.keys(formsAfter({ s1: Object.fromEntries(keys.map((k) => [k, "v"])) }).s1!)).toEqual(["7R"]);
+    expect(isPdfFieldId("pdfjs_internal_editor_0")).toBe(false);
+    expect(checkPdfInvariants(loadRaw(rawPdf())).length).toBe(0);
   });
 
   it("drops forms keyed by an unknown source, and a source with no value left", () => {
@@ -1873,9 +1900,12 @@ describe("PDF sanitizer mirrors (core cannot import their originals)", () => {
     expect(decodePdfPoints(pdfPts(2e6, 0, 1))).toBeNull();
   });
 
-  it("keeps the point caps equal to the image editor's", () => {
-    expect(PDF_STROKE_MAX_POINTS).toBe(MAX_STROKE_POINTS);
-    expect(PDF_TOTAL_MAX_POINTS).toBe(MAX_TOTAL_POINTS);
+  it("keeps the point caps no higher than the image editor's, and at the export-safe sizes", () => {
+    expect(PDF_STROKE_MAX_POINTS).toBeLessThanOrEqual(MAX_STROKE_POINTS);
+    expect(PDF_TOTAL_MAX_POINTS).toBeLessThanOrEqual(MAX_TOTAL_POINTS);
+    // a crafted file at the old 20M made an export run for minutes / GBs
+    expect(PDF_STROKE_MAX_POINTS).toBe(100_000);
+    expect(PDF_TOTAL_MAX_POINTS).toBe(2_000_000);
   });
 });
 

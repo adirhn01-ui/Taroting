@@ -326,7 +326,7 @@ fn make_thumb(src: &Path, dst: &Path, at_sec: f64, until: Instant, abandoned: &A
             Some(stderr) => last_words = stderr,
         }
     }
-    if let Some(at) = damaged_prefix_seek(src, dst, &seeks) {
+    if let Some(at) = damaged_prefix_seek(src, dst, &seeks, until, abandoned)? {
         match attempt(src, dst, at, until, abandoned)? {
             None => return Ok(Made::Done),
             Some(stderr) => last_words = stderr,
@@ -346,13 +346,33 @@ fn make_thumb(src: &Path, dst: &Path, at_sec: f64, until: Instant, abandoned: &A
 /// needs. The thumbnail is still the one asked for (same cache name); its
 /// frame is the first sound one, from the original file — never from a
 /// repair copy, which only exists once something plans playback.
-fn damaged_prefix_seek(src: &Path, dst: &Path, tried: &[f64]) -> Option<f64> {
+///
+/// The scan reads the whole sample table (a cold multi-GB recording is
+/// seconds of disk), so a caller that gave up or a spent deadline ends the
+/// request BEFORE it — the same errors `attempt` gives — and again after it,
+/// so a scan that outlived its request starts no ffmpeg.
+fn damaged_prefix_seek(src: &Path, dst: &Path, tried: &[f64], until: Instant, abandoned: &AtomicBool) -> Result<Option<f64>> {
+    still_wanted(until, abandoned)?;
     #[cfg(test)]
     tests::count_scan(dst);
     #[cfg(not(test))]
     let _ = dst;
-    let at = seek_up_to_ms(crate::media::damage::scan_damaged_prefix(src)?);
-    (at > 0.0 && !tried.iter().any(|t| (t - at).abs() < 0.0005)).then_some(at)
+    let found = crate::media::damage::scan_damaged_prefix(src);
+    still_wanted(until, abandoned)?;
+    let Some(t) = found else { return Ok(None) };
+    let at = seek_up_to_ms(t);
+    Ok((at > 0.0 && !tried.iter().any(|t| (t - at).abs() < 0.0005)).then_some(at))
+}
+
+/// `Ok` while the request is still wanted and has time left.
+fn still_wanted(until: Instant, abandoned: &AtomicBool) -> Result<()> {
+    if abandoned.load(Ordering::Relaxed) {
+        return Err(AppError::Ffmpeg("thumbnail abandoned".into()));
+    }
+    if until.saturating_duration_since(Instant::now()).is_zero() {
+        return Err(AppError::Ffmpeg("thumbnail timed out".into()));
+    }
+    Ok(())
 }
 
 /// `t` as a seek, rounded UP to the millisecond `-ss` is written with. An
@@ -858,6 +878,33 @@ mod tests {
         assert_eq!(seek_up_to_ms(60.0 + 1.0 / 30.0), 60.034);
         assert_eq!(format!("{:.3}", seek_up_to_ms(1.0 / 30.0)), "0.034");
         assert!(seek_up_to_ms(f64::NAN) == 0.0);
+    }
+
+    /// A cancelled or out-of-time request never walks the file for damage:
+    /// the scan is skipped (and nothing is counted) when the caller gave up
+    /// or the deadline is spent, and runs only for a live request.
+    #[test]
+    fn a_cancelled_or_late_thumbnail_does_not_scan_for_damage() {
+        let (dir, _cache) = scratch("no scan when unwanted");
+        let junk = dir.join("junk.mp4");
+        std::fs::write(&junk, vec![0x5au8; 4096]).unwrap();
+        let dst = dir.join("unwanted_0.jpg");
+        let later = Instant::now() + Duration::from_secs(60);
+
+        let gave_up = AtomicBool::new(true);
+        let e = damaged_prefix_seek(&junk, &dst, &[0.0], later, &gave_up).unwrap_err();
+        assert!(e.to_string().contains("abandoned"), "{e}");
+        assert_eq!(scans(&dst), 0, "abandoned: no scan");
+
+        let live = AtomicBool::new(false);
+        let spent = Instant::now();
+        let e = damaged_prefix_seek(&junk, &dst, &[0.0], spent, &live).unwrap_err();
+        assert!(e.to_string().contains("timed out"), "{e}");
+        assert_eq!(scans(&dst), 0, "deadline spent: no scan");
+
+        assert_eq!(damaged_prefix_seek(&junk, &dst, &[0.0], later, &live).unwrap(), None);
+        assert_eq!(scans(&dst), 1, "a live request scans");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Four requests for one thumbnail at once make it once and all get it.

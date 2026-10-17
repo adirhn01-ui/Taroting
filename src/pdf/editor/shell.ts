@@ -23,7 +23,7 @@ import { registerCloseTask } from "../../core/app-close";
 import { describeError, ipc } from "../../core/ipc";
 import type { LoadedProject } from "../../core/ipc";
 import { exitDest, navigate } from "../../core/nav";
-import type { EditorRoute } from "../../core/nav";
+import type { EditorRoute, Route } from "../../core/nav";
 import { isPdfProject } from "../../core/pdf-project";
 import { ProjectSession, currentSession, settingsStore } from "../../core/session";
 import {
@@ -41,7 +41,7 @@ import { icon } from "../../ui/icons";
 import { closeMenu, showMenu } from "../../ui/menu";
 import { createTempExits, createTempLeaveGate } from "../../ui/temp-project";
 import { toast } from "../../ui/toast";
-import { formValue, setFormValue } from "../model";
+import { deletePages, formValue, setFormValue } from "../model";
 import type { PdfDoc, PdfEditorCtx, PdfEditorHosts, PdfToolState, PdfViewPage } from "../types";
 import { createPdfView, createSearch, renderPageToBlob } from "../view";
 import { button, el } from "./el";
@@ -49,7 +49,7 @@ import { openPdfExportDialog } from "./export-dialog";
 import { mountFind } from "./find";
 import { formsPart } from "./forms";
 import { inspectorPart } from "./inspector";
-import { mountPagePanel } from "./pages";
+import { PageSelection, mountPagePanel } from "./pages";
 import { blankCover, writeCover } from "./save";
 import { openSources, openSourcesDialog } from "./sources";
 import type { SourceIssue } from "./sources";
@@ -141,7 +141,7 @@ export async function mountPdfEditor(
     if (!isPdfProject(project) || !project.pdf || project.pdf.pages.length === 0) {
       throw new Error("This file isn't a PDF project Taroting can open.");
     }
-    const { docs, issues } = await openSources(project.pdf.sources);
+    const { docs, issues } = await openSources(project.pdf.sources, project);
     built.docs = docs;
     // Superseded while the documents opened: give them back, touch nothing.
     if (isStale()) {
@@ -159,8 +159,9 @@ export async function mountPdfEditor(
       void s.dispose();
     }
     if (built.docs) void destroyDocs(built.docs);
-    root.textContent = "";
+    // Superseded: the root belongs to the newer screen now — leave it be.
     if (isStale()) return noop;
+    root.textContent = "";
     toast.error(`Couldn't open this PDF project: ${describeError(e)}`);
     navigate(exitDest(route));
     return noop;
@@ -294,7 +295,9 @@ function mount(
   root.textContent = "";
   root.appendChild(frame);
   undo.push(() => {
-    root.textContent = "";
+    // Only while the root still shows this frame: a failed mount that a newer
+    // navigation superseded must not wipe that screen.
+    if (frame.parentNode === root) root.textContent = "";
   });
 
   /* ---------------- overlays (body-parked surfaces) ---------------- */
@@ -329,6 +332,8 @@ function mount(
   const rawCommitFrom = session.commitFrom.bind(session);
   const rawUndo = session.undo.bind(session);
   const rawRedo = session.redo.bind(session);
+  /** the form values the strip shows (see syncForms) */
+  let shownForms: Record<string, Record<string, PdfFormValue>> | null = session.project.pdf?.forms ?? null;
   let typing: { field: string; before: ProjectFile; timer: number } | null = null;
   const endTyping = (): void => {
     const t = typing;
@@ -349,6 +354,9 @@ function mount(
     if (next === session.project) return;
     if (!typing) typing = { field, before: session.project, timer: 0 };
     window.clearTimeout(typing.timer);
+    // The field already shows this value: the forms sync must not re-render
+    // the page under the user's cursor for it.
+    shownForms = next.pdf?.forms ?? null;
     session.replace(next);
     typing.timer = window.setTimeout(endTyping, FORM_IDLE_MS);
   };
@@ -431,13 +439,14 @@ function mount(
     docs,
     tools: new Store<PdfToolState>(defaultToolState()),
     selection: new Store<{ key: string; id: string }[]>([]),
-    pageSelection: new Store<number[]>([]),
+    pageSelection: new PageSelection(() => session.project.pdf?.pages ?? []),
     mode: new Store<"annotate" | "forms">("annotate"),
     hasForms: new Store<boolean>(false),
     holdAutosave: () => session.holdAutosave(),
     registerOverlay,
     bindKey,
     isTyping,
+    leave: (to) => leave(to),
   };
 
   /* ---------------- page panel, find ---------------- */
@@ -473,11 +482,32 @@ function mount(
     viewPages = viewPagesOf(pages, docs);
     view.setPages(viewPages);
     panel.setPages(viewPages);
-    const n = viewPages.length;
-    const sel = ctx.pageSelection.get();
-    if (sel.some((s) => s >= n)) ctx.pageSelection.set(sel.filter((s) => s < n));
+    // The selection stays on the same pages (moved, or gone).
+    (ctx.pageSelection as PageSelection).remap(pages);
     find.refresh();
     paintPage();
+  }
+
+  /* ---------------- form values on screen ---------------- */
+
+  // The strip reads a field's value when it renders the page, and keeps the
+  // pages (setFormValue leaves pdf.pages alone), so an undo/redo of a value or
+  // a Clear form would leave the fields showing the old values. Any change of
+  // pdf.forms that the user did not just type re-renders the pages of the
+  // sources whose values changed.
+  function syncForms(): void {
+    const forms = session.project.pdf?.forms ?? null;
+    if (forms === shownForms) return;
+    const was = shownForms;
+    shownForms = forms;
+    const changed = new Set<string>();
+    for (const id of new Set([...Object.keys(was ?? {}), ...Object.keys(forms ?? {})])) {
+      if (was?.[id] !== forms?.[id]) changed.add(id);
+    }
+    if (changed.size === 0) return;
+    for (const pg of session.project.pdf?.pages ?? []) {
+      if (pg.src !== null && changed.has(pg.src)) view.invalidate(pg.id);
+    }
   }
 
   const unsubs: (() => void)[] = [];
@@ -672,6 +702,12 @@ function mount(
 
   const goHome = (): void => exits.confirmLeave(() => navigate(exitDest(route)));
   const goSettings = (): void => exits.confirmLeave(() => navigate({ view: "settings" }));
+  /** ctx.leave: a part's way out (the export dialog's "Open as image
+   *  project"). Another editor inherits this one's way back to the viewer. */
+  function leave(to: Route): void {
+    const dest: Route = to.view === "editor" && !to.returnTo && route.returnTo ? { ...to, returnTo: route.returnTo } : to;
+    exits.confirmLeave(() => navigate(dest));
+  }
   // The dialog registers its own closer (ctx.registerOverlay) and holds
   // ctx.session.blockLeave + a registerCloseTask while an export runs.
   function openExport(opts?: Parameters<typeof openPdfExportDialog>[1]): void {
@@ -740,6 +776,7 @@ function mount(
       syncName();
       refreshUndo();
       syncPages();
+      syncForms();
     }),
   );
   unsubs.push(
@@ -892,6 +929,28 @@ function mount(
   /* ---------------- sources, recovered ---------------- */
 
   if (loaded.recovered) toast.info("Project restored from its automatic backup.");
+  /** Continue past the sources dialog: a source that opened with fewer pages
+   *  than the project shows from it (a crafted or replaced file) loses those
+   *  pages, as ONE step. */
+  function dropImpossiblePages(): void {
+    if (disposed) return;
+    const p = session.project;
+    const gone = (p.pdf?.pages ?? []).filter((pg) => {
+      if (pg.src === null) return false;
+      const d = docs.get(pg.src);
+      return !!d && pg.page >= d.numPages;
+    });
+    if (gone.length === 0) return;
+    const ids = gone.map((pg) => pg.id);
+    session.commit((q) => deletePages(q, ids));
+    if (session.project === p) {
+      // deletePages keeps at least one page: nothing could go.
+      toast.refuse("None of this project's pages are in its PDFs any more.");
+      return;
+    }
+    const n = gone.length;
+    toast.info(`${n} ${n === 1 ? "page wasn't" : "pages weren't"} in the PDF any more and ${n === 1 ? "was" : "were"} removed.`);
+  }
   if (issues.length > 0) {
     registerOverlay(
       openSourcesDialog({
@@ -908,6 +967,7 @@ function mount(
           syncPages(true);
         },
         onCloseProject: goHome,
+        onContinue: dropImpossiblePages,
       }),
     );
   }

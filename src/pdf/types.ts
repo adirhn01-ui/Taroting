@@ -213,7 +213,9 @@ export interface PdfEditorCtx {
   tools: Store<PdfToolState>;
   /** selected annotation ids (with their page keys) — the select tool's state */
   selection: Store<{ key: string; id: string }[]>;
-  /** selected page slots in the rail */
+  /** selected page slots in the rail. The shell keeps it on the same PAGES
+   *  across reorders and undo/redo (it remembers the ids behind the slots and
+   *  re-maps them after every page change). */
   pageSelection: Store<number[]>;
   /** "annotate" = tools own the pointer; "forms" = Fill forms mode (form
    *  widgets own it, tools are disabled). Transient, default "annotate". */
@@ -231,6 +233,12 @@ export interface PdfEditorCtx {
   /** pdf.js widget/annotation layers and inputs inside the strip are typing
    *  targets; parts call this to know whether a key belongs to a text field */
   isTyping(target: EventTarget | null): boolean;
+  /** Leave this editor for `to` through the shell's exits — the temporary
+   *  project's Keep/Discard prompt and the unsaved-edits save run first, and an
+   *  editor destination inherits this editor's `returnTo`. A part must never
+   *  call `navigate` itself: main.ts go() does not read `leaveGuard`.
+   *  Always set by the shell; optional only so test contexts may omit it. */
+  leave?(to: import("../core/nav").Route): void;
 }
 
 /** Where the shell lets each part put its UI (all inside the editor root). */

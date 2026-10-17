@@ -115,7 +115,7 @@ export interface ReadPage {
   rotate: number;
   view: number[];
   text: string;
-  annots: { id: string; subtype: string; rect: number[]; fieldName?: string; fieldValue?: unknown }[];
+  annots: { id: string; subtype: string; rect: number[]; fieldName?: string; fieldValue?: unknown; textContent?: string[] }[];
 }
 
 export async function readBack(bytes: Uint8Array): Promise<{ pages: ReadPage[]; fields: Map<string, Record<string, unknown>[]> | null }> {
@@ -127,12 +127,21 @@ export async function readBack(bytes: Uint8Array): Promise<{ pages: ReadPage[]; 
     for (let i = 1; i <= doc.numPages; i++) {
       const p = await doc.getPage(i);
       const tc = await p.getTextContent();
-      const an = (await p.getAnnotations()) as { id: string; subtype: string; rect: number[]; fieldName?: string; fieldValue?: unknown }[];
+      const an = (await p.getAnnotations()) as ReadPage["annots"];
       pages.push({
         rotate: p.rotate,
         view: [...p.view],
         text: tc.items.map((x) => ("str" in x ? x.str : "")).join(" "),
-        annots: an.map((a) => ({ id: a.id, subtype: a.subtype, rect: [...a.rect], fieldName: a.fieldName, fieldValue: a.fieldValue })),
+        annots: an.map((a) => ({
+          id: a.id,
+          subtype: a.subtype,
+          rect: [...a.rect],
+          fieldName: a.fieldName,
+          fieldValue: a.fieldValue,
+          // the text pdf.js reads from the widget's appearance stream (none
+          // while the form sets /NeedAppearances)
+          textContent: a.textContent,
+        })),
       });
     }
     const fields = (await doc.getFieldObjects()) as Map<string, Record<string, unknown>[]> | null;

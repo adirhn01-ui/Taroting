@@ -4122,6 +4122,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     await (await import("./autotest-wave1")).runWave1Blocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-viewer")).runViewerBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-image")).runImageBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-pdf")).runPdfBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-home")).runHomeBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await runDamagedVideoBlocks(test, fixturesDir);
   } catch (e) {

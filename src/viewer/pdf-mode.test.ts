@@ -418,6 +418,53 @@ describe("the page scrubber", () => {
     expect(h.view!.scrollToPage).toHaveBeenLastCalledWith(0);
   });
 
+  it("answers the arrows a page at a time, and keeps them from the viewer's file stepping", async () => {
+    const mode = mount();
+    await openDoc(mode, 9);
+    const scrub = byId("vw-pdf-scrub");
+    for (const [key, to] of [
+      ["ArrowRight", 4],
+      ["ArrowDown", 4],
+      ["ArrowLeft", 2],
+      ["ArrowUp", 2],
+    ] as const) {
+      // the fake strip lands where it is sent: back to page 4 each time
+      h.view!.state.set({ ...h.view!.state.get(), current: 3 });
+      const ev = scrub.fire("keydown", { key });
+      expect(h.view!.scrollToPage).toHaveBeenLastCalledWith(to);
+      // never on to the viewer's ShortcutManager (prevFile / nextFile)
+      expect(ev.stopPropagation).toHaveBeenCalled();
+      expect(ev.preventDefault).toHaveBeenCalled();
+    }
+    // at the last page an arrow still stays here: the end of the slider,
+    // not the next file
+    h.view!.state.set({ ...h.view!.state.get(), current: 8 });
+    await flush();
+    const atEnd = scrub.fire("keydown", { key: "ArrowRight" });
+    expect(h.view!.scrollToPage).toHaveBeenLastCalledWith(8);
+    expect(atEnd.stopPropagation).toHaveBeenCalled();
+    // a modified arrow is someone else's chord
+    const calls = h.view!.scrollToPage.mock.calls.length;
+    const ctrl = scrub.fire("keydown", { key: "ArrowRight", ctrlKey: true });
+    expect(ctrl.stopPropagation).not.toHaveBeenCalled();
+    expect(h.view!.scrollToPage.mock.calls.length).toBe(calls);
+  });
+
+  it("Space / Shift+Space page the strip a screen at a time", async () => {
+    const mode = mount();
+    mode.scrollPage(1); // nothing open: nothing to scroll
+    expect((h.view!.el as unknown as { scrollTop?: number }).scrollTop).toBeUndefined();
+    await openDoc(mode, 9);
+    const el = h.view!.el as unknown as { scrollTop: number; clientHeight: number };
+    el.scrollTop = 1000;
+    el.clientHeight = 800;
+    mode.scrollPage(1);
+    expect(el.scrollTop).toBe(1700);
+    mode.scrollPage(-1);
+    mode.scrollPage(-1);
+    expect(el.scrollTop).toBe(300);
+  });
+
   it("Home / End from the viewer's chords go to the first and last page", async () => {
     const mode = mount();
     await openDoc(mode, 12);
@@ -666,6 +713,15 @@ describe("stale opens and stepping", () => {
     await mode.open("a.pdf", () => false);
     expect(a.destroy).toHaveBeenCalled();
     expect(h.view!.setPages).not.toHaveBeenCalled();
+  });
+
+  it("shows the strip before the pages go in, so it never lays them out in a 0×0 box", async () => {
+    const mode = mount();
+    const wrapHidden: boolean[] = [];
+    h.view!.setPages.mockImplementation(() => void wrapHidden.push(byId("vw-pdf").hidden));
+    await openDoc(mode, 4);
+    expect(wrapHidden).toEqual([false, false]);
+    expect(byId("vw-pdf-bar").hidden).toBe(false);
   });
 
   it("PDF → PDF swaps the document in place, page 1 first, and lets the old one go after", async () => {

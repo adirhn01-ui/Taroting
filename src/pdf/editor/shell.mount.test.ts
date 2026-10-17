@@ -41,6 +41,7 @@ const h = vi.hoisted(() => ({
   exports: [] as unknown[],
   parts: [] as string[],
   partThrows: "",
+  partHook: null as null | (() => void),
   ctx: null as null | Record<string, unknown>,
   hosts: null as null | Record<string, unknown>,
   view: null as null | Record<string, any>,
@@ -93,7 +94,10 @@ vi.mock("../../ui/temp-project", () => ({
   createTempLeaveGate: () => ({}),
   createTempExits: (session: { temp: { set(v: boolean): void } }) => ({
     confirm: async () => true,
-    confirmLeave: (dest: () => void) => dest(),
+    confirmLeave: (dest: () => void) => {
+      h.log.push("confirmLeave");
+      dest();
+    },
     keep: async () => {
       session.temp.set(false);
       return "kept";
@@ -110,6 +114,7 @@ vi.mock("./tools", () => ({
     h.ctx = ctx;
     h.hosts = hosts;
     h.parts.push("tools");
+    h.partHook?.();
     if (h.partThrows === "tools") throw new Error("The tools could not start.");
     return { dispose: () => void h.log.push("tools.dispose") };
   },
@@ -225,7 +230,10 @@ vi.mock("../view", async () => {
         },
         on: () => () => {},
         overlay: () => null,
-        invalidate: () => {},
+        invalidated: [] as string[],
+        invalidate(k: string) {
+          v.invalidated.push(k);
+        },
         setTextLayer: () => {},
         setFormsLayer: () => {},
         dispose() {
@@ -265,6 +273,7 @@ beforeEach(() => {
   h.exports.length = 0;
   h.parts.length = 0;
   h.partThrows = "";
+  h.partHook = null;
   h.ctx = null;
   h.hosts = null;
   h.view = null;
@@ -964,6 +973,136 @@ describe("source documents", () => {
     const m = await mount();
     expect(m.view.pages[0].doc).toBe(h.docs[0]);
     expect(doc.body.querySelector(".relink-row__status")!.textContent).toBe("Changed since it was added");
+    await m.handle.dispose();
+  });
+});
+
+/* ---------------- fixes: leave, form values, selection, stale failure, short sources ---------------- */
+
+describe("ctx.leave", () => {
+  it("goes through the exits and carries the viewer's returnTo to another editor", async () => {
+    const m = await mount(project(), { returnTo: "D:/v/report.pdf" });
+    h.log.length = 0;
+    m.ctx.leave({ view: "editor", projectPath: "C:/x/page.trt" });
+    expect(h.log).toEqual(["confirmLeave"]);
+    expect(h.navigations).toEqual([{ view: "editor", projectPath: "C:/x/page.trt", returnTo: "D:/v/report.pdf" }]);
+    await m.handle.dispose();
+  });
+});
+
+describe("form values on screen", () => {
+  it("an undo, a redo or a cleared form re-renders the source's pages; typing never does", async () => {
+    vi.useFakeTimers();
+    const m = await mount();
+    const src = m.session.project.pdf!.sources[0]!.id;
+    const ids = pageIds(m.session.project);
+    const forms = m.view.opts.forms;
+    forms.set(src, "12R", "Jo");
+    await flush();
+    forms.set(src, "12R", "Joe");
+    await flush();
+    vi.advanceTimersByTime(1000);
+    await flush();
+    expect(m.view.invalidated).toEqual([]);
+    m.session.undo();
+    await flush();
+    expect(forms.get(src, "12R")).toBeUndefined();
+    expect(m.view.invalidated).toEqual(ids);
+    m.view.invalidated.length = 0;
+    m.session.redo();
+    await flush();
+    expect(m.view.invalidated).toEqual(ids);
+    m.view.invalidated.length = 0;
+    // Clear form: a commit that drops the source's values
+    m.session.commit((p) => ({ ...p, pdf: { ...p.pdf!, forms: {} } }));
+    await flush();
+    expect(m.view.invalidated).toEqual(ids);
+    vi.useRealTimers();
+    await m.handle.dispose();
+  });
+});
+
+describe("the page selection", () => {
+  it("stays on its pages through a reorder, an undo and a redo: Delete removes the page selected", async () => {
+    const m = await mount();
+    const ids = pageIds(m.session.project);
+    m.ctx.pageSelection.set([0]);
+    m.rail.opts.onReorder([ids[1], ids[2], ids[0]]);
+    await flush();
+    expect(m.ctx.pageSelection.get()).toEqual([2]);
+    ctrl("Z");
+    await flush();
+    expect(m.ctx.pageSelection.get()).toEqual([0]);
+    m.session.redo();
+    await flush();
+    expect(m.ctx.pageSelection.get()).toEqual([2]);
+    key(m.rail.el, "Delete");
+    expect(pageIds(m.session.project)).toEqual([ids[1], ids[2]]);
+    await m.handle.dispose();
+  });
+});
+
+describe("a failed mount", () => {
+  it("superseded meanwhile leaves the newer screen's root alone", async () => {
+    let stale = false;
+    h.partThrows = "tools";
+    const root = document.createElement("div") as unknown as FakeElement;
+    doc.body.appendChild(root);
+    const newer = document.createElement("div") as unknown as FakeElement;
+    h.partHook = () => {
+      root.textContent = "";
+      root.appendChild(newer);
+      stale = true;
+    };
+    await mountPdfEditor(root as never, { view: "editor", projectPath: PROJECT_PATH }, () => stale, {
+      project: project(),
+      missing: [],
+      recovered: false,
+    });
+    await flush();
+    expect(root.childNodes).toHaveLength(1);
+    expect(root.childNodes[0]).toBe(newer);
+    expect(h.toasts).toEqual([]);
+    expect(h.navigations).toEqual([]);
+    expect(currentSession.get()).toBeNull();
+  });
+});
+
+describe("a source with fewer pages than the project shows", () => {
+  it("is listed as changed; Continue drops the pages it lacks as ONE step, with a toast", async () => {
+    h.files.set("C:/docs/report.pdf", { pages: 2 });
+    const m = await mount();
+    const ids = pageIds(m.session.project);
+    expect(m.view.pages[0].doc).toBe(h.docs[0]);
+    const dialog = doc.body.querySelector(".pdfed-sources")!;
+    expect(dialog.querySelector(".relink-row__status")!.textContent).toMatch(/^Changed: it now has 2 pages; this project uses 3/);
+    dialog.querySelector("[data-continue]")!.click();
+    await flush();
+    expect(pageIds(m.session.project)).toEqual([ids[0], ids[1]]);
+    expect(h.toasts).toContain("info:1 page wasn't in the PDF any more and was removed.");
+    m.session.undo();
+    expect(pageIds(m.session.project)).toEqual(ids);
+    expect(m.session.history.canUndo).toBe(false);
+    await m.handle.dispose();
+  });
+
+  it("the X (like Esc or a click outside) only closes: no page is removed", async () => {
+    h.files.set("C:/docs/report.pdf", { pages: 2 });
+    const m = await mount();
+    const dialog = doc.body.querySelector(".pdfed-sources")!;
+    dialog.querySelector(".modal__header button")!.click();
+    await flush();
+    expect(m.session.project.pdf!.pages).toHaveLength(3);
+    expect(m.session.history.canUndo).toBe(false);
+    await m.handle.dispose();
+  });
+
+  it("Close project drops nothing", async () => {
+    h.files.set("C:/docs/report.pdf", { pages: 2 });
+    const m = await mount();
+    doc.body.querySelector("[data-close-project]")!.click();
+    expect(m.session.project.pdf!.pages).toHaveLength(3);
+    expect(h.navigations).toEqual([{ view: "home" }]);
     await m.handle.dispose();
   });
 });

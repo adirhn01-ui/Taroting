@@ -1,29 +1,31 @@
 // Home's PDF projects: one or more PDFs, chosen with "New project → PDF
 // project", Open, or a drop, become ONE real library project in
 // Documents\Taroting (never a temporary one — Home's New and Open are the
-// permanent way in), its pages in the order the files came.
+// permanent way in), its pages in the order Home hands the files over (natural
+// name order, see home.ts mediaRoute).
 //
 // Its own lazy chunk, fetched by Home only when there are PDFs to make a
-// project of. Everything PDF-specific is fetched from HERE with dynamic
-// imports, and only once the first file has been found on disk: the page
-// counter pulls pdf.js, and pdf-project / the page model are only wanted on
-// this path. Home itself must never import any of them (the boundary test in
-// src/dev/image-chunk-boundary.test.ts pins that).
+// project of, or when "New project → PDF project" is chosen (the picker is
+// here too, so Home carries none of this at boot). Everything PDF-specific is
+// fetched from HERE with dynamic imports, and only once the first file has
+// been found on disk: the page counter pulls pdf.js, and pdf-project / the
+// page model are only wanted on this path. Home itself must never import any
+// of them (the boundary test in src/dev/image-chunk-boundary.test.ts pins
+// that).
 //
-// The stat → page count → error mapping mirrors core/open-media's pdfProject
-// (which makes a TEMPORARY project and is not exported); keep the two saying
-// the same words.
+// Reading a PDF (stat → page count → which failure) is core/pdf-open's, the
+// one copy open-media uses too; only the words are Home's.
 
 import { fileStem } from "../core/format";
-import { describeError, ipc } from "../core/ipc";
+import { describeError, ipc, pickPdfFiles } from "../core/ipc";
+import { PDF_MISSING, readPdfSource } from "../core/pdf-open";
+import type { PdfSourceInfo } from "../core/pdf-project";
 import { uid } from "../core/project";
 import { PDF_MAX_PAGES } from "../core/types";
 import type { ProjectFile } from "../core/types";
 import { toast } from "../ui/toast";
 
-/** Said for a file that is gone, or that the backend cannot stat. The same
- *  words core/open-media and the backend use for a missing PDF. */
-export const PDF_MISSING = "This PDF is missing or can't be read.";
+export { PDF_MISSING };
 /** Said for one password-protected PDF: Home makes nothing of it. */
 export const PDF_PROTECTED = "Protected PDFs can't be edited — open it to read it instead.";
 
@@ -34,55 +36,43 @@ export function protectedSkippedText(n: number): string {
     : `Skipped ${n} protected PDFs — protected PDFs can't be edited. Open them to read them instead.`;
 }
 
-/** One PDF that went into the project: its identity and page count. */
-interface Readable {
-  path: string;
-  size: number;
-  mtimeMs: number;
-  pages: number;
-}
-
+type Readable = PdfSourceInfo;
 type ReadResult = { ok: Readable } | { protectedPdf: true } | { failed: true };
 
-/** The kind a PdfOpenError (or anything else pdf.js threw) carries. */
-function openErrorKind(e: unknown): unknown {
-  return e && typeof e === "object" && "kind" in e ? (e as { kind: unknown }).kind : null;
-}
-
-/** Stat, then count the pages. A missing file stops at the stat, before
- *  pdf.js is ever fetched. Every failure but "protected" is reported here, in
- *  Home's words; "protected" is left to the caller, which knows how many. */
+/** One PDF read for the project. Every failure but "protected" is reported
+ *  here, in Home's words; "protected" is left to the caller, which knows how
+ *  many. */
 async function readPdf(path: string, gone: () => boolean): Promise<ReadResult | null> {
   const stem = fileStem(path);
-  let stat: { size: number; mtimeMs: number } | null;
+  let read;
   try {
-    stat = await ipc.fileStat(path);
-  } catch {
-    stat = null;
-  }
-  if (gone()) return null;
-  if (!stat) {
-    toast.error(PDF_MISSING);
-    return { failed: true };
-  }
-  let pages: number;
-  try {
-    const { countPages } = await import("../pdf/view/loader");
-    pages = await countPages(path);
+    read = await readPdfSource(path, gone);
   } catch (e) {
     if (gone()) return null;
-    const kind = openErrorKind(e);
-    if (kind === "password") return { protectedPdf: true };
-    if (kind === "missing") toast.error(PDF_MISSING);
-    else if (kind === "invalid") toast.error(`Couldn't read ${stem} as a PDF.`);
-    else if (kind === "other") {
-      const message = (e as { message?: unknown }).message;
-      toast.error(`Couldn't open ${stem}: ${typeof message === "string" && message ? message : "it isn't a readable PDF."}`);
-    } else toast.error(`Couldn't open ${stem}: ${describeError(e)}`);
+    toast.error(`Couldn't open ${stem}: ${describeError(e)}`);
     return { failed: true };
   }
-  if (gone()) return null;
-  return { ok: { path, size: stat.size, mtimeMs: stat.mtimeMs, pages } };
+  if (read === null) return null;
+  if ("ok" in read) return read;
+  switch (read.problem) {
+    case "protected":
+      return { protectedPdf: true };
+    case "missing":
+      toast.error(PDF_MISSING);
+      break;
+    case "invalid":
+      toast.error(`Couldn't read ${stem} as a PDF.`);
+      break;
+    case "other":
+      toast.error(`Couldn't open ${stem}: ${read.message || "it isn't a readable PDF."}`);
+      break;
+  }
+  return { failed: true };
+}
+
+/** "New project → PDF project": one PDF from the picker (none when cancelled). */
+export async function pickNewPdf(): Promise<string[]> {
+  return (await pickPdfFiles(false)).slice(0, 1);
 }
 
 /** Reads every PDF in order, drops (and names, in a toast) any that is

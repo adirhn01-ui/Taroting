@@ -113,7 +113,7 @@ export async function runHomeBlocks(ctx: HomeCtx): Promise<void> {
       newBtn!.click();
       const menu = await waitFor(() => (rendered($(".ctx-menu")) ? $(".ctx-menu") : null), 2_000, "the New project menu");
       const rows = menuRows();
-      assert(rows.length === 2, `the menu has ${rows.length} rows, not 2`);
+      assert(rows.length === 3, `the menu has ${rows.length} rows, not 3`);
       assert(
         document.activeElement === rows[0] && rows[0]!.classList.contains("ctx-menu__item--active"),
         `a keyboard open did not start on Video project (focus on ${document.activeElement?.textContent ?? "nothing"})`,
@@ -121,11 +121,11 @@ export async function runHomeBlocks(ctx: HomeCtx): Promise<void> {
       const labels = rows.map((r) => text(r.querySelector(".ctx-menu__label")));
       const hints = rows.map((r) => text(r.querySelector(".ctx-menu__hint")));
       assert(
-        labels.join("|") === "Video project|Image project",
+        labels.join("|") === "Video project|Image project|PDF project",
         `the rows read ${JSON.stringify(labels)}`,
       );
       assert(
-        hints.join("|") === "Clips, photos and music on a timeline|Draw on, adjust and export a picture",
+        hints.join("|") === "Clips, photos and music on a timeline|Draw on, adjust and export a picture|Arrange, mark up and fill in a PDF",
         `the hints read ${JSON.stringify(hints)}`,
       );
       for (const r of rows) {
@@ -150,7 +150,7 @@ export async function runHomeBlocks(ctx: HomeCtx): Promise<void> {
       // A POINTER open (detail 1) highlights nothing and leaves focus alone.
       // Image project → the New image project dialog, unchanged but retitled.
       newBtn!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 1 }));
-      await waitFor(() => menuRows().length === 2 && rendered(menuRows()[1]), 2_000, "the menu again");
+      await waitFor(() => menuRows().length === 3 && rendered(menuRows()[1]), 2_000, "the menu again");
       assert(
         !$(".ctx-menu")!.contains(document.activeElement) && !menuRows().some((r) => r.classList.contains("ctx-menu__item--active")),
         "a pointer open highlighted or focused a row",
@@ -160,7 +160,7 @@ export async function runHomeBlocks(ctx: HomeCtx): Promise<void> {
       assert(text(header) === "New image project", `the dialog is titled "${text(header)}"`);
       $<HTMLButtonElement>(".nimg-modal .modal__footer [data-act='cancel']")!.click();
       await waitFor(() => !$(".nimg-modal"), 2_000, "the New image project dialog to close");
-      return `two rows with icon + hint, anchored ${m.top >= b.bottom ? "below" : "above"} the button; a keyboard open starts on Video project, a pointer open on nothing; Escape closes; Image project → "New image project"`;
+      return `three rows with icon + hint, anchored ${m.top >= b.bottom ? "below" : "above"} the button; a keyboard open starts on Video project, a pointer open on nothing; Escape closes; Image project → "New image project"`;
     } finally {
       closeMenu();
       $<HTMLButtonElement>(".nimg-modal [data-act='cancel']")?.click();

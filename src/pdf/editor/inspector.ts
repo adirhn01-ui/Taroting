@@ -27,7 +27,7 @@ import { imgIcon } from "../../image/icons";
 import { deletePages, removeAnnots, rotatePages, updateAnnot, type PdfAnnotPatch } from "../model";
 import type { PdfEditorCtx, PdfEditorPart, PdfToolId, PdfToolState } from "../types";
 import { sameEdit } from "./marks/env";
-import { FONT_MIN, SIZE_MAX, SIZE_MIN, clampFont, clampSize, textHeight } from "./marks/geom";
+import { FONT_MIN, SIZE_MAX, SIZE_MIN, clampFont, clampSize, frameOf, plainOnly, textHeight, withFrameH } from "./marks/geom";
 import { textLines } from "./marks/render";
 import { selectedMarks } from "./marks/select";
 
@@ -130,18 +130,49 @@ const hasOpacity = (a: PdfAnnot): boolean => a.t === "ink" || a.t === "highlight
 export const WIDTH_MIN = 0.5;
 export const WIDTH_MAX = 72;
 
-/** A patch for one mark; a text mark's box grows to keep every line. */
-export function patchFor(a: PdfAnnot, patch: Record<string, unknown>): PdfAnnotPatch {
-  if (a.t !== "text") return patch as PdfAnnotPatch;
-  const next = { ...a, ...patch } as Extract<PdfAnnot, { t: "text" }>;
-  const h = Math.max(next.h, textHeight(textLines(next).length, next.size));
-  return (h !== a.h ? { ...patch, h } : patch) as PdfAnnotPatch;
+/** Which panel fields a mark kind takes: a field shared by name across kinds
+ *  must not cross them (the Width control's `w` is a stroke width on ink and
+ *  shapes, but a BOX width on text, whiteout, pictures and signatures). */
+const FIELD_KINDS: Record<string, (a: PdfAnnot) => boolean> = {
+  w: hasWidth,
+  c: hasColor,
+  o: hasOpacity,
+  font: (a) => a.t === "text",
+  size: (a) => a.t === "text",
+  bold: (a) => a.t === "text",
+  italic: (a) => a.t === "text",
+  align: (a) => a.t === "text",
+};
+
+/** `patch` cut to the fields mark `a`'s kind takes from the panel. */
+export function patchForKind(a: PdfAnnot, patch: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(patch)) {
+    const ok = FIELD_KINDS[k];
+    if (ok && ok(a)) out[k] = patch[k];
+  }
+  return out;
 }
 
-/** `p` with `patch` applied to every selected mark that has its fields. */
+/** A patch for one mark: only the fields its kind takes; a text mark's box
+ *  grows (along its upright frame's down direction) to keep every line. */
+export function patchFor(a: PdfAnnot, patch: Record<string, unknown>): PdfAnnotPatch {
+  const own = patchForKind(a, patch);
+  if (a.t !== "text") return own as PdfAnnotPatch;
+  const next = { ...a, ...own } as Extract<PdfAnnot, { t: "text" }>;
+  const H = Math.max(frameOf(next).H, textHeight(textLines(next).length, next.size));
+  if (H === frameOf(a).H) return own as PdfAnnotPatch;
+  return { ...own, ...withFrameH(a, H) } as PdfAnnotPatch;
+}
+
+/** `p` with `patch` applied to every selected mark, each taking only the
+ *  fields its kind has (see FIELD_KINDS). */
 export function patchSelected(p: ProjectFile, sel: readonly { key: string; id: string }[], patch: Record<string, unknown>): ProjectFile {
   let next = p;
-  for (const m of selectedMarks(p, sel)) next = updateAnnot(next, m.key, m.a.id, patchFor(m.a, patch));
+  for (const m of selectedMarks(p, sel)) {
+    const own = patchFor(m.a, patch);
+    if (Object.keys(own).length) next = updateAnnot(next, m.key, m.a.id, own);
+  }
   return next;
 }
 
@@ -156,7 +187,10 @@ export function selectionLabel(marks: readonly PdfAnnot[]): string {
 /* ------------------------------------------------------------------ */
 
 interface Gesture {
-  write(apply: () => void): void;
+  /** a live write; `apply` gets the gesture's START snapshot, so a value
+   *  dragged up and back down lands from where it began (a text box grown
+   *  by a large font size shrinks back when the size comes back down) */
+  write(apply: (base: ProjectFile) => void): void;
   hold(): void;
   commit(): void;
 }
@@ -184,7 +218,7 @@ export function createGestures(
       write(apply) {
         begin();
         if (!sameEdit(session.project, written!)) before = session.project;
-        apply();
+        apply(before!);
         written = session.project;
       },
       commit() {
@@ -453,7 +487,7 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
       step,
       unit,
       read,
-      write: (v) => g.write(() => session.replace(patchSelected(session.project, sel(), patch(v)))),
+      write: (v) => g.write((base) => session.replace(patchSelected(base, sel(), patch(v)))),
       done: () => g.commit(),
       hold: () => g.hold(),
     });
@@ -522,7 +556,7 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
             fallback: "#000000",
             read: () => first((a) => ("c" in a ? a.c : undefined), "#000000"),
             commit: (hex) => commitMarks({ c: normalizeHexColor(hex, "#000000") }),
-            preview: (hex) => g.write(() => session.replace(patchSelected(session.project, sel(), { c: normalizeHexColor(hex, "#000000") }))),
+            preview: (hex) => g.write((base) => session.replace(patchSelected(base, sel(), { c: normalizeHexColor(hex, "#000000") }))),
             end: () => g.commit(),
           }),
         ),
@@ -567,8 +601,19 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
         ),
       );
       const styleRow = el("div", "insp-row");
-      styleRow.appendChild(toggleBtn("Bold", "<b>B</b>", () => text()?.bold ?? false, () => commitMarks({ bold: !(text()?.bold ?? false) })));
-      styleRow.appendChild(toggleBtn("Italic", "<i>I</i>", () => text()?.italic ?? false, () => commitMarks({ italic: !(text()?.italic ?? false) })));
+      // a regular-only font (Impact) exports plain: no Bold / Italic for it
+      const plain = (): boolean => plainOnly(text()?.font ?? "");
+      const bold = toggleBtn("Bold", "<b>B</b>", () => !plain() && (text()?.bold ?? false), () => {
+        if (!plain()) commitMarks({ bold: !(text()?.bold ?? false) });
+      });
+      const italic = toggleBtn("Italic", "<i>I</i>", () => !plain() && (text()?.italic ?? false), () => {
+        if (!plain()) commitMarks({ italic: !(text()?.italic ?? false) });
+      });
+      watch(plain, (v) => {
+        bold.disabled = v;
+        italic.disabled = v;
+      });
+      styleRow.append(bold, italic);
       t.appendChild(styleRow);
       const alignRow = el("div", "insp-row");
       for (const [al, label] of [["left", "Left"], ["center", "Center"], ["right", "Right"]] as const) {

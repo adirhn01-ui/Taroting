@@ -19,7 +19,6 @@ import { registerCloseTask } from "../../core/app-close";
 import { createExportRunHold } from "../../core/export-hold";
 import { escapeHtml, fileExt, fileStem } from "../../core/format";
 import { errorDetail, ipc } from "../../core/ipc";
-import { navigate } from "../../core/nav";
 import { pdfSourcePaths } from "../../core/pdf-project";
 import { settingsStore, updateSettings } from "../../core/session";
 import type { PdfExportPreset, ProjectFile, Settings } from "../../core/types";
@@ -58,6 +57,7 @@ export type PageImageFormat = "png" | "jpeg";
 
 export const FLATTEN_MARKS_TIP = "Draw marks into the page so they can't be moved or removed";
 export const FLATTEN_FORMS_TIP = "Turn filled fields into plain text — they can't be edited afterwards";
+export const PAGE_SOURCE_UNOPENED = "This page's PDF couldn't be opened.";
 export const ORIGINAL_FILE_WARNING = "That's one of the project's own files — choose a different name. Originals are never changed.";
 
 /** Quality JPEG opens on (the image export's default). */
@@ -192,11 +192,9 @@ function abortError(): DOMException {
   return new DOMException("The export was canceled.", "AbortError");
 }
 
-/** The write path of exportPdf with a cancel on it: exportPdf takes no
- *  AbortSignal, but it takes its save IPC — so a cancel refuses the next
- *  begin / chunk / commit, and writePdf then aborts the partial file. The
- *  build before the write cannot be interrupted; a cancel during it lands
- *  the moment the build hands over its bytes. */
+/** The write path of exportPdf with a cancel on it: the build stops on
+ *  opts.signal; the write stops here — a cancel refuses the next begin /
+ *  chunk / commit, and writePdf then aborts the partial file. */
 export function abortableSaveIpc(signal: AbortSignal): PdfSaveIpc {
   const guard = (): void => {
     if (signal.aborted) throw abortError();
@@ -402,6 +400,14 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
     return pageImageSize(pageBox.w, pageBox.h, pageBox.rotate, scale);
   }
 
+  /** Why page `n` (1-based) has no picture to give, or null. */
+  function pageProblem(n: number | null): string | null {
+    if (n === null) return null;
+    const pg = session.project.pdf?.pages[n - 1];
+    if (!pg || pg.src === null) return null;
+    return ctx.docs.has(pg.src) ? null : PAGE_SOURCE_UNOPENED;
+  }
+
   /** The page box of page `n` (1-based) as the view shows it. */
   async function loadPageBox(n: number): Promise<void> {
     const pg = session.project.pdf?.pages[n - 1];
@@ -424,7 +430,9 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
         return;
       }
     }
-    if (closed) return;
+    // Typed on meanwhile ("1" then "12"): an older answer must not replace
+    // the box of the page now asked for.
+    if (closed || imagePage() !== n) return;
     pageBox = { page: n, w, h, rotate };
     refresh();
   }
@@ -507,6 +515,7 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
         </div>
       </div>
       <div class="export-note" id="px-note-page" hidden>Enter a page number from 1 to ${n}.</div>
+      <div class="export-note" id="px-note-source" hidden>${escapeHtml(PAGE_SOURCE_UNOPENED)}</div>
       <div class="export-note" id="px-note-reduced" hidden></div>`;
     bodyEl.innerHTML = `
       <div class="export-form">
@@ -559,6 +568,8 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
       const n = imagePage();
       const notePage = q<HTMLElement>("#px-note-page");
       if (notePage) notePage.hidden = n !== null;
+      const noteSrc = q<HTMLElement>("#px-note-source");
+      if (noteSrc) noteSrc.hidden = pageProblem(n) === null;
       const size = imageSize();
       const px = q<HTMLElement>("#px-px");
       if (px) px.textContent = size ? `${size.w} × ${size.h} px` : "";
@@ -759,23 +770,6 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
       return;
     }
 
-    // Remember the flags on the project — once, and only when they changed.
-    // Like the image export's preset, not an edit of the document: it must
-    // not make an untouched temporary project ask "keep?", nor become an
-    // undo step.
-    if (tab === "pdf") {
-      const p = session.project;
-      const next = setExportPreset(p, { flattenMarks, flattenForms });
-      if (next !== p) session.replace(next, { edit: false });
-    }
-    void updateSettings({ lastExportDir: folder }).catch((e: unknown) => {
-      toast.error("Couldn't save your settings.", {
-        detail: errorDetail(e).message,
-        op: "Settings",
-        title: "Export folder",
-      });
-    });
-
     const target = outPath();
     if (isProjectSource(target, sourcesAsMedia())) {
       showWarning(ORIGINAL_FILE_WARNING, null, () => void renameThenExport());
@@ -830,8 +824,29 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
     return ac;
   }
 
+  /** The choices an export that actually starts leaves behind (a Cancel at
+   *  the overwrite / own-file warning leaves none). */
+  function rememberChoices(): void {
+    // The flags on the project — once, and only when they changed. Like the
+    // image export's preset, not an edit of the document: it must not make an
+    // untouched temporary project ask "keep?", nor become an undo step.
+    if (tab === "pdf") {
+      const p = session.project;
+      const next = setExportPreset(p, { flattenMarks, flattenForms });
+      if (next !== p) session.replace(next, { edit: false });
+    }
+    void updateSettings({ lastExportDir: folder }).catch((e: unknown) => {
+      toast.error("Couldn't save your settings.", {
+        detail: errorDetail(e).message,
+        op: "Settings",
+        title: "Export folder",
+      });
+    });
+  }
+
   function beginExport(target: string): Promise<void> {
     if (exporting || closed) return Promise.resolve();
+    rememberChoices();
     const which = tab;
     const r = rangeCheck();
     const range = r.ok ? r.range : undefined;
@@ -850,7 +865,8 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
         if (which === "pdf") {
           progress(0, "Preparing pages");
           const { exportPdf } = await import("../export/export");
-          const done = await exportPdf(project, { ...flags, range }, target, undefined, abortableSaveIpc(ac.signal), (x) =>
+          // Cancel stops the build (opts.signal) and the write (the save IPC).
+          const done = await exportPdf(project, { ...flags, range, signal: ac.signal }, target, undefined, abortableSaveIpc(ac.signal), (x) =>
             progress(x, "Saving"),
           );
           path = done.path;
@@ -886,8 +902,11 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
 
   /** "Open as image project": the page as a PNG in the pasted-pictures
    *  folder (where the user can see and relink it), a permanent image
-   *  project made from it, and the editor switched to that project. The PDF
-   *  editor's own leave path (its leave guard) runs on the navigation. */
+   *  project made from it, and the editor switched to that project — through
+   *  ctx.leave, the shell's exits: a bare navigate() would skip a temporary
+   *  PDF project's Keep/Discard prompt (main.ts go() never reads leaveGuard)
+   *  and lose the way back to the viewer. A Cancel at that prompt keeps the
+   *  user here; the image project stays saved in the library. */
   async function onOpenAsImage(): Promise<void> {
     if (exporting) return;
     const n = imagePage();
@@ -911,7 +930,7 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
         if (closed) return;
         finish();
         teardown();
-        navigate({ view: "editor", projectPath });
+        ctx.leave?.({ view: "editor", projectPath });
       } catch (e) {
         if (closed) return;
         finish();
@@ -948,8 +967,8 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
     q<HTMLElement>("#px-cancel")!.addEventListener("click", () => {
       if (!run) return;
       run.abort();
-      // The PDF build cannot stop mid-way (see abortableSaveIpc): say that
-      // the cancel is landing rather than look stuck.
+      // The build stops at its next checkpoint, not at once: say that the
+      // cancel is landing rather than look stuck.
       const phase = q<HTMLElement>("#px-phase");
       if (phase) phase.textContent = "Canceling";
       const c = q<HTMLButtonElement>("#px-cancel");

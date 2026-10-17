@@ -21,6 +21,7 @@ const h = vi.hoisted(() => ({
   renders: [] as { page: number; w: number; h: number; type: string; quality: number }[],
   saves: [] as { dest: unknown; format: string }[],
   navigations: [] as unknown[],
+  leaves: [] as unknown[],
   created: [] as { name: string; info: unknown }[],
   savedProjects: [] as string[],
   begins: 0,
@@ -130,6 +131,7 @@ beforeEach(() => {
   h.renders = [];
   h.saves = [];
   h.navigations = [];
+  h.leaves = [];
   h.created = [];
   h.savedProjects = [];
   h.begins = 0;
@@ -172,7 +174,12 @@ interface Opened {
   overlays: (() => void)[];
 }
 
-function open(opts?: { pageSlot?: number; tab?: "pdf" | "image" }, hasForms = true): Opened {
+function open(
+  opts?: { pageSlot?: number; tab?: "pdf" | "image" },
+  hasForms = true,
+  pageInfo: (i: number) => Promise<{ w: number; h: number; rotate: 0 | 90 | 180 | 270 }> = async () => ({ w: 612, h: 792, rotate: 0 }),
+  withSource = true,
+): Opened {
   const s = {
     project: project(),
     blockLeave: null as string | null,
@@ -192,17 +199,19 @@ function open(opts?: { pageSlot?: number; tab?: "pdf" | "image" }, hasForms = tr
         path: "C:\\docs\\lease.pdf",
         doc: {},
         numPages: 2,
-        pageInfo: async () => ({ w: 612, h: 792, rotate: 0 }),
+        pageInfo,
         destroy: async () => {},
       },
     ],
   ]);
+  if (!withSource) docs.clear();
   const overlays: (() => void)[] = [];
   const ctx = {
     session: s,
     view: { state: new Store({ zoom: 1, fit: null, current: 1, count: 3 }) },
     docs,
     hasForms: new Store(hasForms),
+    leave: (to: unknown) => void h.leaves.push(to),
     registerOverlay: (c: () => void) => {
       overlays.push(c);
       return () => {
@@ -308,7 +317,7 @@ describe("PDF export", () => {
     expect(h.exportCalls).toHaveLength(1);
     const [proj, opts, target, deps, io, onProgress] = h.exportCalls[0]!;
     expect(proj).toBe(d.s.project);
-    expect(opts).toEqual({ flattenMarks: false, flattenForms: false, range: undefined });
+    expect(opts).toEqual({ flattenMarks: false, flattenForms: false, range: undefined, signal: expect.any(AbortSignal) });
     expect(target).toBe("E:\\Out\\Lease.pdf");
     expect(deps).toBeUndefined();
     expect(typeof (io as { pdfSaveBegin?: unknown }).pdfSaveBegin).toBe("function");
@@ -363,7 +372,7 @@ describe("PDF export", () => {
     expect(d.s.replaced).toBe(1);
     expect(d.s.edits).toEqual([false]);
     expect(d.s.project.pdf!.export).toEqual({ flattenMarks: true, flattenForms: true });
-    expect(h.exportCalls[0]![1]).toEqual({ flattenMarks: true, flattenForms: true, range: undefined });
+    expect(h.exportCalls[0]![1]).toEqual({ flattenMarks: true, flattenForms: true, range: undefined, signal: expect.any(AbortSignal) });
 
   });
 
@@ -432,6 +441,8 @@ describe("PDF export", () => {
     d.$("#px-run").click();
     await settle();
     d.$("#px-cancel").click();
+    // the build hears it too (opts.signal)
+    expect((h.exportCalls[0]![1] as { signal: AbortSignal }).signal.aborted).toBe(true);
     expect(d.s.blockLeave).toBe(EXPORT_RUNNING_REASON);
     release();
     await settle();
@@ -552,9 +563,77 @@ describe("Image export", () => {
     expect(h.created[0]!.name).toBe("Lease - page 1");
     expect(h.created[0]!.info).toMatchObject({ kind: "image", width: 816 });
     expect(h.savedProjects).toEqual(["C:\\Docs\\Taroting\\Lease - page 1.trt"]);
-    expect(h.navigations).toEqual([{ view: "editor", projectPath: "C:\\Docs\\Taroting\\Lease - page 1.trt" }]);
+    // through the shell's exits (a temp project's Keep/Discard), never a bare navigate
+    expect(h.leaves).toEqual([{ view: "editor", projectPath: "C:\\Docs\\Taroting\\Lease - page 1.trt" }]);
+    expect(h.navigations).toEqual([]);
     expect(doc.body.querySelector(".modal-backdrop")).toBeNull();
     expect(d.s.blockLeave).toBeNull();
+  });
+});
+
+describe("Image export: page box and sources", () => {
+  it("a late answer for an earlier typed page never replaces the current page's box", async () => {
+    const pending = new Map<number, (v: { w: number; h: number; rotate: 0 }) => void>();
+    const d = open({ tab: "image", pageSlot: 0 }, true, (i) => new Promise((r) => pending.set(i, r)));
+    await settle();
+    d.$("#px-page").typeText("2");
+    await settle();
+    // page 2 (index 1) answers first, then page 1's old request lands
+    pending.get(1)!({ w: 612, h: 792, rotate: 0 });
+    await settle();
+    pending.get(0)!({ w: 100, h: 100, rotate: 0 });
+    await settle();
+    expect(d.$("#px-run").disabled).toBe(false);
+    expect(d.$("#px-px").textContent).toBe("1056 × 816 px"); // page 2 is turned 90°
+  });
+
+  it("a page whose PDF didn't open says so instead of a silent disabled Export", async () => {
+    const d = open({ tab: "image", pageSlot: 0 }, true, undefined, false);
+    await settle();
+    expect(d.$("#px-run").disabled).toBe(true);
+    expect(d.$("#px-note-source").hidden).toBe(false);
+    expect(d.$("#px-note-source").textContent).toBe("This page's PDF couldn't be opened.");
+    // a blank page has no PDF to miss
+    d.$("#px-page").typeText("3");
+    await settle();
+    expect(d.$("#px-note-source").hidden).toBe(true);
+    expect(d.$("#px-run").disabled).toBe(false);
+  });
+});
+
+describe("remembered choices", () => {
+  it("a Cancel at the overwrite warning stores neither the flags nor the folder; Replace does", async () => {
+    h.onDisk.add("E:\\Out\\Lease.pdf");
+    const d = open();
+    const fm = d.$("#px-flat-marks");
+    fm.checked = true;
+    fm.dispatch("change");
+    d.$("#px-run").click();
+    await settle();
+    expect(d.has('[data-w="replace"]')).toBe(true);
+    d.$('[data-w="cancel"]').click();
+    await settle();
+    expect(h.settingsWrites).toEqual([]);
+    expect(d.s.replaced).toBe(0);
+    expect(h.exportCalls).toHaveLength(0);
+    d.$("#px-run").click();
+    await settle();
+    d.$('[data-w="replace"]').click();
+    await settle();
+    expect(h.exportCalls).toHaveLength(1);
+    expect(h.settingsWrites).toEqual([{ lastExportDir: "E:\\Out" }]);
+    expect(d.s.edits).toEqual([false]);
+  });
+
+  it("a Cancel at the own-file warning stores nothing", async () => {
+    h.settings.lastExportDir = "C:\\docs";
+    h.onDisk.add("C:\\docs");
+    const d = open();
+    d.$("#px-name").typeText("lease");
+    d.$("#px-run").click();
+    await settle();
+    d.$('[data-w="cancel"]').click();
+    expect(h.settingsWrites).toEqual([]);
   });
 });
 

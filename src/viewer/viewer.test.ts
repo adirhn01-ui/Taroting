@@ -17,7 +17,9 @@ const m = vi.hoisted(() => ({
   navigate: vi.fn(),
   /** The items of the last menu the viewer opened. */
   menu: [] as { label: string; onSelect: () => void }[],
-  keys: new Map<string, (e: { repeat: boolean }) => void>(),
+  keys: new Map<string, (e: { repeat: boolean; shiftKey?: boolean }) => void>(),
+  /** window keydown listeners the viewer added (its own, besides the manager's) */
+  winKeys: [] as ((e: unknown) => void)[],
   /** The viewer's state callback, so a test can play the loader's part. */
   onState: null as null | ((p: string, s: LoadState) => void),
   prepare: vi.fn(),
@@ -33,7 +35,9 @@ const m = vi.hoisted(() => ({
   pdfMode: null as null | {
     open: ReturnType<typeof vi.fn>;
     goPage: ReturnType<typeof vi.fn>;
+    scrollPage: ReturnType<typeof vi.fn>;
     find: ReturnType<typeof vi.fn>;
+    zoom: ReturnType<typeof vi.fn>;
     owns: ReturnType<typeof vi.fn>;
     retitle: ReturnType<typeof vi.fn>;
     dispose: ReturnType<typeof vi.fn>;
@@ -90,6 +94,9 @@ vi.mock("../core/shortcuts", async (importOriginal) => ({
   ShortcutManager: class {
     on(action: string, h: (e: { repeat: boolean }) => void): void {
       m.keys.set(action, h);
+    }
+    off(action: string): void {
+      m.keys.delete(action);
     }
     setSuppressed(): void {}
     setBindings(): void {}
@@ -239,6 +246,7 @@ beforeEach(() => {
   created = [];
   calls = [];
   m.keys.clear();
+  m.winKeys = [];
   m.menu = [];
   m.onState = null;
   m.prepare.mockReset();
@@ -253,7 +261,9 @@ beforeEach(() => {
   m.pdfMode = {
     open: vi.fn(async () => {}),
     goPage: vi.fn(),
+    scrollPage: vi.fn(),
     find: vi.fn(),
+    zoom: vi.fn(),
     owns: vi.fn(() => false),
     retitle: vi.fn(),
     dispose: vi.fn(),
@@ -275,8 +285,12 @@ beforeEach(() => {
   vi.stubGlobal("window", {
     setTimeout: (fn: () => void, ms?: number) => setTimeout(fn, ms),
     clearTimeout: (t?: ReturnType<typeof setTimeout>) => clearTimeout(t),
-    addEventListener: () => {},
-    removeEventListener: () => {},
+    addEventListener: (type: string, fn: (e: unknown) => void) => {
+      if (type === "keydown") m.winKeys.push(fn);
+    },
+    removeEventListener: (type: string, fn: (e: unknown) => void) => {
+      if (type === "keydown") m.winKeys = m.winKeys.filter((f) => f !== fn);
+    },
   });
 });
 
@@ -632,6 +646,25 @@ describe("seeking", () => {
     video.seeking = false;
     video.fire("seeked");
     expect(video.log).toHaveLength(4);
+  });
+
+  it("lets go of a held bar when the file changes: the next video is never dragged by it", () => {
+    const { root, video } = mounted();
+    const bar = root.querySelector("#vw-seek");
+    bar.getBoundingClientRect = () => ({ left: 100, top: 0, right: 710, bottom: 10, width: 610, height: 10 });
+    const ptr = (sec: number) => ({ button: 0, pointerId: 1, clientX: 100 + (sec / 61) * 610, preventDefault: () => {} });
+    bar.fire("pointerdown", ptr(10));
+    expect(video.log).toHaveLength(1);
+    // stepped on while the button is still down
+    const NEXT = String.raw`D:\clips\next.mp4`;
+    views[0]!.show(NEXT);
+    m.onState!(NEXT, { state: "ready", element: "video", url: "asset://localhost/next", kind: "video", tryingDirect: false });
+    video.duration = 61;
+    video.seeking = false;
+    video.log.length = 0;
+    bar.fire("pointermove", ptr(30));
+    bar.fire("pointerup", ptr(30));
+    expect(video.log).toEqual([]);
   });
 
   it("seeks straight away when nothing is decoding", () => {
@@ -1186,7 +1219,7 @@ describe("a PDF", () => {
   it("Ctrl+F finds, Home / End go to the first and last page", async () => {
     mount(`${F}001.jpg`);
     // nothing to find without a PDF, and Home is still a seek
-    m.keys.get("find")!({ repeat: false });
+    expect(m.keys.has("find")).toBe(false);
     m.keys.get("goStart")!({ repeat: false });
     expect(m.pdfMode!.goPage).not.toHaveBeenCalled();
     remount();
@@ -1197,6 +1230,55 @@ describe("a PDF", () => {
     expect(m.pdfMode!.goPage).toHaveBeenLastCalledWith("first");
     m.keys.get("goEnd")!({ repeat: false });
     expect(m.pdfMode!.goPage).toHaveBeenLastCalledWith("last");
+  });
+
+  it("binds find and the zoom keys only while a PDF is shown, so elsewhere their chords fall through", async () => {
+    const PDF_ONLY = ["find", "imgZoomIn", "imgZoomOut", "imgZoomFit", "imgZoom100"];
+    mount(`${F}001.jpg`);
+    m.onState!(`${F}001.jpg`, { state: "ready", element: "img", url: "u", kind: "image", tryingDirect: false });
+    // ShortcutManager preventDefault()s any chord with a handler: none here
+    for (const a of PDF_ONLY) expect(m.keys.has(a), a).toBe(false);
+    remount();
+    await shownPdf(`${D}a.pdf`);
+    for (const a of PDF_ONLY) expect(m.keys.has(a), a).toBe(true);
+    m.keys.get("imgZoomIn")!({ repeat: false });
+    m.keys.get("imgZoom100")!({ repeat: false });
+    expect(m.pdfMode!.zoom.mock.calls).toEqual([["in"], ["100"]]);
+    // a video after it: the PDF mode goes, and its chords with it
+    views[0]!.show("D:\\clips\\x.mp4");
+    expect(m.pdfMode!.dispose).toHaveBeenCalledTimes(1);
+    for (const a of PDF_ONLY) expect(m.keys.has(a), a).toBe(false);
+  });
+
+  it("Space pages the strip over a PDF (Shift+Space up), and plays a video again after", async () => {
+    await shownPdf(`${D}a.pdf`, ["D:\\clips\\x.mp4"]);
+    m.keys.get("playPause")!({ repeat: false, shiftKey: false });
+    expect(m.pdfMode!.scrollPage).toHaveBeenLastCalledWith(1);
+    // Shift+Space is no chord of Play / Pause: the viewer's own listener
+    // (isTypingTarget asks `instanceof HTMLElement`; a null target is none)
+    vi.stubGlobal("HTMLElement", class {});
+    const shift = (over: Record<string, unknown> = {}) => {
+      const ev = { key: " ", shiftKey: true, ctrlKey: false, altKey: false, metaKey: false, repeat: false, defaultPrevented: false, target: null, preventDefault: vi.fn(), ...over };
+      for (const fn of m.winKeys) fn(ev);
+      return ev;
+    };
+    const ev = shift();
+    expect(ev.preventDefault).toHaveBeenCalled();
+    expect(m.pdfMode!.scrollPage).toHaveBeenLastCalledWith(-1);
+    expect(m.pdfMode!.scrollPage).toHaveBeenCalledTimes(2);
+    // a binding the user gave Shift+Space already claimed it
+    shift({ defaultPrevented: true });
+    expect(m.pdfMode!.scrollPage).toHaveBeenCalledTimes(2);
+
+    // a video: Space plays again, Shift+Space is left alone
+    views[0]!.show("D:\\clips\\x.mp4");
+    m.onState!("D:\\clips\\x.mp4", { state: "ready", element: "video", url: "v", kind: "video", tryingDirect: false });
+    const root = created[0]!;
+    const video = root.querySelector("#vw-video");
+    video.duration = 10;
+    m.keys.get("playPause")!({ repeat: false });
+    expect(m.pdfMode!.scrollPage).toHaveBeenCalledTimes(2);
+    expect(shift().preventDefault).not.toHaveBeenCalled();
   });
 
   it("a double-click on the pages selects a word, not fullscreen", async () => {

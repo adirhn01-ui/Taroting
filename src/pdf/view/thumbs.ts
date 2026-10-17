@@ -29,6 +29,8 @@ interface Item {
   near: boolean;
   /** the cache key of the image it shows ("" = none) */
   shows: string;
+  /** its page size has been asked for (lazily, once it comes near) */
+  measured: boolean;
 }
 
 const docIds = new WeakMap<PdfDoc, number>();
@@ -44,6 +46,7 @@ type PageLike = {
   rotate: number;
   getViewport(o: { scale: number; rotation: number }): { width: number; height: number };
   render(o: Record<string, unknown>): { promise: Promise<void>; cancel(): void };
+  cleanup(): boolean;
 };
 
 export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
@@ -80,8 +83,10 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
         const it = items[Number((e.target as HTMLElement).dataset.slot)];
         if (!it || it.el !== e.target) continue;
         it.near = e.isIntersecting;
-        if (it.near) want(it);
-        else queue.delete(it);
+        if (it.near) {
+          measure(it);
+          want(it);
+        } else queue.delete(it);
       }
       schedule();
     },
@@ -161,9 +166,10 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
         task?.cancel();
       },
     };
+    let page: PageLike | null = null;
     try {
       const pdfjs = pdfjsNow() ?? (await loadPdfjs());
-      const page = (await (doc.doc as { getPage(n: number): Promise<PageLike> }).getPage(it.page.index + 1)) as PageLike;
+      page = (await (doc.doc as { getPage(n: number): Promise<PageLike> }).getPage(it.page.index + 1)) as PageLike;
       if (cancelled || disposed) return;
       const rotation = displayRotation(page.rotate, it.page.rotate);
       const vp1 = page.getViewport({ scale: 1, rotation });
@@ -194,6 +200,11 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
       for (const o of items) if (o !== it && o.near && o.shows !== k && cacheKey(o.page) === k) want(o);
     } catch {
       it.el.classList.add("pdfv-thumb--error");
+    } finally {
+      // The thumbnail is a bitmap now: drop the page's operator list, fonts
+      // and images. The proxy is the one the strip uses too; pdf.js defers
+      // this while any render on it is still running.
+      page?.cleanup();
     }
   }
 
@@ -220,6 +231,21 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
     it.img.style.aspectRatio = `${b.W} / ${b.H}`;
   }
 
+  function measure(it: Item): void {
+    const doc = it.page.doc;
+    if (it.measured || !doc) return;
+    it.measured = true;
+    const rotate = it.page.rotate;
+    void doc
+      .pageInfo(it.page.index)
+      .then((info) => {
+        if (!disposed && items.includes(it)) sizeItem(it, info.w, info.h, displayRotation(info.rotate, rotate));
+      })
+      .catch(() => {
+        it.measured = false;
+      });
+  }
+
   function build(pages: PdfViewPage[]): void {
     for (const it of items) io.unobserve(it.el);
     queue.clear();
@@ -242,16 +268,11 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
       num.setAttribute("aria-hidden", "true");
       row.append(img, num);
       frag.appendChild(row);
-      const it: Item = { page: p, el: row, img, near: false, shows: "" };
+      const it: Item = { page: p, el: row, img, near: false, shows: "", measured: false };
       if (p.doc) {
+        // an estimate until the item comes near (measure): asking every page
+        // up front would queue a GetPage per page ahead of the strip's first
         sizeItem(it, DEFAULT_PAGE_W, DEFAULT_PAGE_H, displayRotation(0, p.rotate));
-        const doc = p.doc;
-        void doc
-          .pageInfo(p.index)
-          .then((info) => {
-            if (!disposed && items[i] === it) sizeItem(it, info.w, info.h, displayRotation(info.rotate, p.rotate));
-          })
-          .catch(() => {});
       } else {
         sizeItem(it, p.w ?? DEFAULT_PAGE_W, p.h ?? DEFAULT_PAGE_H, p.rotate);
       }
@@ -422,13 +443,17 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
     if (items.length === 0) return;
     if (e.key === "Escape" && press?.drag) {
       e.preventDefault();
+      e.stopPropagation();
       endDrag();
       press = null;
       return;
     }
     const step: Record<string, number> = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 };
+    // Keys the rail handles stop here: the viewer's shortcuts listen on the
+    // window and ArrowLeft/ArrowRight there are previous/next file.
     if (e.key in step) {
       e.preventDefault();
+      e.stopPropagation();
       const to = focus + step[e.key]!;
       setFocus(to);
       if (e.shiftKey && opts.selection) {
@@ -438,11 +463,13 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
     }
     if (e.key === "Home" || e.key === "End") {
       e.preventDefault();
+      e.stopPropagation();
       setFocus(e.key === "Home" ? 0 : items.length - 1);
       return;
     }
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
+      e.stopPropagation();
       click(focus, { ctrl: e.ctrlKey && e.key === " ", shift: false });
       return;
     }
@@ -450,6 +477,7 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
       const it = items[focus];
       if (!it || !opts.onContextMenu) return;
       e.preventDefault();
+      e.stopPropagation();
       const r = it.el.getBoundingClientRect();
       menu(focus, { clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 });
     }
@@ -485,7 +513,12 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
       const prev = current;
       current = slot;
       paintCurrent(prev);
-      if (!opts.selection) paintSelection();
+      if (!opts.selection) {
+        // single-select rail: the current page is the selected one; only the
+        // old and new items change (a 2000-page rail is not walked per scroll)
+        items[prev]?.el.setAttribute("aria-selected", "false");
+        items[current]?.el.setAttribute("aria-selected", "true");
+      }
       if (follow) scrollIntoView(slot);
       if (document.activeElement !== el) focus = Math.max(0, slot);
     },

@@ -542,6 +542,15 @@ describe("openMediaAsProject with a PDF", () => {
     expect(h.del).not.toHaveBeenCalled();
   });
 
+  it("reads a stat that fails outright as a missing PDF, before pdf.js is ever fetched", async () => {
+    const h = await harness(STAT, 5);
+    const { ipc } = await import("./ipc");
+    vi.spyOn(ipc, "fileStat").mockRejectedValueOnce(new Error("access denied"));
+    await expect(h.om.openMediaAsProject(PDF)).rejects.toThrow("This PDF is missing or can't be read.");
+    expect(h.calls).not.toContain(`countPages:${PDF}`);
+    expect(h.save).not.toHaveBeenCalled();
+  });
+
   it("makes no project of a password-protected PDF: it says so, for the viewer to show it", async () => {
     const h = await harness(STAT, { kind: "password" });
     const failure = await h.om.openMediaAsProject(PDF).catch((e: unknown) => e);

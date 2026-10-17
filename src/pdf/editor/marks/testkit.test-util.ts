@@ -45,6 +45,9 @@ export class FakeSession {
   holds = 0;
   released = 0;
   history: ProjectFile[] = [];
+  /** the real session's `edited`: set by commits and by replace() unless
+   *  `{ edit: false }` */
+  edited = false;
   constructor(p: ProjectFile) {
     this.store = new Store(p);
   }
@@ -57,16 +60,19 @@ export class FakeSession {
     if (after === before) return;
     this.history.push(before);
     this.steps++;
+    this.edited = true;
     this.store.set(after);
   }
   commitFrom(before: ProjectFile): void {
     if (this.store.get() === before) return;
     this.history.push(before);
     this.steps++;
+    this.edited = true;
   }
-  replace(next: ProjectFile): void {
+  replace(next: ProjectFile, opts?: { edit?: boolean }): void {
     if (next === this.store.get()) return;
     this.replaces++;
+    if (opts?.edit !== false) this.edited = true;
     this.store.set(next);
   }
   holdAutosave(): () => void {

@@ -336,6 +336,9 @@ export function createPdfView(opts: PdfViewOptions): PdfViewExt {
     dropCanvas(d.canvas);
     d.canvas = null;
     d.canvasMap.clear();
+    // pdf.js keeps a page's operator list, fonts and images until cleanup();
+    // with a render still in flight it defers until that one settles.
+    d.proxy?.cleanup();
     d.root.remove();
     s.dom = null;
   }
@@ -428,6 +431,8 @@ export function createPdfView(opts: PdfViewOptions): PdfViewExt {
       d.px = 0;
       d.evicted = true;
       d.stale = true;
+      // the proxy stays valid (and cached): a later render re-fetches its data
+      d.proxy?.cleanup();
     }
   }
 
@@ -560,6 +565,10 @@ export function createPdfView(opts: PdfViewOptions): PdfViewExt {
     if (list.length === 0) return;
     const div = document.createElement("div");
     div.className = "annotationLayer";
+    // Internal links are href="#" with an onclick that returns false, which
+    // covers Shift/Ctrl-click; a middle click is an auxclick that never runs
+    // onclick and would open the app's page in a new window.
+    div.addEventListener("auxclick", stopLinkAux);
     const linkService = makeLinkService(s.page.doc!);
     const storage = (s.page.doc!.doc as PDFDocumentProxy).annotationStorage;
     const layer = new pdfjs.AnnotationLayer({
@@ -631,6 +640,12 @@ export function createPdfView(opts: PdfViewOptions): PdfViewExt {
   }
 
   /* ------------------------------ links ------------------------------ */
+
+  function stopLinkAux(e: Event): void {
+    if (!(e.target as HTMLElement | null)?.closest?.("a")) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }
 
   function makeLinkService(doc: PdfDoc): Record<string, unknown> {
     const stop = (e: Event): void => {

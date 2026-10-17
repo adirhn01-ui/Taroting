@@ -22,7 +22,7 @@ import type { MonitorVolumeState } from "../core/monitor-volume";
 import { navigate } from "../core/nav";
 import { PdfProtectedError, openMediaAsProject, runOnOpenChain } from "../core/open-media";
 import { settingsStore } from "../core/session";
-import { ShortcutManager, normalizeChord } from "../core/shortcuts";
+import { ShortcutManager, isTypingTarget, normalizeChord, shortcutsBlocked } from "../core/shortcuts";
 import type { ActionId } from "../core/types";
 import { elementFullscreen } from "../ui/fullscreen";
 import { icon } from "../ui/icons";
@@ -490,6 +490,9 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     video.hidden = true;
     audioCard.hidden = true;
     bar.hidden = true;
+    // A seek bar still held lets go with the file it was seeking: the next
+    // file is never dragged by a press that began on this one.
+    seekDrag.cancel();
     scrubbing = false;
     paintDamage();
     paintPlay();
@@ -507,6 +510,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     if (pdf === null) return;
     pdf.dispose();
     pdf = null;
+    bindModeKeys();
     syncAutoHide();
   }
 
@@ -527,6 +531,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
       (mod) => {
         if (!live()) return;
         pdf ??= mod.mountPdfMode({ root: el, stage, top: topEl, nameEl, setStatus, withChord }, pdfMemory);
+        bindModeKeys();
         syncAutoHide();
         void pdf.open(p, live);
       },
@@ -1346,7 +1351,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   // Seek: down + every move while held, pointer capture keeps the drag alive
   // off the thin track (the theater bar's behaviour; ./scrub, shared with the
   // PDF page scrubber).
-  bindScrub(seekEl, {
+  const seekDrag = bindScrub(seekEl, {
     enabled: hasMedia,
     at: (r) => {
       if (hasMedia()) seekTo(r * video.duration);
@@ -1384,20 +1389,53 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   // From playhead(), not the element: presses made while a seek decodes add up.
   keys.on("seekBack", () => seekTo(playhead() - SEEK_S));
   keys.on("seekFwd", () => seekTo(playhead() + SEEK_S));
-  keys.on("playPause", () => togglePlay());
   keys.on("goStart", () => (pdf ? pdf.goPage("first") : seekTo(0)));
   keys.on("goEnd", () => (pdf ? pdf.goPage("last") : seekTo(video.duration)));
-  keys.on("find", () => pdf?.find());
-  // Zoom keys only mean something on a PDF; elsewhere they stay unbound so the
-  // chord falls through (the handler is a no-op without a PDF).
-  keys.on("imgZoomIn", () => pdf?.zoom("in"));
-  keys.on("imgZoomOut", () => pdf?.zoom("out"));
-  keys.on("imgZoomFit", () => pdf?.zoom("fit"));
-  keys.on("imgZoom100", () => pdf?.zoom("100"));
   keys.on("fullscreen", () => toggleFs());
   keys.on("goHome", () => back());
   keys.setBindings(settingsStore.get().shortcuts);
   keys.attach();
+
+  /** The chords whose meaning depends on what is shown, (re)bound whenever
+   *  the PDF mode comes or goes. ShortcutManager preventDefault()s every chord
+   *  that has a handler, so a handler that would do nothing must not exist:
+   *  - find and the zoom keys exist only over a PDF; on a picture or a video
+   *    their chords fall through untouched;
+   *  - Play / Pause (Space) pages the strip down over a PDF, as Space does
+   *    in any reader (Shift+Space, up, is onPdfShiftSpace below) — never a
+   *    dead key that stops it scrolling. */
+  function bindModeKeys(): void {
+    if (pdf !== null) {
+      keys.on("playPause", () => pdf?.scrollPage(1));
+      keys.on("find", () => pdf?.find());
+      keys.on("imgZoomIn", () => pdf?.zoom("in"));
+      keys.on("imgZoomOut", () => pdf?.zoom("out"));
+      keys.on("imgZoomFit", () => pdf?.zoom("fit"));
+      keys.on("imgZoom100", () => pdf?.zoom("100"));
+    } else {
+      keys.on("playPause", () => togglePlay());
+      keys.off("find");
+      keys.off("imgZoomIn");
+      keys.off("imgZoomOut");
+      keys.off("imgZoomFit");
+      keys.off("imgZoom100");
+    }
+  }
+  bindModeKeys();
+
+  // Shift+Space is no chord of Play / Pause, so the manager never sees it:
+  // over a PDF it pages the strip up wherever focus is (not only with the
+  // strip focused). After the manager's listener: a binding the user gave
+  // Shift+Space has already claimed the press (defaultPrevented).
+  const onPdfShiftSpace = (e: KeyboardEvent): void => {
+    if (pdf === null || e.key !== " " || !e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
+    if (e.defaultPrevented || isTypingTarget(e.target) || shortcutsBlocked()) return;
+    if (document.querySelector(".modal-backdrop")) return;
+    e.preventDefault();
+    // Once per press, as Space itself (Play / Pause does not repeat).
+    if (!e.repeat) pdf.scrollPage(-1);
+  };
+  window.addEventListener("keydown", onPdfShiftSpace);
   const unSettings = settingsStore.subscribe((s, prev) => {
     if (s.shortcuts === prev.shortcuts) return;
     keys.setBindings(s.shortcuts);
@@ -1418,6 +1456,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
       disposed = true;
       closeMenu();
       keys.detach();
+      window.removeEventListener("keydown", onPdfShiftSpace);
       unSettings();
       window.removeEventListener("keydown", onAnyKey);
       loader.dispose();

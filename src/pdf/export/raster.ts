@@ -5,13 +5,14 @@
 
 import type { RasterTextSpec } from "./deps";
 import { firstStrongRtl } from "./bidi";
-import { wrapParagraph } from "./layout";
+import { rasterScale, wrapParagraph } from "./layout";
 
 export async function layoutCanvasLines(
   spec: RasterTextSpec,
   toPng: (c: OffscreenCanvas) => Promise<Uint8Array>,
 ): Promise<Uint8Array> {
-  const s = spec.scale;
+  // capped here too: whatever asked, the canvas stays within the limits
+  const s = Math.min(spec.scale, rasterScale(spec.w, spec.h));
   const cw = Math.max(1, Math.ceil(spec.w * s));
   const ch = Math.max(1, Math.ceil(spec.h * s));
   const c = new OffscreenCanvas(cw, ch);
