@@ -170,6 +170,30 @@ function evalProp(clip: Clip, prop: AnimProp, staticVal: number, s: number): num
   return staticVal;
 }
 
+/** A slider whose track is not linear in its value: the range input runs in
+ *  position space 0..posMax (step 1), and these convert both ways. The readout
+ *  and the number twin stay in value space. */
+export interface SliderScale {
+  posMax: number;
+  toPos(v: number): number;
+  fromPos(p: number): number;
+}
+
+/**
+ * Clip volume's two-part track: the first half is 0..100%, the second half
+ * 100..500%. 100 positions per half, so every position in the first half is a
+ * distinct 1% (an arrow key never rounds back onto the value it left — commit
+ * puts the thumb back where the value maps) and the second half moves 4% a
+ * step; the number twin reaches every 1% in between. Values come out rounded
+ * to 0.01, so the exact middle is exactly 1. A value past 5 (project data is
+ * not clamped on load) pins the thumb at the right end.
+ */
+export const VOLUME_SCALE: SliderScale = {
+  posMax: 200,
+  toPos: (v) => Math.min(Math.max(v <= 1 ? v * 100 : 100 + (v - 1) * 25, 0), 200),
+  fromPos: (p) => Math.round((p <= 100 ? p / 100 : 1 + (p - 100) / 25) * 100) / 100,
+};
+
 export function mountInspector(
   host: HTMLElement,
   ctx: InspectorCtx,
@@ -385,15 +409,22 @@ export function mountInspector(
       /** decimals shown in the number twin (keeps it compact) */
       decimals?: number;
       format: (v: number) => string;
+      /** A non-linear track (see SliderScale). min/max/step stay in value
+       *  space; they bound the number twin and every applied value. */
+      scale?: SliderScale;
     },
   ): HTMLElement {
+    const sc = opts.scale;
+    // The range input's value for a true value, and back.
+    const posOf = (v: number): string => String(sc ? sc.toPos(v) : v);
+    const valueOf = (s: string): number => (sc ? sc.fromPos(Number(s)) : Number(s));
     const wrap = el("div", "insp-slider");
     const input = el("input", "slider");
     input.type = "range";
-    input.min = String(opts.min);
-    input.max = String(opts.max);
-    input.step = String(opts.step);
-    input.value = String(opts.value);
+    input.min = sc ? "0" : String(opts.min);
+    input.max = sc ? String(sc.posMax) : String(opts.max);
+    input.step = sc ? "1" : String(opts.step);
+    input.value = posOf(opts.value);
 
     const num = el("input", "input insp-num insp-num--twin");
     num.type = "number";
@@ -455,7 +486,7 @@ export function mountInspector(
       release(token);
       // Settle all three views on the applied value: a typed 5 in a 0..1 field
       // applied 1, and an emptied field applied nothing at all.
-      input.value = String(last);
+      input.value = posOf(last);
       num.value = fmtNum(last);
       readout.textContent = opts.format(last);
       // Last, with the gesture fully closed. Never a rebuild from in here: see
@@ -468,7 +499,7 @@ export function mountInspector(
       // nudges arrive after commit() already cleared `before` — without this
       // they edit the project through replace() and land no history entry.
       begin();
-      const v = clampRange(Number(input.value));
+      const v = clampRange(valueOf(input.value));
       num.value = fmtNum(v);
       readout.textContent = opts.format(v);
       apply(v);
@@ -487,7 +518,7 @@ export function mountInspector(
       // waits for the commit — "0" on its way to "0.5" is a prefix below a 0.1
       // minimum, and rewriting it would break the number mid-word.
       if (raw > opts.max) num.value = fmtNum(v);
-      input.value = String(v);
+      input.value = posOf(v);
       readout.textContent = opts.format(v);
       apply(v);
     };
@@ -1075,15 +1106,17 @@ export function mountInspector(
       return s;
     }
 
-    // Volume 0..2 shown as 0..200%
+    // Volume 0..5 shown as 0..500%, on a two-part track: 0..100% on the left
+    // half, 100..500% on the right (VOLUME_SCALE).
     s.appendChild(
       field(
         "Volume",
         slider(clipId, {
           min: 0,
-          max: 2,
+          max: 5,
           step: 0.01,
           value: a.volume,
+          scale: VOLUME_SCALE,
           format: (v) => `${Math.round(v * 100)}%`,
           patch: (v) => ({ audio: { ...currentAudio(clipId, a), volume: v } }),
         }),

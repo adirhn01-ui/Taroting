@@ -40,7 +40,7 @@ vi.mock("../media/generators", () => ({
   measureText: (g: { text: string; sizePx: number }) => ({ width: g.text.length * 10, height: g.sizePx * 2 }),
 }));
 
-const { mountInspector } = await import("./inspector");
+const { mountInspector, VOLUME_SCALE } = await import("./inspector");
 
 type Handler = (e: unknown) => void;
 
@@ -532,6 +532,118 @@ describe("C92: number fields show what the project holds", () => {
     size.blur();
     const gen = t.store.get().media.find((m) => m.id === "m-text")!.generator;
     expect(gen).toMatchObject({ sizePx: 48 });
+  });
+});
+
+describe("clip volume reaches 500% on a two-part track", () => {
+  /** The [range, readout, number] of the Volume field. */
+  const volume = (t: ReturnType<typeof mount>): { range: El; readout: El; num: El } => {
+    const wrap = t.fieldControl("Volume");
+    return { range: wrap.children[0]!, readout: wrap.children[1]!, num: wrap.children[2]! };
+  };
+  const withVolume = (v: number): ProjectFile =>
+    project([clip("a", "m-video", { audio: { volume: v, muted: false, fadeInSec: 0, fadeOutSec: 0, gainOffsetDb: 0, detached: false } })]);
+
+  it("maps 0..100% onto the first half and 100..500% onto the second, both ways", () => {
+    const table: [number, number][] = [[0, 0], [0.5, 50], [1, 100], [2, 125], [3, 150], [5, 200]];
+    expect(VOLUME_SCALE.posMax).toBe(200);
+    for (const [v, p] of table) {
+      expect(VOLUME_SCALE.toPos(v)).toBe(p);
+      expect(VOLUME_SCALE.fromPos(p)).toBe(v);
+    }
+    // Every 1% survives the round trip with no float dust.
+    for (let i = 0; i <= 500; i++) {
+      expect(VOLUME_SCALE.fromPos(VOLUME_SCALE.toPos(i / 100))).toBe(i / 100);
+    }
+  });
+
+  it("runs the range in position space and lands exactly on 100% at the middle", () => {
+    const t = mount(withVolume(0.5), "a");
+    const { range, readout, num } = volume(t);
+    expect([range.min, range.max, range.step, range.value]).toEqual(["0", "200", "1", "50"]);
+    expect([num.min, num.max, num.step, num.value]).toEqual(["0", "5", "0.01", "0.5"]);
+    expect(readout.textContent || readout.innerHTML).toBe("50%");
+    range.focus();
+    range.value = "100";
+    range.fire("input");
+    expect(t.clipNow().audio.volume).toBe(1);
+    expect(readout.textContent).toBe("100%");
+    expect(num.value).toBe("1");
+    range.value = "200";
+    range.fire("input");
+    expect(t.clipNow().audio.volume).toBe(5);
+    expect(readout.textContent).toBe("500%");
+    range.fire("change");
+    expect(range.value).toBe("200");
+    expect(t.history.length).toBe(1);
+  });
+
+  it("moves 1% per arrow key in the first half and never snaps back", () => {
+    const t = mount(withVolume(0.5), "a");
+    const { range } = volume(t);
+    range.focus();
+    // A range input fires input+change on every arrow press.
+    range.value = "51";
+    range.fire("input");
+    range.fire("change");
+    expect(t.clipNow().audio.volume).toBe(0.51);
+    expect(range.value).toBe("51");
+    range.value = "52";
+    range.fire("input");
+    range.fire("change");
+    expect(t.clipNow().audio.volume).toBe(0.52);
+    // The upper half: one step is 4%.
+    range.value = "101";
+    range.fire("input");
+    range.fire("change");
+    expect(t.clipNow().audio.volume).toBe(1.04);
+  });
+
+  it("takes a typed 3.5 as 350% and puts the thumb where 350% sits", () => {
+    const t = mount(withVolume(1), "a");
+    const { range, readout, num } = volume(t);
+    num.focus();
+    type(num, "3.5");
+    expect(t.clipNow().audio.volume).toBe(3.5);
+    expect(readout.textContent).toBe("350%");
+    expect(range.value).toBe("162.5");
+    num.blur();
+    expect(num.value).toBe("3.5");
+    expect(range.value).toBe("162.5");
+    expect(t.history.length).toBe(1);
+  });
+
+  it("clamps a typed value over 500% to 500%", () => {
+    const t = mount(withVolume(1), "a");
+    const { range, readout, num } = volume(t);
+    num.focus();
+    type(num, "9");
+    expect(num.value).toBe("5");
+    expect(t.clipNow().audio.volume).toBe(5);
+    expect(readout.textContent).toBe("500%");
+    expect(range.value).toBe("200");
+  });
+
+  it("shows a project volume past 500% as it is, with the thumb pinned at the right end", () => {
+    const t = mount(withVolume(6), "a");
+    const { range, readout, num } = volume(t);
+    expect(readout.textContent || readout.innerHTML).toBe("600%");
+    expect(num.value).toBe("6");
+    expect(range.value).toBe("200");
+    expect(t.clipNow().audio.volume).toBe(6); // loading never clamps it
+  });
+
+  it("leaves a slider without a scale linear in its value", () => {
+    const t = mount(project([clip("a", "m-video")]), "a");
+    const { range, num } = t.groupSlider("Opacity");
+    expect([range.min, range.max, range.step, range.value]).toEqual(["0", "1", "0.01", "0.8"]);
+    range.focus();
+    range.value = "0.5";
+    range.fire("input");
+    expect(t.clipNow().transform!.opacity).toBe(0.5);
+    expect(num.value).toBe("0.5");
+    range.fire("change");
+    expect(range.value).toBe("0.5");
   });
 });
 
