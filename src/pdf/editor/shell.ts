@@ -7,7 +7,7 @@
 // session, the open source documents and the app-shell duties of the image
 // editor's SHELL CONTRACT (src/image/image-editor.ts, the comment above
 // mountImageEditor — all ten points apply here unchanged). The tools, the
-// inspector and the Fill forms switch are PARTS mounted into hosts it gives
+// inspector and Fill forms mode are PARTS mounted into hosts it gives
 // them, and they only talk to it through the PdfEditorCtx it builds. It reuses
 // the video editor's shell classes and route-out ids (#ed-home, #ed-name,
 // #ed-save, #ed-keep, #ed-settings, #ed-export), so the nav rescue, the
@@ -25,7 +25,7 @@ import type { LoadedProject } from "../../core/ipc";
 import { exitDest, navigate } from "../../core/nav";
 import type { EditorRoute, Route } from "../../core/nav";
 import { isPdfProject } from "../../core/pdf-project";
-import { ProjectSession, currentSession, settingsStore } from "../../core/session";
+import { ProjectSession, currentSession, normalizeHexColor, settingsStore } from "../../core/session";
 import {
   ShortcutManager,
   chordOf,
@@ -35,14 +35,14 @@ import {
   shortcutsBlocked,
 } from "../../core/shortcuts";
 import { Store } from "../../core/store";
-import type { ActionId, PdfFormValue, PdfPage, ProjectFile } from "../../core/types";
+import type { ActionId, PdfFormValue, PdfPage, PdfToolStyle, ProjectFile } from "../../core/types";
 import { imgIcon } from "../../image/icons";
 import { icon } from "../../ui/icons";
 import { closeMenu, showMenu } from "../../ui/menu";
 import { createTempExits, createTempLeaveGate } from "../../ui/temp-project";
 import { toast } from "../../ui/toast";
 import { deletePages, formValue, setFormValue } from "../model";
-import type { PdfDoc, PdfEditorCtx, PdfEditorHosts, PdfToolState, PdfViewPage } from "../types";
+import type { PdfDoc, PdfEditorCtx, PdfEditorHosts, PdfTextEditing, PdfToolState, PdfViewPage } from "../types";
 import { createPdfView, createSearch, renderPageToBlob } from "../view";
 import { button, el } from "./el";
 import { openPdfExportDialog } from "./export-dialog";
@@ -50,6 +50,7 @@ import { mountFind } from "./find";
 import { formsPart } from "./forms";
 import { inspectorPart } from "./inspector";
 import { PageSelection, mountPagePanel } from "./pages";
+import { clampFont, clampSize } from "./marks/geom";
 import { blankCover, writeCover } from "./save";
 import { openSources, openSourcesDialog } from "./sources";
 import type { SourceIssue } from "./sources";
@@ -85,15 +86,31 @@ export function wheelFactor(deltaY: number, deltaMode: number): number {
   return Math.exp(-Math.max(-300, Math.min(300, px)) * 0.002);
 }
 
-/** The tool state a mount starts with (transient: never saved). Colours and
- *  sizes match the image editor's defaults where the tool exists there. */
-export function defaultToolState(): PdfToolState {
+/** The tool state a mount starts with. Colours and sizes match the image
+ *  editor's defaults where the tool exists there; `style` (Settings →
+ *  pdfToolStyle, already sanitized) brings back what the user last picked —
+ *  each tool's colour and size, the shape, the text font and the text box's
+ *  fill and border. The tool itself and the ruler always start fresh. */
+export function defaultToolState(style: PdfToolStyle = {}): PdfToolState {
+  const colors = { highlight: "#ffd400", pen: "#000000", pencil: "#3a3a3a", marker: "#ffd400", shape: "#e5484d", text: "#000000" };
+  const sizes = { pen: 4, pencil: 2, marker: 18, eraser: 16, shape: 4, text: 14 };
+  for (const k of Object.keys(colors) as (keyof typeof colors)[]) {
+    const c = style.colors?.[k] ? normalizeHexColor(style.colors[k], "") : "";
+    if (c) colors[k] = c;
+  }
+  for (const k of Object.keys(sizes) as (keyof typeof sizes)[]) {
+    const v = style.sizes?.[k];
+    if (typeof v === "number" && Number.isFinite(v)) sizes[k] = k === "text" ? clampFont(v) : clampSize(v);
+  }
+  const hex = (v: string | null | undefined): string | null => (v ? normalizeHexColor(v, "") || null : null);
   return {
     tool: "select",
-    colors: { highlight: "#ffd400", pen: "#000000", pencil: "#3a3a3a", marker: "#ffd400", shape: "#e5484d", text: "#000000" },
-    sizes: { pen: 4, pencil: 2, marker: 18, eraser: 16, shape: 4, text: 14 },
-    shape: "arrow",
-    font: "Segoe UI",
+    colors,
+    sizes,
+    shape: style.shape ?? "arrow",
+    font: style.font ?? "Segoe UI",
+    textBg: hex(style.textBg),
+    textBorder: hex(style.textBorder),
     ruler: null,
   };
 }
@@ -437,9 +454,10 @@ function mount(
     session,
     view,
     docs,
-    tools: new Store<PdfToolState>(defaultToolState()),
+    tools: new Store<PdfToolState>(defaultToolState(settingsStore.get().pdfToolStyle)),
     selection: new Store<{ key: string; id: string }[]>([]),
     pageSelection: new PageSelection(() => session.project.pdf?.pages ?? []),
+    textEdit: new Store<PdfTextEditing | null>(null),
     mode: new Store<"annotate" | "forms">("annotate"),
     hasForms: new Store<boolean>(false),
     holdAutosave: () => session.holdAutosave(),

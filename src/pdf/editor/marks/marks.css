@@ -67,17 +67,27 @@
   white-space: pre;
   overflow: visible;
 }
-/* the in-place editor: same font and leading, wraps like a text box */
+/* the in-place editor: same font, leading, fill and border, wraps like a
+   text box; its frame is the selection's own (.pdfmk-sel + handles, drawn
+   beside it), so typing and selected look the same */
 .pdfmk-text-edit {
   height: auto;
   overflow: visible;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  outline: 1px dashed var(--accent);
-  outline-offset: 1px;
+  outline: none;
   pointer-events: auto;
   cursor: text;
   caret-color: currentColor;
+}
+
+/* Edit text: the line under the pointer, quietly */
+.pdfmk-edit-hover {
+  fill: color-mix(in srgb, var(--accent) 8%, transparent);
+  stroke: var(--accent);
+  stroke-width: 1;
+  stroke-dasharray: 3 2;
+  vector-effect: non-scaling-stroke;
 }
 
 /* ---------- selection chrome ---------- */
@@ -209,6 +219,12 @@
 }
 .pdfmk-swatch[aria-pressed="true"] {
   box-shadow: 0 0 0 1px var(--swatch-ring), 0 0 0 3px var(--accent);
+}
+/* "None" (a text box's fill / border): an empty face crossed out */
+.pdfmk-swatch--none,
+.pdfmk-swatch-face--none {
+  background: linear-gradient(to top right, transparent calc(50% - 1px), var(--danger) calc(50% - 1px), var(--danger) calc(50% + 1px), transparent calc(50% + 1px)),
+    var(--bg-input, transparent);
 }
 .pdfmk-swatch-face {
   width: 16px;

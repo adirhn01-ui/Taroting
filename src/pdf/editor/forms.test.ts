@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { installFakeDom, settle, type FakeDocument, type FakeElement } from "../../editor/export/dialog-fake-dom";
+import { installFakeDom, settle, type FakeDocument } from "../../editor/export/dialog-fake-dom";
 import { Store } from "../../core/store";
 import type { ActionId, PdfFormValue, ProjectFile } from "../../core/types";
 import type { PdfDoc, PdfEditorCtx, PdfEditorHosts, PdfToolState } from "../types";
@@ -27,7 +27,7 @@ vi.mock("../../ui/toast", () => ({
 vi.mock("../../image/icons", () => ({ imgIcon: () => "" }));
 
 const forms = await import("./forms");
-const { formsPart, FORMS_HINT, XFA_TOAST, clearAllFormValues, detectForms, resetFormsSessionState } = forms;
+const { formsPart, XFA_TOAST, clearAllFormValues, clearForm, detectForms, setFillForms } = forms;
 
 let doc: FakeDocument;
 let uninstall: () => void;
@@ -35,7 +35,6 @@ let uninstall: () => void;
 beforeEach(() => {
   ({ doc, uninstall } = installFakeDom());
   h.toasts = [];
-  resetFormsSessionState();
 });
 afterEach(() => uninstall());
 
@@ -115,24 +114,17 @@ function setup(opts: { docs?: PdfDoc[]; hasForms?: boolean; mode?: "annotate" | 
   doc.body.appendChild(topbar);
   const hosts = { toolbar: doc.createElement("div"), inspector: doc.createElement("div"), topbar } as unknown as PdfEditorHosts;
   const part = formsPart(ctx, hosts);
-  const $ = (sel: string): FakeElement => {
-    const el = topbar.querySelector(sel);
-    if (!el) throw new Error(`no ${sel}`);
-    return el;
-  };
   return {
     ctx,
     view,
     part,
     keys,
-    $,
     topbar,
     commits: () => commits,
     setTyping: (v: boolean) => (typing = v),
     paint: () => {
       for (const fn of [...rendered]) fn({ key: "pg1" });
     },
-    wrap: () => topbar.querySelector(".pdfed-forms")!,
   };
 }
 
@@ -142,24 +134,19 @@ function pressF(t: ReturnType<typeof setup>): void {
   fn({ target: null, preventDefault() {} } as unknown as KeyboardEvent);
 }
 
+/** The inspector's switch calls this (inspector.ts buildDocument). */
 function flipSwitch(t: ReturnType<typeof setup>, on: boolean): void {
-  const sw = t.$("#pdfed-fill-forms");
-  sw.checked = on;
-  sw.dispatch("change");
+  setFillForms(t.ctx, on);
 }
 
 const withFields = (): object => ({ getFieldObjects: async () => new Map([["name", [{ id: "12R" }]]]) });
 const noFields = (): object => ({ getFieldObjects: async () => null, getMetadata: async () => ({ info: {} }) });
 const xfaOnly = (): object => ({ getFieldObjects: async () => null, getMetadata: async () => ({ info: { IsXFAPresent: true } }) });
 
-describe("Fill forms switch: visibility", () => {
-  it("is hidden while no document has fields and shown when hasForms turns true", async () => {
-    const t = setup();
-    expect(t.wrap().hidden).toBe(true);
-    t.ctx.hasForms.set(true);
-    await settle();
-    expect(t.wrap().hidden).toBe(false);
-    expect(t.$(".pdfed-forms__switch").title).toBe("Fill forms (F)");
+describe("Fill forms: detection (the switch itself is the inspector's)", () => {
+  it("puts nothing in the top bar any more", () => {
+    const t = setup({ hasForms: true });
+    expect(t.topbar.children.length).toBe(0);
     t.part.dispose();
   });
 
@@ -170,16 +157,14 @@ describe("Fill forms switch: visibility", () => {
     t.paint();
     await settle();
     expect(t.ctx.hasForms.get()).toBe(true);
-    expect(t.wrap().hidden).toBe(false);
     t.part.dispose();
   });
 
-  it("a document without fields leaves the switch hidden", async () => {
+  it("a document without fields leaves hasForms false (the switch stays disabled)", async () => {
     const t = setup({ docs: [fakeDoc("s1", noFields())] });
     t.paint();
     await settle();
     expect(t.ctx.hasForms.get()).toBe(false);
-    expect(t.wrap().hidden).toBe(true);
     expect(h.toasts).toEqual([]);
     t.part.dispose();
   });
@@ -229,7 +214,6 @@ describe("Fill forms mode", () => {
   it("opens off even when the store said forms", () => {
     const t = setup({ hasForms: true, mode: "forms" });
     expect(t.ctx.mode.get()).toBe("annotate");
-    expect(t.$("#pdfed-fill-forms").checked).toBe(false);
     expect(t.view.setFormsLayer).toHaveBeenLastCalledWith(false);
     t.part.dispose();
   });
@@ -242,21 +226,28 @@ describe("Fill forms mode", () => {
     expect(t.view.setFormsLayer).toHaveBeenLastCalledWith(true);
     expect(t.ctx.selection.get()).toEqual([]);
     expect(t.ctx.tools.get().tool).toBe("select");
-    expect(t.$("#pdfed-clear-form").hidden).toBe(false);
     flipSwitch(t, false);
     expect(t.ctx.mode.get()).toBe("annotate");
     expect(t.view.setFormsLayer).toHaveBeenLastCalledWith(false);
-    expect(t.$("#pdfed-clear-form").hidden).toBe(true);
     t.part.dispose();
   });
 
-  it("shows the hint once per session", () => {
-    const t = setup({ hasForms: true });
+  it("refuses to come on while the PDF has no fillable fields; no toast (the panel says why)", () => {
+    const t = setup({ hasForms: false });
     flipSwitch(t, true);
-    flipSwitch(t, false);
+    expect(t.ctx.mode.get()).toBe("annotate");
+    t.ctx.hasForms.set(true);
     flipSwitch(t, true);
-    expect(h.toasts.filter((m) => m === FORMS_HINT)).toHaveLength(1);
+    expect(t.ctx.mode.get()).toBe("forms");
+    expect(h.toasts).toEqual([]);
     t.part.dispose();
+  });
+
+  it("after dispose the controls do nothing", () => {
+    const t = setup({ hasForms: true });
+    t.part.dispose();
+    flipSwitch(t, true);
+    expect(t.ctx.mode.get()).toBe("annotate");
   });
 
   it("F toggles the mode through bindKey; does nothing without forms or while typing", () => {
@@ -277,13 +268,12 @@ describe("Fill forms mode", () => {
     expect(t.keys.has("pdfFillForms")).toBe(false);
   });
 
-  it("dispose turns the mode off and removes the switch", () => {
+  it("dispose turns the mode off", () => {
     const t = setup({ hasForms: true });
     flipSwitch(t, true);
     t.part.dispose();
     expect(t.ctx.mode.get()).toBe("annotate");
     expect(t.view.setFormsLayer).toHaveBeenLastCalledWith(false);
-    expect(t.topbar.querySelector(".pdfed-forms")).toBeNull();
   });
 });
 
@@ -291,13 +281,13 @@ describe("Clear form", () => {
   it("clears every value in ONE history step and re-renders the pages", () => {
     const t = setup({ hasForms: true, forms: { s1: { "12R": "Ada", "13R": true } } });
     flipSwitch(t, true);
-    t.$("#pdfed-clear-form").click();
+    clearForm(t.ctx);
     expect(t.commits()).toBe(1);
     expect(Object.keys(t.ctx.session.project.pdf!.forms)).toEqual([]);
     expect(t.view.invalidate).toHaveBeenCalledWith("pg1");
     expect(t.view.invalidate).toHaveBeenCalledWith("pg2");
     // nothing left: no second step
-    t.$("#pdfed-clear-form").click();
+    clearForm(t.ctx);
     expect(t.commits()).toBe(1);
     t.part.dispose();
   });

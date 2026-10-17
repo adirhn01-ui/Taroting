@@ -459,6 +459,7 @@ async function textAppearance(
   const bold = !plain && !!a.bold;
   const italic = !plain && !!a.italic;
   const clip = `${num(frame[0])} ${num(frame[1])} ${num(W)} ${num(H)} re W n`;
+  const back = boxBackOps(a, rect);
   const annot: Record<string, unknown> = {
     Subtype: "FreeText",
     Contents: PDFHexString.fromText(text),
@@ -484,7 +485,7 @@ async function textAppearance(
     const img = await cx.doc.embedPng(png);
     return {
       rect,
-      ops: `q ${turn}${clip} ${num(W)} 0 0 ${num(H)} ${num(frame[0])} ${num(frame[1])} cm /Im0 Do Q`,
+      ops: `${back}q ${turn}${clip} ${num(W)} 0 0 ${num(H)} ${num(frame[0])} ${num(frame[1])} cm /Im0 Do Q`,
       resources: { XObject: { Im0: img.ref } },
       annot,
     };
@@ -508,8 +509,24 @@ async function textAppearance(
       lines.push(`1 0 0 1 ${num(frame[0] + lx)} ${num(frame[3] - baseline)} Tm ${encodeVisual(font, visual)} Tj`);
     }
   }
-  const ops = lines.length ? `q ${turn}${clip} BT /F0 ${num(size)} Tf ${rgbOps(c, "rg")} ${lines.join(" ")} ET Q` : "";
-  return { rect, ops, resources: { Font: { F0: font.ref } }, annot };
+  const ops = back + (lines.length ? `q ${turn}${clip} BT /F0 ${num(size)} Tf ${rgbOps(c, "rg")} ${lines.join(" ")} ET Q` : "");
+  return { rect, ops: ops.trimEnd(), resources: { Font: { F0: font.ref } }, annot };
+}
+
+/** A text box's fill and 1 pt border (each optional), behind its text: the
+ *  page-space box itself — the same for every turn, as the box does not turn
+ *  — with the border inset half its width so all of it stays inside the
+ *  appearance's BBox. "" for neither; else ends in a space. */
+export function boxBackOps(a: { bg?: string; border?: string }, rect: Rect): string {
+  const [x0, y0, x1, y1] = rect;
+  let out = "";
+  if (typeof a.bg === "string" && /^#[0-9a-f]{6}$/i.test(a.bg)) {
+    out += `q ${rgbOps(hexRgb(a.bg), "rg")} ${num(x0)} ${num(y0)} ${num(x1 - x0)} ${num(y1 - y0)} re f Q `;
+  }
+  if (typeof a.border === "string" && /^#[0-9a-f]{6}$/i.test(a.border) && x1 - x0 > 1 && y1 - y0 > 1) {
+    out += `q ${rgbOps(hexRgb(a.border), "RG")} 1 w 0 J 0 j ${num(x0 + 0.5)} ${num(y0 + 0.5)} ${num(x1 - x0 - 1)} ${num(y1 - y0 - 1)} re S Q `;
+  }
+  return out;
 }
 
 /** Right-to-left script characters: fontkit's layout (inside pdf-lib's

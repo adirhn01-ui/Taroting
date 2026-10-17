@@ -29,6 +29,7 @@
 // passes the loader's bounds.
 
 import type {
+  MediaRef,
   PdfAnnot,
   PdfAnnotKind,
   PdfExportPreset,
@@ -261,6 +262,100 @@ export function moveAnnot(p: ProjectFile, from: AnnotRef, toPageId: string): Pro
   let annots = setKey(pdf.annots, from.pageId, kept.length > 0 ? kept : undefined);
   annots = setKey(annots, toPageId, [...dst, a]);
   return withPdf(p, { ...pdf, annots });
+}
+
+/** A text box's optional look: its fill and 1 pt border. */
+export interface TextBoxLook {
+  /** #rrggbb sets it, null removes it, absent leaves it */
+  bg?: string | null;
+  border?: string | null;
+}
+
+/** Set or remove a text mark's fill / border — fields `updateAnnot` cannot
+ *  add or drop (it only touches fields a mark already has). A colour must be
+ *  lowercase #rrggbb (anything else is ignored). Refused: not a text mark,
+ *  unknown page/mark, or nothing changes. */
+export function setTextBox(p: ProjectFile, pageId: string, id: string, look: TextBoxLook): ProjectFile {
+  const pdf = pdfOf(p);
+  if (!pdf) return p;
+  const list = pageAnnots(p, pageId);
+  const i = list.findIndex((a) => a.id === id);
+  if (i < 0) return p;
+  const cur = list[i]!;
+  if (cur.t !== "text") return p;
+  const next: Record<string, unknown> = { ...cur };
+  let changed = false;
+  for (const k of ["bg", "border"] as const) {
+    if (!hasOwn(look, k)) continue;
+    const v = look[k];
+    if (v === null) {
+      if (hasOwn(next, k)) {
+        delete next[k];
+        changed = true;
+      }
+    } else if (typeof v === "string" && /^#[0-9a-f]{6}$/.test(v) && next[k] !== v) {
+      next[k] = v;
+      changed = true;
+    }
+  }
+  if (!changed) return p;
+  const out = list.slice();
+  out[i] = next as unknown as PdfAnnot;
+  return withPdf(p, { ...pdf, annots: setKey(pdf.annots, pageId, out) });
+}
+
+/**
+ * Paste copies of `marks` on top of page `pageId`, each moved by (dx, dy),
+ * with fresh ids (`ids()`), in ONE new project. A text box loses its `edit`
+ * (what it replaced belongs to the page it was copied from). A picture whose
+ * MediaRef the project lacks brings it along from `media` (reusing a ref of
+ * the same file when there is one). Refused (returns `p`, no ids): not a PDF
+ * project, unknown page, nothing to paste, or not all of them fit on it.
+ */
+export function pasteAnnots(
+  p: ProjectFile,
+  pageId: string,
+  marks: readonly PdfAnnot[],
+  dx: number,
+  dy: number,
+  media: readonly MediaRef[],
+  ids: () => string = newId,
+): { project: ProjectFile; ids: string[] } {
+  const none = { project: p, ids: [] as string[] };
+  const pdf = pdfOf(p);
+  if (!pdf || marks.length === 0 || !canAddAnnots(p, pageId, marks.length)) return none;
+  let mediaList = p.media;
+  const mediaMap = new Map<string, string>();
+  const out: PdfAnnot[] = [];
+  const newIds: string[] = [];
+  for (const m of marks) {
+    let a = translateAnnot(m, dx, dy);
+    if (a.t === "image" && !mediaMap.has(a.media)) {
+      const want = a.media;
+      if (mediaList.some((r) => r.id === want)) mediaMap.set(want, want);
+      else {
+        const ref = media.find((r) => r.id === want);
+        if (!ref) return none;
+        const same = mediaList.find((r) => r.kind === ref.kind && !r.generator && r.path === ref.path && r.size === ref.size && r.mtimeMs === ref.mtimeMs);
+        if (same) mediaMap.set(want, same.id);
+        else {
+          mediaList = [...mediaList, ref];
+          mediaMap.set(want, ref.id);
+        }
+      }
+    }
+    if (a.t === "image") a = { ...a, media: mediaMap.get(a.media)! };
+    if (a.t === "text" && a.edit) {
+      const { edit: _drop, ...plain } = a;
+      a = plain;
+    }
+    const id = ids();
+    newIds.push(id);
+    out.push({ ...a, id });
+  }
+  const list = pageAnnots(p, pageId);
+  const next: ProjectFile = mediaList === p.media ? p : { ...p, media: mediaList };
+  return { project: withPdf(next, { ...pdf, annots: setKey(pdf.annots, pageId, [...list, ...out]) }), ids: newIds };
 }
 
 /* ------------------------------------------------------------------ */

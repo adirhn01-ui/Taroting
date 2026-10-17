@@ -587,11 +587,18 @@ export async function runPdfBlocks(ctx: PdfCtx): Promise<void> {
       const key = firstPageId(d);
       const srcId = d.session.project.pdf!.sources[0]!.id;
       await until(() => d.ctx.hasForms.get() || null, 4_000, () => "form_acro.pdf to be detected as fillable (hasForms)");
-      const sw = $<HTMLInputElement>("#pdfed-fill-forms");
-      const label = sw?.closest("label") ?? null;
-      await until(() => rendered(label) || null, 1_000, () => "the Fill forms switch to show");
-      const lHit = hitAtCentreOf(label!);
-      assert(lHit !== null && label!.contains(lHit), `the Fill forms switch's centre shows ${describeEl(lHit)}`);
+      // The switch lives in the right panel's Document section: Select tool,
+      // nothing selected.
+      d.ctx.selection.set([]);
+      d.ctx.pageSelection.set([]);
+      d.ctx.tools.update((t) => (t.tool === "select" ? t : { ...t, tool: "select" }));
+      const sw = await until(() => {
+        const i = $<HTMLInputElement>("#pdfed-fill-forms");
+        return i && rendered(i.closest(".insp-field")) && !i.disabled ? i : null;
+      }, 2_000, () => "the Fill forms switch to show, enabled, in the right panel");
+      const label = sw.closest(".insp-field") as HTMLElement;
+      const lHit = hitAtCentreOf(sw);
+      assert(lHit !== null && label.contains(lHit), `the Fill forms switch's centre shows ${describeEl(lHit)}`);
       d.view.reveal(key, [NAME_FIELD.x, NAME_FIELD.y, NAME_FIELD.w, NAME_FIELD.h]);
       sw!.click();
       switched = true;
@@ -611,7 +618,13 @@ export async function runPdfBlocks(ctx: PdfCtx): Promise<void> {
       field.blur();
 
       // Off: the widgets go inert — at the field's place the hit is not a form control.
-      sw!.click();
+      // The panel rebuilt when the mode changed: the live switch, not the one clicked on.
+      const swOff = await until(() => {
+        const i = $<HTMLInputElement>("#pdfed-fill-forms");
+        return i && i.isConnected && rendered(i.closest(".insp-field")) ? i : null;
+      }, 2_000, () => "the Fill forms switch in Fill forms mode");
+      assert(hitAtCentreOf(swOff) !== null && swOff.closest(".insp-field")!.contains(hitAtCentreOf(swOff)), "the Fill forms switch is covered in Fill forms mode");
+      swOff.click();
       switched = false;
       assert(d.ctx.mode.get() === "annotate", `the switch was clicked off but the mode is "${d.ctx.mode.get()}"`);
       const c = toClient(d, key, NAME_FIELD.x + NAME_FIELD.w / 2, NAME_FIELD.y + NAME_FIELD.h / 2);

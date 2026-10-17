@@ -46,15 +46,18 @@ import type { Clip, Generator, MediaInfo, ProjectFile } from "./types";
 import { ProjectFileError } from "./project";
 import {
   PDF_COORD_MAX,
+  PDF_EDIT_MAX_RECTS,
   PDF_STROKE_MAX_POINTS,
   PDF_TOTAL_MAX_POINTS,
   checkPdfInvariants,
   isPdfFieldId,
   decodePdfPoints,
   emptyPdfTimeline,
+  pdfAnnotPointCount,
   pdfHexColor,
   sanitizePdfAnnot,
   sanitizePdfMeta,
+  sanitizePdfTextEdit,
 } from "./pdf-sanitize";
 import { createPdfProject } from "./pdf-project";
 import { errorDetail } from "./ipc";
@@ -1769,6 +1772,89 @@ describe("PDF project load: marks", () => {
     const big = { ...K("a1"), id: "big", p: "A".repeat((PDF_STROKE_MAX_POINTS + 1) * 16) };
     expect(sanitizePdfAnnot(big, new Set())).toBeNull();
     expect(ids(marksAfterLoad([big, K("a8")]))).toEqual(["a8"]);
+  });
+});
+
+describe("PDF project load: an edited text box (bg, border, edit)", () => {
+  const text = () => everyKind().find((k) => k.id === "a3")! as Record<string, unknown>;
+  const edit = { rects: [[10.5, 20, 30, 12], [50, 20, 0, 12]], cover: "#F0F0F0", orig: "Old words" };
+  const one = (patch: Record<string, unknown>) => marksAfterLoad([{ ...text(), ...patch }]);
+
+  it("keeps a readable fill, border and edit, colours normalised", () => {
+    const [a] = one({ bg: "#ABC", border: "#102030", edit });
+    expect(a).toMatchObject({ bg: "#aabbcc", border: "#102030" });
+    expect((a as { edit: unknown }).edit).toEqual({ rects: edit.rects, cover: "#f0f0f0", orig: "Old words" });
+    // and a second load changes nothing
+    expect(marksAfterLoad([a])).toEqual([a]);
+  });
+
+  it("leaves out an unreadable fill or border, keeping the box", () => {
+    for (const v of ["red", "#ggg", 5, null, "#1234567"]) {
+      const [a] = one({ bg: v, border: v });
+      expect(a, String(v)).toBeDefined();
+      expect("bg" in a! || "border" in a!, String(v)).toBe(false);
+    }
+  });
+
+  it("drops a malformed edit alone: the box and its other fields stay", () => {
+    const bad: unknown[] = [
+      "x",
+      [],
+      { ...edit, rects: [] },
+      { ...edit, rects: [[0, 0, -1, 1]] },
+      { ...edit, rects: [[0, 0, 1]] },
+      { ...edit, rects: [[0, PDF_COORD_MAX + 1, 1, 1]] },
+      { ...edit, rects: [[NaN, 0, 1, 1]] },
+      { ...edit, rects: [["0", 0, 1, 1]] },
+      { ...edit, rects: "0,0,1,1" },
+      { ...edit, rects: Array(PDF_EDIT_MAX_RECTS + 1).fill([0, 0, 1, 1]) },
+      { ...edit, orig: 5 },
+      { ...edit, orig: "x".repeat(20_001) },
+      { rects: edit.rects, cover: "#fff" },
+    ];
+    for (const e of bad) {
+      const out = one({ edit: e, bg: "#ffffff" });
+      expect(out, JSON.stringify(e).slice(0, 60)).toHaveLength(1);
+      expect("edit" in out[0]!).toBe(false);
+      expect((out[0] as { bg?: string }).bg).toBe("#ffffff");
+      expect((out[0] as { text: string }).text).toBe("hello");
+    }
+    expect(one({ edit: { ...edit, rects: Array(PDF_EDIT_MAX_RECTS).fill([0, 0, 1, 1]) } })[0]).toHaveProperty("edit");
+  });
+
+  it("gives an unreadable cover the default white when the rects are sound", () => {
+    expect(sanitizePdfTextEdit({ ...edit, cover: "nope" })!.cover).toBe("#ffffff");
+    expect(sanitizePdfTextEdit({ ...edit, cover: undefined })!.cover).toBe("#ffffff");
+  });
+
+  it("counts edit rects against the document's point budget", () => {
+    const e = { ...edit, rects: [[0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1]] };
+    expect(sanitizePdfAnnot({ ...text(), edit: e }, new Set(), 3)).toHaveProperty("edit");
+    const over = sanitizePdfAnnot({ ...text(), edit: e }, new Set(), 2);
+    expect(over).not.toBeNull();
+    expect("edit" in over!).toBe(false);
+    // what the document-wide budget is charged for it
+    expect(pdfAnnotPointCount({ ...text(), edit: e } as unknown as PdfAnnot)).toBe(3);
+    expect(pdfAnnotPointCount(text() as unknown as PdfAnnot)).toBe(0);
+  });
+
+  it("a crafted file with garbage edit rects loads with the box and passes the invariants", () => {
+    const raw = rawPdf({ annots: { p1: [{ ...text(), edit: { rects: [[1e300, "x", -5, null]], cover: 7, orig: {} } }] } });
+    const out = loadRaw(raw);
+    expect(checkInvariants(out)).toEqual([]);
+    const [a] = out.pdf!.annots.p1!;
+    expect(a!.t).toBe("text");
+    expect("edit" in a!).toBe(false);
+  });
+
+  it("checkPdfInvariants reports an edit, fill or border the sanitizer would drop", () => {
+    const p = createPdfProject("x", { path: "C:\\a.pdf", size: 1, mtimeMs: 1, pages: 1 });
+    const id = p.pdf!.pages[0]!.id;
+    const bad = { ...text(), bg: "red", edit: { ...edit, rects: [] } } as unknown as PdfAnnot;
+    const errs = checkPdfInvariants({ ...p, pdf: { ...p.pdf!, annots: { [id]: [bad] } } });
+    expect(errs).toContain("mark a3: invalid bg, edit");
+    const good = { ...text(), bg: "#ffffff", edit } as unknown as PdfAnnot;
+    expect(checkPdfInvariants({ ...p, pdf: { ...p.pdf!, annots: { [id]: [sanitizePdfAnnot(good, new Set())!] } } })).toEqual([]);
   });
 });
 

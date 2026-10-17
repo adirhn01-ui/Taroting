@@ -17,6 +17,8 @@ import {
   movePages,
   newId,
   pageAnnots,
+  pasteAnnots,
+  setTextBox,
   removeAnnots,
   reorderPages,
   rotatePages,
@@ -607,5 +609,89 @@ describe("scaleAnnot", () => {
     const out = scaleAnnot(sig, [0, 0, 10, 10], [0, 0, 20, 20]) as Extract<PdfAnnot, { t: "signature" }>;
     expect(out.strokes).toBe(strokes);
     expect([out.w, out.h]).toEqual([20, 20]);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* 0.9.3 review round: text box look, paste                            */
+/* ------------------------------------------------------------------ */
+
+const textMark = (id: string, extra: Record<string, unknown> = {}): PdfAnnot =>
+  ({ id, t: "text", x: 50, y: 60, w: 100, h: 20, text: "hi", font: "Arial", size: 12, c: "#000000", bold: false, italic: false, align: "left", ...extra }) as PdfAnnot;
+
+function withMarks(p: ProjectFile, page: string, list: PdfAnnot[]): ProjectFile {
+  const annots = Object.assign(Object.create(null) as Record<string, PdfAnnot[]>, p.pdf!.annots, { [page]: list });
+  return { ...p, pdf: { ...p.pdf!, annots } };
+}
+
+describe("setTextBox", () => {
+  it("adds, changes and removes a text box's fill / border (updateAnnot cannot)", () => {
+    const p = withMarks(doc(), "P3", [textMark("t")]);
+    // updateAnnot ignores a field the mark does not have
+    expect(updateAnnot(p, "P3", "t", { bg: "#ff0000" } as never)).toBe(p);
+    const a = setTextBox(p, "P3", "t", { bg: "#ff0000", border: "#00ff00" });
+    expect(pageAnnots(a, "P3")[0]).toMatchObject({ bg: "#ff0000", border: "#00ff00" });
+    const b = setTextBox(a, "P3", "t", { bg: null });
+    expect("bg" in pageAnnots(b, "P3")[0]!).toBe(false);
+    expect(pageAnnots(b, "P3")[0]).toMatchObject({ border: "#00ff00" });
+    // nothing changes / not a colour / not a text mark: the input itself
+    expect(setTextBox(b, "P3", "t", { bg: null })).toBe(b);
+    expect(setTextBox(b, "P3", "t", { bg: "red" })).toBe(b);
+    expect(setTextBox(b, "P1", "m1", { bg: "#ff0000" })).toBe(b);
+    expect(setTextBox(b, "P3", "nope", { bg: "#ff0000" })).toBe(b);
+  });
+});
+
+describe("pasteAnnots", () => {
+  it("copies with new ids, moved, on top of the page, in one new project", () => {
+    const p = doc();
+    const src = pageAnnots(p, "P1");
+    let n = 0;
+    const out = pasteAnnots(p, "P3", src, 10, 20, [], () => `n${n++}`);
+    expect(out.ids).toEqual(["n0", "n1"]);
+    const got = pageAnnots(out.project, "P3");
+    expect(got.map((a) => a.id)).toEqual(["n0", "n1"]);
+    expect(got[0]).toMatchObject({ t: "whiteout", x: 20, y: 40, w: 30, h: 40 });
+    expect(annotBounds(got[1]!)[0]).toBeCloseTo(annotBounds(src[1]!)[0] + 10);
+    // the originals stay where they were
+    expect(pageAnnots(out.project, "P1")).toBe(pageAnnots(p, "P1"));
+    clean(out.project);
+  });
+
+  it("a picture brings its MediaRef into a project that lacks it, and reuses one of the same file", () => {
+    const ref = { id: "m9", kind: "image", path: "C:\pic.png", size: 5, mtimeMs: 7, width: 10, height: 10 } as unknown as import("../core/types").MediaRef;
+    const pic: PdfAnnot = { id: "i", t: "image", x: 1, y: 2, w: 3, h: 4, media: "m9" };
+    const p = doc();
+    const out = pasteAnnots(p, "P1", [pic], 0, 0, [ref], () => "x1");
+    expect(out.project.media.map((m) => m.id)).toContain("m9");
+    expect(pageAnnots(out.project, "P1").at(-1)).toMatchObject({ id: "x1", media: "m9" });
+    // the same file already there under another id: that one is used
+    const has = { ...p, media: [...p.media, { ...ref, id: "mine" }] };
+    const again = pasteAnnots(has, "P1", [pic], 0, 0, [ref], () => "x2");
+    expect(again.project.media.filter((m) => (m as { path?: string }).path === ref.path)).toHaveLength(1);
+    expect(pageAnnots(again.project, "P1").at(-1)).toMatchObject({ media: "mine" });
+    // no ref anywhere: refused
+    expect(pasteAnnots(p, "P1", [pic], 0, 0, [], () => "x3").project).toBe(p);
+  });
+
+  it("an edited text box pastes as a plain box (what it replaced stays on its page)", () => {
+    const edited = textMark("e", { edit: { rects: [[50, 60, 40, 10]], cover: "#ffffff", orig: "old" } });
+    const out = pasteAnnots(doc(), "P2", [edited], 10, 10, [], () => "c");
+    const got = pageAnnots(out.project, "P2").at(-1)!;
+    expect(got).toMatchObject({ id: "c", t: "text", x: 60, y: 70 });
+    expect("edit" in got).toBe(false);
+  });
+
+  it("refuses an unknown page or nothing to paste", () => {
+    const p = doc();
+    expect(pasteAnnots(p, "nope", [box("z")], 0, 0, []).project).toBe(p);
+    expect(pasteAnnots(p, "P1", [], 0, 0, []).project).toBe(p);
+  });
+
+  it("moving an edited box leaves its cover where the original text was", () => {
+    const edited = textMark("e", { edit: { rects: [[50, 60, 40, 10]], cover: "#ffffff", orig: "old" } });
+    const moved = translateAnnot(edited, 100, 0) as Extract<PdfAnnot, { t: "text" }>;
+    expect(moved.x).toBe(150);
+    expect(moved.edit!.rects).toEqual([[50, 60, 40, 10]]);
   });
 });

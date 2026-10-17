@@ -36,6 +36,7 @@ import type {
 } from "../types";
 import * as M from "./math";
 import { formsBridge, type WidgetLite } from "./forms";
+import { canvasPatch, paperAndInk } from "./text-lines";
 import { loadPdfjs, pdfjsNow, type PDFPageProxy, type Pdfjs } from "./pdfjs";
 import { pageText } from "./search";
 
@@ -975,6 +976,23 @@ export function createPdfView(opts: PdfViewOptions): PdfViewExt {
       d.stale = true;
       d.root.querySelector(".pdfv-page__error")?.remove();
       pump();
+    },
+
+    samplePage(key, rect): { ink: string; paper: string } | null {
+      const i = indexOfKey(key);
+      const s = i >= 0 ? slots[i]! : null;
+      const canvas = s?.dom?.canvas;
+      if (disposed || !s || !canvas || s.dom!.error) return null;
+      const patch = canvasPatch(rect, s.w, s.h, s.rot, canvas.width, canvas.height);
+      if (!patch) return null;
+      try {
+        const g = canvas.getContext("2d");
+        if (!g) return null;
+        const img = g.getImageData(patch.x, patch.y, patch.w, patch.h);
+        return paperAndInk(img.data, patch.w, patch.h, patch.inner);
+      } catch {
+        return null;
+      }
     },
 
     setSearchHits(hits: PdfSearchHit[], active: number): void {

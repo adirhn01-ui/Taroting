@@ -133,6 +133,12 @@ export interface PdfView {
   on<K extends keyof PdfViewEvents>(type: K, fn: (e: PdfViewEvents[K]) => void): () => void;
   /** re-render one page's canvas (e.g. a source changed); cheap no-op if hidden */
   invalidate(key: string): void;
+  /** The colours of the RENDERED page around/inside a page-space rect ("Edit
+   *  text"): `paper` = the most common colour of a 2 pt ring around it, `ink`
+   *  = the text colour inside it (#000000 when none stands out). null when
+   *  the page has no painted canvas. Reads a small patch; never at rest.
+   *  Optional so test views need not implement it. */
+  samplePage?(key: string, rect: PageRect): { ink: string; paper: string } | null;
   dispose(): void;
 }
 
@@ -188,6 +194,7 @@ export type PdfToolId =
   | "eraser"
   | "shape"
   | "text"
+  | "edittext"
   | "whiteout"
   | "image"
   | "signature";
@@ -199,8 +206,29 @@ export interface PdfToolState {
   sizes: { pen: number; pencil: number; marker: number; eraser: number; shape: number; text: number };
   shape: import("../core/types").ShapeKind;
   font: import("../core/types").FontFamily;
+  /** a new text box's fill / 1 pt border, #rrggbb; null = none */
+  textBg: string | null;
+  textBorder: string | null;
   /** null = hidden; page space of the page it lies on */
   ruler: { key: string; cx: number; cy: number; angle: number } | null;
+}
+
+/** A text box open for typing (marks/text.ts). While one is open the
+ *  inspector shows THAT box and edits it live. */
+export interface PdfTextEditing {
+  key: string;
+  /** the mark's id (a new box gets its id when it lands) */
+  id: string;
+  /** a NEW box's look while it is not a mark yet (the inspector edits this;
+   *  the box lands with it, in its one history step); null = an existing
+   *  mark (edited through the project, one step per control gesture) */
+  draft: Extract<import("../core/types").PdfAnnot, { t: "text" }> | null;
+  /** land the box and leave it selected (Escape) */
+  commit(): void;
+  /** close the editor writing nothing (Delete in the panel) */
+  discard(): void;
+  /** focus back in the text, the caret where it was */
+  refocus(): void;
 }
 
 /** What every part of the PDF editor is handed. Built once per mount by the
@@ -217,10 +245,12 @@ export interface PdfEditorCtx {
    *  across reorders and undo/redo (it remembers the ids behind the slots and
    *  re-maps them after every page change). */
   pageSelection: Store<number[]>;
+  /** the text box open for typing, or null (marks/text.ts sets it) */
+  textEdit: Store<PdfTextEditing | null>;
   /** "annotate" = tools own the pointer; "forms" = Fill forms mode (form
    *  widgets own it, tools are disabled). Transient, default "annotate". */
   mode: Store<"annotate" | "forms">;
-  /** true when any open source has fillable fields (shows the Fill forms switch) */
+  /** true when any open source has fillable fields (enables the Fill forms switch) */
   hasForms: Store<boolean>;
   /** ProjectSession.holdAutosave passthrough (pointer-down → hold, up → release) */
   holdAutosave(): () => void;
@@ -247,7 +277,8 @@ export interface PdfEditorHosts {
   toolbar: HTMLElement;
   /** the right-hand panel (tool/mark/page properties) */
   inspector: HTMLElement;
-  /** in the top bar, before Settings/Export: the Fill forms switch */
+  /** in the top bar, before Settings/Export (empty since 0.9.3's review:
+   *  the Fill forms switch lives in the inspector) */
   topbar: HTMLElement;
 }
 

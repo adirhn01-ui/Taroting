@@ -88,6 +88,8 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   pdfWhiteout: "Whiteout (PDF)",
   pdfFillForms: "Fill forms on/off (PDF)",
   find: "Find in PDF",
+  pdfEditText: "Edit text (PDF)",
+  duplicate: "Duplicate (PDF)",
 };
 
 /** The screens that have a ShortcutManager. The conflict warning names a mode,
@@ -151,6 +153,8 @@ export const ACTION_ORDER: ActionId[] = [
   "pdfWhiteout",
   "pdfFillForms",
   "find",
+  "pdfEditText",
+  "duplicate",
 ];
 
 /** The three user-settable colours of the custom theme, in the order they are

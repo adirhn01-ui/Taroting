@@ -1,5 +1,8 @@
-// Fill forms mode: the "Fill forms" switch in the top bar, the detection that
-// decides whether it shows (ctx.hasForms), and Clear form.
+// Fill forms mode: the mode itself, the detection that decides whether it can
+// come on (ctx.hasForms), Clear form, and the F key. The SWITCH lives in the
+// inspector (inspector.ts, "Document" — the image editor's switch field, as
+// the owner asked); it calls setFillForms / clearForm here, so this module
+// stays the one owner of what the mode does.
 //
 // The owner's words: "an option to turn on form filling, like a click slider
 // with the option to turn on or off form filling … its like a mode in pdf
@@ -13,15 +16,15 @@
 // first page has painted (or on idle), and caches its answer by document.
 // No timer, no frame loop.
 
-import "./forms.css";
 import type { PdfMeta, ProjectFile } from "../../core/types";
-import { settingsStore } from "../../core/session";
-import { imgIcon } from "../../image/icons";
 import { toast } from "../../ui/toast";
-import type { PdfDoc, PdfEditorCtx, PdfEditorHosts, PdfEditorPart } from "../types";
+import type { PdfDoc, PdfEditorCtx, PdfEditorPart } from "../types";
 
 export const FILL_FORMS_LABEL = "Fill forms";
-export const FORMS_HINT = "Click a field to type. Tab moves to the next field.";
+/** The tip under the switch while the mode is on. */
+export const FORMS_TIP = "Click a field to type. Tab moves to the next one.";
+/** The note beside a disabled switch (so it is always findable). */
+export const NO_FIELDS_NOTE = "This PDF has no fillable fields.";
 export const XFA_TOAST = "This PDF uses an older form type (XFA) that Taroting can't fill.";
 export const CLEAR_FORM_LABEL = "Clear form";
 
@@ -82,22 +85,23 @@ export function clearAllFormValues(p: ProjectFile): ProjectFile {
   return { ...p, pdf };
 }
 
-/** "Fill forms (F)", or just the label when the action has no chord. */
-function titled(label: string, chord: string | undefined): string {
-  return chord ? `${label} (${chord})` : label;
-}
-
-/** The forms hint is shown once per app session, not once per editor mount. */
-let hintShown = false;
 /** Documents (pdf.js proxies) already reported as XFA-only: one toast each,
  *  ever, even across remounts. */
 const xfaToasted = new WeakSet<object>();
 /** Detection results by pdf.js proxy — a document is asked once. */
 const detected = new WeakMap<object, Promise<FormsKind>>();
 
-/** Test hook: forget the once-per-session hint. */
-export function resetFormsSessionState(): void {
-  hintShown = false;
+/** Each mounted editor's mode controls (the inspector's switch calls them). */
+const controls = new WeakMap<PdfEditorCtx, { setMode(on: boolean): void; clear(): void }>();
+
+/** Turn Fill forms mode on or off (refused on while the PDF has no fields). */
+export function setFillForms(ctx: PdfEditorCtx, on: boolean): void {
+  controls.get(ctx)?.setMode(on);
+}
+
+/** Clear every form value: one history step, the pages re-rendered. */
+export function clearForm(ctx: PdfEditorCtx): void {
+  controls.get(ctx)?.clear();
 }
 
 type IdleHandle = { cancel(): void };
@@ -115,45 +119,16 @@ function onIdle(fn: () => void, timeout: number): IdleHandle {
   return { cancel: () => clearTimeout(id) };
 }
 
-export const formsPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts: PdfEditorHosts) => {
+export const formsPart: PdfEditorPart = (ctx: PdfEditorCtx) => {
   let disposed = false;
   const cleanups: (() => void)[] = [];
 
-  /* ---------------- UI ---------------- */
+  /* ---------------- the mode ---------------- */
 
-  const wrap = document.createElement("div");
-  wrap.className = "pdfed-forms";
-  wrap.hidden = true;
-  wrap.innerHTML = `
-    <label class="pdfed-forms__switch">
-      <input class="switch" type="checkbox" id="pdfed-fill-forms" />
-      <span>${FILL_FORMS_LABEL}</span>
-    </label>
-    <button class="btn btn--ghost btn--icon btn--sm" id="pdfed-clear-form" hidden></button>
-  `;
-  hosts.topbar.appendChild(wrap);
-  const label = wrap.querySelector<HTMLElement>(".pdfed-forms__switch")!;
-  const input = wrap.querySelector<HTMLInputElement>("#pdfed-fill-forms")!;
-  const clearBtn = wrap.querySelector<HTMLButtonElement>("#pdfed-clear-form")!;
-  input.setAttribute("aria-label", FILL_FORMS_LABEL);
-  clearBtn.innerHTML = imgIcon("eraser", 14);
-  clearBtn.title = CLEAR_FORM_LABEL;
-  clearBtn.setAttribute("aria-label", CLEAR_FORM_LABEL);
-
-  let shownTitle = "";
-  function paintTitle(): void {
-    const t = titled(FILL_FORMS_LABEL, settingsStore.get().shortcuts?.pdfFillForms);
-    if (t === shownTitle) return;
-    shownTitle = t;
-    label.title = t;
-  }
-
-  /** The switch, the clear button and the view's forms layer follow the mode. */
+  /** The view's forms layer follows the mode. */
   let appliedOn: boolean | null = null;
   function applyMode(): void {
     const on = ctx.mode.get() === "forms";
-    input.checked = on;
-    clearBtn.hidden = !on;
     if (on === appliedOn) return;
     appliedOn = on;
     ctx.view.setFormsLayer(on);
@@ -172,25 +147,13 @@ export const formsPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts: PdfEditorHost
       // box being typed in must not survive into a mode where they can't act.
       ctx.selection.set([]);
       if (ctx.tools.get().tool !== "select") ctx.tools.update((s) => ({ ...s, tool: "select" }));
-      if (!hintShown) {
-        hintShown = true;
-        toast.info(FORMS_HINT);
-      }
     }
     ctx.mode.set(on ? "forms" : "annotate");
     applyMode();
   }
 
-  const onChange = (): void => setMode(input.checked);
-  input.addEventListener("change", onChange);
-  // Same as the inspector's switches: a mouse click must not leave the switch
-  // focused, or a later Space would flip it.
-  const onClick = (e: Event): void => {
-    if ((e as MouseEvent).detail > 0) input.blur();
-  };
-  input.addEventListener("click", onClick);
-
-  const onClear = (): void => {
+  function clear(): void {
+    if (disposed) return;
     const before = ctx.session.project;
     ctx.session.commit(clearAllFormValues);
     const after = ctx.session.project;
@@ -198,12 +161,11 @@ export const formsPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts: PdfEditorHost
     // The forms bridge re-seeds on render and drops the values the project
     // no longer has; every page with a widget must render again.
     for (const pg of after.pdf?.pages ?? []) ctx.view.invalidate(pg.id);
-  };
-  clearBtn.addEventListener("click", onClear);
+  }
+
+  controls.set(ctx, { setMode, clear });
   cleanups.push(() => {
-    input.removeEventListener("change", onChange);
-    input.removeEventListener("click", onClick);
-    clearBtn.removeEventListener("click", onClear);
+    if (controls.get(ctx)?.setMode === setMode) controls.delete(ctx);
   });
 
   cleanups.push(
@@ -218,23 +180,12 @@ export const formsPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts: PdfEditorHost
   cleanups.push(ctx.mode.subscribe(() => applyMode()));
   cleanups.push(
     ctx.hasForms.subscribe((has) => {
-      wrap.hidden = !has;
       if (!has && ctx.mode.get() === "forms") setMode(false);
-    }),
-  );
-  let lastShortcuts = settingsStore.get().shortcuts;
-  cleanups.push(
-    settingsStore.subscribe((st) => {
-      if (st.shortcuts === lastShortcuts) return;
-      lastShortcuts = st.shortcuts;
-      paintTitle();
     }),
   );
 
   // Off every time the editor opens (transient).
   ctx.mode.set("annotate");
-  wrap.hidden = !ctx.hasForms.get();
-  paintTitle();
   applyMode();
 
   /* ---------------- detection ---------------- */
@@ -333,7 +284,6 @@ export const formsPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts: PdfEditorHost
         ctx.mode.set("annotate");
         ctx.view.setFormsLayer(false);
       }
-      wrap.remove();
     },
   };
 };

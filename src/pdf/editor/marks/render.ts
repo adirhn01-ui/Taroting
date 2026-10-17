@@ -192,6 +192,27 @@ export function styleTextBox(el: HTMLElement, a: Pick<Extract<PdfAnnot, { t: "te
   s.textAlign = a.align;
 }
 
+/** A text box's fill and 1 pt border (inside the box), on its content
+ *  element: shared by the saved text and the in-place editor, so both look
+ *  the same. Absent = transparent / none. */
+export function styleBoxLook(el: HTMLElement, a: { bg?: string; border?: string }): void {
+  const s = el.style;
+  const bg = a.bg ? normalizeHexColor(a.bg, "") : "";
+  const border = a.border ? normalizeHexColor(a.border, "") : "";
+  s.backgroundColor = bg || "transparent";
+  // an inset ring: inside the box, takes no layout room (1 px = 1 pt here)
+  s.boxShadow = border ? `inset 0 0 0 1px ${border}` : "none";
+}
+
+/** How far a cover box reaches past each glyph rect it hides, points. */
+export const COVER_PAD = 0.5;
+
+/** Path data of an edited text box's covers: each original glyph rect,
+ *  padded by COVER_PAD. */
+export function coverD(rects: readonly [number, number, number, number][]): string {
+  return rectsD(rects.map(([x, y, w, h]) => [x - COVER_PAD, y - COVER_PAD, w + 2 * COVER_PAD, h + 2 * COVER_PAD] as [number, number, number, number]));
+}
+
 /** One saved mark as an SVG node in page space (null: nothing to draw). */
 export function markNode(a: PdfAnnot, media: readonly MediaRef[], urlOf: (path: string) => string): SVGElement | null {
   let node: SVGElement | null = null;
@@ -263,9 +284,20 @@ export function markNode(a: PdfAnnot, media: readonly MediaRef[], urlOf: (path: 
       turn(node, a);
       break;
     }
-    case "text":
-      node = textNode(a);
+    case "text": {
+      const fo = textNode(a);
+      const d = a.edit ? coverD(a.edit.rects) : "";
+      if (!d) {
+        node = fo;
+        break;
+      }
+      // "Edit text": the page's own text hides under its cover (page space,
+      // never turned), then the box draws on top
+      node = svg("g", { class: "pdfmk-edited" });
+      node.appendChild(svg("path", { d, fill: col(a.edit!.cover, "#ffffff"), class: "pdfmk-cover" }));
+      node.appendChild(fo);
       break;
+    }
   }
   if (node) node.setAttribute("data-id", a.id);
   return node;
@@ -287,6 +319,7 @@ export function textNode(a: Extract<PdfAnnot, { t: "text" }>): SVGElement {
   const box = document.createElement("div");
   box.className = "pdfmk-text";
   styleTextBox(box, a);
+  styleBoxLook(box, a);
   const lh = a.size * LINE_HEIGHT;
   for (const line of textLines(a)) {
     const div = document.createElement("div");

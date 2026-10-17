@@ -2,10 +2,17 @@
 // pointerdown on the page strip decides who owns a press:
 //   - Fill forms mode: nobody here (form widgets own the pointer);
 //   - the ruler, when the press lands on it;
-//   - the active tool (draw.ts, select.ts, text.ts, the armed signature);
+//   - the active tool (draw.ts, select.ts, text.ts, edit-tool.ts, the armed
+//     signature). Text, Shapes, Whiteout and Highlight also act on a mark OF
+//     THEIR OWN KIND under the press (and on the selection's handles): it is
+//     selected and moved (or resized) instead of a new one being drawn. With
+//     Text, a click on a box types in it, caret where clicked;
 //   - with Select or Highlight, a press on a text-layer span (or a form
 //     widget / link) is left to the browser, so native text selection works —
 //     Highlight then turns that selection into marks on release.
+// Any press on a page also clears the page panel's selection (the inspector
+// shows what was touched last). Copy / paste / duplicate (clipboard.ts) and
+// Delete act on the selected marks whatever the tool.
 // A started gesture captures the pointer, holds autosave until it ends, and
 // paints at most once per frame. Nothing runs at rest: no timer, no frame
 // loop; listeners return on a compare when idle.
@@ -13,7 +20,7 @@
 // The text layer follows the tool: ON for Select and Highlight (and in Fill
 // forms mode), OFF while any other tool owns the pointer.
 
-import type { PdfRotation, PdfSignature } from "../../../core/types";
+import type { PdfAnnot, PdfRotation, PdfSignature } from "../../../core/types";
 import type { PdfToolId } from "../../types";
 import { normalizeHexColor } from "../../../core/session";
 import { shortcutsBlocked } from "../../../core/shortcuts";
@@ -21,11 +28,26 @@ import { PalmFilter } from "../../../image/ink/input";
 import { addAnnot, newId, pageAnnots, removeAnnots, translateAnnot, updateAnnot, type PdfAnnotPatch } from "../../model";
 import type { PdfEditorCtx } from "../../types";
 import type { Env, Gesture } from "./env";
-import { HIT_CSS, onNativeTarget, paintChrome, selectedMarks, startRuler, startSelect, type SelRef } from "./select";
+import {
+  DRAG_CSS,
+  HANDLE_REACH_CSS,
+  HIT_CSS,
+  handleBox,
+  moveGesture,
+  onNativeTarget,
+  paintChrome,
+  resizeGesture,
+  selectedMarks,
+  startRuler,
+  startSelect,
+  type SelRef,
+} from "./select";
 import { highlightSelection, startBox, startEraser, startInk, startShape } from "./draw";
-import { boxForFrame, boxPoints, clampFont, geometryPatch, rotField, screenToPageDelta, stepSize, topmostAt } from "./geom";
+import { boxForFrame, boxPoints, clampFont, geometryPatch, handleAt, onBoxEdge, rotField, screenToPageDelta, stepSize, topmostAt } from "./geom";
 import type { MarkLayer, PageInfo } from "./layer";
-import { openTextEditor, type TextEditor } from "./text";
+import { openTextEditor, type CaretAt, type TextEditor } from "./text";
+import { copyMarks, duplicateMarks, pasteMarks } from "./clipboard";
+import { createEditTextTool } from "./edit-tool";
 
 /** A placed signature's default width, points (aspect kept). */
 export const SIGNATURE_W = 160;
@@ -76,9 +98,51 @@ function modalOpen(): boolean {
   return typeof document !== "undefined" && !!document.querySelector(".modal-backdrop");
 }
 
-/** Does this tool want the text layer (native text selection)? */
+/** Does this tool want the text layer (native text selection)? Edit text
+ *  keeps it too: its picking may read the page's text spans. */
 export function wantsTextLayer(tool: PdfToolId, mode: "annotate" | "forms"): boolean {
-  return mode === "forms" || tool === "select" || tool === "highlight";
+  return mode === "forms" || tool === "select" || tool === "highlight" || tool === "edittext";
+}
+
+/** The marks a tool acts on directly (select / move / resize) instead of
+ *  drawing a new one over them; null: none. */
+export function ownKind(tool: PdfToolId): ((a: PdfAnnot) => boolean) | null {
+  switch (tool) {
+    case "text":
+      return (a) => a.t === "text";
+    case "shape":
+      return (a) => a.t === "line" || a.t === "arrow" || a.t === "rect" || a.t === "ellipse";
+    case "whiteout":
+      return (a) => a.t === "whiteout";
+    case "highlight":
+      return (a) => a.t === "highlight";
+    default:
+      return null;
+  }
+}
+
+/** Pick a tool (a tool button, its shortcut): the tool's panel comes back,
+ *  so the page panel's and the marks' selections give way (also when the
+ *  tool was already the active one). */
+export function pickTool(ctx: PdfEditorCtx, tool: PdfToolId): void {
+  if (ctx.pageSelection.get().length) ctx.pageSelection.set([]);
+  if (ctx.selection.get().length) ctx.selection.set([]);
+  ctx.tools.update((s) => (s.tool === tool ? s : { ...s, tool }));
+}
+
+/** How far INSIDE a text box being typed in its frame can still be grabbed
+ *  (screen px); outside it reaches HANDLE_REACH_CSS. */
+export const EDGE_IN_CSS = 1;
+
+/** Copy the page text the user selected (Ctrl+C with no marks selected: the
+ *  bound chord took the browser's own copy away). */
+function copyPageText(): void {
+  try {
+    const text = typeof window !== "undefined" && typeof window.getSelection === "function" ? (window.getSelection()?.toString() ?? "") : "";
+    if (text && typeof navigator !== "undefined" && navigator.clipboard) void navigator.clipboard.writeText(text).catch(() => {});
+  } catch {
+    /* nothing to copy */
+  }
 }
 
 /** The cursor class a tool puts on the strip. */
@@ -95,6 +159,7 @@ export function cursorClass(tool: PdfToolId): string | null {
       return "pdfmk-cur-cross";
     case "text":
     case "highlight":
+    case "edittext":
       return "pdfmk-cur-text";
     default:
       return null;
@@ -216,17 +281,71 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
 
   /* ---------- the text editor ---------- */
 
-  function editText(key: string, target: { id: string } | { at: { x: number; y: number } }): void {
+  function editText(key: string, target: { id: string } | { at: { x: number; y: number } }, caret: CaretAt = "end"): void {
     editor?.commit();
-    const ed = openTextEditor(env, key, target, () => {
-      if (editor === ed) editor = null;
-    });
+    const ed = openTextEditor(
+      env,
+      key,
+      target,
+      (id, how) => {
+        if (editor === ed) editor = null;
+        if (disposed) return;
+        // Escape / Ctrl+Enter: the box stays selected
+        if (how === "key" && id) ctx.selection.set([{ key, id }]);
+        repaintChrome();
+      },
+      caret,
+    );
     editor = ed;
+    // an existing box being typed in is the selected mark (its panel shows)
+    if (ed?.id) ctx.selection.set([{ key, id: ed.id }]);
+    else if (ed && ctx.selection.get().length) ctx.selection.set([]);
+    repaintChrome();
+  }
+
+  /** A press on a mark of the active tool's own kind (or on the selection's
+   *  handles): select + move / resize it. Text: a click without a drag types
+   *  in the box, caret where clicked. Null: the press is not on one. */
+  function ownKindPress(e: PointerEvent, key: string, match: (a: PdfAnnot) => boolean, typeOnClick: boolean): Gesture | null {
+    const at = env.pt(key, e);
+    if (!at) return null;
+    const zoom = env.zoom();
+    const before = session.project;
+    const hb = handleBox(before, ctx.selection.get());
+    if (hb && hb.key === key) {
+      const h = handleAt(hb.box, at.x, at.y, HANDLE_REACH_CSS / zoom);
+      if (h) return resizeGesture(env, key, hb.box, h, before);
+    }
+    const on = topmostAt(pageAnnots(before, key).filter(match), at.x, at.y, HIT_CSS / zoom);
+    if (!on) return null;
+    if (!ctx.selection.get().some((r) => r.key === key && r.id === on.id)) ctx.selection.set([{ key, id: on.id }]);
+    const mg = moveGesture(env, key, at, before);
+    if (!typeOnClick) return mg;
+    let dragged = false;
+    return {
+      move(ev) {
+        const q = env.pt(key, ev);
+        if (q && Math.hypot(q.x - at.x, q.y - at.y) * zoom >= DRAG_CSS) dragged = true;
+        mg.move(ev);
+      },
+      up(ev) {
+        mg.up(ev);
+        if (!dragged && !disposed && ctx.tools.get().tool === "text") editText(key, { id: on.id }, { clientX: ev.clientX, clientY: ev.clientY });
+      },
+      cancel: () => mg.cancel(),
+    };
   }
 
   /* ---------- pointer-down: who owns this press ---------- */
 
   const now = (): number => (typeof performance !== "undefined" ? performance.now() : Date.now());
+
+  const editTool = createEditTextTool(
+    env,
+    (key, id) => editText(key, { id }, "end"),
+    () => !disposed && !editor && !gesture,
+  );
+  cleanup.push(() => editTool.dispose());
 
   const onDown = (e: PointerEvent): void => {
     if (disposed) return;
@@ -234,20 +353,60 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
     // defaultPrevented: someone ahead of us took this press (the shell's
     // hold-to-pan listens in the capture phase on the same element)
     if (ctx.mode.get() === "forms" || e.button !== 0 || gesture || e.defaultPrevented) return;
+    const hit = view.clientToPage(e.clientX, e.clientY);
+    // a press on the pages: the inspector follows it, not the page panel
+    if (hit && ctx.pageSelection.get().length) ctx.pageSelection.set([]);
+    const tool = ctx.tools.get().tool;
     if (editor) {
+      // the box being typed in: its handles resize it, its frame edge moves it
+      if (tool === "text") {
+        const key = editor.key;
+        const at = env.pt(key, e);
+        const box = editor.box();
+        const reach = HANDLE_REACH_CSS / env.zoom();
+        const h = at ? handleAt(box, at.x, at.y, reach) : null;
+        // grabbed from just outside the frame (or on its line): inside it, a
+        // click is for the caret
+        if (at && (h || onBoxEdge(box, at.x, at.y, reach, EDGE_IN_CSS / env.zoom()))) {
+          e.preventDefault();
+          const id = editor.commit();
+          if (!id) return;
+          ctx.selection.set([{ key, id }]);
+          const before = session.project;
+          let g: Gesture | null = null;
+          if (h) {
+            const hb = handleBox(before, ctx.selection.get());
+            if (hb) g = resizeGesture(env, key, hb.box, h, before);
+          } else {
+            g = moveGesture(env, key, at, before);
+          }
+          if (g) begin(g, e);
+          return;
+        }
+      }
       if (editor.contains(e.target)) return;
-      // a click away commits the edit — and is only that
+      // a click away commits the edit. With Text it goes on to place the next
+      // box (or open the one clicked); with any other tool it is only that.
       editor.commit();
-      e.preventDefault();
-      return;
+      if (tool !== "text") {
+        e.preventDefault();
+        return;
+      }
     }
     if (!palm.mayDraw(e.pointerType, now())) return;
-    const hit = view.clientToPage(e.clientX, e.clientY);
     if (!hit) return;
     const key = hit.key;
-    const tool = ctx.tools.get().tool;
+    editTool.clear();
 
     let g: Gesture | null = startRuler(env, e, key);
+    if (!g) {
+      const own = ownKind(tool);
+      if (own && !(tool === "highlight" && e.altKey)) {
+        g = ownKindPress(e, key, own, tool === "text");
+        // not on one of its own: a press elsewhere lets the selection go
+        if (!g && ctx.selection.get().length) ctx.selection.set([]);
+      }
+    }
     if (!g) {
       switch (tool) {
         case "select":
@@ -275,13 +434,13 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
           }
           g = startBox(env, e, key, "highlight");
           break;
-        case "text": {
-          const on = topmostAt(pageAnnots(session.project, key), hit.x, hit.y, HIT_CSS / env.zoom());
+        case "text":
           e.preventDefault();
-          if (on && on.t === "text") editText(key, { id: on.id });
-          else editText(key, { at: { x: hit.x, y: hit.y } });
+          editText(key, { at: { x: hit.x, y: hit.y } });
           return;
-        }
+        case "edittext":
+          g = editTool.start(e, key);
+          break;
         case "signature":
           if (armed) {
             e.preventDefault();
@@ -347,6 +506,7 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
   let brushSize = -1;
   const onHover = (e: PointerEvent): void => {
     const s = ctx.tools.get();
+    if (s.tool === "edittext" && !gesture && !editor) editTool.hover(e);
     if (!BRUSH_TOOLS.has(s.tool) || ctx.mode.get() === "forms" || !view.clientToPage(e.clientX, e.clientY)) {
       if (!brush.hidden) brush.hidden = true;
       return;
@@ -362,6 +522,7 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
   };
   const onLeave = (): void => {
     if (!brush.hidden) brush.hidden = true;
+    editTool.clear();
   };
   view.el.addEventListener("pointermove", onHover);
   view.el.addEventListener("pointerleave", onLeave);
@@ -396,6 +557,7 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
       if (s.tool !== "select" && ctx.selection.get().length) ctx.selection.set([]);
       if (s.tool !== "signature") armed = null;
       pendingHighlight = false;
+      editTool.clear();
       if (!BRUSH_TOOLS.has(s.tool)) brush.hidden = true;
     }
     const text = wantsTextLayer(s.tool, mode);
@@ -428,7 +590,11 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
     const want = ctx.selection.get().length > 0 || ctx.tools.get().ruler !== null;
     if (!want && !chromeShown) return;
     chromeShown = want;
-    paintChrome(env, ctx.tools.get().tool === "select");
+    const tool = ctx.tools.get().tool;
+    // handles only where a press on them resizes: Select and the tools that
+    // act on their own kind
+    paintChrome(env, tool === "select" || ownKind(tool) !== null, editor?.id ?? null);
+    editor?.refresh();
   };
   cleanup.push(ctx.selection.subscribe(repaintChrome));
   cleanup.push(
@@ -481,7 +647,8 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
 
   function deleteSelection(): boolean {
     const sel = ctx.selection.get();
-    if (!sel.length) return false;
+    // the box being typed in owns its keys, wherever focus went
+    if (!sel.length || editor) return false;
     session.commit((p) => removeAnnots(p, sel.map((r) => ({ pageId: r.key, id: r.id }))));
     ctx.selection.set([]);
     return true;
@@ -533,7 +700,7 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
 
   const setTool = (tool: PdfToolId): void => {
     if (blocked()) return;
-    ctx.tools.update((s) => (s.tool === tool ? s : { ...s, tool }));
+    pickTool(ctx, tool);
   };
   const bind = (a: Parameters<PdfEditorCtx["bindKey"]>[0], fn: (e: KeyboardEvent) => void): void => {
     cleanup.push(ctx.bindKey(a, fn));
@@ -547,6 +714,7 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
   bind("pdfHighlight", () => setTool("highlight"));
   bind("pdfText", () => setTool("text"));
   bind("pdfWhiteout", () => setTool("whiteout"));
+  bind("pdfEditText", () => setTool("edittext"));
   bind("imgRuler", () => {
     if (!blocked()) toggleRuler();
   });
@@ -570,6 +738,16 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
   // marks only: the page rail deletes pages itself while it has focus
   bind("delete", () => {
     if (!blocked()) deleteSelection();
+  });
+  bind("copy", () => {
+    if (!blocked() && !editor && copyMarks(ctx)) return;
+    copyPageText();
+  });
+  bind("paste", () => {
+    if (!blocked() && !editor) pasteMarks(ctx, layer, currentKey());
+  });
+  bind("duplicate", () => {
+    if (!blocked() && !editor) duplicateMarks(ctx, layer);
   });
 
   function currentKey(): string | null {

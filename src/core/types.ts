@@ -350,7 +350,22 @@ export interface PdfTextStyle {
 export type PdfAnnot =
   | { id: string; t: "ink"; kind: InkKind; c: string; w: number; o: number; p: string }
   | { id: string; t: "highlight"; c: string; o: number; rects: [number, number, number, number][] }
-  | ({ id: string; t: "text"; x: number; y: number; w: number; h: number; text: string; r?: PdfRotation } & PdfTextStyle)
+  | ({
+      id: string;
+      t: "text";
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      text: string;
+      r?: PdfRotation;
+      /** box fill, #rrggbb; absent = transparent */
+      bg?: string;
+      /** box border, #rrggbb (1 pt); absent = none */
+      border?: string;
+      /** "Edit text": this box REPLACES text that is part of the page. */
+      edit?: PdfTextEdit;
+    } & PdfTextStyle)
   | { id: string; t: ShapeKind; c: string; w: number; a: [number, number]; b: [number, number] }
   /** an opaque cover box (default white) — typically with a text box on top */
   | { id: string; t: "whiteout"; x: number; y: number; w: number; h: number; c: string }
@@ -364,6 +379,18 @@ export type PdfAnnot =
  * content is drawn turned by -r inside its page-space box, so it reads upright
  * on screen on a page stored sideways (a landscape scan with /Rotate 90), and
  * in the exported file. Absent = 0. A box's x/y/w/h stay in page space. */
+
+/** What an edited text box replaces. `rects` = the original glyph boxes in
+ *  page space ([x, y, w, h], PageRect convention). The editor covers them
+ *  with `cover` (the page colour sampled behind them); export REMOVES those
+ *  glyphs from the page content and draws the cover only where removal was
+ *  not possible. `orig` = the original text (for undo-free "revert" and
+ *  diagnostics counts only — never exported). */
+export interface PdfTextEdit {
+  rects: [number, number, number, number][];
+  cover: string;
+  orig: string;
+}
 
 export type PdfAnnotKind = PdfAnnot["t"];
 
@@ -455,6 +482,8 @@ export type ActionId =
   | "pdfText"
   | "pdfWhiteout"
   | "pdfFillForms"
+  | "pdfEditText"
+  | "duplicate"
   | "find";
 
 /** The three user-settable colours of the "custom" theme.
@@ -533,6 +562,21 @@ export interface Settings {
    *  Sanitized on read (`asPdfSignatures` in core/session.ts). Local only:
    *  never in a project file except as a placed mark. */
   pdfSignatures: PdfSignature[];
+  /** PDF editor: each tool's last colour / size / text style, so a tool
+   *  comes back as the user left it. Sanitized on read (`asPdfToolStyle`). */
+  pdfToolStyle: PdfToolStyle;
+}
+
+/** Remembered PDF tool styles. Every key optional; colours lowercase
+ *  #rrggbb; sizes CSS px (ink/shape/eraser) or points (text). */
+export interface PdfToolStyle {
+  colors?: Partial<Record<"highlight" | "pen" | "pencil" | "marker" | "shape" | "text", string>>;
+  sizes?: Partial<Record<"pen" | "pencil" | "marker" | "eraser" | "shape" | "text", number>>;
+  shape?: ShapeKind;
+  font?: FontFamily;
+  /** text boxes: last fill / border, null = none */
+  textBg?: string | null;
+  textBorder?: string | null;
 }
 
 export interface PdfSignature {
@@ -627,6 +671,8 @@ export const DEFAULT_SHORTCUTS: Record<ActionId, string> = {
   pdfFillForms: "F",
   // Search the PDF's text (viewer showing a PDF, and the PDF editor).
   find: "Ctrl+F",
+  pdfEditText: "X",
+  duplicate: "Ctrl+D",
 };
 
 /** Which screens an action lives on. A chord conflicts only with an action that shares a
@@ -655,11 +701,11 @@ export const ACTION_MODES: Readonly<Record<ActionId, readonly ShortcutMode[]>> =
   redo: ["editor", "image", "pdf"],
   redoAlt: ["editor", "image", "pdf"],
   save: ["editor", "image", "pdf"],
-  copy: ["editor", "image"],
+  copy: ["editor", "image", "pdf"],
   // Editor-only ON PURPOSE: a bound chord is preventDefault()ed by the
   // ShortcutManager, which would kill the DOM `paste` event the image editor
   // reads pasted pixels from.
-  paste: ["editor"],
+  paste: ["editor", "pdf"],
   toggleSnap: ["editor"],
   toggleLoop: ["editor"],
   addMarker: ["editor"],
@@ -689,6 +735,8 @@ export const ACTION_MODES: Readonly<Record<ActionId, readonly ShortcutMode[]>> =
   pdfWhiteout: ["pdf"],
   pdfFillForms: ["pdf"],
   find: ["viewer", "pdf"],
+  pdfEditText: ["pdf"],
+  duplicate: ["pdf"],
 };
 
 /** The stock DARK palette's --bg-app, --accent and --text-1 — so switching to
@@ -726,6 +774,7 @@ export const DEFAULT_SETTINGS: Settings = {
   shortcuts: DEFAULT_SHORTCUTS,
   inkColors: [],
   pdfSignatures: [],
+  pdfToolStyle: {},
 };
 
 /** Which family an openable extension belongs to (see media-extensions.json).

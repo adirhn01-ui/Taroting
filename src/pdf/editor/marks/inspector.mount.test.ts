@@ -156,7 +156,9 @@ describe("panels", () => {
     await mount();
     kit.ctx.mode.set("forms");
     await kit.flush();
-    expect(host().querySelector(".insp-note")!.textContent).toMatch(/form fields/);
+    // the Document section, whatever the tool (no fields here: disabled, says why)
+    expect(title()).toBe("Fill forms");
+    expect(host().querySelector(".insp-note")!.textContent).toBe("This PDF has no fillable fields.");
   });
 
   it("dispose removes the panel", async () => {

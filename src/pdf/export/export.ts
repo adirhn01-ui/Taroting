@@ -13,9 +13,9 @@
 // bidi-js are reachable from nowhere else.
 
 import fontkit from "@pdf-lib/fontkit";
-import { PDFDict, PDFDocument, PDFName, degrees } from "pdf-lib";
+import { PDFDict, PDFDocument, PDFName, degrees, type PDFRef } from "pdf-lib";
 import { ipc } from "../../core/ipc";
-import type { PdfExportPreset, ProjectFile } from "../../core/types";
+import type { PdfAnnot, PdfExportPreset, ProjectFile } from "../../core/types";
 import { assemble, drawFieldAppearances, type Assembled } from "./assemble";
 import { checkpoints, throwIfAborted } from "./cancel";
 import { appDeps, type ExportDeps } from "./deps";
@@ -24,6 +24,7 @@ import { clearNeedAppearances, drawMissingFieldAppearances } from "./fields";
 import { fieldsNeedingAppearance, flattenForms, separateDuplicateFields } from "./flatten";
 import { buildAppearance, markContext, pageGeom, placeAppearances, type Appearance } from "./marks";
 import { planExtract } from "./plan";
+import { drawCovers, redactPage, type PageEdit, type PageRect } from "./redact";
 import type { PdfSaveIpc } from "./write";
 import { writePdf } from "./write";
 
@@ -128,6 +129,27 @@ export async function buildPdf(project: ProjectFile, opts: PdfExportOptions, dep
     page.setRotation(degrees((own + turn) % 360));
   });
 
+  // "Edit text": the glyphs an edited text box replaces leave the page's
+  // content (redact.ts); a cover is painted only where that was not possible.
+  // Before the forms are flattened, so their appearances are never read as
+  // page text, and only on pages that carry such a box.
+  const redacted = new Set<PDFRef>();
+  for (let i = 0; i < plan.pages.length; i++) {
+    const edits = pageEdits(own(pdf.annots, plan.pages[i]!.id));
+    if (!edits.length) continue;
+    await tick();
+    const page = pages[i]!;
+    const geom = pageGeom(page);
+    if (redacted.has(page.ref)) {
+      // the same page object twice: its content is already rewritten for the
+      // other's edits, so these are covered
+      drawCovers(doc, page, geom, edits.flatMap((e) => e.rects.map((r) => ({ rect: pad(r), cover: e.cover }))));
+      continue;
+    }
+    redacted.add(page.ref);
+    drawCovers(doc, page, geom, redactPage(doc, page, geom, edits).covers);
+  }
+
   // Forms first: in a flattened export the marks paint over the fields, as
   // they sit on top of them in the editor.
   if (opts.flattenForms) flattenForms(doc);
@@ -155,6 +177,22 @@ export async function buildPdf(project: ProjectFile, opts: PdfExportOptions, dep
   throwIfAborted(signal);
   return out;
 }
+
+/** The edited text boxes of one page's marks. */
+function pageEdits(marks: unknown): PageEdit[] {
+  if (!Array.isArray(marks)) return [];
+  const out: PageEdit[] = [];
+  for (const a of marks as PdfAnnot[]) {
+    if (a.t !== "text" || !a.edit || !Array.isArray(a.edit.rects) || !a.edit.rects.length) continue;
+    const rects = a.edit.rects.filter(
+      (r): r is PageRect => Array.isArray(r) && r.length === 4 && r.every((v) => Number.isFinite(v)) && r[2] >= 0 && r[3] >= 0,
+    );
+    if (rects.length) out.push({ rects, cover: a.edit.cover });
+  }
+  return out;
+}
+
+const pad = ([x, y, w, h]: PageRect): PageRect => [x - 0.5, y - 0.5, w + 1, h + 1];
 
 /** pdf-lib's document of what pdf.js assembled: the sentinel page removed and
  *  the information it cost put back (see assemble.ts). */

@@ -13,6 +13,7 @@
 
 import type {
   FontFamily,
+  PdfTextEdit,
   MediaRef,
   PdfAnnot,
   PdfExportPreset,
@@ -42,6 +43,10 @@ export const PDF_FONT_SIZE_MIN = 4;
 export const PDF_FONT_SIZE_MAX = 288;
 export const PDF_HIGHLIGHT_MAX_RECTS = 1000;
 export const PDF_SIGNATURE_MAX_STROKES = 1000;
+/** Glyph rects an edited text box ("Edit text") may replace. Each one also
+ *  counts as a point against PDF_TOTAL_MAX_POINTS: every rect is parsed
+ *  against the page content at export, and may become a cover rect. */
+export const PDF_EDIT_MAX_RECTS = 2000;
 /** Points in one ink stroke / across the whole document. Lower than the image
  *  editor's MAX_STROKE_POINTS / MAX_TOTAL_POINTS (src/image/strokes.ts; a
  *  test pins them no higher): every PDF point becomes vector text in the
@@ -208,15 +213,37 @@ export function decodePdfPoints(
   return out;
 }
 
-/** Points an annot carries (ink `p`, signature `strokes`), from lengths. */
+/** Points an annot carries (ink `p`, signature `strokes`), from lengths; an
+ *  edited text box counts one per replaced glyph rect. */
 export function pdfAnnotPointCount(a: PdfAnnot): number {
   if (a.t === "ink") return Math.floor(a.p.length / 16);
+  if (a.t === "text") return a.edit ? a.edit.rects.length : 0;
   if (a.t === "signature") {
     let n = 0;
     for (const s of a.strokes) n += Math.floor(s.length / 16);
     return n;
   }
   return 0;
+}
+
+/** An edited text box's `edit` (PdfTextEdit), or null when it is not one:
+ *  1..PDF_EDIT_MAX_RECTS rects of [x, y, w, h] (coordinates per isCoord, w/h
+ *  >= 0) and no more than `maxRects`; `orig` a string <= PDF_TEXT_MAX_CHARS;
+ *  `cover` a colour, #ffffff when unreadable. A fresh copy. */
+export function sanitizePdfTextEdit(v: unknown, maxRects: number = PDF_EDIT_MAX_RECTS): PdfTextEdit | null {
+  if (!isRecord(v)) return null;
+  const { rects, cover, orig } = v;
+  if (typeof orig !== "string" || orig.length > PDF_TEXT_MAX_CHARS) return null;
+  if (!Array.isArray(rects) || rects.length === 0) return null;
+  if (rects.length > PDF_EDIT_MAX_RECTS || rects.length > maxRects) return null;
+  const out: [number, number, number, number][] = [];
+  for (const r of rects as unknown[]) {
+    if (!Array.isArray(r) || r.length !== 4) return null;
+    const [x, y, w, h] = r as unknown[];
+    if (!isCoord(x) || !isCoord(y) || !isExtent(w) || !isExtent(h)) return null;
+    out.push([x, y, w, h]);
+  }
+  return { rects: out, cover: pdfHexColor(cover) ?? "#ffffff", orig };
 }
 
 const INK_KINDS: ReadonlySet<string> = new Set(["pen", "pencil", "marker"]);
@@ -234,6 +261,9 @@ const ALIGNS: ReadonlySet<string> = new Set(["left", "center", "right"]);
  *  - highlight: 1..1000 rects of [x, y, w, h]
  *  - text: string <= 20k chars, font on the whitelist, size 4..288, bold and
  *    italic booleans, align left/center/right
+ *  - text: `bg` / `border` kept only when readable colours; `edit` per
+ *    `sanitizePdfTextEdit` (its rects within the point budget) — a bad one is
+ *    left out and the box kept
  *  - text, image, signature: `r` kept only when 90, 180 or 270 (else absent)
  *  - image: `media` names an image in `imageMedia`
  *  - signature: 1..1000 strokes, each decodes
@@ -287,6 +317,9 @@ export function sanitizePdfAnnot(
       return null;
     if (typeof bold !== "boolean" || typeof italic !== "boolean") return null;
     if (typeof align !== "string" || !ALIGNS.has(align)) return null;
+    const bg = pdfHexColor(raw.bg);
+    const border = pdfHexColor(raw.border);
+    const edit = sanitizePdfTextEdit(raw.edit, maxPoints);
     return {
       id,
       t,
@@ -299,6 +332,9 @@ export function sanitizePdfAnnot(
       italic,
       align: align as "left" | "center" | "right",
       ...turn,
+      ...(bg === null ? {} : { bg }),
+      ...(border === null ? {} : { border }),
+      ...(edit === null ? {} : { edit }),
     };
   }
 
@@ -613,7 +649,13 @@ export function checkPdfInvariants(p: ProjectFile): string[] {
     }
     if (list.length > PDF_MAX_ANNOTS_PER_PAGE) errors.push(`page ${key}: too many marks`);
     for (const a of list as PdfAnnot[]) {
-      if (sanitizePdfAnnot(a, imageMedia) === null) errors.push(`mark ${String(a.id)}: invalid`);
+      const clean = sanitizePdfAnnot(a, imageMedia);
+      if (clean === null) errors.push(`mark ${String(a.id)}: invalid`);
+      else if (a.t === "text" && clean.t === "text") {
+        // the optional parts are dropped alone, not with the box
+        const lost = (["bg", "border", "edit"] as const).filter((k) => k in a && !(k in clean));
+        if (lost.length) errors.push(`mark ${String(a.id)}: invalid ${lost.join(", ")}`);
+      }
       if (annotIds.has(a.id)) errors.push(`mark ${a.id}: duplicate id`);
       annotIds.add(a.id);
     }

@@ -126,7 +126,9 @@ export function startSelect(env: Env, e: PointerEvent, key: string): Gesture | n
   return marqueeGesture(env, key, at, additive ? sel : []);
 }
 
-function moveGesture(env: Env, key: string, start: { x: number; y: number }, before: ProjectFile): Gesture {
+/** Move the current selection from `start` (one step on release; dropped
+ *  on another page = moved there). */
+export function moveGesture(env: Env, key: string, start: { x: number; y: number }, before: ProjectFile): Gesture {
   const { ctx } = env;
   const session = ctx.session;
   const marks = selectedMarks(before, ctx.selection.get());
@@ -191,7 +193,8 @@ function moveGesture(env: Env, key: string, start: { x: number; y: number }, bef
   };
 }
 
-function resizeGesture(env: Env, key: string, from: Box, h: Handle, before: ProjectFile): Gesture {
+/** Resize the current selection by handle `h` of `from` (one step). */
+export function resizeGesture(env: Env, key: string, from: Box, h: Handle, before: ProjectFile): Gesture {
   const { ctx } = env;
   const session = ctx.session;
   const marks = selectedMarks(before, ctx.selection.get());
@@ -331,11 +334,12 @@ function svgEl<K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<strin
 }
 
 /** Redraw every rendered page's chrome group from the selection, the ruler
- *  and the zoom (handles keep their screen size). */
-export function paintChrome(env: Env, showHandles: boolean): void {
+ *  and the zoom (handles keep their screen size). `skip`: a mark the text
+ *  editor is typing in (it draws the same frame around the growing box). */
+export function paintChrome(env: Env, showHandles: boolean, skip: string | null = null): void {
   const { ctx } = env;
   const p = ctx.session.project;
-  const sel = ctx.selection.get();
+  const sel = skip === null ? ctx.selection.get() : ctx.selection.get().filter((r) => r.id !== skip);
   const zoom = env.zoom();
   const hb = showHandles ? handleBox(p, sel) : null;
   // the ruler is a marking aid: hidden (not dropped) in Fill forms mode

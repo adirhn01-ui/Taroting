@@ -2543,7 +2543,7 @@ const ADDED_IN_090 = [
 ] as const;
 
 /** The PDF editor's actions and Find, new in 0.9.3. */
-const ADDED_IN_093 = ["pdfHighlight", "pdfText", "pdfWhiteout", "pdfFillForms", "find"] as const;
+const ADDED_IN_093 = ["pdfHighlight", "pdfText", "pdfWhiteout", "pdfFillForms", "find", "pdfEditText", "duplicate"] as const;
 
 /** A shortcut map exactly as a 0.8.1 settings.json stores it. */
 function shortcuts081(overrides: Record<string, unknown> = {}): Record<string, unknown> {

@@ -34,6 +34,7 @@ import {
   cssToPt,
   pencilOpacity,
   rulerEdge,
+  snapStraight,
   snapToRuler,
   sweepHit,
   type RulerPose,
@@ -106,6 +107,14 @@ export function startInk(env: Env, e: PointerEvent, key: string, kind: "pen" | "
   // A preview frame queued by the last move runs AFTER up/cancel; once the
   // gesture has ended it must not draw the live mark back.
   let ended = false;
+  // Shift held: a straight segment from the stroke's start to the pointer,
+  // snapped to 15° steps; letting go of Shift goes back to the freehand line
+  // (its points were kept all along).
+  const start: [number, number] = [at.x, at.y];
+  const p0 = pressureOf(e);
+  let straight = e.shiftKey;
+  let end: [number, number] = [at.x, at.y];
+  const straightPts = (): Float32Array => Float32Array.from([start[0], start[1], p0, end[0], end[1], p0]);
 
   const add = (x: number, y: number, p: number): void => {
     if (ruler && edge !== 0) [x, y] = snapToRuler(ruler, edge, w / 2, x, y);
@@ -114,7 +123,7 @@ export function startInk(env: Env, e: PointerEvent, key: string, kind: "pen" | "
   const paint = (): void => {
     queued = false;
     if (ended) return;
-    const d = inkD(kind, w, sampler.points, sampler.count);
+    const d = straight ? inkD(kind, w, straightPts(), 2) : inkD(kind, w, sampler.points, sampler.count);
     if (!path || !path.isConnected) {
       const node = document.createElementNS(SVG_NS, "path");
       if (kind === "marker") {
@@ -131,7 +140,7 @@ export function startInk(env: Env, e: PointerEvent, key: string, kind: "pen" | "
       path = liveNode(env, key, node, path);
     }
     path?.setAttribute("d", d);
-    if (kind === "pencil") path?.setAttribute("opacity", String(pencilOpacity(sampler.meanPressure())));
+    if (kind === "pencil") path?.setAttribute("opacity", String(pencilOpacity(straight ? p0 : sampler.meanPressure())));
   };
   const queue = (): void => {
     if (queued) return;
@@ -148,11 +157,26 @@ export function startInk(env: Env, e: PointerEvent, key: string, kind: "pen" | "
         const q = env.pt(key, smp);
         if (q) add(q.x, q.y, pressureOf(smp));
       }
+      straight = ev.shiftKey;
+      if (straight) {
+        const q = env.pt(key, ev);
+        if (q) end = snapStraight(start, [q.x, q.y]);
+      }
       queue();
     },
     up(ev) {
       ended = true;
       const q = env.pt(key, ev);
+      if (ev.shiftKey) {
+        // the committed ink is just the segment's two ends
+        if (q) end = snapStraight(start, [q.x, q.y]);
+        path?.remove();
+        path = null;
+        const o = kind === "marker" ? MARKER_OPACITY : kind === "pencil" ? pencilOpacity(p0) : 1;
+        const annot: PdfAnnot = { id: newId(), t: "ink", kind, c: color, w, o, p: encodePoints(straightPts()) };
+        ctx.session.commit((p) => addAnnot(p, key, annot));
+        return;
+      }
       if (q) {
         let [x, y] = [q.x, q.y];
         if (ruler && edge !== 0) [x, y] = snapToRuler(ruler, edge, w / 2, x, y);

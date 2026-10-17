@@ -1,10 +1,22 @@
 // The PDF editor's right-hand panel — the video inspector's markup and sheet
-// (.insp-section, .insp-slider, the twin number), one of four panels:
-//   - marks selected → their properties: colour, width, opacity, the text
-//     style, Delete;
-//   - only pages selected (the rail) → "N pages selected", turn, delete;
-//   - Fill forms mode → a note (the tools are off);
-//   - otherwise → the active tool's style: colour, size, font.
+// (.insp-section, .insp-slider, the twin number). It shows whatever the user
+// touched LAST (`focus`): picking a tool shows that tool, selecting marks
+// shows the marks, clicking a page thumbnail shows the pages:
+//   - marks → their properties: colour, width, opacity, the text style, a
+//     text box's fill and border, Delete (and Restore original for a box
+//     that replaced page text);
+//   - pages (the rail) → "N pages selected", turn, delete;
+//   - a tool → its style: colour, size, font, a new text box's fill and
+//     border; with Select, the "Document" section and its Fill forms switch;
+//   - Fill forms mode → the "Document" section, whatever the tool.
+// While a text box is open for typing (ctx.textEdit) the panel shows THAT
+// box whatever was touched last: a new box's look is its draft (no history:
+// it lands with the box, in one step), an existing box is edited through the
+// project as any mark; either way the Text tool's defaults follow, so the
+// next box matches, and focus goes back to the text afterwards.
+// The Fill forms switch is the image editor's switch field (its "Flip layer"
+// markup: a field holding an .insp-row of one labelled .switch); the mode
+// itself belongs to forms.ts.
 //
 // Live commit, as in the image inspector: a control's continuous changes go
 // through session.replace() and ONE history step lands when the gesture ends
@@ -24,8 +36,9 @@ import { INK_COLORS_MAX, normalizeHexColor, settingsStore, updateSettings } from
 import type { ColorPickerHandle } from "../../ui/color-picker";
 import { toast } from "../../ui/toast";
 import { imgIcon } from "../../image/icons";
-import { deletePages, removeAnnots, rotatePages, updateAnnot, type PdfAnnotPatch } from "../model";
+import { deletePages, removeAnnots, rotatePages, setTextBox, updateAnnot, type PdfAnnotPatch, type TextBoxLook } from "../model";
 import type { PdfEditorCtx, PdfEditorPart, PdfToolId, PdfToolState } from "../types";
+import { CLEAR_FORM_LABEL, FILL_FORMS_LABEL, FORMS_TIP, NO_FIELDS_NOTE, clearForm, setFillForms } from "./forms";
 import { sameEdit } from "./marks/env";
 import { FONT_MIN, SIZE_MAX, SIZE_MIN, clampFont, clampSize, frameOf, plainOnly, textHeight, withFrameH } from "./marks/geom";
 import { textLines } from "./marks/render";
@@ -104,6 +117,7 @@ const TOOL_LABEL: Record<PdfToolId, string> = {
   eraser: "Eraser",
   shape: "Shapes",
   text: "Text",
+  edittext: "Edit text",
   whiteout: "Whiteout",
   image: "Image",
   signature: "Signature",
@@ -175,6 +189,33 @@ export function patchSelected(p: ProjectFile, sel: readonly { key: string; id: s
   }
   return next;
 }
+
+/** `p` with a text box look (fill / border) set on every selected text mark;
+ *  other kinds are left alone. */
+export function lookSelected(p: ProjectFile, sel: readonly { key: string; id: string }[], look: TextBoxLook): ProjectFile {
+  let next = p;
+  for (const m of selectedMarks(p, sel)) if (m.a.t === "text") next = setTextBox(next, m.key, m.a.id, look);
+  return next;
+}
+
+/** What the panel shows: the last thing the user touched. */
+export type InspectorFocus = "tool" | "marks" | "pages";
+
+/** The focus after a change: a tool picked → "tool"; a selection that
+ *  became something new → that; one that emptied → back to the tool. */
+export function nextFocus(
+  focus: InspectorFocus,
+  change: { tool?: boolean; marks?: number; pages?: number },
+): InspectorFocus {
+  if (change.tool) return "tool";
+  if (change.marks !== undefined) return change.marks > 0 ? "marks" : focus === "marks" ? "tool" : focus;
+  if (change.pages !== undefined) return change.pages > 0 ? "pages" : focus === "pages" ? "tool" : focus;
+  return focus;
+}
+
+const sameList = (a: readonly unknown[], b: readonly unknown[]): boolean => a.length === b.length && a.every((v, i) => v === b[i]);
+const sameRefs = (a: readonly { key: string; id: string }[], b: readonly { key: string; id: string }[]): boolean =>
+  a.length === b.length && a.every((r, i) => r.key === b[i]!.key && r.id === b[i]!.id);
 
 /** A label for the selected marks: "Ink", "3 marks". */
 export function selectionLabel(marks: readonly PdfAnnot[]): string {
@@ -316,7 +357,73 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
   }
 
   const sel = (): { key: string; id: string }[] => ctx.selection.get();
-  const marks = (): PdfAnnot[] => selectedMarks(session.project, sel()).map((m) => m.a);
+  /** the text box open for typing, if any */
+  const editing = () => ctx.textEdit.get();
+  const draftOf = (): Extract<PdfAnnot, { t: "text" }> | null => editing()?.draft ?? null;
+  const marks = (): PdfAnnot[] => {
+    const d = draftOf();
+    return d ? [d] : selectedMarks(session.project, sel()).map((m) => m.a);
+  };
+
+  /* ---------- writing the marks (or the open box's draft) ---------- */
+
+  type Look = TextBoxLook | undefined;
+  /** `p` with `patch` (and a text box look) on the selected marks */
+  const applyTo = (p: ProjectFile, s: readonly { key: string; id: string }[], patch: Record<string, unknown>, look: Look): ProjectFile => {
+    const next = Object.keys(patch).length ? patchSelected(p, s, patch) : p;
+    return look ? lookSelected(next, s, look) : next;
+  };
+  /** the open new box's draft with `patch` and `look` applied */
+  const setDraft = (patch: Record<string, unknown>, look: Look): void => {
+    const e = editing();
+    const d = e?.draft;
+    if (!e || !d) return;
+    const next: Record<string, unknown> = { ...d, ...patchFor(d, patch) };
+    for (const k of ["bg", "border"] as const) {
+      if (!look || !(k in look)) continue;
+      const v = look[k];
+      if (v === null) delete next[k];
+      else if (typeof v === "string") next[k] = v;
+    }
+    ctx.textEdit.set({ ...e, draft: next as unknown as Extract<PdfAnnot, { t: "text" }> });
+  };
+  /** while a box is open, the Text tool's defaults follow its look */
+  const mirrorTool = (patch: Record<string, unknown>, look: Look): void => {
+    if (!editing()) return;
+    ctx.tools.update((st) => {
+      let n = st;
+      const set = <K extends keyof PdfToolState>(k: K, v: PdfToolState[K]): void => {
+        if (n[k] !== v) n = { ...n, [k]: v };
+      };
+      if (typeof patch.font === "string" && FONTS.includes(patch.font as FontFamily)) set("font", patch.font as FontFamily);
+      if (typeof patch.size === "number" && n.sizes.text !== patch.size) n = { ...n, sizes: { ...n.sizes, text: patch.size } };
+      if (typeof patch.c === "string" && n.colors.text !== patch.c) n = { ...n, colors: { ...n.colors, text: patch.c } };
+      if (look && "bg" in look) set("textBg", look.bg ?? null);
+      if (look && "border" in look) set("textBorder", look.border ?? null);
+      return n;
+    });
+  };
+  /** a live (mid-gesture) write */
+  const liveWrite = (g: Gesture, patch: Record<string, unknown>, look?: TextBoxLook): void => {
+    if (draftOf()) setDraft(patch, look);
+    else g.write((base) => session.replace(applyTo(base, sel(), patch, look)));
+  };
+  /** the end of a gesture: one step (none for a draft), the tool follows,
+   *  the caret goes back to the text */
+  const endWrite = (g: Gesture | null, patch: Record<string, unknown> | null, look?: TextBoxLook): void => {
+    g?.commit();
+    if (patch) mirrorTool(patch, look);
+    editing()?.refocus();
+  };
+  /** one finished edit */
+  const finishWrite = (patch: Record<string, unknown>, look?: TextBoxLook): void => {
+    if (draftOf()) setDraft(patch, look);
+    else {
+      const s = sel();
+      session.commit((p) => applyTo(p, s, patch, look));
+    }
+    endWrite(null, patch, look);
+  };
 
   /* ---------- controls ---------- */
 
@@ -338,6 +445,8 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     end(): void;
     label: string;
     fallback: string;
+    /** a "None" choice first in the row (a text box's fill / border) */
+    none?: { read(): boolean; pick(): void };
   }
 
   function colorRow(t: ColorTarget): HTMLElement {
@@ -345,6 +454,17 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     wrap.setAttribute("role", "group");
     wrap.setAttribute("aria-label", t.label);
     const swatches: { b: HTMLButtonElement; c: string }[] = [];
+    const none = t.none;
+    let noneBtn: HTMLButtonElement | null = null;
+    if (none) {
+      const b = el("button", "pdfmk-swatch pdfmk-swatch--none");
+      b.type = "button";
+      b.title = "None";
+      b.setAttribute("aria-label", "None");
+      on(b, "click", () => none.pick());
+      wrap.appendChild(b);
+      noneBtn = b;
+    }
     for (const c of inkPresets(settingsStore.get().inkColors)) {
       const b = el("button", "pdfmk-swatch");
       b.type = "button";
@@ -367,9 +487,11 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     more.appendChild(face);
     wrap.appendChild(more);
     watch(
-      () => normalizeHexColor(t.read(), t.fallback),
+      () => (none?.read() ? "none" : normalizeHexColor(t.read(), t.fallback)),
       (cur) => {
-        face.style.background = cur;
+        face.style.background = cur === "none" ? "" : cur;
+        face.classList.toggle("pdfmk-swatch-face--none", cur === "none");
+        noneBtn?.setAttribute("aria-pressed", String(cur === "none"));
         for (const s of swatches) s.b.setAttribute("aria-pressed", String(s.c === cur));
       },
     );
@@ -480,6 +602,7 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
   /** A slider editing the selected marks: one history step per gesture. */
   function markSlider(label: string, min: number, max: number, step: number, unit: string, read: () => number, patch: (v: number) => Record<string, unknown>): HTMLElement {
     const g = gestures.gesture();
+    let last: Record<string, unknown> | null = null;
     return slider({
       label,
       min,
@@ -487,17 +610,20 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
       step,
       unit,
       read,
-      write: (v) => g.write((base) => session.replace(patchSelected(base, sel(), patch(v)))),
-      done: () => g.commit(),
+      write: (v) => {
+        last = patch(v);
+        liveWrite(g, last);
+      },
+      done: () => {
+        endWrite(g, last);
+        last = null;
+      },
       hold: () => g.hold(),
     });
   }
 
   /** One finished edit of the selected marks: one history step. */
-  const commitMarks = (patch: Record<string, unknown>): void => {
-    const s = sel();
-    session.commit((p) => patchSelected(p, s, patch));
-  };
+  const commitMarks = (patch: Record<string, unknown>): void => finishWrite(patch);
 
   function toggleBtn(label: string, html: string, read: () => boolean, onClick: () => void): HTMLButtonElement {
     const b = button(html, "btn btn--sm", onClick, label);
@@ -548,6 +674,7 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     if (list.some(hasColor)) {
       any = true;
       const g = gestures.gesture();
+      let last: Record<string, unknown> | null = null;
       style.appendChild(
         field(
           "Color",
@@ -556,8 +683,14 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
             fallback: "#000000",
             read: () => first((a) => ("c" in a ? a.c : undefined), "#000000"),
             commit: (hex) => commitMarks({ c: normalizeHexColor(hex, "#000000") }),
-            preview: (hex) => g.write((base) => session.replace(patchSelected(base, sel(), { c: normalizeHexColor(hex, "#000000") }))),
-            end: () => g.commit(),
+            preview: (hex) => {
+              last = { c: normalizeHexColor(hex, "#000000") };
+              liveWrite(g, last);
+            },
+            end: () => {
+              endWrite(g, last);
+              last = null;
+            },
           }),
         ),
       );
@@ -620,12 +753,61 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
         alignRow.appendChild(toggleBtn(`Align ${label.toLowerCase()}`, label, () => (text()?.align ?? "left") === al, () => commitMarks({ align: al })));
       }
       t.appendChild(alignRow);
+      const lookOf = (k: "bg" | "border"): string | null => text()?.[k] ?? null;
+      for (const [k, label, aria] of [["bg", "Fill", "Text box fill"], ["border", "Border", "Text box border"]] as const) {
+        const g = gestures.gesture();
+        let last: TextBoxLook | undefined;
+        t.appendChild(
+          field(
+            label,
+            colorRow({
+              label: aria,
+              fallback: k === "bg" ? "#ffffff" : "#000000",
+              read: () => lookOf(k) ?? (k === "bg" ? "#ffffff" : "#000000"),
+              commit: (hex) => {
+                const c = normalizeHexColor(hex, "");
+                if (c) finishWrite({}, { [k]: c });
+              },
+              preview: (hex) => {
+                const c = normalizeHexColor(hex, "");
+                if (!c) return;
+                last = { [k]: c };
+                liveWrite(g, {}, last);
+              },
+              end: () => {
+                endWrite(g, last ? {} : null, last);
+                last = undefined;
+              },
+              none: {
+                read: () => lookOf(k) === null,
+                pick: () => finishWrite({}, { [k]: null }),
+              },
+            }),
+          ),
+        );
+      }
       root.appendChild(t);
     }
 
     const actions = section("Mark");
+    // a box that replaced page text (Edit text): removing it brings the
+    // original back
+    if (list.some((a) => a.t === "text" && a.edit)) {
+      actions.appendChild(
+        button("Restore original", "btn btn--sm insp-block", () => {
+          // the box being typed in closes first, writing nothing
+          editing()?.discard();
+          const s = selectedMarks(session.project, sel()).filter((m) => m.a.t === "text" && m.a.edit);
+          if (!s.length) return;
+          session.commit((p) => removeAnnots(p, s.map((m) => ({ pageId: m.key, id: m.a.id }))));
+          ctx.selection.set(sel().filter((r) => !s.some((m) => m.key === r.key && m.a.id === r.id)));
+        }, "Remove this text and show the page's original text again"),
+      );
+    }
     actions.appendChild(
       button("Delete", "btn btn--sm insp-block", () => {
+        // the box being typed in closes writing nothing (a new one never lands)
+        editing()?.discard();
         const s = sel();
         session.commit((p) => removeAnnots(p, s.map((r) => ({ pageId: r.key, id: r.id }))));
         ctx.selection.set([]);
@@ -663,10 +845,71 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     root.appendChild(s);
   }
 
-  function buildForms(): void {
-    const s = section("Fill forms");
-    s.appendChild(el("div", "insp-note", "Type into the form fields on the pages. Turn Fill forms off to mark the pages."));
+  /** "Document": the Fill forms switch — the image editor's switch field
+   *  (src/image/inspector.ts "Flip layer": a field holding an .insp-row of
+   *  one labelled .switch). Always shown with Select, so it is findable;
+   *  disabled with a note when the PDF has no fillable fields. */
+  function buildDocument(): void {
+    const s = section("Document");
+    const sw = el("input", "switch");
+    sw.type = "checkbox";
+    sw.id = "pdfed-fill-forms";
+    sw.setAttribute("aria-label", FILL_FORMS_LABEL);
+    on(sw, "change", () => setFillForms(ctx, sw.checked));
+    // Space on a still-focused switch would flip it again
+    on(sw, "click", (e) => {
+      if ((e as MouseEvent).detail > 0) sw.blur();
+    });
+    const has = ctx.hasForms.get();
+    const isOn = ctx.mode.get() === "forms";
+    sw.checked = isOn;
+    sw.disabled = !has;
+    const chord = settingsStore.get().shortcuts?.pdfFillForms;
+    const tip = has ? (chord ? `${FILL_FORMS_LABEL} (${chord})` : FILL_FORMS_LABEL) : NO_FIELDS_NOTE;
+    sw.title = tip;
+    const row = el("div", "insp-row");
+    const inner = field("Type into fields", sw);
+    inner.title = tip;
+    row.appendChild(inner);
+    s.appendChild(field(FILL_FORMS_LABEL, row));
+    if (!has) s.appendChild(el("div", "insp-note", NO_FIELDS_NOTE));
+    if (isOn) {
+      const clear = button(CLEAR_FORM_LABEL, "btn btn--sm insp-block", () => clearForm(ctx), "Clear every value typed into this PDF's fields");
+      clear.id = "pdfed-clear-form";
+      s.appendChild(clear);
+      s.appendChild(el("div", "insp-note", FORMS_TIP));
+    }
     root.appendChild(s);
+  }
+
+  function buildForms(): void {
+    const header = el("div", "insp-header");
+    header.appendChild(el("div", "insp-header__name", FILL_FORMS_LABEL));
+    root.appendChild(header);
+    buildDocument();
+  }
+
+  /** A row of Fill / Border for the Text tool's next box (tool state only). */
+  function toolLookRow(k: "textBg" | "textBorder", label: string, aria: string, fallback: string): HTMLElement {
+    const set = (v: string | null): void => ctx.tools.update((st) => (st[k] === v ? st : { ...st, [k]: v }));
+    return field(
+      label,
+      colorRow({
+        label: aria,
+        fallback,
+        read: () => ctx.tools.get()[k] ?? fallback,
+        commit: (hex) => {
+          const c = normalizeHexColor(hex, "");
+          if (c) set(c);
+        },
+        preview: (hex) => {
+          const c = normalizeHexColor(hex, "");
+          if (c) set(c);
+        },
+        end: () => {},
+        none: { read: () => ctx.tools.get()[k] === null, pick: () => set(null) },
+      }),
+    );
   }
 
   function buildTool(tool: PdfToolId): void {
@@ -684,9 +927,12 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
             ? "Drag a box to cover part of the page. Put a text box on top to replace what was there."
             : tool === "eraser"
               ? "Drag over marks to remove them."
-              : "Use the tool row below the pages.";
+              : tool === "edittext"
+                ? "Click a line of the page's text to change it, or drag over several lines. Your text takes its place."
+                : "Use the tool row below the pages.";
       s.appendChild(el("div", "insp-note", tip));
       root.appendChild(s);
+      if (tool === "select") buildDocument();
       return;
     }
     const s = section("Style");
@@ -751,6 +997,8 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
           }),
         ),
       );
+      s.appendChild(toolLookRow("textBg", "Fill", "Text box fill", "#ffffff"));
+      s.appendChild(toolLookRow("textBorder", "Border", "Text box border", "#000000"));
     } else if (sk) {
       s.appendChild(
         field(
@@ -775,12 +1023,32 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
 
   /* ---------- build / sync ---------- */
 
+  // What the user touched last (see nextFocus): the tool, the marks, the pages.
+  let focus: InspectorFocus = ctx.selection.get().length ? "marks" : ctx.pageSelection.get().length ? "pages" : "tool";
+  let lastTool = ctx.tools.get().tool;
+  let lastSel = ctx.selection.get();
+  let lastPages = ctx.pageSelection.get();
+
   function structureKey(): string {
-    if (ctx.mode.get() === "forms") return "forms";
+    const docKey = `${ctx.hasForms.get()}`;
+    if (ctx.mode.get() === "forms") return `forms:${docKey}`;
     const list = marks();
-    if (list.length) return `marks:${[...new Set(list.map((a) => a.t))].sort().join(",")}`;
-    if (ctx.pageSelection.get().length) return "pages";
-    return `tool:${ctx.tools.get().tool}`;
+    const pages = ctx.pageSelection.get().length > 0;
+    const markKey = (): string =>
+      `marks:${[...new Set(list.map((a) => a.t))].sort().join(",")}${list.some((a) => a.t === "text" && a.edit) ? "+edit" : ""}`;
+    // a box open for typing: its own panel, whatever was touched last
+    if (editing() && list.length) return markKey();
+    // the last thing touched wins; when it is gone, whatever is still there
+    if (focus === "marks" && list.length) return markKey();
+    if (focus === "pages" && pages) return "pages";
+    if (focus === "tool") {
+      const tool = ctx.tools.get().tool;
+      return `tool:${tool}${tool === "select" ? `:${docKey}` : ""}`;
+    }
+    if (list.length) return markKey();
+    if (pages) return "pages";
+    const tool = ctx.tools.get().tool;
+    return `tool:${tool}${tool === "select" ? `:${docKey}` : ""}`;
   }
 
   function teardown(): void {
@@ -798,7 +1066,7 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     if (key !== builtKey) {
       teardown();
       builtKey = key;
-      if (key === "forms") buildForms();
+      if (key.startsWith("forms:")) buildForms();
       else if (key === "pages") buildPages();
       else if (key.startsWith("marks:")) buildMarks(marks());
       else buildTool(ctx.tools.get().tool);
@@ -809,10 +1077,25 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
 
   const unsubs = [
     session.store.subscribe(sync),
-    ctx.selection.subscribe(sync),
-    ctx.pageSelection.subscribe(sync),
-    ctx.tools.subscribe(sync),
+    ctx.selection.subscribe((s) => {
+      if (!sameRefs(s, lastSel)) focus = nextFocus(focus, { marks: s.length });
+      lastSel = s;
+      sync();
+    }),
+    ctx.pageSelection.subscribe((s) => {
+      // a re-map after a page op keeps the same pages: not a new touch
+      if (!sameList(s, lastPages)) focus = nextFocus(focus, { pages: s.length });
+      lastPages = s;
+      sync();
+    }),
+    ctx.tools.subscribe((s) => {
+      if (s.tool !== lastTool) focus = nextFocus(focus, { tool: true });
+      lastTool = s.tool;
+      sync();
+    }),
     ctx.mode.subscribe(sync),
+    ctx.hasForms.subscribe(sync),
+    ctx.textEdit.subscribe(sync),
   ];
   sync();
 

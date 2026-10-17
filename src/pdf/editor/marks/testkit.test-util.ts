@@ -9,7 +9,7 @@ import { vi } from "vitest";
 import { Store } from "../../../core/store";
 import { createPdfProject } from "../../../core/pdf-project";
 import type { ActionId, PdfAnnot, ProjectFile } from "../../../core/types";
-import type { PdfDoc, PdfEditorCtx, PdfEditorHosts, PdfSearchHit, PdfToolState, PdfView, PdfViewEvents, PdfViewState } from "../../types";
+import type { PdfDoc, PdfEditorCtx, PdfEditorHosts, PdfSearchHit, PdfTextEditing, PdfToolState, PdfView, PdfViewEvents, PdfViewState } from "../../types";
 import { FakeElement, FakeEvent, installFakeDom, type FakeDocument } from "../fake-dom.test-util";
 import { setTextMeasurer } from "./render";
 
@@ -176,6 +176,8 @@ export function defaultTools(): PdfToolState {
     sizes: { pen: 4, pencil: 2, marker: 18, eraser: 16, shape: 4, text: 14 },
     shape: "rect",
     font: "Segoe UI",
+    textBg: null,
+    textBorder: null,
     ruler: null,
   };
 }
@@ -221,6 +223,7 @@ export function makeKit(p: ProjectFile = project()): Kit {
     tools: new Store(defaultTools()),
     selection: new Store<{ key: string; id: string }[]>([]),
     pageSelection: new Store<number[]>([]),
+    textEdit: new Store<PdfTextEditing | null>(null),
     mode: new Store<"annotate" | "forms">("annotate"),
     hasForms: new Store(false),
     holdAutosave: () => session.holdAutosave(),

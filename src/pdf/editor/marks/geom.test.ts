@@ -8,6 +8,8 @@ import { firstStrongRtl as exportFirstStrongRtl } from "../../export/bidi";
 import { annotBounds, scaleAnnot } from "../../model";
 import {
   LINE_HEIGHT,
+  onBoxEdge,
+  snapStraight,
   RULER_THICK,
   SIGNATURE_WIDTH_FRACTION,
   applyPageTransform,
@@ -347,5 +349,28 @@ describe("ink strokes stay within what a project can hold", () => {
     expect(Array.from(out.slice(-3))).toEqual([n - 1, (n - 1) * 2, 0.5]);
     const small = new Float32Array([1, 2, 1, 3, 4, 1]);
     expect(capPoints(small)).toBe(small);
+  });
+});
+
+describe("straight strokes and the text box's grab band", () => {
+  it("snapStraight: 15° steps, the end at the pointer's reach along them", () => {
+    const [x, y] = snapStraight([100, 100], [200, 127]);
+    expect((Math.atan2(y - 100, x - 100) * 180) / Math.PI).toBeCloseTo(15, 6);
+    // a near-horizontal drag is exactly horizontal; a near-vertical one exactly vertical
+    expect(snapStraight([0, 0], [100, 3])[1]).toBe(0);
+    expect(snapStraight([0, 0], [2, 100])[0]).toBe(0);
+    // 45° snaps would have put this at 45°; 15° steps keep it at 30°
+    const [a, b] = snapStraight([0, 0], [100, 60]);
+    expect((Math.atan2(b, a) * 180) / Math.PI).toBeCloseTo(30, 6);
+    expect(snapStraight([5, 5], [5, 5])).toEqual([5, 5]);
+  });
+
+  it("onBoxEdge: within tol of the border, inside or out; not deep inside, not far outside", () => {
+    const box: [number, number, number, number] = [100, 100, 200, 50];
+    expect(onBoxEdge(box, 101, 120, 4)).toBe(true);
+    expect(onBoxEdge(box, 97, 120, 4)).toBe(true);
+    expect(onBoxEdge(box, 200, 148, 4)).toBe(true);
+    expect(onBoxEdge(box, 200, 125, 4)).toBe(false);
+    expect(onBoxEdge(box, 90, 120, 4)).toBe(false);
   });
 });

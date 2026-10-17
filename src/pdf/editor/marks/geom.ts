@@ -664,3 +664,35 @@ export function geometryPatch(a: PdfAnnot): Record<string, unknown> {
       return { x: a.x, y: a.y, w: a.w, h: a.h };
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* Straight strokes (Shift)                                            */
+/* ------------------------------------------------------------------ */
+
+/** The end of a straight stroke from `a` toward `b`, its direction snapped
+ *  to 15° steps (the end kept at `b`'s reach along that direction). */
+export function snapStraight(a: [number, number], b: [number, number], stepDeg = 15): [number, number] {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const len = Math.hypot(dx, dy);
+  if (len === 0) return [b[0], b[1]];
+  const step = (stepDeg * Math.PI) / 180;
+  const ang = Math.round(Math.atan2(dy, dx) / step) * step;
+  const ux = Math.cos(ang);
+  const uy = Math.sin(ang);
+  const along = dx * ux + dy * uy;
+  const clean = (v: number): number => (Math.abs(v) < 1e-9 ? 0 : v);
+  return [a[0] + clean(ux * along), a[1] + clean(uy * along)];
+}
+
+/** Is (x, y) on the frame edge of `box` — at most `outside` beyond its
+ *  border or `inside` within it (the band a text box being typed in is
+ *  grabbed by: wide outside, thin inside, so a click on the text itself
+ *  still places the caret)? */
+export function onBoxEdge(box: Box, x: number, y: number, outside: number, inside = outside): boolean {
+  const [bx, by, bw, bh] = box;
+  const inOuter = x >= bx - outside && x <= bx + bw + outside && y >= by - outside && y <= by + bh + outside;
+  if (!inOuter) return false;
+  const inInner = x > bx + inside && x < bx + bw - inside && y > by + inside && y < by + bh - inside;
+  return !inInner;
+}

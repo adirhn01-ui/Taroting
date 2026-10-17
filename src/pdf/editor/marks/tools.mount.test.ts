@@ -70,7 +70,7 @@ describe("mounting", () => {
     const row = (kit.hosts.toolbar as unknown as FakeElement).querySelector(".pdfmk-toolbar")!;
     expect(row).not.toBeNull();
     expect(toolbarButtons().map((b) => b.getAttribute("aria-label"))).toEqual([
-      "Select", "Highlight", "Pen", "Pencil", "Marker", "Eraser", "Shapes", "Text", "Whiteout", "Image", "Signature", "Ruler",
+      "Select", "Highlight", "Pen", "Pencil", "Marker", "Eraser", "Shapes", "Text", "Edit text", "Whiteout", "Image", "Signature", "Ruler",
     ]);
     expect(svgOf("P1")).not.toBeNull();
     expect(kit.view.el.listenerCount("pointerdown")).toBe(1);
@@ -349,14 +349,16 @@ describe("text boxes", () => {
 
     kit.pointer("pointerdown", 100, 100);
     editorDiv()!.textContent = "x";
-    // a click away commits
+    // a click away commits (and, with Text, starts the next box there)
     kit.pointer("pointerdown", 400, 600);
     expect(kit.session.steps).toBe(1);
+    expect(editorDiv()).not.toBeNull();
     const id = marks()[0]!.id;
     await kit.flush();
     // click the box again: edits it
     const a = marks()[0] as Extract<PdfAnnot, { t: "text" }>;
     kit.pointer("pointerdown", a.x + 5, a.y + 5);
+    kit.pointer("pointerup", a.x + 5, a.y + 5);
     const ed = editorDiv()!;
     expect(ed.textContent).toBe("x");
     ed.textContent = "  ";

@@ -6,7 +6,7 @@ import { describeError, ipc, type SettingsRead } from "./ipc";
 import { touchModified } from "./project";
 import { normalizeChord } from "./shortcuts";
 import { Store } from "./store";
-import type { ActionId, CustomTheme, PdfSignature, ProjectFile, Settings } from "./types";
+import type { ActionId, CustomTheme, FontFamily, PdfSignature, PdfToolStyle, ProjectFile, Settings, ShapeKind } from "./types";
 import {
   ACTION_MODES,
   DEFAULT_CUSTOM_THEME,
@@ -891,6 +891,45 @@ function asPdfSignatures(v: unknown): PdfSignature[] {
   return out;
 }
 
+const TOOL_COLOR_KEYS = ["highlight", "pen", "pencil", "marker", "shape", "text"] as const;
+const TOOL_SIZE_KEYS = ["pen", "pencil", "marker", "eraser", "shape", "text"] as const;
+const TOOL_SHAPES: readonly ShapeKind[] = ["line", "arrow", "rect", "ellipse"];
+const TOOL_FONTS: readonly FontFamily[] = ["Segoe UI", "Arial", "Georgia", "Times New Roman", "Courier New", "Impact"];
+/** Remembered PDF tool styles: a FRESH object of only the valid entries —
+ *  colours through normalizeHexColor, sizes finite in 0.5..288, shape and
+ *  font from their whitelists, text fill/border a colour or null. */
+function asPdfToolStyle(v: unknown): PdfToolStyle {
+  const out: PdfToolStyle = {};
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return out;
+  const o = v as Record<string, unknown>;
+  const cs = o.colors as Record<string, unknown> | undefined;
+  if (cs && typeof cs === "object") {
+    for (const k of TOOL_COLOR_KEYS) {
+      if (!Object.prototype.hasOwnProperty.call(cs, k)) continue;
+      const c = normalizeHexColor(cs[k], "");
+      if (c) (out.colors ??= {})[k] = c;
+    }
+  }
+  const ss = o.sizes as Record<string, unknown> | undefined;
+  if (ss && typeof ss === "object") {
+    for (const k of TOOL_SIZE_KEYS) {
+      if (!Object.prototype.hasOwnProperty.call(ss, k)) continue;
+      const n = ss[k];
+      if (typeof n === "number" && Number.isFinite(n) && n >= 0.5 && n <= 288) (out.sizes ??= {})[k] = n;
+    }
+  }
+  if (TOOL_SHAPES.includes(o.shape as ShapeKind)) out.shape = o.shape as ShapeKind;
+  if (TOOL_FONTS.includes(o.font as FontFamily)) out.font = o.font as FontFamily;
+  for (const k of ["textBg", "textBorder"] as const) {
+    if (o[k] === null) out[k] = null;
+    else {
+      const c = normalizeHexColor(o[k], "");
+      if (c) out[k] = c;
+    }
+  }
+  return out;
+}
+
 /** Rebuild a stored shortcut map over every known action. A stored STRING wins. An action the
  *  stored map does not mention gets its DEFAULT chord UNLESS that chord (normalizeChord) is
  *  already bound, IN THE STORED MAP, to an action sharing a mode; then it is left unbound (""):
@@ -983,6 +1022,7 @@ export function sanitizeSettings(raw: unknown): Settings {
     shortcuts,
     inkColors: asInkColors(o.inkColors),
     pdfSignatures: asPdfSignatures(o.pdfSignatures),
+    pdfToolStyle: asPdfToolStyle(o.pdfToolStyle),
   };
 }
 

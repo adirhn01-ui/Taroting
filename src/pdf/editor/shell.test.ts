@@ -81,6 +81,28 @@ describe("defaultToolState", () => {
     expect(s.ruler).toBeNull();
     // a fresh object each time: no mount can change another's defaults
     expect(shell.defaultToolState().colors).not.toBe(s.colors);
+    expect([s.textBg, s.textBorder]).toEqual([null, null]);
+  });
+
+  it("brings back the remembered styles (Settings → pdfToolStyle), clamped; tool and ruler start fresh", () => {
+    const s = shell.defaultToolState({
+      colors: { pen: "#ABCDEF", marker: "not a colour" },
+      sizes: { pen: 9, text: 500, eraser: 0.5 },
+      shape: "ellipse",
+      font: "Georgia",
+      textBg: "#fff3a0",
+      textBorder: null,
+    });
+    expect(s.tool).toBe("select");
+    expect(s.ruler).toBeNull();
+    expect(s.colors.pen).toBe("#abcdef");
+    expect(s.colors.marker).toBe("#ffd400");
+    expect(s.colors.shape).toBe("#e5484d");
+    expect(s.sizes.pen).toBe(9);
+    expect(s.sizes.text).toBe(288);
+    expect(s.sizes.eraser).toBe(1);
+    expect(s.sizes.marker).toBe(18);
+    expect([s.shape, s.font, s.textBg, s.textBorder]).toEqual(["ellipse", "Georgia", "#fff3a0", null]);
   });
 });
 
