@@ -26,7 +26,7 @@ use crate::media::source::{source_file, INPUT_PROTOCOL_ARGS};
 const THUMB_WIDTH: u32 = 320;
 
 /// How long the lane worker may spend on one thumbnail, counted from the
-/// moment it picks the request up and shared by both attempts (see
+/// moment it picks the request up and shared by every attempt (see
 /// `make_thumb`). Under `run_blocking_on_lane`'s own 30 s on purpose: the
 /// child is killed and the lane is free again before the caller gives up, so
 /// nothing keeps running for a request nobody is waiting on.
@@ -280,8 +280,9 @@ static FLIGHTS: LazyLock<Flights> = LazyLock::new(Flights::default);
 /// What a lane run came to, short of an error worth retrying.
 enum Made {
     Done,
-    /// ffmpeg ran to the end and no frame came out, from the requested time
-    /// or from the start: the file is present but undecodable.
+    /// ffmpeg ran to the end and no frame came out, from the requested time,
+    /// from the start or from where a damaged start ends: the file is present
+    /// but undecodable.
     NoFrame(String),
 }
 
@@ -306,54 +307,103 @@ fn is_locked_out(stderr: &str) -> bool {
 /// error on others (both measured) — and before this the missing path was
 /// returned as if it were the thumbnail, then stored in recents. A run the
 /// deadline killed is not retried: the time is spent.
+///
+/// When neither gives a frame, the file may be a recording whose START is
+/// damaged (an Instant Replay file whose first minute is scrambled): both
+/// times land in the damage. Only then is `damage::scan_damaged_prefix` asked
+/// where the sound part begins, and one last run is made from there
+/// (`damaged_prefix_seek`). A healthy file never reaches the scan, and a file
+/// the scan does not answer fails exactly as it did before.
 fn make_thumb(src: &Path, dst: &Path, at_sec: f64, until: Instant, abandoned: &AtomicBool) -> Result<Made> {
     let mut seeks = vec![at_sec];
     if at_sec > 0.0 {
         seeks.push(0.0);
     }
     let mut last_words = String::new();
-    for at in seeks {
-        // The caller has given up (reading the orientation can be slow on a
-        // dead network share): nobody wants this frame any more, so no
-        // ffmpeg is spent on it.
-        if abandoned.load(Ordering::Relaxed) {
-            return Err(AppError::Ffmpeg("thumbnail abandoned".into()));
+    for &at in &seeks {
+        match attempt(src, dst, at, until, abandoned)? {
+            None => return Ok(Made::Done),
+            Some(stderr) => last_words = stderr,
         }
-        let tmp = Partial(tmp_path_for(dst));
-        // Built first: the argv reads the file's header (`ignores_orientation`),
-        // and that time comes out of the budget too, so ffmpeg's deadline
-        // never runs past the lane's.
-        let args = thumbnail_args(src, &tmp.0, at);
-        let left = until.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(AppError::Ffmpeg("thumbnail timed out".into()));
+    }
+    if let Some(at) = damaged_prefix_seek(src, dst, &seeks) {
+        match attempt(src, dst, at, until, abandoned)? {
+            None => return Ok(Made::Done),
+            Some(stderr) => last_words = stderr,
         }
-        let mut cmd = jobs::ffmpeg::command("ffmpeg")?;
-        cmd.args(args);
-        #[cfg(test)]
-        tests::count_run(dst);
-        let ran = jobs::ffmpeg::run_with_deadline(cmd, left);
-        let out = match ran {
-            Ok(Some(out)) => out,
-            Ok(None) => return Err(AppError::Ffmpeg("thumbnail timed out".into())),
-            Err(e) => return Err(e.into()),
-        };
-        if out.status.success() && is_ready(&tmp.0) {
-            std::fs::rename(&tmp.0, dst)?;
-            return Ok(Made::Done);
-        }
-        drop(tmp);
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if is_locked_out(&stderr) {
-            return Err(AppError::Ffmpeg(format!("thumbnail failed: {stderr}")));
-        }
-        last_words = stderr;
     }
     Ok(Made::NoFrame(if last_words.is_empty() {
         "thumbnail failed: no frame could be decoded".into()
     } else {
         format!("thumbnail failed: {last_words}")
     }))
+}
+
+/// Where the sound part of a recording with a damaged start begins, as a
+/// seek not yet tried — or `None` for anything else (`scan_damaged_prefix`).
+/// Asked only after every ordinary seek made no frame: the scan reads the
+/// sample table and every sample's first bytes, which a healthy file never
+/// needs. The thumbnail is still the one asked for (same cache name); its
+/// frame is the first sound one, from the original file — never from a
+/// repair copy, which only exists once something plans playback.
+fn damaged_prefix_seek(src: &Path, dst: &Path, tried: &[f64]) -> Option<f64> {
+    #[cfg(test)]
+    tests::count_scan(dst);
+    #[cfg(not(test))]
+    let _ = dst;
+    let at = seek_up_to_ms(crate::media::damage::scan_damaged_prefix(src)?);
+    (at > 0.0 && !tried.iter().any(|t| (t - at).abs() < 0.0005)).then_some(at)
+}
+
+/// `t` as a seek, rounded UP to the millisecond `-ss` is written with. An
+/// input seek lands on the keyframe at or before its target, so a sound
+/// keyframe at 60.0333 s asked for as 60.033 lands on the one before it —
+/// inside the damage, where ffmpeg gives up (measured on the fixture: 1.999
+/// fails, 2.000 decodes).
+fn seek_up_to_ms(t: f64) -> f64 {
+    seek_of((t * 1000.0).ceil() / 1000.0)
+}
+
+/// One ffmpeg run for the frame at `at`: `None` once the thumbnail is at
+/// `dst`, `Some(ffmpeg's words)` when the run finished without a frame. A
+/// caller that gave up, a spent deadline, a child that would not start and a
+/// file another program has locked are errors, ending the whole request.
+fn attempt(src: &Path, dst: &Path, at: f64, until: Instant, abandoned: &AtomicBool) -> Result<Option<String>> {
+    // The caller has given up (reading the orientation can be slow on a
+    // dead network share): nobody wants this frame any more, so no
+    // ffmpeg is spent on it.
+    if abandoned.load(Ordering::Relaxed) {
+        return Err(AppError::Ffmpeg("thumbnail abandoned".into()));
+    }
+    let tmp = Partial(tmp_path_for(dst));
+    // Built first: the argv reads the file's header (`ignores_orientation`),
+    // and that time comes out of the budget too, so ffmpeg's deadline
+    // never runs past the lane's.
+    let args = thumbnail_args(src, &tmp.0, at);
+    let left = until.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(AppError::Ffmpeg("thumbnail timed out".into()));
+    }
+    let mut cmd = jobs::ffmpeg::command("ffmpeg")?;
+    cmd.args(args);
+    #[cfg(test)]
+    tests::count_run(dst, at);
+    let ran = jobs::ffmpeg::run_with_deadline(cmd, left);
+    let out = match ran {
+        Ok(Some(out)) => out,
+        Ok(None) => return Err(AppError::Ffmpeg("thumbnail timed out".into())),
+        Err(e) => return Err(e.into()),
+    };
+    if out.status.success() && is_ready(&tmp.0) {
+        std::fs::rename(&tmp.0, dst)?;
+        return Ok(None);
+    }
+    drop(tmp);
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if is_locked_out(&stderr) {
+        return Err(AppError::Ffmpeg(format!("thumbnail failed: {stderr}")));
+    }
+    Ok(Some(stderr))
 }
 
 /// Queue the thumbnail on the thumb lane and wait for it (the lane's wait is
@@ -449,14 +499,44 @@ mod tests {
     /// ffmpeg runs started for each destination, so a test can tell "made
     /// once" from "made again" without timing anything. Keyed by destination
     /// because the tests run in parallel and each uses its own.
-    static RUNS: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(Default::default);
+    /// The seek of each run is kept too, in order.
+    static RUNS: LazyLock<Mutex<HashMap<PathBuf, Vec<f64>>>> = LazyLock::new(Default::default);
 
-    pub(super) fn count_run(dst: &Path) {
-        *lock(&RUNS).entry(dst.to_path_buf()).or_default() += 1;
+    pub(super) fn count_run(dst: &Path, at: f64) {
+        lock(&RUNS).entry(dst.to_path_buf()).or_default().push(at);
     }
 
     fn runs(dst: &Path) -> usize {
-        lock(&RUNS).get(dst).copied().unwrap_or(0)
+        seeks(dst).len()
+    }
+
+    fn seeks(dst: &Path) -> Vec<f64> {
+        lock(&RUNS).get(dst).cloned().unwrap_or_default()
+    }
+
+    /// Damaged-prefix scans asked for each destination (`damaged_prefix_seek`).
+    static SCANS: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(Default::default);
+
+    pub(super) fn count_scan(dst: &Path) {
+        *lock(&SCANS).entry(dst.to_path_buf()).or_default() += 1;
+    }
+
+    fn scans(dst: &Path) -> usize {
+        lock(&SCANS).get(dst).copied().unwrap_or(0)
+    }
+
+    /// The repo's damaged-start fixture (`npm run fixtures`), or `None` —
+    /// with a note — on a checkout that has not made it.
+    fn damaged_fixture() -> Option<PathBuf> {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|p| p.join("tests").join("fixtures").join("damaged_h264.mp4"))?;
+        if p.is_file() {
+            Some(p)
+        } else {
+            eprintln!("skipped: {} is missing (npm run fixtures)", p.display());
+            None
+        }
     }
 
     /// A fresh folder for one test, with a cache inside it.
@@ -698,6 +778,86 @@ mod tests {
         assert_eq!(runs(&dst), 2, "forgotten, so tried again");
         assert!(!dst.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recording whose START is damaged gets its thumbnail from where the
+    /// damage ends: the asked time and the start both fail, the scan is asked
+    /// once, and the third run — at the scan's answer — makes a real frame.
+    /// Before, the file had no thumbnail at all and was remembered as
+    /// undecodable for the session.
+    #[test]
+    fn a_damaged_start_is_thumbnailed_from_where_the_damage_ends() {
+        let Some(fixture) = damaged_fixture() else { return };
+        let (dir, cache) = scratch("damaged start");
+        let jobs = Jobs::default();
+        let clean_at = crate::media::damage::scan_damaged_prefix(&fixture).expect("the fixture's damage is a prefix");
+        assert!(clean_at > 0.5, "fixture: the asked time and the start both lie in the damage ({clean_at})");
+        let key = key_of(&fixture, 61);
+        let thumb = ensure_thumb(&cache, &jobs, &key, 0.5).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(seeks(&thumb), vec![0.5, 0.0, seek_up_to_ms(clean_at)]);
+        assert_eq!(scans(&thumb), 1);
+        assert!(!failed_before(&thumb));
+        let info = crate::media::probe::probe_sync(thumb.to_str().unwrap()).unwrap();
+        assert_eq!((info.width, info.height), (Some(THUMB_WIDTH), Some(240)), "512x384 scaled to 320 wide");
+        assert!(partials(&cache).is_empty(), "{:?}", partials(&cache));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A healthy file never pays for the scan: not when the asked frame is
+    /// there, and not when it falls back to the start. Only a file whose
+    /// every ordinary seek failed asks it (the junk file, once).
+    #[test]
+    fn a_healthy_file_never_scans_for_damage() {
+        let (dir, cache) = scratch("healthy no scan");
+        let jobs = Jobs::default();
+        let src = clip(&dir);
+        for (at, mtime, want_runs) in [(0.5, 71, 1), (5.0, 72, 2), (0.0, 73, 1)] {
+            let thumb = ensure_thumb(&cache, &jobs, &key_of(&src, mtime), at).unwrap();
+            assert_eq!(runs(&thumb), want_runs, "{at}");
+            assert_eq!(scans(&thumb), 0, "{at}: a frame came out, so no scan");
+        }
+        let junk = dir.join("junk.mp4");
+        std::fs::write(&junk, vec![0x5au8; 4096]).unwrap();
+        let key = key_of(&junk, 74);
+        let dst = cache.file_path(CacheKind::Thumbs, &key.hash(), "_0.jpg");
+        assert!(ensure_thumb(&cache, &jobs, &key, 0.0).is_err());
+        assert_eq!(scans(&dst), 1, "no frame anywhere, so the scan is asked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same damaged start in a container the scan does not read (an MKV
+    /// remux of the fixture, every byte of the video kept) fails exactly as
+    /// before: the scan is asked and refuses, no third run is made, and the
+    /// failure is remembered so the next request runs nothing.
+    #[test]
+    fn damage_the_scan_refuses_still_fails_as_before() {
+        let Some(fixture) = damaged_fixture() else { return };
+        let (dir, cache) = scratch("damage refused");
+        let jobs = Jobs::default();
+        let mkv = dir.join("damaged.mkv");
+        encode(&mkv, &["-i", fixture.to_str().unwrap(), "-map", "0:v", "-c", "copy"]);
+        assert_eq!(crate::media::damage::scan_damaged_prefix(&mkv), None, "fixture: the scan refuses an MKV");
+        let key = key_of(&mkv, 81);
+        let dst = cache.file_path(CacheKind::Thumbs, &key.hash(), "_500.jpg");
+        assert!(ensure_thumb(&cache, &jobs, &key, 0.5).is_err());
+        assert_eq!(seeks(&dst), vec![0.5, 0.0], "no third run");
+        assert_eq!(scans(&dst), 1);
+        assert!(failed_before(&dst) && !dst.exists());
+        assert!(ensure_thumb(&cache, &jobs, &key, 0.5).is_err());
+        assert_eq!((runs(&dst), scans(&dst)), (2, 1), "remembered: nothing runs again");
+        assert!(partials(&cache).is_empty(), "{:?}", partials(&cache));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The third seek is rounded UP to the millisecond, so it never lands
+    /// just before the sound keyframe (an input seek takes the keyframe at
+    /// or before its target).
+    #[test]
+    fn the_damaged_prefix_seek_rounds_up() {
+        assert_eq!(seek_up_to_ms(2.0), 2.0);
+        assert_eq!(seek_up_to_ms(60.0 + 1.0 / 30.0), 60.034);
+        assert_eq!(format!("{:.3}", seek_up_to_ms(1.0 / 30.0)), "0.034");
+        assert!(seek_up_to_ms(f64::NAN) == 0.0);
     }
 
     /// Four requests for one thumbnail at once make it once and all get it.
