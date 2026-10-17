@@ -178,6 +178,9 @@
 /* ---------- Switch ---------- */
 .switch {
   appearance: none;
+  /* a checkbox keeps the browser's default 3-4 px margin, which put every
+     switch a few pixels right of the label and text above and below it */
+  margin: 0;
   width: 36px;
   height: 20px;
   border-radius: var(--radius-full);
