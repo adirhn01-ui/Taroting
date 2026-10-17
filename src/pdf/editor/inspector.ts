@@ -3,8 +3,7 @@
 // touched LAST (`focus`): picking a tool shows that tool, selecting marks
 // shows the marks, clicking a page thumbnail shows the pages:
 //   - marks → their properties: colour, width, opacity, the text style, a
-//     text box's fill and border, Delete (and Restore original for a box
-//     that replaced page text);
+//     text box's fill and border, Delete;
 //   - pages (the rail) → "N pages selected", turn, delete;
 //   - a tool → its style: colour, size, font, a new text box's fill and
 //     border; with Select, the "Document" section and its Fill forms switch;
@@ -14,9 +13,9 @@
 // it lands with the box, in one step), an existing box is edited through the
 // project as any mark; either way the Text tool's defaults follow, so the
 // next box matches, and focus goes back to the text afterwards.
-// The Fill forms switch is the image editor's switch field (its "Flip layer"
-// markup: a field holding an .insp-row of one labelled .switch); the mode
-// itself belongs to forms.ts.
+// The Fill forms switch is one field: its label over the .switch, both at the
+// panel's left edge like every other field; the mode itself belongs to
+// forms.ts.
 //
 // Live commit, as in the image inspector: a control's continuous changes go
 // through session.replace() and ONE history step lands when the gesture ends
@@ -117,7 +116,6 @@ const TOOL_LABEL: Record<PdfToolId, string> = {
   eraser: "Eraser",
   shape: "Shapes",
   text: "Text",
-  edittext: "Edit text",
   whiteout: "Whiteout",
   image: "Image",
   signature: "Signature",
@@ -790,20 +788,6 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     }
 
     const actions = section("Mark");
-    // a box that replaced page text (Edit text): removing it brings the
-    // original back
-    if (list.some((a) => a.t === "text" && a.edit)) {
-      actions.appendChild(
-        button("Restore original", "btn btn--sm insp-block", () => {
-          // the box being typed in closes first, writing nothing
-          editing()?.discard();
-          const s = selectedMarks(session.project, sel()).filter((m) => m.a.t === "text" && m.a.edit);
-          if (!s.length) return;
-          session.commit((p) => removeAnnots(p, s.map((m) => ({ pageId: m.key, id: m.a.id }))));
-          ctx.selection.set(sel().filter((r) => !s.some((m) => m.key === r.key && m.a.id === r.id)));
-        }, "Remove this text and show the page's original text again"),
-      );
-    }
     actions.appendChild(
       button("Delete", "btn btn--sm insp-block", () => {
         // the box being typed in closes writing nothing (a new one never lands)
@@ -845,10 +829,10 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     root.appendChild(s);
   }
 
-  /** "Document": the Fill forms switch — the image editor's switch field
-   *  (src/image/inspector.ts "Flip layer": a field holding an .insp-row of
-   *  one labelled .switch). Always shown with Select, so it is findable;
-   *  disabled with a note when the PDF has no fillable fields. */
+  /** "Document": the Fill forms switch — one field, its label over the
+   *  switch at the same left edge as every other field. Always shown with
+   *  Select, so it is findable; disabled with a note when the PDF has no
+   *  fillable fields. */
   function buildDocument(): void {
     const s = section("Document");
     const sw = el("input", "switch");
@@ -867,11 +851,10 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     const chord = settingsStore.get().shortcuts?.pdfFillForms;
     const tip = has ? (chord ? `${FILL_FORMS_LABEL} (${chord})` : FILL_FORMS_LABEL) : NO_FIELDS_NOTE;
     sw.title = tip;
-    const row = el("div", "insp-row");
-    const inner = field("Type into fields", sw);
-    inner.title = tip;
-    row.appendChild(inner);
-    s.appendChild(field(FILL_FORMS_LABEL, row));
+    const f = field(FILL_FORMS_LABEL, sw);
+    f.title = tip;
+    f.querySelector("label")?.setAttribute("for", sw.id);
+    s.appendChild(f);
     if (!has) s.appendChild(el("div", "insp-note", NO_FIELDS_NOTE));
     if (isOn) {
       const clear = button(CLEAR_FORM_LABEL, "btn btn--sm insp-block", () => clearForm(ctx), "Clear every value typed into this PDF's fields");
@@ -927,9 +910,7 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
             ? "Drag a box to cover part of the page. Put a text box on top to replace what was there."
             : tool === "eraser"
               ? "Drag over marks to remove them."
-              : tool === "edittext"
-                ? "Click a line of the page's text to change it, or drag over several lines. Your text takes its place."
-                : "Use the tool row below the pages.";
+              : "Use the tool row below the pages.";
       s.appendChild(el("div", "insp-note", tip));
       root.appendChild(s);
       if (tool === "select") buildDocument();
@@ -1035,7 +1016,7 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     const list = marks();
     const pages = ctx.pageSelection.get().length > 0;
     const markKey = (): string =>
-      `marks:${[...new Set(list.map((a) => a.t))].sort().join(",")}${list.some((a) => a.t === "text" && a.edit) ? "+edit" : ""}`;
+      `marks:${[...new Set(list.map((a) => a.t))].sort().join(",")}`;
     // a box open for typing: its own panel, whatever was touched last
     if (editing() && list.length) return markKey();
     // the last thing touched wins; when it is gone, whatever is still there

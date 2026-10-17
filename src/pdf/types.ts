@@ -133,12 +133,6 @@ export interface PdfView {
   on<K extends keyof PdfViewEvents>(type: K, fn: (e: PdfViewEvents[K]) => void): () => void;
   /** re-render one page's canvas (e.g. a source changed); cheap no-op if hidden */
   invalidate(key: string): void;
-  /** The colours of the RENDERED page around/inside a page-space rect ("Edit
-   *  text"): `paper` = the most common colour of a 2 pt ring around it, `ink`
-   *  = the text colour inside it (#000000 when none stands out). null when
-   *  the page has no painted canvas. Reads a small patch; never at rest.
-   *  Optional so test views need not implement it. */
-  samplePage?(key: string, rect: PageRect): { ink: string; paper: string } | null;
   dispose(): void;
 }
 
@@ -194,7 +188,6 @@ export type PdfToolId =
   | "eraser"
   | "shape"
   | "text"
-  | "edittext"
   | "whiteout"
   | "image"
   | "signature";

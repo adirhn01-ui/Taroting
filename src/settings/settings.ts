@@ -88,7 +88,6 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   pdfWhiteout: "Whiteout (PDF)",
   pdfFillForms: "Fill forms on/off (PDF)",
   find: "Find in PDF",
-  pdfEditText: "Edit text (PDF)",
   duplicate: "Duplicate (PDF)",
 };
 
@@ -153,7 +152,6 @@ export const ACTION_ORDER: ActionId[] = [
   "pdfWhiteout",
   "pdfFillForms",
   "find",
-  "pdfEditText",
   "duplicate",
 ];
 

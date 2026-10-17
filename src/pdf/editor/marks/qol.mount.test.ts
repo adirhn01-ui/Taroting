@@ -1,40 +1,25 @@
 // The owner's review round on the PDF editor (0.9.3): text box fill and
 // border, the inspector following the last thing touched, the Text tool that
 // selects / moves / types, copy-paste-duplicate, remembered tool styles,
-// Shift-straight ink, the Fill forms switch in the panel, and the Edit text
-// tool's wiring. The tools, the inspector and (where needed) the forms part
-// are mounted together on the marks test kit.
+// Shift-straight ink and the Fill forms switch in the panel. The tools, the
+// inspector and (where needed) the forms part are mounted together on the
+// marks test kit.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PdfAnnot } from "../../../core/types";
 import { DEFAULT_SETTINGS } from "../../../core/types";
 import { decodePoints } from "../../../image/strokes";
 import { pageAnnots } from "../../model";
-import type { EditCandidate } from "./edit-text";
 import { FakeElement, FakeEvent, makeKit, project, showPages, type Kit } from "./testkit.test-util";
 
 const h = vi.hoisted(() => ({
   toasts: [] as string[],
-  pickAt: null as null | ((key: string, x: number, y: number, opts?: unknown) => Promise<unknown>),
-  pickIn: null as null | ((key: string, r: number[]) => Promise<unknown>),
-  atCalls: 0,
-  inCalls: [] as number[][],
 }));
 vi.mock("../../../ui/toast", () => ({
   toast: {
     error: (m: string) => h.toasts.push(`error:${m}`),
     refuse: (m: string) => h.toasts.push(`refuse:${m}`),
     info: (m: string) => h.toasts.push(`info:${m}`),
-  },
-}));
-vi.mock("./edit-text", () => ({
-  pickTextAt: (_env: unknown, key: string, x: number, y: number, opts?: unknown) => {
-    h.atCalls++;
-    return h.pickAt ? h.pickAt(key, x, y, opts) : Promise.resolve(null);
-  },
-  pickTextIn: (_env: unknown, key: string, r: number[]) => {
-    h.inCalls.push(r);
-    return h.pickIn ? h.pickIn(key, r) : Promise.resolve(null);
   },
 }));
 vi.mock("../../../core/session", async (orig) => {
@@ -54,7 +39,6 @@ const { toolsPart, STYLE_SAVE_MS } = await import("../tools");
 const { inspectorPart, nextFocus } = await import("../inspector");
 const { formsPart } = await import("../forms");
 const { resetMarkClipboard, PASTE_STEP } = await import("./clipboard");
-const { NO_TEXT_HERE } = await import("./edit-tool");
 
 type Text = Extract<PdfAnnot, { t: "text" }>;
 const text = (id: string, x: number, y: number, extra: Partial<Text> = {}): PdfAnnot => ({
@@ -96,10 +80,6 @@ function drag(points: [number, number][], extra: Record<string, unknown> = {}, t
 
 beforeEach(() => {
   h.toasts.length = 0;
-  h.pickAt = null;
-  h.pickIn = null;
-  h.atCalls = 0;
-  h.inCalls.length = 0;
   updateSettings.mockClear();
   resetMarkClipboard();
   settingsStore.set({ ...DEFAULT_SETTINGS, inkColors: [], pdfToolStyle: {} });
@@ -585,18 +565,18 @@ describe("Shift draws a straight line with pen, pencil and marker", () => {
 describe("Fill forms in the inspector", () => {
   const sw = (): FakeElement | null => insp().querySelector("#pdfed-fill-forms");
 
-  it("Select with nothing selected: a Document section with the image editor's switch field; disabled without fields", async () => {
+  it("Select with nothing selected: a Document section with one Fill forms field holding the switch; disabled without fields", async () => {
     await mount(project(), { forms: true });
     expect((kit.hosts.topbar as unknown as FakeElement).children).toHaveLength(0);
     const s = sw()!;
     expect(s.classList.contains("switch")).toBe(true);
-    // the "Flip layer" markup: field > .insp-row > field > (label + switch)
-    const inner = s.parentNode as unknown as FakeElement;
-    expect(inner.classList.contains("insp-field")).toBe(true);
-    const row = inner.parentNode as unknown as FakeElement;
-    expect(row.classList.contains("insp-row")).toBe(true);
-    const outer = row.parentNode as unknown as FakeElement;
-    expect(outer.querySelector("label")!.textContent).toBe("Fill forms");
+    // one field: its label, then the switch itself (no nested row or sublabel),
+    // straight inside the Document section like every other field
+    const f = s.parentNode as unknown as FakeElement;
+    expect(f.classList.contains("insp-field")).toBe(true);
+    expect(f.querySelectorAll("label").map((l) => l.textContent)).toEqual(["Fill forms"]);
+    expect(f.querySelector("label")!.getAttribute("for")).toBe("pdfed-fill-forms");
+    expect((f.parentNode as unknown as FakeElement).classList.contains("insp-section")).toBe(true);
     expect(s.disabled).toBe(true);
     expect(insp().querySelectorAll(".insp-note").map((n) => n.textContent)).toContain("This PDF has no fillable fields.");
     // another tool: no Document section
@@ -626,128 +606,5 @@ describe("Fill forms in the inspector", () => {
     await kit.flush();
     expect(kit.ctx.mode.get()).toBe("annotate");
     expect(insp().querySelector("#pdfed-clear-form")).toBeNull();
-  });
-});
-
-/* ------------------------------------------------------------------ */
-/* 8. The Edit text tool                                               */
-/* ------------------------------------------------------------------ */
-
-describe("the Edit text tool", () => {
-  const cand = (over: Partial<EditCandidate> = {}): EditCandidate => ({
-    key: "P1",
-    text: "Old line",
-    box: [100, 200, 150, 14],
-    edit: { rects: [[100, 201, 150, 12]], cover: "#fdfdfd", orig: "Old line" },
-    font: "Times New Roman",
-    size: 11,
-    bold: true,
-    italic: false,
-    color: "#222222",
-    align: "left",
-    ...over,
-  });
-
-  it("has a button after Text and the X shortcut", async () => {
-    await mount();
-    const labels = (kit.hosts.toolbar as unknown as FakeElement).querySelectorAll("button").map((b) => b.getAttribute("aria-label"));
-    expect(labels.indexOf("Edit text")).toBe(labels.indexOf("Text") + 1);
-    kit.action("pdfEditText");
-    expect(kit.ctx.tools.get().tool).toBe("edittext");
-    await kit.flush();
-    expect(title()).toBe("Edit text");
-  });
-
-  it("a click turns the line into ONE text box that replaces it, selected, typed in with the caret at the end", async () => {
-    h.pickAt = async () => cand();
-    await mount();
-    await setTool("edittext");
-    kit.pointer("pointerdown", 120, 205);
-    kit.pointer("pointerup", 120, 205);
-    await kit.flush();
-    await kit.flush();
-    expect(kit.session.steps).toBe(1);
-    const a = marks()[0] as Text;
-    expect(a).toMatchObject({ t: "text", x: 100, y: 200, w: 150, h: 14, text: "Old line", font: "Times New Roman", size: 11, bold: true, c: "#222222" });
-    expect(a.edit).toEqual({ rects: [[100, 201, 150, 12]], cover: "#fdfdfd", orig: "Old line" });
-    expect("bg" in a).toBe(false);
-    expect(kit.ctx.selection.get()).toEqual([{ key: "P1", id: a.id }]);
-    expect(editorDiv()!.textContent).toBe("Old line");
-    // the cover stays on screen while the box is typed in
-    const g = overlay().querySelector("g[data-id]")!;
-    expect(g.children[0]!.getAttribute("fill")).toBe("#fdfdfd");
-    expect(g.children[0]!.style.visibility ?? "").not.toBe("hidden");
-    expect(g.children[1]!.style.visibility).toBe("hidden");
-  });
-
-  it("a plain click asks for the paragraph, Alt+click for one line", async () => {
-    const opts: unknown[] = [];
-    h.pickAt = async (_k, _x, _y, o?: unknown) => {
-      opts.push(o);
-      return null;
-    };
-    await mount();
-    await setTool("edittext");
-    kit.pointer("pointerdown", 120, 205);
-    kit.pointer("pointerup", 120, 205);
-    kit.pointer("pointerdown", 120, 205, { altKey: true });
-    kit.pointer("pointerup", 120, 205, { altKey: true });
-    await kit.flush();
-    expect(opts).toEqual([{ line: false }, { line: true }]);
-  });
-
-  it("no text there: a quiet toast, nothing added", async () => {
-    await mount();
-    await setTool("edittext");
-    kit.pointer("pointerdown", 120, 205);
-    kit.pointer("pointerup", 120, 205);
-    await kit.flush();
-    expect(h.toasts).toEqual([`info:${NO_TEXT_HERE}`]);
-    expect(kit.session.steps).toBe(0);
-  });
-
-  it("a drag asks for every line in the box (pickTextIn, page space)", async () => {
-    h.pickIn = async () => cand({ text: "a\nb" });
-    await mount();
-    await setTool("edittext");
-    drag([
-      [100, 100],
-      [200, 150],
-      [300, 250],
-    ]);
-    await kit.flush();
-    expect(h.inCalls).toEqual([[100, 100, 200, 150]]);
-    expect((marks()[0] as Text).text).toBe("a\nb");
-  });
-
-  it("hover: at most one pick per frame, a quiet outline of the line under the pointer", async () => {
-    h.pickAt = async () => cand();
-    await mount();
-    await setTool("edittext");
-    kit.pointer("pointermove", 120, 205);
-    kit.pointer("pointermove", 125, 205);
-    kit.pointer("pointermove", 130, 205);
-    expect(h.atCalls).toBe(0);
-    kit.runFrames();
-    expect(h.atCalls).toBe(1);
-    await kit.flush();
-    const r = overlay().querySelector(".pdfmk-edit-hover")!;
-    expect([r.getAttribute("x"), r.getAttribute("width")]).toEqual(["100", "150"]);
-    // another tool: the outline goes, moves pick nothing
-    await setTool("select");
-    expect(overlay().querySelector(".pdfmk-edit-hover")).toBeNull();
-    kit.pointer("pointermove", 140, 205);
-    kit.runFrames();
-    expect(h.atCalls).toBe(1);
-  });
-
-  it("an edited box: Restore original removes it (the page's text shows again)", async () => {
-    await mount(project({ P1: [text("e", 100, 200, { edit: { rects: [[100, 201, 150, 12]], cover: "#ffffff", orig: "x" } })] }));
-    kit.ctx.selection.set([{ key: "P1", id: "e" }]);
-    await kit.flush();
-    insp().querySelectorAll("button").find((b) => b.innerHTML === "Restore original")!.click();
-    expect(marks()).toHaveLength(0);
-    expect(kit.session.steps).toBe(1);
-    expect(kit.ctx.selection.get()).toEqual([]);
   });
 });

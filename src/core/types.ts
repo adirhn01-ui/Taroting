@@ -363,8 +363,6 @@ export type PdfAnnot =
       bg?: string;
       /** box border, #rrggbb (1 pt); absent = none */
       border?: string;
-      /** "Edit text": this box REPLACES text that is part of the page. */
-      edit?: PdfTextEdit;
     } & PdfTextStyle)
   | { id: string; t: ShapeKind; c: string; w: number; a: [number, number]; b: [number, number] }
   /** an opaque cover box (default white) — typically with a text box on top */
@@ -379,18 +377,6 @@ export type PdfAnnot =
  * content is drawn turned by -r inside its page-space box, so it reads upright
  * on screen on a page stored sideways (a landscape scan with /Rotate 90), and
  * in the exported file. Absent = 0. A box's x/y/w/h stay in page space. */
-
-/** What an edited text box replaces. `rects` = the original glyph boxes in
- *  page space ([x, y, w, h], PageRect convention). The editor covers them
- *  with `cover` (the page colour sampled behind them); export REMOVES those
- *  glyphs from the page content and draws the cover only where removal was
- *  not possible. `orig` = the original text (for undo-free "revert" and
- *  diagnostics counts only — never exported). */
-export interface PdfTextEdit {
-  rects: [number, number, number, number][];
-  cover: string;
-  orig: string;
-}
 
 export type PdfAnnotKind = PdfAnnot["t"];
 
@@ -482,7 +468,6 @@ export type ActionId =
   | "pdfText"
   | "pdfWhiteout"
   | "pdfFillForms"
-  | "pdfEditText"
   | "duplicate"
   | "find";
 
@@ -671,7 +656,6 @@ export const DEFAULT_SHORTCUTS: Record<ActionId, string> = {
   pdfFillForms: "F",
   // Search the PDF's text (viewer showing a PDF, and the PDF editor).
   find: "Ctrl+F",
-  pdfEditText: "X",
   duplicate: "Ctrl+D",
 };
 
@@ -735,7 +719,6 @@ export const ACTION_MODES: Readonly<Record<ActionId, readonly ShortcutMode[]>> =
   pdfWhiteout: ["pdf"],
   pdfFillForms: ["pdf"],
   find: ["viewer", "pdf"],
-  pdfEditText: ["pdf"],
   duplicate: ["pdf"],
 };
 

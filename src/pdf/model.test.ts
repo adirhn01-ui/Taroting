@@ -674,24 +674,9 @@ describe("pasteAnnots", () => {
     expect(pasteAnnots(p, "P1", [pic], 0, 0, [], () => "x3").project).toBe(p);
   });
 
-  it("an edited text box pastes as a plain box (what it replaced stays on its page)", () => {
-    const edited = textMark("e", { edit: { rects: [[50, 60, 40, 10]], cover: "#ffffff", orig: "old" } });
-    const out = pasteAnnots(doc(), "P2", [edited], 10, 10, [], () => "c");
-    const got = pageAnnots(out.project, "P2").at(-1)!;
-    expect(got).toMatchObject({ id: "c", t: "text", x: 60, y: 70 });
-    expect("edit" in got).toBe(false);
-  });
-
   it("refuses an unknown page or nothing to paste", () => {
     const p = doc();
     expect(pasteAnnots(p, "nope", [box("z")], 0, 0, []).project).toBe(p);
     expect(pasteAnnots(p, "P1", [], 0, 0, []).project).toBe(p);
-  });
-
-  it("moving an edited box leaves its cover where the original text was", () => {
-    const edited = textMark("e", { edit: { rects: [[50, 60, 40, 10]], cover: "#ffffff", orig: "old" } });
-    const moved = translateAnnot(edited, 100, 0) as Extract<PdfAnnot, { t: "text" }>;
-    expect(moved.x).toBe(150);
-    expect(moved.edit!.rects).toEqual([[50, 60, 40, 10]]);
   });
 });

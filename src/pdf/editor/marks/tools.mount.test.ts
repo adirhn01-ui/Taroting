@@ -70,7 +70,7 @@ describe("mounting", () => {
     const row = (kit.hosts.toolbar as unknown as FakeElement).querySelector(".pdfmk-toolbar")!;
     expect(row).not.toBeNull();
     expect(toolbarButtons().map((b) => b.getAttribute("aria-label"))).toEqual([
-      "Select", "Highlight", "Pen", "Pencil", "Marker", "Eraser", "Shapes", "Text", "Edit text", "Whiteout", "Image", "Signature", "Ruler",
+      "Select", "Highlight", "Pen", "Pencil", "Marker", "Eraser", "Shapes", "Text", "Whiteout", "Image", "Signature", "Ruler",
     ]);
     expect(svgOf("P1")).not.toBeNull();
     expect(kit.view.el.listenerCount("pointerdown")).toBe(1);

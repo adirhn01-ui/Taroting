@@ -204,15 +204,6 @@ export function styleBoxLook(el: HTMLElement, a: { bg?: string; border?: string 
   s.boxShadow = border ? `inset 0 0 0 1px ${border}` : "none";
 }
 
-/** How far a cover box reaches past each glyph rect it hides, points. */
-export const COVER_PAD = 0.5;
-
-/** Path data of an edited text box's covers: each original glyph rect,
- *  padded by COVER_PAD. */
-export function coverD(rects: readonly [number, number, number, number][]): string {
-  return rectsD(rects.map(([x, y, w, h]) => [x - COVER_PAD, y - COVER_PAD, w + 2 * COVER_PAD, h + 2 * COVER_PAD] as [number, number, number, number]));
-}
-
 /** One saved mark as an SVG node in page space (null: nothing to draw). */
 export function markNode(a: PdfAnnot, media: readonly MediaRef[], urlOf: (path: string) => string): SVGElement | null {
   let node: SVGElement | null = null;
@@ -284,20 +275,9 @@ export function markNode(a: PdfAnnot, media: readonly MediaRef[], urlOf: (path: 
       turn(node, a);
       break;
     }
-    case "text": {
-      const fo = textNode(a);
-      const d = a.edit ? coverD(a.edit.rects) : "";
-      if (!d) {
-        node = fo;
-        break;
-      }
-      // "Edit text": the page's own text hides under its cover (page space,
-      // never turned), then the box draws on top
-      node = svg("g", { class: "pdfmk-edited" });
-      node.appendChild(svg("path", { d, fill: col(a.edit!.cover, "#ffffff"), class: "pdfmk-cover" }));
-      node.appendChild(fo);
+    case "text":
+      node = textNode(a);
       break;
-    }
   }
   if (node) node.setAttribute("data-id", a.id);
   return node;

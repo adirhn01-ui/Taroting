@@ -247,17 +247,15 @@ export function openTextEditor(
     return r;
   });
 
-  // The saved text hides while its editor is open. An edited box's cover
-  // (Edit text) stays, so the page's own text does not show through.
-  // A box committed this very tick (Edit text) is painted by the layer on its
-  // next notification, after this opens: the store listener below looks again.
+  // The saved text hides while its editor is open. The layer repaints a
+  // changed mark as a new node: the store listener below looks again.
   let hidden: SVGElement | null = null;
   const hideSaved = (): void => {
     if (!existing) return;
     for (const n of Array.from(frame.marks.children)) {
       if (n.getAttribute("data-id") !== id) continue;
-      const shown = (n.tagName.toLowerCase() === "g" ? n.children[n.children.length - 1] : n) as SVGElement | undefined;
-      if (shown && shown !== hidden) {
+      const shown = n as SVGElement;
+      if (shown !== hidden) {
         if (hidden) hidden.style.visibility = "";
         hidden = shown;
         shown.style.visibility = "hidden";

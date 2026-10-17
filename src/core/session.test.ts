@@ -166,6 +166,12 @@ describe("sanitizeSettings", () => {
     }
   });
 
+  it("drops a removed action's stored binding (pdfEditText, from an unreleased 0.9.3 build) without it holding its chord", () => {
+    const s = sanitizeSettings({ shortcuts: { pdfEditText: "Ctrl+Alt+E" } });
+    expect(Object.keys(s.shortcuts)).not.toContain("pdfEditText");
+    expect(Object.values(s.shortcuts)).not.toContain("Ctrl+Alt+E");
+  });
+
   it("never mutates the shared DEFAULT_SHORTCUTS object", () => {
     sanitizeSettings({ shortcuts: { split: "Ctrl+Alt+P" } });
     expect(DEFAULT_SHORTCUTS.split).toBe("S");
@@ -2543,7 +2549,7 @@ const ADDED_IN_090 = [
 ] as const;
 
 /** The PDF editor's actions and Find, new in 0.9.3. */
-const ADDED_IN_093 = ["pdfHighlight", "pdfText", "pdfWhiteout", "pdfFillForms", "find", "pdfEditText", "duplicate"] as const;
+const ADDED_IN_093 = ["pdfHighlight", "pdfText", "pdfWhiteout", "pdfFillForms", "find", "duplicate"] as const;
 
 /** A shortcut map exactly as a 0.8.1 settings.json stores it. */
 function shortcuts081(overrides: Record<string, unknown> = {}): Record<string, unknown> {

@@ -40,7 +40,6 @@ export const TOOL_DEFS: readonly ToolDef[] = [
   { id: "eraser", label: "Eraser", action: "imgEraser", icon: { img: "eraser" } },
   { id: "shape", label: "Shapes", action: "imgShape", icon: { img: "shapes" } },
   { id: "text", label: "Text", action: "pdfText", icon: { img: "text" } },
-  { id: "edittext", label: "Edit text", action: "pdfEditText", icon: { pdf: "edittext" } },
   { id: "whiteout", label: "Whiteout", action: "pdfWhiteout", icon: { pdf: "whiteout" } },
 ];
 

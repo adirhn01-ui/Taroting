@@ -306,8 +306,7 @@ export function setTextBox(p: ProjectFile, pageId: string, id: string, look: Tex
 
 /**
  * Paste copies of `marks` on top of page `pageId`, each moved by (dx, dy),
- * with fresh ids (`ids()`), in ONE new project. A text box loses its `edit`
- * (what it replaced belongs to the page it was copied from). A picture whose
+ * with fresh ids (`ids()`), in ONE new project. A picture whose
  * MediaRef the project lacks brings it along from `media` (reusing a ref of
  * the same file when there is one). Refused (returns `p`, no ids): not a PDF
  * project, unknown page, nothing to paste, or not all of them fit on it.
@@ -345,10 +344,6 @@ export function pasteAnnots(
       }
     }
     if (a.t === "image") a = { ...a, media: mediaMap.get(a.media)! };
-    if (a.t === "text" && a.edit) {
-      const { edit: _drop, ...plain } = a;
-      a = plain;
-    }
     const id = ids();
     newIds.push(id);
     out.push({ ...a, id });

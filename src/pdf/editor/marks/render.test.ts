@@ -167,7 +167,7 @@ describe("marks placed on a turned page (r)", () => {
   });
 });
 
-describe("text box look and Edit text covers", () => {
+describe("text box look", () => {
   const base: Extract<PdfAnnot, { t: "text" }> = { id: "t", t: "text", x: 10, y: 20, w: 100, h: 30, text: "hi", font: "Arial", size: 10, c: "#000000", bold: false, italic: false, align: "left" };
 
   it("fill and a 1 pt border sit inside the box, on the text's own element", () => {
@@ -181,15 +181,4 @@ describe("text box look and Edit text covers", () => {
     expect([bad.style.backgroundColor, bad.style.boxShadow]).toEqual(["transparent", "none"]);
   });
 
-  it("an edited box covers the original glyph rects (padded, page space, never turned), then draws its text", () => {
-    const g = node({ ...base, r: 90, edit: { rects: [[10, 20, 40, 10], [60, 20, 20, 10]], cover: "#fafafa", orig: "old" } });
-    expect(g.tagName).toBe("G");
-    expect(g.getAttribute("data-id")).toBe("t");
-    expect(g.getAttribute("transform")).toBeNull();
-    const [cover, fo] = g.children;
-    expect(cover!.getAttribute("fill")).toBe("#fafafa");
-    expect(cover!.getAttribute("d")).toBe("M9.5 19.5h41v11h-41ZM59.5 19.5h21v11h-21Z");
-    expect(fo!.tagName).toBe("FOREIGNOBJECT");
-    expect(fo!.getAttribute("transform")).not.toBeNull();
-  });
 });

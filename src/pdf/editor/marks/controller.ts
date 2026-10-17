@@ -2,8 +2,7 @@
 // pointerdown on the page strip decides who owns a press:
 //   - Fill forms mode: nobody here (form widgets own the pointer);
 //   - the ruler, when the press lands on it;
-//   - the active tool (draw.ts, select.ts, text.ts, edit-tool.ts, the armed
-//     signature). Text, Shapes, Whiteout and Highlight also act on a mark OF
+//   - the active tool (draw.ts, select.ts, text.ts, the armed signature). Text, Shapes, Whiteout and Highlight also act on a mark OF
 //     THEIR OWN KIND under the press (and on the selection's handles): it is
 //     selected and moved (or resized) instead of a new one being drawn. With
 //     Text, a click on a box types in it, caret where clicked;
@@ -47,7 +46,6 @@ import { boxForFrame, boxPoints, clampFont, geometryPatch, handleAt, onBoxEdge, 
 import type { MarkLayer, PageInfo } from "./layer";
 import { openTextEditor, type CaretAt, type TextEditor } from "./text";
 import { copyMarks, duplicateMarks, pasteMarks } from "./clipboard";
-import { createEditTextTool } from "./edit-tool";
 
 /** A placed signature's default width, points (aspect kept). */
 export const SIGNATURE_W = 160;
@@ -98,10 +96,9 @@ function modalOpen(): boolean {
   return typeof document !== "undefined" && !!document.querySelector(".modal-backdrop");
 }
 
-/** Does this tool want the text layer (native text selection)? Edit text
- *  keeps it too: its picking may read the page's text spans. */
+/** Does this tool want the text layer (native text selection)? */
 export function wantsTextLayer(tool: PdfToolId, mode: "annotate" | "forms"): boolean {
-  return mode === "forms" || tool === "select" || tool === "highlight" || tool === "edittext";
+  return mode === "forms" || tool === "select" || tool === "highlight";
 }
 
 /** The marks a tool acts on directly (select / move / resize) instead of
@@ -159,7 +156,6 @@ export function cursorClass(tool: PdfToolId): string | null {
       return "pdfmk-cur-cross";
     case "text":
     case "highlight":
-    case "edittext":
       return "pdfmk-cur-text";
     default:
       return null;
@@ -340,13 +336,6 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
 
   const now = (): number => (typeof performance !== "undefined" ? performance.now() : Date.now());
 
-  const editTool = createEditTextTool(
-    env,
-    (key, id) => editText(key, { id }, "end"),
-    () => !disposed && !editor && !gesture,
-  );
-  cleanup.push(() => editTool.dispose());
-
   const onDown = (e: PointerEvent): void => {
     if (disposed) return;
     palm.note(e.pointerType, now());
@@ -396,7 +385,6 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
     if (!palm.mayDraw(e.pointerType, now())) return;
     if (!hit) return;
     const key = hit.key;
-    editTool.clear();
 
     let g: Gesture | null = startRuler(env, e, key);
     if (!g) {
@@ -438,9 +426,6 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
           e.preventDefault();
           editText(key, { at: { x: hit.x, y: hit.y } });
           return;
-        case "edittext":
-          g = editTool.start(e, key);
-          break;
         case "signature":
           if (armed) {
             e.preventDefault();
@@ -506,7 +491,6 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
   let brushSize = -1;
   const onHover = (e: PointerEvent): void => {
     const s = ctx.tools.get();
-    if (s.tool === "edittext" && !gesture && !editor) editTool.hover(e);
     if (!BRUSH_TOOLS.has(s.tool) || ctx.mode.get() === "forms" || !view.clientToPage(e.clientX, e.clientY)) {
       if (!brush.hidden) brush.hidden = true;
       return;
@@ -522,7 +506,6 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
   };
   const onLeave = (): void => {
     if (!brush.hidden) brush.hidden = true;
-    editTool.clear();
   };
   view.el.addEventListener("pointermove", onHover);
   view.el.addEventListener("pointerleave", onLeave);
@@ -557,7 +540,6 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
       if (s.tool !== "select" && ctx.selection.get().length) ctx.selection.set([]);
       if (s.tool !== "signature") armed = null;
       pendingHighlight = false;
-      editTool.clear();
       if (!BRUSH_TOOLS.has(s.tool)) brush.hidden = true;
     }
     const text = wantsTextLayer(s.tool, mode);
@@ -714,7 +696,6 @@ export function mountMarkTools(ctx: PdfEditorCtx, layer: MarkLayer): MarkTools {
   bind("pdfHighlight", () => setTool("highlight"));
   bind("pdfText", () => setTool("text"));
   bind("pdfWhiteout", () => setTool("whiteout"));
-  bind("pdfEditText", () => setTool("edittext"));
   bind("imgRuler", () => {
     if (!blocked()) toggleRuler();
   });
