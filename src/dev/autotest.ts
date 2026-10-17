@@ -5,7 +5,7 @@
 // Results are written to %TEMP%\taroting-autotest-report.json.
 
 import { invoke } from "@tauri-apps/api/core";
-import { appVersion, codecHints, ipc, type PlaybackClass, type RepairNote } from "../core/ipc";
+import { appVersion, codecHints, ipc, onOpenPath, type PlaybackClass, type RepairNote } from "../core/ipc";
 import { navigate } from "../core/nav";
 import {
   addGeneratedMedia,
@@ -171,6 +171,43 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
   };
   const finish = (): Promise<void> => write(true);
 
+  // OS file-opens forwarded INTO this run. The autotest window holds the same
+  // single-instance lock as an installed Taroting, so an "Open with Taroting"
+  // (or another session's launch) made while a run is going is routed here and
+  // replaces whatever screen a block is driving — the suspected cause of the
+  // 2026-10-07 run that lost its editor mid-block, unprovable then because
+  // nothing recorded it. Every such open now lands in `errors` with the block
+  // it hit. The harness's own opens arrive as the same "open-path" event, so
+  // each ipc.debugPushOpenPath call is stamped and matched to the next event
+  // within OPEN_MATCH_MS (a push of a missing file emits nothing; its stamp
+  // just expires). The listener never drains the queue: the app's own handler
+  // still routes the path, exactly as it would for the owner.
+  const OPEN_MATCH_MS = 3_000;
+  let runningBlock = "setup";
+  const harnessPushes: number[] = [];
+  // The original is kept on the function itself: a run that never reached its
+  // end (hung past the cap, or re-run on HMR) leaves its wrapper installed, and
+  // wrapping that would stamp every push twice — a spare stamp that could
+  // swallow a real forwarded open.
+  type Push = typeof ipc.debugPushOpenPath & { real?: typeof ipc.debugPushOpenPath };
+  const realPushOpenPath = (ipc.debugPushOpenPath as Push).real ?? ipc.debugPushOpenPath;
+  ipc.debugPushOpenPath = Object.assign((path: string): Promise<void> => {
+    harnessPushes.push(performance.now()); // before the call: the event can beat its reply
+    return realPushOpenPath(path);
+  }, { real: realPushOpenPath });
+  const unlistenOpenPath = await onOpenPath(() => {
+    const now = performance.now();
+    while (harnessPushes.length > 0 && now - harnessPushes[0]! > OPEN_MATCH_MS) harnessPushes.shift();
+    if (harnessPushes.length > 0) {
+      harnessPushes.shift();
+      return;
+    }
+    errors.push(
+      `autotest: an OS file-open was forwarded into the autotest window during ${runningBlock} (a second launch or "Open with Taroting" while the run was going — results after it may not be this build's)`,
+    );
+    void write(false);
+  }).catch(() => (): void => {});
+
   // The main video editor's mount guard. Set by runAutotest's body once the
   // editor is up (mainEditorPhase / mainEditor) and cleared before the first
   // block that navigates away on purpose. While it is on, test() checks before
@@ -210,6 +247,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     // This block's OWN slot. `results[results.length - 1]` landed on whatever
     // was pushed last — after the hard timeout, its "overall" entry.
     const idx = results.push({ name, pass: false, detail: "…running" }) - 1;
+    runningBlock = name;
     await write(false);
     // Every block starts with no toasts on screen: one an earlier block raised
     // on purpose ("Still editing…", an export refusal) lives for seconds and
@@ -267,6 +305,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         }
       }
     }
+    runningBlock = `the gap after ${name}`;
     await write(false);
   };
 
@@ -4090,6 +4129,8 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
   }
 
   clearTimeout(hardTimeout);
+  ipc.debugPushOpenPath = realPushOpenPath;
+  unlistenOpenPath();
   await finish();
 }
 
