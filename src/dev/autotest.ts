@@ -5,7 +5,7 @@
 // Results are written to %TEMP%\taroting-autotest-report.json.
 
 import { invoke } from "@tauri-apps/api/core";
-import { appVersion, codecHints, ipc, type PlaybackClass, type RepairNote } from "../core/ipc";
+import { appVersion, codecHints, ipc, onOpenPath, type PlaybackClass, type RepairNote } from "../core/ipc";
 import { navigate } from "../core/nav";
 import {
   addGeneratedMedia,
@@ -171,6 +171,66 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
   };
   const finish = (): Promise<void> => write(true);
 
+  // OS file-opens forwarded INTO this run. The autotest window holds the same
+  // single-instance lock as an installed Taroting, so an "Open with Taroting"
+  // (or another session's launch) made while a run is going is routed here and
+  // replaces whatever screen a block is driving — the suspected cause of the
+  // 2026-10-07 run that lost its editor mid-block, unprovable then because
+  // nothing recorded it. Every such open now lands in `errors` with the block
+  // it hit. The harness's own opens arrive as the same "open-path" event, so
+  // each ipc.debugPushOpenPath call is stamped and matched to the next event
+  // within OPEN_MATCH_MS (a push of a missing file emits nothing; its stamp
+  // just expires). The listener never drains the queue: the app's own handler
+  // still routes the path, exactly as it would for the owner.
+  const OPEN_MATCH_MS = 3_000;
+  let runningBlock = "setup";
+  const harnessPushes: number[] = [];
+  // The original is kept on the function itself: a run that never reached its
+  // end (hung past the cap, or re-run on HMR) leaves its wrapper installed, and
+  // wrapping that would stamp every push twice — a spare stamp that could
+  // swallow a real forwarded open.
+  type Push = typeof ipc.debugPushOpenPath & { real?: typeof ipc.debugPushOpenPath };
+  const realPushOpenPath = (ipc.debugPushOpenPath as Push).real ?? ipc.debugPushOpenPath;
+  ipc.debugPushOpenPath = Object.assign((path: string): Promise<void> => {
+    harnessPushes.push(performance.now()); // before the call: the event can beat its reply
+    return realPushOpenPath(path);
+  }, { real: realPushOpenPath });
+  const unlistenOpenPath = await onOpenPath(() => {
+    const now = performance.now();
+    while (harnessPushes.length > 0 && now - harnessPushes[0]! > OPEN_MATCH_MS) harnessPushes.shift();
+    if (harnessPushes.length > 0) {
+      harnessPushes.shift();
+      return;
+    }
+    errors.push(
+      `autotest: an OS file-open was forwarded into the autotest window during ${runningBlock} (a second launch or "Open with Taroting" while the run was going — results after it may not be this build's)`,
+    );
+    void write(false);
+  }).catch(() => (): void => {});
+
+  // The main video editor's mount guard. Set by runAutotest's body once the
+  // editor is up (mainEditorPhase / mainEditor) and cleared before the first
+  // block that navigates away on purpose. While it is on, test() checks before
+  // and after every block that THIS run's editor is still the one on screen:
+  // a lost mount is pinned on the block that lost it, then re-established (or,
+  // failing that, every block after it is skipped with the reason) — one
+  // failure stays one failure instead of a dozen "no .preview__canvas".
+  let mainEditorPhase = false;
+  let mainEditor: {
+    up(): boolean;
+    remount(): Promise<void>;
+    stopOrphan(): void;
+  } | null = null;
+  // The block during which the editor was last seen mounted, for the reason.
+  let lastMountedBlock = "the initial mount";
+  // Set once a re-mount has failed: nothing can bring the editor back, so
+  // every later main-editor block is skipped instead of failing one by one.
+  let editorLostFor: string | null = null;
+  const appShows = (): string => {
+    const el = document.getElementById("app")?.firstElementChild as HTMLElement | null | undefined;
+    return el ? `${el.tagName.toLowerCase()}.${el.className || "(no class)"}` : "an empty #app";
+  };
+
   const test = async (name: string, fn: () => Promise<string> | string): Promise<void> => {
     // Past the cap nothing new starts: the report is already final, and a
     // block started now would only race the teardown of the one that hung.
@@ -178,14 +238,36 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
       results.push({ name, pass: false, detail: "skipped: the run had already timed out" });
       return;
     }
+    const guarded = mainEditorPhase && mainEditor !== null;
+    if (guarded && editorLostFor !== null) {
+      results.push({ name, pass: false, detail: `skipped: editor not mounted after ${editorLostFor}` });
+      await write(false);
+      return;
+    }
     // This block's OWN slot. `results[results.length - 1]` landed on whatever
     // was pushed last — after the hard timeout, its "overall" entry.
     const idx = results.push({ name, pass: false, detail: "…running" }) - 1;
+    runningBlock = name;
     await write(false);
     // Every block starts with no toasts on screen: one an earlier block raised
     // on purpose ("Still editing…", an export refusal) lives for seconds and
     // would sit over whatever this block hit-tests next.
     for (const t of Array.from(document.querySelectorAll(".toast"))) t.remove();
+    if (guarded && !mainEditor!.up()) {
+      // Lost between blocks (nothing of ours runs there, so: something outside
+      // the harness). Re-mount before this block rather than fail it for it.
+      const lost = `editor not mounted after ${lastMountedBlock} (#app shows ${appShows()})`;
+      errors.push(`autotest: ${lost} — re-mounting before ${name}`);
+      mainEditor!.stopOrphan();
+      try {
+        await mainEditor!.remount();
+      } catch (e) {
+        editorLostFor = lastMountedBlock;
+        results[idx] = { name, pass: false, detail: `skipped: ${lost}; re-mount failed: ${String(e)}` };
+        await write(false);
+        return;
+      }
+    }
     try {
       const detail = await fn();
       results[idx] = { name, pass: true, detail };
@@ -198,6 +280,32 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
           : "";
       results[idx] = { name, pass: false, detail: String(e) + where };
     }
+    if (guarded) {
+      if (mainEditor!.up()) {
+        lastMountedBlock = name;
+      } else if (!timedOut) {
+        // No main-editor block navigates on purpose, so whatever this block
+        // reports, it ends without the editor every later block drives. Say so
+        // on THIS block (a pass becomes a fail: it leaked state), stop the
+        // orphaned engine — a disposed engine that a later play() restarts
+        // keeps an rAF loop running with no screen, the likely source of the
+        // hundreds of frames image-pen-undo-redo's window-wide rAF count saw
+        // in the cascaded 2026-10-07 run — and bring
+        // the editor back for the next block.
+        const prior = results[idx]!;
+        const lost = `left the editor unmounted (#app shows ${appShows()})`;
+        results[idx] = { name, pass: false, detail: prior.pass ? `${lost}; the block itself reported: ${prior.detail}` : `${prior.detail} — and ${lost}` };
+        await write(false);
+        mainEditor!.stopOrphan();
+        try {
+          await mainEditor!.remount();
+        } catch (e) {
+          editorLostFor = name;
+          errors.push(`autotest: re-mounting the editor after ${name} failed: ${String(e)}`);
+        }
+      }
+    }
+    runningBlock = `the gap after ${name}`;
     await write(false);
   };
 
@@ -222,24 +330,63 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     const tone = await ipc.probeMedia(`${fixturesDir}\\tone.mp3`);
     project = importMediaAsClip(project, tone).project;
     await ipc.saveProject(projectPath, project);
-    navigate({ view: "editor", projectPath });
 
-    /* ---- wait for the editor + media readiness ---- */
-    const dev = await waitFor(
-      () => (window as unknown as { __tarotingDev?: DevHook }).__tarotingDev,
-      15_000,
-      "editor dev hook",
-    );
-    const { engine, session, media } = dev;
-    await waitFor(
-      () => {
-        const st = media.status.get();
-        const states = Object.values(st);
-        return states.length >= 2 && states.every((s) => s.state === "ready");
+    /* ---- mount the editor + wait for media readiness ---- */
+    // `let`, not const: every block below closes over these BINDINGS, so when
+    // the guard in test() has to re-mount the editor, rebinding them here hands
+    // the fresh engine/session to every later block at once.
+    let dev!: DevHook;
+    let engine!: DevHook["engine"];
+    let session!: DevHook["session"];
+    let media!: DevHook["media"];
+    const hookNow = (): DevHook | undefined => (window as unknown as { __tarotingDev?: DevHook }).__tarotingDev;
+    const mountMainEditor = async (hookMs: number, mediaMs: number): Promise<void> => {
+      // A fresh hook is mountEditor's completion signal; the previous one stays
+      // on window after its editor is gone, so presence alone proves nothing.
+      const prev = hookNow();
+      navigate({ view: "editor", projectPath });
+      dev = await waitFor(() => { const h = hookNow(); return h && h !== prev ? h : null; }, hookMs, "editor dev hook");
+      ({ engine, session, media } = dev);
+      await waitFor(
+        () => {
+          const st = media.status.get();
+          const states = Object.values(st);
+          return states.length >= 2 && states.every((s) => s.state === "ready");
+        },
+        mediaMs,
+        "all media ready",
+      );
+    };
+    await mountMainEditor(15_000, 30_000);
+    mainEditor = {
+      // THIS run's editor, not just an editor: the hook identity catches a
+      // different one (a temp project from a forwarded open) mounted over it.
+      up: () =>
+        hookNow() === dev &&
+        document.querySelector(".editor:not(.imged)") !== null &&
+        document.querySelector(".preview__canvas") !== null,
+      // Tighter than the first mount: the media are warm in the cache by now,
+      // and the whole run shares one 90 s budget.
+      remount: async () => {
+        await mountMainEditor(10_000, 15_000);
+        // The first mount's graph was running by the blocks after it (the
+        // embedded-audio block starts it); a fresh one is not. Pull it now, as
+        // that block does: under autotest master reaches no speakers, and an
+        // unpulled graph stalls the clocks the playback blocks measure.
+        await dev.audioGraph.devEnsureRunning();
+        dev.audioGraph.devMasterAnalyser();
+        assert(mainEditor!.up(), `re-mounted, but the editor is still not on screen (#app shows ${appShows()})`);
       },
-      30_000,
-      "all media ready",
-    );
+      stopOrphan: () => {
+        try { engine.pause(); } catch { /* already torn down */ }
+      },
+    };
+    // Every block from here to settings-version-visible drives THIS editor. A
+    // block that loses it (a navigation, an OS file-open forwarded into the
+    // autotest window by the single-instance plugin, #app cleared) used to
+    // leave every later block poking a disposed engine and absent DOM: one
+    // failure became a dozen. test() now checks the mount around each of them.
+    mainEditorPhase = true;
 
     const fps = engine.fps();
     const frameAt = (mediaTime: number): number =>
@@ -2547,6 +2694,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     // `appVersion()` is the same source Settings renders from, which turns this
     // from "shows a version" into "shows the RIGHT version" — a label stuck on a
     // stale or hardcoded string would still pass a bare semver match.
+    mainEditorPhase = false; // from here every block owns its own route
     await test("settings-version-visible", async () => {
       try {
         const expected = await appVersion();
@@ -3981,6 +4129,8 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
   }
 
   clearTimeout(hardTimeout);
+  ipc.debugPushOpenPath = realPushOpenPath;
+  unlistenOpenPath();
   await finish();
 }
 
