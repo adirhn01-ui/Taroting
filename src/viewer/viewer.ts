@@ -1,7 +1,9 @@
 // The folder viewer: one file at a time, arrows through its folder, no project.
 // Lazy route chunk, never prefetched; imports only main-chunk modules plus
-// ./loader and ./stepper (never anything under src/editor/ — that would drag
-// the editor chunk into this one).
+// ./loader, ./stepper and ./scrub (never anything under src/editor/ — that
+// would drag the editor chunk into this one). A PDF is shown by ./pdf-mode,
+// reached ONLY through import() on the first PDF: it and pdf.js behind it
+// are never part of this chunk.
 //
 // Zero work while idle. One <img> and one <video>, reused for every file and
 // emptied on every switch (the decoder and the Windows file handle go with the
@@ -18,7 +20,7 @@ import { describeError, ipc, revealInFolder, setWindowTitle } from "../core/ipc"
 import { createMonitorVolume } from "../core/monitor-volume";
 import type { MonitorVolumeState } from "../core/monitor-volume";
 import { navigate } from "../core/nav";
-import { openMediaAsProject, runOnOpenChain } from "../core/open-media";
+import { PdfProtectedError, openMediaAsProject, runOnOpenChain } from "../core/open-media";
 import { settingsStore } from "../core/session";
 import { ShortcutManager, normalizeChord } from "../core/shortcuts";
 import type { ActionId } from "../core/types";
@@ -28,6 +30,8 @@ import { closeMenu, showMenu } from "../ui/menu";
 import { toast } from "../ui/toast";
 import { DIRECT_TIMEOUT_MS, createSourceLoader } from "./loader";
 import type { Damage, LoadState } from "./loader";
+import type { PdfMemory, PdfMode } from "./pdf-mode";
+import { bindScrub } from "./scrub";
 import {
   DWELL_MS,
   WINDOW_RADIUS,
@@ -216,6 +220,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   const statusEl = $("#vw-status");
   const statusText = $(".viewer__status-text");
   const backBtn = $<HTMLButtonElement>("#vw-back");
+  const topEl = $("#vw-top");
   const nameEl = $("#vw-name");
   const damageEl = $("#vw-damage");
   const countEl = $("#vw-count");
@@ -311,6 +316,12 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   let rereading = false;
   /** When the last such reload started (performance.now()). */
   let lastRereadAt = Number.NEGATIVE_INFINITY;
+
+  /** The PDF mode while a PDF is the shown file (null otherwise); see showPdf. */
+  let pdf: PdfMode | null = null;
+  let pdfModule: Promise<typeof import("./pdf-mode")> | null = null;
+  /** The zoom and the rail toggle, kept while stepping between PDFs. */
+  const pdfMemory: PdfMemory = { fit: "width", zoom: 1, railOpen: null };
 
   const hasMedia = (): boolean => videoUrl !== null;
   /** The position the user is at: where they asked to be while that frame is
@@ -491,8 +502,45 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     img.hidden = true;
   }
 
+  /** Take the PDF mode down (strip, rail, bars, document, listeners). */
+  function closePdf(): void {
+    if (pdf === null) return;
+    pdf.dispose();
+    pdf = null;
+    syncAutoHide();
+  }
+
+  /** The loader says `p` is a PDF: fetch the PDF mode on first use, then open
+   *  it there. A newer file shown meanwhile (gen moved) wins. */
+  function showPdf(p: string): void {
+    releaseVideo();
+    releaseImg();
+    setStatus(null);
+    const myGen = gen;
+    const live = (): boolean => !disposed && myGen === gen && loadingPath === p && cur === p;
+    if (pdf !== null) {
+      void pdf.open(p, live);
+      return;
+    }
+    pdfModule ??= import("./pdf-mode");
+    pdfModule.then(
+      (mod) => {
+        if (!live()) return;
+        pdf ??= mod.mountPdfMode({ root: el, stage, top: topEl, nameEl, setStatus, withChord }, pdfMemory);
+        syncAutoHide();
+        void pdf.open(p, live);
+      },
+      (e) => {
+        // A chunk that failed to load: the next PDF tries again.
+        pdfModule = null;
+        if (live()) setStatus("Can't show this file", { detail: describeError(e) });
+      },
+    );
+  }
+
   function showReady(s: Extract<LoadState, { state: "ready" }>): void {
     setStatus(null);
+    closePdf();
     if (s.element === "img") {
       releaseVideo();
       imgUrl = s.url;
@@ -581,6 +629,9 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
       case "loading":
         setStatus(null);
         return;
+      case "document":
+        showPdf(p);
+        return;
       case "ready":
         if (s.element === "video" && s.damage !== undefined && videoUrl !== null && videoGen === gen) {
           // This load's damaged video is already out: only what the user is
@@ -599,6 +650,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
         showReady(s);
         return;
       case "preparing":
+        closePdf();
         releaseVideo();
         releaseImg();
         // A repair of a file the WebView refused says so while it runs: the
@@ -615,11 +667,13 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
         );
         return;
       case "needsPrepare":
+        closePdf();
         releaseVideo();
         releaseImg();
         setStatus("This video needs a preview copy", { prepare: true });
         return;
       case "failed":
+        closePdf();
         releaseVideo();
         releaseImg();
         setStatus("Can't show this file", { detail: s.message });
@@ -896,9 +950,11 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     paintNav();
     const target = elementFor(fileExt(cur));
     // The <video> is released on every step. An <img> stays up only when the
-    // next file is a picture too (no black flash between photos).
+    // next file is a picture too (no black flash between photos), the PDF
+    // strip only when the next file is a PDF too (it opens in place).
     releaseVideo();
     if (target !== "img") releaseImg();
+    if (target !== "pdf") closePdf();
     setStatus(null);
     const now = performance.now();
     const burst = now - lastStepAt < DWELL_MS.burst;
@@ -938,7 +994,9 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     paintName();
     paintNav();
     releaseVideo();
-    if (elementFor(fileExt(p)) !== "img") releaseImg();
+    const target = elementFor(fileExt(p));
+    if (target !== "img") releaseImg();
+    if (target !== "pdf") closePdf();
     setStatus(null);
     setTitle(p);
     // No dwell for a file the user opened: it loads now.
@@ -1089,8 +1147,10 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   let lastActivity = 0;
   let scrubbing = false;
 
+  // Never over a PDF, fullscreen included: a reader's mouse rests while they
+  // read, and the page indicator and scrubber are what they read by.
   const wantsAutoHide = (): boolean =>
-    !disposed && !scrubbing && (fsWanted || (hasMedia() && !video.paused));
+    !disposed && !scrubbing && pdf === null && (fsWanted || (hasMedia() && !video.paused));
 
   const menuOpen = (): boolean =>
     document.querySelector<HTMLElement>(".ctx-menu")?.style.display === "block";
@@ -1177,7 +1237,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
       // Only once the target itself is loading. Inside a step's dwell the
       // loader still holds the PREVIOUS file's job, and handing that off would
       // leave it running for nobody (dispose() never cancels a handed-off job).
-      if (loadingPath === target) {
+      // A PDF has no job to hand off: the editor opens the file itself.
+      if (loadingPath === target && elementFor(fileExt(target)) !== "pdf") {
         handedOff = true;
         await loader.handOff();
       }
@@ -1191,7 +1252,9 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
       navigate({ view: "editor", projectPath: p, temp: true, returnTo: target });
     })
       .catch((e) => {
-        toast.error(describeError(e));
+        // A protected PDF is not a failure: it stays here, in the viewer.
+        if (e instanceof PdfProtectedError) toast.info(e.message);
+        else toast.error(describeError(e));
         // A failed open must hand the file back to the loader (its contract:
         // load() again). The hand-off may have canceled the job behind a
         // "Preparing" without saying so, and it leaves the editor's CLAIM on
@@ -1281,39 +1344,22 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   volSlider.addEventListener("input", () => volume.setLevel(Number(volSlider.value)));
 
   // Seek: down + every move while held, pointer capture keeps the drag alive
-  // off the thin track (the theater bar's behaviour).
-  const seekFromX = (clientX: number): void => {
-    const box = seekEl.getBoundingClientRect();
-    if (box.width <= 0 || !hasMedia()) return;
-    seekTo(((clientX - box.left) / box.width) * video.duration);
-  };
-  seekEl.addEventListener("pointerdown", (e) => {
-    if (e.button !== 0 || !hasMedia()) return;
-    e.preventDefault();
-    scrubbing = true;
-    try {
-      seekEl.setPointerCapture(e.pointerId);
-    } catch {
-      /* synthetic pointer (autotest): listeners still fire on the element */
-    }
-    seekFromX(e.clientX);
-    syncAutoHide();
+  // off the thin track (the theater bar's behaviour; ./scrub, shared with the
+  // PDF page scrubber).
+  bindScrub(seekEl, {
+    enabled: hasMedia,
+    at: (r) => {
+      if (hasMedia()) seekTo(r * video.duration);
+    },
+    start: () => {
+      scrubbing = true;
+      syncAutoHide();
+    },
+    end: () => {
+      scrubbing = false;
+      syncAutoHide();
+    },
   });
-  seekEl.addEventListener("pointermove", (e) => {
-    if (scrubbing) seekFromX(e.clientX);
-  });
-  const endScrub = (e: PointerEvent): void => {
-    if (!scrubbing) return;
-    scrubbing = false;
-    try {
-      seekEl.releasePointerCapture(e.pointerId);
-    } catch {
-      /* not captured */
-    }
-    syncAutoHide();
-  };
-  seekEl.addEventListener("pointerup", endScrub);
-  seekEl.addEventListener("pointercancel", endScrub);
 
   // Click the picture to play/pause; double-click anywhere on the stage for
   // fullscreen (its two clicks toggle play twice: net unchanged).
@@ -1323,6 +1369,9 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   });
   stage.addEventListener("dblclick", (e) => {
     if (statusEl.contains(e.target as Node)) return;
+    // A double-click on a PDF's page selects a word; on its rail or prompt it
+    // is no request for fullscreen either.
+    if (pdf?.owns(e.target as Node)) return;
     toggleFs();
   });
 
@@ -1336,8 +1385,15 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   keys.on("seekBack", () => seekTo(playhead() - SEEK_S));
   keys.on("seekFwd", () => seekTo(playhead() + SEEK_S));
   keys.on("playPause", () => togglePlay());
-  keys.on("goStart", () => seekTo(0));
-  keys.on("goEnd", () => seekTo(video.duration));
+  keys.on("goStart", () => (pdf ? pdf.goPage("first") : seekTo(0)));
+  keys.on("goEnd", () => (pdf ? pdf.goPage("last") : seekTo(video.duration)));
+  keys.on("find", () => pdf?.find());
+  // Zoom keys only mean something on a PDF; elsewhere they stay unbound so the
+  // chord falls through (the handler is a no-op without a PDF).
+  keys.on("imgZoomIn", () => pdf?.zoom("in"));
+  keys.on("imgZoomOut", () => pdf?.zoom("out"));
+  keys.on("imgZoomFit", () => pdf?.zoom("fit"));
+  keys.on("imgZoom100", () => pdf?.zoom("100"));
   keys.on("fullscreen", () => toggleFs());
   keys.on("goHome", () => back());
   keys.setBindings(settingsStore.get().shortcuts);
@@ -1346,6 +1402,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     if (s.shortcuts === prev.shortcuts) return;
     keys.setBindings(s.shortcuts);
     paintTitles();
+    pdf?.retitle();
   });
 
   /* ---------------- go ---------------- */
@@ -1366,6 +1423,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
       loader.dispose();
       fsWanted = false;
       fs.dispose();
+      closePdf();
       window.clearTimeout(dwellTimer);
       window.clearTimeout(hideTimer);
       window.clearTimeout(directTimer);

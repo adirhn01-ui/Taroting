@@ -172,7 +172,9 @@ export function createPdfView(opts: PdfViewOptions): PdfViewExt {
     if (slots.length === 0 || L.tops.length !== slots.length) return null;
     const v = viewport();
     const ox = offX ?? v.w / 2;
-    const oy = offY ?? v.h / 2;
+    // At the very top, keep the TOP still (a fit or a resize on open must not
+    // scroll the first page's head out of view); elsewhere the centre.
+    const oy = offY ?? (el.scrollTop <= 0 ? 0 : v.h / 2);
     const cx = el.scrollLeft + ox;
     const cy = el.scrollTop + oy;
     const slot = M.slotAtY(L, cy);
@@ -754,8 +756,12 @@ export function createPdfView(opts: PdfViewOptions): PdfViewExt {
     setPages(pages: PdfViewPage[]): void {
       if (disposed) return;
       const prevCurrent = slots[state.get().current];
-      const anchor = captureAnchor();
-      const anchorKey = anchor ? slots[anchor.slot]?.key : undefined;
+      // The current page's top keeps its place on screen across any page
+      // operation (rotate, insert, delete, reorder): a page turned to
+      // landscape gets shorter, and keeping the CENTRE still would slide the
+      // next page under the eye.
+      const curIndex = state.get().current;
+      const curOffset = prevCurrent && L.tops.length === slots.length ? L.tops[curIndex]! - el.scrollTop : null;
       const old = new Map(slots.map((s) => [s.key, s] as const));
       const estimate = slots.find((s) => s.known) ?? null;
       const next: Slot[] = pages.map((p) => {
@@ -764,6 +770,10 @@ export function createPdfView(opts: PdfViewOptions): PdfViewExt {
           old.delete(p.key);
           prev.page = p;
           return prev;
+        }
+        // Only turned (same document and page): its size is already known.
+        if (prev && prev.page.doc === p.doc && prev.page.index === p.index && prev.known && p.doc !== null) {
+          return { key: p.key, page: p, w: prev.w, h: prev.h, srcRot: prev.srcRot, rot: M.displayRotation(prev.srcRot, p.rotate), known: true, dom: null };
         }
         const blank = p.doc === null;
         const w = blank ? (p.w ?? M.DEFAULT_PAGE_W) : (estimate?.w ?? M.DEFAULT_PAGE_W);
@@ -777,14 +787,10 @@ export function createPdfView(opts: PdfViewOptions): PdfViewExt {
       slots = next;
       byKey = new Map(slots.map((s, i) => [s.key, i] as const));
       setState({ count: slots.length, current: Math.min(state.get().current, Math.max(0, slots.length - 1)) });
-      // keep the page that was current in view when it still exists
-      if (anchor && anchorKey !== undefined && byKey.has(anchorKey)) {
-        relayout({ ...anchor, slot: byKey.get(anchorKey)! });
-      } else {
-        relayout(null);
-        const i = prevCurrent ? byKey.get(prevCurrent.key) : undefined;
-        el.scrollTop = i !== undefined ? Math.max(0, L.tops[i]! - gap) : 0;
-      }
+      relayout(null);
+      const i = prevCurrent ? byKey.get(prevCurrent.key) : undefined;
+      el.scrollTop = i !== undefined ? Math.max(0, L.tops[i]! - (curOffset ?? gap)) : 0;
+      updateCurrent();
       const gen = ++measureGen;
       void measure(gen);
     },

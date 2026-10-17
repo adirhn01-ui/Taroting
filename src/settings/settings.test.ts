@@ -7,6 +7,7 @@ import {
   ACTION_LABELS,
   ACTION_ORDER,
   LIVE_MODES,
+  OPEN_WITH_HINTS,
   cacheLimitLabel,
   changeCacheLimit,
   clearCacheButton,
@@ -282,5 +283,17 @@ describe("uninstallRefusal", () => {
     expect(uninstallRefusal({ code: "bad_input", message: "uninstall task failed: x" })).toBeNull();
     expect(uninstallRefusal({ code: "io", message: "not installed" })).toBeNull();
     expect(uninstallRefusal(new Error("not installed"))).toBeNull();
+  });
+});
+
+describe("the Opening files hints", () => {
+  it("name PDFs too, since the setting decides where a PDF opened from Explorer goes", () => {
+    expect(OPEN_WITH_HINTS.viewer).toBe(
+      "Shows the video, picture, song or PDF on its own. Use the arrows to move through its folder.",
+    );
+    // The editor's: a PDF becomes a PDF project, not a timeline.
+    expect(OPEN_WITH_HINTS.editor).toContain("a PDF as a PDF project");
+    expect(OPEN_WITH_HINTS.editor).toContain("a picture as an image project");
+    expect(OPEN_WITH_HINTS.editor).toContain("Keep it any time; leaving asks only if you changed it.");
   });
 });

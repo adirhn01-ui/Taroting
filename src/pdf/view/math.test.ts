@@ -215,11 +215,16 @@ describe("zoom", () => {
 
   it("fit width / fit page leave the gap on each side", () => {
     const d: SlotDims = { w: 600, h: 800, rot: 0 };
-    expect(fitZoom("width", d, 1232, 500, 16)).toBeCloseTo(2, 9);
-    expect(fitZoom("page", d, 1232, 432, 16)).toBeCloseTo(0.5, 9);
-    expect(fitZoom("page", d, 332, 4000, 16)).toBeCloseTo(0.5, 9);
+    // one pixel of slack on the width, so a rounded box never overflows
+    expect(fitZoom("width", d, 1233, 500, 16)).toBeCloseTo(2, 9);
+    expect(fitZoom("page", d, 1233, 432, 16)).toBeCloseTo(0.5, 9);
+    expect(fitZoom("page", d, 333, 4000, 16)).toBeCloseTo(0.5, 9);
     // a turned page fits by its turned width
-    expect(fitZoom("width", { w: 600, h: 800, rot: 90 }, 832, 500, 16)).toBeCloseTo(1, 9);
+    expect(fitZoom("width", { w: 600, h: 800, rot: 90 }, 833, 500, 16)).toBeCloseTo(1, 9);
+    // the fitted box (plus the gaps) is never wider than the strip
+    for (const w of [500, 777, 982, 1233, 1919]) {
+      expect(Math.round(600 * fitZoom("width", d, w, 500, 16)) + 32).toBeLessThanOrEqual(w);
+    }
   });
 
   it("keeps the page point under the cursor fixed across a zoom", () => {

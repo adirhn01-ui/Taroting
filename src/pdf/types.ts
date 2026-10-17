@@ -224,7 +224,25 @@ export interface PdfEditorCtx {
   holdAutosave(): () => void;
   /** register a body-parked surface's closer; dispose closes all */
   registerOverlay(close: () => void): () => void;
+  /** The editor's ONE ShortcutManager("pdf") belongs to the shell; parts add
+   *  handlers through this (an action bound twice: the later handler wins until
+   *  it is removed). Returns the unbind. */
+  bindKey(action: import("../core/types").ActionId, fn: (e: KeyboardEvent) => void): () => void;
+  /** pdf.js widget/annotation layers and inputs inside the strip are typing
+   *  targets; parts call this to know whether a key belongs to a text field */
+  isTyping(target: EventTarget | null): boolean;
 }
 
-/** A part of the editor (tools, panels): mounted with the ctx, disposed with the editor. */
-export type PdfEditorPart = (ctx: PdfEditorCtx) => { dispose(): void };
+/** Where the shell lets each part put its UI (all inside the editor root). */
+export interface PdfEditorHosts {
+  /** left of the transport row under the page strip: the tool buttons */
+  toolbar: HTMLElement;
+  /** the right-hand panel (tool/mark/page properties) */
+  inspector: HTMLElement;
+  /** in the top bar, before Settings/Export: the Fill forms switch */
+  topbar: HTMLElement;
+}
+
+/** A part of the editor (tools, panels): mounted with the ctx and its hosts,
+ *  disposed with the editor (disposal must remove everything it added). */
+export type PdfEditorPart = (ctx: PdfEditorCtx, hosts: PdfEditorHosts) => { dispose(): void };

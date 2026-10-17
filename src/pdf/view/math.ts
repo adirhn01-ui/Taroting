@@ -272,7 +272,9 @@ export function anchoredScroll(
 export function fitZoom(mode: "width" | "page", dims: SlotDims, viewW: number, viewH: number, gap: number): number {
   const s = boxSize(dims.w, dims.h, dims.rot, 1);
   if (!(s.W > 0) || !(s.H > 0)) return 1;
-  const zw = (viewW - 2 * gap) / s.W;
+  // 1 px of slack: the layout rounds page boxes to whole pixels, and a box
+  // one pixel wider than the strip would bring up a horizontal scrollbar.
+  const zw = (viewW - 2 * gap - 1) / s.W;
   const z = mode === "width" ? zw : Math.min(zw, (viewH - 2 * gap) / s.H);
   return clampZoom(z);
 }

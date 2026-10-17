@@ -26,6 +26,7 @@ const {
   openRouteInfo,
   openRouteNotice,
   orphanRowsHtml,
+  PDFS_ASIDE_NOTICE,
   routeDrop,
   routeOpenPicks,
   sortRecents,
@@ -59,13 +60,14 @@ describe("routeOpenPicks (Home's Open)", () => {
       kind: "media",
       media: ["E:\\z\\clip.mp4", "C:\\y\\shot 2.png", "C:\\y\\Shot 9.JPG", "D:\\x\\shot 10.png"],
       skipped: 0,
+      pdfs: 0,
     });
     expect(openRouteNotice(route)).toBeNull();
   });
 
   it("drops unsupported files with one toast that says how many", () => {
     const route = routeOpenPicks(["C:\\a.png", "C:\\notes.txt", "C:\\b.psd", "C:\\c.mov"]);
-    expect(route).toEqual({ kind: "media", media: ["C:\\a.png", "C:\\c.mov"], skipped: 2 });
+    expect(route).toEqual({ kind: "media", media: ["C:\\a.png", "C:\\c.mov"], skipped: 2, pdfs: 0 });
     expect(openRouteNotice(route)).toBe("Skipped 2 files of an unsupported type.");
     const one = routeOpenPicks(["C:\\a.png", "C:\\notes.txt"]);
     expect(openRouteNotice(one)).toBe("Skipped 1 file of an unsupported type.");
@@ -98,7 +100,48 @@ describe("routeDrop (a drop on Home)", () => {
   });
 
   it("sends dropped media to the same dialog as Open", () => {
-    expect(routeDrop(["C:\\b.png", "C:\\a.png"])).toEqual({ kind: "media", media: ["C:\\a.png", "C:\\b.png"], skipped: 0 });
+    expect(routeDrop(["C:\\b.png", "C:\\a.png"])).toEqual({ kind: "media", media: ["C:\\a.png", "C:\\b.png"], skipped: 0, pdfs: 0 });
+  });
+});
+
+describe("PDFs on Open and drop", () => {
+  it("make a PDF project of a single PDF, with no question asked", () => {
+    const route = routeOpenPicks(["C:\\Docs\\Report.PDF"]);
+    expect(route).toEqual({ kind: "pdf", pdfs: ["C:\\Docs\\Report.PDF"], skipped: 0 });
+    expect(openRouteNotice(route)).toBeNull();
+    expect(routeDrop(["C:\\Docs\\Report.pdf"])).toEqual({ kind: "pdf", pdfs: ["C:\\Docs\\Report.pdf"], skipped: 0 });
+  });
+
+  it("keep several PDFs in the order they came, never name-sorted like media", () => {
+    const picked = ["C:\\d\\cover 10.pdf", "C:\\d\\body.pdf", "C:\\d\\appendix 2.pdf"];
+    expect(routeOpenPicks(picked)).toEqual({ kind: "pdf", pdfs: picked, skipped: 0 });
+    const reversed = [...picked].reverse();
+    expect(routeDrop(reversed)).toEqual({ kind: "pdf", pdfs: reversed, skipped: 0 });
+  });
+
+  it("skip unsupported files among PDFs with the usual one toast", () => {
+    const route = routeOpenPicks(["C:\\a.pdf", "C:\\notes.txt"]);
+    expect(route).toEqual({ kind: "pdf", pdfs: ["C:\\a.pdf"], skipped: 1 });
+    expect(openRouteNotice(route)).toBe("Skipped 1 file of an unsupported type.");
+  });
+
+  it("with media: the media keep their flow, the PDFs are left aside in ONE toast", () => {
+    const route = routeOpenPicks(["C:\\b.pdf", "C:\\clip.mp4", "C:\\a.png"]);
+    expect(route).toEqual({ kind: "media", media: ["C:\\a.png", "C:\\clip.mp4"], skipped: 0, pdfs: 1 });
+    expect(openRouteNotice(route)).toBe(PDFS_ASIDE_NOTICE);
+    expect(PDFS_ASIDE_NOTICE).toContain("Open the PDFs on their own to make a PDF project.");
+    // Unsupported files too: still one toast, saying both.
+    const both = routeDrop(["C:\\b.pdf", "C:\\clip.mp4", "C:\\x.txt", "C:\\y.doc"]);
+    expect(openRouteNotice(both)).toBe(`${PDFS_ASIDE_NOTICE} Skipped 2 files of an unsupported type.`);
+  });
+
+  it("keep today's rule for a .trt among them", () => {
+    expect(routeOpenPicks(["C:\\a.pdf", "C:\\Cut.trt"])).toEqual({ kind: "mixed" });
+    expect(routeDrop(["C:\\a.pdf", "C:\\Cut.trt", "C:\\b.pdf"])).toEqual({
+      kind: "project",
+      path: "C:\\Cut.trt",
+      ignored: 2,
+    });
   });
 });
 

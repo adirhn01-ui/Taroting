@@ -167,6 +167,37 @@ describe("stills", () => {
   });
 });
 
+describe("a PDF", () => {
+  it("is never probed: the viewer opens it itself", async () => {
+    const probe = vi.spyOn(ipc, "probeMedia");
+    const classify = vi.spyOn(ipc, "classifyPlayback");
+    const { loader, states } = recorded();
+    loader.load("D:\\docs\\Report.PDF");
+    await settle();
+    expect(states).toEqual([
+      ["D:\\docs\\Report.PDF", { state: "loading" }],
+      ["D:\\docs\\Report.PDF", { state: "document" }],
+    ]);
+    expect(probe).not.toHaveBeenCalled();
+    expect(classify).not.toHaveBeenCalled();
+  });
+
+  it("stepping onto a PDF cancels the job the previous file was waiting on", async () => {
+    probeAll();
+    classifyAs({ [MTS]: "remux" });
+    vi.spyOn(ipc, "planPlayback").mockResolvedValue({ mode: "pending", jobId: 41, output: "o" } as PlaybackPlan);
+    const cancel = vi.spyOn(ipc, "cancelJob").mockResolvedValue(true);
+    const { loader } = recorded();
+    loader.load(MTS);
+    await settle();
+    expect(loader.debug().jobId).toBe(41);
+    loader.load("D:\\docs\\a.pdf");
+    await settle();
+    expect(cancel.mock.calls.map((c) => c[0])).toEqual([41]);
+    expect(loader.debug().jobId).toBeNull();
+  });
+});
+
 describe("classification", () => {
   it("plays a direct file as-is, with the probe's kind, and plans nothing", async () => {
     probeAll({ [MP3]: { kind: "audio", width: undefined, height: undefined } });

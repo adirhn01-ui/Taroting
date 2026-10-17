@@ -24,7 +24,8 @@ export interface StepState {
   family: StepFamily;
 }
 
-export type ViewElement = "img" | "video";
+/** "pdf": the page strip (src/viewer/pdf-mode.ts), never a media element. */
+export type ViewElement = "img" | "video" | "pdf";
 
 /** Neighbours requested on each side of the shown file. */
 export const WINDOW_RADIUS = 16;
@@ -97,12 +98,14 @@ export function counterText(s: StepState): string {
   return `${s.firstIndex + s.pos} / ${s.total}`;
 }
 
-/** image + gif → img; video + audio → video; anything else → null.
+/** image + gif → img; video + audio → video; a PDF (the "document" family,
+ *  its own step family too) → pdf; anything else → null.
  *  `ext` is already lowercased (fileExt). */
 export function elementFor(ext: string): ViewElement | null {
   // Through the one extension table (media-extensions.json), never a local
   // list: the viewer must refuse exactly what import and list_siblings refuse.
   const f = mediaFamilyOf(ext);
   if (f === null) return null;
+  if (f === "document") return "pdf";
   return f === "image" || f === "gif" ? "img" : "video";
 }

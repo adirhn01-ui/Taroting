@@ -21,7 +21,20 @@ const m = vi.hoisted(() => ({
   menus: [] as Array<{ activateFirst: boolean | undefined }>,
   errors: [] as string[],
   refusals: [] as string[],
+  infos: [] as string[],
   picks: [] as string[],
+  /** the last menu's rows, so a test can choose one */
+  menuItems: [] as Array<{ label: string; icon?: string; hint?: string; onSelect(): void }>,
+  /** what "New project > PDF project" picks, and how often the picker opened */
+  pdfPicks: [] as string[],
+  pdfPickArgs: [] as boolean[],
+  stats: new Map<string, { size: number; mtimeMs: number }>(),
+  /** page count, or the PdfOpenError kind countPages rejects with */
+  pages: new Map<string, number | "password" | "invalid">(),
+  /** held open by a test to keep a PDF project in the making */
+  countGate: null as null | Promise<void>,
+  saved: [] as Array<{ path: string; project: { schema: number; kind?: string; pdf?: { sources: Array<{ id: string; path: string; size: number; mtimeMs: number; pages: number }>; pages: Array<{ src: string | null; page: number }> } } }>,
+  openAs: [] as string[][],
 }));
 
 vi.mock("../core/ipc", () => ({
@@ -29,7 +42,17 @@ vi.mock("../core/ipc", () => ({
   mediaUrl: (p: string) => `asset://${p}`,
   onDragDrop: async () => () => {},
   pickOpenFiles: async () => m.picks.slice(),
+  pickPdfFiles: async (multiple: boolean) => {
+    m.pdfPickArgs.push(multiple);
+    return m.pdfPicks.slice();
+  },
   ipc: {
+    fileStat: async (p: string) => m.stats.get(p) ?? null,
+    newProjectPath: async (s?: string) => `C:\\Docs\\Taroting\\${s ?? "Untitled"}.trt`,
+    saveProject: async (path: string, project: (typeof m.saved)[number]["project"]) => {
+      m.saved.push({ path, project });
+      return { modifiedAt: "2026-10-17T10:00:00Z" };
+    },
     listRecents: () => {
       m.listCalls++;
       return m.recents ? m.recents() : Promise.resolve({ schema: 1, items: [] });
@@ -56,16 +79,35 @@ vi.mock("../core/ipc", () => ({
 }));
 vi.mock("../core/nav", () => ({ navigate: (r: unknown) => void m.navigations.push(r) }));
 vi.mock("../ui/menu", () => ({
-  showMenu: (_x: number, _y: number, _items: unknown, _flip?: number, activateFirst?: boolean) =>
-    void m.menus.push({ activateFirst }),
+  showMenu: (_x: number, _y: number, items: typeof m.menuItems, _flip?: number, activateFirst?: boolean) => {
+    m.menuItems = items;
+    m.menus.push({ activateFirst });
+  },
   closeMenu: () => {},
 }));
 vi.mock("../ui/toast", () => ({
   toast: {
     error: (s: string) => void m.errors.push(s),
-    info: () => {},
+    info: (s: string) => void m.infos.push(s),
     refuse: (s: string) => void m.refusals.push(s),
   },
+}));
+vi.mock("../pdf/view/loader", () => ({
+  countPages: async (p: string) => {
+    await (m.countGate ?? Promise.resolve());
+    const v = m.pages.get(p);
+    if (typeof v === "number") return v;
+    throw Object.assign(new Error(v ?? "missing"), { kind: v ?? "missing" });
+  },
+}));
+// The "Open as" dialog is its own chunk with its own tests; here only whether
+// Home offers it, and with which files.
+vi.mock("./open-as-dialog", () => ({
+  openOpenAsDialog: (o: { paths: string[] }) => {
+    m.openAs.push([...o.paths]);
+    return () => {};
+  },
+  createImageProjectFrom: async () => null,
 }));
 
 /* ---------------- the stub DOM ---------------- */
@@ -79,6 +121,7 @@ class Stub {
   disabled = false;
   value = "";
   innerHTML = "";
+  textContent = "";
   dataset: Record<string, string> = {};
   focusCalls = 0;
   classList = { toggle: () => {}, add: () => {}, remove: () => {}, contains: () => false };
@@ -153,6 +196,14 @@ vi.stubGlobal("window", globalThis);
 vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => {} });
 vi.stubGlobal("CSS", { escape: (s: string) => s });
 vi.stubGlobal("requestIdleCallback", (cb: () => void) => setTimeout(cb, 0));
+/** Home's card-picture error handler only acts on an <img>. */
+class FakeImg {
+  constructor(private readonly map: Record<string, object>) {}
+  closest(sel: string): object | null {
+    return this.map[sel] ?? null;
+  }
+}
+vi.stubGlobal("HTMLImageElement", FakeImg);
 
 const { mountHome } = await import("./home");
 const { runOnOpenChain } = await import("../core/open-media");
@@ -218,7 +269,16 @@ beforeEach(() => {
   m.menus = [];
   m.errors = [];
   m.refusals = [];
+  m.infos = [];
   m.picks = [];
+  m.menuItems = [];
+  m.pdfPicks = [];
+  m.pdfPickArgs = [];
+  m.stats.clear();
+  m.pages.clear();
+  m.countGate = null;
+  m.saved = [];
+  m.openAs = [];
   doc.activeElement = null;
   doc.present.clear();
   doc.nodes.clear();
@@ -520,5 +580,274 @@ describe("opening a recents card", () => {
     expect(m.navigations).toEqual([]);
     expect(m.errors).toEqual(["Project file not found"]);
     expect(m.listCalls).toBe(before + 1);
+  });
+});
+
+/* ---------------- PDF projects ---------------- */
+
+describe("a PDF project's card", () => {
+  const PDF = "C:\\Docs\\Taroting\\Cut 2.trt";
+
+  it("has the document glyph and data-kind, no running time, and no thumbnail backfill", async () => {
+    m.recents = () =>
+      Promise.resolve({ schema: 1, items: [item(1), item(2, { kind: "pdf", durationSec: 0 }), item(3)] });
+    const root = mount();
+    await flush(12);
+    const html = root.el("#recents").innerHTML;
+    const start = html.indexOf(`data-path="${PDF}"`);
+    const card = html.slice(start, html.indexOf("data-path=", start + 12));
+    expect(card).toContain('data-kind="pdf"');
+    // The page glyph, not the film strip or the picture.
+    expect(card).toContain('<path d="M14 3H7');
+    expect(card).not.toContain('<rect x="3" y="5"');
+    // No "0:00" where a video card shows its length.
+    expect(card).not.toMatch(/\d:\d\d/);
+    // Its editor renders its picture: Home never asks the backend for one.
+    expect(m.thumbCalls.flat()).toEqual(["C:\\Docs\\Taroting\\Cut 1.trt", "C:\\Docs\\Taroting\\Cut 3.trt"]);
+  });
+
+  it("falls back to its glyph when its picture is gone, without asking for a new one", async () => {
+    const VID = "C:\\Docs\\Taroting\\Cut 1.trt";
+    m.recents = () =>
+      Promise.resolve({
+        schema: 1,
+        items: [
+          item(1, { thumb: "C:\\cache\\v.jpg" }),
+          item(2, { kind: "pdf", durationSec: 0, thumb: "C:\\cache\\p.jpg" }),
+        ],
+      });
+    const root = mount();
+    await flush(12);
+    expect(m.thumbCalls).toEqual([]);
+    const grid = root.el("#recents");
+    const pdfThumb = { innerHTML: "<img>" };
+    grid.fire("error", {
+      target: new FakeImg({ ".project-card__thumb": pdfThumb, ".project-card": { dataset: { path: PDF } } }),
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    await flush(12);
+    expect(pdfThumb.innerHTML).toContain('<path d="M14 3H7');
+    expect(m.thumbCalls).toEqual([]);
+    // A video card in the same state IS backfilled again: the PDF card's skip
+    // is its kind, not the timing.
+    const vidThumb = { innerHTML: "<img>" };
+    grid.fire("error", {
+      target: new FakeImg({ ".project-card__thumb": vidThumb, ".project-card": { dataset: { path: VID } } }),
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    await flush(12);
+    expect(m.thumbCalls).toEqual([[VID]]);
+  });
+
+  it("is selected by path like any other card", async () => {
+    m.recents = () => Promise.resolve({ schema: 1, items: [item(1), item(2, { kind: "pdf", durationSec: 0 })] });
+    const root = mount();
+    await flush();
+    root.el("#btn-select").fire("click", {});
+    root.el("#recents").fire("click", { target: target({ ".project-card": { dataset: { path: PDF } } }) });
+    expect(root.el("#home-select-count").textContent).toBe("1 selected");
+  });
+});
+
+describe("New project > PDF project", () => {
+  const SRC = "C:\\Users\\u\\Papers\\Report.pdf";
+
+  async function choosePdf(root: Root): Promise<void> {
+    root.el("#btn-new").fire("click", { detail: 1 });
+    const row = m.menuItems.find((r) => r.label === "PDF project");
+    expect(row, "the New project menu has a PDF project row").toBeDefined();
+    row!.onSelect();
+    await flush(10);
+  }
+
+  it("is the third row, in the same style as the others", async () => {
+    const root = mount();
+    await flush();
+    root.el("#btn-new").fire("click", { detail: 1 });
+    expect(m.menuItems.map((r) => r.label)).toEqual(["Video project", "Image project", "PDF project"]);
+    expect(m.menuItems[2]!.icon).toContain("<svg");
+    expect(m.menuItems[2]!.hint).toBeTruthy();
+  });
+
+  it("picks ONE PDF and saves a permanent PDF project of it, then opens it", async () => {
+    m.pdfPicks = [SRC];
+    m.stats.set(SRC, { size: 5120, mtimeMs: 1_700_000_000_000 });
+    m.pages.set(SRC, 4);
+    const root = mount();
+    await flush();
+    await choosePdf(root);
+    expect(m.pdfPickArgs).toEqual([false]);
+    expect(m.saved).toHaveLength(1);
+    const { path, project } = m.saved[0]!;
+    expect(path).toBe("C:\\Docs\\Taroting\\Report.trt");
+    expect(project.schema).toBe(4);
+    expect(project.kind).toBe("pdf");
+    expect(project.pdf!.sources[0]).toMatchObject({ path: SRC, size: 5120, mtimeMs: 1_700_000_000_000, pages: 4 });
+    expect(project.pdf!.pages.map((p) => p.page)).toEqual([0, 1, 2, 3]);
+    // Permanent: no `temp` flag.
+    expect(m.navigations).toEqual([{ view: "editor", projectPath: path }]);
+  });
+
+  it("says a missing PDF is missing, and makes nothing", async () => {
+    m.pdfPicks = [SRC];
+    const root = mount();
+    await flush();
+    await choosePdf(root);
+    expect(m.errors).toEqual(["This PDF is missing or can't be read."]);
+    expect(m.saved).toEqual([]);
+    expect(m.navigations).toEqual([]);
+  });
+
+  it("makes nothing of a protected PDF and says to open it to read it", async () => {
+    m.pdfPicks = [SRC];
+    m.stats.set(SRC, { size: 1, mtimeMs: 1 });
+    m.pages.set(SRC, "password");
+    const root = mount();
+    await flush();
+    await choosePdf(root);
+    expect(m.infos).toEqual(["Protected PDFs can't be edited — open it to read it instead."]);
+    expect(m.errors).toEqual([]);
+    expect(m.saved).toEqual([]);
+    expect(m.navigations).toEqual([]);
+  });
+
+  it("says an invalid PDF couldn't be read, and makes nothing", async () => {
+    m.pdfPicks = [SRC];
+    m.stats.set(SRC, { size: 1, mtimeMs: 1 });
+    m.pages.set(SRC, "invalid");
+    const root = mount();
+    await flush();
+    await choosePdf(root);
+    expect(m.errors).toEqual(["Couldn't read Report as a PDF."]);
+    expect(m.saved).toEqual([]);
+    expect(m.navigations).toEqual([]);
+  });
+
+  it("does nothing when the picker is cancelled", async () => {
+    const root = mount();
+    await flush();
+    await choosePdf(root);
+    expect(m.pdfPickArgs).toEqual([false]);
+    expect(m.saved).toEqual([]);
+    expect(m.errors).toEqual([]);
+  });
+
+  it("does not open the picker again, or take an Open, while a project is being made", async () => {
+    m.pdfPicks = [SRC];
+    m.stats.set(SRC, { size: 1, mtimeMs: 1 });
+    m.pages.set(SRC, 1);
+    let release!: () => void;
+    m.countGate = new Promise<void>((r) => (release = r));
+    const root = mount();
+    await flush();
+    await choosePdf(root);
+    await choosePdf(root);
+    m.picks = [SRC];
+    root.el("#btn-open").fire("click", {});
+    await flush(10);
+    expect(m.pdfPickArgs).toEqual([false]);
+    release();
+    await flush(10);
+    expect(m.saved).toHaveLength(1);
+    expect(m.navigations).toHaveLength(1);
+  });
+
+  it("makes nothing once Home is gone", async () => {
+    m.pdfPicks = [SRC];
+    m.stats.set(SRC, { size: 1, mtimeMs: 1 });
+    m.pages.set(SRC, 1);
+    let release!: () => void;
+    m.countGate = new Promise<void>((r) => (release = r));
+    const root = mount();
+    await flush();
+    await choosePdf(root);
+    mounted.splice(0).forEach((v) => v.dispose());
+    release();
+    await flush(10);
+    expect(m.saved).toEqual([]);
+    expect(m.navigations).toEqual([]);
+  });
+});
+
+describe("Open and drop with PDFs", () => {
+  const A = "C:\\Users\\u\\Papers\\b cover.pdf";
+  const B = "C:\\Users\\u\\Papers\\a body.pdf";
+  type DevWin = { __tarotingAutotest?: boolean; __tarotingHomeDev?: { drop(p: string[]): void } };
+  const win = globalThis as unknown as DevWin;
+
+  function readable(path: string, pages: number, size: number): void {
+    m.stats.set(path, { size, mtimeMs: 1_700_000_000_000 });
+    m.pages.set(path, pages);
+  }
+
+  afterEach(() => {
+    delete win.__tarotingAutotest;
+  });
+
+  it("opens a single PDF straight into a new permanent PDF project, with no question", async () => {
+    m.picks = [A];
+    readable(A, 2, 10);
+    const root = mount();
+    await flush();
+    root.el("#btn-open").fire("click", {});
+    await flush(10);
+    expect(m.openAs).toEqual([]);
+    expect(m.saved).toHaveLength(1);
+    expect(m.saved[0]!.project.kind).toBe("pdf");
+    expect(m.navigations).toEqual([{ view: "editor", projectPath: "C:\\Docs\\Taroting\\b cover.trt" }]);
+  });
+
+  it("makes ONE project of several dropped PDFs, every page in the dropped order", async () => {
+    readable(A, 1, 10);
+    readable(B, 2, 20);
+    // The drop hook (the same handler a real window drop runs) is published
+    // for the in-app E2E only.
+    win.__tarotingAutotest = true;
+    mount();
+    await flush();
+    win.__tarotingHomeDev!.drop([A, B]);
+    await flush(12);
+    expect(m.openAs).toEqual([]);
+    expect(m.saved).toHaveLength(1);
+    const meta = m.saved[0]!.project.pdf!;
+    const pathOf = new Map(meta.sources.map((s) => [s.id, s.path]));
+    // Dropped order ("b cover" before "a body"), NOT name order.
+    expect(meta.pages.map((p) => [pathOf.get(p.src!), p.page])).toEqual([
+      [A, 0],
+      [B, 0],
+      [B, 1],
+    ]);
+    expect(m.navigations).toHaveLength(1);
+  });
+
+  it("with media: the media go to Open as unchanged, the PDFs make nothing, one toast says why", async () => {
+    m.picks = [A, "C:\\Users\\u\\shot.png", "C:\\Users\\u\\clip.mp4"];
+    readable(A, 1, 10);
+    const root = mount();
+    await flush();
+    root.el("#btn-open").fire("click", {});
+    await flush(10);
+    expect(m.openAs).toEqual([["C:\\Users\\u\\clip.mp4", "C:\\Users\\u\\shot.png"]]);
+    expect(m.saved).toEqual([]);
+    expect(m.refusals).toEqual([
+      "PDFs and media open separately. Open the PDFs on their own to make a PDF project.",
+    ]);
+  });
+
+  it("skips protected PDFs in a multi-pick with one toast naming how many", async () => {
+    const L = "C:\\Users\\u\\Papers\\locked.pdf";
+    m.picks = [L, A];
+    readable(A, 1, 10);
+    m.stats.set(L, { size: 1, mtimeMs: 1 });
+    m.pages.set(L, "password");
+    const root = mount();
+    await flush();
+    root.el("#btn-open").fire("click", {});
+    await flush(10);
+    expect(m.infos).toEqual([
+      "Skipped 1 protected PDF — protected PDFs can't be edited. Open it to read it instead.",
+    ]);
+    expect(m.saved).toHaveLength(1);
+    expect(m.saved[0]!.project.pdf!.sources.map((s) => s.path)).toEqual([A]);
   });
 });

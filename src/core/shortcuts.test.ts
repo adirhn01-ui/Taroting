@@ -498,6 +498,15 @@ describe("ShortcutManager dispatch", () => {
     expect(p.prevented).toBe(false);
   });
 
+  it("off() returns an action's chord to the browser", () => {
+    const h = harness("pdf", ["undo"]);
+    h.press(kev("z", "KeyZ", { ctrl: true }));
+    h.manager.off("undo");
+    const p = h.press(kev("z", "KeyZ", { ctrl: true }));
+    expect(h.fired).toEqual(["undo"]);
+    expect(p.prevented).toBe(false);
+  });
+
   it("never binds an unbound (empty) chord", () => {
     const h = harness("editor", ALL, { ...DEFAULT_SHORTCUTS, redoAlt: "" });
     const p = h.press(kev("y", "KeyY", { ctrl: true }));
@@ -645,7 +654,7 @@ describe("ShortcutManager dispatch", () => {
     expect(p.prevented).toBe(false);
   });
 
-  it("the video editor and the viewer bind none of the image tools", () => {
+  it("the video editor and the viewer bind none of the image tools (the viewer only shares zoom)", () => {
     for (const mode of ["editor", "viewer"] as const) {
       const h = harness(mode, ALL);
       for (const k of [
@@ -658,14 +667,18 @@ describe("ShortcutManager dispatch", () => {
         kev("r", "KeyR"),
         kev("[", "BracketLeft"),
         kev("]", "BracketRight"),
-        kev("=", "Equal", { ctrl: true }),
-        kev("1", "Digit1", { ctrl: true }),
+        // the zoom chords are the viewer's too (a PDF zooms), never the video editor's
+        ...(mode === "editor" ? [kev("=", "Equal", { ctrl: true }), kev("1", "Digit1", { ctrl: true })] : []),
       ]) {
         expect(h.press(k).prevented, `${mode} ${k.key}`).toBe(false);
       }
       expect(h.fired, mode).toEqual([]);
       vi.unstubAllGlobals();
     }
+    const v = harness("viewer", ALL);
+    v.press(kev("=", "Equal", { ctrl: true }));
+    v.press(kev("1", "Digit1", { ctrl: true }));
+    expect(v.fired).toEqual(["imgZoomIn", "imgZoom100"]);
   });
 });
 

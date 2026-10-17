@@ -192,6 +192,7 @@ describe("elementFor", () => {
     ["mp4", "video"],
     ["mts", "video"],
     ["mp3", "video"],
+    ["pdf", "pdf"],
     ["txt", null],
     ["trt", null],
     ["", null],
@@ -204,5 +205,17 @@ describe("constants", () => {
   it("pins the window radius and the dwell times", () => {
     expect(WINDOW_RADIUS).toBe(16);
     expect(DWELL_MS).toEqual({ image: 0, media: 0, burst: 250, repeat: 150 });
+  });
+});
+
+describe("a folder of PDFs", () => {
+  it("steps PDF to PDF in the family the backend named", () => {
+    const docs = ["C:\\d\\a.pdf", "C:\\d\\b.pdf", "C:\\d\\c.pdf"];
+    const s = fromWindow(docs[1]!, { before: [docs[0]!], after: [docs[2]!], index: 2, total: 3, family: "document" });
+    expect(s.family).toBe("document");
+    expect(counterText(s)).toBe("2 / 3");
+    expect(step(s, 1)!.list[step(s, 1)!.pos]).toBe(docs[2]);
+    expect(step(s, -1)!.list[step(s, -1)!.pos]).toBe(docs[0]);
+    expect(canStep(step(s, 1)!, 1)).toBe(false);
   });
 });

@@ -10,13 +10,13 @@ import {
   formatDuration,
   formatRelative,
 } from "../core/format";
-import { describeError, ipc, mediaUrl, onDragDrop, pickOpenFiles } from "../core/ipc";
+import { describeError, ipc, mediaUrl, onDragDrop, pickOpenFiles, pickPdfFiles } from "../core/ipc";
 import { navigate } from "../core/nav";
 import { isTempProjectPath, runOnOpenChain } from "../core/open-media";
 import { addMedia, createProject } from "../core/project";
 import { chordOf, physicalChordOf } from "../core/shortcuts";
 import type { ChordSource } from "../core/shortcuts";
-import { MEDIA_FILE_EXTENSIONS } from "../core/types";
+import { DOCUMENT_FILE_EXTENSIONS, MEDIA_FILE_EXTENSIONS } from "../core/types";
 import type { RecentItem } from "../core/types";
 import { focusFirst, trapTab } from "../ui/focus";
 import { icon } from "../ui/icons";
@@ -72,7 +72,8 @@ export function sortRecents(items: readonly RecentItem[], key: SortKey): RecentI
 
 /** Where a set of chosen (or dropped) files goes. There is deliberately no
  *  viewer here: opening media from Home is starting a project with it, and
- *  the "Open as" dialog asks which kind. */
+ *  the "Open as" dialog asks which kind. PDFs never reach that dialog: a PDF
+ *  can only become a PDF project, so there is nothing to ask. */
 export type OpenRoute =
   | { kind: "nothing" }
   /** `ignored`: the other files that came with it (a drop only; Open refuses) */
@@ -80,20 +81,36 @@ export type OpenRoute =
   /** a .trt together with anything else, another .trt included */
   | { kind: "mixed" }
   | { kind: "unsupported"; count: number }
-  /** allowlisted media in natural name order, plus how many files were not */
-  | { kind: "media"; media: string[]; skipped: number };
+  /** allowlisted media in natural name order, plus how many files were not
+   *  supported and how many PDFs came along (left aside: PDFs and media do
+   *  not go into one project) */
+  | { kind: "media"; media: string[]; skipped: number; pdfs: number }
+  /** PDFs only (besides unsupported files): ONE new PDF project, its pages in
+   *  the order the files came */
+  | { kind: "pdf"; pdfs: string[]; skipped: number };
 
 /** The allowlist, then natural name order ("2" before "10"): the pickers hand
  *  files back in no particular order, and the first file names the project
  *  and, for an image project, sets the canvas and the bottom layer. The
  *  pickers' filters can be typed around ("*.*"), so the allowlist is applied
- *  here too, as it is on every other way in. */
+ *  here too, as it is on every other way in.
+ *
+ *  PDFs are told apart first. PDFs alone make a PDF project, in the order
+ *  they came (the order of pages is the user's, and a name sort would
+ *  reshuffle a dropped "cover, body, appendix"). PDFs with media keep the
+ *  media's flow and leave the PDFs aside, said in the notice: one project
+ *  cannot be both, and guessing which the user meant is worse than asking
+ *  them to open the PDFs on their own. */
 function mediaRoute(paths: readonly string[]): OpenRoute {
   const media = paths.filter((p) => MEDIA_FILE_EXTENSIONS.has(fileExt(p)));
-  const skipped = paths.length - media.length;
-  if (media.length === 0) return { kind: "unsupported", count: skipped };
+  const pdfs = paths.filter((p) => DOCUMENT_FILE_EXTENSIONS.has(fileExt(p)));
+  const skipped = paths.length - media.length - pdfs.length;
+  if (media.length === 0) {
+    if (pdfs.length === 0) return { kind: "unsupported", count: skipped };
+    return { kind: "pdf", pdfs, skipped };
+  }
   media.sort((a, b) => compareNames(fileName(a), fileName(b)));
-  return { kind: "media", media, skipped };
+  return { kind: "media", media, skipped, pdfs: pdfs.length };
 }
 
 /** Home's Open: one project opens; media goes to "Open as"; a project picked
@@ -124,18 +141,28 @@ export function openRouteInfo(route: OpenRoute): string | null {
   return `Opened the project. The other ${route.ignored === 1 ? "file was" : `${route.ignored} files were`} not opened.`;
 }
 
-/** The toast a route shows, if any. */
+function skippedText(skipped: number): string {
+  return skipped === 1 ? "Skipped 1 file of an unsupported type." : `Skipped ${skipped} files of an unsupported type.`;
+}
+
+/** What a mix of PDFs and media says: the media go on, the PDFs do not. */
+export const PDFS_ASIDE_NOTICE = "PDFs and media open separately. Open the PDFs on their own to make a PDF project.";
+
+/** The toast a route shows, if any: one toast, whatever was left out. */
 export function openRouteNotice(route: OpenRoute): string | null {
   switch (route.kind) {
     case "mixed":
       return "Open one project at a time, or choose media files to start a new project.";
     case "unsupported":
       return route.count === 1 ? "Unsupported file type." : `None of these ${route.count} files is a supported type.`;
-    case "media":
-      if (route.skipped === 0) return null;
-      return route.skipped === 1
-        ? "Skipped 1 file of an unsupported type."
-        : `Skipped ${route.skipped} files of an unsupported type.`;
+    case "media": {
+      const parts: string[] = [];
+      if (route.pdfs > 0) parts.push(PDFS_ASIDE_NOTICE);
+      if (route.skipped > 0) parts.push(skippedText(route.skipped));
+      return parts.length > 0 ? parts.join(" ") : null;
+    }
+    case "pdf":
+      return route.skipped > 0 ? skippedText(route.skipped) : null;
     default:
       return null;
   }
@@ -199,7 +226,7 @@ export function emptyGridHtml(state: "error" | "searching" | "none"): string {
       <div class="empty-state">
         ${icon("film", 32)}
         <div>${searching ? "No projects match your search." : "No projects yet."}</div>
-        ${searching ? "" : `<div class="faint">Create one, or drop a video anywhere in this window.</div>`}
+        ${searching ? "" : `<div class="faint">Create one, or drop a video, picture or PDF anywhere in this window.</div>`}
       </div>`;
 }
 
@@ -239,6 +266,13 @@ const CHECK_SVG =
   'stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   '<path d="M5 12.5 10 17.5 19 6.5"/></svg>';
 
+/* A page with a folded corner and lines of text: a PDF project's glyph on its
+   card and in the New project menu. ui/icons has no document icon and isn't
+   ours to edit; same stroke style as icon(), so it sits with the others. */
+export function documentIcon(size: number): string {
+  return icon("document", size);
+}
+
 export function mountHome(root: HTMLElement): { dispose(): void } {
   root.innerHTML = `
     <div class="home">
@@ -274,7 +308,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
           <div class="recents-grid" id="recents"></div>
         </div>
       </main>
-      <div class="home__drop-hint">Drop media files or a .trt project anywhere</div>
+      <div class="home__drop-hint">Drop media, PDFs or a .trt project anywhere</div>
       <div class="drop-overlay" id="drop-overlay">
         <div class="drop-overlay__inner">Drop to import</div>
       </div>
@@ -325,9 +359,10 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
 
   /* ---------------- rendering ---------------- */
 
-  /** A card with no picture: the kind's own glyph, so an image project never
-   *  borrows the film strip. */
+  /** A card with no picture: the kind's own glyph, so an image or PDF project
+   *  never borrows the film strip. */
   function placeholderFor(item: RecentItem | undefined): string {
+    if (item?.kind === "pdf") return documentIcon(28);
     return icon(item?.kind === "image" ? "image" : "film", 28);
   }
 
@@ -337,10 +372,12 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       : placeholderFor(item);
     const size = item.sizeBytes > 0 ? `<span>·</span><span>${formatBytes(item.sizeBytes)}</span>` : "";
     const selected = selectMode && selection.has(item.path);
-    // An image has no running time, so its card never shows one: the duration
-    // is printed only above zero, and an image project's recents entry carries 0.
+    // An image or a PDF has no running time, so its card never shows one: the
+    // duration is printed only above zero, and those projects' recents entries
+    // carry 0.
+    const kind = item.kind === "image" || item.kind === "pdf" ? ` data-kind="${item.kind}"` : "";
     return `
-      <div class="project-card${selected ? " is-selected" : ""}" data-path="${escapeHtml(item.path)}"${item.kind === "image" ? ' data-kind="image"' : ""} tabindex="0" role="button"${selected ? ' aria-pressed="true"' : ""}>
+      <div class="project-card${selected ? " is-selected" : ""}" data-path="${escapeHtml(item.path)}"${kind} tabindex="0" role="button"${selected ? ' aria-pressed="true"' : ""}>
         <div class="project-card__thumb">${thumb}</div>
         <div class="project-card__meta">
           <div class="project-card__name" title="${escapeHtml(item.path)}">${escapeHtml(item.name)}</div>
@@ -522,12 +559,12 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
 
   function backfillThumbs(): void {
     for (const item of recents) {
-      // An image project's card picture is RENDERED by the image editor when
+      // An image or PDF project's card picture is RENDERED by its editor when
       // it is left, never derived from a source file, so there is nothing to
       // backfill. Skipped before the IPC, not just in Rust: asking would read
       // and parse a possibly multi-megabyte .trt for every picture-less image
-      // card on every Home visit, only to be told no.
-      if (item.kind === "image") continue;
+      // or PDF card on every Home visit, only to be told no.
+      if (hasRenderedCard(item)) continue;
       if (item.thumb || thumbTried.has(item.path)) continue;
       thumbTried.add(item.path);
       thumbQueue.push(item.path);
@@ -588,7 +625,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     const model = recentByPath(card.dataset.path ?? "");
     if (model) model.thumb = null;
     thumbEl.innerHTML = placeholderFor(model);
-    if (!model || model.kind === "image" || thumbTried.has(model.path)) return;
+    if (!model || hasRenderedCard(model) || thumbTried.has(model.path)) return;
     window.clearTimeout(thumbRetry);
     thumbRetry = window.setTimeout(() => {
       thumbRetry = undefined;
@@ -626,6 +663,12 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     renderGrid();
     backfillThumbs();
     syncSelectAvailability();
+  }
+
+  /** Image and PDF projects: the card picture is one their editor renders
+   *  (the backend's has_rendered_card), so Home never backfills one. */
+  function hasRenderedCard(item: RecentItem): boolean {
+    return item.kind === "image" || item.kind === "pdf";
   }
 
   function recentByPath(path: string): RecentItem | undefined {
@@ -795,7 +838,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
 
   /* "New project" asks which kind in a menu under the button: a video project
      is made on the spot, an image project through the "New image project"
-     dialog. `fromKeyboard`: opened with Enter/Space, so the menu starts on
+     dialog, a PDF project from a PDF the user picks. `fromKeyboard`: opened with Enter/Space, so the menu starts on
      its first row and the next Enter chooses it. */
   function openNewMenu(fromKeyboard = false): void {
     const r = newBtn.getBoundingClientRect();
@@ -814,6 +857,12 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
           icon: icon("image", 18),
           hint: "Draw on, adjust and export a picture",
           onSelect: () => void openNewImage(),
+        },
+        {
+          label: "PDF project",
+          icon: documentIcon(18),
+          hint: "Arrange, mark up and fill in a PDF",
+          onSelect: () => void openNewPdf(),
         },
       ],
       r.top - 4,
@@ -847,6 +896,43 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       openOverlays.add(close);
     } catch (e) {
       toast.error(describeError(e));
+    } finally {
+      busy = false;
+    }
+  }
+
+  /* "New project > PDF project": one PDF from the picker, straight into a new
+     library project. Nothing is held busy while the picker is up (the user
+     may take as long as they like, or cancel); the making runs under
+     makePdfProject's own guard. */
+  async function openNewPdf(): Promise<void> {
+    if (busy) return;
+    let paths: string[];
+    try {
+      paths = await pickPdfFiles(false);
+    } catch (e) {
+      if (!disposed) toast.error(describeError(e));
+      return;
+    }
+    // See createNew for why a disposed screen must not act.
+    if (disposed || paths.length === 0) return;
+    await makePdfProject(paths.slice(0, 1));
+  }
+
+  /** PDFs to ONE new PDF project, a real library project like createNew's,
+   *  pages in the order given. The work is its own small chunk (it fetches
+   *  pdf.js and the PDF model only once there is a PDF to read), never at
+   *  boot. */
+  async function makePdfProject(pdfs: string[]): Promise<void> {
+    if (guard()) return;
+    try {
+      const { createPdfProjectFrom } = await import("./pdf-project-from");
+      if (disposed) return;
+      const projectPath = await createPdfProjectFrom(pdfs, () => disposed);
+      // See createNew for why a disposed screen must not navigate.
+      if (projectPath && !disposed) navigate({ view: "editor", projectPath });
+    } catch (e) {
+      if (!disposed) toast.error(describeError(e));
     } finally {
       busy = false;
     }
@@ -1002,6 +1088,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     if (notice) toast.refuse(notice);
     if (route.kind === "project") void openPath(route.path, openRouteInfo(route));
     else if (route.kind === "media") void offerOpenAs(route.media);
+    else if (route.kind === "pdf") void makePdfProject(route.pdfs);
   }
 
   async function openViaDialog(): Promise<void> {

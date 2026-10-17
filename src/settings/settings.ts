@@ -276,11 +276,12 @@ export function colorRow(role: ColorRole, hex: string): string {
 /** What each "Opening files" choice does, shown under the control for the one
  *  that is on. Both say plainly that nothing lands in the library on its own:
  *  the viewer makes no project at all, and the editor's is temporary until the
- *  user keeps it. */
-const OPEN_WITH_HINTS: Record<OpenWith, string> = {
-  viewer: "Shows the file on its own. Use the arrows to move through its folder.",
+ *  user keeps it. The setting covers videos, pictures and PDFs alike, so both
+ *  name all three. Exported for the test. */
+export const OPEN_WITH_HINTS: Record<OpenWith, string> = {
+  viewer: "Shows the video, picture, song or PDF on its own. Use the arrows to move through its folder.",
   editor:
-    "Opens a temporary project with the file in it: a picture as an image project, anything else on a timeline. Keep it any time; leaving asks only if you changed it.",
+    "Opens a temporary project with the file in it: a picture as an image project, a PDF as a PDF project, anything else on a timeline. Keep it any time; leaving asks only if you changed it.",
 };
 
 const AUTOSAVE_OPTIONS = [1, 3, 5, 10, 30];

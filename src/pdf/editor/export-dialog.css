@@ -1,0 +1,22 @@
+/* PDF export dialog: only what the shared export sheet
+   (editor/export/export.css) has no row for — the image export dialog's
+   quality and pixel-size readouts (src/image/export-dialog.css), and the
+   "of N" after a page number. Everything else is the shared classes. */
+
+.pdfx-quality .slider {
+  flex: 1 1 auto;
+}
+.pdfx-quality__value {
+  flex: none;
+  min-width: 64px;
+  text-align: right;
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}
+
+.pdfx-px,
+.pdfx-of {
+  flex: none;
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}

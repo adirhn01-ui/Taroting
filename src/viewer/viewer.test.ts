@@ -24,6 +24,20 @@ const m = vi.hoisted(() => ({
   playbackFailed: vi.fn(),
   load: vi.fn(),
   openMedia: vi.fn(),
+  toastInfo: vi.fn(),
+  toastError: vi.fn(),
+  fsRequest: vi.fn(),
+  /** ./pdf-mode was imported (its factory ran): the lazy chunk was fetched. */
+  pdfImported: false,
+  pdfMounts: [] as { host: Record<string, unknown>; memory: Record<string, unknown> }[],
+  pdfMode: null as null | {
+    open: ReturnType<typeof vi.fn>;
+    goPage: ReturnType<typeof vi.fn>;
+    find: ReturnType<typeof vi.fn>;
+    owns: ReturnType<typeof vi.fn>;
+    retitle: ReturnType<typeof vi.fn>;
+    dispose: ReturnType<typeof vi.fn>;
+  },
 }));
 
 vi.mock("./loader", () => ({
@@ -60,8 +74,17 @@ vi.mock("../core/monitor-volume", () => ({
   }),
 }));
 vi.mock("../ui/fullscreen", () => ({
-  elementFullscreen: () => ({ request: () => {}, release: () => {}, holds: () => false, dispose: () => {} }),
+  elementFullscreen: () => ({ request: m.fsRequest, release: () => {}, holds: () => false, dispose: () => {} }),
 }));
+vi.mock("./pdf-mode", () => {
+  m.pdfImported = true;
+  return {
+    mountPdfMode: (host: Record<string, unknown>, memory: Record<string, unknown>) => {
+      m.pdfMounts.push({ host, memory });
+      return m.pdfMode;
+    },
+  };
+});
 vi.mock("../core/shortcuts", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../core/shortcuts")>()),
   ShortcutManager: class {
@@ -81,9 +104,13 @@ vi.mock("../ui/menu", () => ({
   },
   closeMenu: () => {},
 }));
-vi.mock("../ui/toast", () => ({ toast: { error: () => {}, info: () => {} } }));
+vi.mock("../ui/toast", () => ({
+  toast: { error: (...a: unknown[]) => m.toastError(...a), info: (...a: unknown[]) => m.toastInfo(...a) },
+}));
 vi.mock("../core/nav", () => ({ navigate: m.navigate }));
-vi.mock("../core/open-media", () => ({
+vi.mock("../core/open-media", async (importOriginal) => ({
+  // The real class: the viewer tells a protected PDF apart by instanceof.
+  PdfProtectedError: (await importOriginal<typeof import("../core/open-media")>()).PdfProtectedError,
   openMediaAsProject: (p: string) => m.openMedia(p),
   runOnOpenChain: (task: () => Promise<void>) => task(),
 }));
@@ -114,6 +141,7 @@ function fakeEl(): FakeEl {
   // listen for `seeked` on the one <video>.
   const listeners = new Map<string, ((e?: unknown) => void)[]>();
   const styles = new Map<string, string>();
+  const classes = new Set<string>();
   const log: string[] = [];
   const el: FakeEl = {
     log,
@@ -133,7 +161,13 @@ function fakeEl(): FakeEl {
     muted: false,
     volume: 1,
     style: { setProperty: (k: string, v: string) => void styles.set(k, v), display: "" },
-    classList: { toggle: () => {}, add: () => {}, remove: () => {}, contains: () => false },
+    classes,
+    classList: {
+      toggle: (c: string, on?: boolean) => void ((on ?? !classes.has(c)) ? classes.add(c) : classes.delete(c)),
+      add: (c: string) => void classes.add(c),
+      remove: (c: string) => void classes.delete(c),
+      contains: (c: string) => classes.has(c),
+    },
     setAttribute: (k: string, v: unknown) => void attrs.set(k, String(v)),
     getAttribute: (k: string) => attrs.get(k) ?? null,
     hasAttribute: (k: string) => attrs.has(k),
@@ -212,6 +246,18 @@ beforeEach(() => {
   m.load.mockReset();
   m.openMedia.mockReset().mockResolvedValue("C:\\temp\\Quick view.trt");
   m.navigate.mockReset();
+  m.toastInfo.mockReset();
+  m.toastError.mockReset();
+  m.fsRequest.mockReset();
+  m.pdfMounts = [];
+  m.pdfMode = {
+    open: vi.fn(async () => {}),
+    goPage: vi.fn(),
+    find: vi.fn(),
+    owns: vi.fn(() => false),
+    retitle: vi.fn(),
+    dispose: vi.fn(),
+  };
   m.forgetSiblingOrder.mockReset().mockResolvedValue(undefined);
   m.listSiblings.mockReset().mockImplementation(
     (path: string) => new Promise<SiblingWindow>((resolve) => calls.push({ path, resolve })),
@@ -1040,5 +1086,183 @@ describe("a damaged video", () => {
       created = [];
     }
     expect(got).toEqual([1, 0]);
+  });
+});
+
+/* ---------------- a PDF ---------------- */
+
+describe("a PDF", () => {
+  const D = "C:\\docs\\";
+  const DOC: LoadState = { state: "document" };
+
+  /** Mount on `path`, list its folder, and let the loader call it a PDF. */
+  async function shownPdf(path: string, after: string[] = []): Promise<FakeEl> {
+    const root = mount(path);
+    calls[0]!.resolve({ before: [], after, index: 1, total: 1 + after.length, family: "document" });
+    await flush();
+    m.onState!(path, DOC);
+    await flush();
+    return root;
+  }
+
+  /** Dispose the mounted viewer and start the fake DOM afresh. */
+  function remount(): void {
+    unmount();
+    created = [];
+    calls = [];
+  }
+
+  it("fetches the PDF mode only once a PDF is shown, and opens the file there", async () => {
+    // FIRST in this describe, and no earlier test shows a PDF: the factory of
+    // the mocked ./pdf-mode runs on the first import() of it.
+    mount(`${F}001.jpg`);
+    m.onState!(`${F}001.jpg`, { state: "ready", element: "img", url: "u", kind: "image", tryingDirect: false });
+    await flush();
+    expect(m.pdfImported).toBe(false);
+    remount();
+
+    const root = await shownPdf(`${D}a.pdf`);
+    expect(m.load).toHaveBeenCalledWith(`${D}a.pdf`);
+    expect(m.pdfImported).toBe(true);
+    expect(m.pdfMounts).toHaveLength(1);
+    const host = m.pdfMounts[0]!.host;
+    expect(host.root).toBe(root);
+    expect(host.stage).toBe(root.querySelector("#vw-stage"));
+    expect(host.top).toBe(root.querySelector("#vw-top"));
+    expect(host.nameEl).toBe(root.querySelector("#vw-name"));
+    expect(m.pdfMounts[0]!.memory).toEqual({ fit: "width", zoom: 1, railOpen: null });
+    expect(m.pdfMode!.open).toHaveBeenCalledTimes(1);
+    const [path, live] = m.pdfMode!.open.mock.calls[0]! as [string, () => boolean];
+    expect(path).toBe(`${D}a.pdf`);
+    expect(live()).toBe(true);
+    // no media element and no player bar under the strip
+    expect(root.querySelector("#vw-img").hidden).toBe(true);
+    expect(root.querySelector("#vw-video").hidden).toBe(true);
+    expect(root.querySelector("#vw-bar").hidden).toBe(true);
+  });
+
+  it("steps PDF → PDF in the one mode, and anything else takes it down", async () => {
+    await shownPdf(`${D}a.pdf`, [`${D}b.pdf`]);
+    const firstLive = m.pdfMode!.open.mock.calls[0]![1] as () => boolean;
+    m.load.mockClear();
+    m.keys.get("nextFile")!({ repeat: false });
+    expect(m.load).toHaveBeenCalledWith(`${D}b.pdf`);
+    // the strip stays while the next PDF opens in place
+    expect(m.pdfMode!.dispose).not.toHaveBeenCalled();
+    expect(firstLive()).toBe(false);
+    m.onState!(`${D}b.pdf`, DOC);
+    await flush();
+    expect(m.pdfMounts).toHaveLength(1);
+    expect(m.pdfMode!.open).toHaveBeenLastCalledWith(`${D}b.pdf`, expect.any(Function));
+
+    views[0]!.show("D:\\clips\\x.mp4");
+    expect(m.pdfMode!.dispose).toHaveBeenCalledTimes(1);
+    // back to a PDF: a fresh mount, the session's memory handed over again
+    const memory = m.pdfMounts[0]!.memory;
+    views[0]!.show(`${D}c.pdf`);
+    m.onState!(`${D}c.pdf`, DOC);
+    await flush();
+    expect(m.pdfMounts).toHaveLength(2);
+    expect(m.pdfMounts[1]!.memory).toBe(memory);
+    unmount();
+    expect(m.pdfMode!.dispose).toHaveBeenCalledTimes(2);
+  });
+
+  it("a PDF whose module lands after the user moved on mounts nothing", async () => {
+    mount(`${D}a.pdf`);
+    m.onState!(`${D}a.pdf`, DOC);
+    views[0]!.show(`${F}001.jpg`);
+    await flush();
+    expect(m.pdfMounts).toHaveLength(0);
+    expect(m.pdfMode!.open).not.toHaveBeenCalled();
+  });
+
+  it("a failure the loader reports takes the PDF mode down", async () => {
+    await shownPdf(`${D}a.pdf`);
+    m.onState!(`${D}a.pdf`, { state: "failed", message: "x" });
+    expect(m.pdfMode!.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("Ctrl+F finds, Home / End go to the first and last page", async () => {
+    mount(`${F}001.jpg`);
+    // nothing to find without a PDF, and Home is still a seek
+    m.keys.get("find")!({ repeat: false });
+    m.keys.get("goStart")!({ repeat: false });
+    expect(m.pdfMode!.goPage).not.toHaveBeenCalled();
+    remount();
+    await shownPdf(`${D}a.pdf`);
+    m.keys.get("find")!({ repeat: false });
+    expect(m.pdfMode!.find).toHaveBeenCalledTimes(1);
+    m.keys.get("goStart")!({ repeat: false });
+    expect(m.pdfMode!.goPage).toHaveBeenLastCalledWith("first");
+    m.keys.get("goEnd")!({ repeat: false });
+    expect(m.pdfMode!.goPage).toHaveBeenLastCalledWith("last");
+  });
+
+  it("a double-click on the pages selects a word, not fullscreen", async () => {
+    const root = await shownPdf(`${D}a.pdf`);
+    const page = { page: true };
+    m.pdfMode!.owns.mockImplementation((t: unknown) => t === page);
+    root.querySelector("#vw-stage").fire("dblclick", { target: page });
+    expect(m.fsRequest).not.toHaveBeenCalled();
+    root.querySelector("#vw-stage").fire("dblclick", { target: {} });
+    expect(m.fsRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("never hides the chrome over a PDF, even in fullscreen", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("performance", { now: () => Date.now() });
+    // control: a photo in fullscreen does fade
+    const photo = mount(`${F}001.jpg`);
+    m.keys.get("fullscreen")!({ repeat: false });
+    await vi.advanceTimersByTimeAsync(3000);
+    expect((photo.classes as Set<string>).has("viewer--chrome-hidden")).toBe(true);
+    remount();
+
+    const root = mount(`${D}a.pdf`);
+    m.onState!(`${D}a.pdf`, DOC);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(m.pdfMounts).toHaveLength(1);
+    m.keys.get("fullscreen")!({ repeat: false });
+    await vi.advanceTimersByTimeAsync(3000);
+    expect((root.classes as Set<string>).has("viewer--chrome-hidden")).toBe(false);
+  });
+
+  it("Open as project on a protected PDF says so as news, not as an error", async () => {
+    const { PdfProtectedError } = await import("../core/open-media");
+    const root = await shownPdf(`${D}locked.pdf`);
+    m.load.mockClear();
+    m.openMedia.mockRejectedValueOnce(new PdfProtectedError(`${D}locked.pdf`));
+    root.querySelector("#vw-more").fire("click");
+    m.menu.find((i) => i.label === "Open as project")!.onSelect();
+    await flush();
+    expect(m.openMedia).toHaveBeenCalledWith(`${D}locked.pdf`);
+    expect(m.toastInfo).toHaveBeenCalledWith(new PdfProtectedError("x").message);
+    expect(m.toastError).not.toHaveBeenCalled();
+    // the PDF stays on screen: nothing reloaded, nothing taken down
+    expect(m.load).not.toHaveBeenCalled();
+    expect(m.pdfMode!.dispose).not.toHaveBeenCalled();
+    expect(m.navigate).not.toHaveBeenCalled();
+  });
+
+  it("any other failed open is still an error", async () => {
+    const root = await shownPdf(`${D}a.pdf`);
+    m.openMedia.mockRejectedValueOnce(new Error("disk full"));
+    root.querySelector("#vw-more").fire("click");
+    m.menu.find((i) => i.label === "Open as project")!.onSelect();
+    await flush();
+    expect(m.toastError).toHaveBeenCalledTimes(1);
+    expect(m.toastInfo).not.toHaveBeenCalled();
+  });
+
+  it("never imports src/pdf or ./pdf-mode statically", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const src = readFileSync(fileURLToPath(new URL("./viewer.ts", import.meta.url)), "utf8");
+    expect(src).not.toMatch(/^import\s[^;]*from\s+"\.\.\/pdf\//m);
+    const lines = src.match(/^import\s[^;]*"\.\/pdf-mode";/gm) ?? [];
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) expect(line).toMatch(/^import type /);
+    expect(src).toContain('import("./pdf-mode")');
   });
 });

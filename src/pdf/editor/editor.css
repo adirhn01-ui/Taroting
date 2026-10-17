@@ -1,0 +1,152 @@
+/* PDF editor shell. The frame is the video/image editor's own (.editor,
+ * .editor__topbar, .media-panel, .editor__preview, .transport,
+ * .inspector-panel from editor.css); these rules only fit the PDF parts into
+ * it. Stacking is by DOM order inside the stage — no z-index of its own. */
+
+/* `hidden` must win over the app's display rules (.btn is display:flex):
+ * every part of this editor toggles visibility with the attribute. */
+.pdfed [hidden] {
+  display: none !important;
+}
+
+/* ---------- stage: the page strip ---------- */
+
+.pdfed-stage {
+  position: relative;
+  overflow: hidden;
+  background: var(--bg-app);
+}
+.pdfed-strip {
+  flex: 1;
+}
+.pdfed-strip.pdfed-pan,
+.pdfed-strip.pdfed-pan * {
+  cursor: grab;
+}
+.pdfed-strip.pdfed-panning,
+.pdfed-strip.pdfed-panning * {
+  cursor: grabbing;
+}
+
+/* ---------- page panel ---------- */
+
+.pdfed-pages {
+  width: 168px;
+}
+.pdfed-pages--collapsed {
+  display: none;
+}
+.pdfed-rail {
+  flex: 1;
+  min-height: 0;
+}
+.pdfed-pages__footer {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-2);
+  border-top: 1px solid var(--border);
+  flex: none;
+}
+
+/* ---------- tool row (the image editor's .imged-toolrow) ---------- */
+
+.pdfed-toolrow {
+  border-bottom: 0;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.pdfed-tools,
+.pdfed-viewctl,
+.pdfed-topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+.pdfed-tools {
+  min-width: 0;
+}
+.pdfed-viewctl {
+  flex: none;
+  margin-left: auto;
+}
+.pdfed-topbar:empty {
+  display: none;
+}
+.pdfed-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  margin: 0 var(--sp-1);
+  background: var(--border);
+}
+.pdfed-zoom {
+  min-width: 52px;
+  justify-content: center;
+  color: var(--text-2);
+  font-size: var(--fs-12);
+  font-variant-numeric: tabular-nums;
+}
+.pdfed-pageind {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--text-2);
+  font-size: var(--fs-12);
+}
+.pdfed-pagenum {
+  width: 44px;
+  height: 24px;
+  padding: 0 var(--sp-1);
+  text-align: center;
+  font-size: var(--fs-12);
+}
+.pdfed-pagecount {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- find bar (floats like the image editor's crop bar) ---------- */
+
+.pdfed-find {
+  position: absolute;
+  top: var(--sp-3);
+  right: var(--sp-5);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-2);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  box-shadow: var(--shadow-2);
+  white-space: nowrap;
+}
+.pdfed-find[hidden] {
+  display: none;
+}
+.pdfed-find__input {
+  width: 200px;
+  height: 28px;
+}
+.pdfed-find__count {
+  min-width: 64px;
+  padding: 0 var(--sp-1);
+  text-align: center;
+  color: var(--text-2);
+  font-size: var(--fs-12);
+  font-variant-numeric: tabular-nums;
+}
+/* previous / next point up / down */
+.pdfed-find__prev svg,
+.pdfed-find__next svg {
+  transform: rotate(90deg);
+}
+
+/* ---------- sources dialog ---------- */
+
+.pdfed-sources__intro {
+  margin: 0 0 var(--sp-3);
+  color: var(--text-2);
+  font-size: var(--fs-13);
+}

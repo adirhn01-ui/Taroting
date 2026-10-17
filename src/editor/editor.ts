@@ -211,6 +211,23 @@ export async function mountEditor(
     return mountImageEditor(root, route, isStale, loaded);
   }
 
+  // A PDF project, exactly the same way: its own lazy chunk (the PDF editor
+  // and pdf.js), never prefetched, mounted before anything of the video
+  // editor exists, owing the app shell the same duties.
+  if (loaded.project.kind === "pdf") {
+    let mountPdfEditor: typeof import("../pdf/editor").mountPdfEditor;
+    try {
+      ({ mountPdfEditor } = await import("../pdf/editor"));
+    } catch (e) {
+      if (isStale()) return noop;
+      toast.error(describeError(e));
+      navigate(exitDest(route));
+      return noop;
+    }
+    if (isStale()) return noop;
+    return mountPdfEditor(root, route, isStale, loaded);
+  }
+
   const session = new ProjectSession(route.projectPath, loaded.project, {
     temp: route.temp === true,
   });

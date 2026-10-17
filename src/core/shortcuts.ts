@@ -457,6 +457,12 @@ export class ShortcutManager {
     this.handlers.set(action, handler);
   }
 
+  /** Remove an action's handler: its chord then falls through to the browser
+   *  again, exactly as if it had never been bound. */
+  off(action: ActionId): void {
+    this.handlers.delete(action);
+  }
+
   attach(): void {
     window.addEventListener("keydown", this.listener);
   }

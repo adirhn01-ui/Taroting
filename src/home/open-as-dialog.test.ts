@@ -228,6 +228,19 @@ describe("imageProjectBlocker", () => {
 });
 
 describe("openOpenAsDialog", () => {
+  it("is never offered a PDF: refuses before building anything, so nothing leaks", () => {
+    const listenersBefore = doc.count("keydown");
+    for (const paths of [["C:\\d\\Report.pdf"], ["C:\\p\\a.png", "C:\\d\\b.PDF"]]) {
+      expect(() => open(paths)).toThrow("PDFs open as a PDF project, not through Open as.");
+    }
+    expect(body.children).toEqual([]);
+    expect(doc.count("keydown")).toBe(listenersBefore);
+    expect(m.releases).toBe(0);
+    // Media alone still opens it.
+    open(["C:\\p\\a.png"]);
+    expect(backdrop()).toBeDefined();
+  });
+
   it("offers both choices for pictures, titled by count, focused on Video project", () => {
     open(["C:\\p\\a.png", "C:\\p\\b.jpg"]);
     expect(backdrop()!.find((e) => e.id === "openas-title")[0]!.textContent).toBe("Open 2 files as");

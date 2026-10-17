@@ -92,6 +92,14 @@ export function imageProjectBlocker(paths: readonly string[]): string | null {
   return `${lead} ${list}.`;
 }
 
+/** Why the dialog refuses a set with a PDF in it (a caller's bug, never a
+ *  user's choice). */
+export const OPEN_AS_PDF_REFUSAL = "PDFs open as a PDF project, not through Open as.";
+
+function isPdfPath(p: string): boolean {
+  return mediaFamilyOf(fileExt(p)) === "document";
+}
+
 /* ---------------- the dialog ---------------- */
 
 export interface OpenAsOptions {
@@ -133,6 +141,11 @@ function option(kind: "video" | "image", glyph: string, label: string, hint: str
  *  Home's teardown closes the dialog through this closer, which is
  *  unconditional and idempotent. */
 export function openOpenAsDialog(opts: OpenAsOptions): () => void {
+  // A PDF is never media: it can only become a PDF project, so there is no
+  // kind to ask about, and Home routes PDFs before this dialog (routeOpenPicks
+  // / routeDrop). Refused before anything is built, so a wrong caller leaves
+  // no backdrop or focus trap behind; Home's offerOpenAs shows the error.
+  if (opts.paths.some(isPdfPath)) throw new Error(OPEN_AS_PDF_REFUSAL);
   const count = opts.paths.length;
   const blocked = imageProjectBlocker(opts.paths);
 

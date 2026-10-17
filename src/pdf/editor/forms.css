@@ -1,0 +1,22 @@
+/* Fill forms switch in the PDF editor's top bar: the app's own `.switch`
+   with its label beside it, and the Clear form ghost button after it. */
+
+.pdfed-forms {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex: none;
+}
+.pdfed-forms[hidden] {
+  display: none;
+}
+.pdfed-forms__switch {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-13);
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+}

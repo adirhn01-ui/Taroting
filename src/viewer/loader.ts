@@ -87,7 +87,11 @@ export type LoadState =
    *  percent starts from 0 once that copy plays, so showing it would go backwards. */
   | { state: "preparing"; ratio: number | null; damaged?: true; quick?: true }
   | { state: "needsPrepare" }
-  | { state: "failed"; message: string };
+  | { state: "failed"; message: string }
+  /** A PDF: nothing to probe or prepare. The viewer opens it itself, in the
+   *  lazily loaded page strip (pdf-mode.ts); the loader only made sure the
+   *  previous file's jobs were let go (load() releases them first). */
+  | { state: "document" };
 
 export const DIRECT_TIMEOUT_MS = 4000;
 
@@ -788,6 +792,12 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
       if (family === "image" || family === "gif") {
         pipeline = Promise.resolve();
         emit({ state: "ready", element: "img", url: mediaUrl(p), kind: "image", tryingDirect: false });
+        return;
+      }
+      if (family === "document") {
+        // Never probed: ffprobe has nothing to say about a PDF.
+        pipeline = Promise.resolve();
+        emit({ state: "document" });
         return;
       }
       if (family === null) {

@@ -1,0 +1,231 @@
+/* PDF editor marks: the tool row, the page-space mark layer, the selection
+   chrome, the ruler, the text editor, the signature menu and pad. Everything
+   here is built from tokens and the app's own pieces (btn, select, ctx-menu,
+   modal); only what those never needed is defined. The tool row mirrors the
+   image editor's (image/toolbar.css), which this chunk does not load. */
+
+/* ---------- tool row ---------- */
+.pdfmk-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+/* swapped glyphs are never the click target */
+.pdfmk-toolbar .btn svg {
+  pointer-events: none;
+}
+.pdfmk-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  margin: 0 var(--sp-1);
+  background: var(--border);
+}
+.pdfmk-shape[hidden] {
+  display: none;
+}
+
+/* ---------- the mark layer (one SVG per rendered page) ---------- */
+.pdfmk-marks {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  pointer-events: none;
+}
+/* marker ink and highlights multiply over the page, like the export */
+.pdfmk-mark--multiply {
+  mix-blend-mode: multiply;
+}
+.pdfmk-mark--missing {
+  fill: none;
+  stroke: var(--danger);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
+}
+
+/* text boxes: the export's layout — line height 1.25 × size (set inline), no
+   padding, one absolutely placed line per laid-out row */
+.pdfmk-text {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  font-kerning: normal;
+}
+.pdfmk-text__line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  margin: 0;
+  white-space: pre;
+  overflow: visible;
+}
+/* the in-place editor: same font and leading, wraps like a text box */
+.pdfmk-text-edit {
+  height: auto;
+  overflow: visible;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  outline: 1px dashed var(--accent);
+  outline-offset: 1px;
+  pointer-events: auto;
+  cursor: text;
+  caret-color: currentColor;
+}
+
+/* ---------- selection chrome ---------- */
+.pdfmk-sel {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.pdfmk-handle {
+  fill: #fff;
+  stroke: var(--accent);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.pdfmk-marquee {
+  fill: color-mix(in srgb, var(--accent) 12%, transparent);
+  stroke: var(--accent);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
+}
+.pdfmk-live-box {
+  outline: none;
+}
+
+/* ---------- ruler ---------- */
+.pdfmk-ruler__body {
+  fill: color-mix(in srgb, var(--bg-raised) 88%, transparent);
+  stroke: var(--border-strong);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.pdfmk-ruler__ticks {
+  stroke: var(--text-3);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.pdfmk-ruler__knob {
+  fill: var(--accent);
+}
+
+/* ---------- cursors (classes on the page strip) ---------- */
+.pdfmk-cur-cross .pdfv-page {
+  cursor: crosshair;
+}
+.pdfmk-cur-text .pdfv-page {
+  cursor: text;
+}
+.pdfmk-cur-brush .pdfv-page {
+  cursor: none;
+}
+/* a drawing tool owns touch on the pages */
+.pdfmk-draw .pdfv-page {
+  touch-action: none;
+}
+
+/* the brush circle: follows the pointer by transform only */
+.pdfmk-brush {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: var(--z-stage-overlay);
+  box-sizing: border-box;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.7);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.8);
+  pointer-events: none;
+}
+.pdfmk-brush[hidden] {
+  display: none;
+}
+
+/* ---------- signature menu ---------- */
+.pdfmk-sigmenu__row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+.pdfmk-sigmenu__pick {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  color: var(--text-1);
+}
+.pdfmk-sigmenu__pick svg {
+  pointer-events: none;
+}
+
+/* ---------- signature pad ---------- */
+.pdfmk-sigpad {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius-m);
+  background: #fff;
+  color: #111;
+  box-shadow: inset 0 0 0 1px var(--border);
+  touch-action: none;
+  cursor: crosshair;
+}
+.pdfmk-sigpad__line {
+  stroke: #c8c8c8;
+  stroke-width: 1;
+  fill: none;
+}
+.pdfmk-sigpad__note {
+  margin-top: var(--sp-2);
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+
+/* ---------- inspector ---------- */
+/* colour swatches: the image editor's ring-outside-the-face treatment */
+.pdfmk-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.pdfmk-swatch {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px var(--swatch-ring);
+  cursor: pointer;
+}
+.pdfmk-swatch[aria-pressed="true"] {
+  box-shadow: 0 0 0 1px var(--swatch-ring), 0 0 0 3px var(--accent);
+}
+.pdfmk-swatch-face {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px var(--swatch-ring);
+  pointer-events: none;
+}
+.pdfmk-insp .insp-slider .insp-num--twin {
+  width: 60px;
+  padding: 0 var(--sp-2);
+  font-variant-numeric: tabular-nums;
+}
+.pdfmk-insp-unit {
+  flex: none;
+  min-width: 2ch;
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}

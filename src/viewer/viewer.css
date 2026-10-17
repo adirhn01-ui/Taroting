@@ -297,6 +297,146 @@ html[data-rescue-chrome] #vw-back:focus-visible {
   white-space: nowrap;
 }
 
+/* ---------- a PDF (pdf-mode.ts) ----------
+ * The pages sit BETWEEN the chrome, never under its glass: the top bar and
+ * the bottom bar stay up while a PDF is shown (no auto-hide), so the strip
+ * gets the stage minus their bands. The rail is a glass column on the left,
+ * the ‹ › arrows sit in gutters beside the strip, never over a page. Pages
+ * are judged against the stage's black, like a photo. */
+.viewer--pdf {
+  /* top bar: 12 gap + 1 + 4 + 32 + 4 + 1, then a breath */
+  --vw-pdf-top: calc(var(--sp-3) + 42px + var(--sp-2));
+  /* player bar: 20 gap + 1 + 8 + 32 + 8 + 1, then a breath */
+  --vw-pdf-bottom: calc(var(--sp-5) + 50px + var(--sp-2));
+  --vw-pdf-rail: 156px;
+  --vw-pdf-gutter: calc(44px + var(--sp-2) * 2);
+}
+
+.viewer__pdf {
+  position: absolute;
+  top: var(--vw-pdf-top);
+  bottom: var(--vw-pdf-bottom);
+  left: var(--sp-3);
+  right: 0;
+  display: flex;
+}
+
+.viewer__rail {
+  flex: none;
+  width: var(--vw-pdf-rail);
+  min-height: 0;
+  overflow: hidden;
+  border-radius: var(--radius-l);
+  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-3);
+  backdrop-filter: blur(12px);
+}
+.viewer__rail .pdfv-rail {
+  height: 100%;
+  background: transparent;
+}
+
+.viewer__pdf-strip {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  margin: 0 var(--vw-pdf-gutter);
+}
+.viewer__pdf-strip .pdfv {
+  background: transparent;
+}
+
+.viewer--pdf .viewer__nav--prev {
+  left: var(--sp-3);
+}
+.viewer--pdf .viewer__nav--next {
+  right: var(--sp-2);
+}
+.viewer--pdf-rail .viewer__nav--prev {
+  left: calc(var(--sp-3) + var(--vw-pdf-rail) + var(--sp-2));
+}
+
+/* The rail toggle reads as on while the rail shows. */
+.viewer .viewer__pdf-railbtn[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+/* "Page 2 of 9" beside the name. */
+.viewer__pdf-page {
+  flex: none;
+  padding: 0 var(--sp-1);
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The bottom bar: page scrubber, zoom, Find. */
+.viewer__pdf-scrub:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+  border-radius: var(--radius-full);
+}
+.viewer__pdf-sep {
+  flex: none;
+  width: 1px;
+  height: 18px;
+  margin: 0 var(--sp-1);
+  background: var(--border);
+}
+.viewer__pdf-zoom {
+  flex: none;
+  min-width: 56px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The find box: glass, under the top bar's right end. */
+.viewer__pdf-find {
+  position: absolute;
+  top: var(--vw-pdf-top);
+  right: var(--sp-3);
+  z-index: var(--z-theater-bar);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-l);
+  background: color-mix(in srgb, var(--bg-panel) 82%, transparent);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-3);
+  backdrop-filter: blur(12px);
+}
+.viewer__pdf-find-input {
+  width: 200px;
+  height: 26px;
+  user-select: text;
+}
+.viewer__pdf-find-count {
+  min-width: 64px;
+  padding: 0 var(--sp-1);
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The password prompt: the status card with a field and two buttons. */
+.viewer__pdf-lock-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.viewer__pdf-lock-input {
+  width: 200px;
+  height: 26px;
+  user-select: text;
+}
+.viewer__pdf-lock-error {
+  color: var(--danger);
+}
+
 /* LAST, on purpose: .btn and the rules above set display, which would tie with
  * (and beat) the UA [hidden] rule. */
 .viewer [hidden] {
