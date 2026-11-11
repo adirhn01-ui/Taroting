@@ -37,6 +37,11 @@ export interface FontFamilyInfo {
   name: string;
   source: "library" | "installed";
   faces: FontFaceInfo[];
+  /** Library families only (absent for installed ones): when the family's
+   *  newest file was added, in ms since the epoch. */
+  addedMs?: number;
+  /** Library families only: the size of the family's files, summed. */
+  bytes?: number;
 }
 export interface FontCatalog {
   library: FontFamilyInfo[];

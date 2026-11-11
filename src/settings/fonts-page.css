@@ -1,0 +1,127 @@
+/* The Fonts page (fonts-page.ts). The header and column are Settings'
+   (.settings__*), the search field and sort control Home's (.home__search,
+   .home__sort, .home__select-count); this file adds only the list and the
+   page's own arrangement. Tokens only, no z-index (nothing here stacks). */
+
+.fontlib__head-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.fontlib__inner {
+  max-width: 760px;
+}
+
+/* `.btn`/`.row`/the toolbar set display, which ties with the UA [hidden] rule. */
+.fontlib__toolbar[hidden],
+.fontlib__select-bar[hidden],
+#fontlib-select[hidden] {
+  display: none;
+}
+
+.fontlib__toolbar {
+  flex-wrap: wrap;
+}
+
+.fontlib__spacer {
+  flex: 1;
+}
+
+.fontlib__select-bar {
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.fontlib__errors {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.fontlib__errors:empty {
+  display: none;
+}
+
+.fontlib__list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fontlib__row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-s);
+  background: var(--bg-panel);
+}
+.fontlib__row:hover {
+  background: var(--bg-hover);
+}
+
+.fontlib__row--select {
+  cursor: pointer;
+}
+.fontlib__row--select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.fontlib__row.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.fontlib__check {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 5px;
+  color: var(--on-accent);
+}
+.fontlib__row.is-selected .fontlib__check {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.fontlib__text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fontlib__name {
+  font-size: var(--fs-13);
+  font-weight: 500;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Drawn in the family itself once its face is loaded (fonts-page.ts sets
+   font-family through the CSSOM); the UI font until then. */
+.fontlib__sample {
+  font-family: var(--font-ui);
+  font-size: var(--fs-20);
+  line-height: 1.35;
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fontlib__meta {
+  font-size: var(--fs-12);
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

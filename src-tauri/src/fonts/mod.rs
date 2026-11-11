@@ -75,6 +75,14 @@ pub struct FontFamilyInfo {
     pub name: String,
     pub source: FontSource,
     pub faces: Vec<FontFaceInfo>,
+    /// Library families only: when the family's newest file was added, in ms
+    /// since the Unix epoch. Omitted (never `null`) for an installed family, so
+    /// installed entries stay byte-identical on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_ms: Option<u64>,
+    /// Library families only: the size of the family's files, summed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -208,6 +216,32 @@ struct Face {
     /// `.ttc` itself (the standalone copy is made on resolve).
     path: PathBuf,
     index: u32,
+    /// A library file's date added and size (None for an installed face).
+    file: Option<FileFacts>,
+}
+
+/// What the library page shows about one library file, read from metadata the
+/// caller already holds (the folder walk's own entry): no file is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileFacts {
+    added_ms: u64,
+    bytes: u64,
+}
+
+impl FileFacts {
+    /// `added_ms` is the later of the creation and last-write times. The file is
+    /// written once, at import, so both are the import time; but NTFS
+    /// "tunnelling" hands a file created under a name deleted moments before
+    /// (remove a font, import it again) the OLD file's creation time, and the
+    /// write time is not tunnelled.
+    fn of(meta: &std::fs::Metadata) -> FileFacts {
+        let ms = |t: std::io::Result<std::time::SystemTime>| {
+            t.ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        };
+        FileFacts { added_ms: ms(meta.created()).max(ms(meta.modified())).unwrap_or(0), bytes: meta.len() }
+    }
 }
 
 impl Face {
@@ -229,6 +263,7 @@ impl Face {
             line_height_em,
             path,
             index,
+            file: None,
         })
     }
 
@@ -299,9 +334,28 @@ fn families(faces: &[Face], source: FontSource) -> Vec<FontFamilyInfo> {
             FontSource::Library => format!("{LIB_PREFIX}{}", f.family),
             FontSource::Installed => f.family.clone(),
         };
-        match out.last_mut() {
-            Some(last) if last.id == id => last.faces.push(f.info()),
-            _ => out.push(FontFamilyInfo { id, name: f.family.clone(), source, faces: vec![f.info()] }),
+        let fam = match out.last_mut() {
+            Some(last) if last.id == id => {
+                last.faces.push(f.info());
+                last
+            }
+            _ => {
+                out.push(FontFamilyInfo {
+                    id,
+                    name: f.family.clone(),
+                    source,
+                    faces: vec![f.info()],
+                    added_ms: None,
+                    bytes: None,
+                });
+                out.last_mut().expect("just pushed")
+            }
+        };
+        // Date added and size are a library family's only: the newest of its
+        // files, and their sizes summed.
+        if let (FontSource::Library, Some(x)) = (source, f.file) {
+            fam.added_ms = Some(fam.added_ms.map_or(x.added_ms, |a| a.max(x.added_ms)));
+            fam.bytes = Some(fam.bytes.unwrap_or(0).saturating_add(x.bytes));
         }
     }
     out
@@ -601,7 +655,7 @@ impl Service {
         let id = format!("{LIB_PREFIX}{}", checked.family);
         // The face's own style (`shown_style`) is what the library compares
         // and what the result reports: the same name a rescan lists it under.
-        let face = Face::from_tables(checked.family.clone(), checked.style, target.clone(), 0, &checked.tables)
+        let mut face = Face::from_tables(checked.family.clone(), checked.style, target.clone(), 0, &checked.tables)
             .ok_or(FontImportError::NotAFont)?;
         let style = face.style.clone();
         let outcome = self.with_library(|lib| {
@@ -627,6 +681,8 @@ impl Service {
                 }
             }
             lib.faces.retain(|f| !(f.family == checked.family && f.style == style));
+            // The same facts a rescan of the folder would read.
+            face.file = std::fs::metadata(&target).ok().map(|m| FileFacts::of(&m));
             lib.faces.push(face);
             sort_faces(&mut lib.faces);
             Ok(())
@@ -733,6 +789,9 @@ fn scan_library(dir: &Path) -> Vec<Face> {
         if !name.to_str().is_some_and(is_library_name) {
             continue;
         }
+        // The walk's own metadata (on Windows it comes with the directory
+        // listing): date added and size cost no extra file access.
+        let Ok(meta) = entry.metadata() else { continue };
         let path = entry.path();
         let Ok(mut src) = FileSource::open(&path) else { continue };
         if src.len() > MAX_IMPORT {
@@ -742,7 +801,8 @@ fn scan_library(dir: &Path) -> Vec<Face> {
         let Some(n) = t.name.as_deref() else { continue };
         let Some(family) = sfnt::name_string(n, 1).filter(|f| is_font_id(&format!("{LIB_PREFIX}{f}"))) else { continue };
         let style = sfnt::name_string(n, 2).unwrap_or_else(|| "Regular".to_owned());
-        if let Some(face) = Face::from_tables(family, style, path, 0, &t) {
+        if let Some(mut face) = Face::from_tables(family, style, path, 0, &t) {
+            face.file = Some(FileFacts::of(&meta));
             faces.push(face);
         }
     }
@@ -902,7 +962,14 @@ mod tests {
         assert_eq!(keys(&fv), ["bold", "embed", "italic", "style", "weight"]);
         assert_eq!(fv["embed"], "noSubset");
 
-        let fam = FontFamilyInfo { id: "lib:Inter".into(), name: "Inter".into(), source: FontSource::Library, faces: vec![face] };
+        let fam = FontFamilyInfo {
+            id: "lib:Inter".into(),
+            name: "Inter".into(),
+            source: FontSource::Library,
+            faces: vec![face],
+            added_ms: None,
+            bytes: None,
+        };
         let cat = FontCatalog { library: vec![fam], installed: vec![] };
         let cv = serde_json::to_value(&cat).unwrap();
         assert_eq!(keys(&cv), ["installed", "library"]);
@@ -1366,7 +1433,63 @@ mod tests {
             line_height_em: 1.2,
             path: PathBuf::from(name),
             index: 0,
+            file: None,
         }
+    }
+
+    /// A library family's date added is its NEWEST file's, its size the sum of
+    /// its files'; an installed family carries neither. Values chosen so the
+    /// first file is the larger and the second the newer: a max where a sum is
+    /// due (or a first-wins) gives a different answer on each field.
+    #[test]
+    fn families_sum_sizes_and_keep_the_newest_date() {
+        let with = |name: &str, family: &str, added_ms: u64, bytes: u64| Face {
+            family: family.into(),
+            file: Some(FileFacts { added_ms, bytes }),
+            ..face(name, false, false, 400)
+        };
+        let faces = [with("Regular", "A", 1_000, 300), with("Bold", "A", 5_000, 20), with("Regular", "B", 3_000, 7)];
+        let lib = families(&faces, FontSource::Library);
+        let got: Vec<(&str, Option<u64>, Option<u64>)> = lib.iter().map(|f| (f.name.as_str(), f.added_ms, f.bytes)).collect();
+        assert_eq!(got, vec![("A", Some(5_000), Some(320)), ("B", Some(3_000), Some(7))]);
+        // Installed: neither field, even from a face that somehow had facts.
+        let inst = families(&faces, FontSource::Installed);
+        assert!(inst.iter().all(|f| f.added_ms.is_none() && f.bytes.is_none()));
+        assert_eq!(keys(&serde_json::to_value(&inst[0]).unwrap()), ["faces", "id", "name", "source"]);
+        assert_eq!(keys(&serde_json::to_value(&lib[0]).unwrap()), ["addedMs", "bytes", "faces", "id", "name", "source"]);
+    }
+
+    /// Through the real service: a two-file family (Consolas Regular + Bold)
+    /// reports the sum of the two files' sizes and the newer file's date, the
+    /// same from memory after the imports and from a fresh scan of the folder.
+    #[test]
+    fn a_two_file_library_family_reports_size_and_date_added() {
+        let iso = Isolated::new("facts");
+        let reg = system_font("consola.ttf").to_string_lossy().into_owned();
+        let bold = system_font("consolab.ttf").to_string_lossy().into_owned();
+        assert!(iso.import(&reg, false).ok);
+        assert!(iso.import(&bold, false).ok);
+        let mut sum = 0u64;
+        let mut newest = 0u64;
+        for e in iso.lib_dir().read_dir().unwrap() {
+            let m = e.unwrap().metadata().unwrap();
+            let x = FileFacts::of(&m);
+            sum += x.bytes;
+            newest = newest.max(x.added_ms);
+        }
+        let expect_bytes = std::fs::metadata(&reg).unwrap().len() + std::fs::metadata(&bold).unwrap().len();
+        assert_eq!(sum, expect_bytes, "fixture: the library holds exactly the two files");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        assert!(newest > 0 && newest <= now + 1_000 && now - newest.min(now) < 600_000, "date added {newest} vs now {now}");
+
+        let lib = iso.svc.list(false).library;
+        assert_eq!(lib.len(), 1);
+        assert_eq!((lib[0].faces.len(), lib[0].bytes, lib[0].added_ms), (2, Some(expect_bytes), Some(newest)));
+        let fresh = Service::at(iso.root.join("appdata"), iso.root.join("cache"));
+        assert_eq!(fresh.list(false).library, lib, "a rescan reads the same facts");
+        // Installed families stay as they were on the wire.
+        let installed = iso.svc.list(false).installed;
+        assert!(installed.iter().all(|f| f.added_ms.is_none() && f.bytes.is_none()));
     }
 
     fn pick(faces: &[Face], bold: bool, italic: bool) -> &str {

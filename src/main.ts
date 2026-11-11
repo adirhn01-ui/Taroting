@@ -155,6 +155,12 @@ async function go(route: Route): Promise<void> {
     if (token !== navToken) return;
     const view = mountSettings(app);
     dispose = () => view.dispose();
+  } else if (route.view === "fonts") {
+    // The font library's page, reached only from Settings: its own lazy chunk.
+    const { mountFontsPage } = await import("./settings/fonts-page");
+    if (token !== navToken) return;
+    const view = mountFontsPage(app);
+    dispose = () => view.dispose();
   } else if (route.view === "viewer") {
     // Lazy and never prefetched: a user who never opens a file from Explorer
     // never pays for the viewer chunk.

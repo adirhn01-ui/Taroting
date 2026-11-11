@@ -6,7 +6,9 @@
 export type EditorRoute = { view: "editor"; projectPath: string; temp?: true; returnTo?: string };
 /** The folder viewer showing `path` (no project, no session). */
 export type ViewerRoute = { view: "viewer"; path: string };
-export type Route = { view: "home" } | EditorRoute | { view: "settings" } | ViewerRoute;
+/** `fonts`: the font library's own page (Settings → Fonts → View); its Back
+ *  goes to Settings. */
+export type Route = { view: "home" } | EditorRoute | { view: "settings" } | { view: "fonts" } | ViewerRoute;
 
 type Navigate = (route: Route) => void;
 

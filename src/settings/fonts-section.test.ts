@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SETTINGS, DEFAULT_SHORTCUTS } from "../core/types";
 import type { FontFamilyInfo, FontImportResult } from "../core/types";
+import { El, body, doc, fakeWindow, flush, focusState, until } from "./markup-dom.test-util";
 
 // The Fonts section, mounted inside the real Settings screen against a fake
-// DOM (vitest runs in node; no DOM library is a dependency) and a fake font
-// runtime (`src/fonts`). The fake DOM is the same small model the Settings
-// mount tests use: it parses the markup the screen writes, matches the simple
-// selectors it queries with, detaches replaced nodes (focus falls to <body>),
-// and does not deliver a click to a disabled button.
+// DOM (markup-dom.test-util.ts: vitest runs in node, no DOM library is a
+// dependency) and a fake font runtime (`src/fonts`). Since 0.9.4 the section
+// is ONE row however big the library is: the count, View (the Fonts page,
+// tested in fonts-page.test.ts) and Import fonts.
 
 const f = vi.hoisted(() => ({
   /** Set by the fake runtime's factory: true once `src/fonts` was imported. */
@@ -19,11 +19,9 @@ const f = vi.hoisted(() => ({
   importCalls: [] as Array<{ paths: string[]; replace: boolean | undefined }>,
   importImpl: (paths: string[], _replace: boolean | undefined): FontImportResult[] =>
     paths.map((path) => ({ path, ok: true })),
-  removeCalls: [] as string[],
-  /** When set, removeFont waits on it: a removal held in flight. */
-  removeGate: null as Promise<void> | null,
   listeners: new Set<() => void>(),
   toasts: [] as Array<{ kind: string; message: string }>,
+  navigations: [] as unknown[],
 }));
 
 vi.mock("../fonts", () => {
@@ -37,10 +35,8 @@ vi.mock("../fonts", () => {
       f.importCalls.push({ paths: [...paths], replace });
       return f.importImpl(paths, replace);
     },
-    removeFont: async (id: string) => {
-      f.removeCalls.push(id);
-      await f.removeGate;
-      f.library = f.library.filter((x) => x.id !== id);
+    removeFont: async () => {
+      throw new Error("Settings no longer removes fonts");
     },
     onFontsChanged: (cb: () => void) => {
       f.listeners.add(cb);
@@ -75,7 +71,7 @@ vi.mock("../core/ipc", async (importOriginal) => {
     },
   };
 });
-vi.mock("../core/nav", () => ({ navigate: () => {} }));
+vi.mock("../core/nav", () => ({ navigate: (route: unknown) => void f.navigations.push(route) }));
 vi.mock("../ui/icons", () => ({ icon: () => "" }));
 vi.mock("../ui/toast", () => ({
   toast: {
@@ -85,249 +81,8 @@ vi.mock("../ui/toast", () => ({
   },
 }));
 
-/* ---------------- the fake DOM ---------------- */
-
-type Handler = (e: unknown) => void;
-
-const VOID = new Set(["input", "br", "img", "hr", "meta"]);
-
-function decode(s: string): string {
-  return s
-    .replace(/&quot;/g, '"')
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, "&");
-}
-
-class El {
-  readonly tagName: string;
-  nodes: Array<El | string> = [];
-  parentNode: El | null = null;
-  attrs = new Map<string, string>();
-  style: Record<string, string> = {};
-  value = "";
-  checked = false;
-  private listeners = new Map<string, Set<Handler>>();
-  constructor(tag: string) {
-    this.tagName = tag.toUpperCase();
-  }
-  get children(): El[] {
-    return this.nodes.filter((n): n is El => typeof n !== "string");
-  }
-  get id(): string {
-    return this.attrs.get("id") ?? "";
-  }
-  get className(): string {
-    return this.attrs.get("class") ?? "";
-  }
-  set className(v: string) {
-    this.attrs.set("class", v);
-  }
-  get classes(): string[] {
-    return this.className.split(/\s+/).filter(Boolean);
-  }
-  get disabled(): boolean {
-    return this.attrs.has("disabled");
-  }
-  set disabled(v: boolean) {
-    if (v) this.attrs.set("disabled", "");
-    else this.attrs.delete("disabled");
-  }
-  get dataset(): Record<string, string> {
-    const out: Record<string, string> = {};
-    for (const [k, v] of this.attrs) {
-      if (k.startsWith("data-")) out[k.slice(5).replace(/-([a-z])/g, (_, c: string) => c.toUpperCase())] = v;
-    }
-    return out;
-  }
-  get textContent(): string {
-    return this.nodes.map((n) => (typeof n === "string" ? n : n.textContent)).join("");
-  }
-  set textContent(v: string) {
-    this.detachAll();
-    this.nodes = [v];
-  }
-  set innerHTML(html: string) {
-    this.detachAll();
-    parseInto(this, html);
-  }
-  get innerHTML(): string {
-    return "";
-  }
-  get isConnected(): boolean {
-    let n: El | null = this;
-    while (n) {
-      if (n === body) return true;
-      n = n.parentNode;
-    }
-    return false;
-  }
-  get offsetParent(): El | null {
-    return this.isConnected ? this.parentNode : null;
-  }
-  hasAttribute(k: string): boolean {
-    return this.attrs.has(k);
-  }
-  getAttribute(k: string): string | null {
-    return this.attrs.get(k) ?? null;
-  }
-  setAttribute(k: string, v: string): void {
-    this.attrs.set(k, v);
-  }
-  private detachAll(): void {
-    for (const c of this.children) c.parentNode = null;
-    this.nodes = [];
-  }
-  appendChild(c: El): El {
-    c.remove();
-    c.parentNode = this;
-    this.nodes.push(c);
-    return c;
-  }
-  remove(): void {
-    if (!this.parentNode) return;
-    const p = this.parentNode;
-    p.nodes = p.nodes.filter((n) => n !== this);
-    this.parentNode = null;
-  }
-  contains(n: unknown): boolean {
-    return n === this || this.children.some((c) => c.contains(n));
-  }
-  addEventListener(t: string, fn: Handler): void {
-    if (!this.listeners.has(t)) this.listeners.set(t, new Set());
-    this.listeners.get(t)!.add(fn);
-  }
-  removeEventListener(t: string, fn: Handler): void {
-    this.listeners.get(t)?.delete(fn);
-  }
-  fire(t: string, extra: Record<string, unknown> = {}): void {
-    let stopped = false;
-    const ev: Record<string, unknown> = {
-      target: this,
-      currentTarget: this,
-      preventDefault() {},
-      stopPropagation() {
-        stopped = true;
-      },
-      ...extra,
-    };
-    for (let n: El | null = this; n && !stopped; n = n.parentNode) {
-      ev.currentTarget = n;
-      for (const fn of [...(n.listeners.get(t) ?? [])]) fn(ev);
-    }
-  }
-  click(): void {
-    if (!this.disabled) this.fire("click");
-  }
-  focus(): void {
-    focusState.el = this;
-  }
-  blur(): void {
-    if (focusState.el === this) focusState.el = null;
-  }
-  matches(selector: string): boolean {
-    return selector.split(",").some((part) => matchCompound(this, part.trim()));
-  }
-  all(): El[] {
-    const out: El[] = [];
-    const walk = (e: El): void => {
-      for (const c of e.children) {
-        out.push(c);
-        walk(c);
-      }
-    };
-    walk(this);
-    return out;
-  }
-  querySelectorAll(selector: string): El[] {
-    return this.all().filter((e) => e.matches(selector));
-  }
-  querySelector(selector: string): El | null {
-    return this.querySelectorAll(selector)[0] ?? null;
-  }
-}
-
-function matchCompound(el: El, sel: string): boolean {
-  let rest = sel;
-  while (rest.length > 0) {
-    let mm: RegExpMatchArray | null;
-    if ((mm = rest.match(/^:not\(([^)]*)\)/))) {
-      if (matchCompound(el, mm[1]!)) return false;
-    } else if ((mm = rest.match(/^#([\w-]+)/))) {
-      if (el.id !== mm[1]) return false;
-    } else if ((mm = rest.match(/^\.([\w-]+)/))) {
-      if (!el.classes.includes(mm[1]!)) return false;
-    } else if ((mm = rest.match(/^\[([\w-]+)(?:="([^"]*)")?\]/))) {
-      const v = el.getAttribute(mm[1]!);
-      if (v === null || (mm[2] !== undefined && v !== mm[2])) return false;
-    } else if ((mm = rest.match(/^[a-zA-Z][\w-]*/))) {
-      if (el.tagName !== mm[0].toUpperCase()) return false;
-    } else {
-      throw new Error(`fake DOM: unsupported selector "${sel}"`);
-    }
-    rest = rest.slice(mm[0].length);
-  }
-  return true;
-}
-
-const TOKEN = /<!--[\s\S]*?-->|<\/([a-zA-Z][\w-]*)\s*>|<([a-zA-Z][\w-]*)((?:\s+[^\s=>/]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?)*)\s*\/?>|[^<]+/g;
-const ATTR = /([^\s=>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
-
-function parseInto(root: El, html: string): void {
-  const stack: El[] = [root];
-  for (const t of html.matchAll(TOKEN)) {
-    const top = stack[stack.length - 1]!;
-    if (t[0].startsWith("<!--")) continue;
-    if (t[1]) {
-      const tag = t[1].toUpperCase();
-      for (let i = stack.length - 1; i > 0; i--) {
-        if (stack[i]!.tagName === tag) {
-          stack.length = i;
-          break;
-        }
-      }
-    } else if (t[2]) {
-      const el = new El(t[2]);
-      for (const a of (t[3] ?? "").matchAll(ATTR)) {
-        el.attrs.set(a[1]!.toLowerCase(), decode(a[2] ?? a[3] ?? a[4] ?? ""));
-      }
-      top.appendChild(el);
-      if (!VOID.has(t[2].toLowerCase()) && !t[0].endsWith("/>")) stack.push(el);
-    } else {
-      top.nodes.push(decode(t[0]));
-    }
-  }
-}
-
-const focusState = { el: null as El | null };
-const body = new El("body");
-const docListeners = new Map<string, Set<Handler>>();
-const doc = {
-  body,
-  get activeElement(): El {
-    const el = focusState.el;
-    return el && el.isConnected && !el.disabled ? el : body;
-  },
-  createElement: (tag: string) => new El(tag),
-  addEventListener: (t: string, fn: Handler) => {
-    if (!docListeners.has(t)) docListeners.set(t, new Set());
-    docListeners.get(t)!.add(fn);
-  },
-  removeEventListener: (t: string, fn: Handler) => void docListeners.get(t)?.delete(fn),
-};
-function pressKey(key: string): void {
-  const ev = { key, preventDefault() {}, stopPropagation() {} };
-  for (const fn of [...(docListeners.get("keydown") ?? [])]) fn(ev);
-}
-
 vi.stubGlobal("document", doc);
-vi.stubGlobal("window", {
-  setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms),
-  clearTimeout: (id: ReturnType<typeof setTimeout>) => clearTimeout(id),
-  addEventListener: () => {},
-  removeEventListener: () => {},
-});
+vi.stubGlobal("window", fakeWindow);
 
 const { settingsStore } = await import("../core/session");
 const { mountSettings } = await import("./settings");
@@ -337,21 +92,6 @@ const { importErrorSentence } = await import("./fonts-section");
 
 let root: El;
 let view: { dispose(): void } | null = null;
-
-async function flush(): Promise<void> {
-  for (let i = 0; i < 10; i++) await Promise.resolve();
-  await new Promise((r) => setTimeout(r, 0));
-}
-
-/** Flush until `cond` holds (bounded): a dynamic import can take more than
- *  one macrotask to land. */
-async function until(cond: () => boolean, what: string): Promise<void> {
-  for (let i = 0; i < 50; i++) {
-    if (cond()) return;
-    await flush();
-  }
-  throw new Error(`timed out waiting for ${what}`);
-}
 
 function mount(): void {
   root = new El("div");
@@ -366,17 +106,12 @@ const section = (): El => {
   return el;
 };
 const importBtn = (): El => section().querySelector("#settings-fonts-import")!;
-const removeBtn = (id: string): El | undefined =>
-  section()
-    .querySelectorAll("[data-font-remove]")
-    .find((b) => b.getAttribute("data-font-remove") === id);
-const familyNames = (): string[] =>
-  section()
-    .querySelectorAll(".settings__row-label")
-    .map((e) => e.textContent)
-    .filter((t) => t !== "Font library");
+const viewBtn = (): El => section().querySelector("#settings-fonts-view")!;
+const countLine = (): string => section().querySelector("#settings-fonts-count")!.textContent;
 const errorLines = (): string[] => section().querySelectorAll(".settings__font-error").map((e) => e.textContent);
 const backdrops = (): El[] => body.children.filter((c) => c.className === "modal-backdrop");
+
+const NOTE = "Fonts installed on this PC are already in every font list.";
 
 const face = (style: string, bold = false, italic = false) => ({
   bold,
@@ -385,18 +120,14 @@ const face = (style: string, bold = false, italic = false) => ({
   style,
   embed: "full" as const,
 });
-const INTER: FontFamilyInfo = {
-  id: "lib:Inter",
-  name: "Inter",
+const fam = (name: string): FontFamilyInfo => ({
+  id: `lib:${name}`,
+  name,
   source: "library",
-  faces: [face("Regular"), face("Bold", true)],
-};
-const FIRA: FontFamilyInfo = {
-  id: "lib:Fira Code",
-  name: "Fira Code",
-  source: "library",
-  faces: [face("Light Italic", false, true)],
-};
+  faces: [face("Regular")],
+  addedMs: 1_700_000_000_000,
+  bytes: 1000,
+});
 
 beforeEach(() => {
   f.library = [];
@@ -405,10 +136,9 @@ beforeEach(() => {
   f.pickCalls = 0;
   f.importCalls.length = 0;
   f.importImpl = (paths) => paths.map((path) => ({ path, ok: true }));
-  f.removeCalls.length = 0;
-  f.removeGate = null;
   f.listeners.clear();
   f.toasts.length = 0;
+  f.navigations.length = 0;
   focusState.el = null;
   settingsStore.set({ ...DEFAULT_SETTINGS, shortcuts: { ...DEFAULT_SHORTCUTS } });
 });
@@ -436,36 +166,41 @@ describe("nothing before Settings opens", () => {
   });
 });
 
-describe("the list", () => {
-  it("lists each library family with its styles and a Remove button", async () => {
-    f.library = [INTER, FIRA];
+describe("the row", () => {
+  it.each([
+    [0, "No fonts imported yet."],
+    [1, "1 imported font."],
+    [12, "12 imported fonts."],
+  ])("says how many fonts are imported (%i), whatever the size of the library, in one row", async (n, sentence) => {
+    f.library = Array.from({ length: n }, (_, i) => fam(`Family ${i}`));
     mount();
-    await until(() => familyNames().length === 2, "the families");
-    expect(familyNames()).toEqual(["Inter", "Fira Code"]);
-    const hints = section()
-      .querySelectorAll(".settings__hint")
-      .map((e) => e.textContent);
-    expect(hints).toEqual([
-      "Fonts installed on this PC are already in every font list.",
-      "Regular, Bold",
-      "Light Italic",
-    ]);
-    expect(removeBtn("lib:Inter")?.textContent).toBe("Remove");
-    expect(removeBtn("lib:Fira Code")?.textContent).toBe("Remove");
-    // Rows sit directly in the card, as in every other section: the card's
-    // spacing between rows comes from being their parent.
-    for (const row of section().querySelectorAll(".settings__row")) expect(row.parentNode).toBe(section());
+    await until(() => countLine() !== `Reading fonts ${NOTE}`, "the count");
+    expect(countLine()).toBe(`${sentence} ${NOTE}`);
+    // One row, and no per-family rows or Remove buttons in Settings.
+    expect(section().querySelectorAll(".settings__row")).toHaveLength(1);
+    expect(section().querySelectorAll("[data-font-remove]")).toHaveLength(0);
+    expect(section().querySelector(".settings__row-label")!.textContent).toBe("Font library");
+    expect(viewBtn().textContent).toBe("View");
+    expect(importBtn().textContent).toBe("Import fonts");
+    // The row sits directly in the card, as in every other section.
+    expect(section().querySelector(".settings__row")!.parentNode).toBe(section());
   });
 
-  it("says so in one line when the library is empty", async () => {
+  it("View opens the Fonts page", async () => {
+    f.library = [fam("Inter")];
     mount();
-    await until(() => f.catalogCalls > 0, "the catalogue");
-    await flush();
-    const hints = section()
-      .querySelectorAll(".settings__hint")
-      .map((e) => e.textContent);
-    expect(hints).toEqual(["Fonts installed on this PC are already in every font list.", "No fonts imported yet."]);
-    expect(section().querySelectorAll("[data-font-remove]")).toHaveLength(0);
+    await until(() => countLine().startsWith("1 imported font."), "the count");
+    viewBtn().click();
+    expect(f.navigations).toEqual([{ view: "fonts" }]);
+  });
+
+  it("follows a change made elsewhere (onFontsChanged)", async () => {
+    f.library = [fam("Inter")];
+    mount();
+    await until(() => countLine().startsWith("1 imported font.") && f.listeners.size === 1, "the count and the subscription");
+    f.library = [fam("Inter"), fam("Fira Code")];
+    for (const cb of f.listeners) cb();
+    await until(() => countLine().startsWith("2 imported fonts."), "the new count");
   });
 });
 
@@ -536,6 +271,20 @@ describe("import", () => {
     expect(backdrops()).toHaveLength(0);
   });
 
+  it("refreshes the count after an import and keeps focus on Import fonts", async () => {
+    mount();
+    await until(() => countLine().startsWith("No fonts imported yet."), "the zero count");
+    f.picks = ["C:\\x\\New.ttf"];
+    f.importImpl = (paths) => {
+      f.library = [fam("New")];
+      return paths.map((path) => ({ path, ok: true, id: "lib:New" }));
+    };
+    importBtn().focus();
+    importBtn().click();
+    await until(() => countLine().startsWith("1 imported font."), "the count after the import");
+    expect(doc.activeElement).toBe(importBtn());
+  });
+
   it("maps every error code to its own sentence", () => {
     const p = "C:\\x\\Face.ttf";
     expect(importErrorSentence(p, "extension")).toBe("Face.ttf isn't a .ttf or .otf file.");
@@ -549,85 +298,34 @@ describe("import", () => {
   });
 });
 
-describe("remove", () => {
-  it("asks first, and calls removeFont only on confirm", async () => {
-    f.library = [INTER, FIRA];
-    mount();
-    await until(() => familyNames().length === 2, "the families");
-
-    removeBtn("lib:Inter")!.click();
-    await flush();
-    expect(backdrops()).toHaveLength(1);
-    let dlg = backdrops()[0]!;
-    expect(dlg.querySelector(".modal__header")!.textContent).toBe("Remove Inter?");
-    expect(dlg.querySelector(".modal__text")!.textContent).toBe(
-      "Projects that use it show Segoe UI until you import it again. The file you imported it from is not touched.",
-    );
-    expect(doc.activeElement).toBe(dlg.querySelector("[data-cancel]"));
-    expect(dlg.querySelector("[data-confirm]")!.classes).not.toContain("btn--danger");
-    pressKey("Escape");
-    await flush();
-    expect(backdrops()).toHaveLength(0);
-    expect(f.removeCalls).toEqual([]);
-    expect(doc.activeElement).toBe(removeBtn("lib:Inter"));
-
-    removeBtn("lib:Inter")!.click();
-    await flush();
-    dlg = backdrops()[0]!;
-    dlg.querySelector("[data-confirm]")!.click();
-    await until(() => familyNames().length === 1, "the list without Inter");
-    expect(f.removeCalls).toEqual(["lib:Inter"]);
-    expect(familyNames()).toEqual(["Fira Code"]);
-    // Its row is gone: focus lands on Import fonts, not on <body>.
-    await flush();
-    expect(doc.activeElement).toBe(importBtn());
-  });
-
-  it("disables every Remove while a removal is under way", async () => {
-    f.library = [INTER, FIRA];
-    let release = (): void => {};
-    f.removeGate = new Promise<void>((r) => (release = r));
-    mount();
-    await until(() => familyNames().length === 2, "the families");
-    removeBtn("lib:Inter")!.click();
-    await flush();
-    backdrops()[0]!.querySelector("[data-confirm]")!.click();
-    await until(() => f.removeCalls.length === 1, "the removal");
-    expect(removeBtn("lib:Inter")!.disabled).toBe(true);
-    expect(removeBtn("lib:Fira Code")!.disabled).toBe(true);
-    release();
-    await until(() => familyNames().length === 1, "the list without Inter");
-    expect(removeBtn("lib:Fira Code")!.disabled).toBe(false);
-  });
-});
-
 describe("closing Settings", () => {
-  it("closes an open confirm, stops listening, and removes nothing", async () => {
-    f.library = [INTER];
+  it("closes an open confirm, stops listening, and imports nothing more", async () => {
+    f.picks = ["D:\\other\\Beta.otf"];
+    f.importImpl = (paths, replace) =>
+      paths.map((path) => (replace ? { path, ok: true } : { path, ok: false, error: "exists" as const, family: "Beta" }));
     mount();
-    await until(() => familyNames().length === 1 && f.listeners.size === 1, "the family and the subscription");
-    removeBtn("lib:Inter")!.click();
-    await flush();
-    expect(backdrops()).toHaveLength(1);
+    await until(() => f.catalogCalls > 0 && f.listeners.size === 1, "the catalogue and the subscription");
+    importBtn().click();
+    await until(() => backdrops().length === 1, "the replace confirm");
     view!.dispose();
     view = null;
     await flush();
     expect(backdrops()).toHaveLength(0);
     expect(f.listeners.size).toBe(0);
-    expect(f.removeCalls).toEqual([]);
+    expect(f.importCalls).toHaveLength(1);
   });
 });
 
 describe("a re-render of Settings", () => {
-  it("keeps the list and a working Import button", async () => {
-    f.library = [INTER];
+  it("keeps the count and a working Import button", async () => {
+    f.library = [fam("Inter")];
     mount();
-    await until(() => familyNames().length === 1, "the family");
+    await until(() => countLine().startsWith("1 imported font."), "the count");
     const before = section();
     settingsStore.set({ ...settingsStore.get(), theme: "light" });
     await flush();
     expect(section()).not.toBe(before); // genuinely rebuilt
-    expect(familyNames()).toEqual(["Inter"]);
+    expect(countLine()).toBe(`1 imported font. ${NOTE}`);
     f.picks = ["C:\\x\\New.ttf"];
     importBtn().click();
     await until(() => f.importCalls.length === 1, "the import");

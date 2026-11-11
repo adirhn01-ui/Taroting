@@ -15,6 +15,8 @@ function label(route: Route): string {
       return "home";
     case "settings":
       return "settings";
+    case "fonts":
+      return "fonts";
     case "viewer":
       return `viewer:${route.path}`;
     case "editor":

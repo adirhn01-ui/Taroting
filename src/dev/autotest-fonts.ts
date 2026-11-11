@@ -472,25 +472,88 @@ export async function runFontBlocks(ctx: FontsCtx): Promise<void> {
       const fontViolations = violations.filter((v) => /font/i.test(v));
       assert(fontViolations.length === 0, `CSP blocked a font: ${fontViolations.join("; ")}`);
 
-      // Settings > Fonts lists it by name, painted and on top.
+      // Settings > Fonts: ONE row with the count and a View button (no
+      // per-font rows there any more), painted and on top. The card re-renders
+      // itself (catalogue landing, import, removal), so every lookup re-queries.
       navigate({ view: "settings" });
-      // The section's rows are direct children of its card #settings-fonts, and
-      // the card re-renders itself (catalogue landing, import, removal), so
-      // every lookup re-queries instead of holding an element across a repaint.
-      const cardText = (): string =>
-        ($("#settings-fonts")?.textContent ?? "no #settings-fonts card").replace(/\s+/g, " ").trim().slice(0, 160);
-      const rowOf = (): HTMLElement | null =>
-        $$("#settings-fonts > .settings__row").find((r) => r.querySelector(".settings__row-label")?.textContent?.trim() === "Consolas") ?? null;
-      await until(() => (rendered(rowOf()) ? rowOf() : null), 4_000, () => `a "Consolas" row in Settings > Fonts (card: "${cardText()}")`);
-      rowOf()?.scrollIntoView({ block: "center" });
+      const countText = (): string => ($("#settings-fonts-count")?.textContent ?? "").replace(/\s+/g, " ").trim();
+      await until(() => countText().startsWith("1 imported font.") || null, 4_000, () => `Settings > Fonts to say "1 imported font." (it says "${countText() || "nothing"}"; on screen: ${onScreen()})`);
+      const settingsCount = countText();
+      assert($$("#settings-fonts [data-font-remove]").length === 0, "Settings > Fonts still lists a per-font Remove button");
+      const viewBtn = await until(
+        () => {
+          const b = $<HTMLButtonElement>("#settings-fonts-view");
+          return rendered(b) ? b : null;
+        },
+        2_000,
+        () => "a rendered View button in Settings > Fonts",
+      );
+      viewBtn.scrollIntoView({ block: "center" });
       await frames(2);
+      const viewHit = hitsItself(viewBtn);
+      assert(viewHit.ok, `the View button's centre paints ${viewHit.hit}`);
+
+      // View → the Fonts page, rendered (not just present), Settings gone.
+      viewBtn.click();
+      await until(
+        () => (rendered($(".fontlib")) && rendered($("#fontlib-list")) && !$("#settings-inner")) || null,
+        4_000,
+        () => `the Fonts page after View (on screen: ${onScreen()}; .fontlib ${$(".fontlib") ? "present" : "absent"})`,
+      );
+      const pageText = (): string => ($("#fontlib-list")?.textContent ?? "no #fontlib-list").replace(/\s+/g, " ").trim().slice(0, 160);
+      // Every lookup re-queries: the list re-renders (catalogue, search, removal).
+      const rowOf = (): HTMLElement | null => $$("#fontlib-list [data-font]").find((r) => r.getAttribute("data-font") === LIB_ID) ?? null;
       const removeBtn = (): HTMLButtonElement | null =>
         [...(rowOf()?.querySelectorAll<HTMLButtonElement>("[data-font-remove]") ?? [])].find((b) => b.getAttribute("data-font-remove") === LIB_ID) ?? null;
-      assert(rendered(rowOf()), `the Consolas row is no longer rendered after scrolling it into view (card: "${cardText()}")`);
-      assert(rendered(removeBtn()), `the Consolas row has no rendered Remove button with data-font-remove="${LIB_ID}" (card: "${cardText()}")`);
+      await until(() => (rendered(rowOf()) ? rowOf() : null), 4_000, () => `a rendered "Consolas" row on the Fonts page (list: "${pageText()}")`);
+      const rowName = (rowOf()!.querySelector(".fontlib__name")?.textContent ?? "").trim();
+      assert(rowName === "Consolas", `the row for ${LIB_ID} is named "${rowName}"`);
+      assert(rendered(removeBtn()), `the Consolas row has no rendered Remove button with data-font-remove="${LIB_ID}" (list: "${pageText()}")`);
       const hit = hitsItself(removeBtn()!);
       assert(hit.ok, `the Consolas row's Remove button centre paints ${hit.hit}`);
-      const hint = (rowOf()?.querySelector(".settings__hint")?.textContent ?? "").trim();
+      const meta = (rowOf()!.querySelector(".fontlib__meta")?.textContent ?? "").trim();
+
+      // Its sample is drawn in the library font once the row's face is in
+      // (loaded when the row nears the viewport): its computed font-family
+      // names the alias, and the pangram is clearly wider than in Segoe UI.
+      const sample = (): HTMLElement | null => rowOf()?.querySelector<HTMLElement>("[data-sample]") ?? null;
+      await until(
+        () => getComputedStyle(sample() ?? document.body).fontFamily.startsWith(alias) || null,
+        4_000,
+        () => `the Consolas row's sample to use ${alias} (its font-family: ${sample() ? getComputedStyle(sample()!).fontFamily : "no sample"})`,
+      );
+      const sampleEl = sample()!;
+      c.font = `${getComputedStyle(sampleEl).fontSize} "Segoe UI"`;
+      const wSampleSegoe = c.measureText(sampleEl.textContent ?? "").width;
+      const wSample = await until(
+        () => {
+          const w = textWidth(sampleEl);
+          return w / wSampleSegoe > 1.15 ? w : null;
+        },
+        2_000,
+        () => `the sample to draw in Consolas: ${f1(textWidth(sampleEl))} px wide vs ${f1(wSampleSegoe)} px in Segoe UI`,
+      );
+
+      // Search: a name that matches nothing hides the row and says so;
+      // clearing brings it back.
+      const search = $<HTMLInputElement>("#fontlib-search");
+      assert(rendered(search), "the Fonts page has no rendered search field");
+      const setSearch = (v: string): void => {
+        search!.value = v;
+        search!.dispatchEvent(new Event("input", { bubbles: true }));
+      };
+      const NO_MATCH = "zzqq-no-such-font";
+      setSearch(NO_MATCH);
+      await frames(1);
+      assert(!rendered(rowOf()), `searching "${NO_MATCH}" still shows the Consolas row`);
+      const noMatch = $(".fontlib__empty");
+      assert(
+        rendered(noMatch) && (noMatch!.textContent ?? "").includes(`No fonts match "${NO_MATCH}"`),
+        `searching "${NO_MATCH}" shows "${(noMatch?.textContent ?? "nothing").trim()}", not the no-match line`,
+      );
+      setSearch("");
+      await frames(1);
+      assert(rendered(rowOf()), "clearing the search did not bring the Consolas row back");
 
       // Remove → Escape: nothing removed, focus back on Remove.
       removeBtn()!.click();
@@ -500,22 +563,40 @@ export async function runFontBlocks(ctx: FontsCtx): Promise<void> {
       (document.activeElement ?? document.body).dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
       await until(() => !removeDialog() || null, 2_000, () => "Escape to close the Remove confirm");
       await frames(1);
+      assert(rendered($(".fontlib")), `Escape in the Remove confirm left the Fonts page (on screen: ${onScreen()})`);
       assert(rendered(rowOf()), "Escape in the Remove confirm removed the Consolas row");
       assert(document.activeElement === removeBtn(), `after Escape focus is on ${describeEl(document.activeElement)}, not Consolas's Remove button`);
       assert((await rt.fontCatalog()).library.some((f) => f.id === LIB_ID), "Escape in the Remove confirm removed the font from the library");
 
-      // Remove → Remove: the row goes, the catalogue drops it, the faces leave document.fonts.
+      // Remove → Remove: the row goes, the empty state shows, the catalogue
+      // drops it, the faces leave document.fonts.
       removeBtn()!.click();
       const dlg2 = await until(removeDialog, 2_000, () => "the Remove confirm, reopened");
       dlg2.querySelector<HTMLButtonElement>("[data-confirm]")!.click();
-      await until(() => !rowOf() || null, 4_000, () => `the Consolas row to leave Settings (card: "${cardText()}")`);
-      const empty = ($("#settings-fonts")?.textContent ?? "").includes("No fonts imported yet.");
+      await until(() => !rowOf() || null, 4_000, () => `the Consolas row to leave the Fonts page (list: "${pageText()}")`);
+      const empty = await until(
+        () => {
+          const e = $(".fontlib__empty");
+          return rendered(e) && (e.textContent ?? "").includes("No fonts imported yet.") ? e : null;
+        },
+        2_000,
+        () => `the "No fonts imported yet." empty state (list: "${pageText()}")`,
+      );
+      assert(rendered(empty.querySelector("#fontlib-empty-import")), "the empty state has no rendered Import fonts button");
       const after = await rt.fontCatalog();
       assert(!after.library.some((f) => f.id === LIB_ID), `the catalogue still lists ${LIB_ID} after Remove`);
       const left = facesNamed(alias);
       assert(left.length === 0, `after Remove document.fonts still holds ${alias}: ${left.join(", ")}`);
       const focusAfter = describeEl(document.activeElement);
-      return `consola.ttf ${how} → library ${LIB_ID} "${fam!.name}" faces ${fam!.faces.map((f) => f.style).join("/")}; alias ${alias} ${faces.join(", ")}, canvas "${IIS}" ${f1(wLib)} vs Segoe ${f1(wSegoe)} px, no CSP violation; Settings row "Consolas" (${hint || "no hint"}) painted, Remove on top; Escape → kept, focus on Remove; Remove → row gone${empty ? ' ("No fonts imported yet.")' : ""}, catalogue and document.fonts clean, focus on ${focusAfter} — ${ms(t0)}`;
+
+      // Back → Settings, which now says the library is empty.
+      $<HTMLButtonElement>("#fontlib-back")!.click();
+      await until(
+        () => (!$(".fontlib") && countText().startsWith("No fonts imported yet.")) || null,
+        4_000,
+        () => `Settings saying "No fonts imported yet." after Back (on screen: ${onScreen()}; count: "${countText() || "none"}")`,
+      );
+      return `consola.ttf ${how} → library ${LIB_ID} "${fam!.name}" faces ${fam!.faces.map((f) => f.style).join("/")}; alias ${alias} ${faces.join(", ")}, canvas "${IIS}" ${f1(wLib)} vs Segoe ${f1(wSegoe)} px, no CSP violation; Settings "${settingsCount.slice(0, 16)}", View on top → Fonts page; row "Consolas" (${meta || "no meta"}) painted, Remove on top, sample in ${alias} ${f1(wSample)} vs Segoe ${f1(wSampleSegoe)} px; no-match search hides it, clearing restores it; Escape → kept, focus on Remove; Remove → row gone, empty state, catalogue and document.fonts clean, focus on ${focusAfter}; Back → Settings "No fonts imported yet." — ${ms(t0)}`;
     } finally {
       document.removeEventListener("securitypolicyviolation", onViolation);
       removeDialog()?.querySelector<HTMLButtonElement>("[data-cancel]")?.click();
