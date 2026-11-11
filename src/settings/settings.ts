@@ -92,6 +92,8 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   duplicate: "Duplicate (PDF)",
   pdfPages: "Show or hide pages (PDF)",
   pdfProperties: "Show or hide properties (PDF)",
+  imageLayers: "Show or hide layers (image)",
+  imageProperties: "Show or hide properties (image)",
 };
 
 /** The screens that have a ShortcutManager. The conflict warning names a mode,
@@ -158,6 +160,8 @@ export const ACTION_ORDER: ActionId[] = [
   "duplicate",
   "pdfPages",
   "pdfProperties",
+  "imageLayers",
+  "imageProperties",
 ];
 
 /** The three user-settable colours of the custom theme, in the order they are

@@ -319,6 +319,7 @@ class El extends FakeElement {
   }
   after(): void {}
   remove(): void {}
+  setAttribute(): void {}
   blur(): void {}
   focus(): void {}
   select(): void {}

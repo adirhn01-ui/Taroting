@@ -149,6 +149,12 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 const thumbRenders = new Map<string, AbortController>();
 const thumbSaves = new Map<string, Promise<void>>();
 
+/** Whether the layers panel is open: per app session, not saved (the PDF
+ *  editor's rail rule). A fresh start shows both panels. */
+let layersOpen = true;
+/** Whether the inspector is open: per app session, not saved. */
+let inspectorOpen = true;
+
 /**
  * Render `doc`'s Home card and save it for `projectPath`, waiting for it at
  * most until `deadline` (a `Date.now()` time) — a leave or a close never waits
@@ -352,7 +358,11 @@ function mount(
         <div class="editor__main">
           <div class="editor__preview imged-stage" id="imged-stage"><canvas class="imged-canvas" id="imged-canvas"></canvas></div>
           <div class="transport imged-toolrow no-select">
-            <div class="imged-tools" id="imged-tools"></div>
+            <div class="imged-toolstart">
+              <button class="btn btn--ghost btn--icon btn--sm" id="imged-layers-toggle" title="Hide layers" aria-label="Hide layers" aria-pressed="true">${icon("panelLeft", 14)}</button>
+              <span class="imged-sep" aria-hidden="true"></span>
+              <div class="imged-tools" id="imged-tools"></div>
+            </div>
             <div class="imged-viewctl" id="imged-viewctl">
               <button class="btn btn--ghost btn--icon btn--sm" id="imged-undo" title="${titled("Undo", "undo")}" aria-label="Undo" disabled>${imgIcon("undo", 14)}</button>
               <button class="btn btn--ghost btn--icon btn--sm" id="imged-redo" title="${titled("Redo", "redo")}" aria-label="Redo" disabled>${imgIcon("redo", 14)}</button>
@@ -362,6 +372,8 @@ function mount(
               <button class="btn btn--ghost btn--icon btn--sm" id="imged-zoom-in" title="${titled("Zoom in", "imgZoomIn")}" aria-label="Zoom in">${icon("zoomIn", 14)}</button>
               <span class="imged-sep" aria-hidden="true"></span>
               ${canvasMenuButton()}
+              <span class="imged-sep" aria-hidden="true"></span>
+              <button class="btn btn--ghost btn--icon btn--sm" id="imged-insp-toggle" title="Hide properties" aria-label="Hide properties" aria-pressed="true">${icon("panelRight", 14)}</button>
             </div>
           </div>
         </div>
@@ -809,6 +821,86 @@ function mount(
   refreshUndo();
   unsubs.push(mode.subscribe(refreshUndo));
 
+  /* ---------------- the two side panels ---------------- */
+
+  // The PDF editor's toggles, decision for decision (pdf/editor/shell.ts):
+  // two independent toggles, remembered per app session (layersOpen,
+  // inspectorOpen). A collapsed panel stays mounted and synced, so opening it
+  // again shows the current layers / selection at once; neither ever opens
+  // by itself. The stage takes the freed width through the view's own
+  // ResizeObserver — the window-resize path: a fitted view refits, a chosen
+  // one keeps the point at the stage centre — and every stage overlay (the
+  // crop frames, the ruler, the brush circle) re-reads its geometry from the
+  // view store that path publishes. Nothing here runs per frame, and a toggle
+  // mid-gesture is a resize mid-gesture, exactly as a window resize is.
+  const layersHost = $("#imged-layers");
+  const inspectorHost = $("#imged-inspector");
+  const layersBtn = $<HTMLButtonElement>("#imged-layers-toggle");
+  const inspBtn = $<HTMLButtonElement>("#imged-insp-toggle");
+  const paintToggle = (btn: HTMLButtonElement, open: boolean, what: string, action: ActionId): void => {
+    const label = `${open ? "Hide" : "Show"} ${what}`;
+    const chord = normalizeChord(shortcutsNow[action] ?? "");
+    btn.setAttribute("aria-pressed", open ? "true" : "false");
+    btn.setAttribute("aria-label", label);
+    // A DOM property, not markup: no escaping (titled() escapes for innerHTML).
+    btn.title = chord ? `${label} (${chord})` : label;
+  };
+  /** A panel going away takes keyboard focus out of it first: focus left in a
+   *  display:none subtree falls to <body>, and the next shortcut or Tab would
+   *  start from nowhere. Its toggle is the one control that brings it back.
+   *  (A field being typed into loses focus here, so it commits as a blur
+   *  commits it.) */
+  const focusOutOf = (panel: HTMLElement, btn: HTMLButtonElement): void => {
+    const active = document.activeElement;
+    if (active instanceof Element && panel.contains(active)) btn.focus();
+  };
+  const paintLayers = (): void => {
+    layersHost.classList.toggle("imged-layers--collapsed", !layersOpen);
+    paintToggle(layersBtn, layersOpen, "layers", "imageLayers");
+  };
+  const toggleLayers = (): void => {
+    if (disposed) return;
+    layersOpen = !layersOpen;
+    if (!layersOpen) focusOutOf(layersHost, layersBtn);
+    paintLayers();
+  };
+  const paintInspector = (): void => {
+    inspectorHost.classList.toggle("imged-inspector--collapsed", !inspectorOpen);
+    paintToggle(inspBtn, inspectorOpen, "properties", "imageProperties");
+  };
+  const toggleInspector = (): void => {
+    if (disposed) return;
+    inspectorOpen = !inspectorOpen;
+    if (!inspectorOpen) {
+      focusOutOf(inspectorHost, inspBtn);
+      // The inspector's popovers (a colour picker, the font list of a text
+      // layer) live on <body>, anchored to a control that is about to have no
+      // box. Both put themselves away when their anchor scrolls (a window
+      // capture listener for "scroll" from anywhere outside them): a scroll
+      // event from the panel closes them the way a scroll would — the picker
+      // keeps the colour shown, as on any outside dismissal — without
+      // unmounting the panel. (A press on this button already closes them
+      // through their outside-press listener, and F4 is inert while one holds
+      // the keyboard; this covers every other path to a collapse.)
+      inspectorHost.dispatchEvent(new Event("scroll"));
+    }
+    paintInspector();
+  };
+  // The toggles never take focus from a press: a field being typed into
+  // keeps its focus and caret, and an ink or select gesture's keyboard state
+  // is left alone. A pointer click blurs (a focused button would take the
+  // next Space, hold to pan, as a click); a keyboard press keeps focus.
+  const keepFocus = (e: Event): void => e.preventDefault();
+  for (const [btn, fn] of [[layersBtn, toggleLayers], [inspBtn, toggleInspector]] as const) {
+    btn.addEventListener("mousedown", keepFocus);
+    btn.addEventListener("click", (e) => {
+      if ((e as MouseEvent).detail > 0) btn.blur();
+      fn();
+    });
+  }
+  paintLayers();
+  paintInspector();
+
   /* ---------------- exits, export, copy ---------------- */
 
   // Back (home, or the viewer it came from) / Ctrl+W, and the gear. A temp
@@ -1008,6 +1100,10 @@ function mount(
   bind("imgZoomOut", () => zoomBy(-1));
   bind("imgZoomFit", () => view.fit());
   bind("imgZoom100", () => view.actual());
+  // Inert while typing (the manager skips typing targets) and while a
+  // popover, menu or dialog holds the keyboard.
+  bind("imageLayers", toggleLayers);
+  bind("imageProperties", toggleInspector);
   // imgPanHold is view.ts's own keydown/keyup pair (holding needs keyup).
   shortcuts.attach();
   undo.push(() => shortcuts.detach());

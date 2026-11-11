@@ -29,6 +29,7 @@ import { createOpenRouter } from "./open-route";
 import { findConflicts, normalizeChord } from "./shortcuts";
 import { Store } from "./store";
 import {
+  ACTION_MODES,
   DEFAULT_CUSTOM_THEME,
   DEFAULT_SETTINGS,
   DEFAULT_SHORTCUTS,
@@ -2551,8 +2552,8 @@ const ADDED_IN_090 = [
 /** The PDF editor's actions and Find, new in 0.9.3. */
 const ADDED_IN_093 = ["pdfHighlight", "pdfText", "pdfWhiteout", "pdfFillForms", "find", "duplicate"] as const;
 
-/** The PDF editor's two panel toggles, new in 0.9.4. */
-const ADDED_IN_094 = ["pdfPages", "pdfProperties"] as const;
+/** The PDF editor's and the image editor's two panel toggles, new in 0.9.4. */
+const ADDED_IN_094 = ["pdfPages", "pdfProperties", "imageLayers", "imageProperties"] as const;
 
 /** A shortcut map exactly as a 0.8.1 settings.json stores it. */
 function shortcuts081(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -2641,7 +2642,7 @@ describe("sanitizeShortcuts", () => {
   });
 
   it("0.9.4's panel toggles: F4 / Shift+F4 from a 0.9.3 map, unless a PDF-screen action of the user's holds the chord", () => {
-    expect(Object.keys(shortcuts093())).toHaveLength(Object.keys(DEFAULT_SHORTCUTS).length - 2);
+    expect(Object.keys(shortcuts093())).toHaveLength(Object.keys(DEFAULT_SHORTCUTS).length - 4);
     const fresh = sanitizeShortcuts(shortcuts093());
     expect(fresh.pdfPages).toBe("F4");
     expect(fresh.pdfProperties).toBe("Shift+F4");
@@ -2661,6 +2662,52 @@ describe("sanitizeShortcuts", () => {
     expect(elsewhere.pdfPages).toBe("F4");
     expect(elsewhere.pdfProperties).toBe("Shift+F4");
     expect(findConflicts(elsewhere)).toEqual([]);
+  });
+
+  it("0.9.4's image panel toggles: F4 / Shift+F4 from a 0.9.3 map, unless an image-screen action of the user's holds the chord", () => {
+    const fresh = sanitizeShortcuts(shortcuts093());
+    expect(fresh.imageLayers).toBe("F4");
+    expect(fresh.imageProperties).toBe("Shift+F4");
+    // The same chords as the PDF pair, on another screen: not a conflict.
+    expect(findConflicts(fresh)).toEqual([]);
+    expect(findConflicts(DEFAULT_SHORTCUTS)).toEqual([]);
+    // imgPen and copy live on the image screen: the user's chords stay theirs
+    // and the toggles wait, unbound. Different cases and spacing, one chord.
+    const taken = sanitizeShortcuts(shortcuts093({ imgPen: "f4", copy: "shift + F4" }));
+    expect(taken.imgPen).toBe("f4");
+    expect(taken.copy).toBe("shift + F4");
+    expect(taken.imageLayers).toBe("");
+    expect(taken.imageProperties).toBe("");
+    // Only one taken: the other toggle keeps its default.
+    const one = sanitizeShortcuts(shortcuts093({ undo: "Shift+F4" }));
+    expect(one.imageProperties).toBe("");
+    expect(one.imageLayers).toBe("F4");
+    // find and duplicate never reach the image screen (they are the PDF
+    // pair's blockers, not these): the image toggles keep their defaults
+    // while the PDF ones wait.
+    const pdfOnly = sanitizeShortcuts(shortcuts093({ find: "F4", duplicate: "Shift+F4" }));
+    expect(pdfOnly.imageLayers).toBe("F4");
+    expect(pdfOnly.imageProperties).toBe("Shift+F4");
+    expect(pdfOnly.pdfPages).toBe("");
+    expect(pdfOnly.pdfProperties).toBe("");
+    expect(findConflicts(pdfOnly)).toEqual([]);
+    // A user who moved the PDF toggles stored them as strings; the image
+    // pair's F4 / Shift+F4 do not touch them.
+    const moved = sanitizeShortcuts(shortcuts093({ pdfPages: "F6", pdfProperties: "F7" }));
+    expect(moved.imageLayers).toBe("F4");
+    expect(moved.pdfPages).toBe("F6");
+  });
+
+  it("the image panel toggles are bound only on the image screen", () => {
+    expect(ACTION_MODES.imageLayers).toEqual(["image"]);
+    expect(ACTION_MODES.imageProperties).toEqual(["image"]);
+    // A user's own F4 on an image action does conflict there (the ruler is
+    // on the PDF screen too, where it meets the PDF pair's F4).
+    const clash = { ...DEFAULT_SHORTCUTS, imgRuler: "F4" };
+    expect(findConflicts(clash)).toEqual([
+      { chord: "F4", mode: "image", actions: ["imgRuler", "imageLayers"] },
+      { chord: "F4", mode: "pdf", actions: ["imgRuler", "pdfPages"] },
+    ]);
   });
 
   it("is what sanitizeSettings reads the stored map through", () => {

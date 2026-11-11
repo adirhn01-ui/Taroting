@@ -1200,6 +1200,124 @@ export async function runImageBlocks(ctx: ImageCtx): Promise<void> {
       }
     });
 
+    await test("image-panels-collapse", async () => {
+      // 0.9.4: the PDF editor's two panel toggles, in the image editor. The
+      // properties button and Shift+F4, the layers button and F4: each panel
+      // goes (no client rects), the stage takes exactly its width, and the
+      // canvas is still painted in the middle of the wider stage — the view
+      // refits through its own ResizeObserver, the window-resize path. Read
+      // off the screen: rects, the element hit at the canvas centre, the
+      // stage's own pixels. A 641x361 canvas in a colour the app never paints,
+      // so neither a stale fit nor an empty stage can pass.
+      const t0 = performance.now();
+      const paths: string[] = [];
+      const press = (shift: boolean): void => {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "F4", code: "F4", shiftKey: shift, bubbles: true, cancelable: true }));
+      };
+      try {
+        const sc = settingsStore.get().shortcuts;
+        assert(
+          sc.imageLayers === "F4" && sc.imageProperties === "Shift+F4",
+          `the run's shortcuts are imageLayers "${sc.imageLayers}", imageProperties "${sc.imageProperties}", not the defaults F4 / Shift+F4`,
+        );
+        const dev = await mountImage(
+          createBlankImageProject("Autotest image panels", 641, 361, SOLID_HEX),
+          "Autotest image panels",
+          paths,
+        );
+        const stage = $("#imged-stage")!;
+        const insp = $("#imged-inspector")!;
+        const layers = $("#imged-layers")!;
+        const inspBtn = $<HTMLButtonElement>("#imged-insp-toggle");
+        const layersBtn = $<HTMLButtonElement>("#imged-layers-toggle");
+        assert(rendered(inspBtn) && rendered(layersBtn), `the toggles are not both rendered (properties ${rendered(inspBtn)}, layers ${rendered(layersBtn)})`);
+        // A panel an earlier failure left shut (per app session): start open.
+        if (!rendered(insp)) inspBtn!.click();
+        if (!rendered(layers)) layersBtn!.click();
+        await frames(3);
+        assert(rendered(insp) && rendered(layers), `the panels do not start open (properties ${insp.getClientRects().length} rects, layers ${layers.getClientRects().length} rects)`);
+
+        const w = (e: Element): number => e.getBoundingClientRect().width;
+        // The view refits from its ResizeObserver a frame after the width
+        // change, and repaints in the same task.
+        const settle = (): Promise<void> => frames(3);
+        /** The canvas painted, and centred, in the stage as it is now. */
+        const painted = (what: string): string => {
+          const r = stage.getBoundingClientRect();
+          const v = dev.view.store.get();
+          const dpr = v.dpr;
+          assert(
+            Math.abs(v.stageW - Math.round(r.width * dpr)) <= 1,
+            `${what}: the view's stage is ${v.stageW} device px, the stage is ${(r.width * dpr).toFixed(1)} — the view did not take the new width`,
+          );
+          const imgW = 641 * v.zoom;
+          const imgH = 361 * v.zoom;
+          // Fitted: the same margin either side, in both axes.
+          const offX = v.panX * 2 + imgW - v.stageW;
+          const offY = v.panY * 2 + imgH - v.stageH;
+          assert(Math.abs(offX) <= 2 && Math.abs(offY) <= 2, `${what}: the canvas is off centre by ${offX.toFixed(1)} x ${offY.toFixed(1)} device px (pan ${v.panX.toFixed(1)},${v.panY.toFixed(1)}, zoom ${v.zoom.toFixed(3)}, stage ${v.stageW}x${v.stageH})`);
+          const c = dev.view.canvasToClient(320.5, 180.5);
+          const sx = r.left + r.width / 2;
+          const sy = r.top + r.height / 2;
+          assert(Math.abs(c.x - sx) <= 1.5 && Math.abs(c.y - sy) <= 1.5, `${what}: the canvas centre is at ${c.x.toFixed(1)},${c.y.toFixed(1)}, the stage centre at ${sx.toFixed(1)},${sy.toFixed(1)}`);
+          const hit = document.elementFromPoint(c.x, c.y);
+          assert(hit !== null && stage.contains(hit), `${what}: the canvas centre hits ${describeEl(hit)}, not the stage`);
+          const px = stagePx(dev, 320, 180);
+          assert(px !== null && dist(px, SOLID_RGB) <= 2, `${what}: the stage shows ${px ? fmt(px) : "nothing"} at the canvas centre, not ${fmt(SOLID_RGB)}`);
+          // Just outside the canvas's left edge: nothing painted there.
+          const ox = Math.floor(v.panX) - 3;
+          const oy = Math.floor(v.panY + imgH / 2);
+          if (ox >= 0) {
+            const a = dev.canvas.getContext("2d")!.getImageData(ox, oy, 1, 1).data[3]!;
+            assert(a === 0, `${what}: the stage is painted (alpha ${a}) 3 px left of the canvas edge — an image wider than the fit`);
+          }
+          return `${(r.width).toFixed(0)} px, zoom ${v.zoom.toFixed(3)}`;
+        };
+
+        // Properties, by the button.
+        const stage0 = w(stage);
+        const insp0 = w(insp);
+        const fit0 = painted("both open");
+        inspBtn!.click();
+        await settle();
+        const stage1 = w(stage);
+        assert(insp.getClientRects().length === 0, `after the properties toggle the inspector still has ${insp.getClientRects().length} client rects (${w(insp)} px wide)`);
+        assert(Math.abs(stage1 - stage0 - insp0) <= 4, `the stage went ${stage0.toFixed(1)} → ${stage1.toFixed(1)} px (+${(stage1 - stage0).toFixed(1)}), the inspector was ${insp0.toFixed(1)} px`);
+        assert(inspBtn!.getAttribute("aria-pressed") === "false", `the properties toggle reads aria-pressed "${inspBtn!.getAttribute("aria-pressed")}" while collapsed`);
+        const fit1 = painted("properties hidden");
+        // Back, by Shift+F4.
+        press(true);
+        await settle();
+        const stage2 = w(stage);
+        assert(rendered(insp) && Math.abs(w(insp) - insp0) <= 1, `after Shift+F4 the inspector is ${rendered(insp) ? `${w(insp).toFixed(1)} px wide` : "still not rendered"} (was ${insp0.toFixed(1)})`);
+        assert(Math.abs(stage2 - stage0) <= 1, `after Shift+F4 the stage is ${stage2.toFixed(1)} px, was ${stage0.toFixed(1)}`);
+        painted("properties back");
+
+        // Layers, by the button, then F4.
+        const layers0 = w(layers);
+        layersBtn!.click();
+        await settle();
+        const stage3 = w(stage);
+        assert(layers.getClientRects().length === 0, `after the layers toggle the layers panel still has ${layers.getClientRects().length} client rects (${w(layers)} px wide)`);
+        assert(Math.abs(stage3 - stage0 - layers0) <= 4, `the stage went ${stage0.toFixed(1)} → ${stage3.toFixed(1)} px (+${(stage3 - stage0).toFixed(1)}), the layers panel was ${layers0.toFixed(1)} px`);
+        assert(layersBtn!.getAttribute("aria-pressed") === "false", `the layers toggle reads aria-pressed "${layersBtn!.getAttribute("aria-pressed")}" while collapsed`);
+        const fit3 = painted("layers hidden");
+        press(false);
+        await settle();
+        const stage4 = w(stage);
+        assert(rendered(layers) && Math.abs(w(layers) - layers0) <= 1, `after F4 the layers panel is ${rendered(layers) ? `${w(layers).toFixed(1)} px wide` : "still not rendered"} (was ${layers0.toFixed(1)})`);
+        assert(Math.abs(stage4 - stage0) <= 1, `after F4 the stage is ${stage4.toFixed(1)} px, was ${stage0.toFixed(1)}`);
+        painted("layers back");
+        return `stage ${fit0}; properties button → inspector 0 rects, stage ${fit1} (inspector was ${insp0.toFixed(1)}), Shift+F4 → ${stage2.toFixed(1)}; layers button → stage ${fit3} (panel was ${layers0.toFixed(1)}), F4 → ${stage4.toFixed(1)}; canvas centred and painted throughout — ${ms(t0)}`;
+      } finally {
+        // Both panels open again BEFORE leaving (they are remembered per app
+        // session): later image blocks click inside both.
+        if (!rendered($("#imged-inspector"))) $<HTMLButtonElement>("#imged-insp-toggle")?.click();
+        if (!rendered($("#imged-layers"))) $<HTMLButtonElement>("#imged-layers-toggle")?.click();
+        await leave(paths);
+      }
+    });
+
     await test("image-export-roundtrip", async () => {
       // Through the export dialog: a PNG at 100% and a JPEG at 50% are written
       // and read back (size by ffprobe, pixels by decode), the run holds the

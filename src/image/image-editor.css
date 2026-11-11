@@ -44,6 +44,7 @@
   border-top: 1px solid var(--border);
   flex-wrap: wrap; /* .transport's gap spaces the lines too */
 }
+.imged-toolstart,
 .imged-tools,
 .imged-viewctl {
   display: flex;
@@ -51,9 +52,24 @@
   gap: var(--sp-1);
 }
 /* A tools group wider than the whole column may still shrink (its toolbar
-   then wraps its own buttons); the view controls never do. */
+   then wraps its own buttons); the view controls never do. The layers toggle
+   rides in one block with the tools, so a wrap never leaves it alone on a
+   line of its own. */
+.imged-toolstart,
 .imged-tools {
   min-width: 0;
+}
+.imged-toolstart > .btn,
+.imged-toolstart > .imged-sep {
+  flex: none;
+}
+/* The two side panels' collapsed state (0.9.4): per app session, the panel
+   stays mounted and synced. Two classes, so it beats `.inspector`
+   (display:flex), whose stylesheet's load order relative to this one is not
+   fixed. */
+.imged .imged-layers--collapsed,
+.imged .imged-inspector--collapsed {
+  display: none;
 }
 .imged-viewctl {
   flex: none;

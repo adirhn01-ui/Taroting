@@ -564,7 +564,9 @@ export type ActionId =
   | "duplicate"
   | "find"
   | "pdfPages"
-  | "pdfProperties";
+  | "pdfProperties"
+  | "imageLayers"
+  | "imageProperties";
 
 /** The three user-settable colours of the "custom" theme.
  *
@@ -757,6 +759,10 @@ export const DEFAULT_SHORTCUTS: Record<ActionId, string> = {
   // The PDF editor's two side panels (0.9.4): the page rail and the inspector.
   pdfPages: "F4",
   pdfProperties: "Shift+F4",
+  // The image editor's two side panels (0.9.4): the layers panel and the
+  // inspector. The same chords as the PDF pair: the two never share a screen.
+  imageLayers: "F4",
+  imageProperties: "Shift+F4",
 };
 
 /** Which screens an action lives on. A chord conflicts only with an action that shares a
@@ -822,6 +828,8 @@ export const ACTION_MODES: Readonly<Record<ActionId, readonly ShortcutMode[]>> =
   duplicate: ["pdf"],
   pdfPages: ["pdf"],
   pdfProperties: ["pdf"],
+  imageLayers: ["image"],
+  imageProperties: ["image"],
 };
 
 /** The stock DARK palette's --bg-app, --accent and --text-1 — so switching to
