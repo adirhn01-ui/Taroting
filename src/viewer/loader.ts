@@ -70,6 +70,10 @@ export type LoadState =
       state: "ready";
       element: ViewElement;
       url: string;
+      /** The filesystem path of the copy `url` plays (the file itself, a remux
+       *  or a repair). Always set for a video or an audio file, never for a
+       *  picture. The viewer reads a video's keyframe index from it. */
+      file?: string;
       kind: "image" | "video" | "audio";
       /** container-only DIRECT attempt: the viewer must call playbackFailed() on a media `error`
        *  or when `loadedmetadata` has not fired within DIRECT_TIMEOUT_MS */
@@ -226,8 +230,8 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
   /** What the video on screen for this load came from; null while none is
    *  (loading, preparing, failed). Decides what a playback failure earns. */
   let shownFrom: Source | null = null;
-  /** The url of the video on screen, re-emitted when only its damage changes. */
-  let shownUrl = "";
+  /** The copy on disk of the video on screen, re-emitted when only its damage changes. */
+  let shownFile = "";
   /** The current load already planned a repair: a refusal of the file (or its
    *  remux) after that fails, never repairs again. */
   let repairTried = false;
@@ -342,14 +346,17 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
     emit({ state: "failed", message });
   }
 
-  function readyVideo(url: string, tryingDirect: boolean, from: Source): void {
+  /** `file`: the copy on disk the video plays (the file itself, a remux or a
+   *  repair); its url is derived here, so the two always name the same copy. */
+  function readyVideo(file: string, tryingDirect: boolean, from: Source): void {
     shownFrom = from;
-    shownUrl = url;
+    shownFile = file;
+    const url = mediaUrl(file);
     damageSaid = said(damage);
     emit(
       damage === null
-        ? { state: "ready", element: "video", url, kind, tryingDirect }
-        : { state: "ready", element: "video", url, kind, tryingDirect, damage: { ...damage } },
+        ? { state: "ready", element: "video", url, file, kind, tryingDirect }
+        : { state: "ready", element: "video", url, file, kind, tryingDirect, damage: { ...damage } },
     );
   }
 
@@ -358,7 +365,7 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
    *  when what the user reads changes. */
   function retell(): void {
     if (shownFrom === null || said(damage) === damageSaid) return;
-    readyVideo(shownUrl, false, shownFrom);
+    readyVideo(shownFile, false, shownFrom);
   }
 
   function preparing(ratio: number | null): void {
@@ -414,7 +421,7 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
       preparing(damage?.ratio ?? null);
     } else {
       phase = "settled";
-      readyVideo(mediaUrl(p), false, "quick");
+      readyVideo(p, false, "quick");
     }
     if (up !== null) replayOrphan(up.jobId);
   }
@@ -455,7 +462,7 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
       // where playback is) or with nothing shown before it.
       if (jobRepair) damage = { until: damage?.until ?? null, phase: "recovered", ratio: null };
       phase = "settled";
-      readyVideo(mediaUrl(out), false, planned(jobRepair));
+      readyVideo(out, false, planned(jobRepair));
     }
     trimCache();
   }
@@ -529,7 +536,7 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
     if (p.mode === "ready" && p.repair?.quick !== true && p.upgrade === undefined) {
       // The full repair finished meanwhile: swap it in.
       damage = { until: untilOf(p.repair) ?? damage?.until ?? null, phase: "recovered", ratio: null };
-      readyVideo(mediaUrl(p.path), false, "repair");
+      readyVideo(p.path, false, "repair");
       return;
     }
     // The full repair to follow: a plan's `upgrade`, or a pending job that is
@@ -602,7 +609,7 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
       // The backend plays the file as it is: nothing repaired to report.
       damage = null;
       phase = "settled";
-      readyVideo(mediaUrl(p.path), false, "direct");
+      readyVideo(p.path, false, "direct");
       return;
     }
     // A repair either way: asked for, or named by the backend's note.
@@ -625,7 +632,7 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
     if (p.mode === "ready") {
       if (!instant) {
         phase = "settled";
-        readyVideo(mediaUrl(p.path), false, planned(isRepair));
+        readyVideo(p.path, false, planned(isRepair));
         return;
       }
       if (up !== null && listenFailed) {
@@ -707,13 +714,13 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
     switch (cls) {
       case "direct":
         phase = "settled";
-        readyVideo(mediaUrl(p), false, "direct");
+        readyVideo(p, false, "direct");
         return;
       case "containerOnly":
         // Only the container is wrong; WebView2 often plays it anyway (mov
         // H.264/AAC). Try the file itself; the viewer reports a refusal.
         phase = "tryingDirect";
-        readyVideo(mediaUrl(p), true, "direct");
+        readyVideo(p, true, "direct");
         return;
       case "remux":
         // "Auto-remux when quick": a stream copy, audio re-encoded at most.
@@ -776,7 +783,7 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
       replanned = false;
       jobRepair = false;
       shownFrom = null;
-      shownUrl = "";
+      shownFile = "";
       repairTried = false;
       damage = null;
       damageSaid = "";

@@ -36,7 +36,7 @@ const MAX_MOOV: u64 = 64 << 20;
 /// The most samples one scan visits — one small read each. Far above any
 /// recording (19 hours at 60 fps); a crafted table that claims more is
 /// answered `None` at once rather than walked.
-const MAX_SAMPLES: u64 = 1 << 22;
+pub(super) const MAX_SAMPLES: u64 = 1 << 22;
 
 /// Top-level boxes looked at while finding `moov`. A real file has a handful
 /// (`ftyp`, `mdat`, `moov`, maybe `free`); this bounds a crafted file made of
@@ -132,11 +132,11 @@ fn be16(buf: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_be_bytes(buf.get(at..at.checked_add(2)?)?.try_into().ok()?))
 }
 
-fn be32(buf: &[u8], at: usize) -> Option<u32> {
+pub(super) fn be32(buf: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_be_bytes(buf.get(at..at.checked_add(4)?)?.try_into().ok()?))
 }
 
-fn be64(buf: &[u8], at: usize) -> Option<u64> {
+pub(super) fn be64(buf: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_be_bytes(buf.get(at..at.checked_add(8)?)?.try_into().ok()?))
 }
 
@@ -144,7 +144,7 @@ fn be64(buf: &[u8], at: usize) -> Option<u64> {
 /// needed and nothing else: a large buffered reader would drag the whole
 /// recording through memory (a 256 KiB refill per ~60 KB sample), where this
 /// reads ~512 bytes per sample.
-struct Reader<R> {
+pub(super) struct Reader<R> {
     source: R,
     len: u64,
     buf: Vec<u8>,
@@ -153,7 +153,7 @@ struct Reader<R> {
 }
 
 impl<R: Read + Seek> Reader<R> {
-    fn new(source: R, len: u64) -> Self {
+    pub(super) fn new(source: R, len: u64) -> Self {
         Reader { source, len, buf: Vec::with_capacity(WINDOW), start: 0 }
     }
 
@@ -214,7 +214,7 @@ fn box_header(head: &[u8], at: u64, end: u64) -> Option<([u8; 4], u64, u64)> {
 /// The children of a box body, as (type, body). `None` when any child is
 /// malformed — a table that does not add up is not worth guessing at. A tail
 /// shorter than a box header is ignored (some writers pad).
-fn children(body: &[u8]) -> Option<Vec<([u8; 4], &[u8])>> {
+pub(super) fn children(body: &[u8]) -> Option<Vec<([u8; 4], &[u8])>> {
     let end = body.len() as u64;
     let mut out = Vec::new();
     let mut at = 0u64;
@@ -231,19 +231,19 @@ fn children(body: &[u8]) -> Option<Vec<([u8; 4], &[u8])>> {
 
 /// The body of the first child of type `typ`; `None` if there is none or the
 /// children do not parse.
-fn child<'a>(body: &'a [u8], typ: &[u8; 4]) -> Option<&'a [u8]> {
+pub(super) fn child<'a>(body: &'a [u8], typ: &[u8; 4]) -> Option<&'a [u8]> {
     children(body)?.into_iter().find(|(t, _)| t == typ).map(|(_, b)| b)
 }
 
 /// `child` along a path of types.
-fn descend<'a>(body: &'a [u8], path: &[&[u8; 4]]) -> Option<&'a [u8]> {
+pub(super) fn descend<'a>(body: &'a [u8], path: &[&[u8; 4]]) -> Option<&'a [u8]> {
     path.iter().try_fold(body, |b, typ| child(b, typ))
 }
 
 /// The top-level `moov` box's body, read whole (bounded by `MAX_MOOV`).
 /// Found by walking the top-level box headers, so a recording whose `moov`
 /// sits after a 600 MB `mdat` costs a few seeks, not a read of the `mdat`.
-fn read_moov<R: Read + Seek>(r: &mut Reader<R>) -> Option<Vec<u8>> {
+pub(super) fn read_moov<R: Read + Seek>(r: &mut Reader<R>) -> Option<Vec<u8>> {
     let mut at = 0u64;
     for _ in 0..MAX_TOP_BOXES {
         if r.len - at < 8 {
@@ -297,7 +297,7 @@ struct VideoTrack<'a> {
 
 /// A full box's table: the entries after version/flags and an entry count,
 /// `width` bytes each, all inside the body. Returns (version, count, entries).
-fn table(body: &[u8], width: usize) -> Option<(u8, u32, &[u8])> {
+pub(super) fn table(body: &[u8], width: usize) -> Option<(u8, u32, &[u8])> {
     let version = *body.first()?;
     let count = be32(body, 4)?;
     let bytes = usize::try_from(count).ok()?.checked_mul(width)?;
@@ -306,7 +306,7 @@ fn table(body: &[u8], width: usize) -> Option<(u8, u32, &[u8])> {
 
 /// The total of the count column of an (count, value) table, 8 bytes per
 /// entry — what `stts` and `ctts` must sum to.
-fn counted(entries: &[u8]) -> Option<u64> {
+pub(super) fn counted(entries: &[u8]) -> Option<u64> {
     entries.chunks_exact(8).try_fold(0u64, |sum, e| sum.checked_add(u64::from(be32(e, 0)?)))
 }
 
@@ -542,7 +542,7 @@ fn avc1_config(stsd: &[u8]) -> Option<(usize, Vec<u32>)> {
 /// landed on a garbage sample `stss` flags as sync. Reading the offset would
 /// mean the `mvhd` timescale and each empty edit's place in the list; a file
 /// with one is rare enough to get the full repair alone.
-fn single_edit_media_time(elst: &[u8]) -> Option<i64> {
+pub(super) fn single_edit_media_time(elst: &[u8]) -> Option<i64> {
     let version = *elst.first()?;
     let width = if version == 1 { 20 } else { 12 };
     let (_, _, entries) = table(elst, width)?;

@@ -206,7 +206,7 @@ describe("classification", () => {
     const { loader, last } = recorded();
     loader.load(MP3);
     await settle();
-    expect(last()).toEqual({ state: "ready", element: "video", url: MP3, kind: "audio", tryingDirect: false });
+    expect(last()).toEqual({ state: "ready", element: "video", url: MP3, file: MP3, kind: "audio", tryingDirect: false });
     // The viewer never forces a proxy (4K plays direct here).
     expect(classify.mock.calls[0]![2]).toBe(false);
     expect(classify.mock.calls[0]![0]).toMatchObject({ id: "viewer", path: MP3, size: 7340, mtimeMs: 1690 });
@@ -244,7 +244,7 @@ describe("classification", () => {
     const { loader, last } = recorded();
     loader.load(MOV);
     await settle();
-    expect(last()).toEqual({ state: "ready", element: "video", url: MOV, kind: "video", tryingDirect: true });
+    expect(last()).toEqual({ state: "ready", element: "video", url: MOV, file: MOV, kind: "video", tryingDirect: true });
     expect(plan).not.toHaveBeenCalled();
     loader.prepare(); // wrong state: not a proxy file
     await settle();
@@ -286,6 +286,7 @@ describe("classification", () => {
       state: "ready",
       element: "video",
       url: "C:\\cache\\p9.mp4",
+      file: "C:\\cache\\p9.mp4",
       kind: "video",
       tryingDirect: false,
     });
@@ -351,6 +352,7 @@ describe("answers arriving after the user moved on", () => {
       state: "ready",
       element: "video",
       url: "C:\\cache\\r57.mp4",
+      file: "C:\\cache\\r57.mp4",
       kind: "video",
       tryingDirect: false,
     });
@@ -430,6 +432,7 @@ describe("jobs", () => {
       state: "ready",
       element: "video",
       url: "C:\\cache\\r41-final.mp4",
+      file: "C:\\cache\\r41-final.mp4",
       kind: "video",
       tryingDirect: false,
     });
@@ -473,6 +476,7 @@ describe("jobs", () => {
       state: "ready",
       element: "video",
       url: "C:\\cache\\r88.mp4",
+      file: "C:\\cache\\r88.mp4",
       kind: "video",
       tryingDirect: false,
     });
@@ -538,7 +542,7 @@ describe("jobs", () => {
     loader.load(MP3);
     await settle();
     // A direct file still plays without job events.
-    expect(last()).toEqual({ state: "ready", element: "video", url: MP3, kind: "video", tryingDirect: false });
+    expect(last()).toEqual({ state: "ready", element: "video", url: MP3, file: MP3, kind: "video", tryingDirect: false });
     loader.load(MTS);
     await settle();
     expect(cancel.mock.calls.map((c) => c[0])).toEqual([63]);
@@ -810,8 +814,8 @@ describe("a video the WebView refuses", () => {
   const RECOVERED: Damage = { until: null, phase: "recovered", ratio: null };
   const shows = (url: string, damage?: Damage): LoadState =>
     damage === undefined
-      ? { state: "ready", element: "video", url, kind: "video", tryingDirect: false }
-      : { state: "ready", element: "video", url, kind: "video", tryingDirect: false, damage };
+      ? { state: "ready", element: "video", url, file: url, kind: "video", tryingDirect: false }
+      : { state: "ready", element: "video", url, file: url, kind: "video", tryingDirect: false, damage };
 
   it("a direct video it cannot decode is repaired at once, and the user is told while it runs", async () => {
     probeAll();
@@ -958,7 +962,7 @@ describe("a video the WebView refuses", () => {
     const { loader, last } = recorded();
     loader.load(MOV);
     await settle();
-    expect(last()).toEqual({ state: "ready", element: "video", url: MOV, kind: "video", tryingDirect: true });
+    expect(last()).toEqual({ state: "ready", element: "video", url: MOV, file: MOV, kind: "video", tryingDirect: true });
     loader.playbackFailed(3);
     await settle();
     expect(plan.mock.calls.map((c) => c[3])).toEqual([false]);
@@ -1200,6 +1204,7 @@ describe("the instant copy of a damaged file", () => {
     state: "ready",
     element: "video",
     url,
+    file: url,
     kind: "video",
     tryingDirect: false,
     damage: d,
@@ -1489,7 +1494,7 @@ describe("the instant copy of a damaged file", () => {
     await settle();
     // Nothing repaired is on screen, so no damage is reported for it, and the
     // full repair queued behind the canceled copy would run for nobody.
-    expect(last()).toEqual({ state: "ready", element: "video", url: NV, kind: "video", tryingDirect: false });
+    expect(last()).toEqual({ state: "ready", element: "video", url: NV, file: NV, kind: "video", tryingDirect: false });
     expect(cancel.mock.calls.map((c) => c[0])).toEqual([91]);
   });
 

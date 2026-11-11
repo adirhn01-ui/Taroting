@@ -1,9 +1,9 @@
 // The folder viewer: one file at a time, arrows through its folder, no project.
 // Lazy route chunk, never prefetched; imports only main-chunk modules plus
-// ./loader, ./stepper and ./scrub (never anything under src/editor/ — that
-// would drag the editor chunk into this one). A PDF is shown by ./pdf-mode,
-// reached ONLY through import() on the first PDF: it and pdf.js behind it
-// are never part of this chunk.
+// ./loader, ./stepper, ./scrub and ./seek-pacer (never anything under
+// src/editor/ — that would drag the editor chunk into this one). A PDF is
+// shown by ./pdf-mode, reached ONLY through import() on the first PDF: it
+// and pdf.js behind it are never part of this chunk.
 //
 // Zero work while idle. One <img> and one <video>, reused for every file and
 // emptied on every switch (the decoder and the Windows file handle go with the
@@ -17,6 +17,7 @@ import "./viewer.css";
 import { registerCloseTask } from "../core/app-close";
 import { fileExt, fileName, formatDuration } from "../core/format";
 import { describeError, ipc, revealInFolder, setWindowTitle } from "../core/ipc";
+import type { KeyframeIndex } from "../core/ipc";
 import { createMonitorVolume } from "../core/monitor-volume";
 import type { MonitorVolumeState } from "../core/monitor-volume";
 import { navigate } from "../core/nav";
@@ -32,6 +33,7 @@ import { DIRECT_TIMEOUT_MS, createSourceLoader } from "./loader";
 import type { Damage, LoadState } from "./loader";
 import type { PdfMemory, PdfMode } from "./pdf-mode";
 import { bindScrub } from "./scrub";
+import { SeekPacer } from "./seek-pacer";
 import {
   DWELL_MS,
   WINDOW_RADIUS,
@@ -70,6 +72,17 @@ interface ViewerDev {
   readonly jobId: number | null;
   path(): string;
   forceUnprepared: boolean;
+  /** Take a video's keyframe index as heavy whatever its gap and bit rate:
+   *  the E2E's way onto the heavy drag path with a light fixture. Set after
+   *  the index has answered, it re-weighs that answer at once. */
+  forceHeavy: boolean;
+  /** The current source scrubs as a heavy file (its index has answered). */
+  heavy(): boolean;
+  /** The current source's keyframe index has answered (heavy, light or none). */
+  indexed(): boolean;
+  /** Every seek the pacer assigned since the last press on the seek bar, in
+   *  order (`keyframe`: a fast drag's). */
+  readonly seeks: { t: number; keyframe: boolean }[];
 }
 type DevWindow = { __tarotingViewerDev?: ViewerDev; __tarotingAutotest?: boolean };
 
@@ -305,6 +318,23 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
    *  "perfect ... aligned"). Before, the viewer painted the element's time on
    *  `seeked`/`timeupdate` only, so mid-drag the knob trailed the cursor. */
   let asked: number | null = null;
+  /** The copy on disk the <video> plays (LoadState `file`): where its
+   *  keyframe index is read from. Null for audio and while no video is out. */
+  let videoFile: string | null = null;
+  /** This source's keyframe index was asked for (on its first scrub). */
+  let indexAsked = false;
+  /** DEV: this source's keyframe index as it answered (null: unreadable),
+   *  undefined until it has; kept for forceHeavy to re-weigh. A release build
+   *  keeps nothing: the pacer holds a heavy file's keyframes, nobody a light
+   *  file's. */
+  let indexAnswer: KeyframeIndex | null | undefined;
+  /** DEV: the E2E's forceHeavy (see ViewerDev). */
+  let devForceHeavy = false;
+  /** Bumped by every source change: an index answer for an older source is
+   *  dropped. */
+  let srcGen = 0;
+  /** The next `at` of the seek bar is its press, not a move. */
+  let pressAt = false;
   /** In-place reloads after a read error on the video on screen (see the
    *  error listener); reset by every new source. */
   let readRetries = 0;
@@ -353,9 +383,53 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
         },
         path: () => cur,
         forceUnprepared: false,
+        get forceHeavy() {
+          return devForceHeavy;
+        },
+        set forceHeavy(v: boolean) {
+          devForceHeavy = v;
+          if (indexAnswer !== undefined) pacer.setIndex(indexAnswer, v);
+        },
+        heavy: () => pacer.heavy(),
+        indexed: () => indexAnswer !== undefined,
+        seeks: [],
       }
     : null;
   if (dev) devWin.__tarotingViewerDev = dev;
+
+  /** Heavy clips' seek-bar drags (./seek-pacer): idle for a light file. */
+  const pacer = new SeekPacer(video, {
+    tolerance: SAME_POSITION_S,
+    onIssue: dev ? (t, keyframe) => void dev.seeks.push({ t, keyframe }) : undefined,
+  });
+
+  /** The <video> is about to get a new source (or none): the pacer forgets
+   *  the old one — a keyframe still waiting must never reach the new one —
+   *  and the new one is asked for its own index on its first scrub. */
+  function resetPacer(): void {
+    pacer.reset();
+    srcGen++;
+    indexAsked = false;
+    indexAnswer = undefined;
+    pressAt = false;
+  }
+
+  /** On a scrub's start: the current video's keyframe index, once per
+   *  source, never at load (nothing is read for a clip nobody scrubs). Until
+   *  it answers, and for no answer, the drag is the light one. */
+  function askIndex(): void {
+    if (indexAsked || videoFile === null || disposed) return;
+    indexAsked = true;
+    const my = srcGen;
+    ipc.keyframeTimes(videoFile).then(
+      (ix) => {
+        if (disposed || my !== srcGen) return;
+        if (import.meta.env.DEV) indexAnswer = ix;
+        pacer.setIndex(ix, import.meta.env.DEV && devForceHeavy);
+      },
+      () => {},
+    );
+  }
 
   /* ---------------- status card ---------------- */
 
@@ -473,6 +547,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
    *  make the engine let go of the decoder (~130 MB for 4K) and the file handle
    *  (Explorer cannot rename or delete a file we still hold). */
   function releaseVideo(): void {
+    resetPacer();
+    videoFile = null;
     tryingDirect = false;
     window.clearTimeout(directTimer);
     directTimer = undefined;
@@ -570,6 +646,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     videoGen = gen;
     swapHold = null;
     asked = null;
+    resetPacer();
+    videoFile = audio ? null : (s.file ?? null);
     readRetries = 0;
     rereading = false;
     damage = s.damage ?? null;
@@ -605,6 +683,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     // A seek still waiting is carried in `t`: the new src abandons the one in
     // flight, so no `seeked` would ever send it.
     asked = null;
+    resetPacer();
     rereading = false;
     swapHold = { t, d: len };
     // Before the src: the error guard compares the two.
@@ -646,6 +725,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
             // A new source (the full repair over the instant copy): its own
             // reload allowance, not what the instant copy spent.
             readRetries = 0;
+            // Its own copy on disk: its own keyframe index, on its next scrub.
+            videoFile = s.file ?? null;
             swapVideo(s.url);
           }
           damage = s.damage;
@@ -746,8 +827,11 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     if (!hidden) paintReadout();
   });
   video.addEventListener("seeked", () => {
-    // The last asked position landed (a newer ask keeps `seeking` true).
-    if (!video.seeking) asked = null;
+    pacer.seeked();
+    // The last asked position landed (a newer ask keeps `seeking` true) —
+    // unless a heavy drag is held: then the cursor owns the position and the
+    // frame that landed may be a keyframe's.
+    if (!video.seeking && !pacer.holding()) asked = null;
     if (damage !== null) paintCover();
     if (!hidden) paintReadout();
   });
@@ -1351,16 +1435,45 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   // Seek: down + every move while held, pointer capture keeps the drag alive
   // off the thin track (the theater bar's behaviour; ./scrub, shared with the
   // PDF page scrubber).
+  // A heavy clip's DRAG (./seek-pacer) shows keyframes while it is fast;
+  // its press, a click, and every light file seek exactly through seekTo.
   const seekDrag = bindScrub(seekEl, {
     enabled: hasMedia,
     at: (r) => {
-      if (hasMedia()) seekTo(r * video.duration);
+      if (!hasMedia()) return;
+      const press = pressAt;
+      pressAt = false;
+      if (press || !pacer.heavy()) {
+        seekTo(r * video.duration);
+        if (press && Number.isFinite(video.duration)) pacer.begin(clamp(r * video.duration, 0, video.duration));
+        return;
+      }
+      const d = video.duration;
+      if (!Number.isFinite(d) || d <= 0) return;
+      // The cursor's position is the one shown, whatever frame is decoding.
+      asked = clamp(r * d, 0, d);
+      pacer.move(asked);
+      paintReadout();
+      if (damage !== null) paintCover();
     },
     start: () => {
+      pressAt = true;
+      if (dev) dev.seeks.length = 0;
+      askIndex();
       scrubbing = true;
       syncAutoHide();
     },
     end: () => {
+      pressAt = false;
+      const held = pacer.holding();
+      // A heavy drag: the exact frame where the pointer let go; once it
+      // lands, the element's time is the position again.
+      pacer.release();
+      if (held) {
+        if (!video.seeking) asked = null;
+        paintReadout();
+        if (damage !== null) paintCover();
+      }
       scrubbing = false;
       syncAutoHide();
     },

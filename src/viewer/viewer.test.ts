@@ -14,6 +14,7 @@ import type { Damage, LoadState } from "./loader";
 const m = vi.hoisted(() => ({
   listSiblings: vi.fn(),
   forgetSiblingOrder: vi.fn(),
+  keyframeTimes: vi.fn(),
   navigate: vi.fn(),
   /** The items of the last menu the viewer opened. */
   menu: [] as { label: string; onSelect: () => void }[],
@@ -62,7 +63,12 @@ vi.mock("../core/ipc", async (importOriginal) => {
   const real = await importOriginal<typeof import("../core/ipc")>();
   return {
     ...real,
-    ipc: { ...real.ipc, listSiblings: m.listSiblings, forgetSiblingOrder: m.forgetSiblingOrder },
+    ipc: {
+      ...real.ipc,
+      listSiblings: m.listSiblings,
+      forgetSiblingOrder: m.forgetSiblingOrder,
+      keyframeTimes: m.keyframeTimes,
+    },
     setWindowTitle: async () => {},
     revealInFolder: async () => {},
   };
@@ -122,6 +128,7 @@ vi.mock("../core/open-media", async (importOriginal) => ({
   runOnOpenChain: (task: () => Promise<void>) => task(),
 }));
 
+import { REST_MS } from "./seek-pacer";
 import { WINDOW_RADIUS } from "./stepper";
 import { mountViewer, type ViewerHandle } from "./viewer";
 
@@ -269,6 +276,7 @@ beforeEach(() => {
     dispose: vi.fn(),
   };
   m.forgetSiblingOrder.mockReset().mockResolvedValue(undefined);
+  m.keyframeTimes.mockReset().mockResolvedValue(null);
   m.listSiblings.mockReset().mockImplementation(
     (path: string) => new Promise<SiblingWindow>((resolve) => calls.push({ path, resolve })),
   );
@@ -774,6 +782,185 @@ describe("seeking", () => {
     video.duration = 61;
     video.fire("error");
     expect(m.playbackFailed.mock.calls).toEqual([[2]]);
+  });
+});
+
+/* ---------------- a heavy clip's drag ---------------- */
+
+describe("a heavy clip's drag", () => {
+  const CLIP = "D:\\clips\\Replay 2026-10-01 21-09-07.mp4";
+  const SRC = "asset://localhost/D%3A%5Cclips%5CReplay%202026-10-01%2021-09-07.mp4";
+  const OTHER = "D:\\clips\\Replay 2026-10-02 18-44-51.mp4";
+  /** Keyframes every 4.17 s at 69 Mbps over 61 s: heavy. */
+  const HEAVY = {
+    allSync: false,
+    times: Array.from({ length: 15 }, (_, i) => Math.round(i * 4.17 * 100) / 100),
+    duration: 61,
+    bytes: Math.round((61 * 69_000_000) / 8),
+  };
+  const ready = (file: string, url = SRC): LoadState => ({
+    state: "ready",
+    element: "video",
+    url,
+    file,
+    kind: "video",
+    tryingDirect: false,
+  });
+  /** The knob's left, as paintReadout writes it for `sec` of 61. */
+  const at = (sec: number): string => `${Math.round((sec / 61) * 1000) / 10}%`;
+
+  /** A 61 s video on screen, at 0, its seek bar 610 px wide from x = 100. */
+  function mounted() {
+    vi.useFakeTimers();
+    vi.stubGlobal("performance", { now: () => Date.now() });
+    const root = mount(CLIP);
+    m.onState!(CLIP, ready(CLIP));
+    const video = root.querySelector("#vw-video");
+    video.duration = 61;
+    video.seeking = false;
+    video.log.length = 0;
+    const bar = root.querySelector("#vw-seek");
+    bar.getBoundingClientRect = () => ({ left: 100, top: 0, right: 710, bottom: 10, width: 610, height: 10 });
+    const ptr = (sec: number) => ({ button: 0, pointerId: 1, clientX: 100 + (sec / 61) * 610, preventDefault: () => {} });
+    const seeks = () => video.log.map((e) => (e.startsWith("t=") ? Math.round(Number(e.slice(2)) * 1000) / 1000 : e));
+    return { root, video, bar, ptr, seeks, knob: root.querySelector(".theater-bar__seek-knob") };
+  }
+
+  /** Press at `sec`, let the index answer, and land the press's exact seek. */
+  async function pressHeavy(v: ReturnType<typeof mounted>, sec: number): Promise<void> {
+    m.keyframeTimes.mockResolvedValue(HEAVY);
+    v.bar.fire("pointerdown", v.ptr(sec));
+    await flush();
+    v.video.seeking = false;
+    v.video.fire("seeked");
+    v.video.log.length = 0;
+  }
+
+  it("asks for the index on the first scrub only, once per source, never at load", async () => {
+    const v = mounted();
+    await flush();
+    expect(m.keyframeTimes).not.toHaveBeenCalled();
+    v.bar.fire("pointerdown", v.ptr(3));
+    v.bar.fire("pointerup", v.ptr(3));
+    v.bar.fire("pointerdown", v.ptr(5));
+    v.bar.fire("pointerup", v.ptr(5));
+    await flush();
+    expect(m.keyframeTimes.mock.calls).toEqual([[CLIP]]);
+    views[0]!.show(OTHER);
+    m.onState!(OTHER, ready(OTHER, "asset://localhost/other"));
+    v.video.duration = 61;
+    v.bar.fire("pointerdown", v.ptr(7));
+    expect(m.keyframeTimes.mock.calls).toEqual([[CLIP], [OTHER]]);
+  });
+
+  it("never asks for an audio file's index", async () => {
+    vi.stubGlobal("performance", { now: () => Date.now() });
+    const root = mount(CLIP);
+    m.onState!(CLIP, { state: "ready", element: "video", url: SRC, file: CLIP, kind: "audio", tryingDirect: false });
+    const bar = root.querySelector("#vw-seek");
+    root.querySelector("#vw-video").duration = 61;
+    bar.getBoundingClientRect = () => ({ left: 100, top: 0, right: 710, bottom: 10, width: 610, height: 10 });
+    bar.fire("pointerdown", { button: 0, pointerId: 1, clientX: 200, preventDefault: () => {} });
+    await flush();
+    expect(m.keyframeTimes).not.toHaveBeenCalled();
+  });
+
+  it("drops an index that answers for a source no longer shown", async () => {
+    const v = mounted();
+    let answer!: (ix: typeof HEAVY) => void;
+    m.keyframeTimes.mockReturnValue(new Promise((r) => (answer = r)));
+    v.bar.fire("pointerdown", v.ptr(1));
+    // The read error's reload is a new source before the answer lands.
+    v.video.error = { code: 2 };
+    v.video.fire("error");
+    v.video.duration = 61;
+    answer(HEAVY);
+    await flush();
+    v.video.log.length = 0;
+    vi.advanceTimersByTime(20);
+    v.bar.fire("pointermove", v.ptr(7.9));
+    vi.advanceTimersByTime(20);
+    v.bar.fire("pointermove", v.ptr(12.3));
+    // Light: a fast move asks the exact cursor time, not keyframe 12.51.
+    expect(v.seeks()).toEqual([7.9, 12.3]);
+  });
+
+  it("asks the nearest keyframe on a fast move, and the knob stays on the cursor when it lands", async () => {
+    const v = mounted();
+    await pressHeavy(v, 1);
+    vi.advanceTimersByTime(40);
+    v.bar.fire("pointermove", v.ptr(7.9));
+    expect(v.seeks()).toEqual([8.34]);
+    expect(v.knob.styles.get("left")).toBe(at(7.9));
+    v.video.seeking = false;
+    v.video.fire("seeked");
+    expect(v.knob.styles.get("left")).toBe(at(7.9));
+  });
+
+  it("a release gives one exact seek to where the pointer let go, and the element's time after it lands", async () => {
+    const v = mounted();
+    await pressHeavy(v, 1);
+    vi.advanceTimersByTime(40);
+    v.bar.fire("pointermove", v.ptr(7.9));
+    v.video.seeking = true;
+    vi.advanceTimersByTime(20);
+    v.bar.fire("pointermove", v.ptr(11));
+    v.bar.fire("pointerup", v.ptr(11));
+    v.video.seeking = false;
+    v.video.fire("seeked");
+    expect(v.seeks()).toEqual([8.34, 11]);
+    // Playback moves on from there: the bar follows the element again.
+    v.video.currentTime = 11.6;
+    v.video.fire("timeupdate");
+    expect(v.knob.styles.get("left")).toBe(at(11.6));
+  });
+
+  it("a 1 px wobble right after the press seeks exactly; the same motion kept up lands on a keyframe", async () => {
+    // 1 px of 610 is 0.1 s of 61: every 8 ms that reads 12.5 s/s, three
+    // keyframe gaps a second — fast, once it has lasted MIN_SPEED_SPAN_MS.
+    const v = mounted();
+    await pressHeavy(v, 1);
+    for (const sec of [1.1, 1.2, 1.3, 1.4]) {
+      vi.advanceTimersByTime(8);
+      v.bar.fire("pointermove", v.ptr(sec));
+    }
+    expect(v.seeks()).toEqual([1.1, 1.2, 1.3, 0]);
+  });
+
+  it("held still on a heavy file, once its exact frame has landed the knob follows playback", async () => {
+    const v = mounted();
+    await pressHeavy(v, 1);
+    vi.advanceTimersByTime(40);
+    v.bar.fire("pointermove", v.ptr(7.9));
+    v.video.seeking = false;
+    v.video.fire("seeked");
+    // The rest's exact seek, then it lands.
+    vi.advanceTimersByTime(REST_MS);
+    expect(v.seeks()).toEqual([8.34, 7.9]);
+    v.video.seeking = false;
+    v.video.fire("seeked");
+    // Playing on from the cursor's frame.
+    v.video.currentTime = 8.6;
+    v.video.fire("timeupdate");
+    expect(v.knob.styles.get("left")).toBe(at(8.6));
+  });
+
+  it("a keyframe waiting when the source is reloaded never reaches the new source", async () => {
+    const v = mounted();
+    await pressHeavy(v, 1);
+    vi.advanceTimersByTime(40);
+    v.bar.fire("pointermove", v.ptr(4));
+    v.video.seeking = true;
+    vi.advanceTimersByTime(20);
+    v.bar.fire("pointermove", v.ptr(12.3));
+    expect(v.seeks()).toEqual([4.17]);
+    // A read error reloads the source (swapVideo) where the user was.
+    v.video.error = { code: 2 };
+    v.video.fire("error");
+    v.video.seeking = false;
+    v.video.fire("seeked");
+    vi.advanceTimersByTime(1000);
+    expect(v.seeks()).toEqual([4.17, `src=${SRC}`, 12.3]);
   });
 });
 

@@ -210,6 +210,20 @@ export interface SiblingWindow {
  *  `containerOnly` = only the container is wrong (a quick remux); `remux` = the
  *  audio needs re-encoding too; `proxy` = the video must be transcoded. */
 export type PlaybackClass = "direct" | "containerOnly" | "remux" | "proxy";
+/** The keyframes of a video file's first track, read from its MP4/MOV sample
+ *  tables without decoding (`media/keyframes.rs`): what a fast drag of the
+ *  viewer's seek bar lands on in a file whose exact seeks are slow
+ *  (`viewer/seek-pacer.ts`). */
+export interface KeyframeIndex {
+  /** Every frame is a keyframe: nothing to snap to (`times` is empty). */
+  allSync: boolean;
+  /** Ascending presentation times, seconds. */
+  times: number[];
+  /** The video track's length, seconds. */
+  duration: number;
+  /** The file's size on disk, bytes. Over `duration`: its overall bit rate. */
+  bytes: number;
+}
 export interface PlaybackClassInfo {
   class: PlaybackClass;
   /** a remux/proxy of this exact file ({path,size,mtimeMs}) is already in the cache, so planning
@@ -359,6 +373,9 @@ export const ipc = {
    *  `dropInbandHeaders` says it needs one. Answers `ready`/`pending` carrying `repair`. */
   planPlayback: (media: MediaRef, hints: CodecHints, forceProxyLarge: boolean, repair = false) =>
     call<PlaybackPlan>("plan_playback", { media, hints, forceProxyLarge, repair }),
+  /** The keyframes of a video file (no decode; MP4/MOV only), for scrubbing.
+   *  null when they cannot be read: every seek is then exact. */
+  keyframeTimes: (path: string) => call<KeyframeIndex | null>("keyframe_times", { path }, () => null),
   /** Pure: one decision + cache stats, no job, no ffmpeg. */
   classifyPlayback: (media: MediaRef, hints: CodecHints, forceProxyLarge: boolean) =>
     call<PlaybackClassInfo>("classify_playback", { media, hints, forceProxyLarge },

@@ -645,6 +645,138 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
     }
   });
 
+  await test("viewer-heavy-scrub-keyframes", async () => {
+    // A heavy clip (long GOP, high bit rate) dragged FAST shows the keyframe
+    // nearest the cursor, one seek at a time, and the exact frame where the
+    // pointer lets go (viewer/seek-pacer.ts). No fixture is heavy, so the
+    // viewer's DEV-only `forceHeavy` (compiled out of release builds) takes
+    // direct_h264.mp4's real index — keyframes ~8.3 s apart — as heavy.
+    // Asserted: the knob under the pointer on every painted frame, every
+    // keyframe seek a time from the file's own index, and one exact seek on
+    // release whose frame the compositor presents. Pictures per second are
+    // logged only: a synthetic drag is no measure of how a hand feels it.
+    const t0 = performance.now();
+    const FILE = `${fixturesDir}\\direct_h264.mp4`;
+    type HeavyHook = {
+      forceHeavy: boolean;
+      heavy(): boolean;
+      indexed(): boolean;
+      seeks: { t: number; keyframe: boolean }[];
+    };
+    let hook: HeavyHook | null = null;
+    try {
+      assert(await ipc.pathExists(FILE), `fixture ${FILE} is missing — run npm run fixtures`);
+      const index = await ipc.keyframeTimes(FILE);
+      if (index === null || index.allSync || index.times.length < 3) {
+        throw new Error(`direct_h264.mp4 should index as a long-GOP file — got ${JSON.stringify(index)}`);
+      }
+      await setOpenWith("viewer");
+      await ipc.debugPushOpenPath(FILE);
+      const video = await until(
+        () => {
+          const v = vwVideo();
+          return v && !v.hidden && v.readyState >= 2 && baseName(viewerDev()?.path() ?? "") === "direct_h264.mp4" ? v : null;
+        },
+        8_000,
+        () => `direct_h264.mp4 playing in the viewer — ${viewerState()}`,
+      );
+      video.pause();
+      const h = viewerDev() as unknown as HeavyHook | undefined;
+      if (h === undefined || typeof h.heavy !== "function" || typeof h.indexed !== "function" || !Array.isArray(h.seeks)) {
+        throw new Error("the viewer's dev hook has no heavy-scrub seam");
+      }
+      hook = h;
+      const bar = await until(() => (rendered($("#vw-seek")) ? $("#vw-seek") : null), 2_000, () => `a painted #vw-seek — ${viewerState()}`);
+      const knob = $<HTMLElement>("#vw-seek .theater-bar__seek-knob");
+      if (knob === null) throw new Error("the seek bar has no knob");
+      const box = bar.getBoundingClientRect();
+      assert(box.width > 200, `the seek bar is ${box.width.toFixed(0)} px wide — too narrow to drag across`);
+      const frame = (): Promise<void> => new Promise((r) => requestAnimationFrame(() => r()));
+      let presented = -1;
+      let pictures = 0;
+      let watching = true;
+      const onFrame: VideoFrameRequestCallback = (_n, meta) => {
+        presented = meta.mediaTime;
+        pictures++;
+        if (watching) video.requestVideoFrameCallback(onFrame);
+      };
+      video.requestVideoFrameCallback(onFrame);
+      const fire = (type: string, x: number): void => {
+        bar.dispatchEvent(
+          new PointerEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            pointerId: 12,
+            button: 0,
+            buttons: type === "pointerup" ? 0 : 1,
+            clientX: x,
+            clientY: box.top + box.height / 2,
+          }),
+        );
+      };
+      // First the real verdict: a click asks for the index, and on its own
+      // numbers (~2.9 Mbit/s) the fixture is LIGHT. Only then forced heavy.
+      fire("pointerdown", box.left + box.width * 0.05);
+      fire("pointerup", box.left + box.width * 0.05);
+      await until(() => h.indexed() || null, 2_000, () => `the keyframe index to answer after a click — ${viewerState()}`);
+      assert(!h.heavy(), `direct_h264.mp4 classified heavy on its real index ${JSON.stringify(index)} — it must be light`);
+      h.forceHeavy = true;
+      assert(h.heavy(), "forceHeavy did not re-weigh the index that had answered");
+      // 24 moves across 10%-80% (~21 s of a 30 s clip), one per painted
+      // frame: far past one keyframe gap per second.
+      const xs = Array.from({ length: 25 }, (_, i) => box.left + box.width * (0.1 + (0.7 * i) / 24));
+      const isKey = (t: number): boolean => index.times.some((k) => Math.abs(k - t) < 1e-6);
+      let worst = 0;
+      let worstAt = 0;
+      try {
+        fire("pointerdown", xs[0]!);
+        await until(() => h.heavy() || null, 2_000, () => `the keyframe index to answer after the press — ${viewerState()}`);
+        h.seeks.length = 0;
+        pictures = 0;
+        const dragStart = performance.now();
+        for (const x of xs.slice(1)) {
+          fire("pointermove", x);
+          await frame();
+          const k = knob.getBoundingClientRect();
+          const off = Math.abs(k.left + k.width / 2 - x);
+          if (off > worst) {
+            worst = off;
+            worstAt = x;
+          }
+        }
+        const dragMs = performance.now() - dragStart;
+        const dragPictures = pictures;
+        const mid = h.seeks.slice();
+        fire("pointerup", xs[xs.length - 1]!);
+        const released = h.seeks.slice(mid.length);
+        const want = ((xs[xs.length - 1]! - box.left) / box.width) * video.duration;
+        const keys = mid.filter((s) => s.keyframe);
+        assert(
+          worst <= 2,
+          `mid-drag the knob was ${worst.toFixed(1)} px from the pointer (at x=${worstAt.toFixed(0)}) — it must sit under the hand`,
+        );
+        assert(keys.length >= 2, `a fast drag over ~21 s asked ${keys.length} keyframe seeks — ${JSON.stringify(mid)}`);
+        const stray = keys.filter((s) => !isKey(s.t));
+        assert(stray.length === 0, `keyframe seeks not in the index ${JSON.stringify(index.times)}: ${JSON.stringify(stray)}`);
+        assert(
+          released.length === 1 && !released[0]!.keyframe && Math.abs(released[0]!.t - want) < 0.05,
+          `the release asked ${JSON.stringify(released)} — want one exact seek to ${want.toFixed(3)} s`,
+        );
+        await until(() => (!video.seeking && Math.abs(presented - want) < 1 / 30 + 0.002) || null, 3_000, () =>
+          `the frame at ${want.toFixed(3)} s on screen after the release — presented ${presented.toFixed(3)} s, seeking ${String(video.seeking)}`,
+        );
+        const fps = dragMs > 0 ? (dragPictures * 1000) / dragMs : 0;
+        const exactMid = mid.length - keys.length;
+        return `knob within ${worst.toFixed(1)} px; ${keys.length} keyframe seeks (all in the index), ${exactMid} exact mid-drag; release landed on ${presented.toFixed(3)} s for ${want.toFixed(3)} s; info: ${fps.toFixed(1)} pictures/s over ${Math.round(dragMs)} ms — ${ms(t0)}`;
+      } finally {
+        watching = false;
+      }
+    } finally {
+      if (hook) hook.forceHeavy = false;
+      await backHome();
+    }
+  });
+
   await test("viewer-prepare-preview", async () => {
     const t0 = performance.now();
     try {
