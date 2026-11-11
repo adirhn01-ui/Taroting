@@ -45,15 +45,28 @@ pub fn report_path() -> std::path::PathBuf {
 #[tauri::command]
 pub fn debug_info() -> Result<DebugInfo> {
     dev_only()?;
-    let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(|p| p.join("tests").join("fixtures"))
-        .unwrap_or_default();
     Ok(DebugInfo {
         autotest: std::env::var("TAROTING_AUTOTEST").is_ok_and(|v| v == "1"),
-        fixtures_dir: fixtures.to_string_lossy().into_owned(),
+        fixtures_dir: fixtures_dir().to_string_lossy().into_owned(),
         report_path: report_path().to_string_lossy().into_owned(),
     })
+}
+
+/// The repo's `tests/fixtures`. Attribute-gated, not `cfg!`-gated: a runtime
+/// check would still compile the build machine's repo path (and with it the
+/// account name) into a release exe. Release never gets here (`dev_only()`
+/// refuses first) and has no repo to point at.
+#[cfg(debug_assertions)]
+fn fixtures_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.join("tests").join("fixtures"))
+        .unwrap_or_default()
+}
+
+#[cfg(not(debug_assertions))]
+fn fixtures_dir() -> std::path::PathBuf {
+    std::path::PathBuf::new()
 }
 
 #[tauri::command]

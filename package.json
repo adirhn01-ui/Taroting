@@ -9,7 +9,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "vitest run",
-    "tauri": "tauri",
+    "tauri": "node scripts/tauri.mjs",
     "fetch-ffmpeg": "node scripts/fetch-ffmpeg.mjs",
     "fixtures": "node scripts/make-fixtures.mjs"
   },

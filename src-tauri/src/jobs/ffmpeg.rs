@@ -15,31 +15,39 @@ use crate::error::{AppError, Result};
 #[cfg(windows)]
 pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+#[cfg(debug_assertions)]
 const HOST_TRIPLE: &str = "x86_64-pc-windows-msvc";
 
 /// Resolve a sidecar binary. In dev builds they live in `src-tauri/binaries/`
 /// with a target-triple suffix (Tauri's externalBin convention); in release
 /// bundles Tauri places them next to the app exe under their plain name.
+///
+/// Two attribute-gated twins, not one `if cfg!(…)`: a runtime check still
+/// compiles the dev branch, and with it the build machine's repo path (and
+/// the account name in it), into a release exe.
+#[cfg(debug_assertions)]
 pub fn sidecar_path(name: &str) -> Result<PathBuf> {
-    if cfg!(debug_assertions) {
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("binaries")
-            .join(format!("{name}-{HOST_TRIPLE}.exe"));
-        if p.is_file() {
-            Ok(p)
-        } else {
-            Err(AppError::Ffmpeg(format!(
-                "{name} sidecar missing at {} — run `npm run fetch-ffmpeg`",
-                p.display()
-            )))
-        }
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("binaries")
+        .join(format!("{name}-{HOST_TRIPLE}.exe"));
+    if p.is_file() {
+        Ok(p)
     } else {
-        let exe = std::env::current_exe()?;
-        let dir = exe
-            .parent()
-            .ok_or_else(|| AppError::Ffmpeg("cannot resolve app directory".into()))?;
-        Ok(dir.join(format!("{name}.exe")))
+        Err(AppError::Ffmpeg(format!(
+            "{name} sidecar missing at {} — run `npm run fetch-ffmpeg`",
+            p.display()
+        )))
     }
+}
+
+/// Release twin of the dev `sidecar_path` above.
+#[cfg(not(debug_assertions))]
+pub fn sidecar_path(name: &str) -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| AppError::Ffmpeg("cannot resolve app directory".into()))?;
+    Ok(dir.join(format!("{name}.exe")))
 }
 
 /// A Command for a sidecar, configured to never flash a console window.
