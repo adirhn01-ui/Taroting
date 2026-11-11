@@ -13,7 +13,7 @@ use crate::cache::{Cache, CacheKind, MediaKey};
 use crate::error::{AppError, Result};
 use crate::jobs::{self, JobId, JobKind, Jobs, Lane};
 use crate::media::source::source_file;
-use crate::media::{damage, prepare, probe};
+use crate::media::{damage, fragmented, prepare, probe};
 use crate::project::schema::MediaRef;
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -27,6 +27,11 @@ pub struct CodecHints {
 pub enum Decision {
     Direct,
     Remux { audio_copy_ok: bool },
+    /// A file `decide()` plays as it is, but FRAGMENTED (`media::fragmented`):
+    /// played from a stream copy into an ordinary MP4 — the remux recipe, audio
+    /// copied too — never handed to the WebView as it is. Only
+    /// `decide_for_file` makes it, from the file's own bytes.
+    Defragment,
     Proxy,
     AudioDirect,
     AudioRemux,
@@ -111,6 +116,55 @@ pub fn decide(media: &MediaRef, hints: CodecHints, force_proxy_large: bool) -> D
     }
 }
 
+/// `decide()`, then the one question it cannot answer from the media entry:
+/// is a file it would play as it is FRAGMENTED? Such a file is played from a
+/// defragmented copy (`Decision::Defragment`) — WebView2 157 fails a seek
+/// into one while it plays (MediaError 2, "demuxer seek failed"), which the
+/// editor takes for a file it cannot play at all. Every other decision is
+/// `decide()`'s, unchanged: a file that already needs a remux or a proxy
+/// gets exactly that (both write ordinary MP4s), and so does a repair, which
+/// `plan_sync` routes before it asks this.
+///
+/// Reads the file (a handful of box headers), so it runs where its callers
+/// already do: on a blocking-pool thread, never the UI thread.
+fn decide_for_file(media: &MediaRef, hints: CodecHints, force_proxy_large: bool) -> Decision {
+    with_layout(decide(media, hints, force_proxy_large), media, settled_fragmented)
+}
+
+/// `decide_for_file` with the layout question injected, so the tests answer
+/// it without a file — and can see that it is asked ONLY of a video
+/// `decide()` plays as it is.
+fn with_layout(decision: Decision, media: &MediaRef, fragmented: impl FnOnce(&MediaRef) -> bool) -> Decision {
+    if decision == Decision::Direct && is_video(media) && fragmented(media) {
+        Decision::Defragment
+    } else {
+        decision
+    }
+}
+
+/// Whether `media` names a fragmented MP4 that is finished and is still the
+/// file its entry describes. Anything else — the file changed since it was
+/// probed (size or mtime: it may be growing, and the copy would be cached
+/// under a key that no longer names it), another program still writing it,
+/// a cloud placeholder, a path that is not a file, anything unreadable —
+/// answers `false`, and the file plays as it always did.
+fn settled_fragmented(media: &MediaRef) -> bool {
+    let Ok(src) = source_file(&media.path) else {
+        return false;
+    };
+    let unchanged = std::fs::metadata(src).is_ok_and(|meta| {
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // `probe_sync`'s own derivation, so the two compare like for like.
+        meta.len() == media.size && mtime_ms == media.mtime_ms
+    });
+    unchanged && fragmented::is_fragmented(&media.path) == Some(true)
+}
+
 /* ------------------------------------------------------------------ */
 /* classify: what the viewer asks before anything starts               */
 /* ------------------------------------------------------------------ */
@@ -133,12 +187,23 @@ pub enum PlaybackClass {
 /// is the audio web-playable? — is `decide()`'s own helper, asked the same way
 /// it asks it: a `Remux` whose audio plays was a container problem only.
 pub fn classify(media: &MediaRef, hints: CodecHints, force_proxy_large: bool) -> PlaybackClass {
-    match decide(media, hints, force_proxy_large) {
+    class_of(decide(media, hints, force_proxy_large), media)
+}
+
+/// The class of a decision already made. A `Defragment` is `Remux`, never
+/// `ContainerOnly`: the viewer TRIES a container-only file as it is first
+/// (`tryingDirect`), and a fragmented file plays fine that way — until it is
+/// scrubbed. `Remux` is the class both consumers already handle as "prepare
+/// the copy, then play the copy": the viewer plans at once and shows its
+/// "preparing" card (src/viewer/loader.ts, `case "remux"`); the editor never
+/// reads a class at all, it plans every file and waits on a pending job.
+fn class_of(decision: Decision, media: &MediaRef) -> PlaybackClass {
+    match decision {
         Decision::Direct | Decision::AudioDirect | Decision::ImageDirect => PlaybackClass::Direct,
         Decision::Remux { .. } if audio_codec_playable(media.acodec.as_deref()) => {
             PlaybackClass::ContainerOnly
         }
-        Decision::Remux { .. } | Decision::AudioRemux => PlaybackClass::Remux,
+        Decision::Remux { .. } | Decision::AudioRemux | Decision::Defragment => PlaybackClass::Remux,
         Decision::Proxy | Decision::GifProxy => PlaybackClass::Proxy,
     }
 }
@@ -167,7 +232,10 @@ pub struct PlaybackClassInfo {
 /// nothing writes, or re-prepare one that is sitting in the cache.
 fn prepared_target(d: &Decision) -> Option<(CacheKind, &'static str)> {
     match d {
-        Decision::Remux { .. } => Some((CacheKind::Remux, ".mp4")),
+        // A defragmented copy is a remux of the file's own streams into an
+        // ordinary MP4: the remuxes' folder and name. One decision per file
+        // identity (the key), so the two never claim the same file.
+        Decision::Remux { .. } | Decision::Defragment => Some((CacheKind::Remux, ".mp4")),
         Decision::AudioRemux => Some((CacheKind::Remux, ".m4a")),
         Decision::Proxy | Decision::GifProxy => Some((CacheKind::Proxy, ".mp4")),
         Decision::Direct | Decision::AudioDirect | Decision::ImageDirect => None,
@@ -260,8 +328,15 @@ fn classify_info(
     hints: CodecHints,
     force_proxy_large: bool,
 ) -> PlaybackClassInfo {
-    let class = classify(media, hints, force_proxy_large);
-    let prepared = prepared_target(&decide(media, hints, force_proxy_large))
+    // The decision `plan_playback` will act on, the file's layout included:
+    // one answer for the class and for the cache file it looks for.
+    info_for(cache, media, decide_for_file(media, hints, force_proxy_large))
+}
+
+/// `classify_info` for a decision already made.
+fn info_for(cache: Option<&Cache>, media: &MediaRef, decision: Decision) -> PlaybackClassInfo {
+    let class = class_of(decision, media);
+    let prepared = prepared_target(&decision)
         .zip(cache)
         .is_some_and(|((kind, suffix), cache)| {
             cache.existing_file(kind, &media_key(media).hash(), suffix).is_some()
@@ -600,41 +675,43 @@ fn plan_sync(
         let mut steps = LiveRepair { app, jobs, cache: &cache, inflight, media };
         return plan_repair(&cache, media, &SCANNED, &mut steps);
     }
-    let decision = decide(media, hints, force_proxy_large);
+    let decision = decide_for_file(media, hints, force_proxy_large);
     // Where the output lives comes from `prepared_target` alone, the table
-    // `classify_playback` reads; each arm below only picks the recipe.
-    let Some((cache_kind, suffix)) = prepared_target(&decision) else {
+    // `classify_playback` reads; `recipe` only picks the job and its argv.
+    let (Some((cache_kind, suffix)), Some((job_kind, args_for))) = (prepared_target(&decision), recipe(decision)) else {
         return direct(media);
     };
+    // No cache, nowhere to prepare into: the original as it is — for a
+    // fragmented file too, which then plays exactly as it did before copies.
     let Some(cache) = app.try_state::<Arc<Cache>>() else {
         return direct(media);
     };
-    match decision {
-        Decision::Remux { audio_copy_ok } => ensure_prepared(
-            app, jobs, &cache, inflight, media,
-            cache_kind, JobKind::Remux, suffix,
-            move |src, dst| prepare::remux_args(src, dst, audio_copy_ok),
-        ),
-        Decision::AudioRemux => ensure_prepared(
-            app, jobs, &cache, inflight, media,
-            cache_kind, JobKind::Remux, suffix,
-            prepare::audio_remux_args,
-        ),
-        Decision::Proxy => ensure_prepared(
-            app, jobs, &cache, inflight, media,
-            cache_kind, JobKind::Proxy, suffix,
-            prepare::proxy_args,
-        ),
-        Decision::GifProxy => ensure_prepared(
-            app, jobs, &cache, inflight, media,
-            cache_kind, JobKind::Proxy, suffix,
-            prepare::gif_proxy_args,
-        ),
-        // `prepared_target` names no file for these, so the early return above
-        // already answered; kept total rather than `unreachable!()` because a
-        // panic here would abort the whole app.
-        Decision::Direct | Decision::AudioDirect | Decision::ImageDirect => direct(media),
-    }
+    ensure_prepared(app, jobs, &cache, inflight, media, cache_kind, job_kind, suffix, args_for)
+}
+
+/// The argv a preparation recipe builds from (source, partial output).
+type RecipeArgs = Box<dyn FnOnce(&Path, &Path) -> Vec<std::ffi::OsString>>;
+
+/// The job a decision prepares its copy with, and that job's recipe; `None`
+/// for a decision that plays the file as it is (`prepared_target` names no
+/// file for those either).
+fn recipe(decision: Decision) -> Option<(JobKind, RecipeArgs)> {
+    Some(match decision {
+        Decision::Remux { audio_copy_ok } => {
+            (JobKind::Remux, Box::new(move |src: &Path, dst: &Path| prepare::remux_args(src, dst, audio_copy_ok)))
+        }
+        // The same stream copy: whatever audio sits in an MP4 goes back into
+        // one as it is (aac, mp3, opus, flac, alac and PCM measured with the
+        // bundled ffmpeg), so a fragmented file never gets an audio re-encode
+        // an ordinary MP4 with its codecs would not.
+        Decision::Defragment => {
+            (JobKind::Remux, Box::new(|src: &Path, dst: &Path| prepare::remux_args(src, dst, true)))
+        }
+        Decision::AudioRemux => (JobKind::Remux, Box::new(|src: &Path, dst: &Path| prepare::audio_remux_args(src, dst))),
+        Decision::Proxy => (JobKind::Proxy, Box::new(|src: &Path, dst: &Path| prepare::proxy_args(src, dst))),
+        Decision::GifProxy => (JobKind::Proxy, Box::new(|src: &Path, dst: &Path| prepare::gif_proxy_args(src, dst))),
+        Decision::Direct | Decision::AudioDirect | Decision::ImageDirect => return None,
+    })
 }
 
 /// Whether a plan goes to the repair copy: a video, when the caller asks
@@ -1175,6 +1252,7 @@ mod tests {
         let table = [
             (Decision::Remux { audio_copy_ok: true }, Some((CacheKind::Remux, ".mp4"))),
             (Decision::Remux { audio_copy_ok: false }, Some((CacheKind::Remux, ".mp4"))),
+            (Decision::Defragment, Some((CacheKind::Remux, ".mp4"))),
             (Decision::AudioRemux, Some((CacheKind::Remux, ".m4a"))),
             (Decision::Proxy, Some((CacheKind::Proxy, ".mp4"))),
             (Decision::GifProxy, Some((CacheKind::Proxy, ".mp4"))),
@@ -1350,8 +1428,43 @@ mod tests {
         let play: String = play.split_whitespace().collect();
         assert!(play.contains("jobs.submit(lane_for(job_kind),"));
         assert!(!play.contains("jobs.submit(Lane::Background"));
-        // The GIF arm asks for a Proxy job, so it lands on Transcode too.
-        assert!(play.contains("cache_kind,JobKind::Proxy,suffix,prepare::gif_proxy_args"));
+        // The GIF's recipe is a Proxy job, so it lands on Transcode too; every
+        // stream copy (a defragmented copy included) on Background.
+        let kind = |d| recipe(d).map(|(k, _)| k);
+        assert_eq!(kind(Decision::GifProxy), Some(JobKind::Proxy));
+        assert_eq!(kind(Decision::Proxy), Some(JobKind::Proxy));
+        assert_eq!(kind(Decision::Remux { audio_copy_ok: false }), Some(JobKind::Remux));
+        assert_eq!(kind(Decision::AudioRemux), Some(JobKind::Remux));
+        assert_eq!(kind(Decision::Defragment), Some(JobKind::Remux));
+        for d in [Decision::Direct, Decision::AudioDirect, Decision::ImageDirect] {
+            assert!(recipe(d).is_none(), "{d:?}");
+        }
+        // And `plan_sync` hands the recipe's own kind to the job.
+        assert!(play.contains("ensure_prepared(app,jobs,&cache,inflight,media,cache_kind,job_kind,suffix,args_for)"));
+    }
+
+    /// Each recipe builds the argv of its own builder — pinned by running
+    /// both on the same paths, so a recipe wired to the wrong builder (or the
+    /// wrong audio choice) differs.
+    #[test]
+    fn each_recipe_builds_its_own_argv() {
+        let (src, dst) = (Path::new(r"C:\v\in.mp4"), Path::new(r"C:\c\out.tmp"));
+        let args = |d| recipe(d).map(|(_, f)| f(src, dst)).unwrap();
+        assert_eq!(args(Decision::Remux { audio_copy_ok: true }), prepare::remux_args(src, dst, true));
+        assert_eq!(args(Decision::Remux { audio_copy_ok: false }), prepare::remux_args(src, dst, false));
+        assert_eq!(args(Decision::AudioRemux), prepare::audio_remux_args(src, dst));
+        assert_eq!(args(Decision::Proxy), prepare::proxy_args(src, dst));
+        assert_eq!(args(Decision::GifProxy), prepare::gif_proxy_args(src, dst));
+        let defrag: Vec<String> =
+            args(Decision::Defragment).iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(defrag, prepare::remux_args(src, dst, true).iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>());
+        // Spelled out: a stream copy of both streams into a faststart MP4,
+        // no encoder named anywhere.
+        let has = |pair: [&str; 2]| defrag.windows(2).any(|w| w[0] == pair[0] && w[1] == pair[1]);
+        assert!(has(["-c:v", "copy"]) && has(["-c:a", "copy"]), "{defrag:?}");
+        assert!(has(["-movflags", "+faststart"]) && has(["-f", "mp4"]), "{defrag:?}");
+        assert!(!defrag.iter().any(|a| a == "aac" || a == "libx264" || a == "-b:a"), "{defrag:?}");
+        crate::media::source::assert_inputs_whitelisted(&defrag);
     }
 
     /// The `.trt`'s path is checked before any answer hands it on: every
@@ -1548,7 +1661,7 @@ mod tests {
         let flat: String = play.split_whitespace().collect();
         let body = &flat[flat.find("fnplan_sync(").unwrap()..];
         let asked = body.find("ifwants_repair(media,repair){").expect("plan_sync routes by wants_repair");
-        assert!(asked < body.find("letdecision=decide(").unwrap());
+        assert!(asked < body.find("letdecision=decide_for_file(").unwrap());
         // Without the cache there is no copy to make: the branch plays the
         // file as it is, exactly like the normal path without one. With it,
         // the real steps.
@@ -2016,5 +2129,239 @@ mod tests {
         assert!(memo.0.is_poisoned(), "fixture must be poisoned");
         assert_eq!(scans_for(2), 0, "remembered through the poison");
         assert_eq!(scans_for(SCAN_MEMO_LEN + 1), 1, "and still learning");
+    }
+
+    /* ---- fragmented files ---- */
+
+    /// Every row of the decision table, every row told "this file is
+    /// fragmented": only the one `decide()` plays as it is AND that is a
+    /// video becomes `Defragment`, and the layout is asked of nothing else (a
+    /// read of every MKV, still and song on each viewer step would be work
+    /// for nothing). A generator is a video kind with no file: never asked.
+    #[test]
+    fn only_a_video_played_as_it_is_is_asked_about_its_layout() {
+        let mut rows = decision_table();
+        let mut generated = media("video", r"C:\v\a.mp4");
+        generated.container = Some("mov,mp4,m4a,3gp,3g2,mj2".into());
+        generated.vcodec = Some("h264".into());
+        generated.generator = Some(crate::project::schema::Generator::Solid { color: "#abcdef".into() });
+        rows.push(("solid generator", generated.clone(), NO_HINTS, false, decide(&generated, NO_HINTS, false), PlaybackClass::Direct));
+        assert_eq!(decide(&generated, NO_HINTS, false), Decision::Direct, "fixture: a generator decide() plays as it is");
+        let mut turned = 0;
+        for (name, m, hints, force, decision, _) in &rows {
+            let asked = std::cell::Cell::new(false);
+            let got = with_layout(decide(m, *hints, *force), m, |_| {
+                asked.set(true);
+                true
+            });
+            let video_direct = *decision == Decision::Direct && m.kind == "video" && m.generator.is_none();
+            assert_eq!(asked.get(), video_direct, "{name}: asked");
+            assert_eq!(got, if video_direct { Decision::Defragment } else { *decision }, "{name}");
+            // Told "not fragmented", nothing changes at all.
+            assert_eq!(with_layout(*decision, m, |_| false), *decision, "{name}");
+            turned += usize::from(video_direct);
+        }
+        assert_eq!(turned, 2, "the table's two direct videos (the 4K row allowed) turn");
+    }
+
+    /// A `Defragment` is the `Remux` class — the one both consumers prepare
+    /// before playing — never `ContainerOnly`, whose file the viewer tries as
+    /// it is first, whatever its audio.
+    #[test]
+    fn a_defragment_is_the_remux_class_whatever_its_audio() {
+        for acodec in [Some("aac"), Some("opus"), Some("flac"), Some("pcm_s16le"), None] {
+            let mut m = media("video", r"C:\v\rec.mp4");
+            m.acodec = acodec.map(Into::into);
+            assert_eq!(class_of(Decision::Defragment, &m), PlaybackClass::Remux, "{acodec:?}");
+            assert_eq!(info_for(None, &m, Decision::Defragment).class, PlaybackClass::Remux, "{acodec:?}");
+        }
+    }
+
+    /// An MP4 on disk, its `moov` holding an `mvex` or not, described by a
+    /// media entry with its real size and mtime and codecs `decide()` plays
+    /// as they are.
+    struct OnDisk {
+        dir: PathBuf,
+        cache: Cache,
+    }
+
+    impl OnDisk {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("taroting-defrag-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let cache = Cache::new_at(dir.join("cache"));
+            OnDisk { dir, cache }
+        }
+
+        fn mp4(&self, file: &str, fragmented: bool) -> MediaRef {
+            fn bx(typ: &[u8; 4], body: &[u8]) -> Vec<u8> {
+                let mut v = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+                v.extend_from_slice(typ);
+                v.extend_from_slice(body);
+                v
+            }
+            let mut moov = [bx(b"mvhd", &[0; 100]), bx(b"trak", &[0; 40])].concat();
+            if fragmented {
+                moov.extend(bx(b"mvex", &bx(b"trex", &[0; 24])));
+            }
+            let path = self.dir.join(file);
+            std::fs::write(&path, [bx(b"ftyp", b"isom\0\0\x02\0"), bx(b"moov", &moov), bx(b"mdat", &[7; 64])].concat()).unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            let mut m = media("video", path.to_str().unwrap());
+            m.size = meta.len();
+            m.mtime_ms = meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            m.container = Some("mov,mp4,m4a,3gp,3g2,mj2".into());
+            m.vcodec = Some("h264".into());
+            m.acodec = Some("aac".into());
+            m.pix_fmt = Some("yuv420p".into());
+            m.bit_depth = Some(8);
+            m.has_audio = true;
+            m
+        }
+
+        /// Put `m`'s prepared copy for `decision` in the cache.
+        fn prepare(&self, m: &MediaRef, decision: Decision) -> PathBuf {
+            let (kind, suffix) = prepared_target(&decision).expect("a decision with a copy");
+            self.cache.ensure_kind_dir(kind).unwrap();
+            let p = self.cache.file_path(kind, &media_key(m).hash(), suffix);
+            std::fs::write(&p, b"defragmented").unwrap();
+            p
+        }
+    }
+
+    impl Drop for OnDisk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A fragmented file `decide()` would play as it is is planned as its
+    /// defragmented copy: class `Remux`, the remux's cache file, "prepared"
+    /// once that file exists — so the viewer's second open plans `ready` at
+    /// once and never shows "preparing". Its twin with the SAME codecs and
+    /// no `mvex` stays direct, with nothing to prepare even when a remux-named
+    /// file sits under its key.
+    #[test]
+    fn a_fragmented_file_is_played_from_its_defragmented_copy() {
+        let d = OnDisk::new("plan");
+        let frag = d.mp4("Replay 2026-11-10.mp4", true);
+        let plain = d.mp4("Ordinary.mp4", false);
+        for m in [&frag, &plain] {
+            assert_eq!(decide(m, NO_HINTS, false), Decision::Direct, "fixture: {}", m.path);
+        }
+        assert_eq!(decide_for_file(&frag, NO_HINTS, false), Decision::Defragment);
+        assert_eq!(decide_for_file(&plain, NO_HINTS, false), Decision::Direct);
+
+        let before = classify_info(Some(&d.cache), &frag, NO_HINTS, false);
+        assert_eq!((before.class, before.prepared, before.repaired), (PlaybackClass::Remux, false, false));
+        let copy = d.prepare(&frag, Decision::Defragment);
+        assert_eq!(prepared_target(&Decision::Defragment), prepared_target(&Decision::Remux { audio_copy_ok: true }));
+        let after = classify_info(Some(&d.cache), &frag, NO_HINTS, false);
+        assert_eq!((after.class, after.prepared), (PlaybackClass::Remux, true), "cached: {}", copy.display());
+
+        d.prepare(&plain, Decision::Defragment);
+        let ordinary = classify_info(Some(&d.cache), &plain, NO_HINTS, false);
+        assert_eq!((ordinary.class, ordinary.prepared), (PlaybackClass::Direct, false));
+
+        // Without a cache the class is still the remux's, with nothing prepared;
+        // `plan_sync` then plays the original (pinned below).
+        let bare = classify_info(None, &frag, NO_HINTS, false);
+        assert_eq!((bare.class, bare.prepared), (PlaybackClass::Remux, false));
+    }
+
+    /// A fragmented file that needs a proxy anyway (10-bit, or 4K with the
+    /// large-file proxy on) keeps the proxy: the layout is never asked.
+    #[test]
+    fn a_fragmented_file_that_needs_a_proxy_keeps_it() {
+        let d = OnDisk::new("proxy");
+        let mut ten = d.mp4("ten-bit.mp4", true);
+        ten.pix_fmt = Some("yuv420p10le".into());
+        ten.bit_depth = Some(10);
+        assert_eq!(decide_for_file(&ten, NO_HINTS, false), Decision::Proxy);
+        assert_eq!(classify_info(Some(&d.cache), &ten, NO_HINTS, false).class, PlaybackClass::Proxy);
+        let mut big = d.mp4("4k.mp4", true);
+        big.width = Some(3840);
+        big.height = Some(2160);
+        assert_eq!(decide_for_file(&big, NO_HINTS, true), Decision::Proxy, "large forced");
+        assert_eq!(decide_for_file(&big, NO_HINTS, false), Decision::Defragment, "large allowed");
+    }
+
+    /// A fragmented file that is not the file its entry describes — grown or
+    /// rewritten since it was probed (a recording still going) — plays as it
+    /// always did: nothing would be cached under a key that names it.
+    #[test]
+    fn a_fragmented_file_that_changed_since_its_probe_plays_as_it_is() {
+        let d = OnDisk::new("changed");
+        let frag = d.mp4("Recording.mp4", true);
+        let (mut grown, mut touched) = (frag.clone(), frag.clone());
+        grown.size -= 1;
+        touched.mtime_ms += 1;
+        for (name, m) in [("size", &grown), ("mtime", &touched)] {
+            assert_eq!(decide_for_file(m, NO_HINTS, false), Decision::Direct, "{name}");
+            assert_eq!(classify_info(Some(&d.cache), m, NO_HINTS, false).class, PlaybackClass::Direct, "{name}");
+        }
+        // And one that is gone, or never was a file.
+        std::fs::remove_file(&frag.path).unwrap();
+        assert_eq!(decide_for_file(&frag, NO_HINTS, false), Decision::Direct, "gone");
+        let mut url = frag.clone();
+        url.path = "https://example.com/clip.mp4".into();
+        assert_eq!(decide_for_file(&url, NO_HINTS, false), Decision::Direct, "a URL");
+    }
+
+    /// `plan_sync`: the repair route is asked first (a fragmented file the
+    /// WebView refused gets the repair plan, which reads the original), then
+    /// the file's own decision; without a cache it plays the original. Pinned
+    /// in the source: the command needs an `AppHandle`.
+    #[test]
+    fn plan_sync_plans_the_files_own_decision_and_falls_back_without_a_cache() {
+        let play = include_str!("playability.rs").split("#[cfg(test)]").next().unwrap();
+        let flat: String = play.split_whitespace().collect();
+        let body = &flat[flat.find("fnplan_sync(").unwrap()..flat.find("typeRecipeArgs").unwrap()];
+        let repair = body.find("ifwants_repair(media,repair){").unwrap();
+        let decided = body.find("letdecision=decide_for_file(media,hints,force_proxy_large);").expect("decided by the file");
+        let no_cache = body.find("letSome(cache)=app.try_state::<Arc<Cache>>()else{returndirect(media);};ensure_prepared(").expect("no cache: the original");
+        assert!(repair < decided && decided < no_cache);
+        assert!(!body[decided..].contains("decide(media"), "one decision, the file's");
+    }
+
+    /// The real thing with the bundled ffmpeg: the defragmented copy of the
+    /// OBS-like fixture (`tests/fixtures/fragmented_h264.mp4`, from
+    /// `npm run fixtures`) is an ordinary MP4 — not fragmented, its keyframes
+    /// readable for the viewer's seek pacer where the original's are not —
+    /// with both streams copied, not re-encoded.
+    #[test]
+    fn the_defragmented_copy_of_a_real_fragmented_file_is_ordinary() {
+        use crate::jobs::ffmpeg;
+        use crate::media::keyframes::keyframe_index;
+        let fixture = fragmented::tests::repo_fixture("fragmented_h264.mp4");
+        assert!(fixture.exists(), "{} is missing: run `npm run fixtures`", fixture.display());
+        let src = fixture.to_str().unwrap();
+        assert_eq!(fragmented::is_fragmented(src), Some(true), "fixture");
+        assert_eq!(keyframe_index(&fixture), None, "fixture: the original's keyframes are not read");
+
+        /// The scratch folder goes whether the test passes or panics.
+        struct Gone(PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Gone(std::env::temp_dir().join(format!("taroting-defrag-real-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let out = dir.0.join("copy.mp4");
+        let (kind, args_for) = recipe(Decision::Defragment).unwrap();
+        assert_eq!(kind, JobKind::Remux);
+        let run = ffmpeg::command("ffmpeg").unwrap().args(args_for(&fixture, &out)).output().unwrap();
+        assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(fragmented::is_fragmented(out.to_str().unwrap()), Some(false), "the copy is not fragmented");
+        let index = keyframe_index(&out).expect("the copy's keyframes are read");
+        assert!(!index.all_sync && index.times.len() >= 5, "{index:?}");
+        assert!((index.duration - 40.0).abs() < 0.5, "{index:?}");
+        let (a, b) = (probe::probe_sync(src).unwrap(), probe::probe_sync(out.to_str().unwrap()).unwrap());
+        assert_eq!((b.vcodec.as_deref(), b.acodec.as_deref()), (Some("h264"), Some("aac")));
+        assert_eq!((b.width, b.height, b.audio_rate), (a.width, a.height, a.audio_rate));
+        assert!(b.container.unwrap_or_default().contains("mp4"));
     }
 }

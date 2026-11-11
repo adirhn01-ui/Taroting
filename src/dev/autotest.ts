@@ -4126,6 +4126,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     await (await import("./autotest-home")).runHomeBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-fonts")).runFontBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await runDamagedVideoBlocks(test, fixturesDir);
+    await runFragmentedEditorBlock(test, fixturesDir);
   } catch (e) {
     results.push({ name: "setup", pass: false, detail: String(e) });
   }
@@ -4549,6 +4550,184 @@ interface ViewerDevHook {
   lastClass: PlaybackClass | null;
   jobId: number | null;
   path(): string;
+}
+
+/* ------------------------------------------------------------------ */
+/* A fragmented MP4 in the editor (owner's call, 2026-11-11): played  */
+/* from its defragmented copy, never as it is                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * WebView2 157 fails a seek into a FRAGMENTED MP4 (OBS's layout: an mvex in
+ * the moov, moof/mdat fragments) while it plays — MediaError 2, "demuxer seek
+ * failed" — and the editor takes a code 2 for a file it cannot play at all:
+ * the bin row "This file couldn't be played", every clip black until a
+ * re-import. So the backend plans such a file as a stream copy into an
+ * ordinary MP4 (playability.rs `Decision::Defragment`, the remux recipe), and
+ * the editor's stage never gets the original. Asserted on what plays: the
+ * media ready on a cache copy, the stage's <video> on that copy (not the
+ * fixture), no media error, a bin row that is not failed, and two playhead
+ * positions presenting two different frames, then a short play that decodes.
+ * The viewer block (viewer-fragmented-scrub) runs earlier and usually leaves
+ * the copy cached; a cold cache waits for the ~30 MB stream copy.
+ */
+async function runFragmentedEditorBlock(
+  test: (name: string, fn: () => Promise<string> | string) => Promise<void>,
+  fixturesDir: string,
+): Promise<void> {
+  const FILE = `${fixturesDir}\\fragmented_h264.mp4`;
+  const isFixture = (p: string): boolean => /(^|[\\/])fragmented_h264\.mp4$/i.test(p);
+  const isRemuxCopy = (p: string): boolean => /[\\/]remux[\\/][0-9a-f]+\.mp4$/i.test(p);
+  const $ = <E extends Element = HTMLElement>(sel: string): E | null => document.querySelector<E>(sel);
+  const editorHook = (): DevHook | undefined => (window as unknown as { __tarotingDev?: DevHook }).__tarotingDev;
+
+  await test("editor-fragmented-plays-copy", async () => {
+    const t0 = performance.now();
+    let path = "";
+    const refusals = recordRefusals();
+    let watching = true;
+    try {
+      assert(await ipc.pathExists(FILE), `fixture ${FILE} is missing — run npm run fixtures`);
+      const info = await ipc.probeMedia(FILE);
+      assert(info.kind === "video" && info.hasAudio, `fragmented_h264.mp4 probed as ${info.kind}, hasAudio ${String(info.hasAudio)}`);
+      path = await ipc.newProjectPath("Autotest fragmented video");
+      await ipc.saveProject(path, importMediaAsClip(createProject("Autotest fragmented video"), info).project);
+
+      const prev = editorHook();
+      navigate({ view: "editor", projectPath: path });
+      const ed = await until(
+        () => {
+          const h = editorHook();
+          return h && h !== prev && $(".editor:not(.imged)") ? h : null;
+        },
+        10_000,
+        () => "the editor to mount on the fragmented-video project",
+      );
+      const mediaId = ed.session.project.media[0]?.id ?? "";
+      assert(mediaId !== "", "the project mounted without its media");
+      const states: string[] = [];
+      const logState = (): void => {
+        const st = ed.media.status.get()[mediaId];
+        const s = st === undefined ? "none" : st.state === "ready" ? `ready on ${lastName(st.sourcePath)}` : st.state === "failed" ? `failed "${st.message}"` : st.state;
+        if (states[states.length - 1] !== s) states.push(s);
+      };
+      logState();
+      const unwatch = ed.media.status.subscribe(logState);
+      const tMount = performance.now();
+      let ready: { sourcePath: string };
+      try {
+        ready = await until(
+          () => {
+            const st = ed.media.status.get()[mediaId];
+            if (st?.state === "failed") throw new Error(`the fragmented clip failed: "${st.message}" — states ${states.join(" → ")}`);
+            return st?.state === "ready" ? st : null;
+          },
+          30_000,
+          () => `the fragmented clip ready — states ${states.join(" → ")}`,
+        );
+      } finally {
+        unwatch();
+      }
+      const readyMs = Math.round(performance.now() - tMount);
+      assert(
+        isRemuxCopy(ready.sourcePath) && !isFixture(ready.sourcePath),
+        `the clip is ready on ${ready.sourcePath} — want the defragmented copy in the cache's remux folder, never the fragmented original`,
+      );
+      const row = $(`.media-row[data-id="${CSS.escape(mediaId)}"]`);
+      assert(row !== null, "the clip has no bin row");
+      assert(!/couldn't be played/i.test(textOf(row)), `the bin row says "${textOf(row)}"`);
+
+      // Playback is measured below: pull the silent harness's audio graph (a
+      // clip with sound advances only while the graph pulls it; see
+      // damaged-video-editor-repair).
+      assert(await ed.audioGraph.devEnsureRunning(), "the editor's AudioContext would not run, so no playback could be measured");
+      ed.audioGraph.devMasterAnalyser();
+
+      let presented = -1;
+      /** The stage's <video> on the copy, settled at `t`, with a frame
+       *  presented there (requestVideoFrameCallback's mediaTime). */
+      const settleAt = async (t: number): Promise<{ v: HTMLVideoElement; sig: number[] }> => {
+        presented = -1;
+        ed.engine.seek(t);
+        let hooked: HTMLVideoElement | null = null;
+        const v = await until(
+          () => {
+            const el = ed.activeVideo();
+            if (el === null) return null;
+            if (hooked !== el) {
+              hooked = el;
+              const on: VideoFrameRequestCallback = (_n, meta) => {
+                presented = meta.mediaTime;
+                if (watching && hooked === el) el.requestVideoFrameCallback(on);
+              };
+              el.requestVideoFrameCallback(on);
+            }
+            // The frame callback is recorded for the failure message only. A
+            // paused element fires it once per new frame, and a seek onto a
+            // cached copy can present its frame before this hook is on the
+            // element, so it cannot be a condition. Which picture is showing
+            // is settled by the signatures compared below.
+            return !el.seeking && el.readyState >= 2 && Math.abs(el.currentTime - t) < 0.05 ? el : null;
+          },
+          4_000,
+          () => {
+            const el = ed.activeVideo();
+            return el
+              ? `the stage's <video> settled at ${t.toFixed(3)} s — on ${lastName(urlPath(el.currentSrc))} at ${el.currentTime.toFixed(3)} s, presented ${presented.toFixed(3)}, readyState ${el.readyState}${el.seeking ? ", seeking" : ""}${el.error ? `, error ${el.error.code}` : ""}`
+              : "the stage's <video> (none active)";
+          },
+        );
+        // Two animation frames and a beat, so the seeked frame is the one
+        // composited before its pixels are read.
+        await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+        await sleep(60);
+        return { v, sig: frameSignature(v) };
+      };
+
+      const T1 = 5.5 + 1 / 60;
+      const T2 = 26.5 + 1 / 60;
+      const a = await settleAt(T1);
+      const src = urlPath(a.v.currentSrc);
+      assert(isRemuxCopy(src) && !isFixture(src), `the stage's <video> plays ${src} — want the defragmented copy, never the fragmented original`);
+      assert(src === urlPath(ready.sourcePath) || src.endsWith(lastName(ready.sourcePath)), `the stage plays ${src}, the media says ${ready.sourcePath}`);
+      assert(pictureSpread(a.sig) > 10, `the frame at ${T1.toFixed(3)} s is flat (spread ${pictureSpread(a.sig).toFixed(1)}): nothing decoded`);
+      const b = await settleAt(T2);
+      const back = await settleAt(T1);
+      const apart = pictureDistance(a.sig, b.sig);
+      const same = pictureDistance(a.sig, back.sig);
+      assert(
+        apart > 4 * same + 0.5,
+        `${T1.toFixed(2)} s and ${T2.toFixed(2)} s presented the same picture (distance ${apart.toFixed(2)}; the same frame read twice differs by ${same.toFixed(2)})`,
+      );
+
+      ed.engine.play();
+      let reading: Awaited<ReturnType<typeof playbackReading>>;
+      try {
+        reading = await playbackReading(back.v, 500);
+      } finally {
+        ed.engine.pause();
+      }
+      assert(reading.ok, `the copy does not play: ${reading.text}`);
+      const errors = refusals.list.filter((r) => isFixture(r.src) || isRemuxCopy(r.src));
+      assert(errors.length === 0, `media error(s) on the fragmented clip: ${describeRefusals(errors)}`);
+      const st = ed.media.status.get()[mediaId];
+      assert(st?.state === "ready", `the clip ended the block ${st?.state ?? "with no status"} — states ${states.join(" → ")}`);
+      return `ready in ${readyMs} ms on ${lastName(ready.sourcePath)} (states ${states.join(" → ")}); stage on the copy; ${T1.toFixed(2)} s vs ${T2.toFixed(2)} s distance ${apart.toFixed(1)} (same frame twice ${same.toFixed(2)}); play: ${reading.text}; no media error — ${Math.round(performance.now() - t0)} ms`;
+    } finally {
+      watching = false;
+      refusals.stop();
+      navigate({ view: "home" });
+      try {
+        await until(() => $(".home") && !$(".editor") && !$("#vw"), 5_000, () => "Home after the fragmented-video block");
+      } catch (e) {
+        console.error("fragmented-video autotest: cleanup did not reach Home", e);
+      }
+      if (path) {
+        await ipc.deleteProject(path).catch(() => {});
+        await ipc.removeRecent(path).catch(() => {});
+      }
+    }
+  });
 }
 
 async function runDamagedVideoBlocks(

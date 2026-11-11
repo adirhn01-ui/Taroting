@@ -2,6 +2,7 @@ pub mod damage;
 pub mod exif;
 pub mod explorer_order;
 pub mod extensions;
+pub mod fragmented;
 pub mod keyframes;
 pub mod normalize;
 pub mod playability;

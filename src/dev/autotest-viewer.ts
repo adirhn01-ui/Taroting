@@ -18,7 +18,7 @@
 // short and every timeout names what WAS on screen: a red run must finish
 // inside the harness's 90 s cap and say why without a rerun.
 
-import { devOverrideMediaPicker, getWindowTitle, ipc, onJobEvents, type PlaybackClass } from "../core/ipc";
+import { devOverrideMediaPicker, getWindowTitle, ipc, mediaUrl, onJobEvents, type PlaybackClass } from "../core/ipc";
 import { navigate } from "../core/nav";
 import { isTempProjectPath } from "../core/open-media";
 import { addMarkerAt, createProject, importMediaAsClip, trimClip } from "../core/project";
@@ -946,15 +946,56 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
     // compositor PRESENTING the frame there (requestVideoFrameCallback's
     // mediaTime — the picture itself; pixels cannot be read back, the
     // viewer's <video> is cross-origin to the page without CORS mode).
+    //
+    // Since the owner's call (2026-11-11) a fragmented MP4 is never handed to
+    // the engine as it is: the viewer plays its defragmented copy (the
+    // remux recipe: stream copy into an ordinary faststart MP4, class
+    // "remux", cached under the file's identity). So the element's source is
+    // a cache file, and the keyframe index the seek pacer reads is the
+    // COPY's (ordinary sample tables: readable), while the original's still
+    // is not. The gestures below are unchanged: on the copy they must all
+    // still land.
     const t0 = performance.now();
     const FILE = `${fixturesDir}\\fragmented_h264.mp4`;
     let log: VideoLog | null = null;
     let watching = true;
+    let statusWatch: ReturnType<typeof setInterval> | null = null;
     try {
       assert(await ipc.pathExists(FILE), `fixture ${FILE} is missing — run npm run fixtures`);
       const index = await ipc.keyframeTimes(FILE);
       assert(index === null, `keyframes.rs indexed the fragmented fixture (${JSON.stringify(index)?.slice(0, 120)}) — it must refuse an mvex file`);
-      const { video, bar } = await openVideoPaused(FILE, 8_000);
+      // The status card while it opens: "preparing" on a cold cache (a ~30 MB
+      // stream copy), nothing at all when the copy is already cached.
+      const seenStatus = new Set<string>();
+      statusWatch = setInterval(() => {
+        if (rendered($("#vw-status"))) seenStatus.add(text("#vw-status").slice(0, 60));
+      }, 20);
+      const o0 = performance.now();
+      const { video, bar } = await openVideoPaused(FILE, 30_000);
+      const openMs = Math.round(performance.now() - o0);
+      clearInterval(statusWatch);
+      statusWatch = null;
+      type FragDev = { lastClass: PlaybackClass | null; videoFile(): string | null; index(): unknown; indexed(): boolean };
+      const fdev = viewerDev() as unknown as Partial<FragDev> | undefined;
+      if (fdev?.videoFile === undefined || fdev.index === undefined || fdev.indexed === undefined) {
+        throw new Error("the viewer's dev hook has no videoFile()/index()/indexed()");
+      }
+      const hookIndex = fdev.index;
+      const hookIndexed = fdev.indexed;
+      assert(fdev.lastClass === "remux", `the fragmented fixture classified ${String(fdev.lastClass)}, not "remux" (the prepared copy)`);
+      const playing = fdev.videoFile() ?? "";
+      assert(
+        /[\\/]remux[\\/][0-9a-f]+\.mp4$/i.test(playing) && baseName(playing) !== baseName(FILE),
+        `the viewer plays ${playing || "nothing"} — want the defragmented copy in the cache's remux folder`,
+      );
+      const src = video.currentSrc;
+      assert(src !== "" && src !== mediaUrl(FILE) && src === mediaUrl(playing), `the <video> plays ${src}, not the copy ${mediaUrl(playing)} (the original is ${mediaUrl(FILE)})`);
+      assert(!decodeURIComponent(src).includes("fragmented_h264"), `the <video>'s source still names the original: ${decodeURIComponent(src)}`);
+      const copyIndex = await ipc.keyframeTimes(playing);
+      if (copyIndex === null || copyIndex.times.length < 5) {
+        throw new Error(`the copy's keyframes are not readable: ${JSON.stringify(copyIndex)?.slice(0, 160)}`);
+      }
+      const statusPart = `opened in ${openMs} ms via ${seenStatus.size > 0 ? `"${[...seenStatus].join('" / "')}"` : "the cached copy (no status card)"}; copy ${baseName(playing)} with ${copyIndex.times.length} keyframes`;
       const d = video.duration;
       assert(Number.isFinite(d) && d > 35 && d < 45, `fragmented_h264.mp4 reports a duration of ${String(d)} s, not ~40 s`);
       log = recordVideo(video, t0);
@@ -1001,6 +1042,14 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
       // 1. A fast burst (moves 4 ms apart) across the whole bar and back.
       let f = await g.drag([...sweep(0.1, 0.95, 18), ...sweep(0.9, 0.2, 14)], 4);
       await settled("burst", f);
+      // The first press asked the seek pacer's index — of the file playing,
+      // the copy, whose tables are readable (the original's answer is null).
+      await until(() => hookIndexed() || null, 3_000, () => "the keyframe index to answer after the first press");
+      const asked = hookIndex() as { times?: number[] } | null;
+      assert(
+        asked !== null && JSON.stringify(asked) === JSON.stringify(copyIndex),
+        `the pacer's index is ${JSON.stringify(asked)?.slice(0, 160)} — want the copy's (${copyIndex.times.length} keyframes), not the original's null`,
+      );
       // 2. Past the right end and back, one move per painted frame.
       f = await g.drag([...sweep(0.3, 1.08, 10), ...sweep(1.05, 0.62, 10)], "frame");
       await settled("overshoot", f);
@@ -1084,8 +1133,9 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
       const delta = c0 && c1
         ? `errors ${lg.errors - E0}, rereads ${c1.rereads - c0.rereads}, failed ${c1.rereadFailures - c0.rereadFailures}, end recoveries ${c1.endRecoveries - c0.endRecoveries}, to loader ${c1.toLoader - c0.toLoader}`
         : "no counts hook";
-      return `${exactPart}; playing sweeps ${sweepRows.join(", ")} (${delta}, loadstarts ${lg.loadstarts - L0}); events ${lg.text(500)} — ${ms(t0)}`;
+      return `${statusPart}; ${exactPart}; playing sweeps ${sweepRows.join(", ")} (${delta}, loadstarts ${lg.loadstarts - L0}); events ${lg.text(500)} — ${ms(t0)}`;
     } finally {
+      if (statusWatch !== null) clearInterval(statusWatch);
       watching = false;
       log?.stop();
       await backHome();

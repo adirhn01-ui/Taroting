@@ -80,6 +80,10 @@ interface ViewerDev {
   heavy(): boolean;
   /** The current source's keyframe index has answered (heavy, light or none). */
   indexed(): boolean;
+  /** That answer (null: unreadable; undefined: not answered yet). */
+  index(): KeyframeIndex | null | undefined;
+  /** The copy on disk the <video> plays, the one the index is asked of. */
+  videoFile(): string | null;
   /** Every seek the pacer assigned since the last press on the seek bar, in
    *  order (`keyframe`: a fast drag's). */
   readonly seeks: { t: number; keyframe: boolean }[];
@@ -463,6 +467,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
         },
         heavy: () => pacer.heavy(),
         indexed: () => indexAnswer !== undefined,
+        index: () => indexAnswer,
+        videoFile: () => videoFile,
         seeks: [],
         lastError: () => devLastError,
         counts: () => ({ ...devCounts }),

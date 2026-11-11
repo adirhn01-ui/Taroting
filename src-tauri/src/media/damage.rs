@@ -244,6 +244,16 @@ pub(super) fn descend<'a>(body: &'a [u8], path: &[&[u8; 4]]) -> Option<&'a [u8]>
 /// Found by walking the top-level box headers, so a recording whose `moov`
 /// sits after a 600 MB `mdat` costs a few seeks, not a read of the `mdat`.
 pub(super) fn read_moov<R: Read + Seek>(r: &mut Reader<R>) -> Option<Vec<u8>> {
+    let (at, body) = find_moov(r)?;
+    if body > MAX_MOOV {
+        return None;
+    }
+    r.owned(at, body)
+}
+
+/// Where the top-level `moov` box's body is: (file offset, length). Only the
+/// top-level box headers are read, never a body.
+pub(super) fn find_moov<R: Read + Seek>(r: &mut Reader<R>) -> Option<(u64, u64)> {
     let mut at = 0u64;
     for _ in 0..MAX_TOP_BOXES {
         if r.len - at < 8 {
@@ -252,15 +262,37 @@ pub(super) fn read_moov<R: Read + Seek>(r: &mut Reader<R>) -> Option<Vec<u8>> {
         let head = r.bytes(at, (r.len - at).min(16) as usize)?.to_vec();
         let (typ, header, size) = box_header(&head, at, r.len)?;
         if &typ == b"moov" {
-            let body = size - header;
-            if body > MAX_MOOV {
-                return None;
-            }
-            return r.owned(at + header, body);
+            return Some((at + header, size - header));
         }
         at += size;
     }
     None
+}
+
+/// The types of the children of the box body at file offset `at`, `len`
+/// bytes long, read from their headers alone — a `moov`'s children without
+/// reading its sample tables (up to `MAX_MOOV` on a long recording). `None`
+/// when a child is malformed, as `children` answers, or when there are more
+/// than `MAX_TOP_BOXES` of them (a real `moov` has a handful: `mvhd`, a
+/// `trak` per stream, `udta`, `mvex`).
+pub(super) fn child_types<R: Read + Seek>(r: &mut Reader<R>, at: u64, len: u64) -> Option<Vec<[u8; 4]>> {
+    let end = at.checked_add(len)?;
+    if end > r.len {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut pos = at;
+    // A tail shorter than a box header is ignored, as `children` ignores it.
+    while end - pos >= 8 {
+        if out.len() >= MAX_TOP_BOXES {
+            return None;
+        }
+        let head = r.bytes(pos, (end - pos).min(16) as usize)?.to_vec();
+        let (typ, _, size) = box_header(&head, pos, end)?;
+        out.push(typ);
+        pos += size;
+    }
+    Some(out)
 }
 
 /* ------------------------------------------------------------------ */
@@ -314,7 +346,7 @@ impl<'a> VideoTrack<'a> {
     fn parse(moov: &'a [u8]) -> Option<Self> {
         let top = children(moov)?;
         // A fragmented file's samples live in `moof` boxes this does not read.
-        if top.iter().any(|(t, _)| t == b"mvex") {
+        if super::fragmented::has_mvex(top.iter().map(|(t, _)| t)) {
             return None;
         }
         // The FIRST video track, as ffmpeg's `0:v:0` (the stream the instant
