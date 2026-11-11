@@ -39,15 +39,17 @@ import {
   type PDFRef,
 } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
-import type { FontFamily, MediaRef, PdfAnnot, PdfTextStyle, ProjectFile } from "../../core/types";
+import type { FontFamily, FontRequest, MediaRef, PdfAnnot, PdfTextStyle, ProjectFile, ResolvedFont } from "../../core/types";
+import { fontDisplayName, fontRequestOf } from "../../core/font-id";
 import { decodePoints } from "../../image/strokes";
 import { outlinePolygon, penHalfWidth, pencilHalfWidth, type HalfWidth } from "../../image/ink/outline";
 import { arrowWings } from "../../image/ink/shapes";
-import { hasArabic, paragraphBidi, visualLine } from "./bidi";
-import type { ExportDeps } from "./deps";
+import { normalizeRuns, rowMetrics, segmentsOf, type PdfResolvedStyle, type RowPiece } from "../../core/pdf-runs";
+import { hasArabic, paragraphBidi, visualGroups, visualLine } from "./bidi";
+import type { ExportDeps, RasterTextRun } from "./deps";
 import { PdfExportError, baseName } from "./errors";
 import { displayedOf, prepareImage, type Orientation } from "./images";
-import { LINE_HEIGHT, rasterScale, wrapParagraph } from "./layout";
+import { LINE_HEIGHT, rangeMeasurer, rasterScale, wrapRanges, type MeasurePiece } from "./layout";
 
 export { RASTER_SCALE } from "./layout";
 
@@ -182,6 +184,12 @@ export interface MarkCtx {
   project: ProjectFile;
   deps: ExportDeps;
   font(family: FontFamily, bold: boolean, italic: boolean): Promise<EmbeddedFont>;
+  /** A non-legacy font (`fonts_resolve`, once per request): null when it is
+   *  not on this PC; the box then exports in its legacy font. */
+  resolveFont(req: FontRequest): Promise<ResolvedFont | null>;
+  /** A resolved non-legacy face, embedded by its embedding policy ("full":
+   *  subset; "noSubset": whole; "none": refused, naming the font). */
+  fontFile(r: ResolvedFont): Promise<EmbeddedFont>;
   image(mediaId: string): Promise<{ img: PDFImage; orientation: Orientation }>;
 }
 
@@ -454,10 +462,23 @@ async function textAppearance(
   const c = hexRgb(a.c);
   const size = a.size;
   const lh = size * LINE_HEIGHT;
-  // Impact has no bold or italic face: drawn plain, as the editor shows it
-  const plain = a.font === "Impact";
-  const bold = !plain && !!a.bold;
-  const italic = !plain && !!a.italic;
+  const baseStyle: PdfResolvedStyle = {
+    font: a.font,
+    ...(a.fontId !== undefined ? { fontId: a.fontId } : {}),
+    size,
+    c: a.c,
+    bold: !!a.bold,
+    italic: !!a.italic,
+  };
+  const base = await faceOf(baseStyle, cx);
+  const { lib, bold, italic } = base;
+  // Style runs (0.9.4): every piece of the text with its own style and face.
+  // A box without runs (or whose runs say nothing) is ONE piece in the base
+  // style, drawn exactly as before (invariant R1).
+  const styled = normalizeRuns(text, a, a.runs) !== undefined;
+  const segs = styled ? segmentsOf(text, a, a.runs) : text ? [{ s: 0, e: text.length, style: baseStyle }] : [];
+  const segFaces: Face[] = [];
+  for (const sg of segs) segFaces.push(styled ? await faceOf(sg.style, cx) : base);
   const clip = `${num(frame[0])} ${num(frame[1])} ${num(W)} ${num(H)} re W n`;
   const back = boxBackOps(a, rect);
   const annot: Record<string, unknown> = {
@@ -472,15 +493,33 @@ async function textAppearance(
     const png = await cx.deps.rasterizeText({
       text,
       font: a.font,
+      ...(lib ? { fontId: lib.requested } : {}),
       bold,
       italic,
       size,
-      color: `#${[...c].map((v) => Math.round(v * 255).toString(16).padStart(2, "0")).join("")}`,
+      color: hexOf(c),
       align: a.align,
       w: W,
       h: H,
       scale: rasterScale(W, H),
       lineHeight: lh,
+      ...(styled
+        ? {
+            runs: segs.map((sg, i): RasterTextRun => {
+              const f = segFaces[i]!;
+              return {
+                s: sg.s,
+                e: sg.e,
+                font: sg.style.font,
+                ...(f.lib ? { fontId: f.lib.requested } : {}),
+                bold: f.bold,
+                italic: f.italic,
+                size: sg.style.size,
+                color: hexOf(hexRgb(sg.style.c)),
+              };
+            }),
+          }
+        : {}),
     });
     const img = await cx.doc.embedPng(png);
     return {
@@ -491,27 +530,115 @@ async function textAppearance(
     };
   }
 
-  const { font, ascent, descent } = await cx.font(a.font, bold, italic);
-  const asc = ascent * size;
-  const desc = descent * size;
-  const lines: string[] = [];
+  // Faces embedded once each, named F0 (the box's own) .. Fn in first use.
+  const baseEmb = await embedFace(base, cx);
+  const names = new Map<EmbeddedFont, string>([[baseEmb, "F0"]]);
+  const pieces: { emb: EmbeddedFont; name: string; size: number; rg: string; row: RowPiece }[] = [];
+  for (let i = 0; i < segs.length; i++) {
+    const emb = styled ? await embedFace(segFaces[i]!, cx) : baseEmb;
+    let name = names.get(emb);
+    if (name === undefined) names.set(emb, (name = `F${names.size}`));
+    const sz = segs[i]!.style.size;
+    const rg = styled ? rgbOps(hexRgb(segs[i]!.style.c), "rg") : rgbOps(c, "rg");
+    pieces.push({ emb, name, size: sz, rg, row: { size: sz, asc: emb.ascent * sz, desc: emb.descent * sz } });
+  }
+  const asc = baseEmb.ascent * size;
+  const desc = baseEmb.descent * size;
+  const strut: RowPiece = { size, asc, desc };
+  const segAt = (i: number): number => {
+    let lo = 0;
+    let hi = segs.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (segs[mid]!.e <= i) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  const parts: string[] = [];
+  let tf = "";
+  let rg = "";
   let row = 0;
+  let top = 0;
+  let ps = 0;
   for (const para of text.split(/\r\n|\r|\n/)) {
     const bidi = paragraphBidi(para);
-    for (const [s, e] of wrapParagraph(para, W, (t) => font.widthOfTextAtSize(t, size))) {
-      const baseline = row * lh + (lh - (asc + desc)) / 2 + asc;
-      row++;
-      if (baseline - asc > H) break; // fully below the frame: clipped anyway
-      const visual = visualLine(bidi, s, e);
-      if (!visual) continue;
-      const lw = font.widthOfTextAtSize(visual, size);
-      const lx = alignX(a.align, W, lw);
-      lines.push(`1 0 0 1 ${num(frame[0] + lx)} ${num(frame[3] - baseline)} Tm ${encodeVisual(font, visual)} Tj`);
+    // the paragraph's pieces, offsets into the paragraph
+    const local: (MeasurePiece & { seg: number })[] = [];
+    if (para) for (let k = segAt(ps); k < segs.length && segs[k]!.s < ps + para.length; k++) {
+      local.push({ s: Math.max(segs[k]!.s, ps) - ps, e: Math.min(segs[k]!.e, ps + para.length) - ps, seg: k });
     }
+    const measure = rangeMeasurer(local, (k, s, e) => {
+      const p = pieces[local[k]!.seg]!;
+      return p.emb.font.widthOfTextAtSize(para.slice(s, e), p.size);
+    });
+    for (const [s, e] of wrapRanges(para, W, measure)) {
+      let baseline: number;
+      if (!styled) {
+        baseline = row * lh + (lh - (asc + desc)) / 2 + asc;
+        row++;
+        if (baseline - asc > H) break; // fully below the frame: clipped anyway
+      } else {
+        const on = local.filter((p) => p.s < e && p.e > s).map((p) => pieces[p.seg]!.row);
+        const m = rowMetrics(on, strut);
+        baseline = top + m.baseline;
+        top += m.height;
+        if (baseline - Math.max(asc, ...on.map((p) => p.asc)) > H) break;
+      }
+      let groups: { seg: number; text: string }[];
+      if (!styled) {
+        const visual = visualLine(bidi, s, e);
+        groups = visual ? [{ seg: 0, text: visual }] : [];
+      } else {
+        groups = visualGroups(bidi, s, e, (i) => segAt(ps + i));
+      }
+      if (!groups.length) continue;
+      const widths = groups.map((g) => pieces[g.seg]!.emb.font.widthOfTextAtSize(g.text, pieces[g.seg]!.size));
+      let x = alignX(a.align, W, widths.reduce((t, w) => t + w, 0));
+      groups.forEach((g, i) => {
+        const p = pieces[g.seg]!;
+        const f = `/${p.name} ${num(p.size)} Tf`;
+        if (f !== tf) parts.push((tf = f));
+        if (p.rg !== rg) parts.push((rg = p.rg));
+        parts.push(`1 0 0 1 ${num(frame[0] + x)} ${num(frame[3] - baseline)} Tm ${encodeVisual(p.emb.font, g.text)} Tj`);
+        x += widths[i]!;
+      });
+    }
+    ps += para.length + (text.startsWith("\r\n", ps + para.length) ? 2 : 1);
   }
-  const ops = back + (lines.length ? `q ${turn}${clip} BT /F0 ${num(size)} Tf ${rgbOps(c, "rg")} ${lines.join(" ")} ET Q` : "");
-  return { rect, ops: ops.trimEnd(), resources: { Font: { F0: font.ref } }, annot };
+  const ops = back + (parts.length ? `q ${turn}${clip} BT ${parts.join(" ")} ET Q` : "");
+  const fonts: Record<string, PDFRef> = {};
+  for (const [emb, name] of names) fonts[name] = emb.font.ref;
+  return { rect, ops: ops.trimEnd(), resources: { Font: fonts }, annot };
 }
+
+/** The face one style draws with: a non-legacy font that is on this PC draws
+ *  with the face it resolved; a style without one (or whose font is missing
+ *  here) takes the legacy path, exactly as 0.9.3: no fonts_resolve call at
+ *  all without a fontId (I1). */
+interface Face {
+  font: FontFamily;
+  lib: ResolvedFont | null;
+  bold: boolean;
+  italic: boolean;
+}
+
+async function faceOf(st: PdfResolvedStyle, cx: MarkCtx): Promise<Face> {
+  const req = fontRequestOf(st.font, st.fontId, st.bold, st.italic);
+  const lib = req === null ? null : await cx.resolveFont(req);
+  // Impact has no bold or italic face: drawn plain, as the editor shows it
+  const plain = lib === null && st.font === "Impact";
+  return { font: st.font, lib, bold: lib ? lib.bold : !plain && st.bold, italic: lib ? lib.italic : !plain && st.italic };
+}
+
+/** Embedded once per document: `cx` caches by face, so equal faces are the
+ *  same object. */
+function embedFace(f: Face, cx: MarkCtx): Promise<EmbeddedFont> {
+  return f.lib ? cx.fontFile(f.lib) : cx.font(f.font, f.bold, f.italic);
+}
+
+const hexOf = (c: [number, number, number]): string =>
+  `#${c.map((v) => Math.round(v * 255).toString(16).padStart(2, "0")).join("")}`;
 
 /** A text box's fill and 1 pt border (each optional), behind its text: the
  *  page-space box itself — the same for every turn, as the box does not turn
@@ -613,16 +740,20 @@ export function placeAppearances(
   });
 }
 
-export async function embedWithMetrics(doc: PDFDocument, bytes: Uint8Array): Promise<EmbeddedFont> {
+/** `subset: false` embeds the whole file (a font whose license allows
+ *  embedding only unsubsetted). */
+export async function embedWithMetrics(doc: PDFDocument, bytes: Uint8Array, subset = true): Promise<EmbeddedFont> {
   const face = fontkit.create(bytes) as unknown as { ascent: number; descent: number; unitsPerEm: number };
   const upm = face.unitsPerEm > 0 ? face.unitsPerEm : 1000;
-  const font = await doc.embedFont(bytes, { subset: true });
+  const font = await doc.embedFont(bytes, { subset });
   return { font, ascent: Math.abs(face.ascent) / upm, descent: Math.abs(face.descent) / upm };
 }
 
 /** Load, cache and embed fonts and pictures for one document. */
 export function markContext(doc: PDFDocument, project: ProjectFile, deps: ExportDeps): MarkCtx {
   const fonts = new Map<string, Promise<EmbeddedFont>>();
+  const resolved = new Map<string, Promise<ResolvedFont | null>>();
+  const files = new Map<string, Promise<EmbeddedFont>>();
   const images = new Map<string, Promise<{ img: PDFImage; orientation: Orientation }>>();
   const style = (bold: boolean, italic: boolean): string =>
     bold && italic ? " (bold italic)" : bold ? " (bold)" : italic ? " (italic)" : "";
@@ -645,6 +776,47 @@ export function markContext(doc: PDFDocument, project: ProjectFile, deps: Export
           return embedWithMetrics(doc, bytes);
         })();
         fonts.set(key, p);
+      }
+      return p;
+    },
+    resolveFont(req) {
+      const key = `${req.id}|${req.bold}|${req.italic}`;
+      let p = resolved.get(key);
+      if (!p) {
+        p = deps.resolveFonts([req]).then(
+          (out) => {
+            const r = out[0];
+            // `found` first: a missing font's other fields are empty
+            return r && r.found === true && typeof r.path === "string" && r.path !== "" ? r : null;
+          },
+          () => null,
+        );
+        resolved.set(key, p);
+      }
+      return p;
+    },
+    fontFile(r) {
+      const key = `${r.path}|${r.embed}`;
+      let p = files.get(key);
+      if (!p) {
+        p = (async () => {
+          const name = fontDisplayName(r.requested);
+          if (r.embed === "none") {
+            throw new PdfExportError(
+              "font-restricted",
+              `The font ${name} can't go in a PDF because its license doesn't allow it, so pick another font for the text that uses it.`,
+            );
+          }
+          const bytes = await deps.readBytes(r.path).catch(() => null);
+          if (!bytes) {
+            throw new PdfExportError(
+              "font-missing",
+              `The font ${name} couldn't be read, so a text box that uses it cannot be exported. Pick another font for it and export again.`,
+            );
+          }
+          return embedWithMetrics(doc, bytes, r.embed !== "noSubset");
+        })();
+        files.set(key, p);
       }
       return p;
     },

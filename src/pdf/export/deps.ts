@@ -4,7 +4,7 @@
 // rasterized by the WebView's own canvas.
 
 import { ipc, mediaUrl } from "../../core/ipc";
-import type { FontFamily } from "../../core/types";
+import type { FontFamily, FontId, FontRequest, ResolvedFont } from "../../core/types";
 
 /* ---------------- the slice of pdf.js export uses ---------------- */
 
@@ -44,6 +44,9 @@ export interface EncodedImage {
 export interface RasterTextSpec {
   text: string;
   font: FontFamily;
+  /** a non-legacy font that resolved on this PC (absent: `font`, as 0.9.3);
+   *  `bold` / `italic` are then the face it resolved */
+  fontId?: FontId;
   bold: boolean;
   italic: boolean;
   /** points */
@@ -57,6 +60,23 @@ export interface RasterTextSpec {
   scale: number;
   /** line height in points */
   lineHeight: number;
+  /** a box with style runs (0.9.4) only: its pieces in order, covering
+   *  `text` without gaps; each drawn in its own face, size and colour
+   *  (`fontId`, `bold`, `italic` as for the box itself) */
+  runs?: RasterTextRun[];
+}
+
+/** One piece of a raster text box with style runs: `text[s, e)`. */
+export interface RasterTextRun {
+  s: number;
+  e: number;
+  font: FontFamily;
+  fontId?: FontId;
+  bold: boolean;
+  italic: boolean;
+  /** points */
+  size: number;
+  color: string;
 }
 
 export interface ExportDeps {
@@ -66,8 +86,13 @@ export interface ExportDeps {
   /** null when the file does not exist */
   fileStat(path: string): Promise<{ size: number; mtimeMs: number } | null>;
   readBytes(path: string): Promise<Uint8Array>;
-  /** the face's file bytes, or null when it is not installed */
+  /** the face's file bytes, or null when it is not installed (the six
+   *  legacy fonts only: `system_font_path`) */
   fontBytes(family: FontFamily, bold: boolean, italic: boolean): Promise<Uint8Array | null>;
+  /** non-legacy fonts (`fonts_resolve`): one answer per request, in order;
+   *  the bytes are then read with `readBytes(path)`. Never asked for a mark
+   *  without a `fontId` (I1). */
+  resolveFonts(reqs: FontRequest[]): Promise<ResolvedFont[]>;
   /** decode a picture pdf-lib cannot embed directly (WebP, BMP, a PNG with an
    *  orientation tag the WebView honours…) into PNG, UNTURNED */
   decodeImage(bytes: Uint8Array, mime: string): Promise<Uint8Array>;
@@ -125,6 +150,34 @@ function canvasToPng(canvas: OffscreenCanvas): Promise<Uint8Array> {
   return canvas.convertToBlob({ type: "image/png" }).then(async (b) => new Uint8Array(await b.arrayBuffer()));
 }
 
+/** The canvas alias of a raster spec's non-legacy font, loaded first (the
+ *  font runtime, imported only when a text box names one); undefined when it
+ *  did not load, so the box draws in its legacy font. */
+export async function rasterAlias(spec: RasterTextSpec): Promise<string | undefined> {
+  const fonts = await import("../../fonts");
+  const req: FontRequest = { id: spec.fontId!, bold: spec.bold, italic: spec.italic };
+  await fonts.ensureFonts([req]).catch(() => {});
+  const f = fonts.fontFace(spec.font, spec.fontId, spec.bold, spec.italic);
+  return f.missing ? undefined : f.family;
+}
+
+/** `rasterAlias` for a spec with style runs: every non-legacy face (the box's
+ *  own and each run's) loaded in ONE runtime call first, then each alias;
+ *  undefined where none or it did not load. */
+export async function rasterAliases(spec: RasterTextSpec): Promise<{ base?: string; runs: (string | undefined)[] }> {
+  const all = [spec, ...(spec.runs ?? [])];
+  if (all.every((r) => r.fontId === undefined)) return { runs: (spec.runs ?? []).map(() => undefined) };
+  const fonts = await import("../../fonts");
+  const reqs: FontRequest[] = all.filter((r) => r.fontId !== undefined).map((r) => ({ id: r.fontId!, bold: r.bold, italic: r.italic }));
+  await fonts.ensureFonts(reqs).catch(() => {});
+  const alias = (r: { font: FontFamily; fontId?: FontId; bold: boolean; italic: boolean }): string | undefined => {
+    if (r.fontId === undefined) return undefined;
+    const f = fonts.fontFace(r.font, r.fontId, r.bold, r.italic);
+    return f.missing ? undefined : f.family;
+  };
+  return { base: alias(spec), runs: (spec.runs ?? []).map(alias) };
+}
+
 /** The desktop app's dependencies. Imported lazily with the export chunk;
  *  core/ipc is on the boot path already, so it is imported statically. */
 export async function appDeps(): Promise<ExportDeps> {
@@ -136,6 +189,7 @@ export async function appDeps(): Promise<ExportDeps> {
       const path = await ipc.systemFontPath(family, bold, italic);
       return path ? fetchBytes(mediaUrl(path)) : null;
     },
+    resolveFonts: (reqs) => ipc.fontsResolve(reqs),
     async decodeImage(bytes, mime) {
       const bmp = await createImageBitmap(new Blob([bytes as BlobPart], { type: mime }), { imageOrientation: "none" });
       try {
@@ -150,7 +204,11 @@ export async function appDeps(): Promise<ExportDeps> {
     },
     async rasterizeText(spec) {
       const { layoutCanvasLines } = await import("./raster");
-      return layoutCanvasLines(spec, canvasToPng);
+      if (spec.runs) {
+        const al = await rasterAliases(spec);
+        return layoutCanvasLines(spec, canvasToPng, al.base, al.runs);
+      }
+      return layoutCanvasLines(spec, canvasToPng, spec.fontId === undefined ? undefined : await rasterAlias(spec));
     },
     now: () => new Date(),
   };

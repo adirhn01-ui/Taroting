@@ -12,7 +12,7 @@ import { annotBounds, type Box } from "../../model";
 import { decodePoints, encodePoints } from "../../../image/strokes";
 import { segSegDistance } from "../../../image/ink/eraser";
 import { arrowWings } from "../../../image/ink/shapes";
-import { LINE_HEIGHT, wrapParagraph } from "../../export/layout";
+import { LINE_HEIGHT, wrapParagraph, wrapRanges, type MeasureRange } from "../../export/layout";
 import { simplifyStroke } from "../../../image/ink/input";
 
 /* ------------------------------------------------------------------ */
@@ -587,6 +587,25 @@ export interface TextLine {
   text: string;
   row: number;
   rtl: boolean;
+  /** where the line sits in the box's whole text: `text === whole.slice(s, e)`
+   *  (0.9.4 style runs) */
+  s: number;
+  e: number;
+}
+
+/** The paragraphs of a box's text with their offsets: exactly
+ *  `text.split(/\r\n|\r|\n/)`, each with where it starts in `text`. */
+export function paragraphsOf(text: string): { start: number; para: string }[] {
+  const out: { start: number; para: string }[] = [];
+  const re = /\r\n|\r|\n/g;
+  let at = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    out.push({ start: at, para: text.slice(at, m.index) });
+    at = m.index + m[0].length;
+  }
+  out.push({ start: at, para: text.slice(at) });
+  return out;
 }
 
 /** MIRRORS `firstStrongRtl` in src/pdf/export/bidi.ts (which imports bidi-js,
@@ -618,9 +637,27 @@ export function plainOnly(font: string): boolean {
 export function layoutText(text: string, w: number, measure: (s: string) => number): TextLine[] {
   const out: TextLine[] = [];
   let row = 0;
-  for (const para of text.split(/\r\n|\r|\n/)) {
+  for (const { start, para } of paragraphsOf(text)) {
     const rtl = firstStrongRtl(para);
-    for (const [s, e] of wrapParagraph(para, w, measure)) out.push({ text: para.slice(s, e), row: row++, rtl });
+    for (const [s, e] of wrapParagraph(para, w, measure)) out.push({ text: para.slice(s, e), row: row++, rtl, s: start + s, e: start + e });
+  }
+  return out;
+}
+
+/**
+ * `layoutText` for a box in several styles (0.9.4 runs): the same paragraphs
+ * and the same breaking rule, each paragraph wrapped by `wrapRanges` over the
+ * range measure `measureFor` gives for it (`start` = the paragraph's offset
+ * in `text`; the ranges it is asked for are offsets INTO the paragraph), so a
+ * word that spans two styles wraps by the sum of its pieces, as the export.
+ */
+export function layoutTextRanges(text: string, w: number, measureFor: (start: number, para: string) => MeasureRange): TextLine[] {
+  const out: TextLine[] = [];
+  let row = 0;
+  for (const { start, para } of paragraphsOf(text)) {
+    const rtl = firstStrongRtl(para);
+    const m = measureFor(start, para);
+    for (const [s, e] of wrapRanges(para, w, m)) out.push({ text: para.slice(s, e), row: row++, rtl, s: start + s, e: start + e });
   }
   return out;
 }
@@ -637,10 +674,20 @@ export function textHeight(lines: number, size: number): number {
   return Math.max(1, lines) * size * LINE_HEIGHT;
 }
 
-/** The CSS font shorthand of a text style (size in points = CSS px in page space). */
-export function cssFont(font: string, size: number, bold: boolean, italic: boolean): string {
-  if (plainOnly(font)) bold = italic = false;
-  return `${italic ? "italic " : ""}${bold ? "bold " : ""}${size}px "${font}"`;
+/** The CSS font shorthand of a text style (size in points = CSS px in page space).
+ *  `alias` = the font runtime's alias of a non-legacy font that is loaded: it
+ *  leads, the legacy font follows as the fallback, and bold / italic are the
+ *  face the runtime resolved (its four slots hold real faces: no Impact rule).
+ *  Without it, exactly the 0.9.3 string. */
+export function cssFont(font: string, size: number, bold: boolean, italic: boolean, alias?: string): string {
+  if (alias === undefined && plainOnly(font)) bold = italic = false;
+  return `${italic ? "italic " : ""}${bold ? "bold " : ""}${size}px ${cssFamily(font, alias)}`;
+}
+
+/** The CSS font-family of a text style: the legacy font quoted (0.9.3), or
+ *  the runtime's alias (needs no quoting) with the legacy font after it. */
+export function cssFamily(font: string, alias?: string): string {
+  return alias === undefined ? `"${font}"` : `${alias}, "${font}"`;
 }
 
 /* ------------------------------------------------------------------ */

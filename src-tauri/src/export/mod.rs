@@ -28,8 +28,8 @@ use self::model::ExportSpec;
 const INLINE_FILTER_LIMIT: usize = 8000;
 
 /// Temp files of one export attempt, deleted in every exit path (success,
-/// failure, cancel): the filtergraph scripts, the drawtext textfiles and a
-/// GIF's palette.
+/// failure, cancel): the filtergraph scripts, the drawtext textfiles, the
+/// font copies and a GIF's palette.
 struct ExportTemps {
     files: Vec<PathBuf>,
 }
@@ -58,19 +58,40 @@ struct Plan {
     encoder: Option<String>,
     /// `(path, contents)` to write before the first run.
     writes: Vec<(PathBuf, String)>,
-    /// Everything to delete afterwards: the writes, plus the palette the
-    /// first pass creates.
+    /// `(source, destination)`: library / installed font files to copy into
+    /// the temp folder before the first run (`BuiltExport::font_copies`).
+    /// Every source is a file Rust located itself, never a path from the
+    /// project. Empty for a project that uses only the six legacy fonts.
+    copies: Vec<(PathBuf, PathBuf)>,
+    /// Everything to delete afterwards: the writes and the copies, plus the
+    /// palette the first pass creates.
     temps: Vec<PathBuf>,
 }
 
 impl Plan {
-    /// Write the textfiles and scripts. A failure removes what was written.
+    /// Write the textfiles and scripts, and copy the fonts. A failure removes
+    /// what was written.
     fn materialize(&self) -> Result<ExportTemps> {
         let temps = ExportTemps { files: self.temps.clone() };
         for (path, contents) in &self.writes {
             if let Err(e) = std::fs::write(path, contents.as_bytes()) {
                 temps.cleanup();
                 return Err(e.into());
+            }
+        }
+        for (from, to) in &self.copies {
+            // The bytes only, not `fs::copy`: that carries the source's
+            // read-only attribute over, and a read-only copy cannot be
+            // written again, by the software retry or by the next export to
+            // the same destination.
+            let copied = std::fs::File::open(from)
+                .and_then(|mut src| std::io::copy(&mut src, &mut std::fs::File::create(to)?));
+            if let Err(e) = copied {
+                temps.cleanup();
+                return Err(AppError::BadInput(format!(
+                    "Taroting couldn't prepare the font {} for the export: {e}",
+                    builder::display_name(&from.to_string_lossy())
+                )));
             }
         }
         Ok(temps)
@@ -106,6 +127,14 @@ fn compose(built: &BuiltExport, out_path: &str, temp: &Path) -> Result<Plan> {
         writes.push((temp.join(&name), content.clone()));
         // The placeholder was embedded escaped-quoted (`'…'`); the bare name
         // goes in through the same escaper, so the two never drift apart.
+        text_names.push((format!("'{placeholder}'"), builder::escape_filter_value(&name)));
+    }
+    // A library / installed font outside the Windows Fonts folder: copied in
+    // beside the textfiles and named bare, for the same apostrophe reason.
+    let mut copies: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (i, (placeholder, source)) in built.font_copies.iter().enumerate() {
+        let name = format!("{}{i}.{}", font_copy_prefix(out_path), font_extension(source));
+        copies.push((source.clone(), temp.join(&name)));
         text_names.push((format!("'{placeholder}'"), builder::escape_filter_value(&name)));
     }
     let substitute = |graph: &str| {
@@ -158,6 +187,7 @@ fn compose(built: &BuiltExport, out_path: &str, temp: &Path) -> Result<Plan> {
     }
 
     temps.extend(writes.iter().map(|(p, _)| p.clone()));
+    temps.extend(copies.iter().map(|(_, p)| p.clone()));
     if palette_args.is_some() {
         temps.push(temp.join(&palette));
     }
@@ -168,8 +198,53 @@ fn compose(built: &BuiltExport, out_path: &str, temp: &Path) -> Result<Plan> {
         duration_sec: built.duration_sec,
         encoder: built.encoder.clone(),
         writes,
+        copies,
         temps,
     })
+}
+
+/// The start of every font copy's name for an export to `out_path`
+/// (`taroting-font-<hash>-`, then its index and extension). The startup sweep
+/// (`claims`) finds an earlier run's leftovers by it.
+fn font_copy_prefix(out_path: &str) -> String {
+    format!("taroting-font-{:016x}-", xxh3_64(out_path.as_bytes()))
+}
+
+/// The extension a copied font keeps: the source's own when it is a plain
+/// short one (`ttf`, `otf`), else `ttf`. FreeType reads the bytes, not the
+/// name; this only keeps the temp file recognisable.
+fn font_extension(source: &Path) -> String {
+    source
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| (1..=4).contains(&e.len()) && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_else(|| "ttf".into())
+}
+
+/// Resolve the distinct `(font_id, bold, italic)` of the project's text
+/// generators into the table `build_with` reads. Blocking (DirectWrite and the
+/// library folder): `start_export` runs it on the blocking pool. A project
+/// without a `fontId` asks nothing and gets an empty table (I1). An id that
+/// does not resolve (`fonts::resolve_face` refuses an ill-shaped one before
+/// looking anywhere) is simply absent: that generator exports with its legacy
+/// font.
+fn resolve_fonts(spec: &ExportSpec, resolve: impl Fn(&str, bool, bool) -> Option<crate::fonts::ResolvedFace>) -> builder::FontTable {
+    use crate::project::schema::Generator;
+    let mut table = builder::FontTable::new();
+    let mut asked: Vec<(&str, bool, bool)> = Vec::new();
+    for m in &spec.media {
+        let Some(Generator::Text { font_id: Some(id), bold, italic, .. }) = &m.generator else { continue };
+        let key = (id.as_str(), *bold, *italic);
+        if asked.contains(&key) {
+            continue;
+        }
+        asked.push(key);
+        if let Some(face) = resolve(id, *bold, *italic) {
+            table.insert(id, *bold, *italic, face);
+        }
+    }
+    table
 }
 
 /// The longest command line `CreateProcessW` accepts is 32,767 UTF-16 units,
@@ -706,9 +781,15 @@ pub fn export_failure_report(state: State<'_, LastExportFailure>) -> Option<Reda
 /// source file that is gone (or not a full path to a file at all). One
 /// function, so the tests pin the refusals the real command makes rather than
 /// a copy of them.
+#[cfg(test)]
 fn plan_export(spec: &ExportSpec, encoders: &hw::EncoderReport) -> Result<BuiltExport> {
+    plan_export_with(spec, encoders, &builder::FontTable::new())
+}
+
+/// `plan_export` with the project's fonts already resolved.
+fn plan_export_with(spec: &ExportSpec, encoders: &hw::EncoderReport, fonts: &builder::FontTable) -> Result<BuiltExport> {
     refuse_unusable_destination(&spec.out_path)?;
-    let built = builder::build(spec, encoders)?;
+    let built = builder::build_with(spec, encoders, fonts)?;
     refuse_overwriting_a_source(&spec.out_path, &spec.media)?;
     refuse_missing_sources(&built.sources)?;
     Ok(built)
@@ -767,18 +848,32 @@ struct Prepared {
     plan: Plan,
     temps: ExportTemps,
     part: PathBuf,
+    /// The fonts the plan was built with, kept for a software retry.
+    fonts: builder::FontTable,
 }
 
 /// Everything `start_export` does before the job exists, in the order that
-/// lets each refusal leave nothing behind: plan (pure), compose (pure, incl.
-/// the command-line length), claim `<out>.part`, write the temp files.
+/// lets each refusal leave nothing behind: resolve the project's library /
+/// installed fonts (nothing to do without a `fontId`), plan (pure), compose
+/// (pure, incl. the command-line length), claim `<out>.part`, write the temp
+/// files.
 fn prepare_export(spec: &ExportSpec, encoders: &hw::EncoderReport, temp: &Path) -> Result<Prepared> {
-    let built = plan_export(spec, encoders)?;
+    prepare_export_with(spec, encoders, resolve_fonts(spec, crate::fonts::resolve_face), temp)
+}
+
+/// `prepare_export` with the font table given (the tests inject one).
+fn prepare_export_with(
+    spec: &ExportSpec,
+    encoders: &hw::EncoderReport,
+    fonts: builder::FontTable,
+    temp: &Path,
+) -> Result<Prepared> {
+    let built = plan_export_with(spec, encoders, &fonts)?;
     let plan = compose(&built, &spec.out_path, temp)?;
     let part = PathBuf::from(format!("{}.part", spec.out_path));
     claim_part(&part)?;
     match plan.materialize() {
-        Ok(temps) => Ok(Prepared { plan, temps, part }),
+        Ok(temps) => Ok(Prepared { plan, temps, part, fonts }),
         Err(e) => {
             let _ = std::fs::remove_file(&part);
             claims::release(&part);
@@ -853,7 +948,7 @@ fn run_export(
     canceled: &dyn Fn() -> bool,
     forget: &dyn Fn(&str),
 ) -> Outcome {
-    let Prepared { plan, temps, .. } = prepared;
+    let Prepared { plan, temps, fonts, .. } = prepared;
     let result = run_plan(&plan, temps, run);
     let first = Outcome {
         result,
@@ -876,7 +971,7 @@ fn run_export(
 
     let mut soft = spec.clone();
     soft.preset.use_hardware = false;
-    let retry = builder::build(&soft, &hw::software_report())
+    let retry = builder::build_with(&soft, &hw::software_report(), &fonts)
         .and_then(|built| compose(&built, &soft.out_path, temp))
         .and_then(|plan| plan.materialize().map(|temps| (plan, temps)));
     match retry {
@@ -1198,7 +1293,7 @@ mod unit {
             container: None, vcodec: None, acodec: None, pix_fmt: None,
             bit_depth: None, has_audio: false, audio_rate: None, audio_channels: None,
             generator: Some(Generator::Text {
-                text: "Ab".into(), font_family: "Arial".into(), size_px: 48.0,
+                text: "Ab".into(), font_family: "Arial".into(), font_id: None, size_px: 48.0,
                 color: "#000000".into(), bold: false, italic: false,
             }),
             no_autorotate: None,
@@ -1259,6 +1354,151 @@ mod unit {
         temps.cleanup();
         assert!(!temp.join(&name).exists());
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    fn lib_face(path: &Path) -> crate::fonts::ResolvedFace {
+        crate::fonts::ResolvedFace {
+            path: path.to_path_buf(),
+            line_height_em: 1.17,
+            bold: false,
+            italic: false,
+            embed: crate::fonts::Embed::Full,
+        }
+    }
+
+    /// A library font outside the Windows Fonts folder (here under a folder
+    /// with an apostrophe, like a per-user install under O'Brien) is copied
+    /// into the temp folder under a bare name, the graph names only that, and
+    /// the copy is removed with the other temps.
+    #[test]
+    fn a_library_font_is_copied_beside_the_textfiles_and_named_bare() {
+        let temp = publish_dir("o'brien fonts");
+        let src = temp.join("Inter Regular.OTF");
+        std::fs::write(&src, b"not really a font").unwrap();
+        let out = temp.join("Final Cut.mp4").to_string_lossy().into_owned();
+        let (mut spec, enc) = text_spec(&out, "mp4");
+        if let Some(crate::project::schema::Generator::Text { font_id, font_family, .. }) = &mut spec.media[0].generator {
+            *font_id = Some("lib:Inter".into());
+            *font_family = "Segoe UI".into();
+        }
+        let mut table = builder::FontTable::new();
+        table.insert("lib:Inter", false, false, lib_face(&src));
+        let plan = compose(&builder::build_with(&spec, &enc, &table).unwrap(), &out, &temp).unwrap();
+
+        let hash = xxh3_64(out.as_bytes());
+        let name = format!("taroting-font-{hash:016x}-0.otf");
+        assert!(plan.filter_complex.contains(&format!("fontfile='{name}':")), "{}", plan.filter_complex);
+        assert!(!plan.filter_complex.contains("brien"), "{}", plan.filter_complex);
+        assert!(!plan.filter_complex.contains("TAROTING_FONT"), "{}", plan.filter_complex);
+        assert_eq!(plan.copies, [(src.clone(), temp.join(&name))]);
+        assert!(plan.temps.contains(&temp.join(&name)));
+
+        let temps = plan.materialize().unwrap();
+        assert_eq!(std::fs::read(temp.join(&name)).unwrap(), b"not really a font");
+        temps.cleanup();
+        assert!(!temp.join(&name).exists());
+        assert!(src.exists(), "the library's own file is never touched");
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// A font that cannot be copied refuses the export and leaves nothing
+    /// behind: the textfile written before it is removed again.
+    #[test]
+    fn a_font_that_cannot_be_copied_refuses_and_cleans_up() {
+        let temp = publish_dir("font copy fails");
+        let out = temp.join("x.mp4").to_string_lossy().into_owned();
+        let (mut spec, enc) = text_spec(&out, "mp4");
+        if let Some(crate::project::schema::Generator::Text { font_id, .. }) = &mut spec.media[0].generator {
+            *font_id = Some("lib:Gone".into());
+        }
+        let mut table = builder::FontTable::new();
+        table.insert("lib:Gone", false, false, lib_face(&temp.join("gone.ttf")));
+        let plan = compose(&builder::build_with(&spec, &enc, &table).unwrap(), &out, &temp).unwrap();
+        let Err(err) = plan.materialize() else { panic!("a missing font file must refuse") };
+        assert!(err.to_string().contains("gone.ttf"), "{err}");
+        for t in &plan.temps {
+            assert!(!t.exists(), "left behind: {}", t.display());
+        }
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// A read-only font file (unpacked from an archive, copied off a disc)
+    /// must not make a read-only temp copy: it has to go with the other temps,
+    /// and the software retry writes the same name again.
+    #[test]
+    fn a_read_only_font_leaves_a_copy_that_can_be_removed_and_rewritten() {
+        let temp = publish_dir("read-only font");
+        let src = temp.join("locked.ttf");
+        std::fs::write(&src, b"not really a font").unwrap();
+        let mut perms = std::fs::metadata(&src).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&src, perms.clone()).unwrap();
+
+        let out = temp.join("x.mp4").to_string_lossy().into_owned();
+        let (mut spec, enc) = text_spec(&out, "mp4");
+        if let Some(crate::project::schema::Generator::Text { font_id, .. }) = &mut spec.media[0].generator {
+            *font_id = Some("lib:Locked".into());
+        }
+        let mut table = builder::FontTable::new();
+        table.insert("lib:Locked", false, false, lib_face(&src));
+        let plan = compose(&builder::build_with(&spec, &enc, &table).unwrap(), &out, &temp).unwrap();
+        let copy = plan.copies[0].1.clone();
+
+        let first = plan.materialize().unwrap();
+        assert!(!std::fs::metadata(&copy).unwrap().permissions().readonly(), "the copy is an ordinary temp file");
+        // A copy still there (ffmpeg killed with the app) is written over.
+        let again = plan.materialize().expect("the same name is written again");
+        drop(first);
+        again.cleanup();
+        assert!(!copy.exists(), "the copy goes with the other temps");
+
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&src, perms).unwrap();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// `resolve_fonts` asks only about generators with a `fontId`, each
+    /// distinct `(id, bold, italic)` once, and keeps only what resolved. A
+    /// legacy-only project asks nothing at all.
+    #[test]
+    fn resolve_fonts_asks_once_per_distinct_request() {
+        use crate::project::schema::Generator;
+        let (base, _) = text_spec(r"C:\o.mp4", "mp4");
+        let with = |id: Option<&str>, bold: bool| {
+            let mut m = base.media[0].clone();
+            if let Some(Generator::Text { font_id, bold: b, .. }) = &mut m.generator {
+                *font_id = id.map(String::from);
+                *b = bold;
+            }
+            m
+        };
+        let asked = std::cell::RefCell::new(Vec::<(String, bool, bool)>::new());
+        let resolver = |id: &str, bold: bool, italic: bool| {
+            asked.borrow_mut().push((id.to_string(), bold, italic));
+            (id != "lib:Missing").then(|| lib_face(Path::new(r"D:\Lib\a.ttf")))
+        };
+
+        let mut legacy = base.clone();
+        legacy.media = vec![with(None, false), with(None, true)];
+        let t = resolve_fonts(&legacy, resolver);
+        assert!(asked.borrow().is_empty(), "no fontId, no question");
+        assert!(builder::build_with(&legacy, &crate::hw::software_report(), &t).unwrap().font_copies.is_empty());
+
+        let mut spec = base.clone();
+        spec.media = vec![
+            with(Some("lib:Inter"), false),
+            with(Some("lib:Inter"), false),
+            with(Some("lib:Inter"), true),
+            with(Some("lib:Missing"), false),
+        ];
+        let t = resolve_fonts(&spec, resolver);
+        assert_eq!(
+            *asked.borrow(),
+            [("lib:Inter".to_string(), false, false), ("lib:Inter".to_string(), true, false), ("lib:Missing".to_string(), false, false)]
+        );
+        let b = builder::build_with(&spec, &crate::hw::software_report(), &t).unwrap();
+        assert_eq!(b.font_copies.len(), 1, "both Inter requests name one file; Missing falls back");
     }
 
     /// A graph past `INLINE_FILTER_LIMIT` goes to a script passed with
@@ -2813,6 +3053,7 @@ mod e2e {
             generator: Some(Generator::Text {
                 text: "TAROTING 100%".into(),
                 font_family: "Arial".into(),
+                font_id: None,
                 size_px: 96.0,
                 color: "#ffffff".into(),
                 bold: true,
@@ -3414,6 +3655,7 @@ mod e2e {
             generator: Some(Generator::Text {
                 text: "Ab".into(),
                 font_family: "Arial".into(),
+                font_id: None,
                 size_px: 48.0,
                 color: "#000000".into(),
                 bold: false,
@@ -3443,6 +3685,105 @@ mod e2e {
         let glyphs = yavg(&out, 2.0, 10, 150, 110, 60);
         assert!(empty_box >= 200.0, "the empty part of the text box must stay transparent: YAVG {empty_box}");
         assert!(glyphs < empty_box - 20.0, "the glyphs must render: glyphs {glyphs} vs box {empty_box}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One frame of `path` at `t` as 8-bit gray pixels.
+    fn gray_frame(path: &std::path::Path, t: f64) -> Vec<u8> {
+        let out = ffmpeg::command("ffmpeg")
+            .unwrap()
+            .args(["-hide_banner", "-nostats", "-loglevel", "error", "-ss", &format!("{t:.3}"), "-i"])
+            .arg(path)
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        out.stdout
+    }
+
+    /// A library font exports for real: a non-legacy system font copied into
+    /// a folder whose name has an apostrophe (a per-user install under a
+    /// profile like O'Brien), with ffmpeg running in that same folder. The
+    /// export succeeds, the font's copy is gone afterwards, and the frame is
+    /// not the one the legacy fallback (Segoe UI) draws.
+    #[test]
+    fn e2e_a_library_font_in_an_apostrophe_folder_exports_and_draws_its_own_glyphs() {
+        let dir = case_dir("o'brien library font");
+        let font = dir.join("consola.ttf");
+        std::fs::copy(builder::fonts_dir().join("consola.ttf"), &font).expect("Consolas ships with Windows");
+
+        let text_spec = |font_id: Option<&str>, name: &str| {
+            let text = MediaRef {
+                id: "txt".into(), path: "Text".into(), size: 0, mtime_ms: 0,
+                kind: "image".into(), duration: 0.0, fps: None,
+                width: Some(600), height: Some(160),
+                container: None, vcodec: None, acodec: None, pix_fmt: None,
+                bit_depth: None, has_audio: false, audio_rate: None, audio_channels: None,
+                generator: Some(Generator::Text {
+                    text: "Wil 1lI0O".into(),
+                    font_family: "Segoe UI".into(),
+                    font_id: font_id.map(String::from),
+                    size_px: 72.0,
+                    color: "#ffffff".into(),
+                    bold: false,
+                    italic: false,
+                }),
+                no_autorotate: None,
+                drop_inband_headers: None,
+            };
+            ExportSpec {
+                kind: None,
+                media: vec![solid_media("base", "#000000"), text],
+                timeline: Timeline {
+                    fps: Rational { num: 30, den: 1 }, width: 640, height: 360,
+                    tracks: vec![
+                        vtrack("vtop", vec![clip_at("t1", "txt", 0.0, 0.0, 1.0)]),
+                        vtrack("vbot", vec![clip_at("b1", "base", 0.0, 0.0, 1.0)]),
+                    ],
+                    markers: vec![],
+                },
+                preset: preset_640(30.0),
+                out_path: dir.join(name).to_string_lossy().into_owned(),
+            }
+        };
+
+        let run = |spec: &ExportSpec, table: builder::FontTable| -> std::path::PathBuf {
+            let prepared = prepare_export_with(spec, &enc(), table, &dir).unwrap();
+            let graph = prepared.plan.filter_complex.clone();
+            let temps = prepared.plan.temps.clone();
+            if let Err(f) = run_plan(&prepared.plan, prepared.temps, &mut direct_runner(&dir)) {
+                panic!("export ffmpeg failed: {}\n{}\n{graph}", f.message, f.log_tail.join("\n"));
+            }
+            for t in &temps {
+                assert!(!t.exists(), "temp file left behind: {}", t.display());
+            }
+            assert!(!graph.contains("brien"), "the folder never enters the graph: {graph}");
+            let out = PathBuf::from(&spec.out_path);
+            std::fs::rename(format!("{}.part", spec.out_path), &out).unwrap();
+            claims::release(&PathBuf::from(format!("{}.part", spec.out_path)));
+            out
+        };
+
+        let mut table = builder::FontTable::new();
+        table.insert("Consolas", false, false, crate::fonts::ResolvedFace {
+            path: font.clone(),
+            line_height_em: 1.1709,
+            bold: false,
+            italic: false,
+            embed: crate::fonts::Embed::Full,
+        });
+        let library = run(&text_spec(Some("Consolas"), "library.mp4"), table);
+        let fallback = run(&text_spec(None, "fallback.mp4"), builder::FontTable::new());
+
+        let a = gray_frame(&library, 0.5);
+        let b = gray_frame(&fallback, 0.5);
+        assert_eq!(a.len(), 640 * 360);
+        assert_eq!(a.len(), b.len());
+        let lit = |f: &[u8]| f.iter().filter(|&&p| p > 128).count();
+        assert!(lit(&a) > 500 && lit(&b) > 500, "both drew text: {} / {}", lit(&a), lit(&b));
+        let differ = a.iter().zip(&b).filter(|(x, y)| x.abs_diff(**y) > 64).count();
+        assert!(differ > 500, "the library font drew its own glyphs: {differ} pixels differ");
+        assert!(font.exists(), "the source font is never touched");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3698,7 +4039,7 @@ mod e2e {
             container: None, vcodec: None, acodec: None, pix_fmt: None,
             bit_depth: None, has_audio: false, audio_rate: None, audio_channels: None,
             generator: Some(Generator::Text {
-                text: "TAROTING".into(), font_family: "Arial".into(), size_px: 96.0,
+                text: "TAROTING".into(), font_family: "Arial".into(), font_id: None, size_px: 96.0,
                 color: "#ffffff".into(), bold: true, italic: false,
             }),
             no_autorotate: None,

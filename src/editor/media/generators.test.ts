@@ -255,6 +255,23 @@ class FakeEl {
 }
 
 vi.mock("../../ui/toast", () => ({ toast: { info: () => {}, error: () => {} } }));
+// The Add text dialog's font control is the shared picker from src/fonts
+// (0.9.4), which needs a real DOM. A plain <select> of the six stands in for
+// it, so the tests below keep exercising the dialog itself; the font runtime's
+// part in this file is covered by generators.fonts.test.ts.
+vi.mock("../../fonts", () => ({
+  ensureFonts: async () => {},
+  fontsReady: () => true,
+  fontFace: (family: string, _id: unknown, bold: boolean, italic: boolean) => ({ family, bold, italic, missing: false }),
+  facesOf: () => null,
+  missingFonts: () => [],
+  mountFontPicker: (host: FakeEl, opts: { onPick(v: { legacy: string }): void }) => {
+    const sel = (document as unknown as { createElement(t: string): FakeEl }).createElement("select");
+    sel.addEventListener("change", () => opts.onPick({ legacy: sel.value as string }));
+    host.append(sel);
+    return { refresh() {}, dispose() {} };
+  },
+}));
 
 function fakeDocument() {
   const body = new FakeEl("body");

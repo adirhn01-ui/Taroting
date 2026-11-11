@@ -44,6 +44,13 @@ pub struct BuiltExport {
     pub duration_sec: f64,
     /// (placeholder, file-content) pairs for drawtext textfiles.
     pub text_payloads: Vec<(String, String)>,
+    /// (placeholder, source file) for each library or installed font face
+    /// that lives outside the Windows Fonts folder, one entry per FILE however
+    /// many generators use it. `compose` copies each into the temp folder
+    /// ffmpeg runs in and substitutes its bare name: a path under a profile
+    /// like `O'Brien` cannot be written into a filter value. Empty for every
+    /// project that uses only the six legacy fonts.
+    pub font_copies: Vec<(String, std::path::PathBuf)>,
     /// The file behind every media `-i`, in argv order: exactly the files
     /// ffmpeg will open (a generator opens none, a muted clip's audio is never
     /// added). `start_export` checks these are still on disk. A GIF's palette
@@ -186,6 +193,71 @@ fn font_file(family: &str, bold: bool, italic: bool) -> Option<&'static str> {
     };
     // [regular, bold, italic, bold-italic]
     Some(faces[usize::from(bold) + 2 * usize::from(italic)])
+}
+
+/// The library and installed faces a project's text generators asked for,
+/// resolved by `start_export` (off the UI thread) BEFORE `build`, so `build`
+/// stays pure. Keyed by the generator's `(font_id, bold, italic)`: the id is
+/// only ever a lookup key, never part of a path; what reaches the graph is the
+/// file Rust located itself (`fonts::resolve_face`). A generator without a
+/// `font_id`, or whose id is not here, takes the legacy path untouched (I1).
+#[derive(Debug, Clone, Default)]
+pub struct FontTable(std::collections::HashMap<(String, bool, bool), crate::fonts::ResolvedFace>);
+
+impl FontTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, id: &str, bold: bool, italic: bool, face: crate::fonts::ResolvedFace) {
+        self.0.insert((id.to_string(), bold, italic), face);
+    }
+
+    /// The face for one request. A face whose line height is not a positive
+    /// finite number is treated as unresolved: it could only come from a
+    /// broken font, and the legacy fallback is always drawable.
+    fn get(&self, id: &str, bold: bool, italic: bool) -> Option<&crate::fonts::ResolvedFace> {
+        if self.0.is_empty() {
+            return None;
+        }
+        self.0
+            .get(&(id.to_string(), bold, italic))
+            .filter(|f| f.line_height_em.is_finite() && f.line_height_em > 0.0)
+    }
+}
+
+/// Placeholder for a font file copied into the export's temp folder: `build`
+/// embeds `\u{0}TAROTING_FONT_{i}\u{0}` (escaped-quoted) where `fontfile=`'s
+/// value belongs; `compose` swaps it for the copy's bare name.
+pub fn font_placeholder(i: usize) -> String {
+    format!("\u{0}TAROTING_FONT_{i}\u{0}")
+}
+
+/// Whether `path` is a plain file inside `dir` (the Windows Fonts folder),
+/// compared the way Windows names files (separators unified, ASCII case
+/// folded: DirectWrite may answer `C:\WINDOWS\Fonts\…`). Such a file is named
+/// by its absolute path, like the legacy fonts; anything else is copied.
+///
+/// A path with an apostrophe is never "in place", wherever it is: it cannot
+/// be written into a filter value, and `emit_clip_chain` `expect`s the
+/// generator's source under `panic = "abort"`, so the resolved branches of
+/// `generator_source` must not be able to fail. A copy's bare name always
+/// escapes.
+fn is_in_fonts_dir(path: &std::path::Path, dir: &std::path::Path) -> bool {
+    use std::path::Component;
+    if !path.is_absolute()
+        || path.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        || path.to_string_lossy().contains('\'')
+    {
+        return false;
+    }
+    let fold = |p: &std::path::Path| p.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    let dir = fold(dir);
+    let dir = dir.trim_end_matches('\\');
+    let path = fold(path);
+    path.strip_prefix(dir)
+        .and_then(|rest| rest.strip_prefix('\\'))
+        .is_some_and(|name| !name.is_empty() && !name.contains('\\'))
 }
 
 /// Full path to a mapped font file.
@@ -1000,7 +1072,16 @@ fn check_bitrates(spec: &ExportSpec) -> Result<()> {
 /* Main builder                                                         */
 /* ------------------------------------------------------------------ */
 
+/// `build_with` for a project whose fonts need no resolving (every caller in
+/// the app goes through `build_with`; the tests pin the legacy path here).
+#[cfg(test)]
 pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport> {
+    build_with(spec, encoders, &FontTable::new())
+}
+
+/// `build` with the project's library / installed fonts already resolved
+/// (`start_export` does that off the UI thread). Pure: no font I/O here.
+pub fn build_with(spec: &ExportSpec, encoders: &EncoderReport, fonts: &FontTable) -> Result<BuiltExport> {
     let preset = &spec.preset;
 
     // --- validation -------------------------------------------------
@@ -1124,6 +1205,7 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
 
     let mut inputs: Vec<InputEntry> = Vec::new();
     let mut text_payloads: Vec<(String, String)> = Vec::new();
+    let mut font_copies: Vec<(String, std::path::PathBuf)> = Vec::new();
 
     /* ---- bottom track → segment list (owns concat + tail-pad) ---- */
     let bottom = video_tracks.last().copied();
@@ -1243,6 +1325,8 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
         fps: &fps_str,
         rate,
         text_payloads: &mut text_payloads,
+        fonts,
+        font_copies: &mut font_copies,
         stage_n: 0,
     };
     let has_overlays = overlay_layers.iter().any(|l| !l.is_empty());
@@ -1321,6 +1405,7 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
             filter_complex: fc,
             duration_sec,
             text_payloads,
+            font_copies,
             sources,
             encoder: None,
             palette_pass: Some(PalettePass { args: pass1, filter_complex: pass1_fc }),
@@ -1360,6 +1445,7 @@ pub fn build(spec: &ExportSpec, encoders: &EncoderReport) -> Result<BuiltExport>
         filter_complex: fc,
         duration_sec,
         text_payloads,
+        font_copies,
         sources,
         encoder: Some(encoder),
         palette_pass: None,
@@ -1381,6 +1467,10 @@ struct GraphGen<'a> {
     /// The exact rational `fps` spells: frame counts are computed from it.
     rate: (u64, u64),
     text_payloads: &'a mut Vec<(String, String)>,
+    /// The resolved library / installed faces (empty for a legacy-only project).
+    fonts: &'a FontTable,
+    /// See `BuiltExport::font_copies`.
+    font_copies: &'a mut Vec<(String, std::path::PathBuf)>,
     /// monotonically increasing suffix for unique stage labels
     stage_n: usize,
 }
@@ -1429,21 +1519,47 @@ impl<'a> GraphGen<'a> {
             Generator::Text {
                 text,
                 font_family,
+                font_id,
                 size_px,
                 color,
                 bold,
                 italic,
+                ..
             } => {
-                let font = font_path(font_family, *bold, *italic).ok_or_else(|| {
-                    AppError::BadInput(format!("unsupported text font family '{font_family}'"))
-                })?;
-                let font_esc = escape_filter_path(&font)?;
+                // A library / installed face Rust resolved, or (no `font_id`,
+                // or it is not on this PC) the legacy family exactly as 0.9.3.
+                let face = font_id.as_deref().and_then(|id| self.fonts.get(id, *bold, *italic));
+                let (font_esc, lhe) = match face {
+                    None => {
+                        let font = font_path(font_family, *bold, *italic).ok_or_else(|| {
+                            AppError::BadInput(format!("unsupported text font family '{font_family}'"))
+                        })?;
+                        (escape_filter_path(&font)?, line_height_em(font_family))
+                    }
+                    Some(face) if is_in_fonts_dir(&face.path, fonts_dir()) => {
+                        (escape_filter_path(&face.path.to_string_lossy())?, face.line_height_em)
+                    }
+                    Some(face) => {
+                        // Copied into ffmpeg's working folder and named bare
+                        // there (see `BuiltExport::font_copies`); one copy per
+                        // file however many generators share it.
+                        let i = match self.font_copies.iter().position(|(_, p)| *p == face.path) {
+                            Some(i) => i,
+                            None => {
+                                let i = self.font_copies.len();
+                                self.font_copies.push((font_placeholder(i), face.path.clone()));
+                                i
+                            }
+                        };
+                        (escape_filter_path(&font_placeholder(i))?, face.line_height_em)
+                    }
+                };
                 let (rgb, alpha) = parse_color(color);
                 let aa = alpha.unwrap_or_default();
                 let px = size_px.round().max(1.0) as i64;
                 // 1.25 mirrors LINE_HEIGHT in src/editor/media/generators.ts.
                 let line_spacing = (1.25 * size_px).round() as i64
-                    - (line_height_em(font_family) * size_px).round() as i64;
+                    - (lhe * size_px).round() as i64;
                 let idx = self.text_payloads.len();
                 let placeholder = text_placeholder(idx);
                 self.text_payloads.push((placeholder.clone(), text.clone()));
@@ -4218,6 +4334,7 @@ mod tests {
                 Generator::Text {
                     text: "hi".into(),
                     font_family: "Georgia".into(),
+                    font_id: None,
                     size_px: 48.0,
                     color: color.into(),
                     bold: false,
@@ -4249,6 +4366,7 @@ mod tests {
         let gm = gen_media("g1", Generator::Text {
             text: "Hello: 100%".into(),
             font_family: "Georgia".into(),
+            font_id: None,
             size_px: 96.0,
             color: "#ffffff".into(),
             bold: false,
@@ -4328,6 +4446,7 @@ mod tests {
         let gm = gen_media("g1", Generator::Text {
             text: "x".into(),
             font_family: "Comic Sans".into(),
+            font_id: None,
             size_px: 40.0,
             color: "#ffffff".into(),
             bold: false, italic: false,
@@ -4522,6 +4641,7 @@ mod tests {
                 Generator::Text {
                     text: "two\nlines".into(),
                     font_family: family.into(),
+                    font_id: None,
                     size_px: size,
                     color: "#ffffff".into(),
                     bold: false,
@@ -4557,6 +4677,194 @@ mod tests {
         }
     }
 
+    /* -------- library / installed fonts (0.9.4) -------- */
+
+    fn text_gen(family: &str, font_id: Option<&str>, size: f64, bold: bool, italic: bool) -> Generator {
+        Generator::Text {
+            text: "two\nlines".into(),
+            font_family: family.into(),
+            font_id: font_id.map(String::from),
+            size_px: size,
+            color: "#ffffff".into(),
+            bold,
+            italic,
+        }
+    }
+
+    /// One text clip per generator, each on its own track, so every
+    /// generator reaches the graph.
+    fn text_spec(gens: Vec<Generator>) -> ExportSpec {
+        let mut media = Vec::new();
+        let mut tracks = Vec::new();
+        for (i, g) in gens.into_iter().enumerate() {
+            media.push(gen_media(&format!("g{i}"), g, 620, 240));
+            tracks.push(vtrack_id(&format!("v{i}"), vec![clip(&format!("c{i}"), &format!("g{i}"), 0.0, 0.0, 2.0)]));
+        }
+        spec(media, timeline(1920, 1080, Rational { num: 30, den: 1 }, tracks), preset("mp4", "h264"), r"C:\o.mp4")
+    }
+
+    fn face(path: &str, lhe: f64, bold: bool) -> crate::fonts::ResolvedFace {
+        crate::fonts::ResolvedFace {
+            path: std::path::PathBuf::from(path),
+            line_height_em: lhe,
+            bold,
+            italic: false,
+            embed: crate::fonts::Embed::Full,
+        }
+    }
+
+    /// A table full of faces the project does not ask for.
+    fn busy_table() -> FontTable {
+        let mut t = FontTable::new();
+        t.insert("Consolas", false, false, face(r"D:\Elsewhere\consola.ttf", 1.4, false));
+        t.insert("lib:Inter", true, true, face(r"D:\Lib\inter-bi.ttf", 1.21, true));
+        // The legacy names as ids: a generator's `font_family` must never be
+        // looked up in the table, only its `font_id`.
+        t.insert("Georgia", true, false, face(r"D:\Lib\not-georgia.ttf", 1.33, true));
+        t
+    }
+
+    fn same_build(a: &BuiltExport, b: &BuiltExport) {
+        assert_eq!(a.filter_complex, b.filter_complex);
+        assert_eq!(a.args, b.args);
+        assert_eq!(a.text_payloads, b.text_payloads);
+        assert!(a.font_copies.is_empty() && b.font_copies.is_empty());
+    }
+
+    /// I1: a generator without a `font_id` builds byte for byte the same
+    /// whether or not a font table is present.
+    #[test]
+    fn a_legacy_generator_builds_byte_identical_with_a_font_table_present() {
+        let s = text_spec(vec![
+            text_gen("Georgia", None, 96.0, true, false),
+            text_gen("Courier New", None, 40.0, false, true),
+        ]);
+        let plain = build(&s, &enc()).unwrap();
+        let with = build_with(&s, &enc(), &busy_table()).unwrap();
+        same_build(&plain, &with);
+        let georgia_b = escape_filter_value(&fonts_dir().join("georgiab.ttf").to_string_lossy());
+        assert!(with.filter_complex.contains(&format!("fontfile={georgia_b}:")), "{}", with.filter_complex);
+    }
+
+    /// I1: an id that did not resolve (absent from the table, or present only
+    /// for another style) falls back to the legacy family's exact arguments.
+    #[test]
+    fn an_unresolved_font_id_falls_back_to_the_legacy_family_exactly() {
+        let legacy = text_spec(vec![
+            text_gen("Segoe UI", None, 96.0, false, false),
+            text_gen("Segoe UI", None, 72.0, false, false),
+        ]);
+        let missing = text_spec(vec![
+            text_gen("Segoe UI", Some("lib:Nope"), 96.0, false, false),
+            // In the table only as bold italic.
+            text_gen("Segoe UI", Some("lib:Inter"), 72.0, false, false),
+        ]);
+        same_build(&build(&legacy, &enc()).unwrap(), &build_with(&missing, &enc(), &busy_table()).unwrap());
+    }
+
+    /// A face outside the Windows Fonts folder is named by a placeholder that
+    /// `compose` turns into a bare temp name, with one copy entry; a face
+    /// inside it (whatever case DirectWrite spells the folder in) is named by
+    /// its absolute escaped path, with no copy.
+    #[test]
+    fn a_non_system_face_is_copied_and_a_system_face_is_named_in_place() {
+        let user = r"C:\Users\o'brien\AppData\Local\Microsoft\Windows\Fonts\Inter-Regular.ttf";
+        let mut t = FontTable::new();
+        t.insert("lib:Inter", false, false, face(user, 1.21, false));
+        let b = build_with(&text_spec(vec![text_gen("Segoe UI", Some("lib:Inter"), 96.0, false, false)]), &enc(), &t).unwrap();
+        assert_eq!(b.font_copies, vec![(font_placeholder(0), std::path::PathBuf::from(user))]);
+        assert!(b.filter_complex.contains(&format!("fontfile='{}':", font_placeholder(0))), "{}", b.filter_complex);
+        assert!(!b.filter_complex.contains("brien"), "no part of the user's path in the graph");
+        assert!(!b.filter_complex.contains("segoeui"), "the legacy fallback is not used");
+
+        let system = fonts_dir().join("CONSOLA.TTF").to_string_lossy().to_uppercase();
+        let mut t = FontTable::new();
+        t.insert("Consolas", false, false, face(&system, 1.17, false));
+        let b = build_with(&text_spec(vec![text_gen("Segoe UI", Some("Consolas"), 96.0, false, false)]), &enc(), &t).unwrap();
+        assert!(b.font_copies.is_empty());
+        assert!(b.filter_complex.contains(&format!("fontfile={}:", escape_filter_value(&system))), "{}", b.filter_complex);
+    }
+
+    /// The folder test is about the folder itself: a sibling folder whose
+    /// name only starts the same, a subfolder, a `..` hop and a relative path
+    /// are all "elsewhere".
+    #[test]
+    fn only_a_file_directly_in_the_fonts_folder_counts_as_a_system_face() {
+        let dir = std::path::Path::new(r"C:\Windows\Fonts");
+        let yes = |p: &str| is_in_fonts_dir(std::path::Path::new(p), dir);
+        assert!(yes(r"C:\Windows\Fonts\consola.ttf"));
+        assert!(yes(r"c:\WINDOWS\fonts\consola.ttf"));
+        assert!(yes(r"C:/Windows/Fonts/consola.ttf"));
+        assert!(!yes(r"C:\Windows\FontsX\consola.ttf"));
+        assert!(!yes(r"C:\Windows\Fonts\sub\consola.ttf"));
+        assert!(!yes(r"C:\Windows\Fonts\..\Temp\consola.ttf"));
+        assert!(!yes(r"Windows\Fonts\consola.ttf"));
+        assert!(!yes(r"C:\Windows\Fonts"));
+        // Inside a Fonts folder whose own path has an apostrophe: copied, so
+        // the build can never fail on it.
+        let odd = std::path::Path::new(r"D:\O'Brien OS\Fonts");
+        assert!(!is_in_fonts_dir(std::path::Path::new(r"D:\O'Brien OS\Fonts\consola.ttf"), odd));
+        assert!(is_in_fonts_dir(std::path::Path::new(r"D:\OBrien OS\Fonts\consola.ttf"), std::path::Path::new(r"D:\OBrien OS\Fonts")));
+    }
+
+    /// `line_spacing` uses the table's line height in the existing formula:
+    /// 1.4 at 96 px is round(120) - round(134.4) = -14, a value none of the
+    /// six legacy ratios gives.
+    #[test]
+    fn line_spacing_follows_the_resolved_face() {
+        let mut t = FontTable::new();
+        t.insert("lib:Tall", false, false, face(r"D:\Lib\tall.ttf", 1.4, false));
+        let b = build_with(&text_spec(vec![text_gen("Segoe UI", Some("lib:Tall"), 96.0, false, false)]), &enc(), &t).unwrap();
+        assert!(b.filter_complex.contains("line_spacing=-14:"), "{}", b.filter_complex);
+        for family in ["Segoe UI", "Arial", "Georgia", "Times New Roman", "Courier New", "Impact"] {
+            assert_ne!(120 - (line_height_em(family) * 96.0).round() as i64, -14, "premise: {family}");
+        }
+    }
+
+    /// Two generators whose requests resolve to the same file (a family with
+    /// no bold face answers bold with its regular) copy it once and name the
+    /// same placeholder; a different file is a second copy.
+    #[test]
+    fn generators_sharing_a_face_copy_it_once() {
+        let inter = r"D:\Lib\inter.ttf";
+        let mut t = FontTable::new();
+        t.insert("lib:Inter", false, false, face(inter, 1.21, false));
+        t.insert("lib:Inter", true, false, face(inter, 1.21, false));
+        t.insert("lib:Mono", false, false, face(r"D:\Lib\mono.otf", 1.3, false));
+        let b = build_with(
+            &text_spec(vec![
+                text_gen("Segoe UI", Some("lib:Inter"), 96.0, false, false),
+                text_gen("Segoe UI", Some("lib:Inter"), 40.0, true, false),
+                text_gen("Segoe UI", Some("lib:Mono"), 40.0, false, false),
+            ]),
+            &enc(),
+            &t,
+        )
+        .unwrap();
+        // The bottom track is built first, so the order is the graph's; what
+        // matters is one entry per file.
+        assert_eq!(b.font_copies.len(), 2, "{:?}", b.font_copies);
+        let uses = |file: &str| {
+            let (ph, _) = b.font_copies.iter().find(|(_, p)| *p == std::path::PathBuf::from(file)).expect(file);
+            b.filter_complex.matches(&format!("fontfile='{ph}':")).count()
+        };
+        assert_eq!(uses(inter), 2);
+        assert_eq!(uses(r"D:\Lib\mono.otf"), 1);
+    }
+
+    /// A face with a line height no real font has is not trusted: the
+    /// generator exports with its legacy font.
+    #[test]
+    fn a_face_with_a_broken_line_height_is_treated_as_unresolved() {
+        let legacy = build(&text_spec(vec![text_gen("Segoe UI", None, 96.0, false, false)]), &enc()).unwrap();
+        for bad in [0.0, -1.2, f64::NAN, f64::INFINITY] {
+            let mut t = FontTable::new();
+            t.insert("lib:Bad", false, false, face(r"D:\Lib\bad.ttf", bad, false));
+            let b = build_with(&text_spec(vec![text_gen("Segoe UI", Some("lib:Bad"), 96.0, false, false)]), &enc(), &t).unwrap();
+            same_build(&legacy, &b);
+        }
+    }
+
     #[test]
     fn text_is_centred_in_its_intrinsic_box() {
         // drawtext now lays out inside a box the size of the MEASURED text box.
@@ -4567,6 +4875,7 @@ mod tests {
             Generator::Text {
                 text: "Hi".into(),
                 font_family: "Georgia".into(),
+                font_id: None,
                 size_px: 48.0,
                 color: "#ffffff".into(),
                 bold: false,
@@ -4596,6 +4905,7 @@ mod tests {
             Generator::Text {
                 text: "fade".into(),
                 font_family: "Georgia".into(),
+                font_id: None,
                 size_px: 48.0,
                 color: "#ffffff".into(),
                 bold: false,

@@ -1,0 +1,356 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`R1: run-less text boxes > Arabic raster 1`] = `
+{
+  "annot": {
+    "BS": {
+      "W": 0,
+    },
+    "Contents": "str <FEFF06450631062D0628062700200628062706440639062706440645>",
+    "DA": "str (0.063 0.125 0.188 rg /Helv 13 Tf)",
+    "Subtype": "FreeText",
+  },
+  "ops": "q 72 582 180 120 re W n 180 0 0 120 72 582 cm /Im0 Do Q",
+  "raster": [
+    {
+      "align": "left",
+      "bold": false,
+      "color": "#102030",
+      "font": "Georgia",
+      "fontId": "lib:Consolas",
+      "h": 120,
+      "italic": false,
+      "lineHeight": 16.25,
+      "scale": 4,
+      "size": 13,
+      "text": "مرحبا بالعالم",
+      "w": 180,
+    },
+  ],
+  "rect": [
+    72,
+    582,
+    252,
+    702,
+  ],
+  "resolveCalls": [
+    [
+      {
+        "bold": false,
+        "id": "lib:Consolas",
+        "italic": true,
+      },
+    ],
+  ],
+  "resources": {
+    "XObject": {
+      "Im0": "ref 4 0 R",
+    },
+  },
+}
+`;
+
+exports[`R1: run-less text boxes > Impact bold draws plain 1`] = `
+{
+  "annot": {
+    "BS": {
+      "W": 0,
+    },
+    "Contents": "str <FEFF0049006D0070006100630074>",
+    "DA": "str (0.063 0.125 0.188 rg /Helv 13 Tf)",
+    "Subtype": "FreeText",
+  },
+  "ops": "q 72 582 180 120 re W n BT /F0 13 Tf 0.063 0.125 0.188 rg 1 0 0 1 72 688.689 Tm <000100020003000400050006> Tj ET Q",
+  "raster": [],
+  "rect": [
+    72,
+    582,
+    252,
+    702,
+  ],
+  "resolveCalls": [],
+  "resources": {
+    "Font": {
+      "F0": "ref 4 0 R",
+    },
+  },
+}
+`;
+
+exports[`R1: run-less text boxes > a library font 1`] = `
+{
+  "annot": {
+    "BS": {
+      "W": 0,
+    },
+    "Contents": "str <FEFF004C00690062007200610072007900200066006F006E007400200074006500780074>",
+    "DA": "str (0.063 0.125 0.188 rg /Helv 13 Tf)",
+    "Subtype": "FreeText",
+  },
+  "ops": "q 72 582 180 120 re W n BT /F0 13 Tf 0.063 0.125 0.188 rg 1 0 0 1 72 690.72 Tm <0001000200030004000500040006000700080009000A000B0007000B000C000D000B> Tj ET Q",
+  "raster": [],
+  "rect": [
+    72,
+    582,
+    252,
+    702,
+  ],
+  "resolveCalls": [
+    [
+      {
+        "bold": true,
+        "id": "lib:Consolas",
+        "italic": false,
+      },
+    ],
+  ],
+  "resources": {
+    "Font": {
+      "F0": "ref 4 0 R",
+    },
+  },
+}
+`;
+
+exports[`R1: run-less text boxes > a word wider than the box breaks between characters 1`] = `
+{
+  "annot": {
+    "BS": {
+      "W": 0,
+    },
+    "Contents": "str <FEFF0053007500700065007200630061006C006900660072006100670069006C0069007300740069006300650078007000690061006C00690064006F00630069006F00750073>",
+    "DA": "str (0.063 0.125 0.188 rg /Helv 13 Tf)",
+    "Subtype": "FreeText",
+  },
+  "ops": "q 72 582 60 120 re W n BT /F0 13 Tf 0.063 0.125 0.188 rg 1 0 0 1 72 689.34 Tm <000100020003000400050006000700080009000A> Tj 1 0 0 1 72 673.09 Tm <00050007000B000900080009000C000D000900060004> Tj 1 0 0 1 72 656.84 Tm <000E00030009000700080009000F001000060009> Tj 1 0 0 1 72 640.59 Tm <00100002000C> Tj ET Q",
+  "raster": [],
+  "rect": [
+    72,
+    582,
+    132,
+    702,
+  ],
+  "resolveCalls": [],
+  "resources": {
+    "Font": {
+      "F0": "ref 4 0 R",
+    },
+  },
+}
+`;
+
+exports[`R1: run-less text boxes > a wrapped RTL paragraph 1`] = `
+{
+  "annot": {
+    "BS": {
+      "W": 0,
+    },
+    "Contents": "str <FEFF05E905DC05D505DD002005E205D505DC05DD002005D605D4002005D805E705E105D8002005D005E805D505DA002005DE05D005D505D3>",
+    "DA": "str (0.063 0.125 0.188 rg /Helv 13 Tf)",
+    "Subtype": "FreeText",
+  },
+  "ops": "q 72 502 70 200 re W n BT /F0 13 Tf 0.063 0.125 0.188 rg 1 0 0 1 72 689.368 Tm <000100020003000400050006000700030004000600050008> Tj 1 0 0 1 72 673.118 Tm <00090006000A000B0003000C000D000E000C> Tj 1 0 0 1 72 656.868 Tm <000F0006000B0010> Tj ET Q",
+  "raster": [],
+  "rect": [
+    72,
+    502,
+    142,
+    702,
+  ],
+  "resolveCalls": [],
+  "resources": {
+    "Font": {
+      "F0": "ref 4 0 R",
+    },
+  },
+}
+`;
+
+exports[`R1: run-less text boxes > an RTL paragraph 1`] = `
+{
+  "annot": {
+    "BS": {
+      "W": 0,
+    },
+    "Contents": "str <FEFF05E905DC05D505DD002005E205D505DC05DD00200061006E006400200045006E0067006C006900730068>",
+    "DA": "str (0.063 0.125 0.188 rg /Helv 13 Tf)",
+    "Subtype": "FreeText",
+  },
+  "ops": "q 72 582 300 120 re W n BT /F0 13 Tf 0.063 0.125 0.188 rg 1 0 0 1 72 689.368 Tm <0001000200030004000500020006000700080009000A0004000B000C000D000E0004000B000D000C000F> Tj ET Q",
+  "raster": [],
+  "rect": [
+    72,
+    582,
+    372,
+    702,
+  ],
+  "resolveCalls": [],
+  "resources": {
+    "Font": {
+      "F0": "ref 4 0 R",
+    },
+  },
+}
+`;
+
+exports[`R1: run-less text boxes > centred, turned 90, fill and border 1`] = `
+{
+  "annot": {
+    "BS": {
+      "W": 0,
+    },
+    "Contents": "str <FEFF005400750072006E0065006400200062006F0078>",
+    "DA": "str (0.063 0.125 0.188 rg /Helv 13 Tf)",
+    "Subtype": "FreeText",
+  },
+  "ops": "q 1 0.933 0.8 rg 72 582 180 120 re f Q q 0.2 0.4 1 RG 1 w 0 J 0 j 72.5 582.5 179 119 re S Q q 0 1 -1 0 804 480 cm 102 552 120 180 re W n BT /F0 13 Tf 0.063 0.125 0.188 rg 1 0 0 1 128.868 719.34 Tm <000100020003000400050006000700080009000A> Tj ET Q",
+  "raster": [],
+  "rect": [
+    72,
+    582,
+    252,
+    702,
+  ],
+  "resolveCalls": [],
+  "resources": {
+    "Font": {
+      "F0": "ref 4 0 R",
+    },
+  },
+}
+`;
+
+exports[`R1: run-less text boxes > clipped below the frame 1`] = `
+{
+  "annot": {
+    "BS": {
+      "W": 0,
+    },
+    "Contents": "str <FEFF0061000A0062000A0063000A0064000A0065000A0066000A0067000A0068>",
+    "DA": "str (0.063 0.125 0.188 rg /Helv 13 Tf)",
+    "Subtype": "FreeText",
+  },
+  "ops": "q 72 662 180 40 re W n BT /F0 13 Tf 0.063 0.125 0.188 rg 1 0 0 1 72 689.34 Tm <0001> Tj 1 0 0 1 72 673.09 Tm <0002> Tj 1 0 0 1 72 656.84 Tm <0003> Tj ET Q",
+  "raster": [],
+  "rect": [
+    72,
+    662,
+    252,
+    702,
+  ],
+  "resolveCalls": [],
+  "resources": {
+    "Font": {
+      "F0": "ref 4 0 R",
+    },
+  },
+}
+`;
+
+exports[`R1: run-less text boxes > empty text 1`] = `
+{
+  "annot": {
+    "BS": {
+      "W": 0,
+    },
+    "Contents": "str <FEFF>",
+    "DA": "str (0.063 0.125 0.188 rg /Helv 13 Tf)",
+    "Subtype": "FreeText",
+  },
+  "ops": "",
+  "raster": [],
+  "rect": [
+    72,
+    582,
+    252,
+    702,
+  ],
+  "resolveCalls": [],
+  "resources": {
+    "Font": {
+      "F0": "ref 4 0 R",
+    },
+  },
+}
+`;
+
+exports[`R1: run-less text boxes > multi-line wrapped, newline, empty paragraph 1`] = `
+{
+  "annot": {
+    "BS": {
+      "W": 0,
+    },
+    "Contents": "str <FEFF00540068006500200071007500690063006B002000620072006F0077006E00200066006F00780020006A0075006D007000730020006F00760065007200200074006800650020006C0061007A007900200064006F0067000A000A0061006E006400200061007700610079>",
+    "DA": "str (0.063 0.125 0.188 rg /Helv 13 Tf)",
+    "Subtype": "FreeText",
+  },
+  "ops": "q 72 502 150 200 re W n BT /F0 13 Tf 0.063 0.125 0.188 rg 1 0 0 1 72 689.34 Tm <0001000200030004000500060007000800090004000A000B000C000D000E0004000F000C0010> Tj 1 0 0 1 72 673.09 Tm <001100060012001300140004000C00150003000B00040016000200030004001700180019001A0004001B000C001C> Tj 1 0 0 1 72 640.59 Tm <0018000E001B00040018000D0018001A> Tj ET Q",
+  "raster": [],
+  "rect": [
+    72,
+    502,
+    222,
+    702,
+  ],
+  "resolveCalls": [],
+  "resources": {
+    "Font": {
+      "F0": "ref 4 0 R",
+    },
+  },
+}
+`;
+
+exports[`R1: run-less text boxes > one line 1`] = `
+{
+  "annot": {
+    "BS": {
+      "W": 0,
+    },
+    "Contents": "str <FEFF00480065006C006C006F002000740068006500720065>",
+    "DA": "str (0.063 0.125 0.188 rg /Helv 13 Tf)",
+    "Subtype": "FreeText",
+  },
+  "ops": "q 72 582 180 120 re W n BT /F0 13 Tf 0.063 0.125 0.188 rg 1 0 0 1 72 689.34 Tm <00010002000300030004000500060007000200080002> Tj ET Q",
+  "raster": [],
+  "rect": [
+    72,
+    582,
+    252,
+    702,
+  ],
+  "resolveCalls": [],
+  "resources": {
+    "Font": {
+      "F0": "ref 4 0 R",
+    },
+  },
+}
+`;
+
+exports[`R1: run-less text boxes > right-aligned, bold italic 1`] = `
+{
+  "annot": {
+    "BS": {
+      "W": 0,
+    },
+    "Contents": "str <FEFF0052006900670068007400200073006900640065000A007300650063006F006E0064>",
+    "DA": "str (0.627 0.063 0.125 rg /Helv 13 Tf)",
+    "Subtype": "FreeText",
+  },
+  "ops": "q 72 582 180 120 re W n BT /F0 13 Tf 0.627 0.063 0.125 rg 1 0 0 1 183.604 689.34 Tm <0001000200030004000500060007000200080009> Tj 1 0 0 1 205.224 673.09 Tm <00070009000A000B000C0008> Tj ET Q",
+  "raster": [],
+  "rect": [
+    72,
+    582,
+    252,
+    702,
+  ],
+  "resolveCalls": [],
+  "resources": {
+    "Font": {
+      "F0": "ref 4 0 R",
+    },
+  },
+}
+`;

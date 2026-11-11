@@ -57,7 +57,7 @@ import { toast } from "../ui/toast";
 import { openExportDialog } from "./export/export-dialog";
 import { mountInspector } from "./inspector/inspector";
 import { damageChange, damageNotice, damageTooltip } from "./media/damage";
-import { openGeneratorDialog } from "./media/generators";
+import { openGeneratorDialog, prepareProjectFonts } from "./media/generators";
 import { abandonsPlayback, MediaManager } from "./media/media";
 import { openRelinkDialog } from "./media/relink";
 import { statusChange } from "./media/status-diff";
@@ -2017,6 +2017,14 @@ function buildEditor(
   // screen, relinking into a project nobody saves.
   if (loaded.missing.length > 0) {
     teardown.add(openRelinkDialog({ session, media, missing: loaded.missing }));
+  }
+
+  // Text in a font from the library or this PC: load those fonts (the stage's
+  // text swaps them in by itself), then one notice naming any that are not on
+  // this PC. Not awaited, and nothing at all runs for a project whose text
+  // uses only the six legacy fonts.
+  if (session.project.media.some((m) => m.generator?.type === "text" && m.generator.fontId !== undefined)) {
+    void prepareProjectFonts(session.project.media, disposed);
   }
 
   // dev hook for the in-app autotest harness

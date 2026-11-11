@@ -11,7 +11,8 @@ import { appVersion, describeError, errorDetail, ipc, onJobEvents } from "../../
 import type { JobDone, JobFailed, JobProgress } from "../../core/ipc";
 import { ProjectSession, settingsStore, updateSettings } from "../../core/session";
 import { timelineDuration } from "../../core/time";
-import type { ExportPreset, FontFamily, ProjectFile, ResolutionPreset } from "../../core/types";
+import { fontDisplayName, fontRequestOf } from "../../core/font-id";
+import type { ExportPreset, FontFamily, FontId, FontRequest, Generator, ProjectFile, ResolutionPreset } from "../../core/types";
 import { detailPane, recentErrors, recordError } from "../../ui/errors";
 import { focusFirst, trapTab } from "../../ui/focus";
 import { icon } from "../../ui/icons";
@@ -429,6 +430,9 @@ export function unsupportedTextSamples(p: Pick<ProjectFile, "media" | "timeline"
   for (const m of p.media) {
     const g = m.generator;
     if (g?.type !== "text" || !used.has(m.id) || typeof g.text !== "string") continue;
+    // A font from the library or this PC is not in the table: it is checked
+    // against its real file instead (libraryFontTextCheck).
+    if (fontRequestOf(g.fontFamily, g.fontId, g.bold, g.italic) !== null) continue;
     // Cheap first pass: most text is plain, and needs no segmenter at all.
     let any = false;
     for (const ch of g.text) {
@@ -458,6 +462,110 @@ export function unsupportedTextSamples(p: Pick<ProjectFile, "media" | "timeline"
 export function missingGlyphNote(samples: readonly string[]): string | null {
   if (samples.length === 0) return null;
   return `Some characters in your text, like ${samples.join(" ")}, aren't in the text's font, so the export will show empty boxes in their place.`;
+}
+
+type TextGen = Extract<Generator, { type: "text" }>;
+
+/** Placed text whose font is from the library or this PC (a well-shaped
+ *  `fontId`), each with its font request. Empty for a project that only uses
+ *  the six legacy fonts. */
+export function libraryFontTexts(p: Pick<ProjectFile, "media" | "timeline">): { gen: TextGen; req: FontRequest }[] {
+  const used = new Set<string>();
+  for (const t of p.timeline.tracks) for (const c of t.clips) used.add(c.mediaId);
+  const out: { gen: TextGen; req: FontRequest }[] = [];
+  for (const m of p.media) {
+    const g = m.generator;
+    if (g?.type !== "text" || !used.has(m.id) || typeof g.text !== "string") continue;
+    const req = fontRequestOf(g.fontFamily, g.fontId, g.bold, g.italic);
+    if (req) out.push({ gen: g, req });
+  }
+  return out;
+}
+
+/** What the export check found for text in a library or installed font. */
+export interface LibraryFontCheck {
+  /** Characters the font's own file cannot draw (whole graphemes, at most 3). */
+  samples: string[];
+  /** Fonts that are not on this PC: the export draws that text in `fallback`. */
+  missing: FontId[];
+  fallback: FontFamily;
+}
+
+/** Push into `found` (up to the sample cap) each distinct grapheme of `text`
+ *  holding a code point `lacks` says the font cannot draw. */
+function collectSamples(text: string, lacks: (cp: number) => boolean, found: string[]): void {
+  let any = false;
+  for (const ch of text) {
+    if (lacks(ch.codePointAt(0)!)) {
+      any = true;
+      break;
+    }
+  }
+  if (!any) return;
+  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  for (const { segment } of segmenter.segment(text)) {
+    if (found.length >= MISSING_GLYPH_SAMPLES) return;
+    if (found.includes(segment)) continue;
+    for (const ch of segment) {
+      if (lacks(ch.codePointAt(0)!)) {
+        found.push(segment);
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * The glyph check for placed text in a font from the library or this PC: its
+ * real file answers (`fonts_missing_glyphs`), not the six-font table. A font
+ * that is not on this PC is exported in the text's legacy font, so that text
+ * is checked against the table for it and the font is named in `missing`.
+ *
+ * Null, with no font call and no IPC at all, when no placed text names such a
+ * font (I1). Never rejects: a failed check just finds nothing.
+ */
+export async function libraryFontTextCheck(
+  p: Pick<ProjectFile, "media" | "timeline">,
+): Promise<LibraryFontCheck | null> {
+  const items = libraryFontTexts(p);
+  if (items.length === 0) return null;
+  const found: string[] = [];
+  const missing: FontId[] = [];
+  let fallback: FontFamily = items[0]!.gen.fontFamily;
+  try {
+    const fonts = await import("../../fonts");
+    const reqs = items.map((i) => i.req);
+    await fonts.ensureFonts(reqs);
+    const absent = new Set(fonts.missingFonts(reqs));
+    const present = items.filter((i) => !absent.has(i.req.id));
+    for (const i of items) {
+      if (!absent.has(i.req.id)) continue;
+      if (!missing.includes(i.req.id)) {
+        if (missing.length === 0) fallback = i.gen.fontFamily;
+        missing.push(i.req.id);
+      }
+      collectSamples(i.gen.text, (cp) => !fontHasGlyph(i.gen.fontFamily, cp), found);
+    }
+    if (present.length > 0) {
+      const answer = await ipc.fontsMissingGlyphs(present.map((i) => ({ ...i.req, text: i.gen.text })));
+      present.forEach((i, k) => {
+        const lacking = new Set(Array.isArray(answer[k]) ? answer[k] : []);
+        if (lacking.size > 0) collectSamples(i.gen.text, (cp) => lacking.has(cp), found);
+      });
+    }
+  } catch {
+    // A note, never a refusal: a check that could not run says nothing.
+  }
+  return { samples: found.slice(0, MISSING_GLYPH_SAMPLES), missing, fallback };
+}
+
+/** The export form's note for fonts that are not on this PC, or null. */
+export function missingFontExportNote(ids: readonly FontId[], fallback: FontFamily): string | null {
+  const names = [...new Set(ids.map(fontDisplayName))];
+  if (names.length === 0) return null;
+  if (names.length === 1) return `Font ${names[0]} isn't on this PC, so the export uses ${fallback} in its place.`;
+  const list = `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  return `Fonts ${list} aren't on this PC, so the export uses ${fallback} in their place.`;
 }
 
 /**
@@ -801,6 +909,11 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
   /** False until the form has been painted once — the difference between
    *  opening the dialog and returning to the form from another view. */
   let formPainted = false;
+  /** The library-font glyph check last asked for, by the content it checks
+   *  (see updateGlyphNote), and its answer (null until it arrives): a repaint
+   *  of the form does not ask Rust again. */
+  let fontCheckKey = "";
+  let fontCheck: LibraryFontCheck | null = null;
   /** Set by close() so an in-flight async listener registration can tell that
    *  the dialog is already gone (see beginExport). */
   let closed = false;
@@ -1016,9 +1129,40 @@ export function openExportDialog(ctx: { session: ProjectSession }): () => void {
   function updateGlyphNote(): void {
     const el = backdrop.querySelector<HTMLElement>("#ex-glyph-note");
     if (!el) return;
-    const note = missingGlyphNote(unsupportedTextSamples(session.project));
-    el.hidden = note === null;
-    el.textContent = note ?? "";
+    const base = unsupportedTextSamples(session.project);
+    const paint = (check: LibraryFontCheck | null): void => {
+      const samples = [...base];
+      for (const s of check?.samples ?? []) {
+        if (samples.length < MISSING_GLYPH_SAMPLES && !samples.includes(s)) samples.push(s);
+      }
+      const parts = [check ? missingFontExportNote(check.missing, check.fallback) : null, missingGlyphNote(samples)]
+        .filter((s): s is string => s !== null);
+      el.hidden = parts.length === 0;
+      el.textContent = parts.join(" ");
+    };
+    // Text in a library or installed font is checked against its real file,
+    // asynchronously, once per distinct content; the six never get here (I1).
+    const items = libraryFontTexts(session.project);
+    if (items.length === 0) {
+      paint(null);
+      return;
+    }
+    const key = JSON.stringify(items.map((i) => [i.req.id, i.req.bold, i.req.italic, i.gen.fontFamily, i.gen.text]));
+    if (key !== fontCheckKey) {
+      fontCheckKey = key;
+      fontCheck = null;
+      void libraryFontTextCheck(session.project).then(
+        (check) => {
+          // An answer for text that has changed since is not painted.
+          if (closed || key !== fontCheckKey) return;
+          fontCheck = check;
+          // The form may have been repainted meanwhile: paint whatever is there now.
+          updateGlyphNote();
+        },
+        () => {},
+      );
+    }
+    paint(fontCheck);
   }
 
   /** Focus lives in the body this function just replaced. Every view swap here

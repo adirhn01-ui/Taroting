@@ -35,7 +35,9 @@ import {
   shortcutsBlocked,
 } from "../../core/shortcuts";
 import { Store } from "../../core/store";
-import type { ActionId, PdfFormValue, PdfPage, PdfToolStyle, ProjectFile } from "../../core/types";
+import { missingFontNotice } from "../../core/font-id";
+import { runFontRequests } from "../../core/pdf-runs";
+import type { ActionId, FontRequest, PdfFormValue, PdfPage, PdfToolStyle, ProjectFile } from "../../core/types";
 import { imgIcon } from "../../image/icons";
 import { icon } from "../../ui/icons";
 import { closeMenu, showMenu } from "../../ui/menu";
@@ -109,10 +111,51 @@ export function defaultToolState(style: PdfToolStyle = {}): PdfToolState {
     sizes,
     shape: style.shape ?? "arrow",
     font: style.font ?? "Segoe UI",
+    // a remembered non-legacy font (Settings keeps only a well-shaped one)
+    ...(style.fontId !== undefined ? { fontId: style.fontId } : {}),
     textBg: hex(style.textBg),
     textBorder: hex(style.textBorder),
     ruler: null,
   };
+}
+
+/** The font requests of a project's text marks that name a non-legacy font,
+ *  their style runs' included (each resolved over its box), deduplicated.
+ *  Empty for a project without a `fontId` anywhere: the editor then never
+ *  loads the font runtime (I1). */
+export function projectFontRequests(p: ProjectFile): FontRequest[] {
+  const out: FontRequest[] = [];
+  const seen = new Set<string>();
+  const annots = p.pdf?.annots ?? {};
+  for (const key of Object.keys(annots)) {
+    const list = annots[key];
+    if (!Array.isArray(list)) continue;
+    for (const a of list) {
+      if (a.t !== "text") continue;
+      for (const req of runFontRequests(a, a.runs)) {
+        const k = `${req.id}\u0000${req.bold}\u0000${req.italic}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        out.push(req);
+      }
+    }
+  }
+  return out;
+}
+
+/** Load the project's non-legacy fonts (asked only for a project that names
+ *  one); the notice for those not on this PC, "" when there is none. Never
+ *  rejects: a failure reads as nothing missing, and the boxes keep their
+ *  legacy fonts until the runtime has them. */
+async function loadProjectFonts(reqs: FontRequest[]): Promise<string> {
+  try {
+    const fonts = await import("../../fonts");
+    await fonts.ensureFonts(reqs);
+    return missingFontNotice(fonts.missingFonts(reqs));
+  } catch (e) {
+    console.error("The PDF project's fonts did not load", e);
+    return "";
+  }
 }
 
 /** Map the project's pages to the strip's slots. A page whose source did not
@@ -137,6 +180,8 @@ export function coverKey(p: ProjectFile): string {
 
 /** Whether the rail is open: per app session, not saved. */
 let railOpen = true;
+/** Whether the inspector is open: per app session, not saved, like the rail. */
+let inspectorOpen = true;
 
 /**
  * Mount the PDF editor for a project `mountEditor` has already loaded (and
@@ -158,6 +203,12 @@ export async function mountPdfEditor(
     if (!isPdfProject(project) || !project.pdf || project.pdf.pages.length === 0) {
       throw new Error("This file isn't a PDF project Taroting can open.");
     }
+    // A project naming a non-legacy font starts loading it alongside its
+    // PDFs, but the editor never waits for it (as the video and image editors
+    // do not): a box shows its legacy font until its own lands, then is laid
+    // out again (marks/render.ts, marks/layer.ts).
+    const reqs = projectFontRequests(project);
+    const fontsLoad = reqs.length > 0 ? loadProjectFonts(reqs) : null;
     const { docs, issues } = await openSources(project.pdf.sources, project);
     built.docs = docs;
     // Superseded while the documents opened: give them back, touch nothing.
@@ -165,7 +216,7 @@ export async function mountPdfEditor(
       void destroyDocs(docs);
       return noop;
     }
-    return mount(root, route, loaded, issues, built);
+    return mount(root, route, loaded, issues, built, fontsLoad);
   } catch (e) {
     built.closeOverlays?.();
     runTeardown(built.teardown);
@@ -226,6 +277,7 @@ function mount(
   loaded: LoadedProject,
   issues: SourceIssue[],
   built: Built,
+  fontsLoad: Promise<string> | null,
 ): { dispose(): Promise<void> } {
   const undo = built.teardown;
   const docs = built.docs!;
@@ -267,7 +319,9 @@ function mount(
   const stage = el("div", { id: "pdfed-stage", className: "editor__preview pdfed-stage" });
   const toolsHost = el("div", { id: "pdfed-tools", className: "pdfed-tools" });
   const sep = (): HTMLElement => el("span", { className: "pdfed-sep", attrs: { "aria-hidden": "true" } });
-  const railBtn = button("btn--ghost btn--icon btn--sm", { id: "pdfed-rail-toggle", title: "Pages", label: "Show pages", icon: imgIcon("layers", 14) });
+  // Both panel toggles are painted by paintRail / paintInspector below.
+  const railBtn = button("btn--ghost btn--icon btn--sm", { id: "pdfed-rail-toggle", title: "Hide pages", label: "Hide pages", icon: icon("panelLeft", 14) });
+  const inspBtn = button("btn--ghost btn--icon btn--sm", { id: "pdfed-insp-toggle", title: "Hide properties", label: "Hide properties", icon: icon("panelRight", 14) });
   const undoBtn = button("btn--ghost btn--icon btn--sm", { id: "pdfed-undo", title: titled("Undo", "undo"), label: "Undo", icon: imgIcon("undo", 14) });
   const redoBtn = button("btn--ghost btn--icon btn--sm", { id: "pdfed-redo", title: titled("Redo", "redo"), label: "Redo", icon: imgIcon("redo", 14) });
   const zoomOutBtn = button("btn--ghost btn--icon btn--sm", { id: "pdfed-zoom-out", title: titled("Zoom out", "imgZoomOut"), label: "Zoom out", icon: icon("zoomOut", 14) });
@@ -303,6 +357,8 @@ function mount(
             el("div", { className: "pdfed-pageind" }, [pageInput, pageCount]),
             sep(),
             findBtn,
+            sep(),
+            inspBtn,
           ]),
         ]),
       ]),
@@ -688,16 +744,67 @@ function mount(
   });
   onClick(findBtn, () => find.open());
 
+  /* ---------------- the two side panels ---------------- */
+
+  // Two independent toggles, remembered per app session (railOpen,
+  // inspectorOpen). A collapsed panel stays mounted and synced, so opening it
+  // again shows the current pages / selection at once; the strip keeps its
+  // page through the width change (its ResizeObserver re-lays out on an
+  // anchor). Neither panel ever opens by itself.
+  const paintToggle = (btn: HTMLButtonElement, open: boolean, what: string, action: ActionId): void => {
+    const label = `${open ? "Hide" : "Show"} ${what}`;
+    btn.setAttribute("aria-pressed", open ? "true" : "false");
+    btn.setAttribute("aria-label", label);
+    btn.title = titled(label, action);
+  };
+  /** A panel going away takes keyboard focus out of it first: focus left in a
+   *  display:none subtree falls to <body>, and the next shortcut or Tab would
+   *  start from nowhere. Its toggle is the one control that brings it back. */
+  const focusOutOf = (panel: HTMLElement, btn: HTMLButtonElement): void => {
+    const active = document.activeElement;
+    if (active instanceof Element && panel.contains(active)) btn.focus();
+  };
   const paintRail = (): void => {
     pagesEl.classList.toggle("pdfed-pages--collapsed", !railOpen);
-    railBtn.setAttribute("aria-pressed", railOpen ? "true" : "false");
-    railBtn.title = railOpen ? "Hide pages" : "Show pages";
+    paintToggle(railBtn, railOpen, "pages", "pdfPages");
   };
-  onClick(railBtn, () => {
+  const toggleRail = (): void => {
+    if (disposed) return;
     railOpen = !railOpen;
+    if (!railOpen) focusOutOf(pagesEl, railBtn);
     paintRail();
-  });
+  };
+  const paintInspector = (): void => {
+    inspectorHost.classList.toggle("pdfed-inspector--collapsed", !inspectorOpen);
+    paintToggle(inspBtn, inspectorOpen, "properties", "pdfProperties");
+  };
+  const toggleInspector = (): void => {
+    if (disposed) return;
+    inspectorOpen = !inspectorOpen;
+    if (!inspectorOpen) {
+      focusOutOf(inspectorHost, inspBtn);
+      // The inspector's popovers (the font list, a colour picker) live on
+      // <body>, anchored to a control that is about to have no box. Both put
+      // themselves away when their anchor scrolls (a window capture listener
+      // for "scroll" from anywhere outside them); a scroll event from the
+      // panel says exactly that, and closes them the way a scroll would,
+      // without unmounting the panel. (A press on this button already closes
+      // them through their outside-press listener; this covers every other
+      // path to a collapse.)
+      inspectorHost.dispatchEvent(new Event("scroll"));
+    }
+    paintInspector();
+  };
+  // The toggles never take focus from a press: a text box being typed into
+  // keeps its focus and caret (its focusout would commit it), as the
+  // inspector's own buttons do while a box is open.
+  const keepFocus = (e: Event): void => e.preventDefault();
+  railBtn.addEventListener("mousedown", keepFocus);
+  inspBtn.addEventListener("mousedown", keepFocus);
+  onClick(railBtn, toggleRail);
+  onClick(inspBtn, toggleInspector);
   paintRail();
+  paintInspector();
 
   pageInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
@@ -927,6 +1034,10 @@ function mount(
   bindKey("imgZoomOut", () => zoomBy(-1));
   bindKey("imgZoomFit", () => view.fit("width"));
   bindKey("imgZoom100", () => view.setZoom(ZOOM_100));
+  // Inert while typing (the manager skips typing targets, and leaves the key
+  // to them untouched) and while a popover or dialog holds the keyboard.
+  bindKey("pdfPages", toggleRail);
+  bindKey("pdfProperties", toggleInspector);
   shortcuts.attach();
   undo.push(() => shortcuts.detach());
 
@@ -947,6 +1058,12 @@ function mount(
   /* ---------------- sources, recovered ---------------- */
 
   if (loaded.recovered) toast.info("Project restored from its automatic backup.");
+  // A notice, not info: nothing failed (each box shows its legacy font), as
+  // in the video and image editors. It follows the load, which may end after
+  // this editor closed.
+  void fontsLoad?.then((notice) => {
+    if (notice && !disposed) toast.notice(notice);
+  });
   /** Continue past the sources dialog: a source that opened with fewer pages
    *  than the project shows from it (a crafted or replaced file) loses those
    *  pages, as ONE step. */

@@ -25,7 +25,11 @@ const spies = vi.hoisted(() => ({
   toastError: [] as string[],
   toastRefuse: [] as string[],
   /** Stands in for the text/solid section when set (null: no section). */
-  genSection: null as null | ((ctx: unknown, target: { clip: unknown; media: { id: string } }) => unknown),
+  genSection: null as null | ((
+    ctx: unknown,
+    target: { clip: unknown; media: { id: string } },
+    opts?: { sharedNote?: boolean; onCleanup?: (fn: () => void) => void; closed?: () => boolean },
+  ) => unknown),
 }));
 vi.mock("./crop-image", () => ({
   startImageCrop: () => {
@@ -39,8 +43,11 @@ vi.mock("./canvas-size-dialog", () => ({
   },
 }));
 vi.mock("../editor/inspector/generated", () => ({
-  buildGeneratedSection: (ctx: unknown, target: { clip: unknown; media: { id: string } }) =>
-    spies.genSection ? spies.genSection(ctx, target) : null,
+  buildGeneratedSection: (
+    ctx: unknown,
+    target: { clip: unknown; media: { id: string } },
+    opts?: { sharedNote?: boolean; onCleanup?: (fn: () => void) => void; closed?: () => boolean },
+  ) => (spies.genSection ? spies.genSection(ctx, target, opts) : null),
 }));
 vi.mock("../ui/menu", () => ({ showMenu: () => {}, closeMenu: () => {} }));
 vi.mock("../ui/toast", () => ({
@@ -700,5 +707,55 @@ describe("inspector: a typed text edit survives a click on another layer", () =>
     expect(t.host.all((e) => e.cls.has("insp-header"))).toHaveLength(1);
     expect(t.host.find((e) => e.cls.has("insp-header__name"))!.textContent).toBe("p");
     expect(t.host.find((e) => e.cls.has("badge"))!.textContent).toBe("Photo");
+  });
+});
+
+describe("inspector: the text section's cleanup (0.9.4 fonts)", () => {
+  // The real section hands back a cleanup that disposes its font picker, and
+  // drops a commit still waiting for a font only once `closed()` reads true
+  // (generated.fonts.test.ts): here, that the image inspector runs the cleanup
+  // when it replaces the section and when it is disposed, and that `closed`
+  // reads true only after dispose.
+  async function withText() {
+    const t = mount(false);
+    const photoId = t.id;
+    const gen = { type: "text", text: "Old", fontFamily: "Arial", sizePx: 40, color: "#ffffff", bold: false, italic: false } as const;
+    const made = addGeneratorLayer(t.store.get(), gen, 94, 50, "Text — Old");
+    t.store.set(made.project);
+    const cleaned: number[] = [];
+    const closed: (() => boolean)[] = [];
+    let built = 0;
+    spies.genSection = (_ctx, _target, opts) => {
+      const n = built++;
+      cleaned[n] = 0;
+      closed[n] = opts?.closed ?? (() => true);
+      opts?.onCleanup?.(() => void cleaned[n]!++);
+      return new El("div");
+    };
+    t.ctx.selection.set(made.trackId);
+    await flush();
+    return { ...t, photoId, cleaned, closed, built: () => built };
+  }
+
+  it("runs the section's cleanup when another layer replaces it", async () => {
+    const t = await withText();
+    expect(t.built()).toBe(1);
+    expect(t.cleaned).toEqual([0]);
+    t.ctx.selection.set(t.photoId);
+    await flush();
+    expect(t.cleaned).toEqual([1]);
+    // Replaced, not closed: a commit still waiting for its font will land.
+    expect(t.closed[0]!()).toBe(false);
+  });
+
+  it("runs the section's cleanup when the inspector is disposed", async () => {
+    const t = await withText();
+    expect(t.cleaned).toEqual([0]);
+    expect(t.closed[0]!()).toBe(false);
+    for (const m of mounted) m.dispose();
+    mounted = [];
+    expect(t.cleaned).toEqual([1]);
+    // Closed: a commit still waiting for its font is dropped.
+    expect(t.closed[0]!()).toBe(true);
   });
 });

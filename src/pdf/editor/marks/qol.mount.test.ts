@@ -15,6 +15,8 @@ import { FakeElement, FakeEvent, makeKit, project, showPages, type Kit } from ".
 const h = vi.hoisted(() => ({
   toasts: [] as string[],
 }));
+// the font runtime as a plain <select> of the six (these tests are about the inspector)
+vi.mock("../../../fonts", async () => (await import("./fonts-stand-in.test-util")).fontsStandIn());
 vi.mock("../../../ui/toast", () => ({
   toast: {
     error: (m: string) => h.toasts.push(`error:${m}`),

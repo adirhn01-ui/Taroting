@@ -36,6 +36,12 @@
 .pdfed-pages--collapsed {
   display: none;
 }
+/* Two classes: the inspector part's `.inspector` (display:flex) lives in a
+ * stylesheet whose load order relative to this one is not fixed. The panel
+ * stays mounted and synced while collapsed. */
+.pdfed .pdfed-inspector--collapsed {
+  display: none;
+}
 .pdfed-rail {
   flex: 1;
   min-height: 0;

@@ -28,19 +28,77 @@ export function rasterScale(w: number, h: number): number {
  *  character of a word that has to be broken is measured once (repeats come
  *  from a cache) and a line's width is their sum — re-measuring the whole
  *  line for every word made a 4000-character box take seconds. Kerning
- *  across a word boundary is ignored; that is far below a pixel. */
+ *  across a word boundary is ignored; that is far below a pixel.
+ *
+ *  The string-measure form: one font for the whole paragraph (form fields, a
+ *  text box without style runs). A thin wrapper over `wrapRanges`, with the
+ *  same answers and the same measure calls as before 0.9.4. */
 export function wrapParagraph(para: string, width: number, measure: (s: string) => number): [number, number][] {
-  const lines: [number, number][] = [];
-  if (para.length === 0) return [[0, 0]];
   const cache = new Map<string, number>();
-  const m = (t: string): number => {
+  return wrapRanges(para, width, (a, b) => {
+    const t = para.slice(a, b);
     let v = cache.get(t);
     if (v === undefined) {
       v = measure(t);
       if (cache.size < 8192) cache.set(t, v);
     }
     return v;
+  });
+}
+
+/** The width of `para[start, end)`, `start < end`, as `wrapRanges` asks. */
+export type MeasureRange = (start: number, end: number) => number;
+
+/** A paragraph's styled pieces for `rangeMeasurer`: [s, e) offsets INTO THE
+ *  PARAGRAPH, in order, covering it without gaps or overlaps. */
+export interface MeasurePiece {
+  s: number;
+  e: number;
+}
+
+/**
+ * A `MeasureRange` for a paragraph in several styles (0.9.4 style runs): the
+ * width of a range is the SUM over the pieces it touches of
+ * `measurePiece(i, start, end)` (piece `i`'s width of `para[start, end)`,
+ * clipped to the piece, measured in that piece's font). Answers are cached by
+ * range. A word that spans two pieces is measured as its parts, so kerning
+ * across a style change is ignored, like across a word boundary.
+ */
+export function rangeMeasurer(
+  pieces: readonly MeasurePiece[],
+  measurePiece: (i: number, start: number, end: number) => number,
+): MeasureRange {
+  const cache = new Map<number, number>();
+  return (start, end) => {
+    const key = start * 0x100000 + end;
+    let v = cache.get(key);
+    if (v !== undefined) return v;
+    v = 0;
+    // first piece that ends after `start` (pieces are sorted)
+    let lo = 0;
+    let hi = pieces.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (pieces[mid]!.e <= start) lo = mid + 1;
+      else hi = mid;
+    }
+    for (let i = lo; i < pieces.length && pieces[i]!.s < end; i++) {
+      const p = pieces[i]!;
+      const a = Math.max(start, p.s);
+      const b = Math.min(end, p.e);
+      if (b > a) v += measurePiece(i, a, b);
+    }
+    if (cache.size < 8192) cache.set(key, v);
+    return v;
   };
+}
+
+/** The wrapping core: `wrapParagraph`'s rule over a range measure, so a
+ *  paragraph in several fonts and sizes wraps by the sum of its pieces. */
+export function wrapRanges(para: string, width: number, measureRange: MeasureRange): [number, number][] {
+  const lines: [number, number][] = [];
+  if (para.length === 0) return [[0, 0]];
+  const m = measureRange;
   const trimEnd = (a: number, b: number): number => {
     while (b > a && /\s/.test(para[b - 1]!)) b--;
     return b;
@@ -59,8 +117,8 @@ export function wrapParagraph(para: string, width: number, measure: (s: string) 
   let full = 0;
   for (const [ws, we] of words) {
     const wt = trimEnd(ws, we);
-    const cw = m(para.slice(ws, wt));
-    const tw = wt < we ? m(para.slice(wt, we)) : 0;
+    const cw = m(ws, wt);
+    const tw = wt < we ? m(wt, we) : 0;
     if ((e > s ? full : 0) + cw <= width) {
       full = (e > s ? full : 0) + cw + tw;
       e = we;
@@ -87,7 +145,7 @@ export function wrapParagraph(para: string, width: number, measure: (s: string) 
       while (j < end) {
         const cp = para.codePointAt(j)!;
         const next = j + (cp > 0xffff ? 2 : 1);
-        const w = m(para.slice(j, next));
+        const w = m(j, next);
         if (last > i && acc + w > width) break;
         acc += w;
         last = next;

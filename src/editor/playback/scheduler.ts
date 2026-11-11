@@ -659,7 +659,7 @@ function generatorKey(mediaId: string, g: Generator): string {
   return g.type === "solid"
     ? `${mediaId}|solid|${g.color}`
     : g.type === "text"
-      ? `${mediaId}|text|${g.text}|${g.fontFamily}|${g.sizePx}|${g.color}|${g.bold}|${g.italic}`
+      ? `${mediaId}|text|${g.text}|${g.fontFamily}|${g.fontId ?? ""}|${g.sizePx}|${g.color}|${g.bold}|${g.italic}`
       : `${mediaId}|drawing`;
 }
 

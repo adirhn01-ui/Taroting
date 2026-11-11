@@ -1,0 +1,96 @@
+/* The font picker's open list (src/fonts/picker.ts). Its own sheet, imported
+   by the module, so it loads with the first open and with nothing else. Built
+   from the context menu's and the colour picker's pieces. Every per-row font
+   is written through the CSSOM (a style attribute is refused by the packaged
+   CSP; see the header of src/ui/color-picker.ts). */
+
+.fontpk__pop {
+  position: fixed;
+  z-index: var(--z-menu); /* a transient popover, same rung as a context menu: see the ladder in tokens.css */
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  width: 260px;
+  max-width: calc(100vw - 16px);
+  padding: var(--sp-1);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-m);
+  box-shadow: var(--shadow-2);
+  user-select: none;
+}
+
+/* Opened from a dialog (the Add text dialog), the list would sit on the menu
+   rung below the modal: every dialog is a .modal-backdrop appended to <body>
+   and the list is appended after it, so this lifts exactly that case one rung,
+   still under toasts. Same rule as the colour picker's. */
+.modal-backdrop ~ .fontpk__pop {
+  z-index: var(--z-modal-popover);
+}
+
+.fontpk__search {
+  height: 28px;
+  font-size: var(--fs-12);
+}
+
+.fontpk__list {
+  max-height: 320px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.fontpk__group {
+  padding: var(--sp-2) var(--sp-2) var(--sp-1);
+  font-size: var(--fs-11);
+  font-weight: 600;
+  color: var(--text-3);
+}
+
+.fontpk__row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 28px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--radius-s);
+  color: var(--text-1);
+  font-size: var(--fs-13);
+  cursor: pointer;
+  white-space: nowrap;
+  /* A PC can have a thousand families: rows off screen are not laid out or
+     painted, and their preview fonts are not fetched until scrolled to. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 28px;
+}
+/* `display: flex` above outranks the UA's [hidden] rule: a row the search
+   filtered out. */
+.fontpk__row[hidden] {
+  display: none;
+}
+.fontpk__row--active {
+  background: var(--bg-hover);
+}
+.fontpk__row[aria-selected="true"] {
+  color: var(--accent-strong);
+}
+
+.fontpk__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The family's own look, beside a name always written in the UI font (a
+   symbol font would otherwise turn its own name into pictures). */
+.fontpk__sample {
+  flex: none;
+  color: var(--text-2);
+  font-size: var(--fs-14);
+}
+
+.fontpk__note {
+  padding: var(--sp-2);
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}

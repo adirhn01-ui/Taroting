@@ -20,8 +20,10 @@ import {
   drawLayer,
   drawUnderlay,
   openDrawingLayer,
+  textFontRequests,
   type ScaledView,
 } from "./composite";
+import { ensureFonts } from "../../fonts";
 import type { RenderResources } from "./index";
 import { ADJUST_STRIP_ROWS, adjustStrip, decodeStill, fetchPhoto, fitRenderLimits, workingWidth } from "./photos";
 
@@ -109,6 +111,23 @@ export function yieldToUi(): Promise<void> {
   const s = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
   if (s && typeof s.yield === "function") return s.yield();
   return new Promise((r) => setTimeout(r, 0));
+}
+
+/** `p`, or settled as soon as `signal` aborts, whichever comes first: a
+ *  cancel never waits on a slow font load. */
+function untilAborted(p: Promise<void>, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const done = (): void => {
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    signal.addEventListener("abort", done);
+    p.then(done, (e: unknown) => {
+      signal.removeEventListener("abort", done);
+      reject(e);
+    });
+  });
 }
 
 /** One photo layer's pixels, prepared for export: decoded at the density the
@@ -253,6 +272,26 @@ async function render(
   }
   if (signal.aborted) throw abortError();
 
+  // What is drawn, by the preview's own opacity rule: a crafted non-finite
+  // opacity draws at 1 in both, never shown on screen yet missing from the file.
+  const visible = layersOf(doc).filter((l) => !l.hidden && opacityOf(l) > 0);
+
+  // The one font barrier for export, Copy image and the Home card: canvas text
+  // does not update by itself, so every non-legacy font a visible text layer
+  // uses is made ready (or known missing, which draws its legacy font) before
+  // the first layer is drawn. A project that uses only the six legacy fonts
+  // asks nothing (I1). A failure to load is not a failure to render: that
+  // text draws with its legacy font, as a missing font does.
+  const reqs = textFontRequests(visible);
+  if (reqs.length > 0) {
+    try {
+      await untilAborted(ensureFonts(reqs), signal);
+    } catch (e) {
+      console.warn("Fonts for the image could not be loaded; drawing with the fallback", e);
+    }
+    if (signal.aborted) throw abortError();
+  }
+
   const W = doc.timeline.width;
   const H = doc.timeline.height;
   const view: ScaledView = { zoom: outW / W, zoomY: outH / H, panX: 0, panY: 0 };
@@ -271,11 +310,7 @@ async function render(
     drawUnderlay(ctx, doc, view, exportUnderlay(opts.format, doc.image?.background));
     drawBackground(ctx, doc, view);
 
-    // The preview's own opacity rule: a crafted non-finite opacity draws at 1
-    // in both, never shown on screen yet missing from the file.
-    const layers = layersOf(doc)
-      .filter((l) => !l.hidden && opacityOf(l) > 0)
-      .reverse(); // bottom → top
+    const layers = visible.reverse(); // bottom → top
     const total = Math.max(1, layers.length);
     const LAYERS_SHARE = 0.9;
     const report = (done: number, within: number): void => onProgress(((done + within) / total) * LAYERS_SHARE);

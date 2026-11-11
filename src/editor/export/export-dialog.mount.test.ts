@@ -20,6 +20,18 @@ const h = vi.hoisted(() => ({
     onDone?: (e: { id: number; kind: string; output: Record<string, unknown> }) => void;
   },
   settings: { lastExportDir: null as string | null, defaultExportDir: null as string | null, hardwareAccel: true },
+  /** The font runtime and `fonts_missing_glyphs`, as recorders. */
+  fontEnsures: [] as unknown[],
+  fontsGone: new Set<string>(),
+  glyphAsks: [] as unknown[],
+  glyphsLacking: [] as number[],
+}));
+vi.mock("../../fonts", () => ({
+  ensureFonts: (reqs: unknown) => {
+    h.fontEnsures.push(reqs);
+    return Promise.resolve();
+  },
+  missingFonts: (reqs: { id: string }[]) => reqs.filter((r) => h.fontsGone.has(r.id)).map((r) => r.id),
 }));
 
 vi.mock("./export-ipc", () => ({
@@ -40,7 +52,14 @@ vi.mock("../../core/ipc", () => ({
   appVersion: () => Promise.resolve("0.0.0"),
   describeError: (e: unknown) => String(e),
   errorDetail: (e: unknown) => ({ code: "", message: String(e) }),
-  ipc: { exportFailureReport: () => Promise.reject(new Error("n/a")), saveDiagnosticReport: () => Promise.resolve("") },
+  ipc: {
+    exportFailureReport: () => Promise.reject(new Error("n/a")),
+    saveDiagnosticReport: () => Promise.resolve(""),
+    fontsMissingGlyphs: (items: unknown[]) => {
+      h.glyphAsks.push(items);
+      return Promise.resolve(items.map(() => h.glyphsLacking));
+    },
+  },
   onJobEvents: (handlers: typeof h.jobs) => {
     h.jobs = handlers;
     return Promise.resolve(() => {});
@@ -83,6 +102,10 @@ beforeEach(() => {
   h.onDisk = new Set();
   h.jobs = null;
   h.settings = { lastExportDir: null, defaultExportDir: null, hardwareAccel: true };
+  h.fontEnsures = [];
+  h.fontsGone = new Set();
+  h.glyphAsks = [];
+  h.glyphsLacking = [];
 });
 afterEach(() => {
   closer?.();
@@ -101,7 +124,7 @@ const video = (id: string, hasAudio: boolean): MediaRef => ({
   width: 1280,
   height: 720,
 });
-const textMedia = (id: string, text: string): MediaRef => ({
+const textMedia = (id: string, text: string, fontId?: string): MediaRef => ({
   id,
   path: "Text",
   size: 0,
@@ -111,7 +134,16 @@ const textMedia = (id: string, text: string): MediaRef => ({
   hasAudio: false,
   width: 400,
   height: 90,
-  generator: { type: "text", text, fontFamily: "Arial", sizePx: 64, color: "#ffffff", bold: false, italic: false },
+  generator: {
+    type: "text",
+    text,
+    fontFamily: "Arial",
+    sizePx: 64,
+    color: "#ffffff",
+    bold: false,
+    italic: false,
+    ...(fontId === undefined ? {} : { fontId }),
+  },
 });
 
 function project(over: { export?: unknown; media?: MediaRef[]; mediaId?: string } = {}): ProjectFile {
@@ -351,5 +383,41 @@ describe("export dialog: text the export font cannot draw (C122)", () => {
   it("stays hidden for text the font draws", () => {
     const d = open(project({ media: [textMedia("t", "Party time — Ωmega")] }));
     expect(d.$("#ex-glyph-note").hidden).toBe(true);
+  });
+
+  it("asks nothing of the font runtime or Rust for text in the six fonts", async () => {
+    open(project({ media: [textMedia("t", "Party 🎉 time")] }));
+    await settle();
+    expect(h.fontEnsures).toEqual([]);
+    expect(h.glyphAsks).toEqual([]);
+  });
+});
+
+describe("export dialog: text in a library or installed font", () => {
+  it("asks the font's own file once, then quotes what it cannot draw", async () => {
+    h.glyphsLacking = [0x4e2d];
+    // Arial's table lacks both Han characters; the font's file only the first.
+    const d = open(project({ media: [textMedia("t", "Hi 中 文", "lib:Inter")] }));
+    const note = d.$("#ex-glyph-note");
+    // Nothing is claimed before the file has answered.
+    expect(note.hidden).toBe(true);
+    await settle();
+    expect(h.glyphAsks).toEqual([[{ id: "lib:Inter", bold: false, italic: false, text: "Hi 中 文" }]]);
+    expect(note.hidden).toBe(false);
+    expect(note.textContent).toContain("中");
+    expect(note.textContent).not.toContain("文");
+    expect(d.$("#ex-run").disabled).toBe(false);
+  });
+
+  it("names a font that is not on this PC and the font the export uses instead", async () => {
+    h.fontsGone.add("lib:Gone");
+    const d = open(project({ media: [textMedia("t", "Plain words", "lib:Gone")] }));
+    await settle();
+    expect(d.$("#ex-glyph-note").textContent).toBe(
+      "Font Gone isn't on this PC, so the export uses Arial in its place.",
+    );
+    // A font with no file is not asked about.
+    expect(h.glyphAsks).toEqual([]);
+    expect(h.fontEnsures).toHaveLength(1);
   });
 });

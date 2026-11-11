@@ -48,15 +48,41 @@ const h = vi.hoisted(() => ({
   rail: null as null | Record<string, any>,
   search: null as null | { queries: string[]; cancels: number; hits: unknown[] },
   savedProjects: 0,
+  /** Font ids the faked runtime calls not on this PC, and the calls into it. */
+  fontMissing: new Set<string>(),
+  fontCalls: [] as string[],
+  /** set: ensureFonts stays pending until it resolves */
+  fontsLoading: null as null | Promise<void>,
+  sharedNotices: 0,
 }));
 
 vi.mock("../../ui/toast", () => ({
   toast: {
     info: (m: string) => void h.toasts.push(`info:${m}`),
+    notice: (m: string) => void h.toasts.push(`notice:${m}`),
     error: (m: string) => void h.toasts.push(`error:${m}`),
     refuse: (m: string) => void h.toasts.push(`refuse:${m}`),
   },
 }));
+// The font runtime (imported by the shell only for a project with a fontId).
+vi.mock("../../fonts", () => ({
+  ensureFonts: async (reqs: { id: string }[]) => {
+    h.fontCalls.push(`ensure:${reqs.map((r) => r.id).join(",")}`);
+    await h.fontsLoading;
+  },
+  missingFonts: (reqs: { id: string }[]) => reqs.filter((r) => h.fontMissing.has(r.id)).map((r) => r.id),
+}));
+// The shared wording, spied on but real: the shell's notice must come from it.
+vi.mock("../../core/font-id", async (orig) => {
+  const real = await orig<typeof import("../../core/font-id")>();
+  return {
+    ...real,
+    missingFontNotice: (ids: readonly string[]) => {
+      h.sharedNotices++;
+      return real.missingFontNotice(ids);
+    },
+  };
+});
 vi.mock("../../core/ipc", () => ({
   describeError: (e: unknown) => (e instanceof Error ? e.message : String(e)),
   ipc: {
@@ -280,6 +306,10 @@ beforeEach(() => {
   h.rail = null;
   h.search = null;
   h.savedProjects = 0;
+  h.fontMissing.clear();
+  h.fontCalls.length = 0;
+  h.fontsLoading = null;
+  h.sharedNotices = 0;
 });
 afterEach(() => {
   currentSession.set(null);
@@ -676,11 +706,19 @@ describe("the page panel", () => {
   it("the rail can be collapsed from the tool row", async () => {
     const m = await mount();
     const panel = m.$("#pdfed-pages");
+    const btn = m.$("#pdfed-rail-toggle");
     expect(panel.classList.contains("pdfed-pages--collapsed")).toBe(false);
-    m.$("#pdfed-rail-toggle").click();
+    expect(btn.getAttribute("aria-pressed")).toBe("true");
+    expect(btn.getAttribute("aria-label")).toBe("Hide pages");
+    expect(btn.title).toBe("Hide pages (F4)");
+    btn.click();
     expect(panel.classList.contains("pdfed-pages--collapsed")).toBe(true);
-    m.$("#pdfed-rail-toggle").click();
+    expect(btn.getAttribute("aria-pressed")).toBe("false");
+    expect(btn.getAttribute("aria-label")).toBe("Show pages");
+    expect(btn.title).toBe("Show pages (F4)");
+    btn.click();
     expect(panel.classList.contains("pdfed-pages--collapsed")).toBe(false);
+    expect(btn.getAttribute("aria-label")).toBe("Hide pages");
     await m.handle.dispose();
   });
 
@@ -694,6 +732,140 @@ describe("the page panel", () => {
       { pageSlot: 2, tab: "pdf" },
       { pageSlot: 2, tab: "image" },
     ]);
+    await m.handle.dispose();
+  });
+});
+
+/* ---------------- the side panels (0.9.4) ---------------- */
+
+describe("the two panel toggles", () => {
+  // The shell closes the inspector's popovers with a scroll event from the
+  // panel; the fake DOM's dispatch writes `target`, which a real Event refuses.
+  beforeEach(() => {
+    vi.stubGlobal("Event", FakeEvent);
+  });
+
+  const collapsed = (m: { $(s: string): FakeElement }): { rail: boolean; insp: boolean } => ({
+    rail: m.$("#pdfed-pages").classList.contains("pdfed-pages--collapsed"),
+    insp: m.$("#pdfed-inspector").classList.contains("pdfed-inspector--collapsed"),
+  });
+
+  it("the inspector toggle sits at the right end of the tool row and collapses and expands the panel", async () => {
+    const m = await mount();
+    const btn = m.$("#pdfed-insp-toggle");
+    const viewctl = m.$("#pdfed-viewctl");
+    expect(viewctl.childNodes[viewctl.childNodes.length - 1]).toBe(btn);
+    expect(collapsed(m)).toEqual({ rail: false, insp: false });
+    expect(btn.getAttribute("aria-pressed")).toBe("true");
+    expect(btn.getAttribute("aria-label")).toBe("Hide properties");
+    expect(btn.title).toBe("Hide properties (Shift+F4)");
+    btn.click();
+    expect(collapsed(m)).toEqual({ rail: false, insp: true });
+    expect(btn.getAttribute("aria-pressed")).toBe("false");
+    expect(btn.getAttribute("aria-label")).toBe("Show properties");
+    expect(btn.title).toBe("Show properties (Shift+F4)");
+    // the part stays mounted: nothing was disposed
+    expect(h.log).not.toContain("inspector.dispose");
+    btn.click();
+    expect(collapsed(m)).toEqual({ rail: false, insp: false });
+    expect(btn.getAttribute("aria-label")).toBe("Hide properties");
+    await m.handle.dispose();
+  });
+
+  it("F4 and Shift+F4 run the buttons' paths; inert in a typing field, whose key is left alone", async () => {
+    const m = await mount();
+    const railBtn = m.$("#pdfed-rail-toggle");
+    const inspBtn = m.$("#pdfed-insp-toggle");
+    const f4 = key(win, "F4");
+    expect(f4.defaultPrevented).toBe(true);
+    expect(collapsed(m)).toEqual({ rail: true, insp: false });
+    expect(railBtn.getAttribute("aria-label")).toBe("Show pages");
+    key(win, "F4", { shiftKey: true });
+    expect(collapsed(m)).toEqual({ rail: true, insp: true });
+    expect(inspBtn.getAttribute("aria-pressed")).toBe("false");
+    expect(inspBtn.getAttribute("aria-label")).toBe("Show properties");
+    // typing in the page box: neither fires, and the key is not swallowed
+    const typed = key(m.$("#pdfed-page"), "F4");
+    const typedShift = key(m.$("#pdfed-page"), "F4", { shiftKey: true });
+    expect(typed.defaultPrevented).toBe(false);
+    expect(typedShift.defaultPrevented).toBe(false);
+    expect(collapsed(m)).toEqual({ rail: true, insp: true });
+    key(win, "F4");
+    key(win, "F4", { shiftKey: true });
+    expect(collapsed(m)).toEqual({ rail: false, insp: false });
+    expect(railBtn.getAttribute("aria-label")).toBe("Hide pages");
+    expect(inspBtn.getAttribute("aria-label")).toBe("Hide properties");
+    await m.handle.dispose();
+  });
+
+  it("a press on either toggle never takes focus (a text box being typed into keeps its caret)", async () => {
+    const m = await mount();
+    for (const id of ["#pdfed-rail-toggle", "#pdfed-insp-toggle"]) {
+      const down = new FakeEvent("mousedown", { button: 0 });
+      m.$(id).dispatchEvent(down);
+      expect(down.defaultPrevented, id).toBe(true);
+    }
+    await m.handle.dispose();
+  });
+
+  it("both states are remembered across a remount in the same session", async () => {
+    const first = await mount();
+    try {
+      first.$("#pdfed-rail-toggle").click();
+      first.$("#pdfed-insp-toggle").click();
+      await first.handle.dispose();
+      const again = await mount();
+      expect(collapsed(again)).toEqual({ rail: true, insp: true });
+      expect(again.$("#pdfed-insp-toggle").getAttribute("aria-pressed")).toBe("false");
+      expect(again.$("#pdfed-insp-toggle").getAttribute("aria-label")).toBe("Show properties");
+      expect(again.$("#pdfed-rail-toggle").getAttribute("aria-label")).toBe("Show pages");
+      again.$("#pdfed-rail-toggle").click();
+      again.$("#pdfed-insp-toggle").click();
+      expect(collapsed(again)).toEqual({ rail: false, insp: false });
+      await again.handle.dispose();
+    } finally {
+      // module state: leave both open for the tests after this one
+      const s = await mount();
+      if (collapsed(s).rail) s.$("#pdfed-rail-toggle").click();
+      if (collapsed(s).insp) s.$("#pdfed-insp-toggle").click();
+      await s.handle.dispose();
+    }
+  });
+
+  it("collapsing closes an open font list (the shared picker's, on <body>); the panel stays mounted", async () => {
+    const m = await mount();
+    const host = m.$("#pdfed-inspector");
+    // the inspector's font control, as the real part builds it
+    const ctl = document.createElement("button") as unknown as FakeElement;
+    ctl.className = "select select--sm fontpk fontpk__ctl";
+    host.appendChild(ctl);
+    const { openFontList } = await import("../../fonts/picker");
+    const closes: boolean[] = [];
+    const list = openFontList({
+      anchor: ctl as unknown as HTMLElement,
+      current: "Segoe UI" as never,
+      query: "",
+      catalog: () => new Promise(() => {}),
+      previewFamily: () => null,
+      onPick: () => {},
+      onClose: (restore) => void closes.push(restore),
+    });
+    try {
+      expect(doc.querySelector(".fontpk__pop")).not.toBeNull();
+      // the list holds the keyboard: Shift+F4 does nothing meanwhile
+      key(win, "F4", { shiftKey: true });
+      expect(collapsed(m).insp).toBe(false);
+      m.$("#pdfed-insp-toggle").click();
+      expect(collapsed(m).insp).toBe(true);
+      expect(doc.querySelector(".fontpk__pop")).toBeNull();
+      expect(closes).toEqual([false]);
+      expect(ctl.parentNode).toBe(host);
+    } finally {
+      // its keyboard token must not outlive a failure here
+      list.close(false);
+      if (collapsed(m).insp) m.$("#pdfed-insp-toggle").click();
+    }
+    expect(collapsed(m).insp).toBe(false);
     await m.handle.dispose();
   });
 });
@@ -1103,6 +1275,62 @@ describe("a source with fewer pages than the project shows", () => {
     doc.body.querySelector("[data-close-project]")!.click();
     expect(m.session.project.pdf!.pages).toHaveLength(3);
     expect(h.navigations).toEqual([{ view: "home" }]);
+    await m.handle.dispose();
+  });
+});
+
+describe("the missing-font notice on open (0.9.4)", () => {
+  function withText(fontIds: (string | undefined)[]): ProjectFile {
+    const p = project();
+    const page = p.pdf!.pages[0]!.id;
+    const annots = fontIds.map((fontId, i) => ({
+      id: `t${i}`, t: "text", x: 1, y: 2, w: 30, h: 10, text: "x", font: "Segoe UI", size: 12, c: "#000000",
+      bold: false, italic: false, align: "left", ...(fontId === undefined ? {} : { fontId }),
+    }));
+    return { ...p, pdf: { ...p.pdf!, annots: { [page]: annots as never } } };
+  }
+
+  it("names the missing fonts once, as a notice worded by the shared helper", async () => {
+    h.fontMissing.add("lib:Gone");
+    h.fontMissing.add("Old Face");
+    const m = await mount(withText(["lib:Gone", "lib:Here", "lib:Gone", "Old Face"]));
+    expect(h.fontCalls).toEqual(["ensure:lib:Gone,lib:Here,Old Face"]);
+    expect(h.toasts).toEqual([
+      "notice:Fonts Gone and Old Face aren't on this PC. Showing Segoe UI. Import them in Settings, or pick other fonts.",
+    ]);
+    expect(h.sharedNotices).toBe(1);
+    await m.handle.dispose();
+  });
+
+  it("the editor opens while a font is still loading; the notice follows the load", async () => {
+    let loaded: () => void = () => {};
+    h.fontsLoading = new Promise<void>((r) => (loaded = r));
+    h.fontMissing.add("lib:Gone");
+    const m = await mount(withText(["lib:Gone"]));
+    expect(m.session).toBeTruthy();
+    expect(h.fontCalls).toEqual(["ensure:lib:Gone"]);
+    expect(h.toasts).toEqual([]);
+    loaded();
+    await flush();
+    expect(h.toasts).toEqual(["notice:Font Gone isn't on this PC. Showing Segoe UI. Import it in Settings, or pick another font."]);
+    await m.handle.dispose();
+  });
+
+  it("an editor closed before its fonts loaded says nothing", async () => {
+    let loaded: () => void = () => {};
+    h.fontsLoading = new Promise<void>((r) => (loaded = r));
+    h.fontMissing.add("lib:Gone");
+    const m = await mount(withText(["lib:Gone"]));
+    await m.handle.dispose();
+    loaded();
+    await flush();
+    expect(h.toasts).toEqual([]);
+  });
+
+  it("says nothing, and loads no font, for a project without a fontId", async () => {
+    const m = await mount(withText([undefined]));
+    expect(h.fontCalls).toEqual([]);
+    expect(h.toasts).toEqual([]);
     await m.handle.dispose();
   });
 });

@@ -388,6 +388,10 @@ export function mountSelectTool(ctx: ImageEditorCtx): {
   /** Cancel an open per-layer crop now, synchronously (the window is closing:
    *  its save must not write a crop the user never applied). */
   revertCrop(): void;
+  /** A font loaded, or was imported or removed: canvas text does not update
+   *  by itself, so a text layer's crop ghost is drawn again. The shell asks
+   *  for the fonts and calls this; the tool makes no font call of its own. */
+  fontsChanged(): void;
   /** Enter the on-canvas crop of `trackId` — the inspector's Crop button, the
    *  same mode a double-click on the layer opens. Selects the layer and takes
    *  up the select tool first (the crop chrome is the select tool's). False
@@ -1194,6 +1198,11 @@ export function mountSelectTool(ctx: ImageEditorCtx): {
   return {
     revertCrop(): void {
       if (!disposed) exitCrop("revert");
+    },
+    fontsChanged(): void {
+      if (!crop) return;
+      ghostSig = "";
+      schedulePaint();
     },
     cropLayer(trackId: string): boolean {
       if (disposed || crop || gesture || mode.get() !== "idle") return false;

@@ -28,6 +28,7 @@ import type {
 } from "../core/types";
 import { STROKE_CHUNK } from "../core/types";
 import { clampImageCanvas, defaultAudio, defaultTransform, uid } from "../core/project";
+import { isFontId } from "../core/font-id";
 import { normalizeHexColor } from "../core/session";
 import { fileStem } from "../core/format";
 import { sanitizeAdjust } from "./adjust/plan";
@@ -1018,6 +1019,11 @@ export function validateImageProject(p: ProjectFile): ImageValidation {
             res.chunks === g.chunks
               ? boxed
               : { ...boxed, generator: { type: "drawing", chunks: res.chunks } };
+        } else if (g.type === "text" && "fontId" in g && !isFontId(g.fontId)) {
+          // A crafted or damaged font id: dropped, so the legacy `fontFamily`
+          // (checked as before) is the font in force. A silent repair, no note.
+          const { fontId: _bad, ...clean } = g;
+          media = { ...boxed, generator: clean };
         } else {
           media = boxed;
         }

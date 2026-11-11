@@ -51,8 +51,72 @@ export function visualLine(p: ParagraphBidi, start: number, end: number): string
   const slice = p.text.slice(start, end);
   // Pure left-to-right text (the common case) has nothing to reorder.
   if (!STRONG_RTL.test(slice) && !p.levels.levels.slice(start, end).some((l) => l & 1)) return slice;
+  // getReorderedString answers the WHOLE paragraph with only [start, end - 1]
+  // reordered in place (code unit for code unit), so cut the line back out.
   const out = lib().getReorderedString(p.text, p.levels, start, end - 1);
-  return fixSurrogates(out);
+  return fixSurrogates(out.slice(start, end));
+}
+
+/** One piece of a laid-out line in a box with style runs (0.9.4): a maximal
+ *  stretch of consecutive VISUAL positions in one segment whose characters
+ *  are also contiguous in LOGICAL order (all ascending, or all descending).
+ *  `[s, e)` is its logical range in the paragraph; `rtl` = drawn reversed;
+ *  `text` its visual-order string (mirrored, surrogate pairs kept whole), for
+ *  pdf-lib. The canvas draws `para.slice(s, e)` with `rtl` as its direction
+ *  instead, so it can shape joining scripts. */
+export interface VisualGroup {
+  seg: number;
+  s: number;
+  e: number;
+  rtl: boolean;
+  text: string;
+}
+
+/** `p.text[start, end)` as visual groups, left to right; `segOf(i)` names the
+ *  segment of paragraph offset `i`. Unlike `visualLine` it reorders only the
+ *  line (the paragraph's other lines are not part of the answer). */
+export function visualGroups(p: ParagraphBidi, start: number, end: number, segOf: (i: number) => number): VisualGroup[] {
+  if (end <= start) return [];
+  const lv = p.levels.levels;
+  let order: number[];
+  if (!STRONG_RTL.test(p.text.slice(start, end)) && !lv.slice(start, end).some((l) => l & 1)) {
+    order = [];
+    for (let i = start; i < end; i++) order.push(i);
+  } else {
+    order = lib().getReorderedIndices(p.text, p.levels, start, end - 1).slice(start, end);
+  }
+  const out: VisualGroup[] = [];
+  let k = 0;
+  while (k < order.length) {
+    const first = order[k]!;
+    const seg = segOf(first);
+    let dir = 0;
+    let last = first;
+    let j = k + 1;
+    for (; j < order.length; j++) {
+      const i = order[j]!;
+      if (segOf(i) !== seg) break;
+      const d = i - last;
+      if (dir === 0 ? d !== 1 && d !== -1 : d !== dir) break;
+      dir = d;
+      last = i;
+    }
+    let text = "";
+    for (let m = k; m < j; m++) {
+      const i = order[m]!;
+      const ch = p.text[i]!;
+      text += (lv[i]! & 1 ? lib().getMirroredCharacter(ch) : null) ?? ch;
+    }
+    out.push({
+      seg,
+      s: Math.min(first, last),
+      e: Math.max(first, last) + 1,
+      rtl: dir === -1 || (dir === 0 && (lv[first]! & 1) === 1),
+      text: fixSurrogates(text),
+    });
+    k = j;
+  }
+  return out;
 }
 
 /** Reversing a run reverses UTF-16 code units, so a supplementary character

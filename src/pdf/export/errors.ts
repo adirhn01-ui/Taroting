@@ -7,6 +7,8 @@ export type PdfExportErrorCode =
   | "source-invalid"
   | "password"
   | "font-missing"
+  /** a font whose license (OS/2 fsType) forbids embedding it in a PDF */
+  | "font-restricted"
   | "image-missing"
   | "image-invalid"
   | "range"

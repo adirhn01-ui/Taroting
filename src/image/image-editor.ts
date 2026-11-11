@@ -56,8 +56,11 @@ import { mountLayersPanel } from "./layers-panel";
 import { addRefusal, installPaste } from "./paste";
 import { PreviewResources, renderComposite } from "./render";
 import type { LiveInk } from "./render";
+import { invalidateTextLooks, textFontRequests } from "./render/composite";
 import { renderThumbnail } from "./render/export";
 import type { RenderSources } from "./render/export";
+import { ensureFonts, missingFonts, onFontsChanged } from "../fonts";
+import { missingFontNotice } from "../core/font-id";
 import { saveBlob } from "./save";
 import { mountSelectTool } from "./select-tool";
 import { SIZE_MAX, SIZE_MIN, createToolStore } from "./tool-state";
@@ -555,6 +558,55 @@ function mount(
       requestRender();
     }),
   );
+
+  /* ---------------- fonts (library and installed) ---------------- */
+
+  // Canvas text does not update by itself (font seam, Addendum): every
+  // non-legacy font a text layer uses is made ready, and the stage repaints
+  // when one lands, an import or a removal changes what a font string draws.
+  // Engaged only once the project HAS such a layer: one that uses only the
+  // six legacy fonts makes no font call at all, not even the subscription
+  // (I1). Asked at mount, then for any request a later edit brings in that
+  // no dialog awaited (a paste, an undo back to an older font). One notice
+  // per open, for the fonts the project opened with.
+  const askedFonts = new Set<string>();
+  let fontsWatched = false;
+  let fontMedia: ProjectFile["media"] | null = null;
+  const fontsRepaint = (): void => {
+    if (disposed) return;
+    invalidateTextLooks();
+    requestRender();
+    // The crop ghost is the one other canvas that draws text.
+    selectTool.fontsChanged();
+  };
+  const ensureProjectFonts = (p: ProjectFile, notice: boolean): void => {
+    // Text generators live in the media list: nothing else can bring a font in.
+    if (p.media === fontMedia) return;
+    fontMedia = p.media;
+    const fresh = textFontRequests(layersOf(p), askedFonts);
+    if (fresh.length === 0) return;
+    if (!fontsWatched) {
+      fontsWatched = true;
+      unsubs.push(onFontsChanged(fontsRepaint));
+    }
+    ensureFonts(fresh).then(
+      () => {
+        if (disposed) return;
+        fontsRepaint();
+        if (!notice) return;
+        const missing = missingFonts(fresh);
+        // A notice, not info: nothing failed (the text shows its legacy
+        // font), as in the video and PDF editors.
+        if (missing.length > 0) toast.notice(missingFontNotice(missing));
+      },
+      (e: unknown) => {
+        // Not fatal: that text keeps drawing with its legacy font.
+        console.warn("The project's fonts could not be loaded", e);
+      },
+    );
+  };
+  ensureProjectFonts(session.project, true);
+  unsubs.push(session.store.subscribe((p) => ensureProjectFonts(p, false)));
 
   /* ---------------- top bar: save badge, Keep, name ---------------- */
 

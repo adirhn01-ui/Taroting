@@ -33,6 +33,10 @@ const paths: Record<string, string> = {
   skipBack5: '<path d="M11 19 2 12l9-7z"/><path d="M22 19l-9-7 9-7z"/>',
   skipFwd5: '<path d="m13 19 9-7-9-7z"/><path d="M2 19l9-7-9-7z"/>',
   more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
+  // The PDF editor's side panels: the window box of `image` with a bar on the
+  // left (the page rail) or the right (the inspector); the viewer's rail icon.
+  panelLeft: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
+  panelRight: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/>',
 };
 
 export function icon(name: keyof typeof paths | string, size = 16): string {

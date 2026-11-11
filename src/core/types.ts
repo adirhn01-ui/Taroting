@@ -19,6 +19,63 @@ export type FontFamily =
   | "Courier New"
   | "Impact";
 
+/** A font from the library or installed on this PC (see core/font-id.ts):
+ *  an installed family's en-us Win32 family name, or `lib:` + a library
+ *  family's name. Never a path. */
+export type FontId = string;
+/** How a face may be embedded in a PDF, from its OS/2 fsType. */
+export type FontEmbed = "full" | "noSubset" | "none";
+export interface FontFaceInfo {
+  bold: boolean;
+  italic: boolean;
+  weight: number;
+  style: string;
+  embed: FontEmbed;
+}
+export interface FontFamilyInfo {
+  id: FontId;
+  name: string;
+  source: "library" | "installed";
+  faces: FontFaceInfo[];
+}
+export interface FontCatalog {
+  library: FontFamilyInfo[];
+  installed: FontFamilyInfo[];
+}
+export interface FontRequest {
+  id: FontId;
+  bold: boolean;
+  italic: boolean;
+}
+/** `found: false` = not on this PC: the other fields are empty and the caller
+ *  uses the object's legacy font. `bold`/`italic` are the face actually used
+ *  (a family without a bold face answers `bold: false`: no faux styles). */
+export interface ResolvedFont {
+  requested: FontId;
+  found: boolean;
+  bold: boolean;
+  italic: boolean;
+  path: string;
+  lineHeightEm: number;
+  embed: FontEmbed;
+}
+export type FontImportError =
+  | "extension"
+  | "tooLarge"
+  | "notAFont"
+  | "noUnicode"
+  | "unsupported"
+  | "exists"
+  | "io";
+export interface FontImportResult {
+  path: string;
+  ok: boolean;
+  id?: FontId;
+  family?: string;
+  style?: string;
+  error?: FontImportError;
+}
+
 /** A synthetic media source (no file on disk): a solid color fill, styled text,
  *  or an image project's drawing layer. Media carrying a generator has
  *  kind:"image"; its `path` is a display label. */
@@ -28,6 +85,9 @@ export type Generator =
       type: "text";
       text: string;
       fontFamily: FontFamily;
+      /** A non-legacy font. Absent for the six; when present `fontFamily` is
+       *  the fallback shown if the font is not on this PC. */
+      fontId?: FontId;
       sizePx: number;
       color: string;
       bold: boolean;
@@ -335,12 +395,35 @@ export interface PdfPage {
  *  Windows), so export embeds a real system font file. */
 export interface PdfTextStyle {
   font: FontFamily;
+  /** A non-legacy font; `font` is its fallback (see Generator's fontId). */
+  fontId?: FontId;
   /** points, 4..288 */
   size: number;
   c: string;
   bold: boolean;
   italic: boolean;
   align: "left" | "center" | "right";
+}
+
+/** A style override on part of a text box's text (0.9.4): sparse fields over
+ *  the box's own style (`PdfTextStyle`). Canonical form (core/pdf-runs.ts
+ *  `normalizeRuns`): sorted, non-overlapping, inside the text, never splitting
+ *  a surrogate pair, at least one field, no field equal to the base, adjacent
+ *  identical runs merged. */
+export interface PdfTextRun {
+  /** [s, e) in UTF-16 units of `text`; 0 <= s < e <= text.length */
+  s: number;
+  e: number;
+  /** `font` and `fontId` travel TOGETHER: a run with `font` sets the pair (its
+   *  `fontId` absent = none); `fontId` without `font` is invalid */
+  font?: FontFamily;
+  fontId?: FontId;
+  /** points, 4..288 */
+  size?: number;
+  /** #rrggbb */
+  c?: string;
+  bold?: boolean;
+  italic?: boolean;
 }
 
 /** A mark on a page (page space, see above). Colours are lowercase #rrggbb.
@@ -363,6 +446,9 @@ export type PdfAnnot =
       bg?: string;
       /** box border, #rrggbb (1 pt); absent = none */
       border?: string;
+      /** per-range style overrides (0.9.4), canonical form; absent = none
+       *  (never `[]`). An older Taroting drops them and shows the base style. */
+      runs?: PdfTextRun[];
     } & PdfTextStyle)
   | { id: string; t: ShapeKind; c: string; w: number; a: [number, number]; b: [number, number] }
   /** an opaque cover box (default white) — typically with a text box on top */
@@ -406,6 +492,8 @@ export const PDF_SCHEMA = 4;
 /** Guards for crafted .trt files (load-time; never a user refusal). */
 export const PDF_MAX_PAGES = 10_000;
 export const PDF_MAX_ANNOTS_PER_PAGE = 5_000;
+/** Style runs in one text mark (`runs`); more = the whole array is dropped. */
+export const PDF_TEXT_MAX_RUNS = 2_000;
 
 export type ImageExportFormat = "png" | "jpeg" | "webp";
 export interface ImageExportPreset {
@@ -469,7 +557,9 @@ export type ActionId =
   | "pdfWhiteout"
   | "pdfFillForms"
   | "duplicate"
-  | "find";
+  | "find"
+  | "pdfPages"
+  | "pdfProperties";
 
 /** The three user-settable colours of the "custom" theme.
  *
@@ -559,6 +649,8 @@ export interface PdfToolStyle {
   sizes?: Partial<Record<"pen" | "pencil" | "marker" | "eraser" | "shape" | "text", number>>;
   shape?: ShapeKind;
   font?: FontFamily;
+  /** A non-legacy text font; `font` is its fallback. */
+  fontId?: FontId;
   /** text boxes: last fill / border, null = none */
   textBg?: string | null;
   textBorder?: string | null;
@@ -657,6 +749,9 @@ export const DEFAULT_SHORTCUTS: Record<ActionId, string> = {
   // Search the PDF's text (viewer showing a PDF, and the PDF editor).
   find: "Ctrl+F",
   duplicate: "Ctrl+D",
+  // The PDF editor's two side panels (0.9.4): the page rail and the inspector.
+  pdfPages: "F4",
+  pdfProperties: "Shift+F4",
 };
 
 /** Which screens an action lives on. A chord conflicts only with an action that shares a
@@ -720,6 +815,8 @@ export const ACTION_MODES: Readonly<Record<ActionId, readonly ShortcutMode[]>> =
   pdfFillForms: ["pdf"],
   find: ["viewer", "pdf"],
   duplicate: ["pdf"],
+  pdfPages: ["pdf"],
+  pdfProperties: ["pdf"],
 };
 
 /** The stock DARK palette's --bg-app, --accent and --text-1 — so switching to

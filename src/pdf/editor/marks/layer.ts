@@ -19,10 +19,11 @@
 
 import type { PdfAnnot, PdfPage, PdfRotation, ProjectFile } from "../../../core/types";
 import { mediaUrl } from "../../../core/ipc";
+import { onFontsChanged } from "../../../fonts";
 import { pageAnnots } from "../../model";
 import type { PdfEditorCtx } from "../../types";
 import { boxPoints, pageTransform } from "./geom";
-import { SVG_NS, markNode } from "./render";
+import { SVG_NS, fontStateOf, markNode, needsFontRuntime } from "./render";
 
 export interface PageInfo {
   /** unrotated page size, points */
@@ -56,6 +57,9 @@ export interface MarkLayer {
   onFrame(fn: (key: string, frame: PageFrame | null) => void): () => void;
   dispose(): void;
 }
+
+/** a text box drawing with a non-legacy font: its own or a style run's */
+const hasFontId = needsFontRuntime;
 
 const normRot = (deg: number): PdfRotation => ((((Math.round(deg / 90) % 4) + 4) % 4) * 90) as PdfRotation;
 
@@ -126,6 +130,32 @@ export function createMarkLayer(ctx: PdfEditorCtx): MarkLayer {
     else f.root.removeAttribute("transform");
   }
 
+  /** The library changed (a font imported or removed, a face loaded): a
+   *  fontId box laid out before may now draw in another font, but its node is
+   *  cached by mark identity. Drop the nodes of the boxes whose own font
+   *  changed (`fontStates`: a face of another font, or another face of the
+   *  same one, landing touches nothing; a box's fonts include its style
+   *  runs') and repaint; legacy boxes keep theirs. Subscribed only once a
+   *  fontId mark (base or run) is painted (I1: a project without one adds no
+   *  listener and makes no font call). */
+  const fontStates = new WeakMap<PdfAnnot, string>();
+  let unFonts: (() => void) | null = null;
+  function relayFonts(): void {
+    if (disposed) return;
+    for (const f of [...frames.values()]) {
+      const cache = nodeCache.get(f.key);
+      if (!cache) continue;
+      let hit = false;
+      for (const a of [...cache.keys()]) {
+        if (hasFontId(a) && fontStates.get(a) !== fontStateOf(a)) {
+          cache.delete(a);
+          hit = true;
+        }
+      }
+      if (hit) paintMarks(f, session.project);
+    }
+  }
+
   /** Bring a page's mark nodes up to `p`: marks are immutable, so a mark
    *  object seen before keeps its node (only new or changed marks are built;
    *  pictures are rebuilt when the media list changed — a relink moves their
@@ -140,11 +170,17 @@ export function createMarkLayer(ctx: PdfEditorCtx): MarkLayer {
     const next = new Map<PdfAnnot, SVGElement | null>();
     const want: SVGElement[] = [];
     for (const a of annots) {
-      const node = prev.has(a) && !(mediaChanged && a.t === "image") ? prev.get(a)! : markNode(a, p.media, mediaUrl);
+      let node: SVGElement | null;
+      if (prev.has(a) && !(mediaChanged && a.t === "image")) node = prev.get(a)!;
+      else {
+        node = markNode(a, p.media, mediaUrl);
+        if (hasFontId(a)) fontStates.set(a, fontStateOf(a));
+      }
       next.set(a, node);
       if (node) want.push(node);
     }
     nodeCache.set(f.key, next);
+    if (!unFonts && annots.some(hasFontId)) unFonts = onFontsChanged(relayFonts);
     // drop the nodes no longer wanted, then order the rest (moves, no builds)
     const keep = new Set<Node>(want);
     for (const n of Array.from(f.marks.childNodes)) if (!keep.has(n)) f.marks.removeChild(n);
@@ -259,6 +295,8 @@ export function createMarkLayer(ctx: PdfEditorCtx): MarkLayer {
       unVisible();
       unHidden();
       unProject();
+      unFonts?.();
+      unFonts = null;
       for (const k of [...frames.keys()]) drop(k, false);
       listeners.clear();
     },

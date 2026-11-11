@@ -27,7 +27,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { errorDetail, ipc, mediaUrl } from "../core/ipc";
 import { navigate } from "../core/nav";
 import { createProject, importMediaAsClip } from "../core/project";
-import { currentSession, settingsStore, settingsWritesSettled, updateSettings, type ProjectSession } from "../core/session";
+import { currentSession, normalizeHexColor, settingsStore, settingsWritesSettled, updateSettings, type ProjectSession } from "../core/session";
 import type { ActionId, PdfAnnot } from "../core/types";
 import type { PdfDoc, PdfEditorCtx, PdfView } from "../pdf/types";
 import { closeMenu } from "../ui/menu";
@@ -747,6 +747,690 @@ export async function runPdfBlocks(ctx: PdfCtx): Promise<void> {
     }
   });
 
+  // 0.9.4: the two panel toggles, on the shared editor. form_acro.pdf is one
+  // page, so two blank A4 pages are added for the block (undone in finally)
+  // and the strip parked on the middle one: "the current page is unchanged"
+  // must be able to fail. Geometry is read off the screen, never a class.
+  await test("pdf-panels-collapse", async () => {
+    const t0 = performance.now();
+    let added = 0;
+    let s: ProjectSession | null = null;
+    const press = (chord: "F4" | "Shift+F4"): void => {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "F4", code: "F4", shiftKey: chord === "Shift+F4", bubbles: true, cancelable: true }));
+    };
+    try {
+      needFixtures();
+      const d = await ensureEditor();
+      s = d.session;
+      const sc = settingsStore.get().shortcuts;
+      assert(sc.pdfPages === "F4" && sc.pdfProperties === "Shift+F4", `the run's shortcuts are pdfPages "${sc.pdfPages}", pdfProperties "${sc.pdfProperties}", not the defaults F4 / Shift+F4`);
+      const stage = $("#pdfed-stage")!;
+      const insp = $("#pdfed-inspector")!;
+      const pages = $("#pdfed-pages")!;
+      const inspBtn = $<HTMLButtonElement>("#pdfed-insp-toggle");
+      const railBtn = $<HTMLButtonElement>("#pdfed-rail-toggle");
+      assert(rendered(inspBtn) && rendered(railBtn), `the toggles are not both rendered (properties ${rendered(inspBtn)}, pages ${rendered(railBtn)})`);
+      // An earlier failure may have left one shut: start from both open.
+      if (!rendered(insp)) inspBtn!.click();
+      if (!rendered(pages)) railBtn!.click();
+      assert(rendered(insp) && rendered(pages), `the panels do not start open (properties ${insp.getClientRects().length} rects, pages ${pages.getClientRects().length} rects)`);
+
+      const { insertBlankPage } = await import("../pdf/model");
+      for (const at of [1, 2]) {
+        const before = s.project;
+        s.commit((p) => insertBlankPage(p, at, 595.28, 841.89));
+        if (s.project !== before) added++;
+      }
+      assert(added === 2, `only ${added} of 2 blank pages could be added`);
+      await until(() => text("#pdfed-page-count") === "/ 3" || null, 2_000, () => `"/ 3" in the page box (shows "${text("#pdfed-page-count")}")`);
+      d.view.scrollToPage(1);
+      await until(() => d.view.state.get().current === 1 || null, 2_000, () => `the strip on page 2 (current slot ${d.view.state.get().current})`);
+      await frames(2);
+      const settle = async (): Promise<void> => {
+        // the strip re-lays out from its ResizeObserver, a frame after the width change
+        await frames(3);
+      };
+      const w = (e: Element): number => e.getBoundingClientRect().width;
+
+      // Properties, by the button.
+      const stage0 = w(stage);
+      const insp0 = w(insp);
+      const cur0 = d.view.state.get().current;
+      inspBtn!.click();
+      await settle();
+      const stage1 = w(stage);
+      const cur1 = d.view.state.get().current;
+      assert(insp.getClientRects().length === 0, `after the properties toggle the inspector still has ${insp.getClientRects().length} client rects (${w(insp)} px wide)`);
+      assert(Math.abs(stage1 - stage0 - insp0) <= 4, `the stage went ${stage0.toFixed(1)} → ${stage1.toFixed(1)} px (+${(stage1 - stage0).toFixed(1)}), the inspector was ${insp0.toFixed(1)} px`);
+      assert(cur1 === cur0, `the current page went from slot ${cur0} to ${cur1} when the inspector collapsed`);
+      assert(inspBtn!.getAttribute("aria-pressed") === "false", `the properties toggle reads aria-pressed "${inspBtn!.getAttribute("aria-pressed")}" while collapsed`);
+      // Back, by Shift+F4.
+      press("Shift+F4");
+      await settle();
+      const stage2 = w(stage);
+      const cur2 = d.view.state.get().current;
+      assert(rendered(insp) && Math.abs(w(insp) - insp0) <= 1, `after Shift+F4 the inspector is ${rendered(insp) ? `${w(insp).toFixed(1)} px wide` : "still not rendered"} (was ${insp0.toFixed(1)})`);
+      assert(Math.abs(stage2 - stage0) <= 1, `after Shift+F4 the stage is ${stage2.toFixed(1)} px, was ${stage0.toFixed(1)}`);
+      assert(cur2 === cur0, `the current page went from slot ${cur0} to ${cur2} when the inspector came back`);
+
+      // Pages, by the button, then F4.
+      const pages0 = w(pages);
+      railBtn!.click();
+      await settle();
+      const stage3 = w(stage);
+      const cur3 = d.view.state.get().current;
+      assert(pages.getClientRects().length === 0, `after the pages toggle the rail still has ${pages.getClientRects().length} client rects (${w(pages)} px wide)`);
+      assert(Math.abs(stage3 - stage0 - pages0) <= 4, `the stage went ${stage0.toFixed(1)} → ${stage3.toFixed(1)} px (+${(stage3 - stage0).toFixed(1)}), the rail was ${pages0.toFixed(1)} px`);
+      assert(cur3 === cur0, `the current page went from slot ${cur0} to ${cur3} when the rail collapsed`);
+      press("F4");
+      await settle();
+      const stage4 = w(stage);
+      const cur4 = d.view.state.get().current;
+      assert(rendered(pages) && Math.abs(w(pages) - pages0) <= 1, `after F4 the rail is ${rendered(pages) ? `${w(pages).toFixed(1)} px wide` : "still not rendered"} (was ${pages0.toFixed(1)})`);
+      assert(Math.abs(stage4 - stage0) <= 1, `after F4 the stage is ${stage4.toFixed(1)} px, was ${stage0.toFixed(1)}`);
+      assert(cur4 === cur0, `the current page went from slot ${cur0} to ${cur4} when the rail came back`);
+      return `on page ${cur0 + 1} of 3: properties button → inspector 0 rects, stage ${stage0.toFixed(1)} → ${stage1.toFixed(1)} px (inspector was ${insp0.toFixed(1)}), Shift+F4 → ${stage2.toFixed(1)}; pages button → stage ${stage3.toFixed(1)} (rail was ${pages0.toFixed(1)}), F4 → ${stage4.toFixed(1)}; current page held throughout — ${ms(t0)}`;
+    } finally {
+      // Both panels open again, and the two blank pages gone, for the next block.
+      if (!rendered($("#pdfed-inspector"))) $<HTMLButtonElement>("#pdfed-insp-toggle")?.click();
+      if (!rendered($("#pdfed-pages"))) $<HTMLButtonElement>("#pdfed-rail-toggle")?.click();
+      if (s && currentSession.get() === s) for (let i = 0; i < added; i++) s.undo();
+    }
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* 0.9.4: per-range text styles ("runs"), on the shared editor       */
+  /* ---------------------------------------------------------------- */
+  // Both blocks drive what a user does: the Text tool's button, a press on
+  // the page, typing into the in-place editor (execCommand insertText, else a
+  // beforeinput/DOM/input fallback the detail line names), a selection made
+  // with the Selection API from an offset walker of THIS file (not the
+  // editor's own helpers, so a bug there cannot agree with itself), and
+  // clicks on the inspector's rendered controls. What they assert is computed
+  // style and client rects, the mark the session holds, and exported bytes.
+
+  /** The Text tool's look both blocks start from (put back in finally):
+   *  Segoe UI (it has a bold face) 12 pt black, no fill / border. */
+  const runsTools = (d: PdfEditorDev): (() => void) => {
+    const before = d.ctx.tools.get();
+    d.ctx.tools.update((s) => {
+      const { fontId: _drop, ...rest } = s;
+      void _drop;
+      return { ...rest, font: "Segoe UI", sizes: { ...s.sizes, text: 12 }, colors: { ...s.colors, text: "#000000" }, textBg: null, textBorder: null };
+    });
+    return () => d.ctx.tools.set(before);
+  };
+  /** A user's click on a control: pointer/mouse down and up at its centre,
+   *  then the click (after a hit test that it is on top). */
+  const pressEl = (el: HTMLElement, what: string): void => {
+    el.scrollIntoView({ block: "nearest" });
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width / 2;
+    const y = r.top + r.height / 2;
+    const hit = document.elementFromPoint(x, y);
+    assert(hit !== null && el.contains(hit), `${what}: its centre shows ${describeEl(hit)}, not the control`);
+    const o = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, button: 0, pointerId: 1, pointerType: "mouse", isPrimary: true };
+    el.dispatchEvent(new PointerEvent("pointerdown", { ...o, buttons: 1 }));
+    el.dispatchEvent(new MouseEvent("mousedown", { ...o, buttons: 1, detail: 1 }));
+    el.dispatchEvent(new PointerEvent("pointerup", o));
+    el.dispatchEvent(new MouseEvent("mouseup", { ...o, detail: 1 }));
+    el.dispatchEvent(new MouseEvent("click", { ...o, detail: 1 }));
+  };
+  /** Pick the Text tool by its toolbar button. */
+  const pickTextTool = async (d: PdfEditorDev): Promise<void> => {
+    const b = await until(() => {
+      const x = $<HTMLButtonElement>('button[data-tool="text"]');
+      return x && rendered(x) && !x.disabled ? x : null;
+    }, 2_000, () => `the Text tool button (${$('button[data-tool="text"]') ? "present but not rendered / disabled" : "absent"})`);
+    pressEl(b, "the Text tool button");
+    assert(d.ctx.tools.get().tool === "text", `the Text tool button was clicked but the tool is "${d.ctx.tools.get().tool}"`);
+  };
+  /** Press on page `key` at page point (x, y) with the Text tool: a new box
+   *  opens there. Returns its editor element and the id it will land under. */
+  const openNewBox = async (d: PdfEditorDev, key: string, x: number, y: number): Promise<{ div: HTMLElement; id: string }> => {
+    d.view.reveal(key, [x, y - 20, 220, 120]);
+    await frames(2);
+    const c = await until(() => toClient(d, key, x, y), 2_000, () => `page point ${x},${y} to map to the screen`);
+    const target = document.elementFromPoint(c.x, c.y);
+    assert(target !== null && d.view.el.contains(target), `page point ${x},${y} (client ${Math.round(c.x)},${Math.round(c.y)}) shows ${describeEl(target)}, not the page strip`);
+    const o = { bubbles: true, cancelable: true, composed: true, clientX: c.x, clientY: c.y, button: 0, pointerId: 1, pointerType: "mouse", isPrimary: true };
+    target!.dispatchEvent(new PointerEvent("pointerdown", { ...o, buttons: 1 }));
+    target!.dispatchEvent(new PointerEvent("pointerup", o));
+    const open = await until(() => {
+      const e = d.ctx.textEdit.get();
+      const div = $(".pdfmk-text-edit");
+      return e && e.draft && rendered(div) ? { div: div!, id: e.id } : null;
+    }, 2_000, () => `a new text box editor (textEdit ${d.ctx.textEdit.get() ? `open on ${d.ctx.textEdit.get()!.id}, draft ${d.ctx.textEdit.get()!.draft ? "yes" : "no"}` : "null"}, .pdfmk-text-edit ${$(".pdfmk-text-edit") ? "present" : "absent"})`);
+    open.div.focus();
+    return open;
+  };
+  /** Type `s` at the editor's selection the way the keyboard does
+   *  (execCommand insertText); when the engine refuses it here, the same
+   *  events by hand. Which path ran is returned for the detail line. */
+  const typeInto = (div: HTMLElement, s: string): "exec" | "dom" => {
+    if (document.activeElement !== div) div.focus();
+    const before = walkText(div);
+    let ok = false;
+    try {
+      ok = document.execCommand("insertText", false, s);
+    } catch {
+      ok = false;
+    }
+    if (ok && walkText(div) !== before) return "exec";
+    const sel = window.getSelection();
+    assert(sel !== null && sel.rangeCount > 0 && div.contains(sel.anchorNode), `typing "${s}": execCommand did nothing and there is no caret in the editor`);
+    const bi = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: s });
+    if (!div.dispatchEvent(bi)) return "dom";
+    const r = sel!.getRangeAt(0);
+    r.deleteContents();
+    const tn = document.createTextNode(s);
+    r.insertNode(tn);
+    sel!.setBaseAndExtent(tn, s.length, tn, s.length);
+    div.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: s }));
+    return "dom";
+  };
+  /** Make a line break at the editor's caret the way the Enter key does, by
+   *  the first of these that gives the text one more "\n" (by this file's
+   *  walker): (a) a real keydown/keyup for Enter (a synthetic key event
+   *  usually does not run the browser's default editing; the app may handle
+   *  it itself), (b) execCommand("insertParagraph"), (c)
+   *  execCommand("insertLineBreak"), (d) by hand: beforeinput insertParagraph
+   *  and, when nothing prevented it, a "\n" text node at the caret and an
+   *  input event. A step that changed the text WITHOUT adding exactly one
+   *  line break stops the ladder (a later step would stack a second break on
+   *  a mangled DOM): the assertion names the step and shows the DOM.
+   *  Returns the steps tried, e.g. "a✗ b✓". */
+  const breakLine = (div: HTMLElement): string => {
+    if (document.activeElement !== div) div.focus();
+    const nl = (s: string): number => (s.match(/\n/g) ?? []).length;
+    const tried: string[] = [];
+    const step = (name: string, run: () => void): boolean => {
+      const before = walkText(div);
+      try {
+        run();
+      } catch (e) {
+        tried.push(`${name}✗(threw ${e instanceof Error ? e.message : String(e)})`);
+        return false;
+      }
+      const after = walkText(div);
+      if (nl(after) === nl(before) + 1 && after.replace(/\n/g, "") === before.replace(/\n/g, "")) {
+        tried.push(`${name}✓`);
+        return true;
+      }
+      assert(after === before, `line break by ${name} changed the editor's text from ${JSON.stringify(before)} to ${JSON.stringify(after)} without adding exactly one line break (tried ${[...tried, name].join(" ")}; DOM ${htmlOf(div)})`);
+      tried.push(`${name}✗`);
+      return false;
+    };
+    const exec = (cmd: string) => (): void => {
+      if (!document.execCommand(cmd, false)) throw new Error(`execCommand("${cmd}") returned false`);
+    };
+    if (step("a:keydown", () => keyOn(div, "Enter"))) return tried.join(" ");
+    if (step("b:insertParagraph", exec("insertParagraph"))) return tried.join(" ");
+    if (step("c:insertLineBreak", exec("insertLineBreak"))) return tried.join(" ");
+    const ok = step("d:dom", () => {
+      const sel = window.getSelection();
+      assert(sel !== null && sel.rangeCount > 0 && div.contains(sel.anchorNode), "line break by hand: there is no caret in the editor");
+      const bi = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertParagraph" });
+      if (!div.dispatchEvent(bi)) {
+        tried.push("(d: beforeinput prevented)");
+        return;
+      }
+      const r = sel!.getRangeAt(0);
+      r.deleteContents();
+      const tn = document.createTextNode("\n");
+      r.insertNode(tn);
+      sel!.setBaseAndExtent(tn, 1, tn, 1);
+      div.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertParagraph" }));
+    });
+    assert(ok, `no way of making a line break added one to the editor's text (tried ${tried.join(" ")}; text ${JSON.stringify(walkText(div))}; DOM ${htmlOf(div)})`);
+    return tried.join(" ");
+  };
+  /** An element's markup for a message, cut to 300 characters. */
+  const htmlOf = (el: Element): string => {
+    const h = el.innerHTML;
+    return JSON.stringify(h.length > 300 ? `${h.slice(0, 300)}…` : h);
+  };
+  /** Ctrl+<k> / Escape on the editor, as the keyboard sends it. */
+  const keyOn = (el: HTMLElement, key: string, ctrl = false): void => {
+    const code = key.length === 1 ? `Key${key.toUpperCase()}` : key;
+    el.dispatchEvent(new KeyboardEvent("keydown", { key, code, ctrlKey: ctrl, bubbles: true, cancelable: true, composed: true }));
+    el.dispatchEvent(new KeyboardEvent("keyup", { key, code, ctrlKey: ctrl, bubbles: true, cancelable: true, composed: true }));
+  };
+  const undoDepth = (s: ProjectSession): number => (s.history as unknown as { undoStack: unknown[] }).undoStack.length;
+  const textMark = (d: PdfEditorDev, key: string, id: string): Extract<PdfAnnot, { t: "text" }> | null => {
+    const a = (d.session.project.pdf?.annots[key] ?? []).find((x) => x.id === id);
+    return a && a.t === "text" ? a : null;
+  };
+  const savedNode = (d: PdfEditorDev, key: string, id: string): SVGElement | null =>
+    d.view.overlay(key)?.querySelector<SVGElement>(`.pdfmk-marks [data-id="${id}"]`) ?? null;
+  /** A computed style in a few words, for messages. */
+  const cs = (el: Element): string => {
+    const c = getComputedStyle(el);
+    return `${c.fontWeight}/${c.fontSize}/${c.color}`;
+  };
+  const isBold = (el: Element): boolean => Number(getComputedStyle(el).fontWeight) >= 600;
+  const rgbOf = (hex: string): string => {
+    const h = hex.replace("#", "");
+    return `rgb(${parseInt(h.slice(0, 2), 16)}, ${parseInt(h.slice(2, 4), 16)}, ${parseInt(h.slice(4, 6), 16)})`;
+  };
+  /** Runs as a comparable string (key order aside). */
+  const runsKey = (runs: readonly object[] | undefined): string =>
+    runs === undefined ? "none" : JSON.stringify(runs.map((r) => Object.fromEntries(Object.entries(r).sort(([a], [b]) => a.localeCompare(b)))));
+  /** Settings the runs blocks may write (recent colours, the tool look). */
+  const settingsSnap = (): { ink: unknown; tool: unknown } => {
+    const st = settingsStore.get() as unknown as { inkColors?: unknown; pdfToolStyle?: unknown };
+    return { ink: st.inkColors, tool: st.pdfToolStyle };
+  };
+  const settingsBack = async (was: { ink: unknown; tool: unknown }): Promise<void> => {
+    try {
+      // the tool look is saved on a short debounce: let it land first
+      await sleep(400);
+      await settingsWritesSettled();
+      const now = settingsSnap();
+      const patch: Record<string, unknown> = {};
+      if (JSON.stringify(now.ink) !== JSON.stringify(was.ink)) patch.inkColors = was.ink;
+      if (JSON.stringify(now.tool) !== JSON.stringify(was.tool)) patch.pdfToolStyle = was.tool;
+      if (Object.keys(patch).length) await updateSettings(patch as Parameters<typeof updateSettings>[0]);
+      await settingsWritesSettled();
+    } catch (e) {
+      console.error("pdf autotest: settings not put back", e);
+    }
+  };
+  /** Close any open editor (discard) and remove a box a block placed. */
+  const runsTeardown = async (d: PdfEditorDev | null, key: string, id: string): Promise<void> => {
+    if (!d) return;
+    try {
+      d.ctx.textEdit.get()?.discard();
+      d.ctx.selection.set([]);
+      if (id && currentSession.get() === d.session && textMark(d, key, id)) {
+        const { removeAnnots } = await import("../pdf/model");
+        d.session.commit((p) => removeAnnots(p, [{ pageId: key, id }]));
+      }
+    } catch (e) {
+      console.error("pdf autotest: the runs box was not removed", e);
+    }
+  };
+
+  await test("pdf-text-runs-style-export", async () => {
+    const t0 = performance.now();
+    const TEXT = "Hello world again";
+    const S = 6;
+    const E = 11;
+    let d: PdfEditorDev | null = null;
+    let key = "";
+    let id = "";
+    let restoreTools: (() => void) | null = null;
+    const was = settingsSnap();
+    const outs: string[] = [];
+    const opened: PdfDoc[] = [];
+    try {
+      needFixtures();
+      d = await ensureEditor();
+      const dd = d;
+      key = firstPageId(dd);
+      dd.ctx.textEdit.get()?.commit();
+      dd.ctx.selection.set([]);
+      restoreTools = runsTools(dd);
+      await pickTextTool(dd);
+      const depth0 = undoDepth(dd.session);
+      const open = await openNewBox(dd, key, 60, 560);
+      id = open.id;
+      const div = open.div;
+      const how = typeInto(div, TEXT);
+      assert(walkText(div) === TEXT, `typed "${TEXT}" (${how}) but the editor holds "${walkText(div)}"`);
+
+      // Select "world" with the Selection API, as a drag would leave it.
+      setSel(div, S, E);
+      document.dispatchEvent(new Event("selectionchange"));
+      await until(() => {
+        const r = dd.ctx.textEdit.get()?.range;
+        return r && r.s === S && r.e === E ? r : null;
+      }, 1_500, () => `the editor to publish range {s:${S},e:${E}} (publishes ${JSON.stringify(dd.ctx.textEdit.get()?.range)}, DOM selection ${JSON.stringify(selOffsets(div))})`);
+
+      // Bold, by the inspector's button.
+      const boldBtn = (): HTMLButtonElement | null => $<HTMLButtonElement>('#pdfed-inspector button[aria-label="Bold"]');
+      const b0 = await until(() => {
+        const b = boldBtn();
+        return b && rendered(b) && !b.disabled ? b : null;
+      }, 2_000, () => `the inspector's Bold button, enabled (${boldBtn() ? `disabled ${boldBtn()!.disabled}` : "absent"}; inspector shows "${text("#pdfed-inspector .insp-header__name")}")`);
+      assert(b0.getAttribute("aria-pressed") !== "true", `Bold reads pressed for the plain range "world" before any click`);
+      pressEl(b0, "the Bold button");
+      const findSpan = (root: ParentNode, t: string): HTMLElement | null => $$<HTMLElement>("span", root).find((s) => s.textContent === t) ?? null;
+      await until(() => {
+        const s = findSpan(div, "world");
+        return s && isBold(s) ? s : null;
+      }, 1_500, () => `a bold span "world" in the editor after Bold (spans: ${$$("span", div).map((s) => `"${s.textContent}" ${cs(s)}`).join(", ") || "none"})`);
+
+      // A colour that is not the base colour, by a swatch of the Color row.
+      const base = normalizeHexColor(dd.ctx.textEdit.get()?.draft?.c ?? "#000000", "#000000");
+      const swatches = $$<HTMLButtonElement>('#pdfed-inspector [role="group"][aria-label="Mark color"] button.pdfmk-swatch:not(.pdfmk-swatch--none)');
+      // the most saturated one: unmistakable against black text and white paper
+      const chroma = (h: string): number => {
+        const a = rgbOf(h).match(/\d+/g)!.map(Number);
+        return Math.max(...a) - Math.min(...a);
+      };
+      const pick = swatches.map((b) => ({ b, c: normalizeHexColor(b.title, "") })).filter((x) => x.c && x.c !== base).sort((x, y) => chroma(y.c) - chroma(x.c))[0];
+      assert(pick !== undefined, `the Mark color row has no swatch other than the base ${base} (swatches: ${swatches.map((b) => b.title).join(", ") || "none"})`);
+      const C = pick!.c;
+      pressEl(pick!.b, `the ${C} swatch`);
+      const worldSpan = await until(() => {
+        const s = findSpan(div, "world");
+        return s && isBold(s) && getComputedStyle(s).color === rgbOf(C) ? s : null;
+      }, 1_500, () => `"world" bold AND ${rgbOf(C)} in the editor (spans: ${$$("span", div).map((s) => `"${s.textContent}" ${cs(s)}`).join(", ") || "none"})`);
+      const selNow = selOffsets(div);
+      const rNow = dd.ctx.textEdit.get()?.range;
+      assert(rNow?.s === S && rNow.e === E, `after Bold + colour the editor publishes range ${JSON.stringify(rNow)}, not ${S}..${E}`);
+      assert(selNow?.s === S && selNow.e === E, `after Bold + colour the DOM selection is ${JSON.stringify(selNow)} (active ${describeEl(document.activeElement)}), not ${S}..${E}`);
+      const others = $$<HTMLElement>("span", div).filter((s) => s !== worldSpan);
+      const before = others.find((s) => s.textContent === "Hello ");
+      const after = others.find((s) => s.textContent === " again");
+      assert(before !== undefined && after !== undefined, `the editor's other spans are ${others.map((s) => `"${s.textContent}"`).join(", ")}, not "Hello " and " again"`);
+      assert(!isBold(before!) && !isBold(after!), `the text around "world" is bold: "Hello " ${cs(before!)}, " again" ${cs(after!)}`);
+      const editShown = `"world" ${cs(worldSpan)}; "Hello " ${cs(before!)}`;
+
+      // The editor's own undo: one step per style.
+      keyOn(div, "z", true);
+      await until(() => {
+        const s = findSpan(div, "world");
+        return s && isBold(s) && getComputedStyle(s).color === rgbOf(base) ? s : null;
+      }, 1_000, () => `Ctrl+Z to take the colour off "world" and keep bold (spans: ${$$("span", div).map((s) => `"${s.textContent}" ${cs(s)}`).join(", ")})`);
+      keyOn(div, "y", true);
+      await until(() => {
+        const s = findSpan(div, "world");
+        return s && isBold(s) && getComputedStyle(s).color === rgbOf(C) ? s : null;
+      }, 1_000, () => `Ctrl+Y to put ${rgbOf(C)} back on "world" (spans: ${$$("span", div).map((s) => `"${s.textContent}" ${cs(s)}`).join(", ")})`);
+      assert(depth0 === undoDepth(dd.session), `styling inside the open editor touched the project history (${depth0} → ${undoDepth(dd.session)})`);
+
+      // Escape: the box lands in one step with its run.
+      keyOn(div, "Escape");
+      await until(() => (!dd.ctx.textEdit.get() && !$(".pdfmk-text-edit") ? true : null), 1_500, () => `the editor to close on Escape (textEdit ${dd.ctx.textEdit.get() ? "still open" : "null"})`);
+      const m1 = textMark(dd, key, id);
+      assert(m1 !== null && m1.text === TEXT, `after Escape the page holds ${m1 ? `"${m1.text}"` : "no box"} under ${id}`);
+      const want1 = runsKey([{ s: S, e: E, bold: true, c: C }]);
+      assert(runsKey(m1!.runs) === want1, `the box's runs are ${runsKey(m1!.runs)}, not ${want1}`);
+      assert(!m1!.bold && normalizeHexColor(m1!.c, "") === base, `the box's own style changed: bold ${m1!.bold}, c ${m1!.c} (base ${base})`);
+      const steps = undoDepth(dd.session) - depth0;
+      assert(steps === 1, `the whole edit (new box, text, two range styles) took ${steps} history steps, not 1`);
+      const sel1 = dd.ctx.selection.get();
+      assert(sel1.length === 1 && sel1[0]!.id === id, `after Escape the selection is ${JSON.stringify(sel1)}, not the box`);
+
+      const savedSpans = async (what: string, ok: (sp: HTMLElement[]) => boolean): Promise<HTMLElement[]> =>
+        until(() => {
+          const n = savedNode(dd, key, id);
+          const sp = n ? $$<HTMLElement>(".pdfmk-text__line span", n) : [];
+          return sp.length && ok(sp) ? sp : null;
+        }, 1_500, () => {
+          const n = savedNode(dd, key, id);
+          return `${what} (saved node ${n ? (rendered(n) ? "rendered" : "not rendered") : "absent"}; spans: ${n ? $$<HTMLElement>(".pdfmk-text__line span", n).map((s) => `"${s.textContent}" ${cs(s)}`).join(", ") || "none" : "-"})`;
+        });
+      const sp1 = await savedSpans(`the saved box to draw "world" bold in ${rgbOf(C)}, the rest plain`, (sp) => {
+        const w = sp.find((s) => s.textContent === "world");
+        return !!w && isBold(w) && getComputedStyle(w).color === rgbOf(C) && sp.filter((s) => s !== w).every((s) => !isBold(s) && getComputedStyle(s).color === rgbOf(base));
+      });
+      assert(sp1.every((s) => rendered(s)), "a span of the saved box is not rendered");
+      const savedShown = sp1.map((s) => `"${s.textContent}" ${cs(s)}`).join(", ");
+
+      // Not editing, the box selected: Bold is the whole box's.
+      const b1 = await until(() => {
+        const b = boldBtn();
+        return b && rendered(b) && !b.disabled && !dd.ctx.textEdit.get() ? b : null;
+      }, 2_000, () => `the Bold button for the selected box (${boldBtn() ? `disabled ${boldBtn()!.disabled}` : "absent"})`);
+      const depth1 = undoDepth(dd.session);
+      pressEl(b1, "the Bold button (whole box)");
+      const m2 = await until(() => {
+        const m = textMark(dd, key, id);
+        return m && m.bold ? m : null;
+      }, 1_000, () => `the box to turn bold (bold ${textMark(dd, key, id)?.bold}, runs ${runsKey(textMark(dd, key, id)?.runs)})`);
+      const want2 = runsKey([{ s: S, e: E, c: C }]);
+      assert(runsKey(m2.runs) === want2, `after the whole-box Bold the runs are ${runsKey(m2.runs)}, not ${want2} (bold must leave the run, colour stay)`);
+      assert(undoDepth(dd.session) === depth1 + 1, `the whole-box Bold took ${undoDepth(dd.session) - depth1} steps, not 1`);
+      await savedSpans("every span of the saved box bold, \"world\" still coloured", (sp) => sp.every((s) => isBold(s)) && getComputedStyle(sp.find((s) => s.textContent === "world") ?? sp[0]!).color === rgbOf(C));
+
+      // The app's undo button takes it back.
+      const undoBtn = $<HTMLButtonElement>("#pdfed-undo");
+      assert(rendered(undoBtn) && !undoBtn!.disabled, `the Undo button is ${undoBtn ? (undoBtn.disabled ? "disabled" : "not rendered") : "absent"}`);
+      pressEl(undoBtn!, "the Undo button");
+      const m3 = await until(() => {
+        const m = textMark(dd, key, id);
+        return m && !m.bold ? m : null;
+      }, 1_000, () => `Undo to take the whole-box Bold off (bold ${textMark(dd, key, id)?.bold})`);
+      assert(runsKey(m3.runs) === want1, `after Undo the runs are ${runsKey(m3.runs)}, not ${want1}`);
+      await savedSpans("after Undo: only \"world\" bold again", (sp) => sp.filter((s) => isBold(s)).map((s) => s.textContent).join("|") === "world");
+
+      // Export: the box alone on its page, flattened into page content.
+      const p = dd.session.project;
+      const only = { ...p, pdf: { ...p.pdf!, annots: { ...p.pdf!.annots, [key]: [m3] } } };
+      const dir = await scratchDir();
+      const out = `${dir}\\autotest-pdf-runs-${Date.now().toString(36)}.pdf`;
+      outs.push(out);
+      const { exportPdf } = await import("../pdf/export/export");
+      const t1 = performance.now();
+      const res = await exportPdf(only, { flattenMarks: true, flattenForms: false }, out).catch((e: unknown) => {
+        throw new Error(`the export of the box with runs failed: ${errorDetail(e).message}`);
+      });
+      const exportMs = Math.round(performance.now() - t1);
+      const got = await pdfLibFonts(res.path);
+      assert(got.pages === 1, `pdf-lib loads the export with ${got.pages} pages, not 1`);
+      const srcNames = (await pdfLibFonts(fx("form_acro.pdf"))).names;
+      const fresh = got.names.filter((n) => !srcNames.includes(n));
+      const regular = fresh.find((n) => /segoe/i.test(n) && !/bold/i.test(n));
+      const boldF = fresh.find((n) => /segoe/i.test(n) && /bold/i.test(n));
+      assert(regular !== undefined && boldF !== undefined, `the export (${got.bytes} bytes) does not embed both a regular and a bold Segoe UI face: new fonts ${fresh.join(", ") || "none"} (source has ${srcNames.join(", ") || "none"})`);
+      // pdf.js: the text items of "world" and "Hello" are drawn in different fonts
+      const { openPdf } = await import("../pdf/view");
+      const doc = await openPdf("autotest-runs-out", res.path);
+      opened.push(doc);
+      const pg = await (doc.doc as PdfProxyLite).getPage(1);
+      const tc = await (pg as unknown as { getTextContent(): Promise<{ items: { str?: string; fontName?: string }[] }> }).getTextContent();
+      const items = tc.items.filter((i) => typeof i.str === "string" && i.str.trim() !== "");
+      const wItem = items.find((i) => i.str!.includes("world"));
+      const hItem = items.find((i) => i.str!.includes("Hello"));
+      assert(wItem !== undefined && hItem !== undefined, `pdf.js reads no "world"/"Hello" text in the export (items: ${items.map((i) => `"${i.str}"`).join(", ") || "none"})`);
+      assert(wItem!.fontName !== hItem!.fontName, `"world" and "Hello" are drawn in the same font ${wItem!.fontName} (items: ${items.map((i) => `"${i.str}"@${i.fontName}`).join(", ")})`);
+      pg.cleanup();
+      return `typed (${how}); "world" 6..11 → Bold + ${C} by the panel: editor ${editShown}, range held; Ctrl+Z → colour off / bold kept, Ctrl+Y → back; Escape → runs ${runsKey(m1!.runs)}, 1 history step, saved ${savedShown}; whole-box Bold → runs ${runsKey(m2.runs)}, all bold; Undo → back; export ${exportMs} ms (${got.bytes} B, pdf-lib 1 page): ${regular} + ${boldF}, pdf.js "world"@${wItem!.fontName} vs "Hello"@${hItem!.fontName} — ${ms(t0)}`;
+    } finally {
+      await runsTeardown(d, key, id);
+      restoreTools?.();
+      for (const doc of opened) await doc.destroy().catch(() => {});
+      for (const o of outs) await removeTestFile(o).catch(() => {});
+      await settingsBack(was);
+    }
+  });
+
+  await test("pdf-text-runs-mixed-size-fits", async () => {
+    const t0 = performance.now();
+    const LINE1 = "Hello BIG word";
+    const LINE2 = "second line";
+    const S = 6;
+    const E = 9;
+    const BIG = 30;
+    const TOL = 1.5;
+    let d: PdfEditorDev | null = null;
+    let key = "";
+    let id = "";
+    let restoreTools: (() => void) | null = null;
+    const was = settingsSnap();
+    try {
+      needFixtures();
+      d = await ensureEditor();
+      const dd = d;
+      key = firstPageId(dd);
+      dd.ctx.textEdit.get()?.commit();
+      dd.ctx.selection.set([]);
+      restoreTools = runsTools(dd);
+      await pickTextTool(dd);
+      const open = await openNewBox(dd, key, 60, 650);
+      id = open.id;
+      const div = open.div;
+      // Two lines the way a person types them: line 1, Enter, line 2.
+      const { readText } = await import("../pdf/editor/marks/text");
+      const howA = typeInto(div, LINE1);
+      const brk1 = breakLine(div);
+      const html1 = htmlOf(div);
+      const howB = typeInto(div, LINE2);
+      const how = `${howA}/${howB}`;
+      const typed = walkText(div);
+      const appRead = readText(div);
+      const html1b = htmlOf(div);
+      const brkShown = `line break ${brk1}, DOM after it ${html1}, after line 2 ${html1b}; walker ${JSON.stringify(typed)}, readText ${JSON.stringify(appRead)}`;
+      assert(typed === `${LINE1}\n${LINE2}`, `typed two lines (${how}) but the editor holds ${JSON.stringify(typed)} — ${brkShown}`);
+
+      setSel(div, S, E);
+      document.dispatchEvent(new Event("selectionchange"));
+      await until(() => {
+        const r = dd.ctx.textEdit.get()?.range;
+        return r && r.s === S && r.e === E ? r : null;
+      }, 1_500, () => `the editor to publish range {s:${S},e:${E}} (publishes ${JSON.stringify(dd.ctx.textEdit.get()?.range)})`);
+
+      // The size, by the inspector's slider (a drag's events).
+      const range = await until(() => {
+        const r = $<HTMLInputElement>('#pdfed-inspector input[type="range"][aria-label="Font size in points"]');
+        return r && rendered(r) ? r : null;
+      }, 2_000, () => "the inspector's Font size slider");
+      const pr = range.getBoundingClientRect();
+      const po = { bubbles: true, cancelable: true, clientX: pr.left + pr.width / 2, clientY: pr.top + pr.height / 2, button: 0, pointerId: 1, pointerType: "mouse", isPrimary: true };
+      range.dispatchEvent(new PointerEvent("pointerdown", { ...po, buttons: 1 }));
+      range.value = String(BIG);
+      range.dispatchEvent(new Event("input", { bubbles: true }));
+      range.dispatchEvent(new Event("change", { bubbles: true }));
+      range.dispatchEvent(new PointerEvent("pointerup", po));
+      /** the 30 pt span "BIG" (re-queried: the styled editor rebuilds its spans) */
+      const bigSpanOf = (): HTMLElement | null =>
+        $$<HTMLElement>("span", div).find((s) => s.textContent === "BIG" && parseFloat(getComputedStyle(s).fontSize) === BIG) ?? null;
+      const spansShown = (): string => $$("span", div).map((s) => `${JSON.stringify(s.textContent)} ${cs(s)}`).join(", ") || "none";
+      await until(bigSpanOf, 1_500, () => `a ${BIG}px span "BIG" in the editor (spans: ${spansShown()}; text ${JSON.stringify(walkText(div))}; DOM ${htmlOf(div)})`);
+      assert(walkText(div) === `${LINE1}\n${LINE2}`, `after the ${BIG} pt style the editor holds ${JSON.stringify(walkText(div))}, not the two lines (DOM ${htmlOf(div)})`);
+      await frames(2);
+      const nl = LINE1.length;
+
+      // Styled mode: Enter at the end of line 1 opens a new line between the
+      // two; "Q" on it. The run still covers exactly "BIG".
+      setSel(div, nl, nl);
+      document.dispatchEvent(new Event("selectionchange"));
+      const brk2 = breakLine(div);
+      const html2 = htmlOf(div);
+      const howQ = typeInto(div, "Q");
+      await frames(1);
+      const wantQ = `${LINE1}\nQ\n${LINE2}`;
+      const afterQ = walkText(div);
+      assert(afterQ === wantQ, `after a line break (${brk2}) at the end of line 1 and "Q" (${howQ}) the styled editor holds ${JSON.stringify(afterQ)}, not ${JSON.stringify(wantQ)} (DOM after the break ${html2}, now ${htmlOf(div)})`);
+      const cq = selOffsets(div);
+      assert(cq !== null && cq.s === nl + 2 && cq.e === nl + 2, `after typing "Q" on the new line the caret is at ${JSON.stringify(cq)}, not ${nl + 2} (DOM ${htmlOf(div)})`);
+      const bigNow = $$<HTMLElement>("span", div).filter((s) => parseFloat(getComputedStyle(s).fontSize) === BIG).map((s) => s.textContent).join("");
+      assert(bigNow === "BIG", `after the line break and "Q" the ${BIG}px text in the editor is ${JSON.stringify(bigNow)}, not "BIG" (spans: ${spansShown()})`);
+      const qShown = `styled break ${brk2}, DOM after it ${html2}, "Q" (${howQ}) → ${JSON.stringify(afterQ)}, ${BIG}px text ${JSON.stringify(bigNow)}`;
+      await frames(1);
+
+      // Editing: the browser's own line boxes for the mixed sizes (line 1
+      // against the last line, "second line").
+      const l3 = nl + 3;
+      const e1 = rangeBox(div, 0, nl);
+      const e2 = rangeBox(div, l3, l3 + LINE2.length);
+      assert(e1 !== null && e2 !== null, `the editor's lines have no client rects (${JSON.stringify(e1)}, ${JSON.stringify(e2)})`);
+      assert(e1!.h > 1.5 * e2!.h, `while editing, line 1's glyphs are ${e1!.h.toFixed(1)} px tall and line 3's ${e2!.h.toFixed(1)} px — the ${BIG} pt word did not make line 1 clearly taller`);
+
+      // Typing at the very start of the large run, then at the end of the text.
+      const bigSpan = bigSpanOf();
+      assert(bigSpan !== null && bigSpan.firstChild !== null, `the ${BIG}px span "BIG" is gone before typing "x" (spans: ${spansShown()})`);
+      const bigText = bigSpan!.firstChild!;
+      window.getSelection()!.setBaseAndExtent(bigText, 0, bigText, 0);
+      document.dispatchEvent(new Event("selectionchange"));
+      const how1 = typeInto(div, "x");
+      await frames(1);
+      const c1 = selOffsets(div);
+      assert(c1 !== null && c1.s === S + 1 && c1.e === S + 1, `after typing "x" at the start of the large run the caret is at ${JSON.stringify(c1)}, not ${S + 1}`);
+      assert(walkText(div).slice(0, S + 2) === "Hello xB", `after typing "x" the text starts ${JSON.stringify(walkText(div).slice(0, 10))}`);
+      const xEl = charEl(div, S);
+      const prevEl = charEl(div, S - 1);
+      assert(xEl !== null && prevEl !== null, "the typed character or the one before it has no element");
+      const xSize = parseFloat(getComputedStyle(xEl!).fontSize);
+      const prevSize = parseFloat(getComputedStyle(prevEl!).fontSize);
+      assert(xSize === prevSize && xSize !== BIG, `the "x" typed at the start of the ${BIG} pt run renders at ${xSize}px; the character before it is ${prevSize}px (it must take the style of the character before it)`);
+      const endAt = walkText(div).length;
+      setSel(div, endAt, endAt);
+      document.dispatchEvent(new Event("selectionchange"));
+      const how2 = typeInto(div, "y");
+      await frames(1);
+      const c2 = selOffsets(div);
+      assert(c2 !== null && c2.s === endAt + 1 && c2.e === endAt + 1, `after typing "y" at the end (${endAt}) the caret is at ${JSON.stringify(c2)}, not ${endAt + 1}`);
+      const yEl = charEl(div, endAt);
+      assert(yEl !== null && parseFloat(getComputedStyle(yEl).fontSize) === 12, `the "y" typed at the end renders ${yEl ? cs(yEl) : "nowhere"}, not 12px`);
+
+      // What the editor shows just before Escape (its frame, client px).
+      await frames(1);
+      const outline = $<SVGElement>(".pdfmk-edit-chrome .pdfmk-sel");
+      assert(rendered(outline), "the editor's frame (.pdfmk-edit-chrome .pdfmk-sel) is not rendered");
+      const edH = outline!.getBoundingClientRect().height;
+      const ed1 = rangeBox(div, 0, nl)!;
+      const ed2 = rangeBox(div, l3, walkText(div).length)!;
+      const divPt = div.offsetHeight;
+
+      keyOn(div, "Escape");
+      await until(() => (!dd.ctx.textEdit.get() && !$(".pdfmk-text-edit") ? true : null), 1_500, () => `the editor to close on Escape (textEdit ${dd.ctx.textEdit.get() ? "still open" : "null"})`);
+      const m = textMark(dd, key, id);
+      const wantText = `Hello xBIG word\nQ\n${LINE2}y`;
+      assert(m !== null && m.text === wantText, `after Escape the box holds ${m ? JSON.stringify(m.text) : "nothing"}, not ${JSON.stringify(wantText)}`);
+      const wantRuns = runsKey([{ s: S + 1, e: E + 1, size: BIG }]);
+      assert(runsKey(m!.runs) === wantRuns, `after Escape the runs are ${runsKey(m!.runs)}, not ${wantRuns}`);
+
+      // Saved: the app's rows, on screen.
+      const n = await until(() => {
+        const x = savedNode(dd, key, id);
+        return x && rendered(x) && $$(".pdfmk-text__line", x).length === 3 ? x : null;
+      }, 1_500, () => `the saved box with 3 line divs (node ${savedNode(dd, key, id) ? `${$$(".pdfmk-text__line", savedNode(dd, key, id)!).length} lines` : "absent"})`);
+      await frames(1);
+      const boxR = n.getBoundingClientRect();
+      const lines = $$<HTMLElement>(".pdfmk-text__line", n);
+      // client px per point (page 1 is not turned; the box is m.w pt wide)
+      const k = boxR.width / m!.w;
+      /** A line's glyph boxes (span client rects) and how far the font's own
+       *  content area may stand out of its line-height box by CSS: half of
+       *  (content height − size × 1.25), per span, 0 when it fits. A span's
+       *  rect is its font's ascent + descent, which for Segoe UI (1.33 em) is
+       *  taller than the 1.25 line height the app (and the export) uses. */
+      const glyphs = (ln: HTMLElement): { top: number; bottom: number; left: number; right: number; h: number; over: number } | null => {
+        const rs: DOMRect[] = [];
+        let over = 0;
+        for (const s of $$<HTMLElement>("span", ln)) {
+          const lh = parseFloat(getComputedStyle(s).fontSize) * 1.25 * k;
+          for (const r of Array.from(s.getClientRects())) {
+            if (r.width <= 0 && r.height <= 0) continue;
+            rs.push(r);
+            over = Math.max(over, (r.height - lh) / 2);
+          }
+        }
+        if (!rs.length) return null;
+        const top = Math.min(...rs.map((r) => r.top));
+        const bottom = Math.max(...rs.map((r) => r.bottom));
+        return { top, bottom, left: Math.min(...rs.map((r) => r.left)), right: Math.max(...rs.map((r) => r.right)), h: bottom - top, over: Math.max(0, over) };
+      };
+      // line 1 (with the 30 pt run), line 2 ("Q"), line 3 ("second liney")
+      const g1 = glyphs(lines[0]!);
+      const gQ = glyphs(lines[1]!);
+      const g2 = glyphs(lines[2]!);
+      assert(g1 !== null && gQ !== null && g2 !== null, "a saved line has no glyph rects");
+      const row1 = lines[0]!.getBoundingClientRect().height;
+      const rowQ = lines[1]!.getBoundingClientRect().height;
+      const row2 = lines[2]!.getBoundingClientRect().height;
+      const nums = `editor: frame ${edH.toFixed(1)} px (div ${divPt} pt), line glyphs 1 ${ed1.h.toFixed(1)} / 3 ${ed2.h.toFixed(1)} px; saved: box ${boxR.height.toFixed(1)} px (h ${m!.h.toFixed(2)} pt), rows ${row1.toFixed(1)} / ${rowQ.toFixed(1)} / ${row2.toFixed(1)} px, line glyphs ${g1!.h.toFixed(1)} / ${gQ!.h.toFixed(1)} / ${g2!.h.toFixed(1)} px`;
+      assert(row1 > 1.5 * row2 && g1!.h > 1.5 * g2!.h, `saved: line 1 is not clearly taller than line 3 — ${nums}`);
+      const overs: string[] = [];
+      for (const [i, g] of [g1!, gQ!, g2!].entries()) {
+        const tolV = TOL + g.over;
+        overs.push(`line ${i + 1}: top ${(boxR.top - g.top).toFixed(1)} / bottom ${(g.bottom - boxR.bottom).toFixed(1)} px out, CSS overhang ${g.over.toFixed(1)}`);
+        const out = g.top < boxR.top - tolV || g.bottom > boxR.bottom + tolV || g.left < boxR.left - TOL || g.right > boxR.right + TOL;
+        assert(!out, `saved line ${i + 1}'s glyphs (${g.left.toFixed(1)},${g.top.toFixed(1)}–${g.right.toFixed(1)},${g.bottom.toFixed(1)}) leave the box (${boxR.left.toFixed(1)},${boxR.top.toFixed(1)}–${boxR.right.toFixed(1)},${boxR.bottom.toFixed(1)}) by more than ${TOL} px + the span's own CSS overhang ${g.over.toFixed(1)} px — ${nums}`);
+      }
+      assert(Math.abs(boxR.height - edH) <= TOL, `the box jumped on commit: the editor showed ${edH.toFixed(1)} px, the saved box is ${boxR.height.toFixed(1)} px (Δ ${(boxR.height - edH).toFixed(1)}) — ${nums}`);
+      return `typed (${how}/${how1}/${how2}); ${brkShown}; "BIG" → ${BIG} pt by the slider; ${qShown}; while editing line glyphs (1 / 3) ${e1!.h.toFixed(1)} / ${e2!.h.toFixed(1)} px; "x" at the run's start → caret ${c1!.s}, ${xSize}px like the char before; "y" at the end → caret ${c2!.s}; runs ${runsKey(m!.runs)}; ${nums}; glyphs vs box: ${overs.join("; ")}; ${k.toFixed(3)} px/pt, zoom ${dd.view.state.get().zoom.toFixed(3)} — ${ms(t0)}`;
+    } finally {
+      await runsTeardown(d, key, id);
+      restoreTools?.();
+      await settingsBack(was);
+    }
+  });
+
   await test("pdf-page-ops", async () => {
     const t0 = performance.now();
     try {
@@ -986,6 +1670,178 @@ export async function runPdfBlocks(ctx: PdfCtx): Promise<void> {
   // Safety net: whatever a failed block left, the Home blocks start on Home.
   if (edPath) await tearDownEditor();
   if (!$(".home")) await backHome();
+}
+
+/* ------------------------------------------------------------------ */
+/* An offset walker for the text editor, independent of the editor's   */
+/* own (marks/text.ts): text nodes count their data, a <br> counts one  */
+/* "\n" unless it is the trailing placeholder Chromium keeps after a    */
+/* last empty line (the last leaf, nothing after it), and the boundary  */
+/* of a block-level child (<div>, <p>: what Chromium builds for a       */
+/* paragraph break) counts one "\n" when text stands on both sides of   */
+/* it, the way innerText reads it (consecutive boundaries collapse to   */
+/* one). A boundary leaf is `br: true` with `at`, the DOM point where    */
+/* the boundary sits (before the block it enters / after the one it     */
+/* leaves), so every `!l.br` filter skips it as it skips a <br>.         */
+/* ------------------------------------------------------------------ */
+
+interface WalkLeaf {
+  node: Node;
+  start: number;
+  len: number;
+  br: boolean;
+  /** a block boundary: its DOM point */
+  at?: { node: Node; offset: number };
+}
+
+const isBlockEl = (n: Node): boolean => n.nodeType === Node.ELEMENT_NODE && (n.nodeName === "DIV" || n.nodeName === "P");
+const indexIn = (n: Node): number => Array.prototype.indexOf.call(n.parentNode!.childNodes, n) as number;
+
+function walkLeaves(root: Node): WalkLeaf[] {
+  const raw: { node: Node; br: boolean; at?: { node: Node; offset: number } }[] = [];
+  /** a block boundary passed since the last leaf, waiting for content after it */
+  let pending: { node: Node; at: { node: Node; offset: number } } | null = null;
+  let content = false;
+  const leaf = (c: Node, br: boolean): void => {
+    if (pending && content) raw.push({ node: pending.node, br: true, at: pending.at });
+    pending = null;
+    raw.push({ node: c, br });
+    content = true;
+  };
+  const walk = (n: Node): void => {
+    for (const c of Array.from(n.childNodes)) {
+      if (c.nodeType === Node.TEXT_NODE) {
+        if ((c as Text).data.length > 0) leaf(c, false);
+        else raw.push({ node: c, br: false });
+      } else if (c.nodeName === "BR") leaf(c, true);
+      else if (c.nodeType === Node.ELEMENT_NODE) {
+        const block = isBlockEl(c);
+        if (block) pending ??= { node: c, at: { node: n, offset: indexIn(c) } };
+        walk(c);
+        if (block) pending ??= { node: c, at: { node: n, offset: indexIn(c) + 1 } };
+      }
+    }
+  };
+  walk(root);
+  let placeholder: Node | null = null;
+  for (let i = raw.length - 1; i >= 0; i--) {
+    const l = raw[i]!;
+    if (l.at) break;
+    if (l.br) {
+      placeholder = l.node;
+      break;
+    }
+    if ((l.node as Text).data.length > 0) break;
+  }
+  let at = 0;
+  return raw.map((l) => {
+    const len = l.at ? 1 : l.br ? (l.node === placeholder ? 0 : 1) : (l.node as Text).data.length;
+    const out: WalkLeaf = { node: l.node, start: at, len, br: l.br };
+    if (l.at) out.at = l.at;
+    at += len;
+    return out;
+  });
+}
+
+/** The editor's text, by this walker. */
+function walkText(root: Node): string {
+  return walkLeaves(root)
+    .map((l) => (l.br ? (l.len ? "\n" : "") : (l.node as Text).data))
+    .join("");
+}
+
+/** The DOM point for text offset `at` (the earlier text node wins at an edge). */
+function walkPoint(root: Node, at: number): { node: Node; offset: number } {
+  for (const l of walkLeaves(root)) {
+    if (!l.br && at >= l.start && at <= l.start + l.len) return { node: l.node, offset: at - l.start };
+    if (l.at && at === l.start) return l.at;
+    if (l.br && l.len && at === l.start) {
+      const p = l.node.parentNode!;
+      return { node: p, offset: Array.prototype.indexOf.call(p.childNodes, l.node) as number };
+    }
+  }
+  return { node: root, offset: root.childNodes.length };
+}
+
+/** The text offset of a DOM point inside `root`, or null. */
+function walkOffset(root: Node, node: Node, off: number): number | null {
+  if (node !== root && !root.contains(node)) return null;
+  const leaves = walkLeaves(root);
+  if (node.nodeType === Node.TEXT_NODE) {
+    const l = leaves.find((x) => x.node === node);
+    return l ? l.start + Math.min(off, l.len) : null;
+  }
+  const r = document.createRange();
+  r.setStart(node, off);
+  r.collapse(true);
+  let pos = 0;
+  for (const l of leaves) {
+    // a block boundary counts once the caret is strictly past its point
+    if (l.at) {
+      if (r.comparePoint(l.at.node, l.at.offset) < 0) pos += l.len;
+    } else if (l.br) {
+      const p = l.node.parentNode!;
+      const i = Array.prototype.indexOf.call(p.childNodes, l.node) as number;
+      if (r.comparePoint(p, i + 1) <= 0) pos += l.len;
+    } else if (r.comparePoint(l.node, (l.node as Text).data.length) <= 0) pos += l.len;
+  }
+  return pos;
+}
+
+/** Select [s, e) of the editor's text with the Selection API. */
+function setSel(root: Node, s: number, e: number): void {
+  const a = walkPoint(root, s);
+  const b = walkPoint(root, e);
+  window.getSelection()!.setBaseAndExtent(a.node, a.offset, b.node, b.offset);
+}
+
+/** The document selection as offsets into `root` (null: not inside it). */
+function selOffsets(root: Node): { s: number; e: number } | null {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || !sel.anchorNode || !sel.focusNode) return null;
+  const a = walkOffset(root, sel.anchorNode, sel.anchorOffset);
+  const f = walkOffset(root, sel.focusNode, sel.focusOffset);
+  return a === null || f === null ? null : { s: Math.min(a, f), e: Math.max(a, f) };
+}
+
+/** The union of the client rects of text [s, e) (glyph boxes), or null. */
+function rangeBox(root: Node, s: number, e: number): { top: number; bottom: number; h: number } | null {
+  const a = walkPoint(root, s);
+  const b = walkPoint(root, e);
+  const r = document.createRange();
+  r.setStart(a.node, a.offset);
+  r.setEnd(b.node, b.offset);
+  const rs = Array.from(r.getClientRects()).filter((x) => x.width > 0 && x.height > 0);
+  if (!rs.length) return null;
+  const top = Math.min(...rs.map((x) => x.top));
+  const bottom = Math.max(...rs.map((x) => x.bottom));
+  return { top, bottom, h: bottom - top };
+}
+
+/** The element holding character `at` of the editor's text. */
+function charEl(root: Node, at: number): Element | null {
+  const l = walkLeaves(root).find((x) => !x.br && at >= x.start && at < x.start + x.len);
+  return l ? l.node.parentElement : null;
+}
+
+/** An exported PDF read back with pdf-lib (the export chunk's own library,
+ *  lazily): every font dictionary's /BaseFont (one per object, so a Type0
+ *  font and its descendant both count), the page count and the size. A file
+ *  pdf-lib cannot load throws — that is the "valid PDF" check. */
+async function pdfLibFonts(path: string): Promise<{ names: string[]; pages: number; bytes: number }> {
+  const res = await fetch(mediaUrl(path), { cache: "no-store" });
+  if (!res.ok) throw new Error(`reading ${baseName(path)} back failed: HTTP ${res.status}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  const { PDFDict, PDFDocument, PDFName } = await import("pdf-lib");
+  const doc = await PDFDocument.load(bytes, { updateMetadata: false, ignoreEncryption: true }).catch((e: unknown) => {
+    throw new Error(`pdf-lib cannot load ${baseName(path)} (${bytes.length} bytes): ${e instanceof Error ? e.message : String(e)}`);
+  });
+  const names: string[] = [];
+  for (const [, obj] of doc.context.enumerateIndirectObjects()) {
+    if (!(obj instanceof PDFDict) || obj.get(PDFName.of("Type"))?.toString() !== "/Font") continue;
+    names.push(obj.get(PDFName.of("BaseFont"))?.toString().replace(/^\//, "") ?? "(no /BaseFont)");
+  }
+  return { names, pages: doc.getPageCount(), bytes: bytes.length };
 }
 
 /** Ink pixels inside a page-space box of a scale-1 page render. */

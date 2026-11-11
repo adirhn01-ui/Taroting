@@ -316,6 +316,14 @@ html[data-rescue-appearance] .settings__card--appearance {
   font-family: var(--font-mono);
 }
 
+/* ---------- Fonts ---------- */
+/* One line per file the last import could not take: a .settings__hint in the
+   shortcut conflict line's colour. Selectable so a file name can be copied. */
+.settings__font-error {
+  color: var(--danger);
+  user-select: text;
+}
+
 /* ---------- Shortcuts ---------- */
 .settings__conflict-warn {
   display: flex;

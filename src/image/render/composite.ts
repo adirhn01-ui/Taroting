@@ -16,8 +16,10 @@
 // recorded size always wins over the decoder (see photos.ts).
 
 import { fontString } from "../../editor/media/generators";
+import { fontRequestOf } from "../../core/font-id";
 import { normalizeHexColor } from "../../core/session";
-import type { ClipTransform, Generator, ProjectFile, Stroke } from "../../core/types";
+import type { ClipTransform, FontRequest, Generator, ProjectFile, Stroke } from "../../core/types";
+import { fontsReady } from "../../fonts";
 import { layerToCanvas } from "../geom";
 import { layersOf, opacityOf, type Layer } from "../layers";
 import { createScratch, paintStroke, strokeBounds, type ReleasableScratch, type Scratch } from "../ink/paint";
@@ -219,13 +221,53 @@ interface TextLook {
   color: string;
   lines: string[];
   step: number;
+  /** The request of a font that was still loading when `font` was built, so
+   *  the look holds the fallback's string: it is rebuilt as soon as the font
+   *  turns ready, never kept. Null for a ready font and for the six legacy
+   *  fonts, which are never asked about (I1). Held, so a frame re-asking
+   *  allocates nothing. */
+  pending: FontRequest[] | null;
 }
-const textLooks = new WeakMap<object, TextLook>();
+let textLooks = new WeakMap<object, TextLook>();
+
+/** The distinct font requests of every text layer in `layers` (empty for a
+ *  project that uses only the six legacy fonts, which then makes no font call
+ *  at all). A caller that asks again as the project changes hands in its own
+ *  `seen`: a request it was already given is left out. */
+export function textFontRequests(layers: readonly Layer[], seen?: Set<string>): FontRequest[] {
+  let out: FontRequest[] | null = null;
+  for (let i = 0; i < layers.length; i++) {
+    const g = layers[i]!.media.generator;
+    if (g?.type !== "text") continue;
+    const req = fontRequestOf(g.fontFamily, g.fontId, g.bold, g.italic);
+    if (req === null) continue;
+    const key = `${req.bold ? 1 : 0}${req.italic ? 1 : 0}${req.id}`;
+    seen ??= new Set();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    (out ??= []).push(req);
+  }
+  return out ?? [];
+}
+
+/** Forget every cached text look: the font runtime changed (an import, a
+ *  removal, a face finishing its load), so a font string built before it may
+ *  now name the wrong face. The image editor calls it from `onFontsChanged`. */
+export function invalidateTextLooks(): void {
+  textLooks = new WeakMap();
+}
+
 function textLook(g: Extract<Generator, { type: "text" }>): TextLook {
   let t = textLooks.get(g);
+  // A look built with a font still loading is asked again each frame (one
+  // sync lookup) until the font is ready; legacy fonts never ask.
+  if (t && t.pending !== null && fontsReady(t.pending)) t = undefined;
   if (!t) {
     const size = Number.isFinite(g.sizePx) && g.sizePx > 0 ? g.sizePx : 1;
-    t = { font: fontString(g), color: normalizeHexColor(g.color, ""), lines: g.text.split("\n"), step: size * TEXT_LINE_HEIGHT };
+    const req = fontRequestOf(g.fontFamily, g.fontId, g.bold, g.italic);
+    const reqs = req === null ? null : [req];
+    const pending = reqs !== null && !fontsReady(reqs) ? reqs : null;
+    t = { font: fontString(g), color: normalizeHexColor(g.color, ""), lines: g.text.split("\n"), step: size * TEXT_LINE_HEIGHT, pending };
     textLooks.set(g, t);
   }
   return t;

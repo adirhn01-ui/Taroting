@@ -1170,7 +1170,9 @@ export function mountImageInspector(
       const gen = buildGeneratedSection(
         { session, refresh: () => ctx.requestRender() },
         { clip: l.clip, media: l.media },
-        { sharedNote: false },
+        // Its cleanup (the font picker) runs
+        // with the build's: on the next rebuild and on dispose.
+        { sharedNote: false, onCleanup: (fn) => cleanup.push(fn), closed: () => disposed },
       );
       if (gen) body.appendChild(gen);
     } else if (l.kind === "drawing") {

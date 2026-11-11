@@ -1,0 +1,21 @@
+/* The font picker's closed control (src/fonts/index.ts, mountFontPicker).
+
+   It is a <button> wearing the very classes of the <select> it replaces
+   (`select select--sm`), so border, height, chevron, padding and type come
+   from components.css unchanged. These rules cover only what a button does
+   differently from a select: it centres its text and does not truncate.
+   Loaded with the lazy chunk that imports src/fonts, never at boot. */
+
+.fontpk__ctl {
+  display: inline-block;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: normal;
+}
+/* A disabled select gets no rule of its own in components.css; only the
+   cursor differs between the two elements. */
+.fontpk__ctl:disabled {
+  cursor: default;
+}

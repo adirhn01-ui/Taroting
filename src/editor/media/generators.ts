@@ -19,10 +19,23 @@
 // clamping from the theme system: do not reintroduce it.
 
 import "./generators.css";
+import { fontRequestOf, isFontId, missingFontNotice } from "../../core/font-id";
 import { textLabel } from "../../core/media-name";
 import { addGeneratedMedia } from "../../core/project";
 import type { ProjectSession } from "../../core/session";
-import { IMAGE_CANVAS_MAX_SIDE, type FontFamily, type Generator } from "../../core/types";
+import {
+  IMAGE_CANVAS_MAX_SIDE,
+  type FontFamily,
+  type FontId,
+  type FontRequest,
+  type Generator,
+  type MediaRef,
+} from "../../core/types";
+// The font runtime. A static import on purpose: fontString / cssFont stay
+// synchronous for the preview and playback call sites, which must not change.
+// This module is reached only from lazy chunks (the editor and the image
+// editor), never from the boot chunk, so neither is src/fonts.
+import { ensureFonts, facesOf, fontFace, fontsReady, missingFonts, mountFontPicker } from "../../fonts";
 import { trapTab } from "../../ui/focus";
 import { toast } from "../../ui/toast";
 import type { MediaManager } from "./media";
@@ -85,13 +98,149 @@ const evenUp = (v: number): number => Math.max(2, Math.ceil(v / 2) * 2);
 /** Round to the nearest even integer, clamped to the canvas range. */
 const evenDim = (v: number): number => clamp(Math.round(v / 2) * 2, MIN_DIM, MAX_DIM);
 
+type TextGen = Extract<Generator, { type: "text" }>;
+
 /** The font for a CANVAS context: "{italic} {bold} {px} {family}". `ctx.font`
  *  has no line height, so this one carries none — a DOM element wants
  *  `cssFont`. */
 export function fontString(g: Extract<Generator, { type: "text" }>): string {
-  const style = g.italic ? "italic" : "normal";
-  const weight = g.bold ? "bold" : "normal";
-  return `${style} ${weight} ${g.sizePx}px ${g.fontFamily}`;
+  return fontShorthand(g, "");
+}
+
+/**
+ * The `font` shorthand a text generator is drawn with; `lineHeight` is "" or
+ * "/1.25".
+ *
+ * Without a well-shaped `fontId` it is written from the generator's own
+ * fields: the six legacy fonts get exactly the strings 0.9.3 wrote, with no
+ * call into the font runtime and nothing allocated but the string (I1).
+ *
+ * With one, the runtime's `fontFace` answers: the font's alias first and the
+ * legacy name, quoted, as the fallback, so DOM text shows the legacy font until
+ * the face has loaded and then swaps it in by itself; the flags are the real
+ * face's (a family without a bold face answers bold off: nothing is faked). A
+ * font known missing on this PC answers the legacy name alone, which is then
+ * the 0.9.3 string again.
+ */
+function fontShorthand(g: TextGen, lineHeight: string): string {
+  let family: string = g.fontFamily;
+  let bold = g.bold;
+  let italic = g.italic;
+  if (isFontId(g.fontId)) {
+    const f = fontFace(g.fontFamily, g.fontId, bold, italic);
+    bold = f.bold;
+    italic = f.italic;
+    if (!f.missing && f.family !== family) family = `${f.family}, "${family}"`;
+  }
+  return `${italic ? "italic" : "normal"} ${bold ? "bold" : "normal"} ${g.sizePx}px${lineHeight} ${family}`;
+}
+
+/** The runtime request for a text generator's font, or null for a legacy font
+ *  (which needs none). */
+const requestOf = (g: TextGen): FontRequest | null => fontRequestOf(g.fontFamily, g.fontId, g.bold, g.italic);
+
+/** The distinct font requests of every text generator in `media` (bin items
+ *  included: the bin previews them too). Empty for a project that only uses
+ *  the six legacy fonts. */
+export function textFontRequests(media: readonly Pick<MediaRef, "generator">[]): FontRequest[] {
+  const out: FontRequest[] = [];
+  const seen = new Set<string>();
+  for (const m of media) {
+    const g = m.generator;
+    if (g?.type !== "text") continue;
+    const req = requestOf(g);
+    if (!req) continue;
+    const key = `${req.bold ? 1 : 0}${req.italic ? 1 : 0}${req.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(req);
+  }
+  return out;
+}
+
+/**
+ * On a project open: load the fonts its text names (so the stage's DOM text
+ * swaps them in), then say once which of them are not on this PC. A project
+ * whose text uses only the six legacy fonts makes no font call at all (I1).
+ * Never rejects. `disposed` stops the notice from landing on another screen.
+ */
+export async function prepareProjectFonts(
+  media: readonly Pick<MediaRef, "generator">[],
+  disposed: () => boolean,
+): Promise<void> {
+  const reqs = textFontRequests(media);
+  if (reqs.length === 0) return;
+  try {
+    await ensureFonts(reqs);
+    if (disposed()) return;
+    const note = missingFontNotice(missingFonts(reqs));
+    if (note) toast.notice(note);
+  } catch {
+    // The runtime never rejects by contract; a broken one must not break the open.
+  }
+}
+
+/**
+ * Which style switches a font can honour. The six keep the Impact rule exactly
+ * (Impact: neither; the other five: both). Any other font follows its real
+ * faces once they are known (`facesOf`), and leaves both on while they are not.
+ */
+export function styleAvailability(
+  legacy: FontFamily,
+  fontId: FontId | undefined,
+): { bold: boolean; italic: boolean } {
+  if (!isFontId(fontId)) {
+    const impact = legacy === "Impact";
+    return { bold: !impact, italic: !impact };
+  }
+  const faces = facesOf(fontId);
+  if (!faces) return { bold: true, italic: true };
+  return { bold: faces.some((f) => f.bold), italic: faces.some((f) => f.italic) };
+}
+
+/** `g` with any style switch its font cannot honour turned off (a font whose
+ *  faces are not known yet keeps both). `g` itself when nothing changes, and
+ *  always for the six. */
+function honourFaces(g: TextGen): TextGen {
+  if (!isFontId(g.fontId)) return g;
+  const can = styleAvailability(g.fontFamily, g.fontId);
+  const bold = g.bold && can.bold;
+  const italic = g.italic && can.italic;
+  return bold === g.bold && italic === g.italic ? g : { ...g, bold, italic };
+}
+
+/**
+ * Measure a text generator with its font loaded, and hand back the generator
+ * to store with that box. A legacy font, or one already ready, is measured at
+ * once and comes back as the same object (no awaited barrier: I1); otherwise
+ * the font is awaited first, because canvas silently measures a fallback font
+ * and that wrong box would be saved into the project. Once the font's faces
+ * are known, a Bold or Italic it has no face for is turned off before
+ * measuring, so the stored switches match what is drawn.
+ */
+export function measureTextWhenReady(
+  g: TextGen,
+): { gen: TextGen; width: number; height: number } | Promise<{ gen: TextGen; width: number; height: number }> {
+  const done = (): { gen: TextGen; width: number; height: number } => {
+    const gen = honourFaces(g);
+    return { gen, ...measureText(gen) };
+  };
+  const req = requestOf(g);
+  if (!req) return { gen: g, ...measureText(g) };
+  if (fontsReady([req])) return done();
+  return ensureFonts([req]).then(done, done);
+}
+
+/** `g` with the picked font fields: `fontId` set, or removed (no key) for a
+ *  legacy pick. Every other field and the key order are kept. */
+export function withFont(
+  g: Extract<Generator, { type: "text" }>,
+  v: { legacy: FontFamily; fontId?: FontId },
+): Extract<Generator, { type: "text" }> {
+  const next = { ...g, fontFamily: v.legacy };
+  if (v.fontId === undefined) delete next.fontId;
+  else next.fontId = v.fontId;
+  return next;
 }
 
 /**
@@ -104,9 +253,7 @@ export function fontString(g: Extract<Generator, { type: "text" }>): string {
  * export's drawtext are measured at.
  */
 export function cssFont(g: Extract<Generator, { type: "text" }>): string {
-  const style = g.italic ? "italic" : "normal";
-  const weight = g.bold ? "bold" : "normal";
-  return `${style} ${weight} ${g.sizePx}px/${LINE_HEIGHT} ${g.fontFamily}`;
+  return fontShorthand(g, `/${LINE_HEIGHT}`);
 }
 
 // One reused offscreen canvas context for text measurement.
@@ -124,7 +271,10 @@ function ctx2d(): CanvasRenderingContext2D | null {
 
 /** Intrinsic pixel box for a text generator: width = ceil(max line width),
  *  height = ceil(lines * sizePx * 1.25), each rounded UP to even, min 2×2.
- *  Falls back to a size-based estimate if no 2D context is available. */
+ *  Falls back to a size-based estimate if no 2D context is available.
+ *  Synchronous, and it assumes the font is ready: a caller measuring a
+ *  non-legacy font awaits it first (measureTextWhenReady), since canvas
+ *  measures a fallback font without a word. */
 export function measureText(g: Extract<Generator, { type: "text" }>): { width: number; height: number } {
   const lines = g.text.split("\n");
   const c = ctx2d();
@@ -155,6 +305,8 @@ interface Modal {
   body: HTMLElement;
   footer: HTMLElement;
   close(): void;
+  /** True once any close path has run. */
+  isClosed(): boolean;
 }
 
 function openModal(title: string, onClose?: () => void): Modal {
@@ -199,7 +351,7 @@ function openModal(title: string, onClose?: () => void): Modal {
   });
   backdrop.querySelector("[data-close]")!.addEventListener("click", close);
 
-  return { backdrop, body, footer, close };
+  return { backdrop, body, footer, close, isClosed: () => closed };
 }
 
 /** A labelled field row. */
@@ -237,7 +389,14 @@ export function openGeneratorDialog(
 /* ---------------- TEXT ---------------- */
 
 function openTextDialog(ctx: GeneratorDialogCtx | GeneratorCreate): () => void {
-  const m = openModal("Add text", "onCreate" in ctx ? ctx.onClose : undefined);
+  // The picker's listeners go with the dialog, on every close path.
+  let picker: { refresh(): void; dispose(): void } | null = null;
+  const callerClose = "onCreate" in ctx ? ctx.onClose : undefined;
+  const m = openModal("Add text", () => {
+    picker?.dispose();
+    picker = null;
+    callerClose?.();
+  });
 
   // Content
   const textarea = document.createElement("textarea");
@@ -245,15 +404,10 @@ function openTextDialog(ctx: GeneratorDialogCtx | GeneratorCreate): () => void {
   textarea.rows = 3;
   textarea.value = "Title";
 
-  // Font family
-  const fontSel = document.createElement("select");
-  fontSel.className = "select select--sm";
-  for (const f of TEXT_FONTS) {
-    const o = document.createElement("option");
-    o.value = f;
-    o.textContent = f;
-    fontSel.appendChild(o);
-  }
+  // Font: the shared picker. `font` holds the fields a pick stores (a legacy
+  // font has no fontId at all).
+  let font: { legacy: FontFamily; fontId?: FontId } = { legacy: TEXT_FONTS[0]! };
+  const fontHost = document.createElement("div");
 
   // Size
   const sizeInput = document.createElement("input");
@@ -285,24 +439,28 @@ function openTextDialog(ctx: GeneratorDialogCtx | GeneratorCreate): () => void {
   previewText.className = "gen-preview__text";
   preview.appendChild(previewText);
 
-  const currentGen = (): Extract<Generator, { type: "text" }> => ({
-    type: "text",
-    text: textarea.value,
-    fontFamily: fontSel.value as FontFamily,
-    sizePx: clamp(Math.round(Number(sizeInput.value) || MIN_SIZE), MIN_SIZE, MAX_SIZE),
-    color: colorInput.value,
-    bold: boldSwitch.checked,
-    italic: italicSwitch.checked,
-  });
+  const currentGen = (): Extract<Generator, { type: "text" }> =>
+    withFont(
+      {
+        type: "text",
+        text: textarea.value,
+        fontFamily: font.legacy,
+        sizePx: clamp(Math.round(Number(sizeInput.value) || MIN_SIZE), MIN_SIZE, MAX_SIZE),
+        color: colorInput.value,
+        bold: boldSwitch.checked,
+        italic: italicSwitch.checked,
+      },
+      font,
+    );
 
+  // The Impact rule, generalized: a switch for a face the font does not have
+  // is off and disabled.
   const syncImpact = (): void => {
-    const impact = fontSel.value === "Impact";
-    if (impact) {
-      boldSwitch.checked = false;
-      italicSwitch.checked = false;
-    }
-    boldSwitch.disabled = impact;
-    italicSwitch.disabled = impact;
+    const can = styleAvailability(font.legacy, font.fontId);
+    if (!can.bold) boldSwitch.checked = false;
+    if (!can.italic) italicSwitch.checked = false;
+    boldSwitch.disabled = !can.bold;
+    italicSwitch.disabled = !can.italic;
   };
 
   const renderPreview = (): void => {
@@ -324,9 +482,25 @@ function openTextDialog(ctx: GeneratorDialogCtx | GeneratorCreate): () => void {
     boldSwitch.addEventListener(ev, renderPreview);
     italicSwitch.addEventListener(ev, renderPreview);
   }
-  fontSel.addEventListener("change", () => {
-    syncImpact();
-    renderPreview();
+  picker = mountFontPicker(fontHost, {
+    value: () => font,
+    onPick: (v) => {
+      font = v;
+      syncImpact();
+      renderPreview();
+      // Start loading a non-legacy font now, so the preview swaps it in and
+      // the switches learn its faces; nothing runs for the six.
+      const req = fontRequestOf(v.legacy, v.fontId, boldSwitch.checked, italicSwitch.checked);
+      if (!req) return;
+      void ensureFonts([req]).then(
+        () => {
+          if (m.isClosed() || font !== v) return;
+          syncImpact();
+          renderPreview();
+        },
+        () => {},
+      );
+    },
   });
 
   const boldRow = fieldRow("Bold", boldSwitch);
@@ -337,7 +511,7 @@ function openTextDialog(ctx: GeneratorDialogCtx | GeneratorCreate): () => void {
 
   m.body.append(
     fieldRow("Text", textarea),
-    fieldRow("Font", fontSel),
+    fieldRow("Font", fontHost),
     (() => {
       const row = document.createElement("div");
       row.className = "gen-row";
@@ -355,22 +529,33 @@ function openTextDialog(ctx: GeneratorDialogCtx | GeneratorCreate): () => void {
   confirm.addEventListener("click", () => {
     if (submitted) return;
     submitted = true;
-    const gen = currentGen();
     // Measured HERE and nowhere else in this dialog: a 137-line paste is ~1100
     // canvas measurements, which is a keystroke's worth of jank if the live
     // preview did it too — so the preview styles a div and only the confirm
     // measures. The result is committed as-is, whatever its size.
-    const { width, height } = measureText(gen);
-    if ("onCreate" in ctx) {
-      ctx.onCreate(gen, width, height, textLabel(gen.text));
+    // A non-legacy font that is not ready yet is awaited first (a box measured
+    // with the fallback font would be saved); the six measure at once, as ever.
+    const add = ({ gen, width, height }: { gen: TextGen; width: number; height: number }): void => {
+      // Closed while the font was loading (Escape, X, a teardown): add nothing.
+      if (m.isClosed()) return;
+      if ("onCreate" in ctx) {
+        ctx.onCreate(gen, width, height, textLabel(gen.text));
+      } else {
+        ctx.session.commit(
+          (p) => addGeneratedMedia(p, gen, width, height, textLabel(gen.text)).project,
+        );
+        ctx.media.ensureAll(ctx.session.project);
+      }
+      toast.info(`Added text — ${width}×${height}`);
+      m.close();
+    };
+    const box = measureTextWhenReady(currentGen());
+    if (box instanceof Promise) {
+      confirm.disabled = true;
+      void box.then(add);
     } else {
-      ctx.session.commit(
-        (p) => addGeneratedMedia(p, gen, width, height, textLabel(gen.text)).project,
-      );
-      ctx.media.ensureAll(ctx.session.project);
+      add(box);
     }
-    toast.info(`Added text — ${width}×${height}`);
-    m.close();
   });
   m.footer.append(cancel, confirm);
 

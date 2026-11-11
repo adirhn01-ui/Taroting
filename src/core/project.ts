@@ -28,6 +28,7 @@ import type {
 } from "./types";
 import { DEFAULT_EXPORT_PRESET, IMAGE_CANVAS_MAX_SIDE } from "./types";
 import { EPS_KF, removeKfNear, upsertKf } from "./anim";
+import { isFontId } from "./font-id";
 import { clipDuration, clipEnd } from "./time";
 
 export const MIN_CANVAS = 16;
@@ -1110,7 +1111,20 @@ export function sanitizeFps(fps: Rational): Rational {
  *  rejects it. */
 export function sanitizeMediaRef(m: MediaRef): MediaRef {
   const duration = finMin(m.duration, 0, 0);
-  return duration === m.duration ? m : { ...m, duration };
+  const generator = sanitizeTextFontId(m.generator);
+  if (duration === m.duration && generator === m.generator) return m;
+  return generator === m.generator ? { ...m, duration } : { ...m, duration, generator };
+}
+
+/** A text generator's `fontId` is a name only (core/font-id `isFontId`); an
+ *  ill-shaped one is dropped, and `fontFamily`, its fallback, then applies.
+ *  Returns `g` itself when there is nothing to drop, so a 0.9.3 generator (no
+ *  `fontId` key at all) is never copied. `fontFamily` is not touched here. */
+function sanitizeTextFontId(g: Generator | undefined): Generator | undefined {
+  if (g?.type !== "text" || !("fontId" in g) || isFontId(g.fontId)) return g;
+  const { fontId: _dropped, ...rest } = g;
+  void _dropped;
+  return rest;
 }
 
 /**

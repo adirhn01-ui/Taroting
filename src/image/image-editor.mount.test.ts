@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createBlankImageProject } from "../core/image-project";
 import { blockShortcuts } from "../core/shortcuts";
 import type { MediaInfo, MediaRef, ProjectFile } from "../core/types";
-import { addPhotoLayer, layersOf } from "./layers";
+import { addGeneratorLayer, addPhotoLayer, layersOf } from "./layers";
 
 // The image editor shell mounted against a small fake DOM (vitest runs in
 // node), with its panels, tools, renderer and the disk faked: what is under
@@ -13,6 +13,8 @@ import { addPhotoLayer, layersOf } from "./layers";
 
 const h = vi.hoisted(() => ({
   toasts: [] as string[],
+  /** Each call into the shared missing-font wording (core/font-id). */
+  sharedNotices: 0,
   exports: 0,
   copies: [] as { doc: unknown; blobFor?: (m: MediaRef) => Blob | null }[],
   navigations: [] as unknown[],
@@ -37,15 +39,59 @@ const h = vi.hoisted(() => ({
   drop: null as null | { onDrop(paths: string[]): void },
   /** each Canvas menu open: was its button still focused, and from the keyboard? */
   menuOpens: [] as { buttonFocused: boolean; fromKeyboard: boolean }[],
+  /** every call into the font runtime, in order */
+  fontCalls: [] as string[],
+  /** how each pending ensureFonts finishes */
+  fontEnsures: [] as (() => void)[],
+  /** ids the fake runtime reports missing */
+  fontMissing: new Set<string>(),
+  /** the shell's onFontsChanged callback */
+  fontsChanged: null as null | (() => void),
+  /** times the shell told the select tool (its crop ghost) the fonts changed */
+  ghostPokes: 0,
+}));
+
+vi.mock("../fonts", () => ({
+  ensureFonts: (reqs: { id: string; bold: boolean; italic: boolean }[]) => {
+    h.fontCalls.push(`ensure:${reqs.map((r) => `${r.id}${r.bold ? "/b" : ""}${r.italic ? "/i" : ""}`).join(",")}`);
+    return new Promise<void>((resolve) => h.fontEnsures.push(resolve));
+  },
+  fontsReady: () => {
+    h.fontCalls.push("ready?");
+    return true;
+  },
+  missingFonts: (reqs: { id: string }[]) => {
+    h.fontCalls.push("missing?");
+    return reqs.filter((r) => h.fontMissing.has(r.id)).map((r) => r.id);
+  },
+  onFontsChanged: (cb: () => void) => {
+    h.fontCalls.push("watch");
+    h.fontsChanged = cb;
+    return () => {
+      h.fontCalls.push("unwatch");
+    };
+  },
 }));
 
 vi.mock("../ui/toast", () => ({
   toast: {
     info: (m: string) => void h.toasts.push(`info:${m}`),
+    notice: (m: string) => void h.toasts.push(`notice:${m}`),
     error: (m: string) => void h.toasts.push(`error:${m}`),
     refuse: (m: string) => void h.toasts.push(`refuse:${m}`),
   },
 }));
+// The shared wording, spied on but real: the editor's notice must come from it.
+vi.mock("../core/font-id", async (orig) => {
+  const real = await orig<typeof import("../core/font-id")>();
+  return {
+    ...real,
+    missingFontNotice: (ids: readonly string[]) => {
+      h.sharedNotices++;
+      return real.missingFontNotice(ids);
+    },
+  };
+});
 vi.mock("../core/ipc", () => ({
   describeError: (e: unknown) => (e instanceof Error ? e.message : String(e)),
   ipc: {
@@ -116,7 +162,12 @@ vi.mock("./inspector", () => ({
   mountImageInspector: () => ({ dispose: () => {}, dropPreview: () => {} }),
 }));
 vi.mock("./select-tool", () => ({
-  mountSelectTool: () => ({ dispose: () => {}, cropLayer: () => {}, revertCrop: () => {} }),
+  mountSelectTool: () => ({
+    dispose: () => {},
+    cropLayer: () => {},
+    revertCrop: () => {},
+    fontsChanged: () => void h.ghostPokes++,
+  }),
 }));
 vi.mock("./ink/ink", () => ({
   mountInk: () => {
@@ -303,6 +354,7 @@ let modal = false;
 
 beforeEach(() => {
   h.toasts.length = 0;
+  h.sharedNotices = 0;
   h.exports = 0;
   h.copies.length = 0;
   h.navigations.length = 0;
@@ -318,6 +370,11 @@ beforeEach(() => {
   h.viewOpts = null;
   h.drop = null;
   h.menuOpens.length = 0;
+  h.fontCalls.length = 0;
+  h.fontEnsures.length = 0;
+  h.fontMissing.clear();
+  h.fontsChanged = null;
+  h.ghostPokes = 0;
   modal = false;
   win = Object.assign(new Target(), {
     requestAnimationFrame: () => 1,
@@ -793,5 +850,98 @@ describe("writeProjectThumb", () => {
     h.thumbs[1]!.reject(new Error("offline"));
     await flush();
     expect(h.saves).toEqual([]);
+  });
+});
+
+/* ---------------- 0.9.4: library and installed fonts ---------------- */
+
+describe("fonts on the image canvas", () => {
+  type TextGen = Extract<NonNullable<MediaRef["generator"]>, { type: "text" }>;
+  const text = (over: Partial<TextGen> = {}): TextGen => ({
+    type: "text",
+    text: "Hi",
+    fontFamily: "Segoe UI",
+    sizePx: 30,
+    color: "#ffffff",
+    bold: false,
+    italic: false,
+    ...over,
+  });
+  const withTexts = (...gens: TextGen[]): ProjectFile => {
+    let p = withPhotos("C:/p/harbour.jpg");
+    for (const g of gens) p = addGeneratorLayer(p, g, 100, 40, "Text").project;
+    return p;
+  };
+  /** requestAnimationFrame calls: each is a stage repaint asked for */
+  const countFrames = (): { n: number } => {
+    const frames = { n: 0 };
+    (win as unknown as { requestAnimationFrame: () => number }).requestAnimationFrame = () => {
+      frames.n++;
+      return 0; // never "pending", so each request is seen
+    };
+    return frames;
+  };
+
+  it("a project using only the six legacy fonts makes no font call at all", async () => {
+    const m = await mount(withTexts(text({ fontFamily: "Impact", bold: true }), text({ fontFamily: "Georgia" })));
+    // An edit that brings in another legacy text layer asks nothing either.
+    m.ctx.session.commit((p) => addGeneratorLayer(p, text({ fontFamily: "Arial" }), 80, 30, "Text").project);
+    await flush();
+    await m.handle.dispose();
+    expect(h.fontCalls).toEqual([]);
+  });
+
+  it("on open: watches, asks for each font once, then one notice naming the missing ones", async () => {
+    h.fontMissing.add("lib:Gone");
+    h.fontMissing.add("Old Face");
+    const frames = countFrames();
+    const m = await mount(withTexts(
+      text({ fontId: "lib:Gone", bold: true }),
+      text({ fontId: "lib:Here" }),
+      text({ fontId: "lib:Gone", bold: true }),
+      text({ fontId: "Old Face" }),
+    ));
+    // Not awaited by the mount: the editor is up while the fonts load.
+    expect(h.fontCalls).toEqual(["watch", "ensure:Old Face,lib:Gone/b,lib:Here"]);
+    expect(h.toasts).toEqual([]);
+    const before = frames.n;
+    h.fontEnsures[0]!();
+    await flush();
+    expect(frames.n).toBe(before + 1);
+    // One notice (amber, not info), worded by the shared helper.
+    expect(h.toasts).toEqual([
+      "notice:Fonts Old Face and Gone aren't on this PC. Showing Segoe UI. Import them in Settings, or pick other fonts.",
+    ]);
+    expect(h.sharedNotices).toBe(1);
+    await m.handle.dispose();
+    expect(h.fontCalls.at(-1)).toBe("unwatch");
+  });
+
+  it("repaints when the runtime says the fonts changed", async () => {
+    const frames = countFrames();
+    const m = await mount(withTexts(text({ fontId: "Consolas" })));
+    const before = frames.n;
+    h.fontsChanged!();
+    expect(frames.n).toBe(before + 1);
+    // The crop ghost draws text on its own canvas: it is told too.
+    expect(h.ghostPokes).toBe(1);
+    await m.handle.dispose();
+  });
+
+  it("a font an edit brings in is asked for then (and watched), with no notice", async () => {
+    h.fontMissing.add("lib:Pasted");
+    const m = await mount(withTexts(text()));
+    expect(h.fontCalls).toEqual([]);
+    m.ctx.session.commit((p) => addGeneratorLayer(p, text({ fontId: "lib:Pasted", italic: true }), 80, 30, "Text").project);
+    await flush();
+    expect(h.fontCalls).toEqual(["watch", "ensure:lib:Pasted/i"]);
+    h.fontEnsures[0]!();
+    await flush();
+    expect(h.toasts).toEqual([]);
+    // The same font again asks nothing new.
+    m.ctx.session.commit((p) => addGeneratorLayer(p, text({ fontId: "lib:Pasted", italic: true }), 80, 30, "Text").project);
+    await flush();
+    expect(h.fontCalls).toEqual(["watch", "ensure:lib:Pasted/i"]);
+    await m.handle.dispose();
   });
 });

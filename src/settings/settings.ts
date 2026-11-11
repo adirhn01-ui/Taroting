@@ -36,6 +36,7 @@ import {
   recordError,
 } from "../ui/errors";
 import { focusFirst, trapTab } from "../ui/focus";
+import { createFontsSection } from "./fonts-section";
 import { icon } from "../ui/icons";
 import { toast } from "../ui/toast";
 
@@ -89,6 +90,8 @@ export const ACTION_LABELS: Record<ActionId, string> = {
   pdfFillForms: "Fill forms on/off (PDF)",
   find: "Find in PDF",
   duplicate: "Duplicate (PDF)",
+  pdfPages: "Show or hide pages (PDF)",
+  pdfProperties: "Show or hide properties (PDF)",
 };
 
 /** The screens that have a ShortcutManager. The conflict warning names a mode,
@@ -153,6 +156,8 @@ export const ACTION_ORDER: ActionId[] = [
   "pdfFillForms",
   "find",
   "duplicate",
+  "pdfPages",
+  "pdfProperties",
 ];
 
 /** The three user-settable colours of the custom theme, in the order they are
@@ -288,7 +293,7 @@ export const OPEN_WITH_HINTS: Record<OpenWith, string> = {
 
 const AUTOSAVE_OPTIONS = [1, 3, 5, 10, 30];
 const CACHE_LIMIT_OPTIONS_MB = [1024, 2048, 5120, 10240, 20480];
-const CACHE_KIND_ORDER = ["remux", "proxy", "waveform", "thumbs", "filmstrip"];
+const CACHE_KIND_ORDER = ["remux", "proxy", "waveform", "thumbs", "filmstrip", "fonts"];
 
 type CacheStats = { totalBytes: number; byKind: Record<string, number> };
 
@@ -412,8 +417,8 @@ export function uninstallRefusal(e: unknown): string | null {
 type FocusKey = { id: string } | { attr: string; value: string };
 
 /** The data attributes that name a control without an id: the theme and
- *  opening-files choices, and the shortcut rows. */
-const FOCUS_ATTRS = ["data-theme-opt", "data-openwith-opt", "data-action"] as const;
+ *  opening-files choices, the shortcut rows, and a library font's Remove. */
+const FOCUS_ATTRS = ["data-theme-opt", "data-openwith-opt", "data-action", "data-font-remove"] as const;
 
 /** Where focus goes when the control it was on is gone or disabled after the
  *  render. Each of these takes itself out of reach by being used. */
@@ -590,6 +595,8 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
   }
   /** Resolved once on mount; empty until then so the first paint isn't blocked. */
   let appVer = "";
+  /** The Fonts section: its state outlives each re-render (see fonts-section.ts). */
+  const fonts = createFontsSection();
 
   /* ---------------- section builders ---------------- */
 
@@ -904,6 +911,7 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       autosaveSection(s),
       exportSection(s),
       openingSection(s),
+      fonts.html(),
       performanceSection(s),
       cacheSection(s),
       shortcutsSection(s),
@@ -917,6 +925,9 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
     // laid out with an empty swatch. See the block comment above colorRow.
     paintColorSwatches(s);
     wire();
+    // The Fonts section keeps its async state in its own module; its markup
+    // came from that state above, and this wires the fresh controls.
+    fonts.paint(inner);
     if (focusKey) restoreFocus(inner, focusKey);
   }
 
@@ -1536,6 +1547,8 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
 
   render();
   void loadCacheStats();
+  // The font catalogue is read only now that Settings is open.
+  fonts.start();
   // Cheap: appVersion() is a cached lazy import, so this only pays once per run.
   void appVersion().then((v) => {
     if (disposed || !v) return;
@@ -1558,6 +1571,8 @@ export function mountSettings(root: HTMLElement): { dispose(): void } {
       // router clears, and its buttons are wired to this screen. Closing it is
       // teardown's job; nothing else will ever do it.
       closeOverlays();
+      // Its confirm lives on document.body too.
+      fonts.dispose();
     },
   };
 }

@@ -3,9 +3,11 @@
 // pdf.js / pdf-lib readers for checking what came out.
 
 import { existsSync, readFileSync } from "node:fs";
-import { PDFArray, PDFDict, PDFDocument, PDFName, PDFNumber, PDFRef, PDFStream } from "pdf-lib";
-import type { FontFamily, MediaRef, PdfAnnot, PdfPage, PdfSource, ProjectFile } from "../../core/types";
+import fontkit from "@pdf-lib/fontkit";
+import { PDFArray, PDFDict, PDFDocument, PDFHexString, PDFName, PDFNumber, PDFRef, PDFStream, PDFString } from "pdf-lib";
+import type { FontEmbed, FontFamily, FontRequest, MediaRef, PdfAnnot, PdfPage, PdfSource, ProjectFile, ResolvedFont } from "../../core/types";
 import type { ExportDeps, PdfjsLike, RasterTextSpec } from "./deps";
+import { buildAppearance, markContext } from "./marks";
 
 export const FIXTURES = "tests/fixtures/pdf/";
 export const fixture = (name: string): string => FIXTURES + name;
@@ -33,14 +35,18 @@ export const TINY_PNG = Uint8Array.from(
 export interface TestDeps extends ExportDeps {
   rasterCalls: RasterTextSpec[];
   decodeCalls: string[];
+  /** every resolveFonts request list, in order */
+  resolveCalls: FontRequest[][];
 }
 
 export function nodeDeps(over: Partial<ExportDeps> = {}): TestDeps {
   const rasterCalls: RasterTextSpec[] = [];
   const decodeCalls: string[] = [];
+  const resolveCalls: FontRequest[][] = [];
   const base: TestDeps = {
     rasterCalls,
     decodeCalls,
+    resolveCalls,
     pdfjs: async () => (await import("pdfjs-dist/legacy/build/pdf.mjs")) as unknown as PdfjsLike,
     pdfjsOptions: { verbosity: 0, standardFontDataUrl: "node_modules/pdfjs-dist/standard_fonts/" },
     fileStat: async (path) => (existsSync(path) ? { size: readFileSync(path).length, mtimeMs: 1000 } : null),
@@ -49,6 +55,9 @@ export function nodeDeps(over: Partial<ExportDeps> = {}): TestDeps {
       const f = fontFile(family, bold, italic);
       return existsSync(f) ? new Uint8Array(readFileSync(f)) : null;
     },
+    // no non-legacy font is on the test PC unless a test says so
+    resolveFonts: async (reqs) =>
+      reqs.map((r) => ({ requested: r.id, found: false, bold: false, italic: false, path: "", lineHeightEm: 0, embed: "none" as const })),
     decodeImage: async (_bytes, mime) => {
       decodeCalls.push(mime);
       return TINY_PNG;
@@ -59,7 +68,14 @@ export function nodeDeps(over: Partial<ExportDeps> = {}): TestDeps {
     },
     now: () => new Date("2026-10-17T12:00:00Z"),
   };
-  return Object.assign(base, over);
+  const out = Object.assign(base, over);
+  // count the calls whichever resolveFonts is in force
+  const resolve = out.resolveFonts;
+  out.resolveFonts = (reqs) => {
+    resolveCalls.push(reqs);
+    return resolve(reqs);
+  };
+  return out;
 }
 
 let seq = 0;
@@ -182,4 +198,51 @@ export function apStream(doc: PDFDocument, annot: PDFDict): PDFStream | null {
 
 export function subtypeOf(d: PDFDict): string {
   return d.get(PDFName.of("Subtype"))?.toString().slice(1) ?? "";
+}
+
+/* ---------------- one text box's appearance (0.9.4 runs) ---------------- */
+
+export const CONSOLAS = "C:/Windows/Fonts/consola.ttf";
+
+export const textBox = (over: Partial<Extract<PdfAnnot, { t: "text" }>> = {}): Extract<PdfAnnot, { t: "text" }> => ({
+  id: "t1",
+  t: "text",
+  x: 72,
+  y: 90,
+  w: 180,
+  h: 120,
+  text: "Hello there",
+  font: "Georgia",
+  size: 13,
+  c: "#102030",
+  bold: false,
+  italic: false,
+  align: "left",
+  ...over,
+});
+
+/** fonts_resolve: every id resolves to Consolas' regular file with `embed`. */
+export function consolas(embed: FontEmbed | "missing" = "full") {
+  return async (reqs: FontRequest[]): Promise<ResolvedFont[]> =>
+    reqs.map((r) =>
+      embed === "missing"
+        ? { requested: r.id, found: false, bold: false, italic: false, path: "", lineHeightEm: 0, embed: "none" }
+        : { requested: r.id, found: true, bold: false, italic: false, path: CONSOLAS, lineHeightEm: 1.17, embed },
+    );
+}
+
+/** One mark's appearance, refs printed as "n 0 R". */
+export async function appear(a: PdfAnnot, deps: TestDeps = nodeDeps()) {
+  const doc = await PDFDocument.create();
+  doc.registerFontkit(fontkit);
+  const cx = markContext(doc, project([], [], {}), deps);
+  const app = await buildAppearance(a, { x: 0, y: 0, w: 612, h: 792 }, cx);
+  if (!app) return null;
+  const json = (v: unknown): unknown =>
+    JSON.parse(
+      JSON.stringify(v, (_k, x) =>
+        x instanceof PDFRef ? `ref ${x.toString()}` : x instanceof PDFHexString || x instanceof PDFString ? `str ${x.toString()}` : x,
+      ),
+    );
+  return { ops: app.ops, rect: app.rect, resources: json(app.resources), annot: json(app.annot), raster: deps.rasterCalls };
 }

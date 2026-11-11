@@ -29,6 +29,8 @@
 // passes the loader's bounds.
 
 import type {
+  FontFamily,
+  FontId,
   MediaRef,
   PdfAnnot,
   PdfAnnotKind,
@@ -38,10 +40,13 @@ import type {
   PdfPage,
   PdfRotation,
   PdfSource,
+  PdfTextRun,
   ProjectFile,
 } from "../core/types";
 import { PDF_MAX_ANNOTS_PER_PAGE, PDF_MAX_PAGES } from "../core/types";
 import { uid } from "../core/project";
+import { isFontId, isLegacyFont } from "../core/font-id";
+import { normalizeRuns, runsEqual } from "../core/pdf-runs";
 import {
   PDF_COORD_MAX,
   PDF_PAGE_SIDE_MAX,
@@ -301,6 +306,66 @@ export function setTextBox(p: ProjectFile, pageId: string, id: string, look: Tex
   if (!changed) return p;
   const out = list.slice();
   out[i] = next as unknown as PdfAnnot;
+  return withPdf(p, { ...pdf, annots: setKey(pdf.annots, pageId, out) });
+}
+
+/** A font pick for a text mark (core/font-id `fontChoice`): the legacy font,
+ *  and a non-legacy font's id when one was picked. */
+export interface TextFontPick {
+  legacy: FontFamily;
+  fontId?: FontId;
+}
+
+/** Set a text mark's font the seam's way: `font` = the legacy field, and
+ *  `fontId` added, replaced, or — for a legacy pick — DELETED (the key is
+ *  absent, never undefined or null). `updateAnnot` cannot do this: it only
+ *  touches fields a mark already has. Refused: not a text mark, unknown
+ *  page/mark, an unknown legacy font or an ill-shaped / legacy `fontId`, or
+ *  nothing changes. */
+export function setTextFont(p: ProjectFile, pageId: string, id: string, pick: TextFontPick): ProjectFile {
+  const pdf = pdfOf(p);
+  if (!pdf || !isLegacyFont(pick.legacy)) return p;
+  const fontId = pick.fontId;
+  if (fontId !== undefined && (!isFontId(fontId) || isLegacyFont(fontId))) return p;
+  const list = pageAnnots(p, pageId);
+  const i = list.findIndex((a) => a.id === id);
+  if (i < 0) return p;
+  const cur = list[i]!;
+  if (cur.t !== "text") return p;
+  const had = hasOwn(cur, "fontId");
+  if (cur.font === pick.legacy && (fontId === undefined ? !had : had && cur.fontId === fontId)) return p;
+  const next: Record<string, unknown> = { ...cur, font: pick.legacy };
+  if (fontId === undefined) delete next.fontId;
+  else next.fontId = fontId;
+  const out = list.slice();
+  out[i] = next as unknown as PdfAnnot;
+  return withPdf(p, { ...pdf, annots: setKey(pdf.annots, pageId, out) });
+}
+
+/**
+ * Set a text box's style runs (0.9.4): `runs` are put in canonical form
+ * against the mark's OWN text and style (`normalizeRuns`) and stored; none
+ * left, or `undefined`, DELETES the key (never `runs: []`). Refused (returns
+ * `p`): not a PDF project, unknown page / mark, not a text mark, or the
+ * canonical runs equal what the mark already has (nothing changes). Set the
+ * text first (`updateAnnot`) when both change: runs are clipped to the text.
+ */
+export function setTextRuns(p: ProjectFile, pageId: string, id: string, runs: readonly PdfTextRun[] | undefined): ProjectFile {
+  const pdf = pdfOf(p);
+  if (!pdf) return p;
+  const list = pageAnnots(p, pageId);
+  const i = list.findIndex((a) => a.id === id);
+  if (i < 0) return p;
+  const cur = list[i]!;
+  if (cur.t !== "text") return p;
+  const next = normalizeRuns(cur.text, cur, runs);
+  const had = hasOwn(cur, "runs");
+  if (next === undefined ? !had : had && runsEqual(cur.runs, next)) return p;
+  const out = list.slice();
+  const mark: Record<string, unknown> = { ...cur };
+  if (next === undefined) delete mark.runs;
+  else mark.runs = next;
+  out[i] = mark as unknown as PdfAnnot;
   return withPdf(p, { ...pdf, annots: setKey(pdf.annots, pageId, out) });
 }
 

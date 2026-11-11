@@ -185,7 +185,7 @@ pub fn sweep_stale_in_background() {
     let _ = std::thread::Builder::new()
         .name("taroting-claims-sweep".into())
         .spawn(move || {
-            sweep_in(&list, started);
+            sweep_in(&list, &std::env::temp_dir(), started);
         });
 }
 
@@ -193,16 +193,23 @@ pub fn sweep_stale_in_background() {
 /// than `started`, and cross off every entry that is settled: deleted, gone,
 /// or replaced by someone else's file (left alone). One that could not be
 /// deleted (another program has it open) stays listed for next time. Returns
-/// how many files went.
-fn sweep_in(list: &Path, started: SystemTime) -> usize {
+/// how many `.part`s went.
+///
+/// A listed claim is an export an earlier run never finished, so the font
+/// copies it may have left in `temp` go too (`sweep_font_copies`).
+fn sweep_in(list: &Path, temp: &Path, started: SystemTime) -> usize {
     let _guard = lock(&LIST);
     let live = lock(&LIVE).clone();
     let mut removed = 0;
     let mut keep = Vec::new();
+    let mut unfinished: Vec<String> = Vec::new();
     for claim in read(list) {
         if live.contains(&claim.path) {
             keep.push(claim);
             continue;
+        }
+        if let Some(out) = claim.path.to_str().and_then(|p| p.strip_suffix(".part")) {
+            unfinished.push(out.to_owned());
         }
         let Ok(meta) = std::fs::metadata(&claim.path) else { continue };
         if !still_ours(&claim, &meta) || meta.modified().map_or(true, |m| m >= started) {
@@ -215,6 +222,33 @@ fn sweep_in(list: &Path, started: SystemTime) -> usize {
         }
     }
     write(list, &keep);
+    sweep_font_copies(temp, &unfinished, started);
+    removed
+}
+
+/// Delete the font copies (`super::font_copy_prefix`) that exports to `outs`
+/// left in `temp` when the app died mid-export, if older than `started`.
+/// Nothing is listed when no export was left unfinished, which is every
+/// launch but the one after a crash or kill, so the temp folder is read only
+/// then. The text files and scripts beside them are small and not swept.
+/// Returns how many went.
+fn sweep_font_copies(temp: &Path, outs: &[String], started: SystemTime) -> usize {
+    if outs.is_empty() {
+        return 0;
+    }
+    let prefixes: Vec<String> = outs.iter().map(|o| super::font_copy_prefix(o)).collect();
+    let Ok(read) = std::fs::read_dir(temp) else { return 0 };
+    let mut removed = 0;
+    for entry in read.flatten() {
+        let name = entry.file_name();
+        let ours = name.to_str().is_some_and(|n| prefixes.iter().any(|p| n.starts_with(p.as_str())));
+        let stale = ours
+            && entry.file_type().is_ok_and(|t| t.is_file())
+            && entry.metadata().and_then(|m| m.modified()).is_ok_and(|m| m < started);
+        if stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
     removed
 }
 
@@ -280,7 +314,7 @@ mod tests {
         assert!(!left_over_in(&list, &replaced), "fixture: a new file is not ours");
 
         let started = SystemTime::now() + Duration::from_secs(1);
-        assert_eq!(sweep_in(&list, started), 1);
+        assert_eq!(sweep_in(&list, &dir, started), 1);
         assert!(!ours.exists(), "our leftover must go");
         assert!(replaced.exists(), "a file that replaced ours is not ours to delete");
         assert!(stranger.exists(), "an unlisted .part is never touched");
@@ -290,8 +324,54 @@ mod tests {
         let fresh = dir.join("fresh.mp4.part");
         std::fs::write(&fresh, b"partial").unwrap();
         record_in(&list, &fresh);
-        assert_eq!(sweep_in(&list, SystemTime::now() - Duration::from_secs(60)), 0);
+        assert_eq!(sweep_in(&list, &dir, SystemTime::now() - Duration::from_secs(60)), 0);
         assert!(fresh.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The font copies of an export an earlier run left claimed go with the
+    /// sweep, whether its `.part` is still there or not; a live export's, an
+    /// unlisted export's and one newer than the sweep's start stay.
+    #[test]
+    fn the_sweep_deletes_an_unfinished_exports_font_copies() {
+        let (dir, list) = scratch("fonts");
+        let temp = dir.join("temp");
+        std::fs::create_dir_all(&temp).unwrap();
+        let out = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let (dead, gone, live, other) = (out("Dead.mp4"), out("Gone.mov"), out("Live.webm"), out("Other.mp4"));
+        for o in [&dead, &gone, &live] {
+            let part = PathBuf::from(format!("{o}.part"));
+            std::fs::write(&part, b"partial").unwrap();
+            record_in(&list, &part);
+        }
+        std::fs::remove_file(format!("{gone}.part")).unwrap();
+        lock(&LIVE).insert(PathBuf::from(format!("{live}.part")));
+        let copy = |o: &str, rest: &str| {
+            let p = temp.join(format!("{}{rest}", super::super::font_copy_prefix(o)));
+            std::fs::write(&p, b"font bytes").unwrap();
+            p
+        };
+        let swept = [copy(&dead, "0.ttf"), copy(&dead, "1.otf"), copy(&gone, "0.ttf")];
+        let kept = [copy(&live, "0.ttf"), copy(&other, "0.ttf")];
+        let started = SystemTime::now() + Duration::from_secs(1);
+        assert_eq!(sweep_in(&list, &temp, started), 1, "the one .part still there");
+        lock(&LIVE).remove(&PathBuf::from(format!("{live}.part")));
+        for p in &swept {
+            assert!(!p.exists(), "{} must go", p.display());
+        }
+        for p in &kept {
+            assert!(p.exists(), "{} must stay", p.display());
+        }
+
+        // A copy newer than the sweep's start belongs to this run.
+        let late = out("Late.mp4");
+        let part = PathBuf::from(format!("{late}.part"));
+        std::fs::write(&part, b"partial").unwrap();
+        record_in(&list, &part);
+        let fresh = copy(&late, "0.ttf");
+        sweep_in(&list, &temp, SystemTime::now() - Duration::from_secs(60));
+        assert!(fresh.exists());
+        let _ = std::fs::remove_file(&list);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

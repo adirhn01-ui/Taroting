@@ -7,6 +7,7 @@ mod debug;
 mod diagnostics;
 mod error;
 mod export;
+mod fonts;
 mod hw;
 mod image_save;
 mod jobs;
@@ -438,6 +439,11 @@ fn main() {
             export::start_export,
             export::export_failure_report,
             export::system_font_path,
+            fonts::fonts_list,
+            fonts::fonts_resolve,
+            fonts::fonts_import,
+            fonts::fonts_remove,
+            fonts::fonts_missing_glyphs,
             diagnostics::save_diagnostic_report,
             crash::take_crash_notes,
             debug::debug_info,

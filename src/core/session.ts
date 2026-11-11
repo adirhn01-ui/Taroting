@@ -1,6 +1,7 @@
 // App-wide session state: settings (theme, shortcuts, …) and the currently
 // open project with autosave + undo/redo orchestration.
 
+import { isFontId } from "./font-id";
 import { History } from "./history";
 import { describeError, ipc, type SettingsRead } from "./ipc";
 import { touchModified } from "./project";
@@ -897,7 +898,8 @@ const TOOL_SHAPES: readonly ShapeKind[] = ["line", "arrow", "rect", "ellipse"];
 const TOOL_FONTS: readonly FontFamily[] = ["Segoe UI", "Arial", "Georgia", "Times New Roman", "Courier New", "Impact"];
 /** Remembered PDF tool styles: a FRESH object of only the valid entries —
  *  colours through normalizeHexColor, sizes finite in 0.5..288, shape and
- *  font from their whitelists, text fill/border a colour or null. */
+ *  font from their whitelists, a well-shaped fontId, text fill/border a
+ *  colour or null. */
 function asPdfToolStyle(v: unknown): PdfToolStyle {
   const out: PdfToolStyle = {};
   if (typeof v !== "object" || v === null || Array.isArray(v)) return out;
@@ -920,6 +922,8 @@ function asPdfToolStyle(v: unknown): PdfToolStyle {
   }
   if (TOOL_SHAPES.includes(o.shape as ShapeKind)) out.shape = o.shape as ShapeKind;
   if (TOOL_FONTS.includes(o.font as FontFamily)) out.font = o.font as FontFamily;
+  // a non-legacy font beside `font` (its fallback): kept only when well-shaped
+  if (isFontId(o.fontId)) out.fontId = o.fontId;
   for (const k of ["textBg", "textBorder"] as const) {
     if (o[k] === null) out[k] = null;
     else {

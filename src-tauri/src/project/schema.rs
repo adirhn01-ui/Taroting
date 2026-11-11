@@ -288,6 +288,12 @@ pub enum Generator {
     Text {
         text: String,
         font_family: String,
+        /// A non-legacy font (`src/core/font-id.ts`), named by id only: never
+        /// a path. Absent for the six legacy fonts, and then not written at
+        /// all, so a project that never uses the library stays byte-identical
+        /// to 0.9.3. When present, `font_family` is the fallback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        font_id: Option<String>,
         size_px: f64,
         color: String,
         bold: bool,
@@ -799,6 +805,34 @@ mod tests {
         assert_eq!(gen["fontFamily"], "Georgia");
         assert_eq!(gen["sizePx"], 96.0);
         assert_eq!(gen["bold"], true);
+    }
+
+    /// A text generator naming a library font keeps its `fontId` through a
+    /// read and a write, beside the legacy fallback it travels with.
+    #[test]
+    fn a_text_generator_round_trips_its_font_id() {
+        let json = r##"{"type":"text","text":"Hi","fontFamily":"Segoe UI","fontId":"lib:Inter","sizePx":48.0,"color":"#ff0000","bold":false,"italic":true}"##;
+        let g: Generator = serde_json::from_str(json).unwrap();
+        match &g {
+            Generator::Text { font_id, font_family, .. } => {
+                assert_eq!(font_id.as_deref(), Some("lib:Inter"));
+                assert_eq!(font_family, "Segoe UI");
+            }
+            other => panic!("not a text generator: {other:?}"),
+        }
+        assert_eq!(serde_json::to_string(&g).unwrap(), json, "written back byte for byte");
+    }
+
+    /// A text generator without `fontId` (every 0.9.3 project) is written with
+    /// no `fontId` key at all — not `null` — so the file stays byte-identical.
+    #[test]
+    fn a_text_generator_without_a_font_id_writes_no_font_id_key() {
+        let json = r##"{"type":"text","text":"Yo","fontFamily":"Courier New","sizePx":30.0,"color":"#00ff00","bold":true,"italic":false}"##;
+        let g: Generator = serde_json::from_str(json).unwrap();
+        assert!(matches!(&g, Generator::Text { font_id: None, .. }));
+        let out = serde_json::to_string(&g).unwrap();
+        assert_eq!(out, json, "byte-identical to what 0.9.3 wrote");
+        assert!(!out.contains("fontId"));
     }
 
     /// `noAutorotate` is a flag only a literal `true` sets. Every other value

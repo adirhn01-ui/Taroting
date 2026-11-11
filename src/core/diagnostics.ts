@@ -93,6 +93,8 @@ export interface RedactedGenerator {
   /** text generators only — the LENGTH of the text, never the text */
   chars?: number;
   fontFamily?: string;
+  /** text generators with a library or installed font only: its id, capped */
+  fontId?: string;
   sizePx?: number;
   bold?: boolean;
   italic?: boolean;
@@ -394,6 +396,15 @@ export function redactEntryText(r: Redactor, s: string, paths: readonly string[]
 
 /* ---------------- project shape ---------------- */
 
+/** Longest font name a report copies. A font id is at most 96 units, but the
+ *  file is untrusted and the report is pasted into issues: anything that is
+ *  not a short string is cut to this, or reported as "?" when not a string. */
+const FONT_NAME_CAP = 96;
+function capFontName(v: unknown): string {
+  if (typeof v !== "string") return "?";
+  return v.length > FONT_NAME_CAP ? v.slice(0, FONT_NAME_CAP) : v;
+}
+
 function redactMedia(m: MediaRef, mapPath: (p: string) => string): RedactedMedia {
   const out: RedactedMedia = {
     ref: mapPath(m.path),
@@ -419,7 +430,10 @@ function redactMedia(m: MediaRef, mapPath: (p: string) => string): RedactedMedia
         ? {
             type: "text",
             chars: g.text.length,
-            fontFamily: g.fontFamily,
+            fontFamily: capFontName(g.fontFamily),
+            // Present only when the file has one, so a 0.9.3 project reports
+            // exactly as before.
+            ...(g.fontId !== undefined ? { fontId: capFontName(g.fontId) } : {}),
             sizePx: g.sizePx,
             bold: g.bold,
             italic: g.italic,
@@ -575,7 +589,7 @@ function mediaLine(m: RedactedMedia): string {
   if (g) {
     bits.push(
       g.type === "text"
-        ? `generator:text chars=${g.chars} ${g.fontFamily} ${g.sizePx}px${g.bold ? " bold" : ""}${g.italic ? " italic" : ""}`
+        ? `generator:text chars=${g.chars} ${g.fontFamily}${g.fontId !== undefined ? ` font=${g.fontId}` : ""} ${g.sizePx}px${g.bold ? " bold" : ""}${g.italic ? " italic" : ""}`
         : g.type === "drawing"
           ? `generator:drawing strokes=${g.strokes ?? 0} points=${g.points ?? 0}`
           : "generator:solid",

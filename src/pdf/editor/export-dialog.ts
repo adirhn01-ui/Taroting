@@ -160,6 +160,7 @@ export const PDF_EXPORT_MESSAGES: Readonly<Record<PdfExportErrorCode, string>> =
   "source-invalid": "A PDF this project uses couldn't be read.",
   password: "A PDF this project uses is password-protected.",
   "font-missing": "A font one of the text boxes uses isn't installed on this PC.",
+  "font-restricted": "A font in one of the text boxes can't go in a PDF because its license doesn't allow it, so pick another font for that text box.",
   "image-missing": "A picture on one of the pages is missing.",
   "image-invalid": "A picture on one of the pages couldn't be read.",
   range: "Those pages aren't in the document.",

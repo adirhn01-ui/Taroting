@@ -1,4 +1,4 @@
-//! Derived-file cache: %LOCALAPPDATA%\Taroting\cache\{remux,proxy,waveform,thumbs,filmstrip}.
+//! Derived-file cache: %LOCALAPPDATA%\Taroting\cache\{remux,proxy,waveform,thumbs,filmstrip,fonts}.
 //!
 //! Every entry is keyed by xxh3(path|size|mtime) of its SOURCE media, so any
 //! change to a source file automatically invalidates its derived files.
@@ -82,6 +82,10 @@ pub enum CacheKind {
     Waveform,
     Thumbs,
     Filmstrip,
+    /// Faces `fonts::Service::standalone` extracted from a collection. Never
+    /// marked used, so a trim dates them by mtime; a removed one is extracted
+    /// again on the next resolve (it checks the file, never a memo).
+    Fonts,
 }
 
 impl CacheKind {
@@ -92,16 +96,18 @@ impl CacheKind {
             CacheKind::Waveform => "waveform",
             CacheKind::Thumbs => "thumbs",
             CacheKind::Filmstrip => "filmstrip",
+            CacheKind::Fonts => "fonts",
         }
     }
 }
 
-const ALL_KINDS: [CacheKind; 5] = [
+const ALL_KINDS: [CacheKind; 6] = [
     CacheKind::Remux,
     CacheKind::Proxy,
     CacheKind::Waveform,
     CacheKind::Thumbs,
     CacheKind::Filmstrip,
+    CacheKind::Fonts,
 ];
 
 fn now_ms() -> u64 {

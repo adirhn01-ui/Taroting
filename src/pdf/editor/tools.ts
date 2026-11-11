@@ -53,6 +53,8 @@ export function toolStyleOf(s: PdfToolState): PdfToolStyle {
     sizes: { ...s.sizes },
     shape: s.shape,
     font: s.font,
+    // a non-legacy font rides beside `font` (its fallback); absent for a legacy one
+    ...(s.fontId !== undefined ? { fontId: s.fontId } : {}),
     textBg: s.textBg,
     textBorder: s.textBorder,
   };
@@ -64,7 +66,7 @@ function styleChanged(a: PdfToolState, b: PdfToolState): boolean {
     for (const k of Object.keys(a.colors) as (keyof PdfToolState["colors"])[]) if (a.colors[k] !== b.colors[k]) return true;
     for (const k of Object.keys(a.sizes) as (keyof PdfToolState["sizes"])[]) if (a.sizes[k] !== b.sizes[k]) return true;
   }
-  return a.shape !== b.shape || a.font !== b.font || a.textBg !== b.textBg || a.textBorder !== b.textBorder;
+  return a.shape !== b.shape || a.font !== b.font || a.fontId !== b.fontId || a.textBg !== b.textBg || a.textBorder !== b.textBorder;
 }
 
 const glyph = (i: ToolDef["icon"]): string => ("img" in i ? imgIcon(i.img) : pdfIcon(i.pdf));

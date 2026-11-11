@@ -429,6 +429,18 @@ describe("PDF export", () => {
     expect(d.$(".export-result__msg").textContent).toBe(PDF_EXPORT_MESSAGES["font-missing"]);
   });
 
+  it("a font whose license forbids embedding has its own code and sentence", async () => {
+    expect(describeExportFailure(new PdfExportError("font-restricted", ""))).toEqual({
+      message: "A font in one of the text boxes can't go in a PDF because its license doesn't allow it, so pick another font for that text box.",
+      code: "font-restricted",
+    });
+    h.exportImpl = () => Promise.reject(new PdfExportError("font-restricted", ""));
+    const d = open();
+    d.$("#px-run").click();
+    await settle();
+    expect(d.$(".export-result__msg").textContent).toBe(PDF_EXPORT_MESSAGES["font-restricted"]);
+  });
+
   it("Cancel aborts the write: the save IPC refuses once canceled", async () => {
     let release: () => void = () => {};
     h.exportImpl = async (...args: unknown[]) => {

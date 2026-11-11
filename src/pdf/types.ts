@@ -199,6 +199,7 @@ export interface PdfToolState {
   sizes: { pen: number; pencil: number; marker: number; eraser: number; shape: number; text: number };
   shape: import("../core/types").ShapeKind;
   font: import("../core/types").FontFamily;
+  fontId?: import("../core/types").FontId;
   /** a new text box's fill / 1 pt border, #rrggbb; null = none */
   textBg: string | null;
   textBorder: string | null;
@@ -222,6 +223,24 @@ export interface PdfTextEditing {
   discard(): void;
   /** focus back in the text, the caret where it was */
   refocus(): void;
+  /** (0.9.4 runs) the selected part of the text, [s, e) UTF-16 offsets into
+   *  the box's text, s < e; null = no selection (a collapsed caret): style
+   *  controls then act on the whole box. Updated in place by the editor on
+   *  selection change (publish through `ctx.textEdit` so listeners hear it). */
+  range: { s: number; e: number } | null;
+  /** (0.9.4 runs) style `range` with `patch` (core/pdf-runs `applyRunStyle`;
+   *  `font` sets the font pair). Does nothing while `range` is null. Lands
+   *  with the text as one history step when the editor closes. */
+  applyRange(patch: import("../core/pdf-runs").PdfRunPatch): void;
+  /** (0.9.4 runs) what the inspector shows: `styleSummary` of the box's
+   *  current text and runs over `range` (null = the whole box). */
+  styleOf(): import("../core/pdf-runs").PdfResolvedStyle;
+  /** (0.9.4 runs) the panel is writing these per-run fields to the WHOLE box
+   *  (no range): the editor takes them off its live runs (`clearRunFields`)
+   *  as one undo step of its own, keeps its other uncommitted styles, and
+   *  knows the project write that follows as its own. Called by the
+   *  inspector BEFORE that write. */
+  clearFields(fields: readonly import("../core/pdf-runs").PdfRunField[]): void;
 }
 
 /** What every part of the PDF editor is handed. Built once per mount by the

@@ -18,6 +18,11 @@ const spies = vi.hoisted(() => ({
   error: [] as string[],
   refuse: [] as string[],
   scans: [] as { path: string; srcIn: number; srcOut: number; settle: (v: unknown, fail?: boolean) => void }[],
+  /** Every text-section font picker mounted, and whether it was disposed. */
+  pickers: [] as { disposed: number; onPick: (v: { legacy: string; fontId?: string }) => void }[],
+  /** Set: the next measure waits for its font (resolve with `fontLoaded`). */
+  fontLate: false,
+  fontLoaded: null as null | (() => void),
 }));
 vi.mock("../../ui/toast", () => ({
   toast: {
@@ -35,9 +40,32 @@ vi.mock("../../core/ipc", () => ({
   },
 }));
 // The real measureText needs a canvas 2D context the fake DOM does not have.
-vi.mock("../media/generators", () => ({
-  TEXT_FONTS: ["Segoe UI", "Arial", "Impact"],
-  measureText: (g: { text: string; sizePx: number }) => ({ width: g.text.length * 10, height: g.sizePx * 2 }),
+vi.mock("../media/generators", () => {
+  const measureText = (g: { text: string; sizePx: number }) => ({ width: g.text.length * 10, height: g.sizePx * 2 });
+  return {
+    TEXT_FONTS: ["Segoe UI", "Arial", "Impact"],
+    measureText,
+    // The 0.9.4 font seam the text section now goes through (its own tests are
+    // in generated.fonts.test.ts); every font here is one of the six.
+    measureTextWhenReady: (g: { text: string; sizePx: number }) => {
+      if (!spies.fontLate) return { gen: g, ...measureText(g) };
+      // Measured once the font is in: 30 px a character, not the fallback's 10.
+      return new Promise((resolve) => {
+        spies.fontLoaded = () => resolve({ gen: g, width: g.text.length * 30, height: g.sizePx * 2 });
+      });
+    },
+    styleAvailability: (legacy: string) => ({ bold: legacy !== "Impact", italic: legacy !== "Impact" }),
+    withFont: (g: object, v: { legacy: string; fontId?: string }) =>
+      v.fontId === undefined ? { ...g, fontFamily: v.legacy } : { ...g, fontFamily: v.legacy, fontId: v.fontId },
+  };
+});
+// The shared font picker needs a real DOM: a recorder stands in for it.
+vi.mock("../../fonts", () => ({
+  mountFontPicker: (_host: unknown, opts: { onPick: (v: { legacy: string; fontId?: string }) => void }) => {
+    const p = { disposed: 0, onPick: opts.onPick };
+    spies.pickers.push(p);
+    return { refresh() {}, dispose: () => void p.disposed++ };
+  },
 }));
 
 const { mountInspector, VOLUME_SCALE } = await import("./inspector");
@@ -176,6 +204,9 @@ beforeEach(() => {
   spies.error = [];
   spies.refuse = [];
   spies.scans = [];
+  spies.pickers = [];
+  spies.fontLate = false;
+  spies.fontLoaded = null;
   focus.active = null;
   frames = new Map();
   vi.stubGlobal("requestAnimationFrame", (cb: () => void) => {
@@ -853,5 +884,101 @@ describe("a stale auto-key rebuild never destroys the next control mid-press", (
     expect(frames.size).toBe(1);
     t.handle.dispose();
     expect(frames.size).toBe(0);
+  });
+});
+
+describe("the text section's cleanup (0.9.4 fonts)", () => {
+  it("disposes the font picker when the section is replaced by another clip's panel", async () => {
+    const t = mount(project([clip("a", "m-text"), clip("b", "m-video", { timelineStart: 7 })]), "a");
+    expect(spies.pickers).toHaveLength(1);
+    t.selection.set("b");
+    await flush();
+    expect(spies.pickers[0]!.disposed).toBe(1);
+  });
+
+  it("disposes the font picker when the inspector is disposed", () => {
+    const t = mount(project([clip("a", "m-text")]), "a");
+    expect(spies.pickers).toHaveLength(1);
+    t.handle.dispose();
+    expect(spies.pickers[0]!.disposed).toBe(1);
+  });
+
+  const textMedia = (t: { store: Store<ProjectFile> }): MediaRef => t.store.get().media.find((m) => m.id === "m-text")!;
+
+  it("typed text waiting for its font lands when another clip replaces the section", async () => {
+    const t = mount(project([clip("a", "m-text"), clip("b", "m-video", { timelineStart: 7 })]), "a");
+    spies.fontLate = true;
+    const text = t.host.find((e) => e.tagName === "TEXTAREA")!;
+    text.focus();
+    text.value = "Late";
+    // The rebuild blurs the field first: its commit starts, waiting for the font.
+    t.selection.set("b");
+    await flush();
+    expect(t.header()).toBe("beach.day");
+    expect(t.history.length).toBe(0);
+    spies.fontLoaded!();
+    await flush();
+    expect(t.history.length).toBe(1);
+    expect(textMedia(t).generator).toMatchObject({ text: "Late" });
+    expect(textMedia(t).width).toBe(120); // 4 characters measured with the font
+  });
+
+  it("a font pick waiting for its font lands when another clip replaces the section", async () => {
+    const t = mount(project([clip("a", "m-text"), clip("b", "m-video", { timelineStart: 7 })]), "a");
+    spies.fontLate = true;
+    spies.pickers[0]!.onPick({ legacy: "Segoe UI", fontId: "lib:Inter" });
+    t.selection.set("b");
+    await flush();
+    expect(spies.pickers[0]!.disposed).toBe(1);
+    spies.fontLoaded!();
+    await flush();
+    expect(t.history.length).toBe(1);
+    expect(textMedia(t).generator).toMatchObject({ fontFamily: "Segoe UI", fontId: "lib:Inter" });
+    expect(textMedia(t).width).toBe(150); // "Hello" measured with the font
+  });
+
+  it("typed text waiting for its font lands across a rebuild from a paused playhead move", async () => {
+    const kf = { x: [{ t: 1.5, v: 0 }, { t: 9.5, v: 80 }] };
+    const t = mount(project([clip("a", "m-text", { keyframes: kf })]), "a");
+    spies.fontLate = true;
+    const text = t.host.find((e) => e.tagName === "TEXTAREA")!;
+    text.focus();
+    text.value = "Late";
+    t.engine.time = 4;
+    t.engine.refresh();
+    await flush();
+    // The panel was rebuilt around the move.
+    expect(t.host.contains(text)).toBe(false);
+    expect(t.history.length).toBe(0);
+    spies.fontLoaded!();
+    await flush();
+    expect(t.history.length).toBe(1);
+    expect(textMedia(t).generator).toMatchObject({ text: "Late" });
+  });
+
+  it("a commit still waiting for its font lands nothing once the inspector is disposed", async () => {
+    const t = mount(project([clip("a", "m-text")]), "a");
+    spies.fontLate = true;
+    const text = t.host.find((e) => e.tagName === "TEXTAREA")!;
+    text.value = "Late";
+    text.fire("change");
+    expect(t.history.length).toBe(0);
+    t.handle.dispose();
+    spies.fontLoaded!();
+    await flush();
+    expect(t.history.length).toBe(0);
+    expect(t.store.get().media.find((m) => m.id === "m-text")!.generator).toMatchObject({ text: "Hello" });
+  });
+
+  it("the same commit lands when the inspector is still up", async () => {
+    const t = mount(project([clip("a", "m-text")]), "a");
+    spies.fontLate = true;
+    const text = t.host.find((e) => e.tagName === "TEXTAREA")!;
+    text.value = "Late";
+    text.fire("change");
+    spies.fontLoaded!();
+    await flush();
+    expect(t.history.length).toBe(1);
+    expect(t.store.get().media.find((m) => m.id === "m-text")!.generator).toMatchObject({ text: "Late" });
   });
 });

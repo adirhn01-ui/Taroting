@@ -19,6 +19,8 @@ import {
   pageAnnots,
   pasteAnnots,
   setTextBox,
+  setTextFont,
+  setTextRuns,
   removeAnnots,
   reorderPages,
   rotatePages,
@@ -639,6 +641,95 @@ describe("setTextBox", () => {
     expect(setTextBox(b, "P3", "t", { bg: "red" })).toBe(b);
     expect(setTextBox(b, "P1", "m1", { bg: "#ff0000" })).toBe(b);
     expect(setTextBox(b, "P3", "nope", { bg: "#ff0000" })).toBe(b);
+  });
+});
+
+describe("setTextFont (0.9.4 font library)", () => {
+  it("a library pick on a legacy box sets both fields; the box keeps everything else", () => {
+    const p = withMarks(doc(), "P3", [textMark("t", { font: "Georgia", bold: true })]);
+    const a = setTextFont(p, "P3", "t", { legacy: "Segoe UI", fontId: "lib:Inter" });
+    const m = pageAnnots(a, "P3")[0]!;
+    expect(m).toMatchObject({ font: "Segoe UI", fontId: "lib:Inter", bold: true, text: "hi" });
+    clean(a);
+  });
+
+  it("a legacy pick on a fontId box takes the key OFF (absent, not undefined)", () => {
+    const p = withMarks(doc(), "P3", [textMark("t", { font: "Segoe UI", fontId: "Consolas" })]);
+    const a = setTextFont(p, "P3", "t", { legacy: "Times New Roman" });
+    const m = pageAnnots(a, "P3")[0]!;
+    expect("fontId" in m).toBe(false);
+    expect(m).toMatchObject({ font: "Times New Roman" });
+  });
+
+  it("one library font replaces another", () => {
+    const p = withMarks(doc(), "P3", [textMark("t", { font: "Segoe UI", fontId: "lib:Inter" })]);
+    const a = setTextFont(p, "P3", "t", { legacy: "Segoe UI", fontId: "Consolas" });
+    expect(pageAnnots(a, "P3")[0]).toMatchObject({ font: "Segoe UI", fontId: "Consolas" });
+  });
+
+  it("the same reference when nothing changes, or the pick / mark is refused", () => {
+    const lib = withMarks(doc(), "P3", [textMark("t", { font: "Segoe UI", fontId: "lib:Inter" })]);
+    expect(setTextFont(lib, "P3", "t", { legacy: "Segoe UI", fontId: "lib:Inter" })).toBe(lib);
+    const leg = withMarks(doc(), "P3", [textMark("t", { font: "Courier New" })]);
+    expect(setTextFont(leg, "P3", "t", { legacy: "Courier New" })).toBe(leg);
+    // a legacy name is never stored as a fontId; an ill-shaped id is refused
+    expect(setTextFont(leg, "P3", "t", { legacy: "Segoe UI", fontId: "Arial" })).toBe(leg);
+    expect(setTextFont(leg, "P3", "t", { legacy: "Segoe UI", fontId: " lib:Inter" })).toBe(leg);
+    expect(setTextFont(leg, "P3", "t", { legacy: "Comic Sans" as never })).toBe(leg);
+    // not a text mark, unknown mark
+    expect(setTextFont(leg, "P1", "m1", { legacy: "Segoe UI", fontId: "lib:Inter" })).toBe(leg);
+    expect(setTextFont(leg, "P3", "nope", { legacy: "Segoe UI", fontId: "lib:Inter" })).toBe(leg);
+  });
+});
+
+describe("setTextRuns (0.9.4 style runs)", () => {
+  // textMark: Arial 12 #000000, bold/italic off; a longer text so runs touch
+  // neither end
+  const long = (extra: Record<string, unknown> = {}) => textMark("t", { text: "Hello brave world", ...extra });
+
+  it("adds runs in canonical form; the box keeps everything else", () => {
+    const p = withMarks(doc(), "P3", [long()]);
+    const a = setTextRuns(p, "P3", "t", [
+      { s: 8, e: 12, italic: true },
+      { s: 2, e: 5, c: "#aa0000", size: 12 },
+    ]);
+    const m = pageAnnots(a, "P3")[0]!;
+    // sorted, and size 12 (the box's own) dropped
+    expect(m).toMatchObject({ runs: [{ s: 2, e: 5, c: "#aa0000" }, { s: 8, e: 12, italic: true }], text: "Hello brave world", font: "Arial" });
+    clean(a);
+  });
+
+  it("replaces runs", () => {
+    const p = withMarks(doc(), "P3", [long({ runs: [{ s: 2, e: 5, c: "#aa0000" }] })]);
+    const a = setTextRuns(p, "P3", "t", [{ s: 6, e: 11, bold: true }]);
+    expect((pageAnnots(a, "P3")[0] as { runs?: unknown }).runs).toEqual([{ s: 6, e: 11, bold: true }]);
+  });
+
+  it("undefined, [] or runs that normalize to nothing DELETE the key", () => {
+    const p = withMarks(doc(), "P3", [long({ runs: [{ s: 2, e: 5, c: "#aa0000" }] })]);
+    for (const none of [undefined, [], [{ s: 2, e: 5, c: "#000000" }]]) {
+      const m = pageAnnots(setTextRuns(p, "P3", "t", none), "P3")[0]!;
+      expect("runs" in m).toBe(false);
+    }
+  });
+
+  it("the same reference when nothing changes, or the mark is refused", () => {
+    const runs = [{ s: 2, e: 5, c: "#aa0000" }];
+    const p = withMarks(doc(), "P3", [long({ runs })]);
+    expect(setTextRuns(p, "P3", "t", [{ s: 2, e: 5, c: "#aa0000" }])).toBe(p);
+    const bare = withMarks(doc(), "P3", [long()]);
+    expect(setTextRuns(bare, "P3", "t", undefined)).toBe(bare);
+    expect(setTextRuns(bare, "P3", "t", [{ s: 2, e: 5, c: "#000000" }])).toBe(bare);
+    // not a text mark, unknown mark, unknown page
+    expect(setTextRuns(bare, "P1", "m1", runs)).toBe(bare);
+    expect(setTextRuns(bare, "P3", "nope", runs)).toBe(bare);
+    expect(setTextRuns(bare, "P9", "t", runs)).toBe(bare);
+  });
+
+  it("does not mutate its input", () => {
+    const p = deepFreeze(withMarks(doc(), "P3", [long({ runs: [{ s: 2, e: 5, c: "#aa0000" }] })]));
+    expect(() => setTextRuns(p, "P3", "t", undefined)).not.toThrow();
+    expect(() => setTextRuns(p, "P3", "t", [{ s: 1, e: 2, bold: true }])).not.toThrow();
   });
 });
 

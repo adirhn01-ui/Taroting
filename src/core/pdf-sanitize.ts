@@ -20,12 +20,15 @@ import type {
   PdfMeta,
   PdfPage,
   PdfSource,
+  PdfTextRun,
   ProjectFile,
   Rational,
   Timeline,
   Track,
 } from "./types";
-import { PDF_MAX_ANNOTS_PER_PAGE, PDF_MAX_PAGES } from "./types";
+import { PDF_MAX_ANNOTS_PER_PAGE, PDF_MAX_PAGES, PDF_TEXT_MAX_RUNS } from "./types";
+import { isFontId } from "./font-id";
+import { normalizeRuns, type PdfRunBase } from "./pdf-runs";
 import { MAX_CANVAS, MIN_CANVAS, ProjectFileError, registerPdfProjectHooks, sanitizeFps, sanitizeMediaRef, uid } from "./project";
 
 /** Blank page side, points (PDF's own user-space limit is 14400). */
@@ -223,6 +226,54 @@ const INK_KINDS: ReadonlySet<string> = new Set(["pen", "pencil", "marker"]);
 const SHAPE_KINDS: ReadonlySet<string> = new Set(["line", "rect", "ellipse", "arrow"]);
 const ALIGNS: ReadonlySet<string> = new Set(["left", "center", "right"]);
 
+const isHighSurrogate = (c: number): boolean => c >= 0xd800 && c <= 0xdbff;
+const isLowSurrogate = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
+/** True when offset `i` of `text` falls between the halves of a surrogate pair. */
+function splitsSurrogate(text: string, i: number): boolean {
+  return i > 0 && i < text.length && isHighSurrogate(text.charCodeAt(i - 1)) && isLowSurrogate(text.charCodeAt(i));
+}
+
+/**
+ * A text mark's untrusted `runs` (0.9.4) → canonical runs, or undefined (the
+ * key is left out). The box itself is always kept.
+ *  - STRUCTURE (any fault drops the whole array): an array of at most
+ *    PDF_TEXT_MAX_RUNS records; `s` / `e` integers with 0 <= s < e <=
+ *    text.length; sorted and non-overlapping (each `s` >= the previous `e`);
+ *    neither `s` nor `e` splits a surrogate pair
+ *  - FIELDS (a bad value drops that field only): `font` on the whitelist;
+ *    `fontId` passes `isFontId` and is kept only beside a valid `font`; `size`
+ *    4..288; `c` a readable colour (stored lowercase #rrggbb); `bold` /
+ *    `italic` booleans; any other key is not copied
+ *  - a run left with no field is dropped; then `normalizeRuns` (fields equal
+ *    to the box's own style dropped, identical neighbours merged; nothing
+ *    left = undefined)
+ */
+export function sanitizePdfRuns(raw: unknown, text: string, base: PdfRunBase): PdfTextRun[] | undefined {
+  if (!Array.isArray(raw) || raw.length > PDF_TEXT_MAX_RUNS) return undefined;
+  const out: PdfTextRun[] = [];
+  let prevEnd = 0;
+  for (const r of raw as unknown[]) {
+    if (!isRecord(r)) return undefined;
+    const { s, e } = r;
+    if (!isCount(s, 0, text.length) || !isCount(e, 0, text.length) || !(s < e)) return undefined;
+    if (s < prevEnd) return undefined;
+    if (splitsSurrogate(text, s) || splitsSurrogate(text, e)) return undefined;
+    prevEnd = e;
+    const run: PdfTextRun = { s, e };
+    if (isPdfFont(r.font)) {
+      run.font = r.font;
+      if (isFontId(r.fontId)) run.fontId = r.fontId;
+    }
+    if (typeof r.size === "number" && r.size >= PDF_FONT_SIZE_MIN && r.size <= PDF_FONT_SIZE_MAX) run.size = r.size;
+    const c = pdfHexColor(r.c);
+    if (c !== null) run.c = c;
+    if (typeof r.bold === "boolean") run.bold = r.bold;
+    if (typeof r.italic === "boolean") run.italic = r.italic;
+    if (Object.keys(run).length > 2) out.push(run);
+  }
+  return normalizeRuns(text, base, out);
+}
+
 /**
  * One untrusted mark → a FRESH annot carrying only its kind's fields, or null
  * when it cannot be one. Rules (any failure drops the mark):
@@ -234,8 +285,11 @@ const ALIGNS: ReadonlySet<string> = new Set(["left", "center", "right"]);
  *  - highlight: 1..1000 rects of [x, y, w, h]
  *  - text: string <= 20k chars, font on the whitelist, size 4..288, bold and
  *    italic booleans, align left/center/right
+ *  - text: `fontId` kept only when well-shaped (`isFontId`) — a bad one is
+ *    left out and the box kept with its legacy `font`
  *  - text: `bg` / `border` kept only when readable colours — a bad one is
  *    left out and the box kept
+ *  - text: `runs` (0.9.4) per `sanitizePdfRuns` — never drops the box
  *  - text, image, signature: `r` kept only when 90, 180 or 270 (else absent)
  *  - image: `media` names an image in `imageMedia`
  *  - signature: 1..1000 strokes, each decodes
@@ -291,12 +345,20 @@ export function sanitizePdfAnnot(
     if (typeof align !== "string" || !ALIGNS.has(align)) return null;
     const bg = pdfHexColor(raw.bg);
     const border = pdfHexColor(raw.border);
+    // A non-legacy font rides beside `font` (its fallback): kept only when
+    // well-shaped; an ill-shaped one is left out and the mark kept.
+    const fontId = raw.fontId;
+    const style: PdfRunBase = { font, ...(isFontId(fontId) ? { fontId } : {}), size, c, bold, italic };
+    // style runs: only when the key is there, so a 0.9.3 mark comes back
+    // exactly as before (no `runs` key at all)
+    const runs = hasOwn(raw, "runs") ? sanitizePdfRuns(raw.runs, text, style) : undefined;
     return {
       id,
       t,
       ...b,
       text,
       font,
+      ...(isFontId(fontId) ? { fontId } : {}),
       size,
       c,
       bold,
@@ -305,6 +367,7 @@ export function sanitizePdfAnnot(
       ...turn,
       ...(bg === null ? {} : { bg }),
       ...(border === null ? {} : { border }),
+      ...(runs === undefined ? {} : { runs }),
     };
   }
 
@@ -623,7 +686,7 @@ export function checkPdfInvariants(p: ProjectFile): string[] {
       if (clean === null) errors.push(`mark ${String(a.id)}: invalid`);
       else if (a.t === "text" && clean.t === "text") {
         // the optional parts are dropped alone, not with the box
-        const lost = (["bg", "border"] as const).filter((k) => k in a && !(k in clean));
+        const lost = (["bg", "border", "fontId", "runs"] as const).filter((k) => k in a && !(k in clean));
         if (lost.length) errors.push(`mark ${String(a.id)}: invalid ${lost.join(", ")}`);
       }
       if (annotIds.has(a.id)) errors.push(`mark ${a.id}: duplicate id`);

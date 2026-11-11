@@ -7,13 +7,18 @@ import type { EncoderSummary, FfmpegFailure } from "./diagnostics";
 import { sanitizeProject } from "./project";
 import { MEDIA_EXTENSIONS, MEDIA_FILE_EXTENSIONS, OPENABLE_FILE_EXTENSIONS } from "./types";
 import type {
+  FontCatalog,
   FontFamily,
+  FontId,
+  FontImportResult,
+  FontRequest,
   ImageExportFormat,
   MediaInfo,
   MediaRef,
   ProjectFile,
   RecentsIndex,
   Settings,
+  ResolvedFont,
   StepFamily,
 } from "./types";
 
@@ -461,6 +466,36 @@ export const ipc = {
   systemFontPath: (family: FontFamily, bold: boolean, italic: boolean) =>
     call<string | null>("system_font_path", { family, bold, italic }, () => null),
 
+  /* font library (src-tauri/src/fonts). Only for NON-legacy fonts: the six
+   * keep `systemFontPath` and never cross these calls. Fonts are named by id
+   * only; every path here was chosen by the backend. */
+  /** Library + installed families. The backend enumerates on the first call
+   *  and answers from memory after, unless `refresh`. */
+  fontsList: (refresh = false) =>
+    call<FontCatalog>("fonts_list", { refresh }, () => ({ library: [], installed: [] })),
+  /** The face file to use per request, in order; `found: false` = not on this PC. */
+  fontsResolve: (requests: FontRequest[]) =>
+    call<ResolvedFont[]>("fonts_resolve", { requests }, () =>
+      requests.map((r) => ({
+        requested: r.id,
+        found: false,
+        bold: false,
+        italic: false,
+        path: "",
+        lineHeightEm: 0,
+        embed: "none" as const,
+      })),
+    ),
+  /** Copy .ttf/.otf files into the library; one result per path, in order.
+   *  `replace`: overwrite a library face of the same family and style. */
+  fontsImport: (paths: string[], replace = false) =>
+    call<FontImportResult[]>("fonts_import", { paths, replace }),
+  /** Remove a library family (`lib:` id) from the library folder. */
+  fontsRemove: (id: FontId) => call<void>("fonts_remove", { id }),
+  /** Per item, the code points of `text` the resolved face has no glyph for. */
+  fontsMissingGlyphs: (items: (FontRequest & { text: string })[]) =>
+    call<number[][]>("fonts_missing_glyphs", { items }, () => items.map(() => [])),
+
   /* diagnostics — all three are on-demand only; nothing is buffered, probed
    * or written unless the user asked for a report. */
   /** Which encoder ffmpeg resolved per family (cached backend-side). The
@@ -677,6 +712,18 @@ export async function pickPdfFiles(multiple: boolean): Promise<string[]> {
   const result = await open({
     multiple,
     filters: [{ name: "PDF documents", extensions: [...MEDIA_EXTENSIONS.document] }],
+  });
+  if (result === null) return [];
+  return Array.isArray(result) ? result : [result];
+}
+
+/** Font files to import into the library (Settings): .ttf and .otf, many. */
+export async function pickFontFiles(): Promise<string[]> {
+  if (!inTauri) return [];
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const result = await open({
+    multiple: true,
+    filters: [{ name: "Fonts", extensions: ["ttf", "otf"] }],
   });
   if (result === null) return [];
   return Array.isArray(result) ? result : [result];

@@ -145,7 +145,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     errors.push(`unhandledrejection: ${r?.stack ?? String(e.reason)}`);
   });
 
-  // Set once by the 90 s hard timeout and never cleared. From then on the
+  // Set once by the 120 s hard timeout and never cleared. From then on the
   // report says done (the run is over as far as anyone polling it is
   // concerned) and failed, whatever a block still running writes afterwards:
   // a late `write(false)` used to flip `done` back to false, and a late result
@@ -315,10 +315,10 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     results.push({
       name: "overall",
       pass: false,
-      detail: `timed out after 90s${running.length ? ` (still running: ${running.join(", ")})` : ""}`,
+      detail: `timed out after 120s${running.length ? ` (still running: ${running.join(", ")})` : ""}`,
     });
     void finish();
-  }, 90_000);
+  }, 120_000);
 
   try {
     await write(false); // mark the run as started
@@ -366,7 +366,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
         document.querySelector(".editor:not(.imged)") !== null &&
         document.querySelector(".preview__canvas") !== null,
       // Tighter than the first mount: the media are warm in the cache by now,
-      // and the whole run shares one 90 s budget.
+      // and the whole run shares one 120 s budget.
       remount: async () => {
         await mountMainEditor(10_000, 15_000);
         // The first mount's graph was running by the blocks after it (the
@@ -4022,7 +4022,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
           // mountEditor awaits only loadProject and media.init() (a listener
           // registration) before it paints — ensureAll runs in the background —
           // so this should land in well under a second. Kept tight on purpose:
-          // the whole run shares one 90s budget, and a generous wait here would
+          // the whole run shares one 120s budget, and a generous wait here would
           // spend it on the one path where nothing is going to arrive anyway.
           15_000,
           "the editor to re-mount",
@@ -4124,6 +4124,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     await (await import("./autotest-image")).runImageBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-pdf")).runPdfBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-home")).runHomeBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-fonts")).runFontBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await runDamagedVideoBlocks(test, fixturesDir);
   } catch (e) {
     results.push({ name: "setup", pass: false, detail: String(e) });

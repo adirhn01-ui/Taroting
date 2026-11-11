@@ -2551,10 +2551,20 @@ const ADDED_IN_090 = [
 /** The PDF editor's actions and Find, new in 0.9.3. */
 const ADDED_IN_093 = ["pdfHighlight", "pdfText", "pdfWhiteout", "pdfFillForms", "find", "duplicate"] as const;
 
+/** The PDF editor's two panel toggles, new in 0.9.4. */
+const ADDED_IN_094 = ["pdfPages", "pdfProperties"] as const;
+
 /** A shortcut map exactly as a 0.8.1 settings.json stores it. */
 function shortcuts081(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const m: Record<string, unknown> = { ...DEFAULT_SHORTCUTS };
-  for (const a of [...ADDED_IN_090, ...ADDED_IN_093]) delete m[a];
+  for (const a of [...ADDED_IN_090, ...ADDED_IN_093, ...ADDED_IN_094]) delete m[a];
+  return { ...m, ...overrides };
+}
+
+/** A shortcut map exactly as a 0.9.3 settings.json stores it. */
+function shortcuts093(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const m: Record<string, unknown> = { ...DEFAULT_SHORTCUTS };
+  for (const a of ADDED_IN_094) delete m[a];
   return { ...m, ...overrides };
 }
 
@@ -2628,6 +2638,29 @@ describe("sanitizeShortcuts", () => {
       expect(out).toEqual(DEFAULT_SHORTCUTS);
       expect(out).not.toBe(DEFAULT_SHORTCUTS);
     }
+  });
+
+  it("0.9.4's panel toggles: F4 / Shift+F4 from a 0.9.3 map, unless a PDF-screen action of the user's holds the chord", () => {
+    expect(Object.keys(shortcuts093())).toHaveLength(Object.keys(DEFAULT_SHORTCUTS).length - 2);
+    const fresh = sanitizeShortcuts(shortcuts093());
+    expect(fresh.pdfPages).toBe("F4");
+    expect(fresh.pdfProperties).toBe("Shift+F4");
+    // find and duplicate live on the PDF screen: the user's chords stay theirs
+    // and the toggles wait, unbound. Different cases and spacing, one chord.
+    const taken = sanitizeShortcuts(shortcuts093({ find: "f4", duplicate: "shift + F4" }));
+    expect(taken.find).toBe("f4");
+    expect(taken.duplicate).toBe("shift + F4");
+    expect(taken.pdfPages).toBe("");
+    expect(taken.pdfProperties).toBe("");
+    // Only one taken: the other toggle keeps its default.
+    const one = sanitizeShortcuts(shortcuts093({ undo: "Shift+F4" }));
+    expect(one.pdfProperties).toBe("");
+    expect(one.pdfPages).toBe("F4");
+    // split and fullscreen never reach the PDF screen: nothing is taken there.
+    const elsewhere = sanitizeShortcuts(shortcuts093({ split: "F4", fullscreen: "Shift+F4" }));
+    expect(elsewhere.pdfPages).toBe("F4");
+    expect(elsewhere.pdfProperties).toBe("Shift+F4");
+    expect(findConflicts(elsewhere)).toEqual([]);
   });
 
   it("is what sanitizeSettings reads the stored map through", () => {

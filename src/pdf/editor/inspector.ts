@@ -29,18 +29,21 @@
 
 import "../../editor/inspector/inspector.css";
 import "./marks/marks.css";
-import type { FontFamily, PdfAnnot, ProjectFile, ShapeKind } from "../../core/types";
+import type { FontFamily, FontId, PdfAnnot, ProjectFile, ShapeKind } from "../../core/types";
+import { isFontId, isLegacyFont } from "../../core/font-id";
 import { describeError } from "../../core/ipc";
+import { mountFontPicker, onFontsChanged } from "../../fonts";
 import { INK_COLORS_MAX, normalizeHexColor, settingsStore, updateSettings } from "../../core/session";
 import type { ColorPickerHandle } from "../../ui/color-picker";
 import { toast } from "../../ui/toast";
 import { imgIcon } from "../../image/icons";
-import { deletePages, removeAnnots, rotatePages, setTextBox, updateAnnot, type PdfAnnotPatch, type TextBoxLook } from "../model";
-import type { PdfEditorCtx, PdfEditorPart, PdfToolId, PdfToolState } from "../types";
+import { clearRunFields, type PdfResolvedStyle, type PdfRunField, type PdfRunPatch } from "../../core/pdf-runs";
+import { deletePages, pageAnnots, removeAnnots, rotatePages, setTextBox, setTextFont, setTextRuns, updateAnnot, type PdfAnnotPatch, type TextBoxLook } from "../model";
+import type { PdfEditorCtx, PdfEditorPart, PdfTextEditing, PdfToolId, PdfToolState } from "../types";
 import { CLEAR_FORM_LABEL, FILL_FORMS_LABEL, FORMS_TIP, NO_FIELDS_NOTE, clearForm, setFillForms } from "./forms";
 import { sameEdit } from "./marks/env";
-import { FONT_MIN, SIZE_MAX, SIZE_MIN, clampFont, clampSize, frameOf, plainOnly, textHeight, withFrameH } from "./marks/geom";
-import { textLines } from "./marks/render";
+import { FONT_MIN, SIZE_MAX, SIZE_MIN, clampFont, clampSize, frameOf, withFrameH } from "./marks/geom";
+import { textBoxHeight, textFaces } from "./marks/render";
 import { selectedMarks } from "./marks/select";
 
 /* ------------------------------------------------------------------ */
@@ -150,6 +153,7 @@ const FIELD_KINDS: Record<string, (a: PdfAnnot) => boolean> = {
   c: hasColor,
   o: hasOpacity,
   font: (a) => a.t === "text",
+  fontId: (a) => a.t === "text",
   size: (a) => a.t === "text",
   bold: (a) => a.t === "text",
   italic: (a) => a.t === "text",
@@ -166,24 +170,109 @@ export function patchForKind(a: PdfAnnot, patch: Record<string, unknown>): Recor
   return out;
 }
 
+/** A font pick as a panel patch: the legacy field always, and `fontId` —
+ *  `null` for a legacy pick, which takes any `fontId` off (see `withFontPick`). */
+export function fontPatch(v: { legacy: FontFamily; fontId?: FontId }): { font: FontFamily; fontId: FontId | null } {
+  return { font: v.legacy, fontId: isFontId(v.fontId) && !isLegacyFont(v.fontId) ? v.fontId : null };
+}
+
+/** `o` with a patch's `fontId` applied the seam's way: a string sets it,
+ *  `null` deletes the key (a legacy pick stores no `fontId` at all); no
+ *  `fontId` in the patch leaves `o` as it is. Returns a fresh object. */
+export function withFontPick<T extends object>(o: T, patch: Record<string, unknown>): T {
+  if (!("fontId" in patch)) return o;
+  const next = { ...o } as Record<string, unknown>;
+  const v = patch.fontId;
+  if (typeof v === "string" && isFontId(v)) next.fontId = v;
+  else delete next.fontId;
+  return next as T;
+}
+
+// The face rule lives in marks/render.ts so the text editor's Ctrl+B / Ctrl+I
+// share it without importing this panel.
+export { textFaces };
+
+type TextMark = Extract<PdfAnnot, { t: "text" }>;
+
+const RUN_FIELDS: readonly PdfRunField[] = ["font", "size", "c", "bold", "italic"];
+
+/** The per-run properties a panel patch writes ("font" = the font pair). */
+export function runFieldsOf(patch: Record<string, unknown>): PdfRunField[] {
+  return RUN_FIELDS.filter((k) => k in patch);
+}
+
+/** A panel patch as a patch for the selected part of a text box's text, or
+ *  null when it carries nothing or anything a run cannot take (alignment, a
+ *  box look). A font pick keeps its pair: a legacy pick (`fontId: null`) is
+ *  `{ font }`, a library pick `{ font, fontId }`. */
+export function runPatchOf(patch: Record<string, unknown>): PdfRunPatch | null {
+  const out: PdfRunPatch = {};
+  let any = false;
+  for (const k of Object.keys(patch)) {
+    const v = patch[k];
+    if (k === "font" && typeof v === "string") out.font = v as FontFamily;
+    else if (k === "fontId" && (v === null || v === undefined)) continue;
+    else if (k === "fontId" && typeof v === "string" && isFontId(v)) out.fontId = v;
+    else if (k === "size" && typeof v === "number") out.size = v;
+    else if (k === "c" && typeof v === "string") out.c = v;
+    else if ((k === "bold" || k === "italic") && typeof v === "boolean") out[k] = v;
+    else return null;
+    any = true;
+  }
+  if (!any || (out.fontId !== undefined && out.font === undefined)) return null;
+  return out;
+}
+
+/** `next` (a text mark with a whole-box write applied to its base) with the
+ *  written per-run properties taken off its runs; a mark without runs, or a
+ *  write of none of them, comes back as it is. */
+function withRunsCleared(next: TextMark, fields: readonly PdfRunField[]): TextMark {
+  if (!next.runs || fields.length === 0) return next;
+  const runs = clearRunFields(next, next.runs, fields);
+  const out = { ...next };
+  if (runs) out.runs = runs;
+  else delete out.runs;
+  return out;
+}
+
 /** A patch for one mark: only the fields its kind takes; a text mark's box
- *  grows (along its upright frame's down direction) to keep every line. */
+ *  grows (along its upright frame's down direction) to keep every line. The
+ *  height is measured with the runs as the whole-box write leaves them. */
 export function patchFor(a: PdfAnnot, patch: Record<string, unknown>): PdfAnnotPatch {
   const own = patchForKind(a, patch);
+  // a legacy pick's `fontId: null` means "take it off": never written as a value
+  if (own.fontId === null) delete own.fontId;
   if (a.t !== "text") return own as PdfAnnotPatch;
-  const next = { ...a, ...own } as Extract<PdfAnnot, { t: "text" }>;
-  const H = Math.max(frameOf(next).H, textHeight(textLines(next).length, next.size));
+  const next = withRunsCleared({ ...a, ...own } as TextMark, runFieldsOf(own));
+  const H = Math.max(frameOf(next).H, textBoxHeight(next));
   if (H === frameOf(a).H) return own as PdfAnnotPatch;
   return { ...own, ...withFrameH(a, H) } as PdfAnnotPatch;
 }
 
 /** `p` with `patch` applied to every selected mark, each taking only the
- *  fields its kind has (see FIELD_KINDS). */
+ *  fields its kind has (see FIELD_KINDS). A font pick (`fontPatch`: `font`
+ *  with a `fontId` key) on a text mark goes through `setTextFont`, which can
+ *  add, replace or take off `fontId`; the rest of the patch (and the box
+ *  growing for the new font) follows on the mark as it then stands. */
 export function patchSelected(p: ProjectFile, sel: readonly { key: string; id: string }[], patch: Record<string, unknown>): ProjectFile {
   let next = p;
+  const pick = typeof patch.font === "string" && "fontId" in patch;
   for (const m of selectedMarks(p, sel)) {
-    const own = patchFor(m.a, patch);
-    if (Object.keys(own).length) next = updateAnnot(next, m.key, m.a.id, own);
+    let a = m.a;
+    if (pick && a.t === "text") {
+      const fontId = typeof patch.fontId === "string" ? patch.fontId : undefined;
+      next = setTextFont(next, m.key, a.id, fontId === undefined ? { legacy: patch.font as FontFamily } : { legacy: patch.font as FontFamily, fontId });
+      a = pageAnnots(next, m.key).find((x) => x.id === m.a.id) ?? a;
+    }
+    const own = patchFor(a, patch);
+    if (Object.keys(own).length) next = updateAnnot(next, m.key, a.id, own);
+    // whole-box rule (0.9.4 runs): a per-run property written to the box's
+    // base comes off every run, in the same project (so the same step)
+    if (a.t === "text" && a.runs) {
+      const fields = runFieldsOf(patchForKind(a, patch));
+      const cur = pageAnnots(next, m.key).find((x) => x.id === a.id);
+      if (fields.length && cur?.t === "text" && cur.runs) next = setTextRuns(next, m.key, a.id, clearRunFields(cur, cur.runs, fields));
+    }
   }
   return next;
 }
@@ -376,7 +465,9 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     const e = editing();
     const d = e?.draft;
     if (!e || !d) return;
-    const next: Record<string, unknown> = { ...d, ...patchFor(d, patch) };
+    const own = patchForKind(d, patch);
+    // whole-box rule: the written per-run properties come off the draft's runs
+    const next = withRunsCleared(withFontPick({ ...d, ...patchFor(d, patch) } as TextMark, own), runFieldsOf(own)) as unknown as Record<string, unknown>;
     for (const k of ["bg", "border"] as const) {
       if (!look || !(k in look)) continue;
       const v = look[k];
@@ -394,6 +485,7 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
         if (n[k] !== v) n = { ...n, [k]: v };
       };
       if (typeof patch.font === "string" && FONTS.includes(patch.font as FontFamily)) set("font", patch.font as FontFamily);
+      if ("fontId" in patch && n.fontId !== (isFontId(patch.fontId) ? patch.fontId : undefined)) n = withFontPick(n, patch);
       if (typeof patch.size === "number" && n.sizes.text !== patch.size) n = { ...n, sizes: { ...n.sizes, text: patch.size } };
       if (typeof patch.c === "string" && n.colors.text !== patch.c) n = { ...n, colors: { ...n.colors, text: patch.c } };
       if (look && "bg" in look) set("textBg", look.bg ?? null);
@@ -401,20 +493,60 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
       return n;
     });
   };
+  /** the open box while part of its text is selected: the per-run controls
+   *  (font, size, colour, Bold, Italic) style that part */
+  const ranged = (): PdfTextEditing | null => {
+    const e = editing();
+    return e && e.range ? e : null;
+  };
+  /** what the per-run controls show: the selected part's summary (first
+   *  character's font, size, colour; Bold / Italic only if all of it), or
+   *  null = the box's own style */
+  const rangeStyle = (): PdfResolvedStyle | null => ranged()?.styleOf() ?? null;
+  /** a per-run write while part of the text is selected goes to the editor
+   *  (its own undo step; it lands with the text when the box closes), never
+   *  to the project; true when it went there */
+  const toRange = (patch: Record<string, unknown>, look: Look): boolean => {
+    const e = ranged();
+    if (!e || look) return false;
+    const rp = runPatchOf(patch);
+    if (!rp) return false;
+    e.applyRange(rp);
+    return true;
+  };
   /** a live (mid-gesture) write */
+  /** a whole-box write of per-run properties while the box being written is
+   *  open for typing: the editor takes them off its live (uncommitted) runs
+   *  too, as its own undo step, BEFORE the write lands (D1) */
+  const clearOpen = (patch: Record<string, unknown>): void => {
+    const e = editing();
+    if (!e) return;
+    if (!e.draft && !sel().some((m) => m.key === e.key && m.id === e.id)) return;
+    const fields = runFieldsOf(patch);
+    if (fields.length) e.clearFields(fields);
+  };
   const liveWrite = (g: Gesture, patch: Record<string, unknown>, look?: TextBoxLook): void => {
+    if (toRange(patch, look)) return;
+    clearOpen(patch);
     if (draftOf()) setDraft(patch, look);
     else g.write((base) => session.replace(applyTo(base, sel(), patch, look)));
   };
-  /** the end of a gesture: one step (none for a draft), the tool follows,
-   *  the caret goes back to the text */
+  /** the end of a gesture: one step (none for a draft), the tool follows
+   *  (not for a range: its style is not the box's), the caret goes back to
+   *  the text */
   const endWrite = (g: Gesture | null, patch: Record<string, unknown> | null, look?: TextBoxLook): void => {
     g?.commit();
-    if (patch) mirrorTool(patch, look);
+    if (patch && !(ranged() && !look && runPatchOf(patch))) mirrorTool(patch, look);
     editing()?.refocus();
   };
   /** one finished edit */
   const finishWrite = (patch: Record<string, unknown>, look?: TextBoxLook): void => {
+    if (toRange(patch, look)) {
+      editing()?.refocus();
+      sync();
+      return;
+    }
+    clearOpen(patch);
     if (draftOf()) setDraft(patch, look);
     else {
       const s = sel();
@@ -632,22 +764,26 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     return b;
   }
 
-  function fontSelect(read: () => FontFamily, apply: (f: FontFamily) => void): HTMLSelectElement {
-    const s = el("select", "select select--sm");
-    s.setAttribute("aria-label", "Font");
-    for (const f of FONTS) {
-      const o = el("option", undefined, f);
-      o.value = f;
-      s.appendChild(o);
-    }
-    watch(read, (v) => {
-      s.value = v;
+  /** The shared font picker (src/fonts): `read` is the style shown, `apply`
+   *  gets a pick as a panel patch (`fontPatch`). */
+  function fontPicker(read: () => { font: FontFamily; fontId?: FontId }, apply: (patch: ReturnType<typeof fontPatch>) => void): HTMLElement {
+    const host = el("div", "pdfmk-font");
+    const picker = mountFontPicker(host, {
+      value: () => {
+        const v = read();
+        return isFontId(v.fontId) ? { legacy: v.font, fontId: v.fontId } : { legacy: v.font };
+      },
+      onPick: (v) => apply(fontPatch(v)),
     });
-    on(s, "change", () => {
-      const v = s.value as FontFamily;
-      if (FONTS.includes(v)) apply(v);
-    });
-    return s;
+    cleanup.push(() => picker.dispose());
+    watch(
+      () => {
+        const v = read();
+        return `${v.font}|${v.fontId ?? ""}`;
+      },
+      () => picker.refresh(),
+    );
+    return host;
   }
 
   /* ---------- panels ---------- */
@@ -679,7 +815,7 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
           colorRow({
             label: "Mark color",
             fallback: "#000000",
-            read: () => first((a) => ("c" in a ? a.c : undefined), "#000000"),
+            read: () => rangeStyle()?.c ?? first((a) => ("c" in a ? a.c : undefined), "#000000"),
             commit: (hex) => commitMarks({ c: normalizeHexColor(hex, "#000000") }),
             preview: (hex) => {
               last = { c: normalizeHexColor(hex, "#000000") };
@@ -724,25 +860,40 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     if (list.some((a) => a.t === "text")) {
       const t = section("Text");
       const text = (): Extract<PdfAnnot, { t: "text" }> | undefined => marks().find((a): a is Extract<PdfAnnot, { t: "text" }> => a.t === "text");
-      t.appendChild(field("Font", fontSelect(() => text()?.font ?? "Segoe UI", (f) => commitMarks({ font: f }))));
+      t.appendChild(
+        field(
+          "Font",
+          fontPicker(
+            () => rangeStyle() ?? text() ?? { font: "Segoe UI" },
+            (patch) => commitMarks(patch),
+          ),
+        ),
+      );
       t.appendChild(
         field(
           "Size",
-          markSlider("Font size in points", FONT_MIN, 96, 0.5, "pt", () => text()?.size ?? 12, (v) => ({ size: clampFont(v) })),
+          markSlider("Font size in points", FONT_MIN, 96, 0.5, "pt", () => rangeStyle()?.size ?? text()?.size ?? 12, (v) => ({ size: clampFont(v) })),
         ),
       );
       const styleRow = el("div", "insp-row");
-      // a regular-only font (Impact) exports plain: no Bold / Italic for it
-      const plain = (): boolean => plainOnly(text()?.font ?? "");
-      const bold = toggleBtn("Bold", "<b>B</b>", () => !plain() && (text()?.bold ?? false), () => {
-        if (!plain()) commitMarks({ bold: !(text()?.bold ?? false) });
+      // a face the font does not have (Impact's bold and italic; a library
+      // family's missing faces) exports plain: that toggle is off and disabled
+      // (0.9.4 runs) with part of the text selected, the font, size, colour
+      // and Bold / Italic show and write THAT part (`shown`); else the box's
+      const shown = (): { font: FontFamily; fontId?: FontId; bold: boolean; italic: boolean } | undefined => rangeStyle() ?? text();
+      const canBold = (): boolean => textFaces(shown()).bold;
+      const canItalic = (): boolean => textFaces(shown()).italic;
+      const bold = toggleBtn("Bold", "<b>B</b>", () => canBold() && (shown()?.bold ?? false), () => {
+        if (canBold()) commitMarks({ bold: !(shown()?.bold ?? false) });
       });
-      const italic = toggleBtn("Italic", "<i>I</i>", () => !plain() && (text()?.italic ?? false), () => {
-        if (!plain()) commitMarks({ italic: !(text()?.italic ?? false) });
+      const italic = toggleBtn("Italic", "<i>I</i>", () => canItalic() && (shown()?.italic ?? false), () => {
+        if (canItalic()) commitMarks({ italic: !(shown()?.italic ?? false) });
       });
-      watch(plain, (v) => {
-        bold.disabled = v;
-        italic.disabled = v;
+      watch(canBold, (v) => {
+        bold.disabled = !v;
+      });
+      watch(canItalic, (v) => {
+        italic.disabled = !v;
       });
       styleRow.append(bold, italic);
       t.appendChild(styleRow);
@@ -960,7 +1111,18 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
       );
     }
     if (sk === "text") {
-      s.appendChild(field("Font", fontSelect(() => ctx.tools.get().font, (f) => ctx.tools.update((st) => ({ ...st, font: f })))));
+      s.appendChild(
+        field(
+          "Font",
+          fontPicker(
+            () => ctx.tools.get(),
+            (patch) =>
+              ctx.tools.update((st) =>
+                st.font === patch.font && st.fontId === (patch.fontId ?? undefined) ? st : withFontPick({ ...st, font: patch.font }, patch),
+              ),
+          ),
+        ),
+      );
       s.appendChild(
         field(
           "Size",
@@ -1077,6 +1239,8 @@ export const inspectorPart: PdfEditorPart = (ctx: PdfEditorCtx, hosts) => {
     ctx.mode.subscribe(sync),
     ctx.hasForms.subscribe(sync),
     ctx.textEdit.subscribe(sync),
+    // a font's faces arriving (or a library change) can enable Bold / Italic
+    onFontsChanged(sync),
   ];
   sync();
 

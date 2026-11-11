@@ -80,6 +80,11 @@
   cursor: text;
   caret-color: currentColor;
 }
+/* the text editor's selection, kept while focus is in the panel (painted by
+   the CSS Custom Highlight API: no DOM change; the same tint as ::selection) */
+::highlight(pdfmk-kept) {
+  background-color: var(--accent-dim);
+}
 
 /* ---------- selection chrome ---------- */
 .pdfmk-sel {

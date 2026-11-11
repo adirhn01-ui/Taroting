@@ -1414,7 +1414,9 @@ export function mountInspector(
     const body = el("div", "insp-body");
     // Generated media (solid / text) get their own editor ABOVE the transform
     // section — transforms still apply to generated clips.
-    const genSection = buildGeneratedSection(ctx, t);
+    // Its cleanup (the font picker) runs with
+    // the build's: on the next rebuild and on dispose.
+    const genSection = buildGeneratedSection(ctx, t, { onCleanup: (fn) => cleanup.push(fn), closed: () => disposed });
     if (genSection) body.appendChild(genSection);
 
     // Video section only for video-track clips

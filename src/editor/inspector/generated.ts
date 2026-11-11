@@ -7,9 +7,18 @@
 // ../media/generators.ts).
 
 import { updateMedia } from "../../core/project";
-import type { Clip, FontFamily, Generator, MediaRef } from "../../core/types";
-import { TEXT_FONTS, measureText } from "../media/generators";
+import type { Clip, FontFamily, FontId, Generator, MediaRef } from "../../core/types";
+import { mountFontPicker } from "../../fonts";
+import { measureTextWhenReady, styleAvailability, withFont } from "../media/generators";
 import type { InspectorCtx } from "./inspector";
+
+/** The newest font-awaiting commit per media id: an older one that finishes
+ *  its font load later must not overwrite a newer edit. Module-level because a
+ *  commit rebuilds the section, so the newer edit usually comes from another
+ *  build of it. An entry lives only while its font loads (at most the
+ *  runtime's load bound). */
+const pendingCommit = new Map<string, number>();
+let commitSeq = 0;
 
 const MIN_SIZE = 8;
 const MAX_SIZE = 512;
@@ -58,7 +67,17 @@ function field(label: string, control: HTMLElement): HTMLElement {
 export function buildGeneratedSection(
   ctx: Pick<InspectorCtx, "session" | "refresh">,
   target: { clip: Clip; media: MediaRef },
-  opts?: { sharedNote?: boolean },
+  opts: {
+    sharedNote?: boolean;
+    /** Registers a function the inspector runs when it replaces this section
+     *  or is disposed: it disposes the font picker. */
+    onCleanup: (fn: () => void) => void;
+    /** True once the editor itself has closed (the inspector's dispose). A
+     *  commit still waiting for its font is then dropped; on a rebuild or a
+     *  section replacement it still lands, since it names its media id and
+     *  the session outlives the section. */
+    closed: () => boolean;
+  },
 ): HTMLElement | null {
   const gen = target.media.generator;
   if (!gen || gen.type === "drawing") return null;
@@ -75,10 +94,10 @@ export function buildGeneratedSection(
   if (gen.type === "solid") {
     buildSolid(s, gen, target.media, commitMedia);
   } else {
-    buildText(s, gen, commitMedia);
+    opts.onCleanup(buildText(s, gen, mediaId, commitMedia, opts.closed));
   }
 
-  if (opts?.sharedNote !== false) {
+  if (opts.sharedNote !== false) {
     s.appendChild(
       el(
         "div",
@@ -140,29 +159,49 @@ function buildSolid(
 function buildText(
   s: HTMLElement,
   gen: Extract<Generator, { type: "text" }>,
+  mediaKey: string,
   commitMedia: (patch: Partial<MediaRef>) => void,
-): void {
+  closed: () => boolean,
+): () => void {
   // Commit the generator the user asked for, alongside its natural box. The
   // dims are always a true measurement of the generator stored beside them —
   // that identity is what keeps the preview and the export describing the same
   // frame — and no size is too big to commit.
+  //
+  // A non-legacy font that is not ready yet is loaded BEFORE measuring: canvas
+  // would silently measure the fallback font and that wrong box would be
+  // saved. The six (and a ready font) commit at once, as they always have.
   const commitGen = (g: Extract<Generator, { type: "text" }>): void => {
-    const box = measureText(g);
-    commitMedia({ generator: g, width: box.width, height: box.height });
+    const box = measureTextWhenReady(g);
+    if (!(box instanceof Promise)) {
+      // Anything still awaiting a font for this element is older: drop it.
+      pendingCommit.delete(mediaKey);
+      commitMedia({ generator: box.gen, width: box.width, height: box.height });
+      return;
+    }
+    const seq = ++commitSeq;
+    pendingCommit.set(mediaKey, seq);
+    void box.then((b) => {
+      // A newer edit of the same element went in meanwhile: it wins.
+      if (pendingCommit.get(mediaKey) !== seq) return;
+      pendingCommit.delete(mediaKey);
+      // The editor closed meanwhile: its session may be gone, so the commit
+      // lands nowhere. (A mere rebuild or replacement lets it land: what was
+      // typed or picked while the font loaded is not thrown away.)
+      if (closed()) return;
+      commitMedia({ generator: b.gen, width: b.width, height: b.height });
+    });
   };
 
   const textarea = el("textarea", "input gen-textarea");
   textarea.rows = 3;
   textarea.value = gen.text;
 
-  const fontSel = el("select", "select select--sm");
-  for (const f of TEXT_FONTS) {
-    const o = el("option");
-    o.value = f;
-    o.textContent = f;
-    if (f === gen.fontFamily) o.selected = true;
-    fontSel.appendChild(o);
-  }
+  // Font: the shared picker, holding the fields a pick stores (a legacy font
+  // has no fontId at all).
+  let font: { legacy: FontFamily; fontId?: FontId } =
+    gen.fontId === undefined ? { legacy: gen.fontFamily } : { legacy: gen.fontFamily, fontId: gen.fontId };
+  const fontHost = el("div");
 
   const sizeInput = el("input", "input insp-num");
   sizeInput.type = "number";
@@ -182,26 +221,30 @@ function buildText(
   italicSwitch.type = "checkbox";
   italicSwitch.checked = gen.italic;
 
+  // The Impact rule, generalized: a switch for a face the font does not have
+  // is off and disabled (the six keep exactly the old rule).
   const syncImpact = (): void => {
-    const impact = fontSel.value === "Impact";
-    if (impact) {
-      boldSwitch.checked = false;
-      italicSwitch.checked = false;
-    }
-    boldSwitch.disabled = impact;
-    italicSwitch.disabled = impact;
+    const can = styleAvailability(font.legacy, font.fontId);
+    if (!can.bold) boldSwitch.checked = false;
+    if (!can.italic) italicSwitch.checked = false;
+    boldSwitch.disabled = !can.bold;
+    italicSwitch.disabled = !can.italic;
   };
   syncImpact();
 
-  const readGen = (): Extract<Generator, { type: "text" }> => ({
-    type: "text",
-    text: textarea.value,
-    fontFamily: fontSel.value as FontFamily,
-    sizePx: clamp(Math.round(numberOr(sizeInput, gen.sizePx)), MIN_SIZE, MAX_SIZE),
-    color: color.value,
-    bold: boldSwitch.checked,
-    italic: italicSwitch.checked,
-  });
+  const readGen = (): Extract<Generator, { type: "text" }> =>
+    withFont(
+      {
+        type: "text",
+        text: textarea.value,
+        fontFamily: font.legacy,
+        sizePx: clamp(Math.round(numberOr(sizeInput, gen.sizePx)), MIN_SIZE, MAX_SIZE),
+        color: color.value,
+        bold: boldSwitch.checked,
+        italic: italicSwitch.checked,
+      },
+      font,
+    );
 
   const commit = (): void => commitGen(readGen());
 
@@ -210,13 +253,17 @@ function buildText(
   color.addEventListener("change", commit);
   boldSwitch.addEventListener("change", commit);
   italicSwitch.addEventListener("change", commit);
-  fontSel.addEventListener("change", () => {
-    syncImpact();
-    commit();
+  const picker = mountFontPicker(fontHost, {
+    value: () => font,
+    onPick: (v) => {
+      font = v;
+      syncImpact();
+      commit();
+    },
   });
 
   s.appendChild(field("Text", textarea));
-  s.appendChild(field("Font", fontSel));
+  s.appendChild(field("Font", fontHost));
   const row = el("div", "insp-row");
   row.appendChild(field("Size (px)", sizeInput));
   row.appendChild(field("Color", color));
@@ -225,4 +272,8 @@ function buildText(
   toggles.appendChild(field("Bold", boldSwitch));
   toggles.appendChild(field("Italic", italicSwitch));
   s.appendChild(toggles);
+
+  // An open list held blockShortcuts: dispose releases it. A commit still
+  // waiting for its font is NOT dropped here (see commitGen's `closed`).
+  return picker.dispose;
 }
