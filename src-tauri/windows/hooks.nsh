@@ -30,6 +30,15 @@
 ; "Do not uninstall", same-version "Add/Reinstall", /UPDATE and silent /S all
 ; install OVER the old keys (only the GUI default radio uninstalls first).
 
+; The publisher name people SEE: Windows' installed-apps list (the Uninstall
+; key's Publisher value, rewritten in POSTINSTALL after the template wrote
+; ${MANUFACTURER}) and the installer file's Details tab (CompanyName, which the
+; template leaves unset). bundle.publisher itself must stay "Taroting": it is
+; ${MANUFACTURER}, which names the registry home Software\Taroting that
+; upgrades rely on (media-extensions.test.ts pins both).
+!define TRT_PUBLISHER_SHOWN "adirhn"
+VIAddVersionKey "CompanyName" "${TRT_PUBLISHER_SHOWN}"
+
 ; A Taroting media (or document) ProgID: its Explorer "Type" text, the exe
 ; icon and a quoted open command. No verb label: Windows localises "Open" itself. Install only.
 !macro TRT_PROGID PROGID DESC
@@ -210,6 +219,10 @@
   !insertmacro TRT_CAPABILITY "ogg" "Taroting.Audio"
   !insertmacro TRT_CAPABILITY "pdf" "Taroting.Document"
   WriteRegStr SHCTX "Software\RegisteredApplications" "Taroting" "Software\Taroting\Capabilities"
+
+  ; The shown publisher (header). The template wrote ${MANUFACTURER} just before
+  ; this hook runs; nothing reads this value back.
+  WriteRegStr SHCTX "${UNINSTKEY}" "Publisher" "${TRT_PUBLISHER_SHOWN}"
 
   ; Tell Explorer associations changed (the template defines this macro but
   ; never inserts it). SHCNF_FLUSH is synchronous; a hung shell extension is

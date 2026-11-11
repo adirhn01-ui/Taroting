@@ -151,6 +151,11 @@ const CAPABILITY_VALUES: readonly string[] = [
 ];
 const REGISTERED_APP_WRITE =
   `WriteRegStr SHCTX "Software\\RegisteredApplications" "Taroting" "Software\\Taroting\\Capabilities"`;
+/** The publisher name people see (the installed-apps list, the installer
+ *  file's Details tab). Not bundle.publisher, which must stay "Taroting". */
+const PUBLISHER_SHOWN_DEFINE = `!define TRT_PUBLISHER_SHOWN "adirhn"`;
+const PUBLISHER_SHOWN_COMPANY = 'VIAddVersionKey "CompanyName" "${TRT_PUBLISHER_SHOWN}"';
+const PUBLISHER_SHOWN_WRITE = 'WriteRegStr SHCTX "${UNINSTKEY}" "Publisher" "${TRT_PUBLISHER_SHOWN}"';
 const REGISTERED_APP_DELETE = `DeleteRegValue SHCTX "Software\\RegisteredApplications" "Taroting"`;
 const CAPABILITIES_DELETE = `DeleteRegKey SHCTX "Software\\Taroting\\Capabilities"`;
 const MANUKEY_IFEMPTY_DELETE = `DeleteRegKey /ifempty SHCTX "Software\\Taroting"`;
@@ -335,6 +340,9 @@ function checkInstallHook(nshText: string, table: Readonly<Record<MediaFamily, r
     ...once(body, LEGACY_PROGID_DELETE, where),
     ...CAPABILITY_VALUES.flatMap((l) => once(body, l, where)),
     ...once(body, REGISTERED_APP_WRITE, where),
+    ...once(body, PUBLISHER_SHOWN_WRITE, where),
+    ...once(lines, PUBLISHER_SHOWN_DEFINE, "hooks.nsh"),
+    ...once(lines, PUBLISHER_SHOWN_COMPANY, "hooks.nsh"),
   ];
   const owner = body.findIndex((l) => /^!insertmacro TRT_LEGACY_OWNER$/i.test(l));
   const firstMigrate = body.findIndex((l) => /^!insertmacro TRT_MIGRATE_LEGACY /i.test(l));
@@ -815,6 +823,15 @@ describe("the installer never claims a media default", () => {
       ]],
       ["the migration run before the owner check", swap("!insertmacro TRT_LEGACY_OWNER\n", "", swap('!insertmacro TRT_MIGRATE_LEGACY "aac"', '!insertmacro TRT_MIGRATE_LEGACY "aac"\n  !insertmacro TRT_LEGACY_OWNER')), [
         "TRT_LEGACY_OWNER must run before the first TRT_MIGRATE_LEGACY",
+      ]],
+      ["the shown publisher not written over the template's", drop(PUBLISHER_SHOWN_WRITE), [
+        `NSIS_HOOK_POSTINSTALL: 0 lines of ${PUBLISHER_SHOWN_WRITE}, expected exactly 1`,
+      ]],
+      ["the shown publisher renamed", swap('!define TRT_PUBLISHER_SHOWN "adirhn"', '!define TRT_PUBLISHER_SHOWN "Someone"'), [
+        `hooks.nsh: 0 lines of ${PUBLISHER_SHOWN_DEFINE}, expected exactly 1`,
+      ]],
+      ["the installer file left without a company name", drop(PUBLISHER_SHOWN_COMPANY), [
+        `hooks.nsh: 0 lines of ${PUBLISHER_SHOWN_COMPANY}, expected exactly 1`,
       ]],
       ["the legacy ProgID left behind", drop(LEGACY_PROGID_DELETE), [
         `NSIS_HOOK_POSTINSTALL: 0 lines of ${LEGACY_PROGID_DELETE}, expected exactly 1`,
