@@ -770,6 +770,261 @@ describe("seeking", () => {
     expect(m.playbackFailed).not.toHaveBeenCalled();
   });
 
+  /* The owner's 0.9.4 report: a fast drag while playing, and the element
+   * reported the END (time = duration, paused) on the clip's first frame;
+   * from then on no seek took. Three parts, each with its own test. */
+
+  /** The engine puts the element at its end: time = duration, ended, paused. */
+  function engineEnds(video: ReturnType<typeof mounted>["video"]): void {
+    (video as unknown as { currentTime: number }).currentTime = 61;
+    video.ended = true;
+    video.paused = true;
+    video.seeking = false;
+  }
+
+  it("reloads after a read error where the user last was, not at an end nobody asked for", () => {
+    const { video } = mounted();
+    m.keys.get("seekFwd")!({ repeat: false }); // asks 5
+    video.fire("seeked"); // lands: 5 is the user's position
+    engineEnds(video); // no `ended` event yet: only the read error follows
+    video.log.length = 0;
+    video.error = { code: 2 };
+    video.fire("error");
+    expect(video.log).toEqual([`src=${SRC}`, "t=5"]);
+  });
+
+  it("never opens a reload at the end: it loads from the start and seeks there after its metadata", () => {
+    const { video } = mounted();
+    m.keys.get("goEnd")!({ repeat: false }); // the user asks for the end
+    video.fire("seeked");
+    engineEnds(video);
+    video.log.length = 0;
+    video.error = { code: 2 };
+    video.fire("error");
+    // No start position given up front ...
+    expect(video.log).toEqual([`src=${SRC}`]);
+    // ... the fresh load reads 0, and gets its seek once it knows its length.
+    (video as unknown as { currentTime: number }).currentTime = 0;
+    video.ended = false;
+    video.duration = 61;
+    video.log.length = 0;
+    video.fire("loadedmetadata");
+    expect(video.log).toEqual(["t=61"]);
+  });
+
+  it("takes an end the user did not cause in a drag for a failed seek: reloaded where the hand is, still playing", () => {
+    const { root, video } = mounted();
+    const play = vi.fn(() => Promise.resolve());
+    video.play = play;
+    video.paused = false;
+    video.fire("play");
+    const bar = root.querySelector("#vw-seek");
+    bar.getBoundingClientRect = () => ({ left: 100, top: 0, right: 710, bottom: 10, width: 610, height: 10 });
+    const ptr = (sec: number) => ({ button: 0, pointerId: 1, clientX: 100 + (sec / 61) * 610, preventDefault: () => {} });
+    bar.fire("pointerdown", ptr(9));
+    video.seeking = true;
+    for (const sec of [31, 51, 54]) bar.fire("pointermove", ptr(sec));
+    engineEnds(video);
+    video.log.length = 0;
+    play.mockClear();
+    video.fire("pause");
+    video.fire("ended");
+    expect(video.log).toEqual([`src=${SRC}`, "t=54"]);
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(m.playbackFailed).not.toHaveBeenCalled();
+  });
+
+  it("lets an end stand that the user went to, or that playback ran into", () => {
+    const { video } = mounted();
+    m.keys.get("goEnd")!({ repeat: false });
+    video.fire("seeked");
+    engineEnds(video);
+    video.log.length = 0;
+    video.fire("ended");
+    expect(video.log).toEqual([]);
+    // Playback running out: the last timeupdate before the end was 60.8 s.
+    m.keys.get("goStart")!({ repeat: false });
+    video.ended = false;
+    video.fire("seeked");
+    (video as unknown as { currentTime: number }).currentTime = 60.8;
+    video.fire("timeupdate");
+    engineEnds(video);
+    video.log.length = 0;
+    video.fire("ended");
+    expect(video.log).toEqual([]);
+  });
+
+  it("recovers a spurious end twice in a row at most, then lets it stand", () => {
+    const { video } = mounted();
+    const reloads = (): number => video.log.filter((e) => e.startsWith("src=")).length;
+    m.keys.get("seekFwd")!({ repeat: false });
+    video.fire("seeked");
+    video.log.length = 0;
+    for (let i = 0; i < 3; i++) {
+      engineEnds(video);
+      video.fire("ended");
+      video.duration = 61;
+      video.fire("loadedmetadata"); // each reload reads again
+    }
+    expect(reloads()).toBe(2);
+  });
+
+  /* Round 3: a reread's recovery is complete. Run 6 on the owner's file: an
+   * engine error mid-sweep while playing, the reread restored a stale 12.19 s
+   * (the user was asking 49.74) and stayed paused. */
+
+  /** The reread's metadata, then its first frame where it starts. */
+  function rereadShows(video: ReturnType<typeof mounted>["video"]): void {
+    video.duration = 61;
+    video.readyState = 1;
+    video.fire("loadedmetadata");
+    video.readyState = 2;
+    video.fire("canplay");
+  }
+
+  it("keeps a position asked while a reread loads, and the reload goes to the latest one", () => {
+    const { root, video, knob } = mounted();
+    const bar = root.querySelector("#vw-seek");
+    bar.getBoundingClientRect = () => ({ left: 100, top: 0, right: 710, bottom: 10, width: 610, height: 10 });
+    const ptr = (sec: number) => ({ button: 0, pointerId: 1, clientX: 100 + (sec / 61) * 610, preventDefault: () => {} });
+    video.error = { code: 2 };
+    video.fire("error"); // reread at 0; no length until its metadata
+    // The drag goes on, and lets go, while the reload loads.
+    bar.fire("pointerdown", ptr(20));
+    bar.fire("pointermove", ptr(41));
+    bar.fire("pointermove", ptr(30));
+    bar.fire("pointerup", ptr(30));
+    expect(knob.styles.get("left")).toBe(at(30));
+    video.log.length = 0;
+    video.duration = 61;
+    video.readyState = 1;
+    video.fire("loadedmetadata");
+    expect(video.log.map((e) => Math.round(Number(e.slice(2)) * 100) / 100)).toEqual([30]);
+    expect(knob.styles.get("left")).toBe(at(30));
+  });
+
+  it("resumes playing after a reread when the user was playing, though the error paused the element", () => {
+    const { video } = mounted();
+    const play = vi.fn(() => Promise.resolve());
+    video.play = play;
+    video.paused = false;
+    video.fire("play");
+    // Chromium stops the element with the error.
+    video.error = { code: 2 };
+    video.paused = true;
+    video.fire("pause");
+    play.mockClear();
+    video.fire("error");
+    expect(video.log[0]).toBe(`src=${SRC}`);
+    expect(play).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays paused after a reread when the user had paused", () => {
+    const { video } = mounted();
+    const play = vi.fn(() => Promise.resolve());
+    video.play = play;
+    video.paused = false;
+    video.fire("play");
+    video.paused = true;
+    video.fire("pause"); // the user's
+    video.error = { code: 2 };
+    video.fire("error");
+    expect(play).not.toHaveBeenCalled();
+  });
+
+  it("recovers every seek-burst read error whose reread shows its frame: five in a row, none reaches the loader", () => {
+    const { video } = mounted();
+    for (let i = 0; i < 5; i++) {
+      (video as unknown as { currentTime: number }).currentTime = 5 + 10 * i;
+      // The user's seek that provokes it (a burst of them in the real app).
+      m.keys.get("seekFwd")!({ repeat: false });
+      video.error = { code: 2 };
+      video.fire("error");
+      rereadShows(video);
+    }
+    expect(video.log.filter((e) => e.startsWith("src=")).length).toBe(5);
+    expect(m.playbackFailed).not.toHaveBeenCalled();
+  });
+
+  it("recovers the same sweep repeated five times, each erroring and reloaded at the same spot: none reaches the loader", () => {
+    // The owner's run: the same sweep 5 s -> 49.7 s three times, each erroring
+    // on the way; every reload went back to 49.7, and the third reached the
+    // loader ("Can't show this file" on a healthy file).
+    const { root, video } = mounted();
+    const bar = root.querySelector("#vw-seek");
+    bar.getBoundingClientRect = () => ({ left: 100, top: 0, right: 710, bottom: 10, width: 610, height: 10 });
+    const ptr = (sec: number) => ({ button: 0, pointerId: 1, clientX: 100 + (sec / 61) * 610, preventDefault: () => {} });
+    const targets: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      (video as unknown as { currentTime: number }).currentTime = 5;
+      bar.fire("pointerdown", ptr(5));
+      bar.fire("pointermove", ptr(30));
+      bar.fire("pointermove", ptr(49.7));
+      bar.fire("pointerup", ptr(49.7));
+      video.seeking = true;
+      video.log.length = 0;
+      video.error = { code: 2 };
+      video.fire("error");
+      expect(video.log[0]).toBe(`src=${SRC}`);
+      targets.push(Math.round(Number((video.log[1] ?? "").slice(2)) * 10) / 10);
+      video.seeking = false;
+      rereadShows(video);
+    }
+    expect(targets).toEqual([49.7, 49.7, 49.7, 49.7, 49.7]);
+    expect(m.playbackFailed).not.toHaveBeenCalled();
+  });
+
+  it("does not loop on a spot that fails again right after each recovery with no seek in between: the loader hears it", () => {
+    const { video } = mounted();
+    let errors = 0;
+    while (m.playbackFailed.mock.calls.length === 0 && errors < 10) {
+      // Playback alone reaches the bad spot again: nothing asked in between.
+      (video as unknown as { currentTime: number }).currentTime = 12;
+      video.error = { code: 2 };
+      video.fire("error");
+      errors++;
+      if (m.playbackFailed.mock.calls.length === 0) rereadShows(video);
+    }
+    expect(m.playbackFailed.mock.calls).toEqual([[2]]);
+    // The allowance (two reloads), then the loader: the reloads' successes
+    // refilled nothing.
+    expect(errors).toBe(3);
+    expect(video.log.filter((e) => e.startsWith("src=")).length).toBe(2);
+  });
+
+  it("does not count a reread that errors after its metadata but before its frame as a success", () => {
+    const { video } = mounted();
+    for (let i = 0; i < 3; i++) {
+      (video as unknown as { currentTime: number }).currentTime = 5 + 10 * i;
+      video.error = { code: 2 };
+      video.fire("error");
+      video.duration = 61;
+      video.readyState = 1;
+      video.fire("loadedmetadata"); // reads again, shows nothing yet
+    }
+    expect(m.playbackFailed.mock.calls).toEqual([[2]]);
+  });
+
+  it("records, for the E2E, the error it handled as it was before the reload", () => {
+    const { video } = mounted();
+    m.keys.get("seekFwd")!({ repeat: false }); // asks 5
+    video.seeking = true;
+    (video as unknown as { currentTime: number }).currentTime = 3;
+    video.error = { code: 2, message: "PIPELINE_ERROR_READ: demuxer seek failed" };
+    video.fire("error");
+    const hook = (window as unknown as { __tarotingViewerDev?: { lastError(): unknown; counts(): Record<string, number> } })
+      .__tarotingViewerDev!;
+    expect(hook.lastError()).toEqual({
+      code: 2,
+      message: "PIPELINE_ERROR_READ: demuxer seek failed",
+      at: 3,
+      asked: 5,
+      ended: false,
+      duringReload: false,
+    });
+    expect(hook.counts()).toMatchObject({ rereads: 1, rereadFailures: 0 });
+  });
+
   it("leaves a read error before the length is known, or on a container-only attempt, to the loader", () => {
     const root = mount(CLIP);
     m.onState!(CLIP, ready());

@@ -194,6 +194,139 @@ async function settleOrModal<T>(
   }
 }
 
+/* ---------------- seek-bar gesture kit (fragmented-file blocks) ---------------- */
+
+/** What a <video> did, with times: every source reload, error and end the
+ *  engine reports, plus seeks. `notable` keeps the first 40 events that are
+ *  never routine (error, ended, emptied, loadstart, abort, stalled), so the
+ *  FIRST failure after the initial load is never pushed out by a long tail;
+ *  `ring` keeps the latest 80 of everything. */
+interface VideoLog {
+  readonly notable: string[];
+  readonly ring: string[];
+  /** loadstart events since the recorder started. */
+  loadstarts: number;
+  errors: number;
+  endeds: number;
+  stop(): void;
+  /** Bounded text: the notable events, then the tail, most recent last. */
+  text(max: number): string;
+}
+
+const NOTABLE = new Set(["error", "ended", "emptied", "loadstart", "abort", "stalled"]);
+
+function recordVideo(video: HTMLVideoElement, t0: number): VideoLog {
+  const src0 = video.currentSrc;
+  const notable: string[] = [];
+  const ring: string[] = [];
+  const log: VideoLog = {
+    notable,
+    ring,
+    loadstarts: 0,
+    errors: 0,
+    endeds: 0,
+    stop: () => {
+      for (const t of TYPES) video.removeEventListener(t, on);
+    },
+    text: (max) => {
+      const head = notable.length ? `notable[${notable.join(" ")}]` : "notable[none]";
+      let tail = ring.join(" ");
+      const room = Math.max(200, max - head.length - 10);
+      if (tail.length > room) tail = `…${tail.slice(tail.length - room)}`;
+      return `${head} tail[${tail}]`.slice(0, max + 200);
+    },
+  };
+  const TYPES = [
+    "loadstart", "emptied", "error", "ended", "stalled", "abort", "waiting",
+    "seeking", "seeked", "durationchange", "loadedmetadata", "play", "pause",
+  ];
+  const on = (e: Event): void => {
+    const at = Math.round(performance.now() - t0);
+    let info = `${at}:${e.type}@${video.currentTime.toFixed(2)}`;
+    if (e.type === "error") {
+      log.errors++;
+      info += `{code ${String(video.error?.code)} "${(video.error?.message ?? "").slice(0, 120)}"}`;
+    } else if (e.type === "loadstart") {
+      log.loadstarts++;
+      info += video.currentSrc === src0 ? "{same src}" : "{NEW src}";
+    } else if (e.type === "ended") {
+      log.endeds++;
+    } else if (e.type === "durationchange") {
+      info += `{d ${String(video.duration)}}`;
+    } else if (e.type === "seeking" || e.type === "seeked") {
+      info = `${at}:${e.type === "seeking" ? "sk" : "sd"}@${video.currentTime.toFixed(2)}`;
+    }
+    if (NOTABLE.has(e.type) && notable.length < 40) notable.push(info);
+    ring.push(info);
+    if (ring.length > 80) ring.shift();
+  };
+  for (const t of TYPES) video.addEventListener(t, on);
+  return log;
+}
+
+function rangesText(r: TimeRanges): string {
+  const out: string[] = [];
+  for (let i = 0; i < r.length; i++) out.push(`${r.start(i).toFixed(1)}-${r.end(i).toFixed(1)}`);
+  return out.join(",") || "none";
+}
+
+/** The readout's position ("1:22 / 1:22" → 82), or NaN. */
+function readoutSeconds(sel: string): number {
+  const left = ((document.querySelector(sel)?.textContent ?? "").split("/")[0] ?? "").trim();
+  const parts = left.split(":").map(Number);
+  if (parts.length < 2 || parts.some((n) => !Number.isFinite(n))) return Number.NaN;
+  return parts.reduce((a, n) => a * 60 + n, 0);
+}
+
+/** Real pointer events on the viewer's seek bar. Fractions may lie outside
+ *  0..1 (a hand that overshoots the bar's ends); the bar clamps them. */
+function seekGestures(bar: HTMLElement, pointerId: number) {
+  const box = (): DOMRect => bar.getBoundingClientRect();
+  const fire = (type: string, f: number): void => {
+    const b = box();
+    bar.dispatchEvent(
+      new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        pointerId,
+        button: 0,
+        buttons: type === "pointerup" ? 0 : 1,
+        clientX: b.left + b.width * f,
+        clientY: b.top + b.height / 2,
+      }),
+    );
+  };
+  const frame = (): Promise<void> => new Promise((r) => requestAnimationFrame(() => r()));
+  return {
+    /** Press at fs[0], move through the rest (`gapMs` apart, or one per
+     *  painted frame with "frame"), release on the last. Returns the clamped
+     *  release fraction. */
+    async drag(fs: number[], gapMs: number | "frame"): Promise<number> {
+      fire("pointerdown", fs[0]!);
+      for (const f of fs.slice(1)) {
+        fire("pointermove", f);
+        if (gapMs === "frame") await frame();
+        else await sleep(gapMs);
+      }
+      const last = fs[fs.length - 1]!;
+      fire("pointerup", last);
+      return Math.min(Math.max(last, 0), 1);
+    },
+    /** The three primitives, for gestures that hold still between them. */
+    press: (f: number): void => fire("pointerdown", f),
+    move: (f: number): void => fire("pointermove", f),
+    up: (f: number): void => fire("pointerup", f),
+    /** A pointer that is somehow still down (a failed block) lets go. */
+    cancel(): void {
+      fire("pointerup", 0.5);
+    },
+  };
+}
+
+/** n evenly spaced fractions from a to b (both included). */
+const sweep = (a: number, b: number, n: number): number[] =>
+  Array.from({ length: n }, (_, i) => a + ((b - a) * i) / Math.max(1, n - 1));
+
 export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
   const { test, assert, fixturesDir } = ctx;
   const dir = `${fixturesDir}\\viewer`;
@@ -773,6 +906,188 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
       }
     } finally {
       if (hook) hook.forceHeavy = false;
+      await backHome();
+    }
+  });
+
+  /** Open `file` (full path) in the viewer and wait for its first picture,
+   *  paused, with a painted seek bar. */
+  const openVideoPaused = async (file: string, capMs: number): Promise<{ video: HTMLVideoElement; bar: HTMLElement }> => {
+    await setOpenWith("viewer");
+    await ipc.debugPushOpenPath(file);
+    const name = baseName(file);
+    const video = await until(
+      () => {
+        const v = vwVideo();
+        return v && !v.hidden && v.readyState >= 2 && baseName(viewerDev()?.path() ?? "") === name ? v : null;
+      },
+      capMs,
+      () => `${name} playing in the viewer — ${viewerState()}`,
+    );
+    video.pause();
+    const bar = await until(() => (rendered($("#vw-seek")) ? $<HTMLElement>("#vw-seek") : null), 2_000, () => `a painted #vw-seek — ${viewerState()}`);
+    return { video, bar };
+  };
+
+  await test("viewer-fragmented-scrub", async () => {
+    // The owner's report on 0.9.4: in the viewer, after ~10 s of dragging the
+    // seek bar of a FRAGMENTED MP4 (OBS's "Fragmented MP4": empty moov + mvex,
+    // moof/mdat pairs, mfra), the readout jumped to the duration, the picture
+    // fell back to the clip's first frame, and from then on no seek took: the
+    // knob followed the hand, the picture stayed on frame 1, a release read
+    // 0:00-0:03 or the end again, and Play played from 0:00.
+    // fragmented_h264.mp4 mirrors that file's structure (make-fixtures.mjs).
+    // The gesture is the owner's: fast bursts across the whole bar, drags that
+    // overshoot the right end and come back, a release AT the end and a drag
+    // away from it, and a drag while playing. After every release, asserted on
+    // what the ENGINE did, not on our state: the element's time where the
+    // pointer let go, the readout saying so, no error, not ended (except the
+    // release at the end), never a reload (loadstart counted), and the
+    // compositor PRESENTING the frame there (requestVideoFrameCallback's
+    // mediaTime — the picture itself; pixels cannot be read back, the
+    // viewer's <video> is cross-origin to the page without CORS mode).
+    const t0 = performance.now();
+    const FILE = `${fixturesDir}\\fragmented_h264.mp4`;
+    let log: VideoLog | null = null;
+    let watching = true;
+    try {
+      assert(await ipc.pathExists(FILE), `fixture ${FILE} is missing — run npm run fixtures`);
+      const index = await ipc.keyframeTimes(FILE);
+      assert(index === null, `keyframes.rs indexed the fragmented fixture (${JSON.stringify(index)?.slice(0, 120)}) — it must refuse an mvex file`);
+      const { video, bar } = await openVideoPaused(FILE, 8_000);
+      const d = video.duration;
+      assert(Number.isFinite(d) && d > 35 && d < 45, `fragmented_h264.mp4 reports a duration of ${String(d)} s, not ~40 s`);
+      log = recordVideo(video, t0);
+      let presented = -1;
+      const presentedAt: number[] = [];
+      const onFrame: VideoFrameRequestCallback = (_n, meta) => {
+        presented = meta.mediaTime;
+        if (watching) video.requestVideoFrameCallback(onFrame);
+      };
+      video.requestVideoFrameCallback(onFrame);
+      const g = seekGestures(bar, 21);
+      const steps: string[] = [];
+      const lg = log;
+
+      /** After a release at fraction f: the element settles there, says so,
+       *  and shows it. `playing`: the time may have run on since. */
+      const settled = async (label: string, f: number, playing = false): Promise<void> => {
+        const want = f * d;
+        const atEnd = f >= 1;
+        const hi = playing ? 1.5 : 0.05;
+        const tolFrame = atEnd ? 0.12 : 1 / 30 + 0.002;
+        const ok = (): boolean =>
+          !video.seeking &&
+          video.error === null &&
+          video.currentTime >= want - 0.05 &&
+          video.currentTime <= want + hi &&
+          (playing ? presented >= want - tolFrame && presented <= want + hi + tolFrame : Math.abs(presented - want) <= tolFrame);
+        const s0 = performance.now();
+        await until(() => ok() || null, 3_000, () =>
+          `${label}: the element at ${want.toFixed(2)} s (${(f * 100).toFixed(0)}%) — currentTime ${video.currentTime.toFixed(3)}, presented ${presented.toFixed(3)}, seeking ${String(video.seeking)}, ended ${String(video.ended)}, paused ${String(video.paused)}, rs${video.readyState} ns${video.networkState}, error ${String(video.error?.code)} "${video.error?.message ?? ""}", buffered ${rangesText(video.buffered)}, readout "${text("#vw-time")}"; events ${lg.text(1500)}`,
+        );
+        const shown = readoutSeconds("#vw-time");
+        assert(
+          Math.abs(shown - Math.floor(video.currentTime)) <= 1,
+          `${label}: the readout says "${text("#vw-time")}" with the element at ${video.currentTime.toFixed(2)} s`,
+        );
+        assert(atEnd || !video.ended, `${label}: the element is ENDED after a release at ${want.toFixed(2)} s; events ${lg.text(1500)}`);
+        assert(lg.loadstarts === 0, `${label}: the source was loaded again (${lg.loadstarts} loadstart) — a reload; events ${lg.text(1500)}`);
+        assert(lg.errors === 0, `${label}: the element reported ${lg.errors} error(s); events ${lg.text(1500)}`);
+        presentedAt.push(presented);
+        steps.push(`${label} ${want.toFixed(1)}→${presented.toFixed(2)} in ${Math.round(performance.now() - s0)} ms`);
+      };
+
+      // 1. A fast burst (moves 4 ms apart) across the whole bar and back.
+      let f = await g.drag([...sweep(0.1, 0.95, 18), ...sweep(0.9, 0.2, 14)], 4);
+      await settled("burst", f);
+      // 2. Past the right end and back, one move per painted frame.
+      f = await g.drag([...sweep(0.3, 1.08, 10), ...sweep(1.05, 0.62, 10)], "frame");
+      await settled("overshoot", f);
+      // 3. Released AT the end (the owner's "1:22 / 1:22"), then dragged away.
+      f = await g.drag(sweep(0.7, 1.1, 8), 4);
+      await settled("end", f);
+      f = await g.drag([...sweep(0.98, 0.1, 12), ...sweep(0.12, 0.37, 6)], 4);
+      await settled("from-end", f);
+      // 4. A drag while playing.
+      await video.play().catch(() => {});
+      await until(() => !video.paused || null, 1_000, () => `the fixture to play — paused ${String(video.paused)}`);
+      f = await g.drag(sweep(0.4, 0.78, 14), "frame");
+      await settled("playing", f, true);
+      video.pause();
+      // The picture really moved: every release presented a different frame.
+      const distinct = new Set(presentedAt.map((t) => t.toFixed(2))).size;
+      assert(distinct === presentedAt.length, `two releases presented the same frame: ${presentedAt.map((t) => t.toFixed(2)).join(", ")}`);
+      const exactPart = `${steps.join("; ")}; no reload, no error`;
+
+      // 5. The owner's trigger: while PLAYING, press and hold still, sweep
+      // across a big stretch one move per painted frame, hold, let go — six
+      // times. On the owner's file the engine raised a read error on about 1
+      // in 6 such sweeps; the viewer then reloads in place. Whether or not
+      // that happens here, the outcome must be the user's: the frame where
+      // they let go, still playing. Reloads are counted, not forbidden.
+      // A read error the engine raises here must be the viewer's to recover:
+      // repeating a sweep that errored once errored again (the same reload
+      // target each time), and a guard that took that for a spot failing by
+      // itself sent the third to the loader — "Can't show this file" on a
+      // healthy file. So after every sweep: no media error reached the loader
+      // (the hook's toLoader), and the video is still on screen with no
+      // status card.
+      type Counts = { rereads: number; rereadFailures: number; endRecoveries: number; reloadSuccesses: number; toLoader: number };
+      type RecoveryHook = { counts?(): Counts };
+      const hook = viewerDev() as unknown as RecoveryHook | undefined;
+      const c0 = hook?.counts?.();
+      assert(c0 !== undefined, "the viewer's dev hook has no counts()");
+      const L0 = lg.loadstarts;
+      const E0 = lg.errors;
+      const sweeps: [number, number][] = [[0.05, 0.6], [0.11, 0.66], [0.2, 0.85], [0.7, 0.15], [0.09, 0.66], [0.3, 0.92]];
+      const sweepRows: string[] = [];
+      const atLoader = (): boolean => rendered($("#vw-status")) || video.hidden !== false || (hook?.counts?.().toLoader ?? 0) > c0!.toLoader;
+      for (const [from, to] of sweeps) {
+        if (video.paused) await video.play().catch(() => {});
+        const errs0 = lg.errors;
+        g.press(from);
+        await sleep(200);
+        for (const f of sweep(from, to, 18).slice(1)) {
+          g.move(f);
+          await new Promise<void>((r) => requestAnimationFrame(() => r()));
+        }
+        await sleep(200);
+        g.up(to);
+        const want = to * d;
+        const s0 = performance.now();
+        await until(
+          () =>
+            atLoader() ||
+            (!video.seeking &&
+              !video.paused &&
+              video.error === null &&
+              video.currentTime >= want - 0.05 &&
+              video.currentTime <= want + 2 &&
+              presented >= want - 0.1 &&
+              presented <= want + 2.1) ||
+            null,
+          3_000,
+          () =>
+            `the sweep ${Math.round(from * 100)}→${Math.round(to * 100)}% while playing to end on ${want.toFixed(2)} s and play on — currentTime ${video.currentTime.toFixed(3)}, presented ${presented.toFixed(3)}, paused ${String(video.paused)}, seeking ${String(video.seeking)}, error ${String(video.error?.code)}, readout "${text("#vw-time")}", counts ${JSON.stringify(hook?.counts?.())}; events ${lg.text(1200)}`,
+        );
+        const errs = lg.errors - errs0;
+        const c = hook?.counts?.();
+        assert(
+          !atLoader(),
+          `the sweep ${Math.round(from * 100)}→${Math.round(to * 100)}% while playing: ${errs} media error(s) this sweep and one reached the loader (a healthy file shown as failed) — status "${rendered($("#vw-status")) ? text("#vw-status") : ""}", video hidden ${String(video.hidden)}, counts ${JSON.stringify(c)} (at the start ${JSON.stringify(c0)}); events ${lg.text(1200)}`,
+        );
+        sweepRows.push(`${Math.round(from * 100)}→${Math.round(to * 100)} ${want.toFixed(1)}→${presented.toFixed(2)} ${Math.round(performance.now() - s0)}ms${errs > 0 ? ` (${errs} error${errs > 1 ? "s" : ""} recovered)` : ""}`);
+      }
+      video.pause();
+      const c1 = hook?.counts?.();
+      const delta = c0 && c1
+        ? `errors ${lg.errors - E0}, rereads ${c1.rereads - c0.rereads}, failed ${c1.rereadFailures - c0.rereadFailures}, end recoveries ${c1.endRecoveries - c0.endRecoveries}, to loader ${c1.toLoader - c0.toLoader}`
+        : "no counts hook";
+      return `${exactPart}; playing sweeps ${sweepRows.join(", ")} (${delta}, loadstarts ${lg.loadstarts - L0}); events ${lg.text(500)} — ${ms(t0)}`;
+    } finally {
+      watching = false;
+      log?.stop();
       await backHome();
     }
   });

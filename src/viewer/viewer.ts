@@ -83,6 +83,24 @@ interface ViewerDev {
   /** Every seek the pacer assigned since the last press on the seek bar, in
    *  order (`keyframe`: a fast drag's). */
   readonly seeks: { t: number; keyframe: boolean }[];
+  /** The last media error the viewer's error listener handled, recorded
+   *  before it reassigned anything (null: none yet). */
+  lastError(): ViewerMediaError | null;
+  /** Since mount: read-error rereads started, rereads that failed (an error
+   *  before their frame showed), spurious-end recoveries started, reloads
+   *  that showed their frame, and media errors handed to the loader. */
+  counts(): { rereads: number; rereadFailures: number; endRecoveries: number; reloadSuccesses: number; toLoader: number };
+}
+/** DEV: one media error as the viewer's listener saw it. */
+interface ViewerMediaError {
+  code: number | null;
+  message: string;
+  /** The element's currentTime then. */
+  at: number;
+  asked: number | null;
+  ended: boolean;
+  /** A reload was loading or not yet confirmed (the error is its failure). */
+  duringReload: boolean;
 }
 type DevWindow = { __tarotingViewerDev?: ViewerDev; __tarotingAutotest?: boolean };
 
@@ -130,6 +148,20 @@ const READ_RETRY_WINDOW_MS = 10_000;
 const CHROME_HELD =
   ".viewer__top:hover, .viewer__bar:hover, .viewer__nav:hover, " +
   ".viewer__top :focus-visible, .viewer__bar :focus-visible, .viewer__nav:focus-visible";
+
+/** A reload's start position is never assigned before the metadata when it
+ *  lies within this of the end (seconds): the reload is told nothing up front
+ *  and seeks there once its metadata is in (loadedmetadata). */
+const END_PRESTART_S = 0.5;
+
+/** An `ended` the user did not cause: the element reports the end while the
+ *  position the user wants is more than this before it (seconds). Natural
+ *  playback reaches the end with its last timeupdate ~0.25 s before it. */
+const END_SLACK_S = 1.0;
+
+/** Spurious ends recovered in place per source (refilled like READ_RETRIES,
+ *  after READ_RETRY_WINDOW_MS); past them the end is accepted. */
+const END_RECOVERIES = 2;
 
 /** A seek to within this of the element's position is not made (seconds):
  *  the editor's own margin (scheduler.ts activate), so the two seek alike. */
@@ -346,6 +378,36 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   let rereading = false;
   /** When the last such reload started (performance.now()). */
   let lastRereadAt = Number.NEGATIVE_INFINITY;
+  /** The last position that was really the user's: what they last asked for,
+   *  or where playback was while not at its end. An `ended` the user did not
+   *  cause (a seek the engine sent to the end) never moves it, so a reload
+   *  after one goes back here, not to the duration. */
+  let goodTime = 0;
+  /** The user wants the video playing: set by `play`, cleared by any pause
+   *  but the end's own (Chromium pauses at the end before `ended`). */
+  let playIntent = false;
+  /** Spurious ends recovered for this source, and when the last one was. */
+  let endRecoveries = 0;
+  let lastEndRecoveryAt = Number.NEGATIVE_INFINITY;
+  /** A reload (read-error reread or end recovery) reached its metadata and
+   *  has not yet shown a frame where the user wants to be. Showing one is the
+   *  reload's SUCCESS: the allowances refill (see confirmReload). An error
+   *  before it is the reload failing. */
+  let verifying = false;
+  /** A reload was confirmed (its allowances refilled) and the user has not
+   *  asked for a position since: the next failure then comes from playback
+   *  alone, at a spot that fails by itself, so the refill is taken back
+   *  (refillTaken) — a spot that fails right after every recovery reaches
+   *  the loader instead of looping. Any user seek clears it (noteUserSeek):
+   *  errors the user's own seeking provokes on a healthy file always get
+   *  their reload, however often and wherever aimed. */
+  let noSeekSinceConfirm = false;
+  /** What the last confirmation refilled, restored by refillTaken. */
+  let refilledRetries = 0;
+  let refilledEnds = 0;
+  /** DEV: what the error listener saw, before it touched the element. */
+  let devLastError: ViewerMediaError | null = null;
+  const devCounts = { rereads: 0, rereadFailures: 0, endRecoveries: 0, reloadSuccesses: 0, toLoader: 0 };
 
   /** The PDF mode while a PDF is the shown file (null otherwise); see showPdf. */
   let pdf: PdfMode | null = null;
@@ -359,6 +421,15 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
    *  element's. */
   const playhead = (): number => {
     return asked !== null ? asked : swapHold !== null ? swapHold.t : video.currentTime || 0;
+  };
+  /** Where a reload of the current source restores to: the asked position,
+   *  else the held one, else the element's — unless the element sits at an
+   *  end: then where the user last was (goodTime), which is the end only when
+   *  they went there or playback ran out. */
+  const restorePoint = (): number => {
+    if (asked !== null) return asked;
+    if (swapHold !== null) return swapHold.t;
+    return video.ended ? goodTime : video.currentTime || 0;
   };
   /** The file's length, or the held one while a swap loads (0: unknown). */
   const lengthOf = (): number =>
@@ -393,6 +464,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
         heavy: () => pacer.heavy(),
         indexed: () => indexAnswer !== undefined,
         seeks: [],
+        lastError: () => devLastError,
+        counts: () => ({ ...devCounts }),
       }
     : null;
   if (dev) devWin.__tarotingViewerDev = dev;
@@ -562,6 +635,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     asked = null;
     readRetries = 0;
     rereading = false;
+    resetEndState();
     damage = null;
     video.hidden = true;
     audioCard.hidden = true;
@@ -650,6 +724,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     videoFile = audio ? null : (s.file ?? null);
     readRetries = 0;
     rereading = false;
+    resetEndState();
     damage = s.damage ?? null;
     tryingDirect = s.tryingDirect;
     window.clearTimeout(directTimer);
@@ -676,15 +751,14 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
    *  takes the new src and carries playback over — never a release, so no
    *  status card ("Preparing", "Can't show this file") and no hidden bar in
    *  between. */
-  function swapVideo(url: string): void {
-    const t = playhead();
+  function swapVideo(url: string, t = restorePoint(), resume = !video.paused): void {
     const len = lengthOf();
-    const resume = !video.paused;
     // A seek still waiting is carried in `t`: the new src abandons the one in
     // flight, so no `seeked` would ever send it.
     asked = null;
     resetPacer();
     rereading = false;
+    verifying = false;
     swapHold = { t, d: len };
     // Before the src: the error guard compares the two.
     videoUrl = url;
@@ -692,10 +766,15 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     // Assigned before the metadata, the position becomes the new copy's
     // default playback start position (HTML), so it starts where the old one
     // was; loadedmetadata makes sure of it.
-    try {
-      video.currentTime = t;
-    } catch {
-      /* loadedmetadata seeks instead */
+    // Never AT the end, though: an engine opened with its start position
+    // there may have nothing to show but its first frame. Such a reload starts
+    // at 0 and loadedmetadata seeks to `t` (more than 0.5 s away).
+    if (!(len > 0 && t >= len - END_PRESTART_S)) {
+      try {
+        video.currentTime = t;
+      } catch {
+        /* loadedmetadata seeks instead */
+      }
     }
     if (resume) void video.play().catch(() => {});
   }
@@ -725,6 +804,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
             // A new source (the full repair over the instant copy): its own
             // reload allowance, not what the instant copy spent.
             readRetries = 0;
+            noSeekSinceConfirm = false;
             // Its own copy on disk: its own keyframe index, on its next scrub.
             videoFile = s.file ?? null;
             swapVideo(s.url);
@@ -774,8 +854,108 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     releaseImg();
     setStatus("Can't show this file");
   });
+  /** Reload the source on screen at `t`, playing if the user means it to be
+   *  (playIntent: the element's own paused flag at an error says nothing
+   *  about that). Marks the reload for confirmReload. */
+  function reloadInPlace(t: number, now: number): void {
+    if (videoUrl === null) return;
+    lastRereadAt = now;
+    swapVideo(videoUrl, t, playIntent);
+    // After the swap, which clears it for any other source change.
+    rereading = true;
+  }
+
+  /** The read-error reload: the same source again where the user was
+   *  (restorePoint), counted against READ_RETRIES until it shows its frame. */
+  function rereadInPlace(now = performance.now()): void {
+    if (videoUrl === null) return;
+    readRetries++;
+    devCounts.rereads++;
+    reloadInPlace(restorePoint(), now);
+  }
+
+  /** A reload reached its metadata and now shows a frame where the user
+   *  wants to be: it worked. A seek-burst read error on a healthy file is
+   *  then fully behind us, so the allowances refill — provisionally: if the
+   *  next failure comes before any user seek, refillTaken takes it back. */
+  function confirmReload(): void {
+    if (!verifying || video.seeking || asked !== null || video.readyState < 2) return;
+    verifying = false;
+    devCounts.reloadSuccesses++;
+    refilledRetries = readRetries;
+    refilledEnds = endRecoveries;
+    readRetries = 0;
+    endRecoveries = 0;
+    noSeekSinceConfirm = true;
+  }
+
+  /** The user asked for a position (seekTo, a heavy drag's move): a failure
+   *  after this is one their seeking provoked, so the last refill stands. */
+  function noteUserSeek(): void {
+    noSeekSinceConfirm = false;
+  }
+
+  /** A failure (read error or spurious end) arrived with no user seek since
+   *  the last confirmed reload: playback alone hit a spot that fails by
+   *  itself, so that reload's refill is undone and this failure counts
+   *  against what was left. */
+  function refillTaken(): void {
+    if (!noSeekSinceConfirm) return;
+    noSeekSinceConfirm = false;
+    readRetries = Math.max(readRetries, refilledRetries);
+    endRecoveries = Math.max(endRecoveries, refilledEnds);
+  }
+
+  function resetEndState(): void {
+    goodTime = 0;
+    playIntent = false;
+    endRecoveries = 0;
+    lastEndRecoveryAt = Number.NEGATIVE_INFINITY;
+    verifying = false;
+    noSeekSinceConfirm = false;
+    refilledRetries = 0;
+    refilledEnds = 0;
+  }
+
+  /** The element reports its END while the user wants a position well before
+   *  it (a seek the engine sent to the end — seen on a fast drag while
+   *  playing): a failed seek, not the end of the video. The same source is
+   *  reloaded where the user wanted to be, playing if they were, at most
+   *  END_RECOVERIES times per READ_RETRY_WINDOW_MS; past that the end stands. */
+  function recoverSpuriousEnd(): void {
+    if (disposed || !video.ended || videoUrl === null || videoGen !== gen) return;
+    if (tryingDirect || swapHold !== null || rereading) return;
+    const len = lengthOf();
+    if (!(len > 0)) return;
+    const want = asked ?? goodTime;
+    if (want >= len - END_SLACK_S) return;
+    refillTaken();
+    const now = performance.now();
+    if (now - lastEndRecoveryAt > READ_RETRY_WINDOW_MS) endRecoveries = 0;
+    if (endRecoveries >= END_RECOVERIES) return;
+    endRecoveries++;
+    devCounts.endRecoveries++;
+    lastEndRecoveryAt = now;
+    reloadInPlace(want, now);
+  }
+
   video.addEventListener("error", () => {
     if (disposed || videoUrl === null || videoGen !== gen || video.getAttribute("src") !== videoUrl) return;
+    const duringReload = rereading || verifying;
+    if (import.meta.env.DEV) {
+      devLastError = {
+        code: video.error?.code ?? null,
+        message: video.error?.message ?? "",
+        at: video.currentTime,
+        asked,
+        ended: video.ended === true,
+        duringReload,
+      };
+    }
+    // A reload that errors before showing its frame has failed: it refills
+    // nothing (its retry stays counted).
+    if (duringReload) devCounts.rereadFailures++;
+    verifying = false;
     // A READ error (MEDIA_ERR_NETWORK) on a local file that already played is
     // the engine losing its place, not the file refusing: a burst of seeks can
     // fail one inside Chromium's demuxer ("demuxer seek failed"). The same
@@ -783,13 +963,12 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     // only then does the loader hear of it.
     const readFailure = video.error?.code === MEDIA_ERR_NETWORK || rereading;
     const now = performance.now();
+    // No seek since the last confirmed reload: playback alone failed again,
+    // so that reload's refill does not count (refillTaken).
+    if (readFailure) refillTaken();
     if (readFailure && !rereading && now - lastRereadAt > READ_RETRY_WINDOW_MS) readRetries = 0;
     if (readFailure && !tryingDirect && readRetries < READ_RETRIES && lengthOf() > 0) {
-      readRetries++;
-      lastRereadAt = now;
-      swapVideo(videoUrl);
-      // After the swap, which clears it for any other source change.
-      rereading = true;
+      rereadInPlace(now);
       return;
     }
     // Out of reloads: the loader hears what happened first, a read failure
@@ -802,23 +981,38 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     // The loader decides what the refusal earns — a remux for a container-only
     // attempt, a repair for a video the WebView could not decode, or "Can't
     // show this file" — and paints it through onState like any state.
+    devCounts.toLoader++;
     loader.playbackFailed(code);
   });
   video.addEventListener("loadedmetadata", () => {
     if (videoGen !== gen) return;
-    // A reload after a read error got this far: the source reads again.
+    // A reload after a read error got this far: the source reads again. It
+    // has worked once it shows its frame (confirmReload).
+    if (rereading) verifying = true;
     rereading = false;
     window.clearTimeout(directTimer);
     directTimer = undefined;
     const hold = swapHold;
     if (hold !== null) {
       swapHold = null;
-      // In case the engine dropped the early assignment: a swap must never
-      // restart the file from 0.
-      if (Math.abs((video.currentTime || 0) - hold.t) > 0.5) {
-        video.currentTime = Math.min(hold.t, lengthOf() || hold.t);
+      const len = lengthOf() || hold.t;
+      if (asked !== null) {
+        // The user asked for a position while the reload loaded (seekTo kept
+        // it in the hold and on the knob): the reload goes exactly there.
+        const want = Math.min(asked, len);
+        if (Math.abs((video.currentTime || 0) - want) > SAME_POSITION_S) {
+          asked = want;
+          video.currentTime = want;
+        } else {
+          asked = null;
+        }
+      } else if (Math.abs((video.currentTime || 0) - hold.t) > 0.5) {
+        // In case the engine dropped the early assignment: a swap must never
+        // restart the file from 0.
+        video.currentTime = Math.min(hold.t, len);
       }
     }
+    confirmReload();
     paintReadout();
     paintDamage();
   });
@@ -827,15 +1021,29 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     if (!hidden) paintReadout();
   });
   video.addEventListener("seeked", () => {
+    // A landing where the user asked (or playback's own) is the user's
+    // position; one the engine put somewhere else — the end, for a mid-file
+    // ask — is not.
+    if (!video.seeking && !video.ended && (asked === null || Math.abs(video.currentTime - asked) <= END_PRESTART_S)) {
+      goodTime = video.currentTime;
+    }
+    // Before `asked` is let go of below: it is what the user wanted.
+    recoverSpuriousEnd();
     pacer.seeked();
     // The last asked position landed (a newer ask keeps `seeking` true) —
     // unless a heavy drag is held: then the cursor owns the position and the
     // frame that landed may be a keyframe's.
     if (!video.seeking && !pacer.holding()) asked = null;
+    confirmReload();
     if (damage !== null) paintCover();
     if (!hidden) paintReadout();
   });
+  // The reload's first frame where it started (no seek after its metadata).
+  video.addEventListener("loadeddata", confirmReload);
+  video.addEventListener("canplay", confirmReload);
   video.addEventListener("timeupdate", () => {
+    if (video.ended) recoverSpuriousEnd();
+    else if (!video.seeking && asked === null && swapHold === null) goodTime = video.currentTime;
     // Not chrome: the cover follows the playhead while the bar is hidden too.
     if (damage !== null) paintCover();
     // Hidden chrome: remember, repaint once on reveal.
@@ -846,9 +1054,21 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     paintPlay();
     syncAutoHide();
   };
-  video.addEventListener("play", onPlayState);
-  video.addEventListener("pause", onPlayState);
-  video.addEventListener("ended", onPlayState);
+  video.addEventListener("play", () => {
+    playIntent = true;
+    onPlayState();
+  });
+  video.addEventListener("pause", () => {
+    // Only the user's pause drops the intent. The end's own pause, one that
+    // comes with a media error, and one while a reload loads keep it: a
+    // recovery resumes playing.
+    if (!video.ended && !video.error && swapHold === null && !rereading) playIntent = false;
+    onPlayState();
+  });
+  video.addEventListener("ended", () => {
+    onPlayState();
+    recoverSpuriousEnd();
+  });
 
   /* ---------------- name, counter, arrows ---------------- */
 
@@ -1150,9 +1370,23 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
    */
   function seekTo(t: number): void {
     if (!hasMedia()) return;
+    noteUserSeek();
     const d = video.duration;
-    if (!Number.isFinite(d) || d <= 0) return;
+    if (!Number.isFinite(d) || d <= 0) {
+      // A reload of this source is loading (no length yet, the old one held):
+      // the position is not dropped. It is what the knob shows (`asked`) and
+      // where the reload goes once its metadata is in (latest wins).
+      if (swapHold !== null && swapHold.d > 0) {
+        const held = clamp(t, 0, swapHold.d);
+        asked = held;
+        goodTime = held;
+        paintReadout();
+        if (damage !== null) paintCover();
+      }
+      return;
+    }
     const target = clamp(t, 0, d);
+    goodTime = target;
     if (Math.abs(video.currentTime - target) > SAME_POSITION_S) {
       asked = target;
       video.currentTime = target;
@@ -1444,14 +1678,16 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
       const press = pressAt;
       pressAt = false;
       if (press || !pacer.heavy()) {
-        seekTo(r * video.duration);
+        seekTo(r * lengthOf());
         if (press && Number.isFinite(video.duration)) pacer.begin(clamp(r * video.duration, 0, video.duration));
         return;
       }
+      noteUserSeek();
       const d = video.duration;
       if (!Number.isFinite(d) || d <= 0) return;
       // The cursor's position is the one shown, whatever frame is decoding.
       asked = clamp(r * d, 0, d);
+      goodTime = asked;
       pacer.move(asked);
       paintReadout();
       if (damage !== null) paintCover();
@@ -1503,7 +1739,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   keys.on("seekBack", () => seekTo(playhead() - SEEK_S));
   keys.on("seekFwd", () => seekTo(playhead() + SEEK_S));
   keys.on("goStart", () => (pdf ? pdf.goPage("first") : seekTo(0)));
-  keys.on("goEnd", () => (pdf ? pdf.goPage("last") : seekTo(video.duration)));
+  keys.on("goEnd", () => (pdf ? pdf.goPage("last") : seekTo(lengthOf())));
   keys.on("fullscreen", () => toggleFs());
   keys.on("goHome", () => back());
   keys.setBindings(settingsStore.get().shortcuts);

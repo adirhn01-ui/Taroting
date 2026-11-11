@@ -607,6 +607,49 @@ if (!fs.existsSync(seqDir)) {
   ]);
 }
 
+/* --- a FRAGMENTED MP4 as OBS writes one ("Fragmented MP4" output): ftyp, a
+   small moov with EMPTY sample tables and an mvex, then moof+mdat pairs, one
+   fragment per keyframe, and an mfra at the end. The owner's clip that broke
+   the viewer's seeking is H.264 High with B-frames + AAC, 1280x720 30 fps,
+   ~10 Mbit/s, a keyframe (= a fragment) every ~7 s. This one: 40 s, the same
+   size and frame rate, a keyframe every 7 s (6 fragments + a short tail),
+   B-frames, ~6 Mbit/s (noise keeps x264 from squeezing testsrc2 to nothing,
+   so a fragment spans several of the asset protocol's 1000 KiB answers like
+   the original's), and a burnt-in frame counter so every position looks
+   different. keyframes.rs refuses it (mvex), so the viewer seeks it exactly. */
+const fragmented = path.join(outDir, "fragmented_h264.mp4");
+if (fs.existsSync(fragmented)) {
+  console.log("skip   fragmented_h264.mp4");
+} else {
+  console.log("create fragmented_h264.mp4");
+  execFileSync(
+    ffmpeg,
+    [
+      "-y", "-hide_banner", "-loglevel", "error",
+      "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=40",
+      "-f", "lavfi", "-i", "sine=frequency=440:duration=40",
+      "-vf", "noise=alls=12:allf=t,drawtext=fontfile=consola.ttf:text='%{frame_num}':fontsize=160:x=40:y=40:fontcolor=white:box=1:boxcolor=black@0.85",
+      "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high", "-bf", "3", "-pix_fmt", "yuv420p",
+      "-g", "210", "-keyint_min", "210", "-sc_threshold", "0",
+      "-b:v", "6M", "-maxrate", "6M", "-bufsize", "12M",
+      "-c:a", "aac", "-b:a", "128k", "-shortest",
+      "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+      fragmented,
+    ],
+    { cwd: "C:\\Windows\\Fonts", stdio: ["ignore", "inherit", "inherit"] },
+  );
+  // Fragmented like the original, or no fixture: a plain MP4 here would make
+  // the E2E block pass without ever exercising a fragmented file.
+  const buf = fs.readFileSync(fragmented);
+  const top = mp4Boxes(buf, 0, buf.length).map((b) => b.type);
+  const moov = mp4Boxes(buf, 0, buf.length).find((b) => b.type === "moov");
+  const moofs = top.filter((t) => t === "moof").length;
+  if (!moov || !mp4Boxes(buf, moov.body, moov.end).some((b) => b.type === "mvex") || moofs < 6 || top[top.length - 1] !== "mfra") {
+    fs.rmSync(fragmented);
+    throw new Error(`fragmented_h264.mp4 is not fragmented like an OBS file: top-level ${top.join(" ")}`);
+  }
+}
+
 /* --- A/V sync soak: white flash + beep every 10s --- */
 if (soak) {
   run("sync_soak_30min.mp4", [
