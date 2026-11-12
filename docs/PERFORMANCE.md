@@ -208,3 +208,110 @@ afterwards.
 |---|---|
 | A | 168 ms |
 | B | 120 ms |
+
+## v0.9.1 to v0.9.5 (2026-11-12)
+
+No rows were recorded for 0.9.1 through 0.9.4 when they shipped. All six
+builds from 0.9.0 to 0.9.5 were measured in one scripted session on the
+reference machine, four minutes after a restart: the 0.9.0 to 0.9.4 portable
+builds from their release folders and the 0.9.5 release exe, each with
+`ffmpeg.exe` and `ffprobe.exe` beside it. WebView2 runtime 157.0.4341.46.
+
+Method, where it differs from the sections above:
+
+- **Window** is the first visible, non-minimized, titled top-level window of
+  the process, found by enumerating its windows every 2 ms. Windows timers
+  still tick at about 15.6 ms, so window-level times land on multiples of
+  that: "15 ms" means "within one tick", and 233 against 248 ms is one tick.
+- **Every launch is closed the way a user closes it** (`WM_CLOSE` to that
+  window), never ended by its process id. Since 0.9.1 an instance that is
+  ended from outside leaves a marker, and the next launch reports that
+  Taroting closed unexpectedly: a run that ended its launches would both
+  disturb the next measurement and leave that notice for the user. No launch
+  in this run had to be ended; no marker was left.
+- **Order**: every round runs all builds, and the order is reversed each
+  round, so drift over the session falls on all of them alike.
+- **Test files have no sound track**: a 1080p30 H.264 clip (20 s, 5 Mbit/s),
+  a 12 MP JPEG, and a silent stream copy of a 65 s 1080p60 screen recording
+  at 63 Mbit/s with a keyframe every 4.17 s.
+- Settings and recents were backed up first and compared afterwards: byte
+  for byte unchanged. The cache gained only the scrub copies the run made.
+
+| Metric | 0.9.0 | 0.9.1 | 0.9.2 | 0.9.3 | 0.9.4 | 0.9.5 | Verdict |
+|---|---|---|---|---|---|---|---|
+| Start → window, warm (median of 9) | 15.9 ms | 15.4 ms | 15.3 ms | 15.5 ms | 15.4 ms | 15.6 ms | parity (one tick) |
+| Idle RAM, home screen (median of 3) | 358.2 MB | 357.6 MB | 360.3 MB | 361.0 MB | 358.2 MB | 358.6 MB | parity |
+| Idle CPU, home screen, 10 s | 0.02 s | 0.05 s | 0.02 s | 0.03 s | 0.02 s | 0.00 s | parity |
+| Explorer launch → viewer on file, cold (median of 5) | 232.9 ms | 232.8 ms | 232.6 ms | 232.8 ms | 232.7 ms | see below | parity |
+| File handed to a running instance (median of 3) | 30.6 ms | 30.5 ms | 30.7 ms | 30.5 ms | 30.7 ms | 30.6 ms | parity |
+| Viewer RAM, a 12 MP still (two runs) | 380.5 / 379.0 | 378.5 / 378.7 | 378.8 / 378.5 | 382.8 / 379.5 | 387.7 / 379.8 | 380.6 / 384.0 | parity |
+| Viewer RAM, the 1080p clip playing (two runs) | 424.7 / 427.1 | 425.5 / 422.0 | 424.3 / 425.7 | 424.3 / 426.5 | 431.5 / 419.7 | 418.2 / 421.6 | parity |
+
+The 0.9.5 column is the release exe as fixed (see the next section). Its home
+RAM, viewer RAM and cold viewer launch were measured in a second pass twenty
+minutes later against 0.9.4 again, where 0.9.4 read 358.5 MB on Home,
+380.1 / 379.6 MB on the still, 421.7 / 421.9 MB on the clip, and 247.5 ms for
+the cold viewer launch against 0.9.5's 247.8 ms (both one tick later than in
+the first pass: the machine, not the builds).
+
+First launch of each binary since the restart, recorded apart from the
+medians: 0.9.5 61 ms (the very first launch after boot), 0.9.4 46 ms, and
+108 to 110 ms for 0.9.0 to 0.9.3.
+
+Five releases that added the PDF viewer and editor, the font library and the
+viewer's scrubbing leave start-up and memory where 0.9.0 had them.
+
+## v0.9.5 — a start-up regression caught by this run, and its guard
+
+The first 0.9.5 build measured heavier than every earlier build on every
+screen, by a small and steady amount:
+
+| Metric | 0.9.4 | 0.9.5, first build | 0.9.5, fixed |
+|---|---|---|---|
+| Idle RAM, home screen | 358.2 MB | 367.4 MB | 358.6 MB |
+| Explorer launch → viewer on file, cold | 232.7 ms | 248.7 ms | parity with 0.9.4 in the same pass |
+| Viewer RAM, a 12 MP still | 387.7 / 379.8 MB | 395.3 / 395.0 MB | 380.6 / 384.0 MB |
+| Viewer RAM, the 1080p clip playing | 431.5 / 419.7 MB | 436.6 / 435.4 MB | 418.2 / 421.6 MB |
+
+The defect was ours, in how the app was bundled, and no source file was
+wrong. 0.9.5 gave pdf-lib a second lazy importer (an image project exported
+as a PDF, beside the PDF export). The bundler then made a shared chunk for
+pdf-lib and placed its own small module-namespace helper in the same file.
+Every chunk that uses that helper, the start-up chunks and the viewer's among
+them, imported it statically, and so loaded and evaluated 420 kB of PDF
+writer for nothing: start-up went from 106 kB of script to 526 kB.
+
+The fix gives pdf-lib a chunk of its own (`vite.config.ts`). The guard is
+`scripts/check-boot.mjs`, run at the end of `npm run build`: it follows the
+static imports of the built entry chunk and of the viewer chunk and fails the
+build when either loads more than its budget (135 kB at start-up, measured
+106 kB; 60 kB more for the viewer, measured 40 kB) or any single chunk over
+150 kB. It fails on the first 0.9.5 build and passes on the fixed one. A
+source-level import test could not have seen this: the imports were right
+and the built files were not.
+
+## v0.9.5 — the viewer's scrub copy
+
+New in 0.9.5: for a heavy clip the viewer makes a small all-keyframe copy in
+the background and shows it while the seek bar is dragged. A clip is heavy
+when its keyframes are two seconds or more apart and it runs at 20 Mbit/s or
+more; every other file, and every other screen, does none of this work. The
+only new work for a light clip is one read of the file's keyframe index
+(sample tables, no decoding, off the UI thread) once it has stayed on screen
+for a second.
+
+Measured on the 65 s, 63 Mbit/s recording, playing in the viewer:
+
+| | 0.9.4 | 0.9.5 |
+|---|---|---|
+| Making the copy | — | starts 2 s after the clip is shown, takes about 5 s, 8.0 s of CPU at below-normal priority |
+| The copy on disk | — | 30.5 MB in the preview cache (counted and trimmed with it) |
+| RAM, 3 s after the title names the file | 511 / 520 MB | 527 / 528 MB |
+| RAM, peak over the first 30 s | 551 / 559 MB | 556 / 556 MB |
+| App + WebView CPU over those 30 s | 5.2 / 6.0 s | 4.8 / 4.8 s |
+
+The 0.9.5 figures are from the fixed build with the copy already made, so its
+second `<video>` is loaded from the start: it adds on the order of 10 MB
+early on and nothing measurable at the peak. The job itself is one `ffmpeg`
+process on its own queue, so it never delays a thumbnail, a remux or a
+repair.
