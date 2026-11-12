@@ -8,10 +8,11 @@
 // always act on something the user can see.
 
 import { fileName } from "../../core/format";
-import { ipc, pickPdfFiles } from "../../core/ipc";
+import { describeError, ipc, mediaUrl, pickImageFiles, pickPdfFiles } from "../../core/ipc";
 import { PDF_MAX_PAGES } from "../../core/types";
 import { Store } from "../../core/store";
-import type { PdfPage, PdfSource, ProjectFile } from "../../core/types";
+import type { MediaInfo, MediaRef, PdfPage, PdfSource, ProjectFile } from "../../core/types";
+import type { PicturePageSizing } from "../../core/picture-page";
 import { imgIcon } from "../../image/icons";
 import { icon } from "../../ui/icons";
 import { closeMenu, showMenu } from "../../ui/menu";
@@ -22,14 +23,19 @@ import {
   deletePages,
   duplicatePages,
   insertBlankPage,
+  insertPicturePages,
   insertSourcePages,
+  isPagePicture,
+  isPagePictureSource,
+  pageAnnots,
   newId,
   reorderPages,
   rotatePages,
 } from "../model";
-import type { PdfDoc, PdfEditorCtx, PdfThumbRail, PdfViewPage } from "../types";
+import type { PdfDoc, PdfEditorCtx, PdfThumbRail, PdfViewPage, PdfViewPicture } from "../types";
 import { createThumbRail, isPdfOpenError, openPdf } from "../view";
 import { button, el } from "./el";
+import { askPicturePagesSizing } from "./pictures-dialog";
 
 /** A4 portrait in points: the size of a blank page with nothing to follow. */
 export const A4: readonly [number, number] = [595.28, 841.89];
@@ -46,6 +52,8 @@ export interface PagePanelDeps {
   /** the export dialog, opened on a page: Extract pages (the PDF tab),
    *  Export page as image (the image tab) */
   openExport(pageSlot: number, tab: "pdf" | "image"): void;
+  /** tests: stands in for the native multi-picture picker */
+  pickPictures?(): Promise<string[]>;
 }
 
 export interface PagePanel {
@@ -66,6 +74,9 @@ export interface PageOps {
   remove(slots: readonly number[]): boolean;
   insertBlank(afterSlot: number): Promise<void>;
   insertFromPdf(afterSlot: number): Promise<void>;
+  /** Pictures as pages after `afterSlot` (0.9.5). `given` skips the picker
+   *  (its paths are used in the order given) and/or the size question. */
+  insertPictures(afterSlot: number, given?: { paths?: readonly string[]; sizing?: PicturePageSizing }): Promise<void>;
   menuItems(slots: readonly number[]): MenuItem[];
 }
 
@@ -104,8 +115,115 @@ export class PageSelection extends Store<number[]> {
 
 const clampSide = (v: number): number => Math.min(SIDE_MAX, Math.max(SIDE_MIN, v));
 
+/* ---------------- pictures as pages (0.9.5) ---------------- */
+
+let nameCollator: Intl.Collator | null = null;
+/** The picker's paths in natural name order (Explorer's: "2" before "10",
+ *  case ignored) — the picker's own order is none in particular. */
+export function sortByName(paths: readonly string[]): string[] {
+  nameCollator ??= new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+  const c = nameCollator;
+  return [...paths].sort((a, b) => c.compare(fileName(a), fileName(b)));
+}
+
+/** Said once for the files a pick of pictures left out (the picture mark's
+ *  own refusal, counted). */
+export function skippedPicturesText(n: number): string {
+  return n === 1
+    ? "Skipped 1 file: only still pictures can be placed on a page."
+    : `Skipped ${n} files: only still pictures can be placed on a page.`;
+}
+
+/** Probe the picked files, a few at a time, keeping their order; a file that
+ *  fails or is not a still picture with a size is left out (counted by the
+ *  caller). null when the editor went away meanwhile. */
+export async function probePictures(
+  paths: readonly string[],
+  probe: (path: string) => Promise<MediaInfo>,
+  gone: () => boolean,
+): Promise<MediaInfo[] | null> {
+  const out: (MediaInfo | null)[] = new Array<MediaInfo | null>(paths.length).fill(null);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < paths.length && !gone()) {
+      const i = next++;
+      try {
+        const info = await probe(paths[i]!);
+        out[i] = isPagePictureSource(info) ? info : null;
+      } catch {
+        out[i] = null;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, paths.length) }, worker));
+  if (gone()) return null;
+  return out.filter((x): x is MediaInfo => x !== null);
+}
+
+/** The rail's pages with each picture page's picture (its file and its box
+ *  as fractions of the page), so the thumbnail shows what the page shows.
+ *  Without any, the very list given comes back: no copy, no media lookup
+ *  table, no URL or thumbnail helper reached. The media are looked up
+ *  through a Map built once per call, on the first page picture met.
+ *  `look.thumb` gives the small cached thumbnail of a file (see
+ *  `railThumbs`); without it the rail shows the original. */
+export function withPagePictures(
+  pages: PdfViewPage[],
+  p: ProjectFile,
+  look: { url?: (path: string) => string; thumb?: (ref: MediaRef) => Promise<string> } = {},
+): PdfViewPage[] {
+  let out: PdfViewPage[] | null = null;
+  let byId: Map<string, MediaRef> | null = null;
+  for (let i = 0; i < pages.length; i++) {
+    const vp = pages[i]!;
+    if (vp.doc !== null) continue;
+    const a = pageAnnots(p, vp.key).find(isPagePicture);
+    if (!a) continue;
+    byId ??= new Map(p.media.map((m) => [m.id, m]));
+    const ref = byId.get(a.media);
+    const w = vp.w ?? A4[0];
+    const h = vp.h ?? A4[1];
+    if (!ref || !(w > 0) || !(h > 0)) continue;
+    const thumb = look.thumb;
+    const picture: PdfViewPicture = {
+      file: `${ref.path}|${ref.size}|${ref.mtimeMs}`,
+      url: (look.url ?? mediaUrl)(ref.path),
+      ...(thumb ? { thumb: () => thumb(ref) } : {}),
+      x: a.x / w,
+      y: a.y / h,
+      w: a.w / w,
+      h: a.h / h,
+    };
+    out ??= pages.slice();
+    out[i] = { ...vp, picture };
+  }
+  return out ?? pages;
+}
+
+/** The rail's source of small pictures: the app's cached still thumbnail
+ *  (`get_thumbnail` at 0 s — the same 320-px JPEG the media bin and Home ask
+ *  for, turned as the WebView shows the file), asked ONCE per file identity
+ *  for the editor's life (a failure is forgotten so a later rebuild may ask
+ *  again; the rail falls back to the original meanwhile). */
+export function railThumbs(ask: (ref: MediaRef) => Promise<string> = (ref) => ipc.getThumbnail({ path: ref.path, size: ref.size, mtimeMs: ref.mtimeMs }, 0).then(mediaUrl)): (ref: MediaRef) => Promise<string> {
+  const asked = new Map<string, Promise<string>>();
+  return (ref) => {
+    const k = `${ref.path}|${ref.size}|${ref.mtimeMs}`;
+    let pr = asked.get(k);
+    if (!pr) {
+      pr = ask(ref);
+      asked.set(k, pr);
+      pr.catch(() => {
+        if (asked.get(k) === pr) asked.delete(k);
+      });
+    }
+    return pr;
+  };
+}
+
 export function createPageOps(ctx: PdfEditorCtx, deps: PagePanelDeps): PageOps {
   const { session } = ctx;
+  let picturesBusy = false;
 
   const targets = (slots?: readonly number[]): number[] => {
     const n = pagesOf(session.project).length;
@@ -265,6 +383,56 @@ export function createPageOps(ctx: PdfEditorCtx, deps: PagePanelDeps): PageOps {
     if (added.length > 0) ctx.view.scrollToPage(afterSlot + 1);
   };
 
+  const insertPictures = async (afterSlot: number, given?: { paths?: readonly string[]; sizing?: PicturePageSizing }): Promise<void> => {
+    if (picturesBusy) return;
+    picturesBusy = true;
+    // The picker, the size question and the probes all wait on the user or
+    // the disk: pages may be deleted or moved meanwhile. The new pages go
+    // after the page that was asked for, wherever it is by then — or at the
+    // end when it is gone.
+    const anchor = afterSlot >= 0 ? pagesOf(session.project)[afterSlot]?.id : undefined;
+    const gapNow = (p: ProjectFile): number => {
+      const list = pagesOf(p);
+      if (afterSlot < 0) return 0;
+      const i = anchor === undefined ? -1 : list.findIndex((pg) => pg.id === anchor);
+      return i >= 0 ? i + 1 : list.length;
+    };
+    try {
+      const picked = given?.paths ? [...given.paths] : sortByName(await (deps.pickPictures ?? pickImageFiles)());
+      if (deps.isDisposed() || picked.length === 0) return;
+      if (!canAddPages(session.project, picked.length)) {
+        toast.refuse(`A PDF project holds up to ${PDF_MAX_PAGES.toLocaleString()} pages.`);
+        return;
+      }
+      const sizing = given?.sizing ?? (await askPicturePagesSizing(ctx, picked.length));
+      if (deps.isDisposed() || sizing === null) return;
+      const infos = await probePictures(picked, (path) => ipc.probeMedia(path), deps.isDisposed);
+      if (infos === null) return;
+      const skipped = picked.length - infos.length;
+      if (skipped > 0) toast.refuse(skippedPicturesText(skipped));
+      if (infos.length === 0) return;
+      const before = new Set(pagesOf(session.project).map((pg) => pg.id));
+      // One undo step for the whole pick.
+      let at = 0;
+      session.commit((p) => {
+        at = gapNow(p);
+        return insertPicturePages(p, at, infos, sizing);
+      });
+      const added = pagesOf(session.project).filter((pg) => !before.has(pg.id)).map((pg) => pg.id);
+      if (added.length === 0) {
+        // only the page limit refuses a set of readable stills
+        toast.refuse(`A PDF project holds up to ${PDF_MAX_PAGES.toLocaleString()} pages.`);
+        return;
+      }
+      reselect(added);
+      ctx.view.scrollToPage(at);
+    } catch (e) {
+      if (!deps.isDisposed()) toast.error(`Couldn't add the pictures: ${describeError(e)}`);
+    } finally {
+      picturesBusy = false;
+    }
+  };
+
   const menuItems = (slots: readonly number[]): MenuItem[] => {
     const t = targets(slots);
     const n = pagesOf(session.project).length;
@@ -288,12 +456,13 @@ export function createPageOps(ctx: PdfEditorCtx, deps: PagePanelDeps): PageOps {
     ];
   };
 
-  return { targets, rotate, duplicate, remove, insertBlank, insertFromPdf, menuItems };
+  return { targets, rotate, duplicate, remove, insertBlank, insertFromPdf, insertPictures, menuItems };
 }
 
 /** Mount the rail and its footer into the left panel. */
 export function mountPagePanel(host: HTMLElement, ctx: PdfEditorCtx, deps: PagePanelDeps): PagePanel {
   const ops = createPageOps(ctx, deps);
+  const thumb = railThumbs();
   const rail = createThumbRail({
     onPick: (slot) => ctx.view.scrollToPage(slot),
     onReorder: (keys) => ctx.session.commit((p) => reorderPages(p, keys)),
@@ -338,6 +507,7 @@ export function mountPagePanel(host: HTMLElement, ctx: PdfEditorCtx, deps: PageP
       r.bottom + 4,
       [
         { label: "Blank page", onSelect: () => void ops.insertBlank(after) },
+        { label: "Pictures", onSelect: () => void ops.insertPictures(after) },
         { label: "Pages from PDF", onSelect: () => void ops.insertFromPdf(after) },
       ],
       r.top - 4,
@@ -354,7 +524,7 @@ export function mountPagePanel(host: HTMLElement, ctx: PdfEditorCtx, deps: PageP
   return {
     rail,
     ops,
-    setPages: (pages) => rail.setPages(pages),
+    setPages: (pages) => rail.setPages(withPagePictures(pages, ctx.session.project, { thumb })),
     setCurrent: (slot) => rail.setCurrent(slot),
     dispose() {
       closeMenu();

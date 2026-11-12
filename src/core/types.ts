@@ -458,8 +458,13 @@ export type PdfAnnot =
   | { id: string; t: ShapeKind; c: string; w: number; a: [number, number]; b: [number, number] }
   /** an opaque cover box (default white) — typically with a text box on top */
   | { id: string; t: "whiteout"; x: number; y: number; w: number; h: number; c: string }
-  /** a picture: `media` is a ProjectFile.media id (kind "image"), so relink works */
-  | { id: string; t: "image"; x: number; y: number; w: number; h: number; media: string; r?: PdfRotation }
+  /** a picture: `media` is a ProjectFile.media id (kind "image"), so relink works.
+   *  `bg` (0.9.5, "page picture"): the picture IS the page (pictures added as
+   *  pages) — painted under every other mark of its page whatever its place in
+   *  the list, never hit by a tool, and always drawn into the exported page's
+   *  content. Absent = an ordinary picture mark (never `false`). An older
+   *  Taroting drops the flag and shows an ordinary picture. */
+  | { id: string; t: "image"; x: number; y: number; w: number; h: number; media: string; r?: PdfRotation; bg?: true }
   /** a signature: vector strokes normalised to a 0..1 box, drawn into x,y,w,h */
   | { id: string; t: "signature"; x: number; y: number; w: number; h: number; c: string; strokes: string[]; r?: PdfRotation };
 
@@ -500,10 +505,13 @@ export const PDF_MAX_ANNOTS_PER_PAGE = 5_000;
 /** Style runs in one text mark (`runs`); more = the whole array is dropped. */
 export const PDF_TEXT_MAX_RUNS = 2_000;
 
-export type ImageExportFormat = "png" | "jpeg" | "webp";
+/** "pdf" (0.9.5): one page holding the rendered picture — a JPEG at
+ *  quality < 100, a lossless PNG (alpha kept) at 100. */
+export type ImageExportFormat = "png" | "jpeg" | "webp" | "pdf";
 export interface ImageExportPreset {
   format: ImageExportFormat;
-  /** 1..100; JPEG/WebP only. WebP 100 = lossless (Chromium's own rule). */
+  /** 1..100; JPEG/WebP/PDF only. WebP 100 = lossless (Chromium's own rule);
+   *  PDF 100 = a lossless PNG page, below = a JPEG page at that quality. */
   quality: number;
   /** percent of the canvas, or an explicit output size */
   size: 100 | 50 | 25 | { w: number; h: number };

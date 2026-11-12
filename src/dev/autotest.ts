@@ -4125,6 +4125,9 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     await (await import("./autotest-pdf")).runPdfBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-home")).runHomeBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-fonts")).runFontBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-v095-pdf-pages")).runPdfPagesBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-v095-pictures")).runPicturePagesBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-v095-image-pdf")).runImagePdfBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await runDamagedVideoBlocks(test, fixturesDir);
     await runFragmentedEditorBlock(test, fixturesDir);
   } catch (e) {

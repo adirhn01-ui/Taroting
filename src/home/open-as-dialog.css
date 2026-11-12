@@ -56,3 +56,14 @@
   opacity: 1;
   border-color: var(--accent);
 }
+/* PDF project's page size (0.9.5): a compact row right under its choice. */
+.openas-size {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-top: calc(var(--sp-1) * -1);
+  padding: 0 var(--sp-3);
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}

@@ -5,7 +5,8 @@
 // its CSS size changes.
 //
 // Inside the turned group, bottom to top:
-//   marks  — the saved marks (render.ts), repainted for a page only when that
+//   marks  — the saved marks (render.ts; page pictures first, drawOrder),
+//            repainted for a page only when that
 //            page's mark list (`pdf.annots[pageId]`, an immutable array)
 //            changes reference; a repaint builds nodes only for the mark
 //            objects it has not drawn before (one node per mark object);
@@ -20,7 +21,7 @@
 import type { PdfAnnot, PdfPage, PdfRotation, ProjectFile } from "../../../core/types";
 import { mediaUrl } from "../../../core/ipc";
 import { onFontsChanged } from "../../../fonts";
-import { pageAnnots } from "../../model";
+import { drawOrder, pageAnnots } from "../../model";
 import type { PdfEditorCtx } from "../../types";
 import { boxPoints, pageTransform } from "./geom";
 import { SVG_NS, fontStateOf, markNode, needsFontRuntime } from "./render";
@@ -169,7 +170,8 @@ export function createMarkLayer(ctx: PdfEditorCtx): MarkLayer {
     const prev = nodeCache.get(f.key) ?? new Map<PdfAnnot, SVGElement | null>();
     const next = new Map<PdfAnnot, SVGElement | null>();
     const want: SVGElement[] = [];
-    for (const a of annots) {
+    // page pictures first, under every other mark (model.ts drawOrder)
+    for (const a of drawOrder(annots)) {
       let node: SVGElement | null;
       if (prev.has(a) && !(mediaChanged && a.t === "image")) node = prev.get(a)!;
       else {

@@ -47,7 +47,7 @@ import { arrowWings } from "../../image/ink/shapes";
 import { normalizeRuns, rowMetrics, segmentsOf, type PdfResolvedStyle, type RowPiece } from "../../core/pdf-runs";
 import { hasArabic, paragraphBidi, visualGroups, visualLine } from "./bidi";
 import type { ExportDeps, RasterTextRun } from "./deps";
-import { PdfExportError, baseName } from "./errors";
+import { PdfExportError, baseName, own } from "./errors";
 import { displayedOf, prepareImage, type Orientation } from "./images";
 import { LINE_HEIGHT, rangeMeasurer, rasterScale, wrapRanges, type MeasurePiece } from "./layout";
 
@@ -141,6 +141,27 @@ export function frameOf(a: { x: number; y: number; w: number; h: number; r?: unk
   const r = turnOf(a);
   const [W, H] = r === 90 || r === 270 ? [a.h, a.w] : [a.w, a.h];
   return [a.x + a.w / 2 - W / 2, a.y + a.h / 2 - H / 2, W, H];
+}
+
+/** A page picture's (`bg`, 0.9.5) missing file, said the way that works for
+ *  it: it cannot be selected, and the PDF editor has no picture relink — so
+ *  the page is named as the user counts it (the project's own order, not the
+ *  exported range's) with the two remedies there are. Any other error, or a
+ *  mark no page holds, keeps the ordinary picture message. */
+function pagePictureError(e: unknown, markId: string, project: ProjectFile): unknown {
+  if (!(e instanceof PdfExportError) || e.code !== "image-missing" || e.path === undefined) return e;
+  const pdf = project.pdf;
+  if (!pdf) return e;
+  const i = pdf.pages.findIndex((pg) => {
+    const list = own(pdf.annots, pg.id);
+    return Array.isArray(list) && list.some((x) => x.id === markId);
+  });
+  if (i < 0) return e;
+  return new PdfExportError(
+    "image-missing",
+    `Page ${i + 1}'s picture ${baseName(e.path)} is missing. Put the file back where it was, or delete the page.`,
+    e.path,
+  );
 }
 
 /** `cm` operands (with a trailing " cm ") turning user space counter-
@@ -385,7 +406,9 @@ export async function buildAppearance(a: PdfAnnot, geom: PageGeom, cx: MarkCtx):
       return textAppearance(a, boxRect, cx);
     case "image": {
       if (!finite(a.x, a.y, a.w, a.h) || !(a.w > 0) || !(a.h > 0)) return null;
-      const { img, orientation } = await cx.image(a.media);
+      const { img, orientation } = await cx.image(a.media).catch((e: unknown) => {
+        throw a.bg === true ? pagePictureError(e, a.id, cx.project) : e;
+      });
       const rect = boxRect(a.x, a.y, a.w, a.h);
       const [fx, fy, fw, fh] = frameOf(a);
       const turn = turnCm(turnOf(a), (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2);
@@ -738,6 +761,30 @@ export function placeAppearances(
     } as never);
     page.node.addAnnot(ctx.register(annot));
   });
+}
+
+/** Paint page pictures (`bg` image marks, 0.9.5) into `page` as its FIRST
+ *  content, under whatever the page already draws and whatever is added
+ *  after: one balanced `q … Do Q` stream inserted at the head of /Contents.
+ *  Always page content, whatever the marks' mode — a picture page must print
+ *  and open everywhere as the page itself, never as an annotation a viewer
+ *  lists or a reader deletes. */
+export function placeUnderlay(doc: PDFDocument, page: PDFPage, items: { app: Appearance }[]): void {
+  if (!items.length) return;
+  const ctx = doc.context;
+  const ops: string[] = [];
+  for (const { app } of items) {
+    const dict: Record<string, unknown> = { Type: "XObject", Subtype: "Form", FormType: 1, BBox: app.rect };
+    if (Object.keys(app.resources).length) dict["Resources"] = app.resources;
+    const ref = ctx.register(ctx.flateStream(app.ops, dict as never));
+    ops.push(`q ${page.node.newXObject("TrtPage", ref).asString()} Do Q`);
+  }
+  const under = ctx.register(ctx.flateStream(`${ops.join("\n")}\n`));
+  // normalizedEntries turns a single /Contents stream into an array (and
+  // wraps existing content in q/Q); a fresh blank page has none at all
+  const { Contents } = page.node.normalizedEntries();
+  if (Contents) Contents.insert(0, under);
+  else page.node.set(PDFName.of("Contents"), ctx.obj([under]));
 }
 
 /** `subset: false` embeds the whole file (a font whose license allows

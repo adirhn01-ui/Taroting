@@ -175,11 +175,55 @@ vi.mock("../adjust/plan", () => ({
   isIdentityAdjust: (a: unknown) => a === undefined,
 }));
 
+/** The PDF builder (pdf-lib behind it), standing in at its locked signature.
+ *  `loaded` flips when the module is first imported: render/export.ts reaches
+ *  it only through a dynamic import, so it stays false until a PDF export. */
+const pdfBuilder = vi.hoisted(() => ({
+  loaded: false,
+  calls: [] as { type: string; picture: string; w: number; h: number }[],
+  /** lossless: rows per strip the stand-in reads with */
+  stripRows: 16,
+  /** lossless: called as the page is about to be built */
+  onBuild: null as null | (() => void),
+}));
+vi.mock("./export-pdf", () => {
+  pdfBuilder.loaded = true;
+  return {
+    buildJpegPicturePdf: async (blob: Blob, w: number, h: number) => {
+      pdfBuilder.calls.push({ type: blob.type, picture: "jpeg", w, h });
+      log.push("pdf|build");
+      return new Blob([new Uint8Array(5)], { type: "application/pdf" });
+    },
+    // Reads every strip through the reader it is given, as the real builder
+    // does, so the test sees which canvas it reads and when that is freed.
+    buildLosslessPicturePdf: async (
+      read: (y: number, rows: number) => Uint8ClampedArray,
+      w: number,
+      h: number,
+      o: { signal: AbortSignal; onProgress?: (r: number) => void; onPixelsRead?: () => void },
+    ) => {
+      pdfBuilder.calls.push({ type: "pixels", picture: "lossless", w, h });
+      for (let y = 0; y < h; y += pdfBuilder.stripRows) {
+        const rows = Math.min(pdfBuilder.stripRows, h - y);
+        const px = read(y, rows);
+        if (px.length !== w * rows * 4) throw new Error(`strip of ${px.length} bytes`);
+        if (y + rows >= h) o.onPixelsRead?.();
+        o.onProgress?.((y + rows) / h);
+        await Promise.resolve();
+        if (o.signal.aborted) throw new DOMException("canceled", "AbortError");
+      }
+      pdfBuilder.onBuild?.();
+      log.push("pdf|build");
+      return new Blob([new Uint8Array(5)], { type: "application/pdf" });
+    },
+  };
+});
+
 import { RENDER_MAX_AREA, RENDER_MAX_SIDE } from "../../core/types";
 import { fillChecker } from "./checker";
 import { layerBox, releaseRenderScratch, renderComposite } from "./composite";
 import type { LiveInk, RenderResources } from "./index";
-import { encodeQuality, maxRenderSize, outputSize, renderImageExport, renderThumbnail, thumbnailSize } from "./export";
+import { encodeQuality, maxRenderSize, outputSize, pdfPictureFormat, renderImageExport, renderThumbnail, thumbnailSize } from "./export";
 
 /* ---------------- fixtures ---------------- */
 
@@ -455,6 +499,14 @@ describe("export sizing", () => {
     expect(encodeQuality("jpeg", 85)).toBe(0.85);
     expect(encodeQuality("webp", 100)).toBe(1);
     expect(encodeQuality("webp", 99)).toBe(0.99);
+  });
+
+  it("a PDF page holds a PNG at 100 and a JPEG below it", () => {
+    expect(pdfPictureFormat(100)).toBe("png");
+    expect(pdfPictureFormat(99)).toBe("jpeg");
+    expect(pdfPictureFormat(99.6)).toBe("png");
+    expect(pdfPictureFormat(1)).toBe("jpeg");
+    expect(pdfPictureFormat(Number.NaN)).toBe("jpeg");
   });
 });
 
@@ -786,5 +838,117 @@ describe("renderImageExport", () => {
     await expect(renderImageExport(doc(), { format: "png", quality: 100, outW: 64, outH: 36 }, never(), () => {})).rejects.toThrow(
       'Couldn\'t read "Harbour"',
     );
+  });
+});
+
+// Kept LAST in the file: every test above exports PNG, JPEG or WebP, so the
+// first case here proves none of them fetched the PDF builder.
+describe("renderImageExport as a PDF", () => {
+  const never = (): AbortSignal => new AbortController().signal;
+
+  it("never loads the PDF builder for PNG, JPEG or WebP", async () => {
+    layers = [];
+    await renderImageExport(doc(), { format: "png", quality: 100, outW: 64, outH: 36 }, never(), () => {});
+    await renderImageExport(doc(), { format: "jpeg", quality: 80, outW: 64, outH: 36 }, never(), () => {});
+    await renderImageExport(doc(), { format: "webp", quality: 80, outW: 64, outH: 36 }, never(), () => {});
+    expect(pdfBuilder.loaded).toBe(false);
+    expect(pdfBuilder.calls).toEqual([]);
+  });
+
+  it("below 100 renders a JPEG flattened onto white, then wraps it at the exported size", async () => {
+    layers = [solid("s", "#123456")];
+    pdfBuilder.calls.length = 0;
+    const out = await renderImageExport(doc(), { format: "pdf", quality: 85, outW: 800, outH: 450 }, never(), () => {});
+    expect(pdfBuilder.loaded).toBe(true);
+    expect(out.type).toBe("application/pdf");
+    expect(encoded).toEqual([{ type: "image/jpeg", quality: 0.85 }]);
+    const fills = log.filter((l) => l.startsWith("c") && l.includes("|fillStyle=")).map((l) => l.split("|")[1]);
+    expect(fills[0]).toBe("fillStyle=#ffffff");
+    expect(pdfBuilder.calls).toEqual([{ type: "image/jpeg", picture: "jpeg", w: 800, h: 450 }]);
+    // the picture's canvas is given back before the page is built
+    expect(log.findIndex((l) => l.endsWith("|encode"))).toBeLessThan(log.indexOf("pdf|build"));
+  });
+
+  it("at 100 encodes no PNG: it streams the canvas's own pixels in strips, no white under them (alpha kept)", async () => {
+    layers = [];
+    pdfBuilder.calls.length = 0;
+    const made: FakeCanvas[] = [];
+    vi.stubGlobal(
+      "OffscreenCanvas",
+      class extends FakeCanvas {
+        constructor(w: number, h: number) {
+          super(w, h);
+          made.push(this);
+        }
+      },
+    );
+    const out = await renderImageExport(doc(), { format: "pdf", quality: 100, outW: 64, outH: 37 }, never(), () => {});
+    expect(out.type).toBe("application/pdf");
+    expect(encoded).toEqual([]);
+    expect(log.some((l) => l.endsWith("fillStyle=#ffffff"))).toBe(false);
+    expect(pdfBuilder.calls).toEqual([{ type: "pixels", picture: "lossless", w: 64, h: 37 }]);
+    // the output canvas (the first one made) is read strip by strip, top to bottom
+    const out0 = made[0]!.name;
+    expect(log.filter((l) => l.includes("|get("))).toEqual([`${out0}|get(0,16)`, `${out0}|get(16,16)`, `${out0}|get(32,5)`]);
+  });
+
+  it("at 100 frees the canvas as soon as its last strip is read, before the page is built", async () => {
+    layers = [];
+    const made: FakeCanvas[] = [];
+    vi.stubGlobal(
+      "OffscreenCanvas",
+      class extends FakeCanvas {
+        constructor(w: number, h: number) {
+          super(w, h);
+          made.push(this);
+        }
+      },
+    );
+    let widthAtBuild = -1;
+    pdfBuilder.onBuild = () => (widthAtBuild = made[0]!.width);
+    try {
+      await renderImageExport(doc(), { format: "pdf", quality: 100, outW: 64, outH: 36 }, never(), () => {});
+      expect(widthAtBuild).toBe(0);
+    } finally {
+      pdfBuilder.onBuild = null;
+    }
+  });
+
+  it("at 100 moves the bar through the strips and stops on a cancel mid-way", async () => {
+    layers = [];
+    const seen: number[] = [];
+    pdfBuilder.stripRows = 4;
+    try {
+      await renderImageExport(doc(), { format: "pdf", quality: 100, outW: 64, outH: 36 }, never(), (r) => seen.push(r));
+      // 36 rows / 4 = nine strips: eight land between the layers' share and 1,
+      // rising; the ninth reaches 1
+      const strips = seen.filter((r) => r > 0.5 && r < 1);
+      expect(strips.length).toBe(8);
+      expect(strips.every((r, i) => i === 0 || r > strips[i - 1]!)).toBe(true);
+      expect(seen.at(-1)).toBe(1);
+
+      const ac = new AbortController();
+      let gets = 0;
+      const p = renderImageExport(doc(), { format: "pdf", quality: 100, outW: 64, outH: 36 }, ac.signal, (r) => {
+        if (r > 0.5 && ++gets === 2) ac.abort();
+      });
+      await expect(p).rejects.toMatchObject({ name: "AbortError" });
+      expect(log.filter((l) => l === "pdf|build")).toHaveLength(1); // only the first, finished run
+    } finally {
+      pdfBuilder.stripRows = 16;
+    }
+  });
+
+  it("reports progress up to 1 only once the page is built, and stops on a cancel", async () => {
+    layers = [];
+    const seen: number[] = [];
+    await renderImageExport(doc(), { format: "pdf", quality: 90, outW: 64, outH: 36 }, never(), (r) => seen.push(r));
+    expect(seen.at(-1)).toBe(1);
+    expect(seen.slice(0, -1).every((r) => r <= 0.95)).toBe(true);
+    const ac = new AbortController();
+    ac.abort();
+    await expect(renderImageExport(doc(), { format: "pdf", quality: 90, outW: 64, outH: 36 }, ac.signal, () => {})).rejects.toMatchObject({
+      name: "AbortError",
+    });
   });
 });

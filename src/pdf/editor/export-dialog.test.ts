@@ -25,12 +25,28 @@ const h = vi.hoisted(() => ({
   created: [] as { name: string; info: unknown }[],
   savedProjects: [] as string[],
   begins: 0,
+  // several pages: the order of render/save starts and ends, a renderer or
+  // saver a test can hold or fail, the folder picker's answer, reveals
+  log: [] as string[],
+  renderImpl: null as null | ((page: number) => Promise<unknown>),
+  saveImpl: null as null | ((path: string) => Promise<unknown>),
+  pickedFolder: null as string | null,
+  reveals: [] as string[],
+  // the several-pages renderer: pages each open asked for, closes, the
+  // one-page renderer's calls, a preparation a test can hold or fail
+  opens: [] as number[][],
+  closes: 0,
+  singleRenders: 0,
+  openImpl: null as null | ((signal?: AbortSignal) => Promise<void>),
 }));
 
 vi.mock("../../editor/export/export-ipc", () => ({
   pathExists: (p: string) => Promise.resolve(h.onDisk.has(p)),
   saveFileDialog: () => Promise.resolve(null),
-  revealInExplorer: () => Promise.resolve(),
+  revealInExplorer: (p: string) => {
+    h.reveals.push(p);
+    return Promise.resolve();
+  },
   setTaskbarProgress: () => Promise.resolve(),
   clearTaskbarProgress: () => Promise.resolve(),
 }));
@@ -41,16 +57,47 @@ vi.mock("../export/export", () => ({
     return Promise.resolve({ path: args[2] as string, pages: 1, bytes: 10 });
   },
 }));
-vi.mock("./page-image", () => ({
-  renderPageImage: (_p: unknown, req: { page: number; w: number; h: number; type: string; quality: number }) => {
+vi.mock("./page-image", () => {
+  const render = (req: { page: number; w: number; h: number; type: string; quality: number }): Promise<unknown> => {
     h.renders.push(req);
+    if (h.renderImpl) {
+      h.log.push(`render ${req.page}`);
+      return h.renderImpl(req.page).then(() => {
+        h.log.push(`rendered ${req.page}`);
+        return { size: 4 };
+      });
+    }
     return Promise.resolve({ size: 4 });
-  },
-  saveImageBlob: (dest: { kind: string; path?: string }, format: string) => {
-    h.saves.push({ dest, format });
-    return Promise.resolve({ path: dest.kind === "user" ? dest.path : "C:\Docs\Taroting\Pasted images\Lease 1.png" });
-  },
-}));
+  };
+  return {
+    renderPageImage: (_p: unknown, req: { page: number; w: number; h: number; type: string; quality: number }) => {
+      h.singleRenders++;
+      return render(req);
+    },
+    openPageImages: (_p: unknown, pages: readonly number[], signal?: AbortSignal) => {
+      h.opens.push([...pages]);
+      const ready = h.openImpl ? h.openImpl(signal) : Promise.resolve();
+      return ready.then(() => ({
+        render,
+        close: () => {
+          h.closes++;
+          return Promise.resolve();
+        },
+      }));
+    },
+    saveImageBlob: (dest: { kind: string; path?: string }, format: string) => {
+      h.saves.push({ dest, format });
+      if (h.saveImpl) {
+        h.log.push(`save ${dest.path}`);
+        return h.saveImpl(dest.path!).then(() => {
+          h.log.push(`saved ${dest.path}`);
+          return { path: dest.path! };
+        });
+      }
+      return Promise.resolve({ path: dest.kind === "user" ? dest.path : "C:\Docs\Taroting\Pasted images\Lease 1.png" });
+    },
+  };
+});
 vi.mock("../../core/ipc", () => ({
   appVersion: () => Promise.resolve("0.0.0"),
   describeError: (e: unknown) => String(e),
@@ -59,6 +106,7 @@ vi.mock("../../core/ipc", () => ({
     return { code: typeof o?.code === "string" ? o.code : "", message: typeof o?.message === "string" ? o.message : String(e) };
   },
   onJobEvents: () => Promise.resolve(() => {}),
+  pickFolder: () => Promise.resolve(h.pickedFolder),
   ipc: {
     pdfSaveBegin: () => {
       h.begins++;
@@ -135,6 +183,15 @@ beforeEach(() => {
   h.created = [];
   h.savedProjects = [];
   h.begins = 0;
+  h.log = [];
+  h.renderImpl = null;
+  h.saveImpl = null;
+  h.pickedFolder = null;
+  h.reveals = [];
+  h.opens = [];
+  h.closes = 0;
+  h.singleRenders = 0;
+  h.openImpl = null;
 });
 afterEach(() => {
   // closes a dialog a test left open (opening one closes the last)
@@ -655,5 +712,374 @@ describe("the default export name never names a source", () => {
     expect(nameClearOf("form", "C:/fx", [String.raw`C:\fx\form.pdf`])).toBe("form (edited)");
     expect(nameClearOf("form", "C:/fx", ["c:/FX/form.pdf", "C:/fx/form (edited).pdf"])).toBe("form (edited 2)");
     expect(nameClearOf("form", "D:/out", ["C:/fx/form.pdf"])).toBe("form");
+  });
+});
+
+/* ---------------- the dialog: several pages as pictures ---------------- */
+
+describe("imagePageList and pageImageFileName", () => {
+  it("All pages is every page; a range is its pages, read by the PDF tab's parser", () => {
+    const { imagePageList } = dlg;
+    expect(imagePageList("all", "9", "1", 4)).toEqual({ ok: true, pages: [1, 2, 3, 4] });
+    expect(imagePageList("range", "2", "3", 4)).toEqual({ ok: true, pages: [2, 3] });
+    expect(imagePageList("range", "1", "4", 4)).toEqual({ ok: true, pages: [1, 2, 3, 4] });
+    expect(imagePageList("range", "3", "3", 4)).toEqual({ ok: true, pages: [3] });
+    expect(imagePageList("range", "3", "2", 4)).toEqual({ ok: false, error: RANGE_REVERSED });
+    expect(imagePageList("range", "2", "5", 4)).toEqual({ ok: false, error: rangeOutside(4) });
+    expect(imagePageList("range", "x", "2", 4)).toEqual({ ok: false, error: RANGE_NOT_NUMBERS });
+  });
+  it("names a page like the single-page export: no padding, the page as the user sees it", () => {
+    const { pageImageFileName } = dlg;
+    expect(pageImageFileName("Lease", 7, "png")).toBe("Lease - page 7.png");
+    expect(pageImageFileName("Lease", 120, "jpg")).toBe("Lease - page 120.jpg");
+  });
+});
+
+function pickPages(d: Opened, mode: "one" | "all" | "range"): void {
+  d.$(`[data-pages="${mode}"]`).click();
+}
+const savedPaths = (): string[] => h.saves.map((s) => (s.dest as { path: string }).path);
+
+describe("Image export: several pages", () => {
+  it("This page is the default, with the one-page rows", async () => {
+    const d = open({ tab: "image" });
+    await settle();
+    expect(d.$('[data-pages="one"]').classList.contains("btn--on")).toBe(true);
+    expect(d.$("#px-page-row").classList.contains("export-row--hidden")).toBe(false);
+    expect(d.$("#px-name-row").classList.contains("export-row--hidden")).toBe(false);
+    expect(d.$("#px-img-range-row").classList.contains("export-row--hidden")).toBe(true);
+  });
+
+  it("All pages writes every page into the folder, named like the one-page export, each at its own size", async () => {
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    await settle();
+    expect(d.$("#px-name-row").classList.contains("export-row--hidden")).toBe(true);
+    expect(d.$("#px-outpath").textContent).toBe("E:\\Out\\Lease - page 1.png … Lease - page 3.png");
+    d.$("#px-run").click();
+    await settle();
+    expect(h.renders).toEqual([
+      { page: 1, w: 816, h: 1056, type: "image/png", quality: 92 },
+      { page: 2, w: 1056, h: 816, type: "image/png", quality: 92 },
+      { page: 3, w: 400, h: 800, type: "image/png", quality: 92 },
+    ]);
+    const sources = ["C:\\docs\\lease.pdf", "C:\\pics\\sig.png"];
+    expect(h.saves).toEqual([1, 2, 3].map((n) => ({ dest: { kind: "user", path: `E:\\Out\\Lease - page ${n}.png`, sources }, format: "png" })));
+    expect(d.$(".export-result__title").textContent).toBe("Exported 3 pages");
+    expect(d.$(".export-result__path").textContent).toBe("E:\\Out");
+    d.$("#px-reveal").click();
+    expect(h.reveals).toEqual(["E:\\Out\\Lease - page 3.png"]);
+    expect(h.settingsWrites).toEqual([{ lastExportDir: "E:\\Out" }]);
+    expect(d.s.blockLeave).toBeNull();
+  });
+
+  it("renders and saves one page at a time, in order", async () => {
+    h.renderImpl = () => Promise.resolve();
+    h.saveImpl = () => Promise.resolve();
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    d.$("#px-run").click();
+    await settle();
+    const steps = (n: number): string[] => [`render ${n}`, `rendered ${n}`, `save E:\\Out\\Lease - page ${n}.png`, `saved E:\\Out\\Lease - page ${n}.png`];
+    expect(h.log).toEqual([...steps(1), ...steps(2), ...steps(3)]);
+  });
+
+  it("Page range: only those pages, JPEG quality and size on every one, progress names the page", async () => {
+    let releaseLast: () => void = () => {};
+    h.renderImpl = (page) => (page === 3 ? new Promise<void>((r) => (releaseLast = r)) : Promise.resolve());
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "range");
+    expect(d.$("#px-img-range-row").classList.contains("export-row--hidden")).toBe(false);
+    d.$("#px-img-from").typeText("2");
+    d.$("#px-img-to").typeText("3");
+    d.$('[data-format="jpeg"]').click();
+    d.$("#px-quality").typeText("70");
+    d.$('[data-scale="200"]').click();
+    d.$("#px-run").click();
+    await settle();
+    expect(d.$("#px-phase").textContent).toBe("Exporting page 3 (2 of 2)");
+    releaseLast();
+    await settle();
+    expect(h.renders).toEqual([
+      { page: 2, w: 2112, h: 1632, type: "image/jpeg", quality: 70 },
+      { page: 3, w: 800, h: 1600, type: "image/jpeg", quality: 70 },
+    ]);
+    expect(savedPaths()).toEqual(["E:\\Out\\Lease - page 2.jpg", "E:\\Out\\Lease - page 3.jpg"]);
+    expect(h.saves.every((s) => s.format === "jpeg")).toBe(true);
+    expect(d.$(".export-result__title").textContent).toBe("Exported 2 pages");
+  });
+
+  it("the whole document's progress reads 'Exporting page N of total'", async () => {
+    let release: () => void = () => {};
+    h.renderImpl = (page) => (page === 2 ? new Promise<void>((r) => (release = r)) : Promise.resolve());
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    d.$("#px-run").click();
+    await settle();
+    expect(d.$("#px-phase").textContent).toBe("Exporting page 2 of 3");
+    release();
+    await settle();
+  });
+
+  it("an invalid range disables Export and says why in the PDF tab's words", () => {
+    const d = open({ tab: "image" });
+    pickPages(d, "range");
+    d.$("#px-img-from").typeText("3");
+    d.$("#px-img-to").typeText("2");
+    expect(d.$("#px-run").disabled).toBe(true);
+    expect(d.$("#px-note-img-range").hidden).toBe(false);
+    expect(d.$("#px-note-img-range").textContent).toBe(RANGE_REVERSED);
+  });
+
+  it("files already there: one strip with the count, Cancel focused, no Rename; Replace writes them", async () => {
+    h.onDisk.add("E:\\Out\\Lease - page 1.png");
+    h.onDisk.add("E:\\Out\\Lease - page 3.png");
+    h.onDisk.add("E:\\Out\\Lease - page 2.jpg"); // another format: not replaced
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    d.$("#px-run").click();
+    await settle();
+    expect(d.$(".export-warn__msg").textContent).toBe("2 files in this folder will be replaced.");
+    expect(d.has('[data-w="rename"]')).toBe(false);
+    expect(doc.activeElement).toBe(d.$('[data-w="cancel"]'));
+    expect(h.renders).toHaveLength(0);
+    d.$('[data-w="cancel"]').click();
+    await settle();
+    expect(h.renders).toHaveLength(0);
+    expect(h.settingsWrites).toEqual([]);
+    d.$("#px-run").click();
+    await settle();
+    d.$('[data-w="replace"]').click();
+    await settle();
+    expect(h.renders.map((r) => r.page)).toEqual([1, 2, 3]);
+  });
+
+  it("never offers to write over one of the project's own files", async () => {
+    const d = open({ tab: "image" });
+    await settle();
+    d.s.project = { ...d.s.project, media: [{ id: "m1", kind: "image", path: "e:/out/LEASE - page 2.png" }] } as ProjectFile;
+    pickPages(d, "all");
+    d.$("#px-run").click();
+    await settle();
+    expect(d.$(".export-warn__msg").textContent).toBe(dlg.PAGES_ORIGINAL_WARNING);
+    expect(d.has('[data-w="replace"]')).toBe(false);
+    expect(h.renders).toHaveLength(0);
+  });
+
+  it("Cancel lets the page in flight finish, stops there and says how many were saved", async () => {
+    let release: () => void = () => {};
+    h.renderImpl = (page) => (page === 2 ? new Promise<void>((r) => (release = r)) : Promise.resolve());
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    d.$("#px-run").click();
+    await settle();
+    d.$("#px-cancel").click();
+    expect(d.$("#px-phase").textContent).toBe("Canceling");
+    release();
+    await settle();
+    expect(h.renders.map((r) => r.page)).toEqual([1, 2]);
+    expect(savedPaths()).toEqual(["E:\\Out\\Lease - page 1.png", "E:\\Out\\Lease - page 2.png"]);
+    expect(h.toasts).toContainEqual({ kind: "info", message: "Export canceled. 2 of 3 pictures were saved." });
+    expect(d.has("#px-run")).toBe(true);
+    expect(d.s.blockLeave).toBeNull();
+  });
+
+  it("a page that fails stops the run and names the page; the pictures before it stay", async () => {
+    h.renderImpl = (page) => (page === 2 ? Promise.reject(new PdfExportError("image-missing", "")) : Promise.resolve());
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    d.$("#px-run").click();
+    await settle();
+    expect(d.$(".export-result__msg").textContent).toBe(
+      "Page 2 couldn't be exported. A picture on one of the pages is missing. The picture saved before it is still in the folder.",
+    );
+    expect(h.renders.map((r) => r.page)).toEqual([1, 2]);
+    expect(h.saves).toHaveLength(1);
+    expect(d.s.blockLeave).toBeNull();
+  });
+
+  it("asks for a folder when none is set", async () => {
+    h.onDisk.add("F:\\Pics");
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    d.$("#px-folder").typeText("");
+    h.pickedFolder = "F:\\Pics";
+    d.$("#px-run").click();
+    await settle();
+    expect(savedPaths()).toEqual([1, 2, 3].map((n) => `F:\\Pics\\Lease - page ${n}.png`));
+  });
+
+  it("Open as image project is a one-page action: disabled with the reason", async () => {
+    const d = open({ tab: "image" });
+    await settle();
+    expect(d.$("#px-open-image").disabled).toBe(false);
+    pickPages(d, "all");
+    expect(d.$("#px-open-image").disabled).toBe(true);
+    expect(d.$("#px-open-image").title).toBe(dlg.OPEN_AS_IMAGE_ONE_PAGE);
+    pickPages(d, "one");
+    await settle();
+    expect(d.$("#px-open-image").disabled).toBe(false);
+    expect(d.$("#px-open-image").title).toBe("");
+  });
+
+  it("says once when any chosen page will be reduced", async () => {
+    // page 1 (index 0) is a long banner that cannot fit at 300 %
+    const d = open({ tab: "image" }, true, async (i) => (i === 0 ? { w: 14400, h: 200, rotate: 0 } : { w: 612, h: 792, rotate: 0 }));
+    await settle();
+    pickPages(d, "range");
+    d.$("#px-img-from").typeText("2");
+    await settle();
+    d.$('[data-scale="300"]').click();
+    expect(d.$("#px-note-reduced").hidden).toBe(true);
+    d.$("#px-img-from").typeText("1");
+    await settle();
+    expect(d.$("#px-note-reduced").hidden).toBe(false);
+    expect(d.$("#px-note-reduced").textContent).toBe(dlg.PAGES_REDUCED_NOTE);
+  });
+
+  it("a chosen page whose PDF didn't open is named and blocks Export", async () => {
+    const d = open({ tab: "image", pageSlot: 2 }, true, undefined, false);
+    await settle();
+    pickPages(d, "range");
+    d.$("#px-img-from").typeText("2");
+    d.$("#px-img-to").typeText("3");
+    expect(d.$("#px-note-source").textContent).toBe("Page 2's PDF couldn't be opened.");
+    expect(d.$("#px-run").disabled).toBe(true);
+    d.$("#px-img-from").typeText("3");
+    expect(d.$("#px-note-source").hidden).toBe(true);
+    expect(d.$("#px-run").disabled).toBe(false);
+  });
+});
+
+describe("Image export: several pages, one preparation", () => {
+  it("prepares the chosen pages ONCE for the whole run, renders each from it, and frees it", async () => {
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "range");
+    d.$("#px-img-from").typeText("2");
+    d.$("#px-img-to").typeText("3");
+    d.$("#px-run").click();
+    await settle();
+    expect(h.opens).toEqual([[2, 3]]);
+    expect(h.renders.map((r) => r.page)).toEqual([2, 3]);
+    expect(h.singleRenders).toBe(0);
+    expect(h.closes).toBe(1);
+    expect(d.$(".export-result__title").textContent).toBe("Exported 2 pages");
+  });
+
+  it("This page keeps the one-page renderer and prepares nothing", async () => {
+    const d = open({ tab: "image", pageSlot: 1 }); // 0-based slot: page 2
+    await settle();
+    d.$("#px-run").click();
+    await settle();
+    expect(h.singleRenders).toBe(1);
+    expect(h.renders.map((r) => r.page)).toEqual([2]);
+    expect(h.opens).toEqual([]);
+    expect(h.closes).toBe(0);
+  });
+
+  it("a failing page frees the prepared document", async () => {
+    h.renderImpl = (page) => (page === 2 ? Promise.reject(new PdfExportError("image-missing", "")) : Promise.resolve());
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    d.$("#px-run").click();
+    await settle();
+    expect(h.saves).toHaveLength(1);
+    expect(h.closes).toBe(1);
+  });
+
+  it("Cancel saves the page in flight, stops, and frees the prepared document", async () => {
+    let release: () => void = () => {};
+    h.renderImpl = (page) => (page === 1 ? new Promise<void>((r) => (release = r)) : Promise.resolve());
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    d.$("#px-run").click();
+    await settle();
+    d.$("#px-cancel").click();
+    release();
+    await settle();
+    expect(savedPaths()).toEqual(["E:\\Out\\Lease - page 1.png"]);
+    expect(h.closes).toBe(1);
+    expect(h.toasts).toContainEqual({ kind: "info", message: "Export canceled. 1 of 3 pictures were saved." });
+  });
+
+  it("a forced close while a page renders writes no further file, and frees the prepared document", async () => {
+    let release: () => void = () => {};
+    h.renderImpl = (page) => (page === 2 ? new Promise<void>((r) => (release = r)) : Promise.resolve());
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    d.$("#px-run").click();
+    await settle();
+    expect(h.log).toContain("render 2");
+    d.overlays[0]!(); // the editor going away
+    release();
+    await settle();
+    expect(h.log).toContain("rendered 2");
+    expect(savedPaths()).toEqual(["E:\\Out\\Lease - page 1.png"]);
+    expect(h.renders.map((r) => r.page)).toEqual([1, 2]);
+    expect(h.closes).toBe(1);
+    expect(d.s.blockLeave).toBeNull();
+  });
+
+  it("a Cancel while the preparation runs stops it: nothing rendered or written", async () => {
+    let seen: AbortSignal | undefined;
+    h.openImpl = (signal) => {
+      seen = signal;
+      return new Promise<void>((_r, reject) =>
+        signal!.addEventListener("abort", () => reject(new DOMException("The export was canceled.", "AbortError"))),
+      );
+    };
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    d.$("#px-run").click();
+    await settle();
+    expect(seen?.aborted).toBe(false);
+    d.$("#px-cancel").click();
+    await settle();
+    expect(seen?.aborted).toBe(true);
+    expect(h.renders).toHaveLength(0);
+    expect(h.saves).toHaveLength(0);
+    expect(h.toasts).toContainEqual({ kind: "info", message: "Export canceled" });
+    expect(d.has("#px-run")).toBe(true);
+  });
+
+  it("a preparation that fails says the export's own sentence, naming no page", async () => {
+    const err = new PdfExportError("image-missing", "");
+    h.openImpl = () => Promise.reject(err);
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    d.$("#px-run").click();
+    await settle();
+    expect(d.$(".export-result__msg").textContent).toBe(describeExportFailure(err).message);
+    expect(h.renders).toHaveLength(0);
+  });
+
+  it("a Cancel that lands while the LAST page is in flight finishes as a success", async () => {
+    let release: () => void = () => {};
+    h.renderImpl = (page) => (page === 3 ? new Promise<void>((r) => (release = r)) : Promise.resolve());
+    const d = open({ tab: "image" });
+    await settle();
+    pickPages(d, "all");
+    d.$("#px-run").click();
+    await settle();
+    d.$("#px-cancel").click();
+    release();
+    await settle();
+    expect(savedPaths()).toEqual([1, 2, 3].map((n) => `E:\\Out\\Lease - page ${n}.png`));
+    expect(d.$(".export-result__title").textContent).toBe("Exported 3 pages");
+    expect(h.toasts.filter((t) => t.message.startsWith("Export canceled"))).toEqual([]);
   });
 });

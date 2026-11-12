@@ -1,6 +1,7 @@
 // Home's "Open as" dialog: media files chosen with Open (or dropped on Home)
 // become a new project, and the user says which kind. Nothing is decided for
 // them: Video project is always there, Image project whenever every file is a
+// picture, PDF project (every picture a page, 0.9.5) only when every file is a
 // picture, and Cancel leaves everything as it was.
 //
 // Its own lazy chunk (Home imports it when there is media to ask about), and
@@ -22,6 +23,7 @@ import { fileExt, fileName, fileStem } from "../core/format";
 import { createPhotosImageProject } from "../core/image-project";
 import { describeError, ipc } from "../core/ipc";
 import { stillSizeProblem } from "../core/open-media";
+import { PICTURE_PAGE_SIZINGS, type PicturePageSizing } from "../core/picture-page";
 import { mediaFamilyOf } from "../core/types";
 import type { MediaInfo } from "../core/types";
 import { trapTab } from "../ui/focus";
@@ -96,6 +98,30 @@ export function imageProjectBlocker(paths: readonly string[]): string | null {
  *  user's choice). */
 export const OPEN_AS_PDF_REFUSAL = "PDFs open as a PDF project, not through Open as.";
 
+/** Whether the PDF project choice is offered: every file a picture (the
+ *  image family — a GIF plays as a clip and is not one). Any number of them:
+ *  a page is a page, up to the PDF project's own limit, which the making
+ *  checks. */
+export function allPictures(paths: readonly string[]): boolean {
+  return paths.length > 0 && paths.every((p) => mediaFamilyOf(fileExt(p)) === "image");
+}
+
+/** The Page size select's labels (the PDF editor's "Insert → Pictures" offers
+ *  the same three). */
+export const PAGE_SIZE_LABELS: Readonly<Record<PicturePageSizing, string>> = {
+  picture: "Picture size",
+  a4: "A4",
+  letter: "Letter",
+};
+
+/** The page size picked last in this app session (the select's default). */
+let lastSizing: PicturePageSizing = "picture";
+
+/** Test seam: forget the remembered page size. */
+export function resetOpenAsSizing(): void {
+  lastSizing = "picture";
+}
+
 function isPdfPath(p: string): boolean {
   return mediaFamilyOf(fileExt(p)) === "document";
 }
@@ -108,6 +134,9 @@ export interface OpenAsOptions {
   /** The choice's work. The dialog stays up, busy, until it settles. */
   onVideo(): Promise<void>;
   onImage(): Promise<void>;
+  /** "PDF project" (offered only when every file is a picture): every picture
+   *  a page of the chosen size. */
+  onPdf?(sizing: PicturePageSizing): Promise<void>;
   /** Runs once, last, on EVERY close path (so Home can drop its closer). */
   onClosed?(): void;
 }
@@ -121,7 +150,7 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, text?: s
 
 /** A choice: the menu rows' icon tile, label and hint (components.css), in a
  *  larger bordered button. */
-function option(kind: "video" | "image", glyph: string, label: string, hint: string): HTMLButtonElement {
+function option(kind: "video" | "image" | "pdf", glyph: string, label: string, hint: string): HTMLButtonElement {
   const btn = el("button", "openas-option");
   btn.type = "button";
   btn.dataset.kind = kind;
@@ -177,6 +206,25 @@ export function openOpenAsDialog(opts: OpenAsOptions): () => void {
     imageBtn.setAttribute("aria-describedby", reason.id);
     body.append(reason);
   }
+  // PDF project: every picture a page, with the page size right under it.
+  let pdfBtn: HTMLButtonElement | null = null;
+  let sizeSelect: HTMLSelectElement | null = null;
+  if (opts.onPdf && allPictures(opts.paths)) {
+    pdfBtn = option("pdf", "document", "PDF project", "Every picture a page");
+    const row = el("div", "openas-size");
+    const label = el("label", "", "Page size");
+    label.htmlFor = "openas-size";
+    sizeSelect = el("select", "select select--sm");
+    sizeSelect.id = "openas-size";
+    for (const s of PICTURE_PAGE_SIZINGS) {
+      const o = el("option", "", PAGE_SIZE_LABELS[s]);
+      o.value = s;
+      sizeSelect.appendChild(o);
+    }
+    sizeSelect.value = lastSizing;
+    row.append(label, sizeSelect);
+    body.append(pdfBtn, row);
+  }
 
   const footer = el("div", "modal__footer");
   const cancelBtn = el("button", "btn", "Cancel");
@@ -231,6 +279,8 @@ export function openOpenAsDialog(opts: OpenAsOptions): () => void {
     cancelBtn.focus();
     videoBtn.disabled = true;
     imageBtn.disabled = true;
+    if (pdfBtn) pdfBtn.disabled = true;
+    if (sizeSelect) sizeSelect.disabled = true;
     btn.dataset.pending = "";
     modal.setAttribute("aria-busy", "true");
     xBtn.setAttribute("aria-disabled", "true");
@@ -245,6 +295,18 @@ export function openOpenAsDialog(opts: OpenAsOptions): () => void {
   }
   videoBtn.addEventListener("click", () => void choose(videoBtn, opts.onVideo));
   imageBtn.addEventListener("click", () => void choose(imageBtn, opts.onImage));
+  const onPdf = opts.onPdf;
+  if (pdfBtn && sizeSelect && onPdf) {
+    const select = sizeSelect;
+    const btn = pdfBtn;
+    btn.addEventListener("click", () => {
+      const v = select.value as PicturePageSizing;
+      const sizing = PICTURE_PAGE_SIZINGS.includes(v) ? v : "picture";
+      if (closed || pending || btn.disabled) return;
+      lastSizing = sizing;
+      void choose(btn, () => onPdf(sizing));
+    });
+  }
 
   // The first enabled choice (Video project is always enabled). trapTab only
   // sees keys while focus is already inside, so this is its precondition.

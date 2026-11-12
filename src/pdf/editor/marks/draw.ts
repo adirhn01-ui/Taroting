@@ -24,7 +24,7 @@ import {
 } from "../../../image/ink/input";
 import { constrainShape, shapeLongEnough, type Pt } from "../../../image/ink/shapes";
 import { toast } from "../../../ui/toast";
-import { addAnnot, canAddAnnots, newId, pageAnnots, removeAnnots, type AnnotRef } from "../../model";
+import { addAnnot, canAddAnnots, isPagePicture, newId, pageAnnots, removeAnnots, type AnnotRef } from "../../model";
 import type { Env, Gesture } from "./env";
 import { sameEdit } from "./env";
 import {
@@ -339,11 +339,12 @@ export function highlightSelection(env: Env): boolean {
 /* Eraser                                                              */
 /* ------------------------------------------------------------------ */
 
-/** The marks of `list` a disk of radius r swept A→B touches (ids). */
+/** The marks of `list` a disk of radius r swept A→B touches (ids); never a
+ *  page picture (it is the page). */
 export function eraserHits(list: readonly PdfAnnot[], ax: number, ay: number, bx: number, by: number, r: number, into: Set<string>): number {
   let n = 0;
   for (const a of list) {
-    if (into.has(a.id)) continue;
+    if (into.has(a.id) || isPagePicture(a)) continue;
     if (sweepHit(a, ax, ay, bx, by, r)) {
       into.add(a.id);
       n++;

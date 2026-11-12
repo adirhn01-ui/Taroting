@@ -580,7 +580,9 @@ pub struct ProjectFile {
     /// PDF projects only (TS `PdfMeta`: sources, pages, marks, form values).
     /// Opaque to Rust like `image`: the PDF editor sanitizes it on read, and
     /// `save_project` only checks that a PDF project carries one, as an
-    /// object (`image_rules::validate_image_project`).
+    /// object (`image_rules::validate_image_project`). Mirrors every TS field
+    /// by being opaque — the 0.9.5 page picture's `bg: true` on an image mark
+    /// included: present only when set, carried as written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf: Option<Value>,
     /// A TEMPORARY project (tmp-projects) the user has edited. Set by the
@@ -1312,5 +1314,41 @@ mod tests {
         let typed: ProjectFile = serde_json::from_value(video.clone()).unwrap();
         assert!(typed.pdf.is_none());
         assert_eq!(serde_json::to_value(&typed).unwrap(), video, "no pdf key appears on a video project");
+    }
+
+    /// A picture page's mark (0.9.5, TS `PdfAnnot` image `bg?: true`, wire
+    /// name `bg`) travels through the backend untouched, and a mark without
+    /// one gains no `bg` key: `pdf` stays opaque to Rust, so a project with
+    /// no page picture saves exactly as before.
+    #[test]
+    fn a_page_picture_mark_round_trips_and_absent_stays_absent() {
+        let with = |mark: Value| {
+            serde_json::json!({
+                "schema": 4, "kind": "pdf", "app": "taroting", "id": "p", "name": "Scans",
+                "createdAt": "2026-11-11T00:00:00Z", "modifiedAt": "2026-11-11T00:00:00Z",
+                "media": [{"id": "m1", "path": "C:\\Scans\\a.jpg", "size": 10, "mtimeMs": 20,
+                           "kind": "image", "duration": 0.0, "width": 800, "height": 600, "hasAudio": false}],
+                "timeline": {"fps": {"num": 30, "den": 1}, "width": 1920, "height": 1080, "tracks": []},
+                "export": {},
+                "pdf": {
+                    "sources": [],
+                    "pages": [{"id": "pg1", "src": null, "page": 0, "rotate": 0, "w": 600, "h": 450}],
+                    "annots": {"pg1": [mark]},
+                    "forms": {}
+                }
+            })
+        };
+        let bg = with(serde_json::json!({"id": "a1", "t": "image", "x": 0, "y": 0, "w": 600, "h": 450, "media": "m1", "bg": true}));
+        let typed: ProjectFile = serde_json::from_value(bg.clone()).unwrap();
+        let back = serde_json::to_value(&typed).unwrap();
+        assert_eq!(back, bg, "the page picture comes back exactly");
+        assert_eq!(back["pdf"]["annots"]["pg1"][0]["bg"], Value::Bool(true));
+
+        let plain = with(serde_json::json!({"id": "a1", "t": "image", "x": 0, "y": 0, "w": 600, "h": 450, "media": "m1"}));
+        let typed: ProjectFile = serde_json::from_value(plain.clone()).unwrap();
+        let back = serde_json::to_value(&typed).unwrap();
+        assert_eq!(back, plain);
+        assert!(back["pdf"]["annots"]["pg1"][0].get("bg").is_none(), "no bg key appears on an ordinary picture");
+        assert!(!serde_json::to_string(&typed).unwrap().contains("\"bg\""));
     }
 }

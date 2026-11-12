@@ -28,6 +28,8 @@ import type { RenderResources } from "./index";
 import { ADJUST_STRIP_ROWS, adjustStrip, decodeStill, fetchPhoto, fitRenderLimits, workingWidth } from "./photos";
 
 export interface ExportRenderOpts {
+  /** "pdf" renders the picture as `pdfPictureFormat(quality)` and wraps it in
+   *  a one-page PDF (the builder is fetched only then). */
   format: ImageExportFormat;
   /** 1..100 */
   quality: number;
@@ -58,7 +60,22 @@ export const EXPORT_MIME: Readonly<Record<ImageExportFormat, string>> = {
   png: "image/png",
   jpeg: "image/jpeg",
   webp: "image/webp",
+  pdf: "application/pdf",
 };
+
+/** The picture a PDF page embeds: lossless at 100 ("png": no PNG is encoded,
+ *  the canvas's pixels are deflated in strips with the alpha as a soft mask;
+ *  a PDF page is white underneath), else a JPEG at that quality — flattened
+ *  onto white exactly as a JPEG export is. */
+export function pdfPictureFormat(quality: number): "png" | "jpeg" {
+  return Number.isFinite(quality) && Math.round(quality) >= 100 ? "png" : "jpeg";
+}
+
+/** The PDF builder (pdf-lib), fetched on the first PDF export only: nothing
+ *  else in the image editor loads it. */
+function loadPdfBuilder(): Promise<typeof import("./export-pdf")> {
+  return import("./export-pdf");
+}
 
 /** Largest output that fits Chromium's canvas limits at the canvas aspect. */
 export function maxRenderSize(w: number, h: number): { w: number; h: number; reduced: boolean } {
@@ -244,14 +261,60 @@ async function preparePhoto(
  *  adjustments with a yield between strips, then convertToBlob. Rejects on
  *  abort; verifies blob.type. `sources.blobFor` hands over photo files the
  *  caller already holds; any it does not hold are read from disk. */
-export function renderImageExport(
+export async function renderImageExport(
   doc: ProjectFile,
   opts: ExportRenderOpts,
   signal: AbortSignal,
   onProgress: (ratio: number) => void,
   sources?: RenderSources,
 ): Promise<Blob> {
-  return render(doc, opts, signal, onProgress, false, sources?.blobFor);
+  if (opts.format !== "pdf") return render(doc, opts, signal, onProgress, false, sources?.blobFor);
+  const outW = Math.round(opts.outW);
+  const outH = Math.round(opts.outH);
+  if (pdfPictureFormat(opts.quality) === "png") {
+    // Lossless: no PNG at all. The page is built straight from the rendered
+    // canvas, read in bounded strips that are deflated as they come (see
+    // export-pdf.ts), so the raw picture is never held twice and the UI
+    // thread gets a turn every strip. The builder is fetched BEFORE the render
+    // so the canvas is never held across the import; the canvas is freed the
+    // moment its last strip is read.
+    const { buildLosslessPicturePdf } = await loadPdfBuilder();
+    if (signal.aborted) throw abortError();
+    return render(doc, { ...opts, format: "png" }, signal, onProgress, false, sources?.blobFor, {
+      share: LOSSLESS_PDF_SHARE,
+      encode: (canvas, ctx, onEncode) =>
+        buildLosslessPicturePdf((y, rows) => ctx.getImageData(0, y, outW, rows).data, outW, outH, {
+          signal,
+          onProgress: onEncode,
+          onPixelsRead: () => {
+            canvas.width = 0;
+            canvas.height = 0;
+          },
+        }),
+    });
+  }
+  // Below 100: a JPEG first (its canvas freed before the page is built), then
+  // one page around it, sized by the shared picture-page rule.
+  const PICTURE_SHARE = 0.95;
+  const blob = await render(doc, { ...opts, format: "jpeg" }, signal, (r) => onProgress(r * PICTURE_SHARE), false, sources?.blobFor);
+  const { buildJpegPicturePdf } = await loadPdfBuilder();
+  if (signal.aborted) throw abortError();
+  const pdf = await buildJpegPicturePdf(blob, outW, outH);
+  if (signal.aborted) throw abortError();
+  onProgress(1);
+  return pdf;
+}
+
+/** The share of a lossless PDF export's progress bar the strip deflate takes
+ *  (the layers take the rest): on a large picture it is the longest step. */
+export const LOSSLESS_PDF_SHARE = 0.5;
+
+/** How `render` turns the finished canvas into the file, when not by
+ *  convertToBlob: `encode` gets the canvas, its context and a 0..1 progress
+ *  callback mapped onto the last `share` of the bar. */
+interface RenderEncoder {
+  share: number;
+  encode(canvas: OffscreenCanvas, ctx: OffscreenCanvasRenderingContext2D, onProgress: (ratio: number) => void): Promise<Blob>;
 }
 
 async function render(
@@ -261,6 +324,7 @@ async function render(
   onProgress: (ratio: number) => void,
   skipMissing: boolean,
   blobFor: RenderSources["blobFor"],
+  encoder?: RenderEncoder,
 ): Promise<Blob> {
   const outW = Math.round(opts.outW);
   const outH = Math.round(opts.outH);
@@ -312,7 +376,7 @@ async function render(
 
     const layers = visible.reverse(); // bottom → top
     const total = Math.max(1, layers.length);
-    const LAYERS_SHARE = 0.9;
+    const LAYERS_SHARE = encoder ? 1 - encoder.share : 0.9;
     const report = (done: number, within: number): void => onProgress(((done + within) / total) * LAYERS_SHARE);
     report(0, 0);
 
@@ -364,6 +428,12 @@ async function render(
     await yieldToUi();
     if (signal.aborted) throw abortError();
 
+    if (encoder) {
+      const out = await encoder.encode(canvas, ctx, (r) => onProgress(LAYERS_SHARE + Math.min(1, Math.max(0, r)) * encoder.share));
+      if (signal.aborted) throw abortError();
+      onProgress(1);
+      return out;
+    }
     const type = EXPORT_MIME[opts.format];
     const quality = encodeQuality(opts.format, opts.quality);
     const blob = await canvas.convertToBlob(quality === undefined ? { type } : { type, quality });

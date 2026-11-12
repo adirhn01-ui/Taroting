@@ -20,7 +20,7 @@
 import "../../editor/editor.css";
 import "./editor.css";
 import { registerCloseTask } from "../../core/app-close";
-import { describeError, ipc } from "../../core/ipc";
+import { describeError, ipc, mediaUrl } from "../../core/ipc";
 import type { LoadedProject } from "../../core/ipc";
 import { exitDest, navigate } from "../../core/nav";
 import type { EditorRoute, Route } from "../../core/nav";
@@ -43,7 +43,7 @@ import { icon } from "../../ui/icons";
 import { closeMenu, showMenu } from "../../ui/menu";
 import { createTempExits, createTempLeaveGate } from "../../ui/temp-project";
 import { toast } from "../../ui/toast";
-import { deletePages, formValue, setFormValue } from "../model";
+import { deletePages, formValue, isPagePicture, pageAnnots, setFormValue } from "../model";
 import type { PdfDoc, PdfEditorCtx, PdfEditorHosts, PdfTextEditing, PdfToolState, PdfViewPage } from "../types";
 import { createPdfView, createSearch, renderPageToBlob } from "../view";
 import { button, el } from "./el";
@@ -53,7 +53,7 @@ import { formsPart } from "./forms";
 import { inspectorPart } from "./inspector";
 import { PageSelection, mountPagePanel } from "./pages";
 import { clampFont, clampSize } from "./marks/geom";
-import { blankCover, writeCover } from "./save";
+import { blankCover, writeCover, type CoverPicture } from "./save";
 import { openSources, openSourcesDialog } from "./sources";
 import type { SourceIssue } from "./sources";
 import { toolsPart } from "./tools";
@@ -173,7 +173,13 @@ export function viewPagesOf(pages: readonly PdfPage[], docs: ReadonlyMap<string,
 export function coverKey(p: ProjectFile): string {
   const pg = p.pdf?.pages[0];
   if (!pg) return "";
-  if (pg.src === null) return `blank|${pg.w}|${pg.h}|${pg.rotate}`;
+  if (pg.src === null) {
+    // a picture page's card shows its picture (0.9.5): which file, where
+    const pic = pageAnnots(p, pg.id).find(isPagePicture);
+    const m = pic ? p.media.find((x) => x.id === pic.media) : undefined;
+    const tail = pic && m ? `|${m.path}|${m.size}|${m.mtimeMs}|${pic.x}|${pic.y}|${pic.w}|${pic.h}` : "";
+    return `blank|${pg.w}|${pg.h}|${pg.rotate}${tail}`;
+  }
   const s = p.pdf!.sources.find((x) => x.id === pg.src);
   return `${s?.path}|${s?.size}|${s?.mtimeMs}|${pg.page}|${pg.rotate}`;
 }
@@ -876,10 +882,25 @@ function mount(
     // A source that never opened has no picture to give: Home keeps its placeholder.
     if (pg.src !== null && !doc) return;
     const turned = pg.rotate % 180 !== 0;
+    const pic = pg.src === null ? pageAnnots(p, pg.id).find(isPagePicture) : undefined;
+    const picRef = pic ? p.media.find((x) => x.id === pic.media) : undefined;
+    const picture: CoverPicture | undefined =
+      pic && picRef
+        ? {
+            url: mediaUrl(picRef.path),
+            box: [pic.x, pic.y, pic.w, pic.h],
+            pageW: pg.w ?? 595,
+            pageH: pg.h ?? 842,
+            rotate: pg.rotate,
+            // A still the WebView does not turn by its EXIF is stored unturned
+            // (MediaRef.noAutorotate): the card must not turn it either.
+            noAutorotate: picRef.noAutorotate === true,
+          }
+        : undefined;
     const render = (): Promise<Blob> =>
       doc
         ? renderPageToBlob(doc, pg.page, pg.rotate, COVER_PX, "image/jpeg")
-        : blankCover(turned ? (pg.h ?? 842) : (pg.w ?? 595), turned ? (pg.w ?? 595) : (pg.h ?? 842), COVER_PX);
+        : blankCover(turned ? (pg.h ?? 842) : (pg.w ?? 595), turned ? (pg.w ?? 595) : (pg.h ?? 842), COVER_PX, picture);
     const w = writeCover(session.path, p.id, render, deadline);
     const work = { doc, done: w.done };
     coverWork = work;

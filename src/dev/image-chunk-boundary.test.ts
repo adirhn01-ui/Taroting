@@ -44,6 +44,17 @@ function valueImports(src: string): string[] {
   for (const m of src.matchAll(/import\(\s*["']([^"']+)["']\s*\)/g)) out.push(m[1]!);
   return out;
 }
+/** Every specifier a module loads STATICALLY: `import … from`, a re-export
+ *  (`export … from`, `export * from`, `export * as n from`) and a bare
+ *  side-effect `import "…"`. Type-only forms (`import type`, `export type`)
+ *  are erased and not counted. Pinned by its own self-check below. */
+function staticSpecifiers(src: string): string[] {
+  const out: string[] = [];
+  for (const m of src.matchAll(/^\s*(?:import|export)\s+(?!type\b)[^;]*?\bfrom\s+["']([^"']+)["']/gm)) out.push(m[1]!);
+  for (const m of src.matchAll(/^\s*import\s*["']([^"']+)["']/gm)) out.push(m[1]!);
+  return out;
+}
+const DYNAMIC_IMPORT = /import\(\s*["']([^"']+)["']\s*\)/g;
 /** "src/…/x.ts" for a relative specifier from `file`, else null. */
 function resolveRel(file: string, spec: string): string | null {
   if (!spec.startsWith(".")) return null;
@@ -118,6 +129,64 @@ describe("the image chunk boundary", () => {
     const editor = read(DISPATCH);
     expect(editor).not.toMatch(STATIC_IMAGE_IMPORT);
     expect(editor).toContain('await import("../image/image-editor")');
+  });
+});
+
+/** The image export's PDF builder (0.9.5): the ONE module under src/image
+ *  that may use pdf-lib, reached only through render/export.ts's dynamic
+ *  import, so pdf-lib is fetched on the first PDF export and never otherwise. */
+const PDF_BUILDER = "src/image/render/export-pdf.ts";
+
+describe("the image chunk's PDF export stays lazy", () => {
+  const imageFiles = (): string[] =>
+    readdirSync(resolve(root, "src/image"), { recursive: true })
+      .map((p) => `src/image/${p.replace(/\\/g, "/")}`)
+      .filter((p) => p.endsWith(".ts") && !p.endsWith(".test.ts") && !p.endsWith(".d.ts"));
+
+  it("finds the files it is guarding", () => {
+    const files = imageFiles();
+    expect(files).toContain(PDF_BUILDER);
+    expect(files).toContain("src/image/render/export.ts");
+  });
+
+  it("its static-import reader sees every form that loads a module, and no type-only one", () => {
+    const src = [
+      'import { a } from "./one";',
+      'import b, {\n  c,\n} from "./two";',
+      'export { d } from "./three";',
+      'export * from "./four";',
+      'export * as five from "./five";',
+      'import "./six";',
+      "import './seven';",
+      'import type { T } from "./type-only";',
+      'export type { U } from "./type-only-too";',
+      'const later = import("./dynamic");',
+    ].join("\n");
+    expect(staticSpecifiers(src)).toEqual(["./one", "./two", "./three", "./four", "./five", "./six", "./seven"]);
+    expect([...src.matchAll(DYNAMIC_IMPORT)].map((m) => m[1])).toEqual(["./dynamic"]);
+  });
+
+  it("only the builder imports pdf-lib, and nothing under src/image imports src/pdf", () => {
+    for (const file of imageFiles()) {
+      const src = read(file);
+      const specs = [...staticSpecifiers(src), ...[...src.matchAll(DYNAMIC_IMPORT)].map((m) => m[1]!)];
+      if (file !== PDF_BUILDER) expect(specs.filter((s) => s.startsWith("pdf-lib")), file).toEqual([]);
+      for (const spec of specs) {
+        const target = resolveRel(file, spec);
+        expect(target !== null && target.startsWith("src/pdf/"), `${file} imports ${spec}`).toBe(false);
+      }
+    }
+  });
+
+  it("the builder is reached only through render/export.ts's dynamic import", () => {
+    for (const file of imageFiles()) {
+      const src = read(file);
+      const statics = staticSpecifiers(src).map((s) => resolveRel(file, s));
+      expect(statics, file).not.toContain(PDF_BUILDER);
+      const dynamic = [...src.matchAll(DYNAMIC_IMPORT)].map((m) => resolveRel(file, m[1]!));
+      if (file !== "src/image/render/export.ts") expect(dynamic, file).not.toContain(PDF_BUILDER);
+    }
+    expect(read("src/image/render/export.ts")).toContain('import("./export-pdf")');
   });
 });
 

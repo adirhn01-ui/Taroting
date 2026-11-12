@@ -77,8 +77,73 @@ export function writeCover(
   return { waited, done };
 }
 
-/** A white JPEG of a blank page's shape, `maxSide` px on its long side. */
-export function blankCover(w: number, h: number, maxSide: number): Promise<Blob> {
+/** A picture page's picture for its cover (0.9.5): the file's URL, its box
+ *  on the UNROTATED page (points), the page's unrotated size and its turn. */
+export interface CoverPicture {
+  url: string;
+  box: [number, number, number, number];
+  pageW: number;
+  pageH: number;
+  rotate: number;
+  /** the MediaRef's flag: the WebView leaves this file's EXIF turn unapplied,
+   *  so the cover does too (as the editor shows it) */
+  noAutorotate?: boolean;
+}
+
+/** Decodes a cover's picture at `size` (CSS px of the picture's own, upright
+ *  box) honouring `orientation`; null when the file cannot be read. */
+export type CoverPictureLoader = (url: string, size: { w: number; h: number }, orientation: ImageOrientation) => Promise<ImageBitmap | null>;
+
+/** The app's canvas path for a picture file: fetch through the asset
+ *  protocol (an `<img>` from that origin would taint the canvas and make
+ *  toBlob throw), then decode once, already at the card's size. */
+export const loadCoverPicture: CoverPictureLoader = async (url, size, orientation) => {
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const blob = await res.blob();
+  if (blob.size === 0) return null;
+  return createImageBitmap(blob, {
+    imageOrientation: orientation,
+    resizeWidth: Math.max(1, Math.ceil(size.w)),
+    resizeHeight: Math.max(1, Math.ceil(size.h)),
+    resizeQuality: "high",
+  });
+};
+
+/** Page space (points, y down, the UNROTATED page) → cover pixels of a cover
+ *  `coverW` px wide showing the page turned clockwise by `rotate`: a canvas
+ *  transform [a, b, c, d, e, f] (x' = a·x + c·y + e, y' = b·x + d·y + f) and
+ *  the points-to-px scale. Pure. */
+export function coverPictureMatrix(
+  picture: Pick<CoverPicture, "pageW" | "pageH" | "rotate">,
+  coverW: number,
+): { m: [number, number, number, number, number, number]; k: number } {
+  const turn = ((Math.round(picture.rotate / 90) % 4) + 4) % 4;
+  const { pageW: W, pageH: H } = picture;
+  const k = coverW / (turn % 2 ? H : W);
+  switch (turn) {
+    case 1: // (x, y) → (H − y, x)
+      return { m: [0, k, -k, 0, k * H, 0], k };
+    case 2: // (x, y) → (W − x, H − y)
+      return { m: [-k, 0, 0, -k, k * W, k * H], k };
+    case 3: // (x, y) → (y, W − x)
+      return { m: [0, -k, k, 0, 0, k * W], k };
+    default:
+      return { m: [k, 0, 0, k, 0, 0], k };
+  }
+}
+
+/** A white JPEG of a blank page's shape, `maxSide` px on its long side — with
+ *  a picture page's picture drawn in, turned with the page, when `picture` is
+ *  given (a picture that does not load leaves the page white). `load` is the
+ *  decoder (tests inject one). */
+export async function blankCover(
+  w: number,
+  h: number,
+  maxSide: number,
+  picture?: CoverPicture,
+  load: CoverPictureLoader = loadCoverPicture,
+): Promise<Blob> {
   const long = Math.max(w, h) || 1;
   const k = maxSide / long;
   const canvas = document.createElement("canvas");
@@ -88,6 +153,26 @@ export function blankCover(w: number, h: number, maxSide: number): Promise<Blob>
   if (g) {
     g.fillStyle = "#ffffff";
     g.fillRect(0, 0, canvas.width, canvas.height);
+    const pw = picture?.pageW ?? 0;
+    const ph = picture?.pageH ?? 0;
+    if (picture && pw > 0 && ph > 0) {
+      const { m, k: kp } = coverPictureMatrix(picture, canvas.width);
+      const [x, y, bw, bh] = picture.box;
+      let bmp: ImageBitmap | null = null;
+      try {
+        bmp = await load(picture.url, { w: bw * kp, h: bh * kp }, picture.noAutorotate ? "none" : "from-image");
+        if (bmp) {
+          g.save();
+          g.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
+          g.drawImage(bmp, x, y, bw, bh);
+          g.restore();
+        }
+      } catch {
+        /* the page stays white: Home still gets a card of the right shape */
+      } finally {
+        bmp?.close();
+      }
+    }
   }
   return new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(

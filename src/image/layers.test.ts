@@ -763,6 +763,9 @@ describe("validateImageProject", () => {
     expect(out.notes).toEqual([]);
     const badFormat = validateImageProject(project([], [track("t0", "Layer", [])], { background: "transparent", export: { format: "gif", quality: 5, size: 50 } }));
     expect(badFormat.project.image).toEqual({ background: "transparent" });
+    // A PDF export (0.9.5) is remembered like the picture formats.
+    const pdf = validateImageProject(project([], [track("t0", "Layer", [])], { background: "transparent", export: { format: "pdf", quality: 100, size: 25 } }));
+    expect(pdf.project.image).toEqual({ background: "transparent", export: { format: "pdf", quality: 100, size: 25 } });
   });
 
   it("gives a generator an unusable box the canvas size, and drops an empty placeholder once layers exist", () => {

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ProjectFile } from "../core/types";
+import type { MediaInfo, PdfAnnot, ProjectFile } from "../core/types";
 
 // Home's PDF projects: PDFs in, ONE saved library project out. The real
 // createPdfProject and the real page model build the project, so what is
@@ -14,10 +14,16 @@ const m = vi.hoisted(() => ({
   errors: [] as string[],
   infos: [] as string[],
   refusals: [] as string[],
+  probes: new Map<string, MediaInfo | Error>(),
 }));
 vi.mock("../core/ipc", () => ({
   ipc: {
     fileStat: async (p: string) => m.stats.get(p) ?? null,
+    probeMedia: async (p: string) => {
+      const v = m.probes.get(p);
+      if (!v || v instanceof Error) throw v ?? new Error("no such file");
+      return v;
+    },
     newProjectPath: async (s?: string) => `C:\\Docs\\Taroting\\${s ?? "Untitled"} (2).trt`,
     saveProject: async (path: string, project: ProjectFile) => void m.saved.push({ path, project }),
   },
@@ -44,7 +50,9 @@ vi.mock("../pdf/view/loader", () => ({
   },
 }));
 
-const { createPdfProjectFrom, PDF_MISSING, PDF_PROTECTED } = await import("./pdf-project-from");
+const { createPdfProjectFrom, createPdfProjectFromPictures, PDF_MISSING, PDF_PROTECTED } = await import("./pdf-project-from");
+const { checkInvariants } = await import("../core/project");
+await import("../core/pdf-sanitize");
 
 function pdf(path: string, pages: number | "password" | "invalid" | "other", size = 1000, mtimeMs = 1_700_000_000_000): string {
   m.stats.set(path, { size, mtimeMs });
@@ -61,6 +69,7 @@ beforeEach(() => {
   m.errors = [];
   m.infos = [];
   m.refusals = [];
+  m.probes.clear();
 });
 
 describe("createPdfProjectFrom", () => {
@@ -160,5 +169,57 @@ describe("createPdfProjectFrom", () => {
     await createPdfProjectFrom([big, more], live);
     expect(m.refusals).toEqual(["more was left out: a PDF project holds up to 10000 pages."]);
     expect(m.saved[0]!.project.pdf!.pages).toHaveLength(9_999);
+  });
+});
+
+describe("createPdfProjectFromPictures (0.9.5)", () => {
+  const P = (name: string): string => `C:\\p\\${name}`;
+  const DOCS = "C:\\Docs\\Taroting\\";
+  const still = (path: string, w: number, h: number, patch: Partial<MediaInfo> = {}): MediaInfo => {
+    const info: MediaInfo = { path, size: 100, mtimeMs: 200, kind: "image", duration: 0, width: w, height: h, hasAudio: false, ...patch };
+    m.probes.set(path, info);
+    return info;
+  };
+
+  it("saves ONE PDF project, a page per picture in the order given, sized as asked, named after the first", async () => {
+    still(P("scan 1.jpg"), 1200, 1600);
+    still(P("scan 2.png"), 1600, 900);
+    const out = await createPdfProjectFromPictures([P("scan 1.jpg"), P("scan 2.png")], "letter", live);
+    expect(out).toBe(DOCS + "scan 1 (2).trt");
+    expect(m.saved).toHaveLength(1);
+    const p = m.saved[0]!.project;
+    expect([p.schema, p.kind, p.name]).toEqual([4, "pdf", "scan 1 (2)"]);
+    expect(p.pdf!.sources).toEqual([]);
+    // Letter, turned to each picture: portrait, then landscape
+    expect(p.pdf!.pages.map((pg) => [pg.src, pg.w, pg.h])).toEqual([
+      [null, 612, 792],
+      [null, 792, 612],
+    ]);
+    const paths = p.pdf!.pages.map((pg) => {
+      const a = p.pdf!.annots[pg.id]![0] as Extract<PdfAnnot, { t: "image" }>;
+      expect(a.bg).toBe(true);
+      return p.media.find((x) => x.id === a.media)!.path;
+    });
+    expect(paths).toEqual([P("scan 1.jpg"), P("scan 2.png")]);
+    expect(checkInvariants(p)).toEqual([]);
+  });
+
+  it("names and skips what is not a readable still, and keeps the rest", async () => {
+    m.probes.set(P("bad.jpg"), new Error("corrupt"));
+    still(P("anim.webp"), 5, 5, { kind: "video" });
+    still(P("ok.png"), 40, 30);
+    const out = await createPdfProjectFromPictures([P("bad.jpg"), P("anim.webp"), P("ok.png")], "picture", live);
+    expect(out).toBe(DOCS + "ok (2).trt");
+    expect(m.errors).toEqual(["Couldn't open bad: corrupt"]);
+    expect(m.refusals).toEqual(["anim is not a still picture, so it was left out."]);
+    expect(m.saved[0]!.project.pdf!.pages.map((pg) => [pg.w, pg.h])).toEqual([[30, 22.5]]);
+  });
+
+  it("makes nothing when none can be read, or once Home is gone", async () => {
+    expect(await createPdfProjectFromPictures([P("gone.jpg")], "a4", live)).toBeNull();
+    expect(m.refusals).toEqual(["None of the pictures could be opened, so no project was made."]);
+    still(P("a.jpg"), 10, 10);
+    expect(await createPdfProjectFromPictures([P("a.jpg")], "a4", () => true)).toBeNull();
+    expect(m.saved).toEqual([]);
   });
 });

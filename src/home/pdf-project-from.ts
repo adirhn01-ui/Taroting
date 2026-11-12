@@ -1,5 +1,6 @@
 // Home's PDF projects: one or more PDFs, chosen with "New project → PDF
-// project", Open, or a drop, become ONE real library project in
+// project", Open, or a drop — or pictures, through "Open as → PDF project"
+// (every picture a page) — become ONE real library project in
 // Documents\Taroting (never a temporary one — Home's New and Open are the
 // permanent way in), its pages in the order Home hands the files over (natural
 // name order, see home.ts mediaRoute).
@@ -20,9 +21,11 @@ import { fileStem } from "../core/format";
 import { describeError, ipc, pickPdfFiles } from "../core/ipc";
 import { PDF_MISSING, readPdfSource } from "../core/pdf-open";
 import type { PdfSourceInfo } from "../core/pdf-project";
+import { stillSizeProblem } from "../core/open-media";
+import type { PicturePageSizing } from "../core/picture-page";
 import { uid } from "../core/project";
-import { PDF_MAX_PAGES } from "../core/types";
-import type { ProjectFile } from "../core/types";
+import { DEFAULT_EXPORT_PRESET, PDF_MAX_PAGES, PDF_SCHEMA } from "../core/types";
+import type { MediaInfo, ProjectFile } from "../core/types";
 import { toast } from "../ui/toast";
 
 export { PDF_MISSING };
@@ -129,6 +132,88 @@ export async function createPdfProjectFrom(
       project = next;
     }
   }
+  await ipc.saveProject(projectPath, project);
+  return projectPath;
+}
+
+/* ---------------- pictures → a PDF project (0.9.5) ---------------- */
+
+/** A PDF project with no page yet, the shape `createPdfProject` gives a PDF
+ *  (schema 4, kind "pdf", the empty timeline, the default export preset):
+ *  only ever a step on the way, never saved without pages. */
+async function emptyPdfProject(name: string): Promise<ProjectFile> {
+  const { emptyPdfTimeline } = await import("../core/pdf-sanitize");
+  const now = new Date().toISOString();
+  return {
+    schema: PDF_SCHEMA,
+    kind: "pdf",
+    app: "taroting",
+    id: uid(),
+    name,
+    createdAt: now,
+    modifiedAt: now,
+    media: [],
+    timeline: emptyPdfTimeline(uid()),
+    export: { ...DEFAULT_EXPORT_PRESET },
+    pdf: {
+      sources: [],
+      pages: [],
+      annots: Object.create(null) as Record<string, never>,
+      forms: Object.create(null) as Record<string, never>,
+    },
+  };
+}
+
+/** Home's "Open as → PDF project": every picture a page, in the order Home
+ *  hands them over (natural name order), each page sized by `sizing`
+ *  (core/picture-page). Probes every picture, drops (and names, in a toast)
+ *  any that fails or is not a still with a size — the words "Open as → Image
+ *  project" uses — and saves ONE real library project named after the first
+ *  picture. Returns its path, or null when nothing was made. `gone` is asked
+ *  after every await. */
+export async function createPdfProjectFromPictures(
+  paths: readonly string[],
+  sizing: PicturePageSizing,
+  gone: () => boolean,
+): Promise<string | null> {
+  const infos: MediaInfo[] = [];
+  for (const path of paths) {
+    const stem = fileStem(path);
+    let info: MediaInfo;
+    try {
+      info = await ipc.probeMedia(path);
+    } catch (e) {
+      if (gone()) return null;
+      toast.error(`Couldn't open ${stem}: ${describeError(e)}`);
+      continue;
+    }
+    if (gone()) return null;
+    const problem =
+      info.kind !== "image" || info.generator ? `${stem} is not a still picture, so it was left out.` : stillSizeProblem(info);
+    if (problem) {
+      toast.refuse(problem);
+      continue;
+    }
+    infos.push(info);
+  }
+  if (infos.length === 0) {
+    toast.refuse("None of the pictures could be opened, so no project was made.");
+    return null;
+  }
+  if (infos.length > PDF_MAX_PAGES) {
+    toast.refuse(`A PDF project holds up to ${PDF_MAX_PAGES} pages.`);
+    return null;
+  }
+  const { insertPicturePages } = await import("../pdf/model");
+  if (gone()) return null;
+  const projectPath = await ipc.newProjectPath(fileStem(infos[0]!.path));
+  if (gone()) return null;
+  // Named after the file the backend picked, as for a PDF.
+  const base = await emptyPdfProject(fileStem(projectPath));
+  const project = insertPicturePages(base, 0, infos, sizing);
+  // The model refuses only what was checked above; never write a project
+  // without pages.
+  if (project === base || (project.pdf?.pages.length ?? 0) === 0) return null;
   await ipc.saveProject(projectPath, project);
   return projectPath;
 }

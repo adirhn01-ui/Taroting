@@ -49,6 +49,24 @@ export interface PdfViewPage {
   rotate: PdfRotation;
   w?: number;
   h?: number;
+  /** editor only (0.9.5): a blank page's page picture, for the rail's
+   *  thumbnail — its box as FRACTIONS (0..1) of the unrotated page, the
+   *  file's identity (`file`: equal for the same file content), the URL of
+   *  the original file and, when there is one, `thumb`: the app's small
+   *  cached thumbnail of it (a URL), which the rail shows instead (the
+   *  original only when the thumbnail fails). The strip shows the picture
+   *  through the mark layer instead. */
+  picture?: PdfViewPicture;
+}
+
+export interface PdfViewPicture {
+  file: string;
+  url: string;
+  thumb?: () => Promise<string>;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
 }
 
 export type PdfFit = "width" | "page";

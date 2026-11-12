@@ -67,6 +67,8 @@ class El extends Listeners {
   type = "";
   title = "";
   disabled = false;
+  /** a select's / an option's value (the PDF choice's Page size) */
+  value = "";
   innerHTML = "";
   private text = "";
   constructor(tag: string) {
@@ -125,8 +127,16 @@ const doc = Object.assign(new Listeners(), {
 });
 vi.stubGlobal("document", doc);
 
-const { MAX_OPEN_AS_PICTURES, createImageProjectFrom, imageProjectBlocker, imageProjectHint, openAsTitle, openOpenAsDialog } =
-  await import("./open-as-dialog");
+const {
+  MAX_OPEN_AS_PICTURES,
+  allPictures,
+  createImageProjectFrom,
+  imageProjectBlocker,
+  imageProjectHint,
+  openAsTitle,
+  openOpenAsDialog,
+  resetOpenAsSizing,
+} = await import("./open-as-dialog");
 
 const backdrop = (): El | undefined => body.children.find((c) => c.className === "modal-backdrop");
 const option = (kind: string): El => backdrop()!.find((e) => e.dataset.kind === kind)[0]!;
@@ -460,5 +470,90 @@ describe("imageProjectHint", () => {
     expect(imageProjectHint(["C:\\p\\song.mp3"], imageProjectBlocker(["C:\\p\\song.mp3"]))).toBe(
       "Draw on, adjust and export a picture",
     );
+  });
+});
+
+describe("PDF project (0.9.5): every picture a page", () => {
+  /** The dialog with a PDF choice; `pdfCalls` gets each size it was asked with. */
+  function openWithPdf(paths: string[], work: () => Promise<void> = async () => {}) {
+    const pdfCalls: string[] = [];
+    const calls: string[] = [];
+    const close = openOpenAsDialog({
+      paths,
+      onVideo: async () => void calls.push("video"),
+      onImage: async () => void calls.push("image"),
+      onPdf: (sizing) => {
+        pdfCalls.push(sizing);
+        return work();
+      },
+      onClosed: () => calls.push("closed"),
+    });
+    openClosers.push(close);
+    return { calls, pdfCalls };
+  }
+  const pdfOption = (): El | undefined => backdrop()!.find((e) => e.dataset.kind === "pdf")[0];
+  const sizeSelect = (): El | undefined => backdrop()!.find((e) => e.tagName === "SELECT")[0];
+
+  beforeEach(() => resetOpenAsSizing());
+
+  it("allPictures: only when every file is a picture (a GIF is not one)", () => {
+    expect(allPictures(["a.png", "b.JPG", "c.webp"])).toBe(true);
+    expect(allPictures(["a.png", "b.gif"])).toBe(false);
+    expect(allPictures(["a.png", "b.mp4"])).toBe(false);
+    expect(allPictures([])).toBe(false);
+  });
+
+  it("is offered for pictures, with its hint and a Page size select defaulting to Picture size", () => {
+    openWithPdf(["C:\\p\\a.png", "C:\\p\\b.jpg"]);
+    const pdf = pdfOption()!;
+    expect(pdf.disabled).toBe(false);
+    expect(pdf.textContent).toContain("PDF project");
+    expect(pdf.find((e) => e.className === "ctx-menu__hint")[0]!.textContent).toBe("Every picture a page");
+    const select = sizeSelect()!;
+    expect(select.children.map((o) => [o.value, o.textContent])).toEqual([
+      ["picture", "Picture size"],
+      ["a4", "A4"],
+      ["letter", "Letter"],
+    ]);
+    expect(select.value).toBe("picture");
+    expect(backdrop()!.find((e) => e.tagName === "LABEL")[0]!.textContent).toBe("Page size");
+    // focus still opens on Video project
+    expect(doc.activeElement).toBe(option("video"));
+  });
+
+  it("is offered for more pictures than an image project takes", () => {
+    const many = Array.from({ length: MAX_OPEN_AS_PICTURES + 5 }, (_, i) => `C:\\p\\s${i}.jpg`);
+    openWithPdf(many);
+    expect(option("image").disabled).toBe(true);
+    expect(pdfOption()!.disabled).toBe(false);
+  });
+
+  it("is not offered when any file is not a picture, nor without a handler", () => {
+    openWithPdf(["C:\\p\\a.png", "C:\\p\\b.mp4"]);
+    expect(pdfOption()).toBeUndefined();
+    expect(sizeSelect()).toBeUndefined();
+    for (const c of openClosers.splice(0)) c();
+    open(["C:\\p\\a.png"]);
+    expect(pdfOption()).toBeUndefined();
+  });
+
+  it("calls back once with the chosen size, busy like the others, and remembers the size for the session", async () => {
+    const work = deferred();
+    const { calls, pdfCalls } = openWithPdf(["C:\\p\\a.png"], () => work.promise);
+    sizeSelect()!.value = "letter";
+    pdfOption()!.click();
+    pdfOption()!.click();
+    expect(pdfCalls).toEqual(["letter"]);
+    expect(option("video").disabled).toBe(true);
+    expect(option("image").disabled).toBe(true);
+    expect(pdfOption()!.disabled).toBe(true);
+    expect(sizeSelect()!.disabled).toBe(true);
+    expect(pdfOption()!.dataset.pending).toBe("");
+    work.resolve();
+    await flush();
+    expect(calls).toEqual(["closed"]);
+    expect(backdrop()).toBeUndefined();
+    openWithPdf(["C:\\p\\b.png"]);
+    expect(sizeSelect()!.value).toBe("letter");
   });
 });

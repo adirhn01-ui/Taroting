@@ -15,14 +15,14 @@
 import fontkit from "@pdf-lib/fontkit";
 import { PDFDict, PDFDocument, PDFName, degrees } from "pdf-lib";
 import { ipc } from "../../core/ipc";
-import type { PdfExportPreset, ProjectFile } from "../../core/types";
+import type { PdfAnnot, PdfExportPreset, ProjectFile } from "../../core/types";
 import { assemble, drawFieldAppearances, type Assembled } from "./assemble";
 import { checkpoints, throwIfAborted } from "./cancel";
 import { appDeps, type ExportDeps } from "./deps";
 import { PdfExportError, baseName, own } from "./errors";
 import { clearNeedAppearances, drawMissingFieldAppearances } from "./fields";
 import { fieldsNeedingAppearance, flattenForms, separateDuplicateFields } from "./flatten";
-import { buildAppearance, markContext, pageGeom, placeAppearances, type Appearance } from "./marks";
+import { buildAppearance, markContext, pageGeom, placeAppearances, placeUnderlay, type Appearance } from "./marks";
 import { planExtract } from "./plan";
 import type { PdfSaveIpc } from "./write";
 import { writePdf } from "./write";
@@ -140,12 +140,16 @@ export async function buildPdf(project: ProjectFile, opts: PdfExportOptions, dep
     const page = pages[i]!;
     const geom = pageGeom(page);
     const items: { id: string; app: Appearance }[] = [];
-    for (const a of marks) {
+    // page pictures (bg, model.ts isPagePicture) are the page: always
+    // content, first, under all
+    const under: { id: string; app: Appearance }[] = [];
+    for (const a of marks as PdfAnnot[]) {
       await tick();
       const app = await buildAppearance(a, geom, cx);
-      if (app && app.ops) items.push({ id: a.id, app });
+      if (app && app.ops) (a.t === "image" && a.bg === true ? under : items).push({ id: a.id, app });
     }
     await tick();
+    placeUnderlay(doc, page, under);
     placeAppearances(doc, page, items, opts.flattenMarks, now);
   }
 

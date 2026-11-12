@@ -229,6 +229,12 @@ export interface KeyframeIndex {
   /** The file's size on disk, bytes. Over `duration`: its overall bit rate. */
   bytes: number;
 }
+/** Mirror of `ScrubPlan` in src-tauri/src/media/scrub.rs. `pending`: the
+ *  job's `job:done` carries `output.path`, `job:failed` ends it. */
+export type ScrubPlan =
+  | { mode: "ready"; path: string }
+  | { mode: "pending"; jobId: number }
+  | { mode: "unavailable"; reason: string };
 export interface PlaybackClassInfo {
   class: PlaybackClass;
   /** a remux/proxy of this exact file ({path,size,mtimeMs}) is already in the cache, so planning
@@ -381,6 +387,10 @@ export const ipc = {
   /** The keyframes of a video file (no decode; MP4/MOV only), for scrubbing.
    *  null when they cannot be read: every seek is then exact. */
   keyframeTimes: (path: string) => call<KeyframeIndex | null>("keyframe_times", { path }, () => null),
+  /** The viewer's all-keyframe scrub copy of the video it plays at `path`
+   *  (`media/scrub.rs`): ready, being made (cancel with cancelJob), or none. */
+  planScrub: (path: string) =>
+    call<ScrubPlan>("plan_scrub", { path }, () => ({ mode: "unavailable", reason: "only in the desktop app" })),
   /** Pure: one decision + cache stats, no job, no ffmpeg. */
   classifyPlayback: (media: MediaRef, hints: CodecHints, forceProxyLarge: boolean) =>
     call<PlaybackClassInfo>("classify_playback", { media, hints, forceProxyLarge },
@@ -704,6 +714,19 @@ export async function pickImageFile(): Promise<string | null> {
   return typeof result === "string" ? result : null;
 }
 
+/** Any number of still images (the same family as `pickImageFile`): pictures
+ *  added to a PDF project as pages. Empty when the picker is closed. */
+export async function pickImageFiles(): Promise<string[]> {
+  if (!inTauri) return [];
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const result = await open({
+    multiple: true,
+    filters: [{ name: "Images", extensions: [...MEDIA_EXTENSIONS.image] }],
+  });
+  if (result === null) return [];
+  return Array.isArray(result) ? result : [result];
+}
+
 /** PDF documents (the document family of media-extensions.json): a new PDF
  *  project, or pages to insert into one. */
 export async function pickPdfFiles(multiple: boolean): Promise<string[]> {
@@ -715,6 +738,15 @@ export async function pickPdfFiles(multiple: boolean): Promise<string[]> {
   });
   if (result === null) return [];
   return Array.isArray(result) ? result : [result];
+}
+
+/** One folder (the PDF editor's "export pages as pictures"), opening at
+ *  `defaultPath` when given; null when the user closes the picker. */
+export async function pickFolder(defaultPath?: string): Promise<string | null> {
+  if (!inTauri) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const result = await open({ directory: true, multiple: false, defaultPath: defaultPath || undefined });
+  return typeof result === "string" ? result : null;
 }
 
 /** Font files to import into the library (Settings): .ttf and .otf, many. */

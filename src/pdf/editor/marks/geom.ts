@@ -8,7 +8,7 @@
 // at its crop box's top-left, y down. `zoom` = CSS px per point.
 
 import type { PdfAnnot, PdfRotation } from "../../../core/types";
-import { annotBounds, type Box } from "../../model";
+import { annotBounds, isPagePicture, type Box } from "../../model";
 import { decodePoints, encodePoints } from "../../../image/strokes";
 import { segSegDistance } from "../../../image/ink/eraser";
 import { arrowWings } from "../../../image/ink/shapes";
@@ -318,10 +318,12 @@ export function sweepHit(a: PdfAnnot, ax: number, ay: number, bx: number, by: nu
   }
 }
 
-/** The topmost mark under a point (marks draw bottom first), or null. */
+/** The topmost mark under a point (marks draw bottom first), or null. A page
+ *  picture (`bg`) is the page itself: never hit. */
 export function topmostAt(list: readonly PdfAnnot[], x: number, y: number, tol: number): PdfAnnot | null {
   for (let i = list.length - 1; i >= 0; i--) {
     const a = list[i]!;
+    if (isPagePicture(a)) continue;
     if (sweepHit(a, x, y, x, y, tol)) return a;
   }
   return null;
@@ -337,9 +339,11 @@ export function boxFrom(x0: number, y0: number, x1: number, y1: number): Box {
   return [Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0)];
 }
 
-/** The marks a marquee touches (by their bounds), bottom first. */
+/** The marks a marquee touches (by their bounds), bottom first; never a page
+ *  picture. */
 export function marqueeHits(list: readonly PdfAnnot[], m: Box): PdfAnnot[] {
   return list.filter((a) => {
+    if (isPagePicture(a)) return false;
     const b = annotBounds(a);
     return (b[2] > 0 || b[3] > 0) && boxesTouch(b, m);
   });

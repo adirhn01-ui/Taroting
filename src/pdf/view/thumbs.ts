@@ -31,6 +31,16 @@ interface Item {
   shows: string;
   /** its page size has been asked for (lazily, once it comes near) */
   measured: boolean;
+  /** the page picture it shows (0.9.5): what it is (`pictureSig`) and its
+   *  element, handed to the next build's item for the same picture */
+  pic?: { sig: string; holder: HTMLDivElement };
+}
+
+/** Everything a shown page picture depends on: the file, its box, the page's
+ *  turn and size. Equal → the element already decoded can be kept. */
+function pictureSig(p: PdfViewPage): string {
+  const pic = p.picture!;
+  return `${pic.file}|${pic.x}|${pic.y}|${pic.w}|${pic.h}|${p.rotate}|${p.w}|${p.h}`;
 }
 
 const docIds = new WeakMap<PdfDoc, number>();
@@ -48,6 +58,43 @@ type PageLike = {
   render(o: Record<string, unknown>): { promise: Promise<void>; cancel(): void };
   cleanup(): boolean;
 };
+
+/** Where a page picture sits in a thumbnail, in % of the thumbnail (the page
+ *  as shown, turned clockwise by `rot`), and the picture's own size and turn
+ *  inside that box (% of the box: a sideways picture's width is the box's
+ *  height). `pic` is in fractions of the UNROTATED w×h page. Pure. */
+export function pictureBox(
+  pic: { x: number; y: number; w: number; h: number },
+  rot: PdfRotation,
+  w: number,
+  h: number,
+): { left: number; top: number; width: number; height: number; imgW: number; imgH: number; turn: PdfRotation } {
+  const pct = (v: number): number => Math.round(v * 1e5) / 1e3;
+  const { x, y } = pic;
+  const fw = pic.w;
+  const fh = pic.h;
+  let r: [number, number, number, number];
+  switch (rot) {
+    case 90:
+      r = [1 - y - fh, x, fh, fw];
+      break;
+    case 180:
+      r = [1 - x - fw, 1 - y - fh, fw, fh];
+      break;
+    case 270:
+      r = [y, 1 - x - fw, fh, fw];
+      break;
+    default:
+      r = [x, y, fw, fh];
+  }
+  const side = rot === 90 || rot === 270;
+  // the box in points as shown: sideways, its width is the picture's height
+  const boxW = side ? fh * h : fw * w;
+  const boxH = side ? fw * w : fh * h;
+  const imgW = side && boxW > 0 ? (fw * w) / boxW : 1;
+  const imgH = side && boxH > 0 ? (fh * h) / boxH : 1;
+  return { left: pct(r[0]), top: pct(r[1]), width: pct(r[2]), height: pct(r[3]), imgW: pct(imgW), imgH: pct(imgH), turn: rot };
+}
 
 export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
   const el = document.createElement("div");
@@ -86,6 +133,7 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
         if (it.near) {
           measure(it);
           want(it);
+          showPicture(it);
         } else queue.delete(it);
       }
       schedule();
@@ -104,6 +152,44 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
       return;
     }
     queue.add(it);
+  }
+
+  /** A blank page's page picture (the editor's picture pages, 0.9.5): the
+   *  app's small cached thumbnail of the file (`thumb`), the original only
+   *  when that fails, placed in the thumbnail at its box and turned with the
+   *  page. Set once, when the item first comes near (the browser decodes it,
+   *  off this thread; nothing is asked for an item never seen), and kept
+   *  across rebuilds while the picture is unchanged (`build`). */
+  function showPicture(it: Item): void {
+    const pic = it.page.picture;
+    if (!pic || it.page.doc || it.pic) return;
+    const box = pictureBox(pic, it.page.rotate, it.page.w ?? DEFAULT_PAGE_W, it.page.h ?? DEFAULT_PAGE_H);
+    const holder = document.createElement("div");
+    holder.className = "pdfv-thumb__pic";
+    holder.style.cssText = `position:absolute;overflow:hidden;left:${box.left}%;top:${box.top}%;width:${box.width}%;height:${box.height}%`;
+    const img = document.createElement("img");
+    img.alt = "";
+    img.decoding = "async";
+    img.draggable = false;
+    img.style.cssText = `position:absolute;left:50%;top:50%;width:${box.imgW}%;height:${box.imgH}%;transform:translate(-50%,-50%)${box.turn ? ` rotate(${box.turn}deg)` : ""}`;
+    const original = (): void => {
+      img.onerror = null;
+      if (!disposed) img.src = pic.url;
+    };
+    if (pic.thumb) {
+      pic.thumb().then(
+        (url) => {
+          if (disposed) return;
+          img.onerror = original;
+          img.src = url;
+        },
+        original,
+      );
+    } else original();
+    holder.appendChild(img);
+    it.img.style.position = "relative";
+    it.img.appendChild(holder);
+    it.pic = { sig: pictureSig(it.page), holder };
   }
 
   function attach(it: Item, canvas: HTMLCanvasElement, k: string): void {
@@ -247,7 +333,18 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
   }
 
   function build(pages: PdfViewPage[]): void {
-    for (const it of items) io.unobserve(it.el);
+    // page pictures already shown, by what they show: an unchanged one moves
+    // to its new item as is (no new request, no new decode)
+    let kept: Map<string, HTMLDivElement[]> | null = null;
+    for (const it of items) {
+      io.unobserve(it.el);
+      if (it.pic) {
+        kept ??= new Map();
+        const list = kept.get(it.pic.sig);
+        if (list) list.push(it.pic.holder);
+        else kept.set(it.pic.sig, [it.pic.holder]);
+      }
+    }
     queue.clear();
     running?.cancel();
     list.textContent = "";
@@ -275,6 +372,15 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
         sizeItem(it, DEFAULT_PAGE_W, DEFAULT_PAGE_H, displayRotation(0, p.rotate));
       } else {
         sizeItem(it, p.w ?? DEFAULT_PAGE_W, p.h ?? DEFAULT_PAGE_H, p.rotate);
+        if (kept && p.picture) {
+          const sig = pictureSig(p);
+          const holder = kept.get(sig)?.pop();
+          if (holder) {
+            img.style.position = "relative";
+            img.appendChild(holder);
+            it.pic = { sig, holder };
+          }
+        }
       }
       return it;
     });

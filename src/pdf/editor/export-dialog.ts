@@ -1,6 +1,7 @@
 // The PDF editor's Export dialog: the document as a new PDF (all pages or a
-// range, marks and form fields optionally flattened), or one page as a
-// picture (PNG / JPEG at 100-300 %), with "Open as image project".
+// range, marks and form fields optionally flattened), or pages as pictures
+// (PNG / JPEG at 100-300 %): one page (a Save As name, plus "Open as image
+// project"), or all pages / a range into a folder, one file per page.
 //
 // Mirrors the image editor's export dialog (src/image/export-dialog.ts) —
 // the same `.export-*` rows, segmented controls, file name + folder row with
@@ -18,7 +19,7 @@ import "./export-dialog.css";
 import { registerCloseTask } from "../../core/app-close";
 import { createExportRunHold } from "../../core/export-hold";
 import { escapeHtml, fileExt, fileStem } from "../../core/format";
-import { errorDetail, ipc } from "../../core/ipc";
+import { errorDetail, ipc, pickFolder } from "../../core/ipc";
 import { pdfSourcePaths } from "../../core/pdf-project";
 import { settingsStore, updateSettings } from "../../core/session";
 import type { PdfExportPreset, ProjectFile, Settings } from "../../core/types";
@@ -48,7 +49,7 @@ import type { PdfSaveIpc } from "../export/write";
 import { setExportPreset } from "../model";
 import type { PdfEditorCtx } from "../types";
 import { CANVAS_MAX_AREA } from "../view/math";
-import { renderPageImage, saveImageBlob } from "./page-image";
+import { openPageImages, renderPageImage, saveImageBlob } from "./page-image";
 
 /* ---------------- pure helpers (tested) ---------------- */
 
@@ -142,6 +143,84 @@ export function pageImageSize(
   fit = Math.min(fit, Math.sqrt(CANVAS_MAX_AREA / (w0 * h0)));
   if (fit >= 1) return { w: Math.max(1, Math.round(w0)), h: Math.max(1, Math.round(h0)), reduced: false };
   return { w: Math.max(1, Math.floor(w0 * fit)), h: Math.max(1, Math.floor(h0 * fit)), reduced: true };
+}
+
+/* ---------------- several pages as pictures (tested) ---------------- */
+
+/** The Image tab's pages choice: the one page typed (the original export),
+ *  every page, or a typed range. */
+export type ImagePagesMode = "one" | "all" | "range";
+export type PageListCheck = { ok: true; pages: number[] } | { ok: false; error: string };
+
+/** "All pages" / "Page range" → the 1-based pages to write, in document
+ *  order. The range is read and refused by checkPageRange (the PDF tab's own
+ *  parser and wording). */
+export function imagePageList(mode: "all" | "range", from: string, to: string, count: number): PageListCheck {
+  if (count < 1) return { ok: false, error: PDF_EXPORT_MESSAGES.empty };
+  let a = 1;
+  let b = count;
+  if (mode === "range") {
+    const r = checkPageRange(from, to, count);
+    if (!r.ok) return r;
+    if (r.range) [a, b] = r.range;
+  }
+  const pages: number[] = [];
+  for (let n = a; n <= b; n++) pages.push(n);
+  return { ok: true, pages };
+}
+
+/** A page picture's file name — the single-page export's default name:
+ *  `<project name> - page N.<ext>`, N as the user sees it, no padding. */
+export function pageImageFileName(projectName: string, n: number, ext: string): string {
+  return `${sanitizeFileName(`${projectName} - page ${n}`)}.${ext}`;
+}
+
+export const PAGES_ORIGINAL_WARNING =
+  "One of these pictures would replace one of the project's own files — choose a different folder. Originals are never changed.";
+export const OPEN_AS_IMAGE_ONE_PAGE = "Open as image project takes one page — choose This page.";
+export const PAGES_REDUCED_NOTE = "Some pages are large — they will be exported at a smaller size.";
+export const PAGE_SIZE_UNREAD = "This page's size couldn't be read.";
+
+export function pageSourceUnopened(n: number): string {
+  return `Page ${n}'s PDF couldn't be opened.`;
+}
+
+export function replaceWarning(count: number): string {
+  return count === 1 ? "1 file in this folder will be replaced." : `${count} files in this folder will be replaced.`;
+}
+
+/** The progress line: "Exporting page 3 of 12" for the whole document,
+ *  "Exporting page 6 (2 of 4)" for a range. */
+export function pagesProgressPhase(n: number, k: number, total: number, whole: boolean): string {
+  return whole ? `Exporting page ${n} of ${total}` : `Exporting page ${n} (${k} of ${total})`;
+}
+
+export function pagesCanceledMessage(written: number, total: number): string {
+  return written === 0 ? "Export canceled" : `Export canceled. ${written} of ${total} pictures were saved.`;
+}
+
+export function pageFailedMessage(n: number, reason: string, written: number): string {
+  const kept =
+    written === 0
+      ? ""
+      : written === 1
+        ? " The picture saved before it is still in the folder."
+        : ` The ${written} pictures saved before it are still in the folder.`;
+  return `Page ${n} couldn't be exported. ${reason}${kept}`;
+}
+
+export function pagesExportedTitle(count: number): string {
+  return count === 1 ? "Exported 1 page" : `Exported ${count} pages`;
+}
+
+/** How many of `paths` exist, asked a batch at a time. */
+async function countExisting(paths: readonly string[]): Promise<number> {
+  let n = 0;
+  for (let i = 0; i < paths.length; i += 32) {
+    const got = await Promise.all(paths.slice(i, i + 32).map((p) => pathExists(p)));
+    n += got.filter(Boolean).length;
+  }
+  return n;
 }
 
 /** Last export folder, else the default one, else the first source's folder
@@ -274,6 +353,12 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
   let imgName = defaultImageName(Number(pageText));
   /** the page box (points, as shown) of the Image tab's page, once known */
   let pageBox: { page: number; w: number; h: number; rotate: number } | null = null;
+  /** several pages: which, and the boxes read so far (1-based page → box) */
+  let imgPages: ImagePagesMode = "one";
+  let imgFrom = "1";
+  let imgTo = String(Math.max(1, pages()));
+  const boxes = new Map<number, { w: number; h: number; rotate: number } | null>();
+  let scanGen = 0;
 
   let folder = defaultPdfFolder(settingsStore.get(), session.project);
   // The default folder is often the source PDF's own: never offer to write the
@@ -306,8 +391,13 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
   let run: AbortController | null = null;
   let running: Promise<void> | null = null;
   let lastTaskbarPct = -1;
+  /** The run was stopped by something other than the user's Cancel (the
+   *  app closing, the editor going away, another dialog): the several-pages
+   *  export then writes no further file, not even the page in flight. */
+  let forced = false;
 
   const runHold = createExportRunHold(session, registerCloseTask, async () => {
+    forced = true;
     run?.abort();
     await running?.catch(() => {});
   });
@@ -334,6 +424,7 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
   /** The editor going away (or a second dialog opening): abort and close. */
   function forceClose(): void {
     if (closed) return;
+    forced = true;
     run?.abort();
     exporting = false;
     teardown();
@@ -383,6 +474,19 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
   function outPath(): string {
     return joinPath(folder, `${filename()}.${ext()}`);
   }
+  /** Where several pages go: every file, by page number. */
+  function pageTargets(list: readonly number[]): string[] {
+    const e = ext();
+    return list.map((n) => joinPath(folder, pageImageFileName(session.project.name, n, e)));
+  }
+  /** The first file and the last one's name, for the path line. */
+  function pagesOutText(): string {
+    const l = imageList();
+    if (!l.ok) return "";
+    const first = pageTargets([l.pages[0]!])[0]!;
+    if (l.pages.length === 1) return first;
+    return `${first} … ${pageImageFileName(session.project.name, l.pages[l.pages.length - 1]!, ext())}`;
+  }
   /** The project's own files as the overwrite check reads them. */
   function sourcesAsMedia(): { path: string }[] {
     return pdfSourcePaths(session.project).map((path) => ({ path }));
@@ -409,10 +513,10 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
     return ctx.docs.has(pg.src) ? null : PAGE_SOURCE_UNOPENED;
   }
 
-  /** The page box of page `n` (1-based) as the view shows it. */
-  async function loadPageBox(n: number): Promise<void> {
+  /** The page box of page `n` (1-based) as the view shows it, or null. */
+  async function readPageBox(n: number): Promise<{ w: number; h: number; rotate: number } | null> {
     const pg = session.project.pdf?.pages[n - 1];
-    if (!pg) return;
+    if (!pg) return null;
     let w: number;
     let h: number;
     let rotate: number = pg.rotate;
@@ -421,21 +525,54 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
       [w, h] = ok(pg.w) && ok(pg.h) ? [pg.w, pg.h] : DEFAULT_BLANK;
     } else {
       const doc = ctx.docs.get(pg.src);
-      if (!doc) return;
+      if (!doc) return null;
       try {
         const info = await doc.pageInfo(pg.page);
         w = info.w;
         h = info.h;
         rotate += info.rotate;
       } catch {
-        return;
+        return null;
       }
     }
+    return { w, h, rotate };
+  }
+
+  /** The page box of page `n` (1-based) as the view shows it. */
+  async function loadPageBox(n: number): Promise<void> {
+    const box = await readPageBox(n);
+    if (!box) return;
     // Typed on meanwhile ("1" then "12"): an older answer must not replace
     // the box of the page now asked for.
     if (closed || imagePage() !== n) return;
-    pageBox = { page: n, w, h, rotate };
+    pageBox = { page: n, ...box };
     refresh();
+  }
+
+  /** Several pages chosen on the Image tab. */
+  function multi(): boolean {
+    return tab === "image" && imgPages !== "one";
+  }
+  function imageList(): PageListCheck {
+    return imagePageList(imgPages === "range" ? "range" : "all", imgFrom, imgTo, pages());
+  }
+  /** Reads the boxes of the chosen pages not read yet (for the "reduced"
+   *  note), one after another; a newer choice takes over. */
+  async function scanBoxes(): Promise<void> {
+    const l = imageList();
+    if (!l.ok) return;
+    const gen = ++scanGen;
+    let changed = false;
+    for (const n of l.pages) {
+      if (boxes.has(n)) continue;
+      const box = await readPageBox(n);
+      if (closed || gen !== scanGen) return;
+      boxes.set(n, box);
+      changed = true;
+    }
+    // A late answer is not a change of the user's choices: an open
+    // replace/own-file strip stays.
+    if (changed) refresh(true);
   }
 
   /* ============================ FORM ============================ */
@@ -484,8 +621,27 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
       </div>`
           : ""
       }`;
+    const several = imgPages !== "one";
     const imageRows = `
       <div class="export-row">
+        <label>Pages</label>
+        <div class="export-seg" id="px-img-pages">
+          <button class="btn ${imgPages === "one" ? "btn--on" : ""}" data-pages="one">This page</button>
+          <button class="btn ${imgPages === "all" ? "btn--on" : ""}" data-pages="all">All pages</button>
+          <button class="btn ${imgPages === "range" ? "btn--on" : ""}" data-pages="range">Page range</button>
+        </div>
+      </div>
+      <div class="export-row ${imgPages === "range" ? "" : "export-row--hidden"}" id="px-img-range-row">
+        <label for="px-img-from">From</label>
+        <div class="export-row__control">
+          <input class="input export-num" id="px-img-from" type="number" min="1" max="${n}" step="1" value="${escapeHtml(imgFrom)}" aria-label="First page" />
+          <span class="export-dim-x">to</span>
+          <input class="input export-num" id="px-img-to" type="number" min="1" max="${n}" step="1" value="${escapeHtml(imgTo)}" aria-label="Last page" />
+          <span class="pdfx-of">of ${n}</span>
+        </div>
+      </div>
+      <div class="export-note" id="px-note-img-range" hidden></div>
+      <div class="export-row ${several ? "export-row--hidden" : ""}" id="px-page-row">
         <label for="px-page">Page</label>
         <div class="export-row__control">
           <input class="input export-num" id="px-page" type="number" min="1" max="${n}" step="1" value="${escapeHtml(pageText)}" />
@@ -522,7 +678,7 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
       <div class="export-form">
         ${tabs}
         ${tab === "pdf" ? pdfRows : imageRows}
-        <div class="export-row">
+        <div class="export-row ${multi() ? "export-row--hidden" : ""}" id="px-name-row">
           <label for="px-name">File name</label>
           <div class="export-row__control">
             <input class="input" id="px-name" value="${escapeHtml(filename())}" spellcheck="false" />
@@ -550,12 +706,13 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
     if (tab === "image") {
       const n1 = imagePage();
       if (n1 !== null && (!pageBox || pageBox.page !== n1)) void loadPageBox(n1);
+      if (multi()) void scanBoxes();
     }
     if (!backdrop.contains(document.activeElement)) focusFirst(backdrop, "#px-run");
   }
 
   /** Everything derived, written in place (the slider keeps its drag). */
-  function refresh(): void {
+  function refresh(keepWarning = false): void {
     let ok = true;
     if (tab === "pdf") {
       const r = rangeCheck();
@@ -565,6 +722,42 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
         note.textContent = r.ok ? "" : r.error;
       }
       ok = r.ok;
+    } else if (multi()) {
+      const l = imageList();
+      const noteRange = q<HTMLElement>("#px-note-img-range");
+      if (noteRange) {
+        noteRange.hidden = l.ok;
+        noteRange.textContent = l.ok ? "" : l.error;
+      }
+      q<HTMLElement>("#px-note-page")?.setAttribute("hidden", "");
+      const unopened = l.ok ? (l.pages.find((p) => pageProblem(p) !== null) ?? null) : null;
+      const noteSrc = q<HTMLElement>("#px-note-source");
+      if (noteSrc) {
+        noteSrc.hidden = unopened === null;
+        noteSrc.textContent = unopened === null ? "" : pageSourceUnopened(unopened);
+      }
+      const px = q<HTMLElement>("#px-px");
+      if (px) px.textContent = "";
+      const reduced =
+        l.ok &&
+        l.pages.some((p) => {
+          const b = boxes.get(p);
+          return !!b && pageImageSize(b.w, b.h, b.rotate, scale).reduced;
+        });
+      const red = q<HTMLElement>("#px-note-reduced");
+      if (red) {
+        red.hidden = !reduced;
+        red.textContent = reduced ? PAGES_REDUCED_NOTE : "";
+      }
+      const qVal = q<HTMLElement>("#px-quality-value");
+      if (qVal) qVal.textContent = String(quality);
+      q<HTMLElement>("#px-quality-row")?.classList.toggle("export-row--hidden", imgFormat !== "jpeg");
+      ok = l.ok && unopened === null;
+      const openBtn = q<HTMLButtonElement>("#px-open-image");
+      if (openBtn) {
+        openBtn.disabled = true;
+        openBtn.title = OPEN_AS_IMAGE_ONE_PAGE;
+      }
     } else {
       const n = imagePage();
       const notePage = q<HTMLElement>("#px-note-page");
@@ -589,11 +782,11 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
     const e = q<HTMLElement>("#px-ext");
     if (e) e.textContent = `.${ext()}`;
     const out = q<HTMLElement>("#px-outpath");
-    if (out) out.textContent = outPath();
+    if (out) out.textContent = multi() ? pagesOutText() : outPath();
     const runBtn = q<HTMLButtonElement>("#px-run");
     if (runBtn) runBtn.disabled = !ok;
     const slot = q<HTMLElement>("#px-warn-slot");
-    if (slot && slot.childElementCount) slot.innerHTML = "";
+    if (slot && slot.childElementCount && !keepWarning) slot.innerHTML = "";
   }
 
   function segClick(sel: string, attr: string, onPick: (v: string) => void): void {
@@ -640,6 +833,24 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
         flattenForms = ff.checked;
       });
     } else {
+      segClick("#px-img-pages", "data-pages", (v) => {
+        const next: ImagePagesMode = v === "all" ? "all" : v === "range" ? "range" : "one";
+        if (next === imgPages) return;
+        imgPages = next;
+        renderForm();
+      });
+      const imgFromEl = q<HTMLInputElement>("#px-img-from")!;
+      const imgToEl = q<HTMLInputElement>("#px-img-to")!;
+      imgFromEl.addEventListener("input", () => {
+        imgFrom = imgFromEl.value;
+        refresh();
+        void scanBoxes();
+      });
+      imgToEl.addEventListener("input", () => {
+        imgTo = imgToEl.value;
+        refresh();
+        void scanBoxes();
+      });
       const page = q<HTMLInputElement>("#px-page")!;
       page.addEventListener("input", () => {
         pageText = page.value;
@@ -690,6 +901,15 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
   }
 
   async function chooseDestination(): Promise<string | null> {
+    if (multi()) {
+      const dir = await pickFolder(folder || undefined);
+      if (!dir || closed) return null;
+      folder = dir;
+      const folderInput = q<HTMLInputElement>("#px-folder");
+      if (folderInput) folderInput.value = folder;
+      refresh();
+      return folder;
+    }
     const e = ext();
     const filters =
       tab === "pdf"
@@ -743,8 +963,75 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
     if (!backdrop.contains(document.activeElement)) focusFirst(backdrop, "#px-run");
   }
 
+  /** The several-pages strip: Replace (when offered) and Cancel, Cancel
+   *  focused — replacing is what a stray Enter must not do. */
+  function showPagesWarning(message: string, onReplace: (() => void) | null): void {
+    const slot = q<HTMLElement>("#px-warn-slot");
+    if (!slot) return;
+    slot.innerHTML = `
+      <div class="export-warn">
+        ${icon("warning", 16)}
+        <div class="export-warn__msg">${escapeHtml(message)}</div>
+        <div class="export-warn__actions">
+          ${onReplace === null ? "" : `<button class="btn btn--sm" data-w="replace">Replace</button>`}
+          <button class="btn btn--sm" data-w="cancel">Cancel</button>
+        </div>
+      </div>`;
+    const clear = (): void => {
+      slot.innerHTML = "";
+      reseat();
+    };
+    slot.querySelector('[data-w="replace"]')?.addEventListener("click", () => {
+      clear();
+      onReplace?.();
+    });
+    const cancel = slot.querySelector<HTMLButtonElement>('[data-w="cancel"]')!;
+    cancel.addEventListener("click", clear);
+    cancel.focus();
+  }
+
+  /** Export with several pages chosen: a folder, the names checked against
+   *  the project's own files and against what is already there, then one
+   *  page after another. */
+  async function onExportPagesClick(): Promise<void> {
+    const l = imageList();
+    if (!l.ok) {
+      toast.refuse(l.error);
+      return;
+    }
+    if (!folder) {
+      const picked = await chooseDestination();
+      if (!picked) return;
+    }
+    const bad = destinationProblem(folder);
+    if (bad) {
+      toast.refuse(bad);
+      return;
+    }
+    const folderExists = await pathExists(folder);
+    if (closed) return;
+    if (!folderExists) {
+      toast.refuse(MISSING_FOLDER);
+      return;
+    }
+    const targets = pageTargets(l.pages);
+    const media = sourcesAsMedia();
+    if (targets.some((t) => isProjectSource(t, media))) {
+      showPagesWarning(PAGES_ORIGINAL_WARNING, null);
+      return;
+    }
+    const taken = await countExisting(targets);
+    if (closed) return;
+    if (taken > 0) {
+      showPagesWarning(replaceWarning(taken), () => void beginPagesExport(l.pages, targets));
+      return;
+    }
+    void beginPagesExport(l.pages, targets);
+  }
+
   async function onExportClick(): Promise<void> {
     if (exporting) return;
+    if (multi()) return onExportPagesClick();
     if (tab === "pdf") {
       const r = rangeCheck();
       if (!r.ok) {
@@ -818,6 +1105,7 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
   function start(): AbortController {
     const ac = new AbortController();
     run = ac;
+    forced = false;
     exporting = true;
     lastTaskbarPct = -1;
     runHold.hold();
@@ -895,6 +1183,94 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
           return;
         }
         renderError(describeExportFailure(e), e);
+      }
+    })();
+    running = job;
+    return job;
+  }
+
+  /** Several pages as pictures, ONE at a time: the chosen pages are built
+   *  into one PDF and opened once (openPageImages), then each page is
+   *  rendered, saved and let go before the next one starts, so a long
+   *  document at 300 % never holds more than one page. The user's Cancel
+   *  lets the page in flight finish (no half-written file) and stops there;
+   *  a forced close (app closing, editor left, another dialog) saves nothing
+   *  more, not even the page in flight; a page that fails stops the run.
+   *  Either way the pictures already saved stay. */
+  function beginPagesExport(list: readonly number[], targets: readonly string[]): Promise<void> {
+    if (exporting || closed) return Promise.resolve();
+    rememberChoices();
+    const dir = folder;
+    const fmt = imgFormat;
+    const q100 = quality;
+    const sc = scale;
+    const total = list.length;
+    const whole = total === pages() && list[0] === 1;
+    const ac = start();
+    let written = 0;
+    let lastPath = "";
+    let current = 0;
+    const job = (async (): Promise<void> => {
+      try {
+        // The project as it is now: one build for the whole run.
+        const project = session.project;
+        const sources = pdfSourcePaths(project);
+        progress(0, pagesProgressPhase(list[0]!, 1, total, whole));
+        // A Cancel while preparing stops the build: nothing is written.
+        const images = await openPageImages(project, list, ac.signal);
+        try {
+          for (let i = 0; i < total; i++) {
+            if (ac.signal.aborted) break;
+            const n = list[i]!;
+            current = n;
+            const phase = pagesProgressPhase(n, i + 1, total, whole);
+            progress(i / total, phase);
+            const box = boxes.get(n) ?? (await readPageBox(n));
+            if (!box) throw new Error(PAGE_SIZE_UNREAD);
+            const size = pageImageSize(box.w, box.h, box.rotate, sc);
+            const blob = await images.render({
+              page: n,
+              w: size.w,
+              h: size.h,
+              type: fmt === "jpeg" ? "image/jpeg" : "image/png",
+              quality: q100,
+            });
+            // Forced close while this page rendered: no further file.
+            if (forced || closed) break;
+            const saved = await saveImageBlob({ kind: "user", path: targets[i]!, sources }, fmt, blob, undefined, (x) =>
+              progress((i + 0.8 + x * 0.2) / total, phase),
+            );
+            written++;
+            lastPath = saved.path;
+          }
+        } finally {
+          await images.close();
+        }
+        if (closed) return;
+        finish();
+        // A Cancel that landed while the last page was in flight changed
+        // nothing: every chosen page was written.
+        if (ac.signal.aborted && written < total) {
+          toast.info(pagesCanceledMessage(written, total));
+          renderForm();
+          return;
+        }
+        renderSuccess(dir, pagesExportedTitle(written), lastPath);
+      } catch (e) {
+        if (closed) return;
+        finish();
+        if (current === 0) {
+          // Before the first page: the preparation was canceled or failed.
+          if (isAbort(e) || ac.signal.aborted) {
+            toast.info(pagesCanceledMessage(0, total));
+            renderForm();
+            return;
+          }
+          renderError(describeExportFailure(e), e);
+          return;
+        }
+        const f = describeExportFailure(e);
+        renderError({ code: f.code, message: pageFailedMessage(current, f.message, written) }, e);
       }
     })();
     running = job;
@@ -994,11 +1370,13 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
     }
   }
 
-  function renderSuccess(path: string): void {
+  /** `path` is shown; Show in folder selects `reveal` (several pages: the
+   *  folder is shown, the last picture selected). */
+  function renderSuccess(path: string, title = "Exported", reveal = path): void {
     bodyEl.innerHTML = `
       <div class="export-result">
         <div class="export-result__icon export-result__icon--ok">${checkIcon(24)}</div>
-        <div class="export-result__title">Exported</div>
+        <div class="export-result__title">${escapeHtml(title)}</div>
         <div class="export-result__path">${escapeHtml(path)}</div>
       </div>
     `;
@@ -1006,7 +1384,7 @@ export function openPdfExportDialog(ctx: PdfEditorCtx, opts?: PdfExportDialogOpt
       <button class="btn" id="px-reveal">${icon("folder", 14)}Show in folder</button>
       <button class="btn btn--primary" data-close-btn>Close</button>
     `;
-    q<HTMLElement>("#px-reveal")!.addEventListener("click", () => void revealInExplorer(path));
+    q<HTMLElement>("#px-reveal")!.addEventListener("click", () => void revealInExplorer(reveal));
     footerEl.querySelector("[data-close-btn]")!.addEventListener("click", () => close());
     focusFirst(backdrop, "[data-close-btn]");
   }

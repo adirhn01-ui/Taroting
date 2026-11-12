@@ -15,6 +15,7 @@ const h = vi.hoisted(() => ({
   settingsWrites: [] as Record<string, unknown>[],
   onDisk: new Set<string>(),
   renders: 0,
+  renderOpts: [] as unknown[],
   settings: { lastExportDir: null as string | null, defaultExportDir: null as string | null },
 }));
 
@@ -28,8 +29,9 @@ vi.mock("../editor/export/export-ipc", () => ({
 vi.mock("./render/export", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./render/export")>()),
   // Never finishes on its own: the progress view stays up until aborted.
-  renderImageExport: (_d: unknown, _o: unknown, signal: AbortSignal) => {
+  renderImageExport: (_d: unknown, o: unknown, signal: AbortSignal) => {
     h.renders++;
+    h.renderOpts.push(o);
     return new Promise((_, reject) => {
       signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
     });
@@ -79,6 +81,7 @@ beforeEach(() => {
   h.settingsWrites = [];
   h.onDisk = new Set();
   h.renders = 0;
+  h.renderOpts = [];
   h.settings = { lastExportDir: null, defaultExportDir: null };
 });
 afterEach(() => {
@@ -207,5 +210,31 @@ describe("image export: focus and the progress view", () => {
     const cancel = d.$("#ix-cancel");
     expect(cancel.className).toBe("btn");
     expect(h.settingsWrites).toEqual([{ lastExportDir: "E:\\Out" }]);
+  });
+});
+
+describe("image export: PDF (0.9.5)", () => {
+  it("picking PDF shows the quality (Lossless at 100), writes .pdf, and renders and remembers a PDF", async () => {
+    h.onDisk.add("E:\\Out");
+    const d = open();
+    expect(d.$("#ix-quality-row").classList.contains("export-row--hidden")).toBe(true); // PNG: no quality
+    d.$('[data-format="pdf"]').click();
+    expect(d.$('[data-format="pdf"]').classList.contains("btn--on")).toBe(true);
+    expect(d.$("#ix-quality-row").classList.contains("export-row--hidden")).toBe(false);
+    expect(d.$("#ix-quality-value").textContent).toBe("92");
+    const slider = d.$("#ix-quality");
+    slider.value = "100";
+    slider.dispatch("input");
+    expect(d.$("#ix-quality-value").textContent).toBe("Lossless");
+    expect(d.$("#ix-ext").textContent).toBe(".pdf");
+    d.$("#ix-folder").typeText("E:\\Out");
+    expect(d.$("#ix-outpath").textContent).toBe("E:\\Out\\IMG_0042 (edited).pdf");
+    d.$("#ix-size").value = "50";
+    d.$("#ix-size").dispatch("change");
+    d.$("#ix-run").click();
+    await settle();
+    // the EXPORTED pixel size (50 % of 641×361) is what the PDF page is laid out from
+    expect(h.renderOpts).toEqual([{ format: "pdf", quality: 100, outW: 321, outH: 181 }]);
+    expect(d.s.project.image?.export).toEqual({ format: "pdf", quality: 100, size: 50 });
   });
 });

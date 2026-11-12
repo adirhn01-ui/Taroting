@@ -291,7 +291,8 @@ export function sanitizePdfRuns(raw: unknown, text: string, base: PdfRunBase): P
  *    left out and the box kept
  *  - text: `runs` (0.9.4) per `sanitizePdfRuns` — never drops the box
  *  - text, image, signature: `r` kept only when 90, 180 or 270 (else absent)
- *  - image: `media` names an image in `imageMedia`
+ *  - image: `media` names an image in `imageMedia`; `bg` (a page picture)
+ *    kept only when exactly `true` (else absent)
  *  - signature: 1..1000 strokes, each decodes
  *  - ink + signature points of this mark at most `maxPoints` (the caller's
  *    remaining document budget)
@@ -316,7 +317,9 @@ export function sanitizePdfAnnot(
     if (t === "image") {
       const media = raw.media;
       if (typeof media !== "string" || !imageMedia.has(media)) return null;
-      return { id, t, ...b, media, ...turn };
+      // a page picture (0.9.5): kept only when literally `true`, so a project
+      // without one keeps exactly the shape it always had
+      return { id, t, ...b, media, ...turn, ...(raw.bg === true ? { bg: true as const } : {}) };
     }
     const c = pdfHexColor(raw.c);
     if (c === null) return null;
@@ -688,6 +691,8 @@ export function checkPdfInvariants(p: ProjectFile): string[] {
         // the optional parts are dropped alone, not with the box
         const lost = (["bg", "border", "fontId", "runs"] as const).filter((k) => k in a && !(k in clean));
         if (lost.length) errors.push(`mark ${String(a.id)}: invalid ${lost.join(", ")}`);
+      } else if (a.t === "image" && clean.t === "image" && "bg" in a && !("bg" in clean)) {
+        errors.push(`mark ${String(a.id)}: invalid bg`);
       }
       if (annotIds.has(a.id)) errors.push(`mark ${a.id}: duplicate id`);
       annotIds.add(a.id);

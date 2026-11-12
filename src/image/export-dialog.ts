@@ -43,10 +43,11 @@ import { saveBlob } from "./save";
 
 /** Where the project's first photo came from, for the default name
  *  (`<stem> (edited)`) and format. `ext` null = no photo, or one whose format
- *  the export does not write (then PNG). */
+ *  the export does not write (then PNG). "pdf" = a picture that came out of
+ *  a PDF goes back as one. */
 export interface ExportSourceHint {
   stem: string;
-  ext: "png" | "jpg" | "webp" | null;
+  ext: "png" | "jpg" | "webp" | "pdf" | null;
 }
 
 /* ---------------- pure helpers (tested) ---------------- */
@@ -55,10 +56,11 @@ export const IMAGE_FORMATS: readonly { value: ImageExportFormat; label: string }
   { value: "png", label: "PNG" },
   { value: "jpeg", label: "JPEG" },
   { value: "webp", label: "WebP" },
+  { value: "pdf", label: "PDF" },
 ];
 
 /** The file extension an export format is written with. */
-export function extForImageFormat(format: ImageExportFormat): "png" | "jpg" | "webp" {
+export function extForImageFormat(format: ImageExportFormat): "png" | "jpg" | "webp" | "pdf" {
   return format === "jpeg" ? "jpg" : format;
 }
 
@@ -75,9 +77,10 @@ export const METADATA_NOTE = "Location and camera details are not included in th
 /** The quality readout: WebP at 100 is the engine's lossless mode (quality
  *  1.0 → VP8L, measured on WebView2 152 and pinned by the
  *  image-export-roundtrip E2E block, which fails if an engine update stops
- *  writing VP8L), and says so. */
+ *  writing VP8L), and says so. A PDF at 100 holds a lossless PNG
+ *  (`pdfPictureFormat`), below it a JPEG at that quality. */
 export function qualityReadout(format: ImageExportFormat, quality: number): string {
-  return format === "webp" && quality >= 100 ? "Lossless" : String(quality);
+  return (format === "webp" || format === "pdf") && quality >= 100 ? "Lossless" : String(quality);
 }
 
 /** A persisted `image.export` (a value out of a `.trt`, so untrusted) as a
@@ -127,6 +130,7 @@ export function defaultImagePreset(project: ProjectFile, hint: ExportSourceHint)
   }
   if (hint.ext === "jpg") return { format: "jpeg", quality: DEFAULT_QUALITY, size: 100 };
   if (hint.ext === "webp") return { format: "webp", quality: DEFAULT_QUALITY, size: 100 };
+  if (hint.ext === "pdf") return { format: "pdf", quality: DEFAULT_QUALITY, size: 100 };
   return { format: "png", quality: DEFAULT_QUALITY, size: 100 };
 }
 

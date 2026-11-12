@@ -1641,4 +1641,46 @@ mod tests {
         assert_eq!(std::fs::read(&stamp).unwrap(), PNG);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// An image project exported as a PDF (0.9.5): the user target beside
+    /// its photo, with that photo as the source. The PDF lands; a `.pdf`
+    /// carrying PNG bytes is refused at commit; the photo itself is never a
+    /// target, whatever the format; and a PNG export through the same saves
+    /// still lands exactly as before.
+    #[test]
+    fn an_image_projects_pdf_export_lands_beside_its_photo() {
+        let dir = scratch("image-pdf");
+        let photo = dir.join("IMG_0042.JPG");
+        std::fs::write(&photo, JPEG).unwrap();
+        let sources = vec![photo.to_string_lossy().into_owned()];
+        let saves = ImageSaves::default();
+        let user = |target: &Path, f: ImageFormat, total: u64| {
+            let t = target.to_string_lossy().into_owned();
+            saves.begin(f, total, || resolve_user(&t, &sources, f))
+        };
+
+        let pdf_target = dir.join("IMG_0042 (edited).pdf");
+        let b = user(&pdf_target, ImageFormat::Pdf, PDF.len() as u64).unwrap();
+        saves.chunk(b.token, PDF).unwrap();
+        saves.commit(b.token).unwrap();
+        assert_eq!(std::fs::read(&pdf_target).unwrap(), PDF);
+
+        let png_in_pdf = dir.join("picture.pdf");
+        let b = user(&png_in_pdf, ImageFormat::Pdf, PNG.len() as u64).unwrap();
+        saves.chunk(b.token, PNG).unwrap();
+        assert_eq!(msg(saves.commit(b.token)), "the image data is not a PDF file");
+        assert!(!png_in_pdf.exists());
+
+        assert!(msg(user(&photo, ImageFormat::Pdf, 64)).contains(".pdf"), "the photo's own name is not a PDF name");
+        assert!(msg(user(&photo, ImageFormat::Jpeg, 64)).contains("originals"));
+
+        let png_target = dir.join("IMG_0042 (edited).png");
+        let b = user(&png_target, ImageFormat::Png, PNG.len() as u64).unwrap();
+        saves.chunk(b.token, PNG).unwrap();
+        saves.commit(b.token).unwrap();
+        assert_eq!(std::fs::read(&png_target).unwrap(), PNG);
+        assert_eq!(std::fs::read(&photo).unwrap(), JPEG, "the photo is untouched");
+        assert_eq!(names_in(&dir), ["IMG_0042 (edited).pdf", "IMG_0042 (edited).png", "IMG_0042.JPG"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

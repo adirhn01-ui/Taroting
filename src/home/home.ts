@@ -1049,6 +1049,13 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
         paths: media,
         onVideo: () => createNew(media),
         onImage: () => makeImageProject(dialog.createImageProjectFrom, media),
+        // Every picture a page: made by the lazy pdf-project-from chunk,
+        // fetched only on this choice.
+        onPdf: (sizing) =>
+          makeImageProject(
+            async (paths, gone) => (await import("./pdf-project-from")).createPdfProjectFromPictures(paths, sizing, gone),
+            media,
+          ),
         onClosed: () => openOverlays.delete(close),
       });
       openOverlays.add(close);

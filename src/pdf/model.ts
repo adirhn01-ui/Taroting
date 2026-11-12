@@ -31,6 +31,7 @@
 import type {
   FontFamily,
   FontId,
+  MediaInfo,
   MediaRef,
   PdfAnnot,
   PdfAnnotKind,
@@ -57,6 +58,7 @@ import {
   sanitizePdfFormValue,
 } from "../core/pdf-sanitize";
 import { decodePoints, encodePoints } from "../image/strokes";
+import { picturePageLayout, type PicturePageSizing } from "../core/picture-page";
 
 /** A fresh id for a page, source or mark — the same helper core/project uses. */
 export const newId = (): string => uid();
@@ -154,6 +156,32 @@ export function pageAnnots(p: ProjectFile, pageId: string): readonly PdfAnnot[] 
   const pdf = pdfOf(p);
   if (!pdf || !hasOwn(pdf.annots, pageId)) return NO_ANNOTS;
   return pdf.annots[pageId] ?? NO_ANNOTS;
+}
+
+/** A page picture (0.9.5, `bg`): the picture a picture page is made of. It
+ *  behaves as the page itself — drawn first, never hit by a tool, always in
+ *  the exported page's content. */
+export function isPagePicture(a: PdfAnnot): a is Extract<PdfAnnot, { t: "image" }> & { bg: true } {
+  return a.t === "image" && a.bg === true;
+}
+
+/** A page's marks in DRAWING order: its page pictures first (under
+ *  everything, whatever their place in the list), then the rest in list
+ *  order. The list itself when it has no page picture, or only page pictures
+ *  already at the bottom (no allocation on the common path). */
+export function drawOrder(list: readonly PdfAnnot[]): readonly PdfAnnot[] {
+  let seenOther = false;
+  let misplaced = false;
+  for (const a of list) {
+    if (isPagePicture(a)) {
+      if (seenOther) {
+        misplaced = true;
+        break;
+      }
+    } else seenOther = true;
+  }
+  if (!misplaced) return list;
+  return [...list.filter(isPagePicture), ...list.filter((a) => !isPagePicture(a))];
 }
 
 /** The typed-in values of one source's form fields (own entry or undefined). */
@@ -576,6 +604,61 @@ export function insertSourcePages(
   const added: PdfPage[] = indices.map((i) => ({ id: newId(), src: srcId, page: i, rotate: 0 }));
   const pages = [...pdf.pages.slice(0, at), ...added, ...pdf.pages.slice(at)];
   return withPdf(p, { ...pdf, sources, pages });
+}
+
+/** A probe result a picture page can be made of: a real still with a size
+ *  (the picture mark's own rule, editor/marks/picture.ts `isStill`, plus a
+ *  finite size, which a crafted file could lack). */
+export function isPagePictureSource(info: MediaInfo): boolean {
+  const ok = (v: number | undefined): boolean => typeof v === "number" && Number.isFinite(v) && v > 0;
+  return info.kind === "image" && !info.generator && ok(info.width) && ok(info.height);
+}
+
+/**
+ * Insert one PICTURE PAGE per picture at gap `atIndex` (clamped into
+ * 0..length), in the order given (the caller sorts), as ONE new project — one
+ * undo step. Each page is a blank page sized by `picturePageLayout` from the
+ * picture's displayed size (a probe's width/height) and `sizing`, carrying ONE
+ * page picture (`bg: true`) at the layout's box. Each picture's MediaRef is
+ * the one already in the project for the same file (path + size + mtimeMs),
+ * else added — the way a picture mark registers its file. `ids` makes every
+ * new page, mark and media id (tests pass a deterministic one).
+ *
+ * Refused (whole; returns `p`): not a PDF project, no pictures, any of them
+ * not a still with a size, or going over PDF_MAX_PAGES.
+ */
+export function insertPicturePages(
+  p: ProjectFile,
+  atIndex: number,
+  pictures: readonly MediaInfo[],
+  sizing: PicturePageSizing,
+  ids: () => string = newId,
+): ProjectFile {
+  const pdf = pdfOf(p);
+  if (!pdf || pictures.length === 0) return p;
+  if (pdf.pages.length + pictures.length > PDF_MAX_PAGES) return p;
+  if (!pictures.every(isPagePictureSource)) return p;
+  const at = gapIndex(atIndex, pdf.pages.length);
+  if (at === null) return p;
+  let media = p.media;
+  // one null-prototype copy for the whole insert (the new keys are fresh ids)
+  const annots = setKey<PdfAnnot[]>(pdf.annots, "", undefined);
+  const added: PdfPage[] = [];
+  for (const info of pictures) {
+    let ref = media.find((m) => m.kind === "image" && !m.generator && m.path === info.path && m.size === info.size && m.mtimeMs === info.mtimeMs);
+    if (!ref) {
+      ref = { ...info, id: ids() };
+      media = [...media, ref];
+    }
+    const box = picturePageLayout(info.width!, info.height!, sizing);
+    const page: PdfPage = { id: ids(), src: null, page: 0, rotate: 0, w: box.pageW, h: box.pageH };
+    added.push(page);
+    const mark: PdfAnnot = { id: ids(), t: "image", x: box.x, y: box.y, w: box.w, h: box.h, media: ref.id, bg: true };
+    annots[page.id] = [mark];
+  }
+  const pages = [...pdf.pages.slice(0, at), ...added, ...pdf.pages.slice(at)];
+  const next: ProjectFile = media === p.media ? p : { ...p, media };
+  return withPdf(next, { ...pdf, pages, annots });
 }
 
 /** Drop sources no page uses, with their form values. Refused when every

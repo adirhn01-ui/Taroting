@@ -893,7 +893,7 @@ function sameExport(a: Record<string, unknown>, b: ImageExportPreset): boolean {
 function cleanExportPreset(raw: unknown): ImageExportPreset | undefined {
   if (!isObject(raw)) return undefined;
   const format = raw.format;
-  if (format !== "png" && format !== "jpeg" && format !== "webp") return undefined;
+  if (format !== "png" && format !== "jpeg" && format !== "webp" && format !== "pdf") return undefined;
   const quality = Math.min(Math.max(Math.round(finiteOr(raw.quality, 90)), 1), 100);
   const sz = raw.size;
   let size: ImageExportPreset["size"] = 100;

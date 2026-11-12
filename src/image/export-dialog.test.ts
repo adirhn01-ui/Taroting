@@ -9,6 +9,7 @@ import {
   defaultImagePreset,
   exportSources,
   extForImageFormat,
+  IMAGE_FORMATS,
   lockedSide,
   parseExportSide,
   planOutput,
@@ -143,5 +144,33 @@ describe("image export dialog helpers", () => {
     expect(lockedSide(1282, 641, 361)).toBe(722);
     expect(lockedSide(90, 361, 641)).toBe(160);
     expect(lockedSide(0, 641, 361)).toBe(1);
+  });
+});
+
+describe("image export as a PDF (0.9.5)", () => {
+  it("offers PDF as the fourth format, after PNG, JPEG and WebP, written as .pdf", () => {
+    expect(IMAGE_FORMATS.map((f) => [f.value, f.label])).toEqual([
+      ["png", "PNG"],
+      ["jpeg", "JPEG"],
+      ["webp", "WebP"],
+      ["pdf", "PDF"],
+    ]);
+    expect(extForImageFormat("pdf")).toBe("pdf");
+  });
+
+  it("says Lossless for a PDF at 100 and the number below it", () => {
+    expect(qualityReadout("pdf", 100)).toBe("Lossless");
+    expect(qualityReadout("pdf", 99)).toBe("99");
+    expect(qualityReadout("pdf", 92)).toBe("92");
+  });
+
+  it("opens on PDF when the project's last export was one, whatever the source photo is", () => {
+    const p = project({ image: { background: "transparent", export: { format: "pdf", quality: 77, size: 50 } } });
+    expect(defaultImagePreset(p, { stem: "IMG_0042", ext: "jpg" })).toEqual({ format: "pdf", quality: 77, size: 50 });
+    expect(sanitizeImagePreset({ format: "pdf", quality: 100, size: 25 })).toEqual({ format: "pdf", quality: 100, size: 25 });
+  });
+
+  it("follows a .pdf source hint to PDF at the usual quality", () => {
+    expect(defaultImagePreset(project(), { stem: "Scan", ext: "pdf" })).toEqual({ format: "pdf", quality: 92, size: 100 });
   });
 });

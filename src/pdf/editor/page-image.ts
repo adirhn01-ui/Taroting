@@ -77,6 +77,99 @@ export async function renderPageImage(project: ProjectFile, req: PageImageReques
   }
 }
 
+/** Several pages of one project as pictures, prepared ONCE: see openPageImages. */
+export interface PageImages {
+  /** Renders `req.page` (1-based, in the document's page order at open time;
+   *  one of the pages opened) and encodes it. Nothing of the page is kept
+   *  after the call: one page's canvas and blob at a time. */
+  render(req: PageImageRequest): Promise<Blob>;
+  /** Frees the built document and the worker share. Idempotent; call it in a
+   *  `finally` (success, cancel, failure and a forced close alike). */
+  close(): Promise<void>;
+}
+
+/**
+ * The several-pages export's renderer: ONE PDF is built for the span of the
+ * chosen pages (`buildPdf`'s own `range`: first..last chosen page, marks and
+ * form fields flattened exactly like renderPageImage), opened once in pdf.js,
+ * and then painted page by page on demand. renderPageImage per page would
+ * re-read and re-parse the whole source PDF for every page.
+ *
+ * `signal` cancels the preparation (the build and the open) only; a render
+ * that has started finishes. On any failure while preparing, everything taken
+ * is freed before the error is thrown.
+ */
+export async function openPageImages(project: ProjectFile, pages: readonly number[], signal?: AbortSignal): Promise<PageImages> {
+  if (signal?.aborted) throw abortError();
+  if (pages.length === 0) throw new RangeError("No pages to render.");
+  let first = pages[0]!;
+  let last = pages[0]!;
+  for (const p of pages) {
+    if (p < first) first = p;
+    if (p > last) last = p;
+  }
+  const [{ buildPdf }, { appDeps }, pdfjsMod] = await Promise.all([
+    import("../export/export"),
+    import("../export/deps"),
+    import("../view/pdfjs"),
+  ]);
+  const deps = await appDeps();
+  if (signal?.aborted) throw abortError();
+  const bytes = await buildPdf(project, { flattenMarks: true, flattenForms: true, range: [first, last], signal }, deps);
+  if (signal?.aborted) throw abortError();
+
+  const pdfjs = await pdfjsMod.loadPdfjs();
+  const worker = pdfjsMod.sharedWorker.acquire();
+  const task = pdfjs.getDocument({ ...pdfjsMod.documentParams(), data: bytes, worker });
+  let freed = false;
+  const close = async (): Promise<void> => {
+    if (freed) return;
+    freed = true;
+    await task.destroy().catch(() => {});
+    pdfjsMod.sharedWorker.release();
+  };
+  let doc: Awaited<typeof task.promise>;
+  try {
+    doc = await task.promise;
+    if (signal?.aborted) throw abortError();
+  } catch (e) {
+    await close();
+    throw e;
+  }
+
+  return {
+    async render(req: PageImageRequest): Promise<Blob> {
+      if (freed) throw new Error("The pages were already closed.");
+      if (!Number.isInteger(req.page) || req.page < first || req.page > last) {
+        throw new RangeError(`Page ${req.page} was not prepared.`);
+      }
+      const page = (await doc.getPage(req.page - first + 1)) as unknown as PageLike;
+      const canvas = document.createElement("canvas");
+      try {
+        const vp1 = page.getViewport({ scale: 1 });
+        const scale = req.w / Math.max(1, vp1.width);
+        const vp = page.getViewport({ scale });
+        canvas.width = Math.max(1, Math.min(req.w, Math.round(vp.width)));
+        canvas.height = Math.max(1, Math.min(req.h, Math.round(vp.height)));
+        await page.render({ canvas, viewport: vp, background: "#ffffff" }).promise;
+        const q = Math.min(100, Math.max(1, req.quality)) / 100;
+        return await new Promise<Blob>((resolve, reject) => {
+          canvas.toBlob(
+            (b) => (b ? resolve(b) : reject(new Error("The page could not be encoded."))),
+            req.type,
+            req.type === "image/jpeg" ? q : undefined,
+          );
+        });
+      } finally {
+        page.cleanup();
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+    },
+    close,
+  };
+}
+
 /** One slice per `image_save_chunk` call — the backend's MAX_CHUNK_BYTES. */
 const SAVE_CHUNK_BYTES = 8 * 1024 * 1024;
 
