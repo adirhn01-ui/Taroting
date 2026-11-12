@@ -1,6 +1,6 @@
 // The folder viewer: one file at a time, arrows through its folder, no project.
 // Lazy route chunk, never prefetched; imports only main-chunk modules plus
-// ./loader, ./stepper, ./scrub and ./seek-pacer (never anything under
+// ./loader, ./stepper, ./scrub, ./seek-pacer and ./scrub-copy (never anything under
 // src/editor/ — that would drag the editor chunk into this one). A PDF is
 // shown by ./pdf-mode, reached ONLY through import() on the first PDF: it
 // and pdf.js behind it are never part of this chunk.
@@ -16,7 +16,7 @@ import "../ui/player-bar.css";
 import "./viewer.css";
 import { registerCloseTask } from "../core/app-close";
 import { fileExt, fileName, formatDuration } from "../core/format";
-import { describeError, ipc, revealInFolder, setWindowTitle } from "../core/ipc";
+import { describeError, ipc, mediaUrl, onJobEvents, revealInFolder, setWindowTitle } from "../core/ipc";
 import type { KeyframeIndex } from "../core/ipc";
 import { createMonitorVolume } from "../core/monitor-volume";
 import type { MonitorVolumeState } from "../core/monitor-volume";
@@ -28,11 +28,14 @@ import type { ActionId } from "../core/types";
 import { elementFullscreen } from "../ui/fullscreen";
 import { icon } from "../ui/icons";
 import { closeMenu, showMenu } from "../ui/menu";
+import type { MenuItem } from "../ui/menu";
 import { toast } from "../ui/toast";
 import { DIRECT_TIMEOUT_MS, createSourceLoader } from "./loader";
 import type { Damage, LoadState } from "./loader";
 import type { PdfMemory, PdfMode } from "./pdf-mode";
 import { bindScrub } from "./scrub";
+import { ScrubCopy } from "./scrub-copy";
+import type { ScrubCopySnapshot } from "./scrub-copy";
 import { SeekPacer } from "./seek-pacer";
 import {
   DWELL_MS,
@@ -94,6 +97,12 @@ interface ViewerDev {
    *  before their frame showed), spurious-end recoveries started, reloads
    *  that showed their frame, and media errors handed to the loader. */
   counts(): { rereads: number; rereadFailures: number; endRecoveries: number; reloadSuccesses: number; toLoader: number };
+  /** The heavy video's scrub copy (./scrub-copy): where it stands, whether it
+   *  is on screen, the file it is for, and why it failed. */
+  scrub(): ScrubCopySnapshot;
+  /** Seeks issued since mount: to the scrub copy, and to the main video (its
+   *  `seeking` events). */
+  scrubSeeks(): { copy: number; main: number };
 }
 /** DEV: one media error as the viewer's listener saw it. */
 interface ViewerMediaError {
@@ -170,6 +179,14 @@ const END_RECOVERIES = 2;
 /** A seek to within this of the element's position is not made (seconds):
  *  the editor's own margin (scheduler.ts activate), so the two seek alike. */
 const SAME_POSITION_S = 0.01;
+
+/** A video that has stayed on screen this long is asked for its keyframe
+ *  index (ms): a read of the file's sample tables, no decoding, off the UI
+ *  thread. It is what tells a heavy clip from a light one, so a heavy clip's
+ *  scrub copy (./scrub-copy, SCRUB_DWELL_MS later) can be ready before the
+ *  first drag. Files stepped past sooner are never read. Tuned by the owner's
+ *  feel. */
+export const INDEX_DWELL_MS = 1000;
 
 /** " 40%", or "" while the ratio is unknown. */
 function percentText(r: number | null): string {
@@ -357,8 +374,11 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   /** The copy on disk the <video> plays (LoadState `file`): where its
    *  keyframe index is read from. Null for audio and while no video is out. */
   let videoFile: string | null = null;
-  /** This source's keyframe index was asked for (on its first scrub). */
+  /** This source's keyframe index was asked for (after INDEX_DWELL_MS on
+   *  screen, or on its first scrub if that came sooner). */
   let indexAsked = false;
+  /** Asks for the index once the video has stayed INDEX_DWELL_MS. */
+  let indexTimer: number | undefined;
   /** DEV: this source's keyframe index as it answered (null: unreadable),
    *  undefined until it has; kept for forceHeavy to re-weigh. A release build
    *  keeps nothing: the pacer holds a heavy file's keyframes, nobody a light
@@ -463,7 +483,10 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
         },
         set forceHeavy(v: boolean) {
           devForceHeavy = v;
-          if (indexAnswer !== undefined) pacer.setIndex(indexAnswer, v);
+          if (indexAnswer !== undefined) {
+            pacer.setIndex(indexAnswer, v);
+            if (videoFile !== null) scrubCopy.indexed(videoFile, pacer.heavy());
+          }
         },
         heavy: () => pacer.heavy(),
         indexed: () => indexAnswer !== undefined,
@@ -472,6 +495,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
         seeks: [],
         lastError: () => devLastError,
         counts: () => ({ ...devCounts }),
+        scrub: () => scrubCopy.snapshot(),
+        scrubSeeks: () => ({ copy: scrubCopy.copySeeks, main: devMainSeeks }),
       }
     : null;
   if (dev) devWin.__tarotingViewerDev = dev;
@@ -482,29 +507,85 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     onIssue: dev ? (t, keyframe) => void dev.seeks.push({ t, keyframe }) : undefined,
   });
 
+  /** DEV: `seeking` events of the main video (the E2E's count). */
+  let devMainSeeks = 0;
+  if (dev) video.addEventListener("seeking", () => void devMainSeeks++);
+
+  /** A heavy clip's all-keyframe scrub copy (./scrub-copy): shown over the
+   *  picture while the seek bar is dragged. Nothing for a light file: its
+   *  element is made on the first copy, its job asked only for a heavy one. */
+  const scrubCopy = new ScrubCopy({
+    main: video,
+    createCopy: () => {
+      const c = document.createElement("video");
+      c.className = "viewer__scrub-copy";
+      c.id = "vw-scrub";
+      c.muted = true;
+      c.preload = "auto";
+      c.playsInline = true;
+      // CORS-clean like the editor's preview elements (the asset protocol
+      // answers the window's origin), so its pixels can be read back.
+      c.crossOrigin = "anonymous";
+      c.hidden = true;
+      c.setAttribute("aria-hidden", "true");
+      // Above the picture, below the cover, the status card and the chrome.
+      stage.insertBefore(c, coverEl);
+      return c;
+    },
+    seekMain: (t) => seekTo(t),
+    plan: (file) => ipc.planScrub(file),
+    cancel: (id) => void ipc.cancelJob(id).catch(() => {}),
+    listen: (h) =>
+      onJobEvents({
+        onDone: (e) => h.done(e.id, typeof e.output["path"] === "string" ? e.output["path"] : null),
+        onFailed: (e) => h.failed(e.id, e.message),
+      }),
+    url: (p) => mediaUrl(p),
+  });
+
   /** The <video> is about to get a new source (or none): the pacer forgets
    *  the old one — a keyframe still waiting must never reach the new one —
    *  and the new one is asked for its own index on its first scrub. */
   function resetPacer(): void {
     pacer.reset();
+    // A new source: a scrub-copy job still running for the old one stops.
+    scrubCopy.reset();
     srcGen++;
     indexAsked = false;
     indexAnswer = undefined;
     pressAt = false;
+    window.clearTimeout(indexTimer);
+    indexTimer = undefined;
   }
 
-  /** On a scrub's start: the current video's keyframe index, once per
-   *  source, never at load (nothing is read for a clip nobody scrubs). Until
-   *  it answers, and for no answer, the drag is the light one. */
+  /** A video source was just set: ask for its keyframe index once it has
+   *  stayed INDEX_DWELL_MS, so a heavy clip's scrub copy can be under way
+   *  before the first drag. A file stepped past sooner is never read, and an
+   *  audio file (no `videoFile`) never is. Always after resetPacer(), which
+   *  drops the old source's timer. */
+  function armIndexDwell(): void {
+    if (videoFile === null) return;
+    indexTimer = window.setTimeout(() => {
+      indexTimer = undefined;
+      askIndex();
+    }, INDEX_DWELL_MS);
+  }
+
+  /** The current video's keyframe index, once per source: when the video
+   *  has stayed INDEX_DWELL_MS (armIndexDwell), or on a scrub's start if
+   *  that comes sooner. Never at load: nothing is read for a clip stepped
+   *  past. Until it answers, and for no answer, the drag is the light one. */
   function askIndex(): void {
     if (indexAsked || videoFile === null || disposed) return;
     indexAsked = true;
     const my = srcGen;
-    ipc.keyframeTimes(videoFile).then(
+    const file = videoFile;
+    ipc.keyframeTimes(file).then(
       (ix) => {
         if (disposed || my !== srcGen) return;
         if (import.meta.env.DEV) indexAnswer = ix;
         pacer.setIndex(ix, import.meta.env.DEV && devForceHeavy);
+        scrubCopy.indexed(file, pacer.heavy());
       },
       () => {},
     );
@@ -728,6 +809,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     asked = null;
     resetPacer();
     videoFile = audio ? null : (s.file ?? null);
+    armIndexDwell();
     readRetries = 0;
     rereading = false;
     resetEndState();
@@ -763,6 +845,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     // flight, so no `seeked` would ever send it.
     asked = null;
     resetPacer();
+    armIndexDwell();
     rereading = false;
     verifying = false;
     swapHold = { t, d: len };
@@ -1039,7 +1122,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     // The last asked position landed (a newer ask keeps `seeking` true) —
     // unless a heavy drag is held: then the cursor owns the position and the
     // frame that landed may be a keyframe's.
-    if (!video.seeking && !pacer.holding()) asked = null;
+    if (!video.seeking && !pacer.holding() && !scrubCopy.holding()) asked = null;
+    scrubCopy.mainSeeked();
     confirmReload();
     if (damage !== null) paintCover();
     if (!hidden) paintReadout();
@@ -1047,6 +1131,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
   // The reload's first frame where it started (no seek after its metadata).
   video.addEventListener("loadeddata", confirmReload);
   video.addEventListener("canplay", confirmReload);
+  video.addEventListener("canplay", () => scrubCopy.mainSeeked());
   video.addEventListener("timeupdate", () => {
     if (video.ended) recoverSpuriousEnd();
     else if (!video.seeking && asked === null && swapHold === null) goodTime = video.currentTime;
@@ -1068,7 +1153,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     // Only the user's pause drops the intent. The end's own pause, one that
     // comes with a media error, and one while a reload loads keep it: a
     // recovery resumes playing.
-    if (!video.ended && !video.error && swapHold === null && !rereading) playIntent = false;
+    // Nor the scrub copy's pause for a drag: the release resumes playing.
+    if (!video.ended && !video.error && swapHold === null && !rereading && !scrubCopy.pausing()) playIntent = false;
     onPlayState();
   });
   video.addEventListener("ended", () => {
@@ -1632,19 +1718,50 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     fsBtn.blur();
     toggleFs();
   });
+  /** The More menu's rows. ONE list for the button and for a right-click on
+   *  the stage, so the two can never offer different things. */
+  const moreItems = (): MenuItem[] => [
+    { label: "Open as project", disabled: busy, onSelect: openAsProject },
+    {
+      label: "Show in folder",
+      onSelect: () =>
+        void revealInFolder(cur).catch((e) => toast.error(`Couldn't show this file in its folder: ${describeError(e)}`)),
+    },
+  ];
   moreBtn.addEventListener("click", () => {
     const r = moreBtn.getBoundingClientRect();
-    showMenu(r.left, r.bottom + 4, [
-      { label: "Open as project", disabled: busy, onSelect: openAsProject },
-      {
-        label: "Show in folder",
-        onSelect: () =>
-          void revealInFolder(cur).catch((e) => toast.error(`Couldn't show this file in its folder: ${describeError(e)}`)),
-      },
-    ]);
+    showMenu(r.left, r.bottom + 4, moreItems());
     // After showMenu has recorded the opener: a keyboard dismissal still hands
     // focus back here, a mouse user is left with nothing focused.
     moreBtn.blur();
+  });
+  // A right-click anywhere on the stage (the picture, a PDF's pages, the
+  // audio card, a status card) opens the same menu at the pointer. Not over
+  // the bars: they are controls, and a right-click there asks for nothing.
+  stage.addEventListener("contextmenu", (e) => {
+    // A menu of its own further in (the PDF rail's) has already answered.
+    if (e.defaultPrevented) return;
+    // An editable field (Find, a PDF's password) keeps the native menu, as
+    // everywhere in the app (main.ts).
+    const t = e.target as { tagName?: string; isContentEditable?: boolean } | null;
+    if (t?.tagName === "INPUT" || t?.tagName === "TEXTAREA" || t?.isContentEditable === true) return;
+    e.preventDefault();
+    const items = moreItems();
+    // Text selected on a PDF's page: the app has no native menu to copy it
+    // from, so the row goes first, where a native menu has it. Read now: the
+    // menu takes focus, and the text must be what was selected at the click.
+    const sel = window.getSelection?.() ?? null;
+    const picked = sel !== null && sel.anchorNode !== null && stage.contains(sel.anchorNode) ? sel.toString() : "";
+    if (picked.trim() !== "") {
+      items.unshift({
+        label: "Copy",
+        onSelect: () => {
+          const copied = navigator.clipboard?.writeText(picked) ?? Promise.reject(new Error("no clipboard"));
+          void copied.catch(() => toast.error("Couldn't copy the text"));
+        },
+      });
+    }
+    showMenu(e.clientX, e.clientY, items);
   });
   playBtn.addEventListener("click", () => {
     playBtn.blur();
@@ -1683,9 +1800,27 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
       if (!hasMedia()) return;
       const press = pressAt;
       pressAt = false;
+      // A heavy clip's drag with its scrub copy ready: the copy follows the
+      // pointer and the main video is left alone until the pointer rests or
+      // lets go (./scrub-copy).
+      if (!press && Number.isFinite(video.duration) && video.duration > 0) {
+        const t = clamp(r * video.duration, 0, video.duration);
+        if (scrubCopy.move(t)) {
+          noteUserSeek();
+          asked = t;
+          goodTime = t;
+          paintReadout();
+          if (damage !== null) paintCover();
+          return;
+        }
+      }
       if (press || !pacer.heavy()) {
         seekTo(r * lengthOf());
-        if (press && Number.isFinite(video.duration)) pacer.begin(clamp(r * video.duration, 0, video.duration));
+        if (press && Number.isFinite(video.duration)) {
+          const t = clamp(r * video.duration, 0, video.duration);
+          pacer.begin(t);
+          scrubCopy.press(t);
+        }
         return;
       }
       noteUserSeek();
@@ -1707,6 +1842,8 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     },
     end: () => {
       pressAt = false;
+      // A copy-driven drag: one exact seek to where the pointer let go.
+      scrubCopy.release();
       const held = pacer.holding();
       // A heavy drag: the exact frame where the pointer let go; once it
       // lands, the element's time is the position again.
@@ -1822,6 +1959,7 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
       window.clearTimeout(hideTimer);
       window.clearTimeout(directTimer);
       releaseVideo();
+      scrubCopy.dispose();
       releaseImg();
       unVolume();
       volume.dispose();

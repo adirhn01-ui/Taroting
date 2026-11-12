@@ -15,9 +15,15 @@ const m = vi.hoisted(() => ({
   listSiblings: vi.fn(),
   forgetSiblingOrder: vi.fn(),
   keyframeTimes: vi.fn(),
+  planScrub: vi.fn(),
+  cancelJob: vi.fn(),
+  /** The job-event handlers the viewer subscribed (the scrub copy's). */
+  jobHandlers: [] as { onDone?: (e: { id: number; output: Record<string, unknown> }) => void; onFailed?: (e: { id: number; message: string }) => void }[],
   navigate: vi.fn(),
   /** The items of the last menu the viewer opened. */
   menu: [] as { label: string; onSelect: () => void }[],
+  /** Where the last menu was opened (client x, y). */
+  menuAt: null as [number, number] | null,
   keys: new Map<string, (e: { repeat: boolean; shiftKey?: boolean }) => void>(),
   /** window keydown listeners the viewer added (its own, besides the manager's) */
   winKeys: [] as ((e: unknown) => void)[],
@@ -68,7 +74,16 @@ vi.mock("../core/ipc", async (importOriginal) => {
       listSiblings: m.listSiblings,
       forgetSiblingOrder: m.forgetSiblingOrder,
       keyframeTimes: m.keyframeTimes,
+      planScrub: m.planScrub,
+      cancelJob: m.cancelJob,
     },
+    onJobEvents: async (h: (typeof m.jobHandlers)[number]) => {
+      m.jobHandlers.push(h);
+      return () => {
+        m.jobHandlers = m.jobHandlers.filter((x) => x !== h);
+      };
+    },
+    mediaUrl: (p: string) => `asset://localhost/${encodeURIComponent(p)}`,
     setWindowTitle: async () => {},
     revealInFolder: async () => {},
   };
@@ -112,8 +127,9 @@ vi.mock("../core/shortcuts", async (importOriginal) => ({
 }));
 vi.mock("../core/app-close", () => ({ registerCloseTask: () => () => {} }));
 vi.mock("../ui/menu", () => ({
-  showMenu: (_x: number, _y: number, items: { label: string; onSelect: () => void }[]) => {
+  showMenu: (x: number, y: number, items: { label: string; onSelect: () => void }[]) => {
     m.menu = items;
+    m.menuAt = [x, y];
   },
   closeMenu: () => {},
 }));
@@ -130,7 +146,7 @@ vi.mock("../core/open-media", async (importOriginal) => ({
 
 import { REST_MS } from "./seek-pacer";
 import { WINDOW_RADIUS } from "./stepper";
-import { mountViewer, type ViewerHandle } from "./viewer";
+import { INDEX_DWELL_MS, mountViewer, type ViewerHandle } from "./viewer";
 
 /* ---------------- a fake DOM, just enough for the viewer ---------------- */
 
@@ -193,6 +209,11 @@ function fakeEl(): FakeEl {
       for (const fn of listeners.get(type) ?? []) fn(event);
     },
     appendChild: (c: unknown) => c,
+    insertBefore: (c: unknown, ref: unknown) => {
+      log.push(`insertBefore`);
+      (el as { inserted?: unknown[] }).inserted = [c, ref];
+      return c;
+    },
     remove: () => {},
     blur: () => {},
     focus: () => {},
@@ -255,6 +276,7 @@ beforeEach(() => {
   m.keys.clear();
   m.winKeys = [];
   m.menu = [];
+  m.menuAt = null;
   m.onState = null;
   m.prepare.mockReset();
   m.playbackFailed.mockReset();
@@ -277,6 +299,9 @@ beforeEach(() => {
   };
   m.forgetSiblingOrder.mockReset().mockResolvedValue(undefined);
   m.keyframeTimes.mockReset().mockResolvedValue(null);
+  m.planScrub.mockReset().mockResolvedValue({ mode: "unavailable", reason: "test default" });
+  m.cancelJob.mockReset().mockResolvedValue(true);
+  m.jobHandlers = [];
   m.listSiblings.mockReset().mockImplementation(
     (path: string) => new Promise<SiblingWindow>((resolve) => calls.push({ path, resolve })),
   );
@@ -460,6 +485,106 @@ describe("the folder order", () => {
     );
     unmount();
     expect(m.forgetSiblingOrder).not.toHaveBeenCalled();
+  });
+});
+
+/* ---------------- a right-click on the stage ---------------- */
+
+describe("a right-click on the stage", () => {
+  const F2 = "D:\\clips\\";
+  /** A contextmenu event at (x, y) on `target`. */
+  function rightClick(x: number, y: number, target: unknown = {}, answered = false) {
+    return { clientX: x, clientY: y, target, defaultPrevented: answered, preventDefault: vi.fn() };
+  }
+  const labels = (): string[] => m.menu.map((i) => i.label);
+
+  it("opens the More button's own rows, at the pointer", () => {
+    const root = mount(`${F2}a.mp4`);
+    root.querySelector("#vw-more").fire("click");
+    const fromButton = labels();
+    expect(fromButton).toEqual(["Open as project", "Show in folder"]);
+    m.menu = [];
+    // x and y differ, so a swapped pair cannot pass.
+    const e = rightClick(321, 87);
+    root.querySelector("#vw-stage").fire("contextmenu", e);
+    expect(labels()).toEqual(fromButton);
+    expect(m.menuAt).toEqual([321, 87]);
+    expect(e.preventDefault).toHaveBeenCalledTimes(1);
+  });
+
+  it("its Open as project is the button's", async () => {
+    const root = mount(`${F2}a.mp4`);
+    root.querySelector("#vw-stage").fire("contextmenu", rightClick(10, 20));
+    m.menu.find((i) => i.label === "Open as project")!.onSelect();
+    await flush();
+    expect(m.openMedia).toHaveBeenCalledWith(`${F2}a.mp4`);
+  });
+
+  it("leaves a menu that something further in already opened alone", () => {
+    const root = mount(`${F2}a.pdf`);
+    const e = rightClick(5, 6, {}, true);
+    root.querySelector("#vw-stage").fire("contextmenu", e);
+    expect(m.menuAt).toBeNull();
+    expect(e.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("leaves an editable field its native menu", () => {
+    const root = mount(`${F2}a.pdf`);
+    for (const target of [{ tagName: "INPUT" }, { tagName: "TEXTAREA" }, { tagName: "DIV", isContentEditable: true }]) {
+      const e = rightClick(5, 6, target);
+      root.querySelector("#vw-stage").fire("contextmenu", e);
+      expect(e.preventDefault).not.toHaveBeenCalled();
+    }
+    expect(m.menuAt).toBeNull();
+    // An ordinary element is not mistaken for one.
+    root.querySelector("#vw-stage").fire("contextmenu", rightClick(5, 6, { tagName: "DIV", isContentEditable: false }));
+    expect(m.menuAt).toEqual([5, 6]);
+  });
+
+  it("offers Copy first for text selected on the stage, and copies exactly that text", async () => {
+    const root = mount(`${F2}a.pdf`);
+    const stage = root.querySelector("#vw-stage");
+    const node = {};
+    stage.contains = (n: unknown) => n === node;
+    const writeText = vi.fn(() => Promise.resolve());
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    let picked = "  two words ";
+    (window as unknown as { getSelection: () => unknown }).getSelection = () => ({ anchorNode: node, toString: () => picked });
+    stage.fire("contextmenu", rightClick(40, 50));
+    expect(labels()).toEqual(["Copy", "Open as project", "Show in folder"]);
+    // The selection changing after the click does not change what is copied.
+    picked = "something else";
+    m.menu[0]!.onSelect();
+    await flush();
+    expect(writeText).toHaveBeenCalledWith("  two words ");
+    expect(m.toastError).not.toHaveBeenCalled();
+  });
+
+  it("offers no Copy for a selection elsewhere, or for one that is only spaces", () => {
+    const root = mount(`${F2}a.pdf`);
+    const stage = root.querySelector("#vw-stage");
+    const inside = {};
+    stage.contains = (n: unknown) => n === inside;
+    const w = window as unknown as { getSelection: () => unknown };
+    w.getSelection = () => ({ anchorNode: {}, toString: () => "text in the top bar" });
+    stage.fire("contextmenu", rightClick(1, 2));
+    expect(labels()).toEqual(["Open as project", "Show in folder"]);
+    w.getSelection = () => ({ anchorNode: inside, toString: () => "   " });
+    stage.fire("contextmenu", rightClick(1, 2));
+    expect(labels()).toEqual(["Open as project", "Show in folder"]);
+  });
+
+  it("says so when the text could not be copied", async () => {
+    const root = mount(`${F2}a.pdf`);
+    const stage = root.querySelector("#vw-stage");
+    const node = {};
+    stage.contains = (n: unknown) => n === node;
+    vi.stubGlobal("navigator", { clipboard: { writeText: () => Promise.reject(new Error("denied")) } });
+    (window as unknown as { getSelection: () => unknown }).getSelection = () => ({ anchorNode: node, toString: () => "abc" });
+    stage.fire("contextmenu", rightClick(1, 2));
+    m.menu[0]!.onSelect();
+    await flush();
+    expect(m.toastError).toHaveBeenCalledWith("Couldn't copy the text");
   });
 });
 
@@ -1091,7 +1216,36 @@ describe("a heavy clip's drag", () => {
     v.video.log.length = 0;
   }
 
-  it("asks for the index on the first scrub only, once per source, never at load", async () => {
+  it("asks for the index once the video has stayed a moment, never at load or for a file stepped past", async () => {
+    const v = mounted();
+    await flush();
+    expect(m.keyframeTimes).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(INDEX_DWELL_MS - 1);
+    expect(m.keyframeTimes).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(m.keyframeTimes.mock.calls).toEqual([[CLIP]]);
+    // A scrub afterwards does not ask again.
+    v.bar.fire("pointerdown", v.ptr(3));
+    v.bar.fire("pointerup", v.ptr(3));
+    await flush();
+    expect(m.keyframeTimes.mock.calls).toEqual([[CLIP]]);
+    // Stepped onto, and past before its moment is up: never read.
+    views[0]!.show(OTHER);
+    m.onState!(OTHER, ready(OTHER, "asset://localhost/other"));
+    await vi.advanceTimersByTimeAsync(INDEX_DWELL_MS - 1);
+    views[0]!.show(CLIP);
+    m.onState!(CLIP, ready(CLIP));
+    // The file stepped past left no timer behind: the new one is not read
+    // at the old one's moment, only at its own.
+    await vi.advanceTimersByTimeAsync(2);
+    expect(m.keyframeTimes.mock.calls).toEqual([[CLIP]]);
+    await vi.advanceTimersByTimeAsync(INDEX_DWELL_MS);
+    expect(m.keyframeTimes.mock.calls).toEqual([[CLIP], [CLIP]]);
+    await vi.advanceTimersByTimeAsync(INDEX_DWELL_MS * 3);
+    expect(m.keyframeTimes.mock.calls).toEqual([[CLIP], [CLIP]]);
+  });
+
+  it("asks for the index on a scrub that comes first, once per source, and the moment adds no second ask", async () => {
     const v = mounted();
     await flush();
     expect(m.keyframeTimes).not.toHaveBeenCalled();
@@ -1106,9 +1260,12 @@ describe("a heavy clip's drag", () => {
     v.video.duration = 61;
     v.bar.fire("pointerdown", v.ptr(7));
     expect(m.keyframeTimes.mock.calls).toEqual([[CLIP], [OTHER]]);
+    await vi.advanceTimersByTimeAsync(INDEX_DWELL_MS * 3);
+    expect(m.keyframeTimes.mock.calls).toEqual([[CLIP], [OTHER]]);
   });
 
   it("never asks for an audio file's index", async () => {
+    vi.useFakeTimers();
     vi.stubGlobal("performance", { now: () => Date.now() });
     const root = mount(CLIP);
     m.onState!(CLIP, { state: "ready", element: "video", url: SRC, file: CLIP, kind: "audio", tryingDirect: false });
@@ -1117,6 +1274,9 @@ describe("a heavy clip's drag", () => {
     bar.getBoundingClientRect = () => ({ left: 100, top: 0, right: 710, bottom: 10, width: 610, height: 10 });
     bar.fire("pointerdown", { button: 0, pointerId: 1, clientX: 200, preventDefault: () => {} });
     await flush();
+    expect(m.keyframeTimes).not.toHaveBeenCalled();
+    // Nor when it has stayed on screen.
+    await vi.advanceTimersByTimeAsync(INDEX_DWELL_MS * 3);
     expect(m.keyframeTimes).not.toHaveBeenCalled();
   });
 
@@ -1216,6 +1376,203 @@ describe("a heavy clip's drag", () => {
     v.video.fire("seeked");
     vi.advanceTimersByTime(1000);
     expect(v.seeks()).toEqual([4.17, `src=${SRC}`, 12.3]);
+  });
+});
+
+/* ---------------- a heavy clip's scrub copy ---------------- */
+
+describe("a heavy clip's scrub copy", () => {
+  const CLIP = "D:\\clips\\Replay 2026-10-03 19-55-12.mp4";
+  const PLAYED = "C:\\cache\\remux\\4c0ffee5d00dfeed.mp4";
+  const SRC = "asset://localhost/C%3A%5Ccache%5Cremux%5C4c0ffee5d00dfeed.mp4";
+  const NEXT = "D:\\clips\\Replay 2026-10-04 08-12-40.mp4";
+  const COPY = "C:\\cache\\scrub\\77aa31d2c09e5b14.scrub1.mp4";
+  const JOB = 23;
+  /** Keyframes every 4.17 s at 69 Mbps over 61 s: heavy. */
+  const HEAVY = {
+    allSync: false,
+    times: Array.from({ length: 15 }, (_, i) => Math.round(i * 4.17 * 100) / 100),
+    duration: 61,
+    bytes: Math.round((61 * 69_000_000) / 8),
+  };
+  /** Keyframes every 0.5 s: light. */
+  const LIGHT = { allSync: false, times: Array.from({ length: 122 }, (_, i) => i / 2), duration: 61, bytes: 61 * 400_000 };
+  const at = (sec: number): string => `${Math.round((sec / 61) * 1000) / 10}%`;
+  let rafQ: (() => void)[] = [];
+  const frames = (n: number): void => {
+    for (let i = 0; i < n; i++) {
+      const q = rafQ;
+      rafQ = [];
+      for (const f of q) f();
+    }
+  };
+
+  /** A 61 s video on screen (played from PLAYED), its bar 610 px from x = 100. */
+  function mounted(kind: "video" | "audio" = "video") {
+    vi.useFakeTimers();
+    vi.stubGlobal("performance", { now: () => Date.now() });
+    rafQ = [];
+    vi.stubGlobal("requestAnimationFrame", (fn: () => void) => rafQ.push(fn));
+    const root = mount(CLIP);
+    m.onState!(CLIP, { state: "ready", element: "video", url: SRC, file: PLAYED, kind, tryingDirect: false });
+    const video = root.querySelector("#vw-video");
+    video.duration = 61;
+    video.seeking = false;
+    video.readyState = 4;
+    video.log.length = 0;
+    const bar = root.querySelector("#vw-seek");
+    bar.getBoundingClientRect = () => ({ left: 100, top: 0, right: 710, bottom: 10, width: 610, height: 10 });
+    const ptr = (sec: number) => ({ button: 0, pointerId: 1, clientX: 100 + (sec / 61) * 610, preventDefault: () => {} });
+    const seeks = () =>
+      video.log.filter((e) => e.startsWith("t=")).map((e) => Math.round(Number(e.slice(2)) * 1000) / 1000);
+    return { root, video, bar, ptr, seeks, knob: root.querySelector(".theater-bar__seek-knob") };
+  }
+  const copyEl = (): FakeEl | undefined => created.find((e) => e.className === "viewer__scrub-copy");
+
+  /** A press and release on the bar (the index answers heavy), and the ready
+   *  copy loaded. */
+  async function withCopy(v: ReturnType<typeof mounted>): Promise<FakeEl> {
+    m.keyframeTimes.mockResolvedValue(HEAVY);
+    m.planScrub.mockResolvedValue({ mode: "ready", path: COPY });
+    v.bar.fire("pointerdown", v.ptr(2.2));
+    v.bar.fire("pointerup", v.ptr(2.2));
+    await flush();
+    const c = copyEl()!;
+    expect(c).toBeDefined();
+    c.readyState = 4;
+    c.seeking = false;
+    c.fire("loadeddata");
+    v.video.seeking = false;
+    v.video.fire("seeked");
+    v.video.log.length = 0;
+    return c;
+  }
+
+  it("costs a light clip nothing: no command, no element, no timer", async () => {
+    const v = mounted();
+    m.keyframeTimes.mockResolvedValue(LIGHT);
+    v.bar.fire("pointerdown", v.ptr(3));
+    await flush();
+    vi.advanceTimersByTime(20);
+    v.bar.fire("pointermove", v.ptr(9.5));
+    v.bar.fire("pointerup", v.ptr(9.5));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(m.planScrub).not.toHaveBeenCalled();
+    expect(m.jobHandlers).toHaveLength(0);
+    expect(copyEl()).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+    // Its drag is exactly today's: a seek per move.
+    expect(v.seeks()).toEqual([3, 9.5]);
+  });
+
+  it("never asks for an audio file", async () => {
+    const v = mounted("audio");
+    m.keyframeTimes.mockResolvedValue(HEAVY);
+    v.bar.fire("pointerdown", v.ptr(3));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(m.planScrub).not.toHaveBeenCalled();
+  });
+
+  it("asks for the copy of the PLAYED file at the first press, and a step cancels its job", async () => {
+    const v = mounted();
+    m.keyframeTimes.mockResolvedValue(HEAVY);
+    m.planScrub.mockResolvedValue({ mode: "pending", jobId: JOB });
+    v.bar.fire("pointerdown", v.ptr(4));
+    await flush();
+    expect(m.planScrub.mock.calls).toEqual([[PLAYED]]);
+    views[0]!.show(NEXT);
+    expect(m.cancelJob.mock.calls).toEqual([[JOB]]);
+    expect(m.jobHandlers).toHaveLength(0);
+  });
+
+  it("leaving the viewer cancels its job", async () => {
+    const v = mounted();
+    m.keyframeTimes.mockResolvedValue(HEAVY);
+    m.planScrub.mockResolvedValue({ mode: "pending", jobId: JOB });
+    v.bar.fire("pointerdown", v.ptr(4));
+    await flush();
+    unmount();
+    expect(m.cancelJob.mock.calls).toEqual([[JOB]]);
+  });
+
+  it("drags on the copy: the main video is not seeked while moving, the knob is on the pointer, one exact seek on release", async () => {
+    const v = mounted();
+    const c = await withCopy(v);
+    v.bar.fire("pointerdown", v.ptr(5.5));
+    v.video.seeking = true;
+    c.seeking = true;
+    for (const sec of [14.25, 27.5, 33.75]) {
+      vi.advanceTimersByTime(16);
+      v.bar.fire("pointermove", v.ptr(sec));
+      expect(v.knob.styles.get("left")).toBe(at(sec));
+    }
+    // Only the press asked the main video; the copy got the first move, the
+    // newest waits behind it.
+    expect(v.seeks()).toEqual([5.5]);
+    expect(c.log.filter((e) => e.startsWith("t=")).map((e) => Math.round(Number(e.slice(2)) * 1000) / 1000)).toEqual([14.25]);
+    // The press's seek landing mid-drag must not pull the knob off the pointer.
+    v.video.seeking = false;
+    v.video.fire("seeked");
+    expect(v.knob.styles.get("left")).toBe(at(33.75));
+    v.bar.fire("pointerup", v.ptr(33.75));
+    expect(v.seeks()).toEqual([5.5, 33.75]);
+  });
+
+  it("a playing video pauses for the drag and keeps the wish to play through it", async () => {
+    const v = mounted();
+    await withCopy(v);
+    const play = vi.fn(() => Promise.resolve());
+    v.video.play = play;
+    v.video.paused = false;
+    v.video.fire("play");
+    v.video.pause = () => {
+      v.video.paused = true;
+      v.video.fire("pause");
+    };
+    v.bar.fire("pointerdown", v.ptr(6.1));
+    vi.advanceTimersByTime(16);
+    v.bar.fire("pointermove", v.ptr(18.4));
+    expect(v.video.paused).toBe(true);
+    // A read error now reloads the source: it resumes playing only if the
+    // drag's pause kept the wish to play.
+    v.video.error = { code: 2 };
+    v.video.fire("error");
+    expect(play).toHaveBeenCalledTimes(1);
+  });
+
+  it("is laid over the picture, under the cover, and never a pointer target", async () => {
+    const v = mounted();
+    const c = await withCopy(v);
+    const stage = v.root.querySelector("#vw-stage") as FakeEl & { inserted?: unknown[] };
+    expect(stage.inserted).toEqual([c, v.root.querySelector("#vw-cover")]);
+    expect(c.muted).toBe(true);
+    expect(c.hidden).toBe(true);
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const css = readFileSync(fileURLToPath(new URL("./viewer.css", import.meta.url)), "utf8");
+    const rule = /\.viewer__scrub-copy\s*\{([^}]*)\}/.exec(css)?.[1] ?? "";
+    expect(rule).toMatch(/pointer-events:\s*none/);
+    expect(rule).toMatch(/position:\s*absolute/);
+    expect(rule).toMatch(/inset:\s*0/);
+    expect(rule).toMatch(/object-fit:\s*contain/);
+  });
+
+  it("publishes its state and seek counts on the dev hook", async () => {
+    const v = mounted();
+    const c = await withCopy(v);
+    const dev = (window as unknown as {
+      __tarotingViewerDev: { scrub(): unknown; scrubSeeks(): { copy: number; main: number } };
+    }).__tarotingViewerDev;
+    expect(dev.scrub()).toEqual({ state: "ready", shown: false, file: PLAYED });
+    v.bar.fire("pointerdown", v.ptr(7));
+    vi.advanceTimersByTime(16);
+    v.bar.fire("pointermove", v.ptr(12.5));
+    c.seeking = false;
+    c.fire("seeked");
+    frames(2);
+    expect(dev.scrub()).toEqual({ state: "ready", shown: true, file: PLAYED });
+    expect(c.hidden).toBe(false);
+    expect(dev.scrubSeeks().copy).toBe(1);
   });
 });
 

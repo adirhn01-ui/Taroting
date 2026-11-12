@@ -413,6 +413,7 @@ fn main() {
             media::siblings::forget_sibling_order,
             media::playability::classify_playback,
             media::keyframes::keyframe_times,
+            media::scrub::plan_scrub,
             jobs::cancel_job,
             cache::cache_stats,
             cache::clear_cache,

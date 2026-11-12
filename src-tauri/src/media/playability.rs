@@ -503,6 +503,8 @@ fn lane_for(kind: JobKind) -> Lane {
         JobKind::Remux | JobKind::Waveform => Lane::Background,
         // Never prepared here; answered truthfully all the same.
         JobKind::Export => Lane::Export,
+        // Never prepared here either (`media::scrub` picks its own lane).
+        JobKind::Scrub => Lane::Scrub,
     }
 }
 

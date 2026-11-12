@@ -30,6 +30,8 @@ pub enum JobKind {
     Proxy,
     Waveform,
     Export,
+    /// The viewer's all-keyframe scrub copy of a heavy video (`media::scrub`).
+    Scrub,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +45,10 @@ pub enum Lane {
     Transcode,
     Thumb,
     Export,
+    /// Scrub copies (`media::scrub`): a full decode and re-encode nobody is
+    /// waiting on, made only to make dragging nicer. One worker of their own,
+    /// so they never hold up a remux, a proxy, a repair or a thumbnail.
+    Scrub,
 }
 
 type Work = Box<dyn FnOnce() + Send + 'static>;
@@ -109,6 +115,7 @@ pub struct Jobs {
     transcode_tx: mpsc::Sender<Work>,
     thumb_tx: mpsc::Sender<Work>,
     export_tx: mpsc::Sender<Work>,
+    scrub_tx: mpsc::Sender<Work>,
 }
 
 fn spawn_workers(count: usize, name: &str) -> mpsc::Sender<Work> {
@@ -139,6 +146,7 @@ impl Default for Jobs {
             transcode_tx: spawn_workers(1, "transcode"),
             thumb_tx: spawn_workers(1, "thumb"),
             export_tx: spawn_workers(1, "export"),
+            scrub_tx: spawn_workers(1, "scrub"),
         }
     }
 }
@@ -163,6 +171,7 @@ impl Jobs {
             Lane::Transcode => &self.transcode_tx,
             Lane::Thumb => &self.thumb_tx,
             Lane::Export => &self.export_tx,
+            Lane::Scrub => &self.scrub_tx,
         };
         // Workers live for the app's lifetime; send only fails at shutdown.
         let _ = tx.send(work);

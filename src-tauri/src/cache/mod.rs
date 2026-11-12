@@ -86,6 +86,9 @@ pub enum CacheKind {
     /// marked used, so a trim dates them by mtime; a removed one is extracted
     /// again on the next resolve (it checks the file, never a memo).
     Fonts,
+    /// The viewer's all-keyframe scrub copies of heavy videos
+    /// (`media::scrub`). Trimmed and cleared like every other kind.
+    Scrub,
 }
 
 impl CacheKind {
@@ -97,17 +100,19 @@ impl CacheKind {
             CacheKind::Thumbs => "thumbs",
             CacheKind::Filmstrip => "filmstrip",
             CacheKind::Fonts => "fonts",
+            CacheKind::Scrub => "scrub",
         }
     }
 }
 
-const ALL_KINDS: [CacheKind; 6] = [
+const ALL_KINDS: [CacheKind; 7] = [
     CacheKind::Remux,
     CacheKind::Proxy,
     CacheKind::Waveform,
     CacheKind::Thumbs,
     CacheKind::Filmstrip,
     CacheKind::Fonts,
+    CacheKind::Scrub,
 ];
 
 fn now_ms() -> u64 {

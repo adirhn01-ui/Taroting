@@ -8,6 +8,7 @@ pub mod normalize;
 pub mod playability;
 pub mod prepare;
 pub mod probe;
+pub mod scrub;
 pub mod siblings;
 pub mod source;
 pub mod thumbs;

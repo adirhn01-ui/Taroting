@@ -2435,4 +2435,314 @@ export async function runViewerBlocks(ctx: ViewerCtx): Promise<void> {
       await backHome();
     }
   });
+
+  // 0.9.5: a right-click on the picture opens the "…" button's own rows, at
+  // the pointer; a right-click on the top bar opens nothing.
+  await test("viewer-right-click-menu", async () => {
+    const t0 = performance.now();
+    try {
+      needFixtures();
+      await setOpenWith("viewer");
+      await openInViewer("z still.png");
+      const stage = await until(
+        () => {
+          const s = $("#vw-stage");
+          const i = $<HTMLImageElement>("#vw-img");
+          return rendered(s) && rendered(i) && i.naturalWidth > 0 ? s : null;
+        },
+        4_000,
+        () => `the still on the stage — ${viewerState()}`,
+      );
+      const rows = (): HTMLButtonElement[] =>
+        Array.from(document.querySelectorAll<HTMLButtonElement>(".ctx-menu .ctx-menu__item")).filter((b) => rendered(b));
+      const labelsOf = (): string[] => rows().map((b) => b.textContent?.trim() ?? "");
+      const menuUp = (what: string): Promise<string[]> =>
+        until(() => (rows().length > 0 ? labelsOf() : null), 2_000, () => what);
+
+      $<HTMLButtonElement>("#vw-more")!.click();
+      const fromButton = await menuUp("the … button's menu");
+      closeMenu();
+      assert(rows().length === 0, "the … button's menu did not close");
+
+      // Off-centre, and x differs from y: a menu placed at the centre, or with
+      // the two swapped, cannot pass.
+      const r = stage.getBoundingClientRect();
+      const x = Math.round(r.left + r.width * 0.3);
+      const y = Math.round(r.top + r.height * 0.45);
+      const target = document.elementFromPoint(x, y);
+      if (target === null || !stage.contains(target)) {
+        throw new Error(`(${x}, ${y}) hits ${describeEl(target)}, outside the stage`);
+      }
+      const ev = new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 2 });
+      target.dispatchEvent(ev);
+      const fromClick = await menuUp("a menu after the right-click on the picture");
+      assert(
+        fromClick.join(" | ") === fromButton.join(" | "),
+        `the right-click menu is [${fromClick.join(" | ")}], the … button's is [${fromButton.join(" | ")}]`,
+      );
+      assert(fromClick.join(" | ") === "Open as project | Show in folder", `unexpected rows: [${fromClick.join(" | ")}]`);
+      assert(ev.defaultPrevented, "the right-click's default (the native menu) was not prevented");
+      const host = $(".ctx-menu")!.getBoundingClientRect();
+      assert(
+        Math.abs(host.left - x) <= 2 && Math.abs(host.top - y) <= 2,
+        `the menu is at (${Math.round(host.left)}, ${Math.round(host.top)}), the pointer at (${x}, ${y})`,
+      );
+      const first = rows()[0]!;
+      const fr = first.getBoundingClientRect();
+      const hit = document.elementFromPoint(fr.left + fr.width / 2, fr.top + fr.height / 2);
+      assert(hit === first || (hit !== null && first.contains(hit)), `the first row's centre paints ${describeEl(hit)}`);
+      closeMenu();
+
+      // The bars are controls: a right-click there asks for nothing.
+      const top = $("#vw-top")!;
+      assert(rendered(top), "#vw-top is not rendered");
+      const tr = top.getBoundingClientRect();
+      const name = $("#vw-name") ?? top;
+      name.dispatchEvent(
+        new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: tr.left + tr.width / 2, clientY: tr.top + tr.height / 2, button: 2 }),
+      );
+      await sleep(60);
+      assert(rows().length === 0, `a right-click on the top bar opened [${labelsOf().join(" | ")}]`);
+      return `right-click at (${x}, ${y}) on the picture → [${fromClick.join(" | ")}] at the pointer, painted on top, same rows as the … button; nothing on the top bar — ${ms(t0)}`;
+    } finally {
+      await backHome();
+    }
+  });
+
+  // 0.9.5: a heavy video's all-keyframe scrub copy (viewer/scrub-copy.ts,
+  // media/scrub.rs). counter_audio_h264.mp4 (sound, a burnt-in frame counter,
+  // keyframes 1 s apart) forced heavy through the DEV `forceHeavy`; its copy
+  // is made by the REAL job (the autotest cache is not the owner's). Dragged
+  // with real pointer events over six uneven positions, each HELD by
+  // same-position moves every frame (a hand's micro-moves: the rest timer
+  // never fires, so the main video must not be seeked at all while held).
+  // Asserted: the main video's seek count does not grow while held; the copy
+  // is painted in the main video's box at each position, at its time; its
+  // picture at the last position matches the file's own frame there (read
+  // through a CORS-clean probe <video> of the main video's own source: the
+  // viewer's element is not CORS-clean) far closer than its picture at
+  // another position does; after release one exact seek lands the main video
+  // at the pointer and the copy hides.
+  await test("viewer-scrub-copy", async () => {
+    const t0 = performance.now();
+    const FILE = `${fixturesDir}\\counter_audio_h264.mp4`;
+    type ScrubHook = {
+      forceHeavy: boolean;
+      heavy(): boolean;
+      indexed(): boolean;
+      scrub(): { state: string; shown: boolean; file: string | null; reason?: string };
+      scrubSeeks(): { copy: number; main: number };
+    };
+    let hook: ScrubHook | null = null;
+    let bar: HTMLElement | null = null;
+    let held = false;
+    const POINTER = 31;
+    const fire = (type: string, x: number): void => {
+      if (bar === null) return;
+      const b = bar.getBoundingClientRect();
+      bar.dispatchEvent(
+        new PointerEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          pointerId: POINTER,
+          button: 0,
+          buttons: type === "pointerup" ? 0 : 1,
+          clientX: x,
+          clientY: b.top + b.height / 2,
+        }),
+      );
+    };
+    const frame = (): Promise<void> => new Promise((r) => requestAnimationFrame(() => r()));
+    /** Mean luma over 16x12 blocks of a 64x48 draw (as editor-fragmented-
+     *  plays-copy reads a picture). */
+    const signature = (el: HTMLVideoElement): number[] => {
+      const c = document.createElement("canvas");
+      c.width = 64;
+      c.height = 48;
+      const g = c.getContext("2d", { willReadFrequently: true });
+      if (g === null) throw new Error("no 2D context for a frame signature");
+      g.imageSmoothingEnabled = true;
+      g.imageSmoothingQuality = "high";
+      g.drawImage(el, 0, 0, 64, 48);
+      const d = g.getImageData(0, 0, 64, 48).data;
+      const out: number[] = [];
+      for (let by = 0; by < 48; by += 4) {
+        for (let bx = 0; bx < 64; bx += 4) {
+          let s = 0;
+          for (let y = by; y < by + 4; y++) {
+            for (let x = bx; x < bx + 4; x++) {
+              const i = (y * 64 + x) * 4;
+              s += 0.299 * (d[i] ?? 0) + 0.587 * (d[i + 1] ?? 0) + 0.114 * (d[i + 2] ?? 0);
+            }
+          }
+          out.push(s / 16);
+        }
+      }
+      return out;
+    };
+    const distance = (a: readonly number[], b: readonly number[]): number =>
+      a.reduce((s, v, i) => s + Math.abs(v - (b[i] ?? 0)), 0) / Math.max(1, a.length);
+    /** The frame `url` shows at `t`, through a CORS-clean probe <video>. */
+    const probeAt = async (url: string, t: number): Promise<number[]> => {
+      const v = document.createElement("video");
+      v.crossOrigin = "anonymous";
+      v.muted = true;
+      v.preload = "auto";
+      Object.assign(v.style, { position: "fixed", left: "0", top: "0", width: "64px", height: "48px", opacity: "0", pointerEvents: "none" });
+      document.body.appendChild(v);
+      try {
+        v.src = url;
+        await until(() => v.error !== null || v.readyState >= 1, 4_000, () => "a probe <video> of the main video's source to load");
+        if (v.error) throw new Error(`a probe <video> could not load the main video's source: error ${v.error.code}`);
+        v.currentTime = t;
+        await until(
+          () => v.error !== null || (!v.seeking && v.readyState >= 2 && Math.abs(v.currentTime - t) < 0.05),
+          3_000,
+          () => `a probe <video> to settle at ${t.toFixed(3)} s (at ${v.currentTime.toFixed(3)}, readyState ${v.readyState})`,
+        );
+        await frame();
+        await frame();
+        return signature(v);
+      } finally {
+        v.removeAttribute("src");
+        v.load();
+        v.remove();
+      }
+    };
+    try {
+      assert(await ipc.pathExists(FILE), `fixture ${FILE} is missing — run npm run fixtures`);
+      await setOpenWith("viewer");
+      await ipc.debugPushOpenPath(FILE);
+      const video = await until(
+        () => {
+          const v = vwVideo();
+          return v && !v.hidden && v.readyState >= 2 && baseName(viewerDev()?.path() ?? "") === "counter_audio_h264.mp4" ? v : null;
+        },
+        8_000,
+        () => `counter_audio_h264.mp4 playing in the viewer — ${viewerState()}`,
+      );
+      video.pause();
+      const h = viewerDev() as unknown as ScrubHook | undefined;
+      if (h === undefined || typeof h.scrub !== "function" || typeof h.scrubSeeks !== "function") {
+        throw new Error("the viewer's dev hook has no scrub-copy seam");
+      }
+      hook = h;
+      bar = await until(() => (rendered($("#vw-seek")) ? $("#vw-seek") : null), 2_000, () => `a painted #vw-seek — ${viewerState()}`);
+      const box = bar.getBoundingClientRect();
+      assert(box.width > 200, `the seek bar is ${box.width.toFixed(0)} px wide — too narrow to drag across`);
+      const xAt = (f: number): number => box.left + box.width * f;
+      const timeAt = (x: number): number => ((x - box.left) / box.width) * video.duration;
+
+      // A click asks for the index; forced heavy, the copy is asked at once
+      // (the press came first) and made by the real job.
+      fire("pointerdown", xAt(0.05));
+      fire("pointerup", xAt(0.05));
+      await until(() => h.indexed() || null, 2_000, () => `the keyframe index to answer after a click — ${viewerState()}`);
+      assert(h.scrub().state === "none", `a light verdict asked for a copy: ${JSON.stringify(h.scrub())}`);
+      h.forceHeavy = true;
+      assert(h.heavy(), "forceHeavy did not re-weigh the index that had answered");
+      const tJob = performance.now();
+      await until(
+        () => {
+          const s = h.scrub();
+          if (s.state === "failed") throw new Error(`the scrub copy failed: ${s.reason ?? "?"}`);
+          return s.state === "ready" || null;
+        },
+        15_000,
+        () => `the scrub copy to be ready — ${JSON.stringify(h.scrub())}`,
+      );
+      const jobMs = Math.round(performance.now() - tJob);
+      const copy = $<HTMLVideoElement>("#vw-scrub");
+      if (copy === null) throw new Error("no #vw-scrub element once the copy is ready");
+      assert(!rendered(copy), "the ready copy is painted before any drag");
+      await until(() => (!video.seeking && video.readyState >= 2) || null, 3_000, () => `the click's seek to land — ${viewerState()}`);
+
+      // Press, then six held positions, unevenly spaced, then back near the
+      // start, with a 2nd-to-last far from the last (the picture check).
+      const fs = [0.14, 0.23, 0.41, 0.46, 0.72, 0.31, 0.83];
+      fire("pointerdown", xAt(fs[0]!));
+      held = true;
+      await until(() => (!video.seeking && video.readyState >= 2) || null, 3_000, () => `the press's exact seek to land — ${viewerState()}`);
+      await frame();
+      const mainBase = h.scrubSeeks().main;
+      const vb = video.getBoundingClientRect();
+      const follow: string[] = [];
+      let sigLast: number[] = [];
+      let sigOther: number[] = [];
+      let tLast = 0;
+      let tOther = 0;
+      for (let i = 1; i < fs.length; i++) {
+        const x = xAt(fs[i]!);
+        const want = timeAt(x);
+        fire("pointermove", x);
+        const tMove = performance.now();
+        // Held there: a same-position move every frame until the copy shows
+        // this position (the rest timer never runs out).
+        for (;;) {
+          await frame();
+          fire("pointermove", x);
+          const s = h.scrub();
+          if (s.state !== "ready") throw new Error(`the copy left "ready" mid-drag: ${JSON.stringify(s)}`);
+          if (s.shown && !copy.seeking && copy.readyState >= 2 && Math.abs(copy.currentTime - want) < 0.05) break;
+          if (performance.now() - tMove > 2_000) {
+            throw new Error(`the copy never showed ${want.toFixed(3)} s — at ${copy.currentTime.toFixed(3)}, seeking ${String(copy.seeking)}, rs ${copy.readyState}, ${JSON.stringify(s)}`);
+          }
+        }
+        await frame();
+        fire("pointermove", x);
+        const main = h.scrubSeeks().main;
+        assert(main === mainBase, `the main video was seeked ${main - mainBase} time(s) while the pointer was held (at ${want.toFixed(3)} s)`);
+        assert(rendered(copy), `the copy is not painted at ${want.toFixed(3)} s`);
+        const cb = copy.getBoundingClientRect();
+        const off = Math.max(Math.abs(cb.left - vb.left), Math.abs(cb.top - vb.top), Math.abs(cb.width - vb.width), Math.abs(cb.height - vb.height));
+        assert(off <= 1, `the copy's box is ${off.toFixed(1)} px off the main video's`);
+        follow.push(`${want.toFixed(2)}→${copy.currentTime.toFixed(2)}`);
+        if (i === fs.length - 2) {
+          sigOther = signature(copy);
+          tOther = want;
+        }
+        if (i === fs.length - 1) {
+          sigLast = signature(copy);
+          tLast = want;
+        }
+      }
+      const copySeeks = h.scrubSeeks().copy;
+      fire("pointerup", xAt(fs[fs.length - 1]!));
+      held = false;
+      await until(
+        () => (!video.seeking && video.readyState >= 2 && Math.abs(video.currentTime - tLast) < 0.05) || null,
+        3_000,
+        () => `the main video at ${tLast.toFixed(3)} s after the release — at ${video.currentTime.toFixed(3)}, seeking ${String(video.seeking)}`,
+      );
+      await until(() => (!h.scrub().shown && !rendered(copy)) || null, 1_500, () => `the copy to hide after the release — ${JSON.stringify(h.scrub())}`);
+      const mainAfter = h.scrubSeeks().main - mainBase;
+      assert(mainAfter === 1, `the release seeked the main video ${mainAfter} time(s) — want exactly one`);
+
+      // The copy's picture against the file's own frames, at two times: each
+      // held position's copy must be nearer the file's frame at ITS time than
+      // the file's frame at the other time. (Not "twice as near": the copy is
+      // a soft 480-line picture, and this fixture's frames ten seconds apart
+      // differ in a small part of the picture only. MEASURED 2026-11-11: an
+      // untagged copy, shown in the wrong colour standard, was 14.1 from its
+      // own frame; tagged, 2.4, with the other time's frame at 4.1.)
+      const mainLast = await probeAt(video.currentSrc, tLast);
+      const mainOther = await probeAt(video.currentSrc, tOther);
+      const lastOwn = distance(sigLast, mainLast);
+      const lastCross = distance(sigLast, mainOther);
+      const otherOwn = distance(sigOther, mainOther);
+      const otherCross = distance(sigOther, mainLast);
+      const said = `copy at ${tLast.toFixed(2)} s: ${lastOwn.toFixed(2)} from the file's frame there, ${lastCross.toFixed(2)} from its frame at ${tOther.toFixed(2)} s; copy at ${tOther.toFixed(2)} s: ${otherOwn.toFixed(2)} from its own, ${otherCross.toFixed(2)} from the other`;
+      assert(distance(mainLast, mainOther) > 2, `the file's own frames at the two times are only ${distance(mainLast, mainOther).toFixed(2)} apart — the fixture cannot tell them apart (${said})`);
+      assert(lastOwn < 6 && otherOwn < 6, `the copy's picture is far from the file's frame at the same time — wrong colours or a wrong frame (${said})`);
+      assert(
+        lastOwn + 1 < lastCross && otherOwn + 1 < otherCross,
+        `the copy does not show the pointer's frame (${said})`,
+      );
+      return `copy ready in ${jobMs} ms; held ${fs.length - 1} positions (${follow.join(", ")}), main seeks while held 0, copy seeks ${copySeeks}, box within 1 px; ${said}; release: one exact seek, main at ${video.currentTime.toFixed(3)} s, copy hidden — ${ms(t0)}`;
+    } finally {
+      if (held && bar !== null) fire("pointerup", bar.getBoundingClientRect().left + 1);
+      if (hook) hook.forceHeavy = false;
+      await backHome();
+    }
+  });
 }

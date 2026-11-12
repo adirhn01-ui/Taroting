@@ -297,7 +297,7 @@ export const OPEN_WITH_HINTS: Record<OpenWith, string> = {
 
 const AUTOSAVE_OPTIONS = [1, 3, 5, 10, 30];
 const CACHE_LIMIT_OPTIONS_MB = [1024, 2048, 5120, 10240, 20480];
-const CACHE_KIND_ORDER = ["remux", "proxy", "waveform", "thumbs", "filmstrip", "fonts"];
+const CACHE_KIND_ORDER = ["remux", "proxy", "waveform", "thumbs", "filmstrip", "fonts", "scrub"];
 
 type CacheStats = { totalBytes: number; byKind: Record<string, number> };
 
