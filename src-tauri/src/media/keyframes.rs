@@ -650,7 +650,7 @@ mod tests {
 
     #[test]
     fn the_command_runs_off_the_ui_thread() {
-        // RULE (AGENTS.md): anything that touches the disk is async.
+        // Project rule: anything that touches the disk is async.
         let code = include_str!("keyframes.rs");
         assert!(code.contains("pub async fn keyframe_times("));
         assert!(code.contains("spawn_blocking(move || keyframe_index(&file))"));
