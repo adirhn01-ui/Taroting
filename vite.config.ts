@@ -61,6 +61,24 @@ export default defineConfig({
     minify: true,
     sourcemap: false,
     modulePreload: { polyfill: false },
+    rolldownOptions: {
+      output: {
+        // pdf-lib in a chunk of its own, with nothing else in it. Once two
+        // lazy paths reached pdf-lib (the PDF export, and the image export's
+        // PDF page), the bundler made a shared chunk for it and put its own
+        // tiny module-namespace helper in the same file — and every chunk
+        // that needs that helper, the start-up ones included, then loaded
+        // 420 kB of pdf-lib with it (measured: +9 MB on Home, +16 MB and
+        // +16 ms in the viewer). scripts/check-boot.mjs fails the build if a
+        // start-up or viewer chunk ever reaches it again.
+        codeSplitting: {
+          groups: [
+            { name: "pdf-lib", test: /node_modules[\\/](pdf-lib|@pdf-lib)[\\/]/, priority: 10 },
+            { name: "rt", test: /rolldown[\\/:]runtime/, priority: 20 },
+          ],
+        },
+      },
+    },
   },
   test: {
     include: ["src/**/*.test.ts"],
