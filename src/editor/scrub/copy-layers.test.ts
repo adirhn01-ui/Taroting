@@ -469,6 +469,32 @@ describe("catching up", () => {
     expect(c.style.display).toBe("none");
   });
 
+  it("the catch-up looks for the real element at the latest target", () => {
+    const { h, s, c } = shownAt(4.4);
+    s.main.seeking = true;
+    h.layers.rest();
+    // Within SAME_POSITION_S of 4.4 (no cancel), but the element lands
+    // farther than that from 4.4 and within it of 4.408.
+    h.layers.follow(0, s.slot, URL_A, FILE_A, 4.408);
+    s.main.seeking = false;
+    s.main.currentTime = 4.416;
+    s.main.fire("seeked");
+    h.frames();
+    expect(c.style.display).toBe("none");
+  });
+
+  it("a caught-up copy stays hidden on a move that does not restart the rest", () => {
+    const { h, s, c } = shownAt(4.4);
+    s.main.currentTime = 4.4;
+    h.layers.rest();
+    h.frames();
+    expect(c.style.display).toBe("none");
+    h.layers.follow(0, s.slot, URL_A, FILE_A, 4.43, false);
+    land(c);
+    h.frames();
+    expect(c.style.display).toBe("none");
+  });
+
   it("a caught-up copy does not cover the exact frame again on a move that keeps the position", () => {
     const { h, s, c } = shownAt(4.4);
     s.main.currentTime = 4.4;

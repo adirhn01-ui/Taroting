@@ -175,9 +175,12 @@ export class ScrubCopyLayers {
 
   /**
    * Layer `idx` qualifies on this pointer-caused tick: stand in `slot`, show
-   * `url` (the copy of `file`), aim at `srcT`.
+   * `url` (the copy of `file`), aim at `srcT`. `restart` false: the playhead
+   * is still within a frame of where the held pointer rested, so a wait for
+   * the real element (or a copy already hidden after it) stands; the wait
+   * then looks for the real element at the new `srcT`.
    */
-  follow(idx: number, slot: SlotView, url: string, file: string, srcT: number): void {
+  follow(idx: number, slot: SlotView, url: string, file: string, srcT: number, restart = true): void {
     if (this.disposed) return;
     const L = this.place(idx, slot, url, file);
     L.active = true;
@@ -187,7 +190,9 @@ export class ScrubCopyLayers {
     // A new position keeps the copy up (cancels the wait for the real
     // element). The same position does not: the real element was already
     // asked for that frame, and a caught-up copy must not cover it again.
-    if (this.moved && (L.awaitingMain || L.caughtUp) && Math.abs(srcT - prev) > SAME_POSITION_S) this.cancelCatchup(L);
+    if (restart && this.moved && (L.awaitingMain || L.caughtUp) && Math.abs(srcT - prev) > SAME_POSITION_S) {
+      this.cancelCatchup(L);
+    }
     if (!this.playing && !this.playingAtPress) this.aim(L, srcT);
     this.paint(L);
   }
@@ -409,7 +414,6 @@ export class ScrubCopyLayers {
     if (m === null) return;
     L.awaitingMain = true;
     const seq = L.catchSeq;
-    const target = L.target;
     const finish = (): void => {
       if (seq !== L.catchSeq || !L.awaitingMain) return;
       this.removeCatchup(L);
@@ -421,7 +425,9 @@ export class ScrubCopyLayers {
     };
     const check = (): void => {
       if (seq !== L.catchSeq || !L.awaitingMain) return;
-      if (m.seeking || m.readyState < 2 || Math.abs(m.currentTime - target) > SAME_POSITION_S) return;
+      // The layer's latest target: a sub-frame move during the wait aims the
+      // real element there too.
+      if (m.seeking || m.readyState < 2 || Math.abs(m.currentTime - L.target) > SAME_POSITION_S) return;
       this.raf(() =>
         this.raf(() => {
           if (m.seeking) return;

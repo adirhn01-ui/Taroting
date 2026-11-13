@@ -14,7 +14,7 @@ import type { DamageState, MediaState } from "../media/media";
 import type { VisibleClip } from "../playback/scheduler";
 import type { SlotView } from "./copy-layers";
 import { mountEditorScrub, type PointerTarget } from "./editor-scrub";
-import { DWELL_MS } from "./precheck";
+import { CATCHUP_MAX_MS, DWELL_MS, REST_MS } from "./precheck";
 
 const flush = async (): Promise<void> => {
   for (let i = 0; i < 10; i++) await Promise.resolve();
@@ -629,6 +629,98 @@ describe("the drag (R7-R10)", () => {
       h.advance(40000);
       h.scrub.dispose();
     }).not.toThrow();
+  });
+});
+
+/* ---------------- resting ---------------- */
+
+// The stage's real element is frozen at 0, far from every target here, so a
+// copy that rests stays up waiting for it and hides only at CATCHUP_MAX_MS
+// after the rest began: the hide time tells when the rest began.
+describe("the rest wait follows the playhead's time, not the pointer's events", () => {
+  it("moves that ask for the same time again do not restart it", async () => {
+    const h = await readyHarness();
+    dragTo(h, 7.0); // the move to 7.0 starts the wait
+    const c = h.copies[0]!;
+    // A hand held still: a move every 10 ms for 230 ms, all at 7.0.
+    for (let i = 0; i < 23; i++) {
+      h.advance(10);
+      h.move(7.0);
+    }
+    expect(c.style.display).toBe("block");
+    // Rested at REST_MS after the move to 7.0: hidden CATCHUP_MAX_MS later.
+    // (Restarted by the last held move, it would rest at 230 + REST_MS.)
+    h.advance(REST_MS + CATCHUP_MAX_MS - 230 - 1);
+    expect(c.style.display).toBe("block");
+    h.advance(1);
+    expect(c.style.display).toBe("none");
+  });
+
+  it("a tremor across sub-frame times (1 px at 80 px/s) does not restart it", async () => {
+    const h = await readyHarness();
+    dragTo(h, 7.0);
+    const c = h.copies[0]!;
+    // Each move differs from the one before (12.5 ms, under one 30 fps frame).
+    for (let i = 0; i < 23; i++) {
+      h.advance(10);
+      h.move(i % 2 === 0 ? 7.0125 : 7.0);
+      h.settleCopies();
+    }
+    expect(c.style.display).toBe("block");
+    h.advance(REST_MS + CATCHUP_MAX_MS - 230 - 1);
+    expect(c.style.display).toBe("block");
+    h.advance(1);
+    expect(c.style.display).toBe("none");
+  });
+
+  it("small steps that add up to more than a frame from where it started restart it", async () => {
+    const h = await readyHarness();
+    dragTo(h, 7.0);
+    const c = h.copies[0]!;
+    // 7.0125 and 7.025 stay within a frame (1/30 s) of 7.0; 7.0375 does not.
+    for (const t of [7.0125, 7.025, 7.0375]) {
+      h.advance(20);
+      h.move(t);
+      h.settleCopies();
+    }
+    // Rested at REST_MS after the move to 7.0375 (60 ms in).
+    h.advance(REST_MS + CATCHUP_MAX_MS - 1);
+    expect(c.style.display).toBe("block");
+    h.advance(1);
+    expect(c.style.display).toBe("none");
+  });
+
+  it("a move to a new time restarts it", async () => {
+    const h = await readyHarness();
+    dragTo(h, 7.0);
+    const c = h.copies[0]!;
+    h.advance(REST_MS - 40);
+    h.move(7.3);
+    h.settleCopies();
+    h.frames();
+    expect(c.style.display).toBe("block");
+    // Rested at REST_MS after the move to 7.3, not after the one to 7.0.
+    h.advance(REST_MS + CATCHUP_MAX_MS - 1);
+    expect(c.style.display).toBe("block");
+    h.advance(1);
+    expect(c.style.display).toBe("none");
+  });
+
+  it("a release rests at once, whatever the wait still had to run", async () => {
+    const h = await readyHarness();
+    dragTo(h, 7.0);
+    const c = h.copies[0]!;
+    h.advance(REST_MS - 60);
+    h.move(7.3);
+    h.settleCopies();
+    h.frames();
+    h.advance(20);
+    h.up();
+    expect(c.style.display).toBe("block");
+    h.advance(CATCHUP_MAX_MS - 1);
+    expect(c.style.display).toBe("block");
+    h.advance(1);
+    expect(c.style.display).toBe("none");
   });
 });
 

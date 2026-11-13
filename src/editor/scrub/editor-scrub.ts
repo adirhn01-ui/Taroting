@@ -40,7 +40,7 @@ import type { JobEventHandlers, KeyframeIndex, ScrubPlan } from "../../core/ipc"
 import type { MediaRef, ProjectFile } from "../../core/types";
 import { ScrubCopyLayers, type CopyLayerSnapshot, type CopyTimers, type SlotView } from "./copy-layers";
 import { ScrubCopyRegistry, type CopyFileSnapshot } from "./copy-registry";
-import { DWELL_MS, REST_MS, isCandidate, layerTargets, liveFiles, type LayerTarget } from "./precheck";
+import { DWELL_MS, REST_MS, isCandidate, layerTargets, liveFiles, restTolerance, type LayerTarget } from "./precheck";
 
 /** What the module may read of the playback engine (no transport). */
 export interface EngineView {
@@ -209,6 +209,9 @@ export function mountEditorScrub(deps: EditorScrubDeps): EditorScrub {
   let held = false;
   let pointerSeeks = 0;
   let pressT = Number.NaN;
+  /** The playhead time the rest wait was last started at (NaN from a press
+   *  until its first move). */
+  let restAnchorT = Number.NaN;
   let playingAtPress = false;
   let playingSeen = false;
   let dwellTimer: number | undefined;
@@ -275,7 +278,7 @@ export function mountEditorScrub(deps: EditorScrubDeps): EditorScrub {
   }
 
   /** A pointer-caused, paused tick: every layer follows or hides. */
-  function follow(t: number): void {
+  function follow(t: number, restart: boolean): void {
     const targets = targetsAt(t);
     const n = Math.max(stage.layers.length, targets.length, layers.extent());
     let unknown: string[] | null = null;
@@ -292,7 +295,7 @@ export function mountEditorScrub(deps: EditorScrubDeps): EditorScrub {
         layers.hide(i);
         continue;
       }
-      layers.follow(i, slot, url, tg.file, tg.srcT);
+      layers.follow(i, slot, url, tg.file, tg.srcT, restart);
     }
     if (unknown !== null) registry.ask(unknown);
   }
@@ -369,8 +372,17 @@ export function mountEditorScrub(deps: EditorScrubDeps): EditorScrub {
     if (pointerSeeks === 1) pressT = t;
     else if (t !== pressT) layers.setMoved();
     if (playingAtPress) return;
-    follow(t);
-    if (pointerSeeks >= 2 && held) armRest();
+    // Only a playhead moved more than a frame from where the rest wait last
+    // started restarts it (the first move always does): a held pointer's
+    // tremor across sub-frame times lets it run out, and does not cancel a
+    // rest already under way.
+    const restart =
+      pointerSeeks >= 2 && !(Math.abs(t - restAnchorT) <= restTolerance(project.timeline.fps));
+    follow(t, restart);
+    if (restart && held) {
+      restAnchorT = t;
+      armRest();
+    }
   }
 
   /** The engine's listener: whatever goes wrong here must never reach the
@@ -395,6 +407,7 @@ export function mountEditorScrub(deps: EditorScrubDeps): EditorScrub {
     evt = e;
     held = true;
     pointerSeeks = 0;
+    restAnchorT = Number.NaN;
     playingAtPress = engine.playing;
     clearRest();
     layers.press(playingAtPress);

@@ -8,7 +8,7 @@ import { HEAVY_BITS_PER_S } from "../../core/heavy-clip";
 import type { Clip, MediaRef, ProjectFile, Track } from "../../core/types";
 import type { DamageState, MediaState } from "../media/media";
 import type { VisibleClip } from "../playback/scheduler";
-import { isCandidate, layerTargets, liveFiles } from "./precheck";
+import { SAME_POSITION_S, isCandidate, layerTargets, liveFiles, restTolerance } from "./precheck";
 
 const MBIT = 1_000_000;
 
@@ -156,5 +156,21 @@ describe("liveFiles", () => {
     const p = project([a, b, c], []);
     const live = liveFiles(p, { a: ready("X:\\a.mp4"), b: { state: "checking" }, c: ready("Y:\\c-copy.mp4") });
     expect([...live].sort()).toEqual(["X:\\a.mp4", "Y:\\c-copy.mp4"]);
+  });
+});
+
+describe("restTolerance", () => {
+  it("is one frame of the timebase", () => {
+    expect(restTolerance({ num: 30, den: 1 })).toBeCloseTo(1 / 30, 12);
+    expect(restTolerance({ num: 60000, den: 1001 })).toBeCloseTo(1001 / 60000, 12);
+  });
+  it("never drops below SAME_POSITION_S", () => {
+    expect(restTolerance({ num: 240, den: 1 })).toBe(SAME_POSITION_S);
+  });
+  it("falls back to SAME_POSITION_S for a missing or broken timebase", () => {
+    expect(restTolerance(undefined)).toBe(SAME_POSITION_S);
+    expect(restTolerance({ num: 0, den: 1 })).toBe(SAME_POSITION_S);
+    expect(restTolerance({ num: 30, den: -1 })).toBe(SAME_POSITION_S);
+    expect(restTolerance({ num: Number.NaN, den: 1 })).toBe(SAME_POSITION_S);
   });
 });

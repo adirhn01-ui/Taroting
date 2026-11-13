@@ -2,7 +2,9 @@
 // DEV-only: imported lazily by autotest.ts, never part of a release bundle.
 //
 // NOTHING under src/editor is imported statically here except types (erased),
-// so loading this file loads no lazy chunk as a side effect.
+// so loading this file loads no lazy chunk as a side effect. The scrub copy's
+// timing constants are read from its own module (a dynamic import of
+// precheck.ts, which has no side effects) once the blocks start.
 //
 // Fixtures: counter_audio_h264.mp4 (a burnt-in frame counter, keyframes 1 s
 // apart, ~1 Mbit/s: light on its own) is forced heavy through the editor's DEV
@@ -13,8 +15,17 @@
 //
 // Every pointer event is dispatched where a hand's would land: the timeline
 // canvas's ruler band (pointerId 1, the mouse's), or the theater's seek bar.
-// Held positions are kept by same-position moves every frame (a hand's micro-
-// moves), so the rest timer never runs out while a copy is checked.
+// A held pointer rests once the playhead has stayed within one frame
+// (restTolerance) for REST_MS, however much it trembles inside that frame. So
+// a position is held for a check by alternating between it and a point two
+// frames on, one move every REST_MS / 2: each move restarts the rest wait and
+// costs each copy one seek, and every check compares the copy with the source
+// time of the position held at that moment (the engine's time), so the two
+// alternating positions (two frames apart, more than the one frame a check
+// allows) can never be taken for each other.
+// editor-scrub-rests-while-held sends the tremor itself, first below the
+// same-position distance and then between it and one frame, and proves the
+// rest then comes while the pointer is still down.
 //
 // Every block ends with the pointer released, playback paused and theater
 // left; the last block parks on Home and deletes every project written.
@@ -223,6 +234,8 @@ function firstDiff(a: readonly string[], b: readonly string[]): string {
 
 export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
   const { test, assert, fixturesDir } = ctx;
+  /** REST_MS, CATCHUP_MAX_MS, SAME_POSITION_S and restTolerance, as the module has them. */
+  const sc = await import("../editor/scrub/precheck");
   const COUNTER = `${fixturesDir}\\counter_audio_h264.mp4`;
   const DIRECT = `${fixturesDir}\\direct_h264.mp4`;
   const paths: string[] = [];
@@ -348,16 +361,33 @@ export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
     return Math.round(performance.now() - t0);
   };
 
-  /** Hold the ruler at `t` (a same-position move every frame) until `ok`
-   *  answers null; its last answer names what was missing. */
-  const holdRuler = async (dev: EdHook, t: number, ok: () => string | null, capMs = 2_000): Promise<void> => {
+  /** Where a hold answered: when the rest wait was last started (read before
+   *  the move that started it), the ruler time last sent, and the engine's
+   *  time at the answer. */
+  type Held = { restarted: number; pos: number; at: number };
+
+  /** Hold the ruler around `t` until `ok(at)` answers null, `at` being the
+   *  engine's time at that check; its last answer names what was missing. The
+   *  caller has just moved to `t` (at `movedAt`, read before that move). Every
+   *  REST_MS / 2 the hold moves once, alternating between `t` + 2 frames and
+   *  `t` (each move restarts the rest wait), and `ok` is not asked on the
+   *  frame of a move. */
+  const holdRuler = async (dev: EdHook, t: number, ok: (at: number) => string | null, capMs = 2_000, movedAt = performance.now()): Promise<Held> => {
+    const step = 2 * shared!.tol;
     const start = performance.now();
+    let restarted = movedAt;
+    let pos = t;
     for (;;) {
       await frame();
-      ruler(dev, "pointermove", t);
-      const why = ok();
-      if (why === null) return;
-      if (performance.now() - start > capMs) throw new Error(`held at ${f3(t)} s for ${capMs} ms: ${why}`);
+      if (performance.now() - start > capMs) throw new Error(`held around ${f3(t)} s for ${capMs} ms: ${ok(dev.engine.time) ?? "(it answered only on a move frame)"}`);
+      if (performance.now() - restarted >= sc.REST_MS / 2) {
+        restarted = performance.now();
+        pos = pos === t ? t + step : t;
+        ruler(dev, "pointermove", pos);
+        continue;
+      }
+      const at = dev.engine.time;
+      if (ok(at) === null) return { restarted, pos, at };
     }
   };
 
@@ -370,8 +400,10 @@ export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
   //  1: direct_h264, in 1.7, scaled to 0.35 and moved to the lower left:
   //     light, covering a corner of the layer below.
   //  2: the counter again, unmodified, from 0: heavy (the same file).
-  let shared: { dev: EdHook; counter: MediaRef; direct: MediaRef } | null = null;
-  const sharedProject = async (): Promise<{ dev: EdHook; counter: MediaRef; direct: MediaRef }> => {
+  /** `tol`: the module's rest tolerance for this project's frame rate (s). */
+  type Shared = { dev: EdHook; counter: MediaRef; direct: MediaRef; tol: number };
+  let shared: Shared | null = null;
+  const sharedProject = async (): Promise<Shared> => {
     const live = shared !== null && hook() === shared.dev && $(".editor:not(.imged)") !== null;
     if (live) return shared!;
     await backHome();
@@ -402,7 +434,9 @@ export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
     const dev = await mount(p, "Editor scrub");
     dev.editorScrub.forceOnly = counter.path;
     dev.editorScrub.forceHeavy = true;
-    shared = { dev, counter, direct };
+    const tol = sc.restTolerance(p.timeline.fps);
+    assert(tol > sc.SAME_POSITION_S, `the rest tolerance ${f3(tol)} s at ${p.timeline.fps.num}/${p.timeline.fps.den} fps is not above the same-position distance`);
+    shared = { dev, counter, direct, tol };
     return shared;
   };
 
@@ -498,20 +532,22 @@ export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
           const want = positions[k]!;
           ruler(dev, "pointermove", want);
           held = want;
-          const t = dev.engine.time;
-          const s0 = topSrc(t);
-          const s2 = t;
-          await holdRuler(dev, want, () => {
+          // Every check compares against the position held at that moment.
+          const h = await holdRuler(dev, want, (at) => {
             for (const [i, s] of [
-              [0, s0],
-              [2, s2],
+              [0, topSrc(at)],
+              [2, at],
             ] as const) {
               const { copy } = pair(dev!, i);
               if (!shown(copy)) return `layer ${i}'s copy is not shown (${JSON.stringify(snap(dev!).layers)})`;
-              if (copy!.seeking || Math.abs(copy!.currentTime - s) > 1 / 30) return `layer ${i}'s copy is at ${f3(copy!.currentTime)} s, not ${f3(s)}`;
+              if (copy!.seeking || Math.abs(copy!.currentTime - s) > 1 / 30) return `layer ${i}'s copy is at ${f3(copy!.currentTime)} s, not ${f3(s)} (held at ${f3(at)} s)`;
             }
             return null;
           });
+          // No move between the answer and the reads below (no await).
+          held = h.pos;
+          const t = h.at;
+          const s2 = t;
           for (const i of [0, 2]) {
             const { copy, main } = pair(dev, i);
             assert(copy !== null && main !== null, `layer ${i} has no copy / real element pair`);
@@ -589,7 +625,7 @@ export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
 
         // Release: each copy hides only once its real element is at the frame.
         const tRel = dev.engine.time;
-        ruler(dev, "pointerup", positions[positions.length - 1]!);
+        ruler(dev, "pointerup", held ?? positions[positions.length - 1]!);
         held = null;
         const relStart = performance.now();
         const hidden = new Set<number>();
@@ -631,13 +667,15 @@ export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
         ruler(dev, "pointerdown", 7.3);
         held = 7.3;
         ruler(dev, "pointermove", 9.6);
-        await holdRuler(dev, 9.6, () => (shown(pair(dev!, 0).copy) ? null : "the top copy is not shown before Space"));
+        held = 9.6;
+        const hs = await holdRuler(dev, 9.6, () => (shown(pair(dev!, 0).copy) ? null : "the top copy is not shown before Space"));
+        held = hs.pos;
         window.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true }));
         await until(() => dev!.engine.playing, 1_000, () => "Space to start playback");
         await frames(3);
         const unloaded = $$<HTMLVideoElement>("video[data-scrub-copy]").every((c) => !c.hasAttribute("src") && !shown(c));
         assert(unloaded, `a copy kept its file or showed while playing: ${JSON.stringify(snap(dev).layers)}`);
-        ruler(dev, "pointerup", 9.6);
+        ruler(dev, "pointerup", hs.pos);
         held = null;
         dev.engine.pause();
 
@@ -665,6 +703,189 @@ export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
     });
 
     /* ============================================================ */
+    /* (b2) a held pointer's tremor rests without a release          */
+    /* ============================================================ */
+    await test("editor-scrub-rests-while-held", async () => {
+      const t0 = performance.now();
+      let dev: EdHook | undefined;
+      let held: number | null = null;
+      try {
+        const sh = await sharedProject();
+        dev = sh.dev;
+        await copyReady(dev);
+        /** The picture painted at canvas point (x, y) of the 1600x900 canvas:
+         *  the overlay and the layer sets step aside and every picture takes
+         *  the pointer for the probe only, so paint order decides the hit. */
+        const pictureAt = (x: number, y: number): Element | null => {
+          const canvas = $<HTMLElement>(".preview__canvas")!;
+          const cb = canvas.getBoundingClientRect();
+          const overlay = $<HTMLElement>(".stage-overlay");
+          const sets = $$<HTMLElement>(".preview__canvas > .stage-layer-set");
+          const pictures = [...$$<HTMLVideoElement>(".preview__canvas video.stage-layer__media"), ...$$<HTMLVideoElement>("video[data-scrub-copy]")];
+          const saved = new Map<HTMLElement, string>();
+          for (const el of [...(overlay ? [overlay] : []), ...sets, ...pictures]) saved.set(el, el.style.pointerEvents);
+          try {
+            if (overlay) overlay.style.pointerEvents = "none";
+            for (const el of sets) el.style.pointerEvents = "none";
+            for (const el of pictures) el.style.pointerEvents = "auto";
+            return document.elementFromPoint(cb.left + (x * cb.width) / 1600, cb.top + (y * cb.height) / 900);
+          } finally {
+            for (const [el, v] of saved) el.style.pointerEvents = v;
+          }
+        };
+        // The top layer's centre: the canvas centre moved by its offset (+180, -60).
+        const CX = 980;
+        const CY = 390;
+        // Tremor A: below the same-position distance on both heavy layers (the
+        // top one runs at speed 1.5), so neither the copy nor a real element
+        // seeks for it; far below one frame, so it never restarts the rest.
+        const TREMOR = sc.SAME_POSITION_S / 2 / 1.5;
+        // Tremor B: above the same-position distance on both heavy layers (the
+        // copies and the real elements seek for every move) and within one
+        // frame (it never restarts the rest): where a one-pixel tremor of a
+        // real hand lands at fit zoom.
+        const AMP = 0.6 * sh.tol;
+        assert(AMP > sc.SAME_POSITION_S && AMP <= sh.tol, `the second tremor ${f3(AMP)} s is not between the same-position distance ${f3(sc.SAME_POSITION_S)} s and one frame ${f3(sh.tol)} s`);
+        /** Tremor B moves once every this many frames. */
+        const AMP_EVERY = 3;
+        /** Once tremor B stops, the copy must give way within this long. */
+        const capB = sc.REST_MS + 1_000;
+        const ok = (at: number): string | null => {
+          const { copy } = pair(dev!, 0);
+          if (!shown(copy)) return `the top copy is not shown (${JSON.stringify(snap(dev!).layers)})`;
+          if (copy!.seeking || Math.abs(copy!.currentTime - topSrc(at)) > sh.tol) return `the top copy is at ${f3(copy!.currentTime)} s, not ${f3(topSrc(at))} (held at ${f3(at)} s)`;
+          return null;
+        };
+        const t = 7.7;
+
+        ruler(dev, "pointerdown", 4.0);
+        held = 4.0;
+        const movedAt = performance.now();
+        ruler(dev, "pointermove", t);
+        held = t;
+        assert(Math.abs(dev.engine.time - t) < 0.05, `the ruler move did not seek (at ${f3(dev.engine.time)} s)`);
+        const h = await holdRuler(dev, t, ok, 2_000, movedAt);
+        held = h.pos;
+        const tHeld = h.at;
+        const upHit = pictureAt(CX, CY);
+        assert(upHit === pair(dev, 0).copy, `with the copy up, the top layer's centre paints ${describeEl(upHit)}, not the copy`);
+
+        // Tremble below the same-position distance every animation frame, never let go.
+        const times = new Set<number>();
+        const cap = sc.REST_MS + sc.CATCHUP_MAX_MS + 500;
+        let n = 0;
+        let hidAt = 0;
+        for (;;) {
+          await frame();
+          ruler(dev, "pointermove", n++ % 2 === 0 ? h.pos + TREMOR : h.pos);
+          times.add(dev.engine.time);
+          if (!shown(pair(dev, 0).copy)) {
+            hidAt = performance.now();
+            break;
+          }
+          if (performance.now() - h.restarted > cap) {
+            throw new Error(`the top copy stayed up ${cap} ms under a held tremor of ${f3(TREMOR)} s (playhead times ${[...times].map(f3).join(", ")}; ${JSON.stringify(snap(dev).layers)})`);
+          }
+        }
+        const spread = Math.max(...times) - Math.min(...times);
+        assert(times.size >= 2, `the tremor did not move the playhead (only ${[...times].map(f3).join(", ")}): the sub-pixel clientX was not taken`);
+        assert(spread < sh.tol, `the tremor spread ${f3(spread)} s, not within one frame (${f3(sh.tol)} s)`);
+        const waited = hidAt - h.restarted;
+        // 2 ms: a timer may fire up to a millisecond before performance.now says.
+        assert(waited >= sc.REST_MS - 2, `the copy gave way ${waited.toFixed(0)} ms after the rest wait started, before REST_MS (${sc.REST_MS} ms)`);
+        const main = pair(dev, 0).main;
+        const asked = topSrc(dev.engine.time);
+        assert(
+          main !== null && !main.seeking && main.readyState >= 2 && Math.abs(main.currentTime - asked) <= sh.tol,
+          `the top copy gave way but its real element is not at ${f3(asked)} s (at ${main ? f3(main.currentTime) : "none"}, seeking ${String(main?.seeking)}, readyState ${main?.readyState ?? -1})`,
+        );
+        const mainA = main!.currentTime;
+        const downHit = pictureAt(CX, CY);
+        assert(downHit === main, `after the rest the top layer's centre paints ${describeEl(downHit)}, not its real element`);
+
+        // A move of five frames brings the copy back, still held, no other move.
+        const t2 = h.pos + 5 * sh.tol;
+        const backAt = performance.now();
+        ruler(dev, "pointermove", t2);
+        held = t2;
+        const tBack = dev.engine.time;
+        await until(
+          () => ok(tBack) === null,
+          1_000,
+          () => `the top copy back at ${f3(topSrc(tBack))} s after a five-frame move: ${ok(tBack) ?? "?"}`,
+        );
+        const backMs = Math.round(performance.now() - backAt);
+        const againHit = pictureAt(CX, CY);
+        assert(againHit === pair(dev, 0).copy, `after the five-frame move the top layer's centre paints ${describeEl(againHit)}, not the copy`);
+
+        // Tremor B. First a held position with the copy up and a rest wait
+        // started less than REST_MS / 2 ago (the hold restarts it as needed),
+        // then a move within one frame of it every AMP_EVERY frames.
+        const hB = await holdRuler(dev, t2, ok, 2_000, backAt);
+        held = hB.pos;
+        const timesB = new Set<number>([dev.engine.time]);
+        // Every move of tremor B re-seeks the real element, so it cannot
+        // settle while the tremor goes on: the copy stays up (the frame asked
+        // for, soft) rather than uncover a real element that is mid-seek.
+        // What must hold on every frame: whatever paints is the asked frame.
+        const WINDOW_MS = sc.REST_MS + 250;
+        const startB = performance.now();
+        let nB = 0;
+        let lastMoveAt = hB.restarted;
+        let hidDuring = false;
+        for (let f = 1; performance.now() - startB < WINDOW_MS; f++) {
+          await frame();
+          const { copy, main: m } = pair(dev, 0);
+          if (!shown(copy)) {
+            hidDuring = true;
+            const want = topSrc(dev.engine.time);
+            if (m === null || m.readyState < 2 || Math.abs(m.currentTime - want) > 2 * sh.tol) {
+              throw new Error(
+                `under tremor B the copy gave way over a real element that is not at the asked frame (asked ${f3(want)} s, real element at ${m ? f3(m.currentTime) : "none"}, readyState ${m?.readyState ?? -1})`,
+              );
+            }
+          }
+          if (f % AMP_EVERY === 0) {
+            ruler(dev, "pointermove", nB++ % 2 === 0 ? hB.pos + AMP : hB.pos);
+            lastMoveAt = performance.now();
+            timesB.add(dev.engine.time);
+          }
+        }
+        const spreadB = Math.max(...timesB) - Math.min(...timesB);
+        assert(timesB.size >= 2, `tremor B did not move the playhead (only ${[...timesB].map(f3).join(", ")})`);
+        assert(spreadB > sc.SAME_POSITION_S && spreadB <= sh.tol, `tremor B spread ${f3(spreadB)} s, not between the same-position distance and one frame (${f3(sh.tol)} s)`);
+        // The hand goes still, the button stays down: the real element lands
+        // and the copy gives way.
+        const askedB = topSrc(dev.engine.time);
+        const mainB = await until(
+          () => {
+            const { copy, main: m } = pair(dev!, 0);
+            return !shown(copy) && m !== null && !m.seeking && m.readyState >= 2 ? m : null;
+          },
+          capB,
+          () => {
+            const m = pair(dev!, 0).main;
+            return `the top copy to give way once tremor B stopped (copy shown ${String(shown(pair(dev!, 0).copy))}; real element at ${m ? f3(m.currentTime) : "none"}, seeking ${String(m?.seeking)}; ${JSON.stringify(snap(dev!).layers)})`;
+          },
+        );
+        const stillMs = performance.now() - lastMoveAt;
+        // The rest wait began REST_MS after the hold, during the tremor. Had a
+        // tremor move restarted it, the copy could not give way during the
+        // tremor, nor sooner than REST_MS after the last move.
+        assert(
+          hidDuring || stillMs < sc.REST_MS - 2,
+          `the copy gave way ${stillMs.toFixed(0)} ms after tremor B's last move: a move within one frame restarted the rest wait (REST_MS ${sc.REST_MS} ms)`,
+        );
+        assert(Math.abs(mainB.currentTime - askedB) <= sh.tol, `after tremor B the copy gave way but its real element is at ${f3(mainB.currentTime)} s, not within one frame of ${f3(askedB)} s`);
+        const downHitB = pictureAt(CX, CY);
+        assert(downHitB === mainB, `after the rest under tremor B the top layer's centre paints ${describeEl(downHitB)}, not its real element`);
+        return `held at ${f3(tHeld)} s; tremor A (${f3(TREMOR)} s, ${n} moves, spread ${f3(spread)} s): the copy gave way ${waited.toFixed(0)} ms after the rest wait began (REST_MS ${sc.REST_MS}), real element at ${f3(mainA)} for ${f3(asked)}; a five-frame move brought it back in ${backMs} ms; tremor B (${f3(AMP)} s every ${AMP_EVERY} frames for ${WINDOW_MS} ms, ${nB} moves, spread ${f3(spreadB)} s): ${hidDuring ? "gave way during the tremor" : `gave way ${stillMs.toFixed(0)} ms after its last move`}, real element at ${f3(mainB.currentTime)} for ${f3(askedB)}; never released — ${ms(t0)}`;
+      } finally {
+        await settle(dev, held);
+      }
+    });
+
+    /* ============================================================ */
     /* (c) the real elements get identical writes                    */
     /* ============================================================ */
     await test("editor-scrub-main-writes-identical", async () => {
@@ -680,8 +901,21 @@ export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
         /** ~170 ms at the harness's 240 Hz: a keyframe-only copy lands well inside it. */
         const HOLD_FRAMES = 40;
         const els = dev.scheduler.videoElements();
+        // A held position alternates with a point two frames on, one move every
+        // STEP_EVERY frames (each move restarts the rest wait): STEP_EVERY is
+        // fixed from the measured frame rate once, before the runs, so all
+        // three runs send the identical event sequence and a move comes about
+        // every REST_MS / 2.
+        const step = 2 * sh.tol;
+        const f0 = performance.now();
+        await frames(10);
+        const frameMs = (performance.now() - f0) / 10;
+        const STEP_EVERY = Math.max(2, Math.floor(sc.REST_MS / 2 / Math.max(1, frameMs)));
         /** One scripted drag: same start, same positions, same frame counts. */
+        /** Per position, how many frames of the last run had the top copy shown. */
+        let shownFrames: number[] = [];
         const run = async (withCopy: boolean): Promise<string[]> => {
+          shownFrames = [];
           dev!.engine.seek(2.8);
           await until(() => els.every((e) => !e.seeking), 2_000, () => "the real elements to settle before a run");
           if (withCopy) {
@@ -694,21 +928,34 @@ export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
           try {
             ruler(dev!, "pointerdown", 2.8);
             held = 2.8;
-            // The same number of same-position moves in every run, so every
-            // run makes the same number of seeks: the logs compare 1:1.
+            // The same moves in every run (one every STEP_EVERY-th frame,
+            // alternating between the position and two frames on), so every
+            // run makes the same seeks: the logs compare 1:1. The copy is
+            // looked at on every frame of every run (reads only), and a ready
+            // run must have shown it on some frame at every position.
+            let pos = 2.8;
             for (const t of positions) {
-              ruler(dev!, "pointermove", t);
-              held = t;
+              pos = t;
+              ruler(dev!, "pointermove", pos);
+              held = pos;
+              let up = 0;
               for (let n = 0; n < HOLD_FRAMES; n++) {
                 await frame();
-                ruler(dev!, "pointermove", t);
+                if (shown(pair(dev!, 0).copy)) up++;
+                if ((n + 1) % STEP_EVERY === 0) {
+                  pos = pos === t ? t + step : t;
+                  ruler(dev!, "pointermove", pos);
+                  held = pos;
+                }
               }
+              shownFrames.push(up);
               if (withCopy) {
-                const c = pair(dev!, 0).copy;
-                assert(shown(c), `the top copy was not shown after ${HOLD_FRAMES} frames held at ${f3(t)} s — ${JSON.stringify(snap(dev!).layers)}`);
+                assert(up > 0, `the top copy was shown on no frame of ${HOLD_FRAMES} held around ${f3(t)} s — ${JSON.stringify(snap(dev!).layers)}`);
+              } else {
+                assert(up === 0, `the top copy was shown on ${up} frames held around ${f3(t)} s in a run without a ready copy`);
               }
             }
-            ruler(dev!, "pointerup", positions[positions.length - 1]!);
+            ruler(dev!, "pointerup", pos);
             held = null;
             await frames(4);
             return [...logger.log];
@@ -729,7 +976,7 @@ export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
         assert(off.some((e) => /currentTime=/.test(e)), "the scripted drag seeked no real element — it did not scrub");
         assert(firstDiff(off, light) === "equal", `disabled vs enabled-not-heavy: ${firstDiff(off, light)}`);
         assert(firstDiff(off, ready) === "equal", `disabled vs a shown ready copy: ${firstDiff(off, ready)}`);
-        return `three drags over ${positions.length} positions (disabled; enabled, not heavy; a ready copy shown): ${off.length} writes each, equal entry for entry — ${ms(t0)}`;
+        return `three drags over ${positions.length} positions (disabled; enabled, not heavy; a ready copy shown on ${shownFrames.join("/")} of ${HOLD_FRAMES} frames, a move every ${STEP_EVERY}): ${off.length} writes each, equal entry for entry — ${ms(t0)}`;
       } finally {
         (logger as { stop(): void } | null)?.stop();
         if (dev) {
@@ -776,16 +1023,33 @@ export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
         fire("pointerdown", 0.12);
         pressed = true;
         const said: string[] = [];
+        // Held as on the ruler: alternating with a point two frames on, one
+        // move every REST_MS / 2 (the bar seeks frac * duration), never
+        // checked on the frame of a move, and checked against the time held
+        // at that moment.
+        const stepFrac = (2 * sh.tol) / dev.engine.duration();
+        let last = 0.12;
         for (const frac of [0.21, 0.39, 0.3]) {
-          fire("pointermove", frac);
-          const t = dev.engine.time;
+          let restarted = performance.now();
+          last = frac;
+          fire("pointermove", last);
           const start = performance.now();
+          let t = dev.engine.time;
           for (;;) {
             await frame();
-            fire("pointermove", frac);
+            if (performance.now() - start > 2_000) {
+              const c = pair(dev, 0).copy;
+              throw new Error(`the top copy never showed ${f3(topSrc(dev.engine.time))} s on the theater bar (copy at ${f3(c?.currentTime ?? -1)}, shown ${String(shown(c))}; ${JSON.stringify(snap(dev).layers)})`);
+            }
+            if (performance.now() - restarted >= sc.REST_MS / 2) {
+              restarted = performance.now();
+              last = last === frac ? frac + stepFrac : frac;
+              fire("pointermove", last);
+              continue;
+            }
+            t = dev.engine.time;
             const { copy } = pair(dev, 0);
             if (shown(copy) && !copy!.seeking && Math.abs(copy!.currentTime - topSrc(t)) <= 1 / 30) break;
-            if (performance.now() - start > 2_000) throw new Error(`the top copy never showed ${f3(topSrc(t))} s on the theater bar (${JSON.stringify(snap(dev).layers)})`);
           }
           const { copy, main } = pair(dev, 0);
           const a = copy!.getBoundingClientRect();
@@ -794,7 +1058,7 @@ export async function runEditorScrubBlocks(ctx: EditorScrubCtx): Promise<void> {
           assert(off <= 0.5, `in theater the copy box is ${off.toFixed(2)} px off its real element's`);
           said.push(`${f3(t)}→${f3(copy!.currentTime)}`);
         }
-        fire("pointerup", 0.3);
+        fire("pointerup", last);
         pressed = false;
         await until(() => !shown(pair(dev!, 0).copy) || null, 4_500, () => "the copy to hide after the theater release");
         return `theater bar drag: ${said.join(", ")}, boxes within 0.5 px, hidden after release — ${ms(t0)}`;
