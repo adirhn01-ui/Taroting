@@ -10,6 +10,7 @@ import { addAnnot, newId } from "../../model";
 import type { PdfEditorCtx } from "../../types";
 import { boxForFrame, boxPoints, fitCentered, rotField } from "./geom";
 import type { MarkLayer } from "./layer";
+import { notePicturesFound } from "../missing-pictures";
 
 /** A probe result that is a still picture (the image editor's isStillInfo
  *  rule, src/editor/media/relink.ts, which the PDF chunk does not import). */
@@ -77,6 +78,8 @@ export async function insertPicture(
     const before = ctx.session.project;
     ctx.session.commit((p) => withPicture(p, key, info, box, id, page.rot));
     if (ctx.session.project === before) return false;
+    // a file picked again that was missing is there after all
+    notePicturesFound(ctx, [info]);
     ctx.tools.update((s) => (s.tool === "select" ? s : { ...s, tool: "select" }));
     ctx.selection.set([{ key, id }]);
     return true;

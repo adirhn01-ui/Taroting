@@ -73,7 +73,22 @@ describe("saved marks as SVG", () => {
     expect(img.getAttribute("href")).toBe("asset://C:\\p.png");
     expect(img.getAttribute("preserveAspectRatio")).toBe("none");
     const gone = node({ id: "p", t: "image", x: 1, y: 2, w: 3, h: 4, media: "nope" });
-    expect(gone.classList.contains("pdfmk-mark--missing")).toBe(true);
+    expect(gone.classList.contains("pdfmk-missing")).toBe(true);
+    expect(gone.children[0]!.classList.contains("pdfmk-mark--missing")).toBe(true);
+    expect(gone.getAttribute("data-id")).toBe("p");
+  });
+
+  it("a picture whose FILE is missing draws the placeholder at its box, not an empty image", () => {
+    const m = { id: "m1", path: "C:\\gone.png", size: 1, mtimeMs: 2 } as MediaRef;
+    const other = { id: "m2", path: "C:\\here.png", size: 3, mtimeMs: 4 } as MediaRef;
+    const isMissing = (r: MediaRef): boolean => r.path === "C:\\gone.png";
+    const gone = markNode({ id: "p", t: "image", x: 10, y: 20, w: 30, h: 40, media: "m1" }, [m, other], (p) => p, isMissing) as unknown as FakeElement;
+    expect(gone.tagName).toBe("G");
+    const rect = gone.children[0]!;
+    expect([rect.getAttribute("x"), rect.getAttribute("y"), rect.getAttribute("width"), rect.getAttribute("height")]).toEqual(["10", "20", "30", "40"]);
+    expect(gone.children[1]!.getAttribute("d")).toBe("M10 20L40 60M40 20L10 60");
+    const here = markNode({ id: "q", t: "image", x: 1, y: 2, w: 3, h: 4, media: "m2" }, [m, other], (p) => p, isMissing) as unknown as FakeElement;
+    expect(here.tagName).toBe("IMAGE");
   });
 
   it("a signature's strokes are drawn into its box", () => {

@@ -156,3 +156,42 @@
   color: var(--text-2);
   font-size: var(--fs-13);
 }
+
+/* ---------- missing pictures (0.9.5) ---------- */
+/* the page's "Relink picture" action, over its missing picture (placed in
+   fractions of the page by missing-pictures.ts) */
+.pdfed-relink-pic {
+  position: absolute;
+  z-index: var(--z-stage-status);
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+  white-space: nowrap;
+  box-shadow: var(--shadow-1);
+}
+.pdfed-relink-pic svg {
+  pointer-events: none;
+  color: var(--danger);
+}
+/* the rail: a page picture's file is gone (its box, dashed) */
+.pdfed-rail .pdfv-thumb__pic--missing {
+  box-sizing: border-box;
+  border: 1px dashed var(--danger);
+  background: var(--danger-dim);
+}
+/* the rail: a picture on this page is missing */
+.pdfed-rail .pdfv-thumb__badge {
+  position: absolute;
+  z-index: var(--z-stage-overlay);
+  top: 4px;
+  right: 4px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--danger);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  pointer-events: none;
+}

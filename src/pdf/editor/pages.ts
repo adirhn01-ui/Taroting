@@ -12,7 +12,7 @@ import { describeError, ipc, mediaUrl, pickImageFiles, pickPdfFiles } from "../.
 import { PDF_MAX_PAGES } from "../../core/types";
 import { Store } from "../../core/store";
 import type { MediaInfo, MediaRef, PdfPage, PdfSource, ProjectFile } from "../../core/types";
-import type { PicturePageSizing } from "../../core/picture-page";
+import { PICTURE_PAGE_SIZINGS, type PicturePageSizing } from "../../core/picture-page";
 import { imgIcon } from "../../image/icons";
 import { icon } from "../../ui/icons";
 import { closeMenu, showMenu } from "../../ui/menu";
@@ -27,15 +27,21 @@ import {
   insertSourcePages,
   isPagePicture,
   isPagePictureSource,
+  isPicturePage,
+  mediaFileKey,
+  missingPicturesOn,
   pageAnnots,
   newId,
+  picturePageSizingOf,
   reorderPages,
   rotatePages,
+  setPicturePageSizing,
 } from "../model";
 import type { PdfDoc, PdfEditorCtx, PdfThumbRail, PdfViewPage, PdfViewPicture } from "../types";
 import { createThumbRail, isPdfOpenError, openPdf } from "../view";
 import { button, el } from "./el";
-import { askPicturePagesSizing } from "./pictures-dialog";
+import { PICTURE_SIZING_LABELS, askPicturePagesSizing } from "./pictures-dialog";
+import { notePicturesFound } from "./missing-pictures";
 
 /** A4 portrait in points: the size of a blank page with nothing to follow. */
 export const A4: readonly [number, number] = [595.28, 841.89];
@@ -54,6 +60,9 @@ export interface PagePanelDeps {
   openExport(pageSlot: number, tab: "pdf" | "image"): void;
   /** tests: stands in for the native multi-picture picker */
   pickPictures?(): Promise<string[]>;
+  /** (0.9.5) open the picture relink for these media ids (the files of the
+   *  pages' missing pictures). Absent: no "Relink picture" entry. */
+  relinkPictures?(mediaIds: string[]): void;
 }
 
 export interface PagePanel {
@@ -77,7 +86,13 @@ export interface PageOps {
   /** Pictures as pages after `afterSlot` (0.9.5). `given` skips the picker
    *  (its paths are used in the order given) and/or the size question. */
   insertPictures(afterSlot: number, given?: { paths?: readonly string[]; sizing?: PicturePageSizing }): Promise<void>;
-  menuItems(slots: readonly number[]): MenuItem[];
+  /** (0.9.5) give the picture pages among `slots` another sizing, one undo
+   *  step; other pages are skipped. False when nothing changed. */
+  setSizing(slots: readonly number[], sizing: PicturePageSizing): boolean;
+  /** (0.9.5) the media ids of the missing pictures on `slots`, one per file */
+  missingOn(slots: readonly number[]): string[];
+  /** `at`: where the menu was opened (the Page size choices open there) */
+  menuItems(slots: readonly number[], at?: { clientX: number; clientY: number }): MenuItem[];
 }
 
 const pagesOf = (p: ProjectFile) => p.pdf?.pages ?? [];
@@ -114,6 +129,12 @@ export class PageSelection extends Store<number[]> {
 }
 
 const clampSide = (v: number): number => Math.min(SIDE_MAX, Math.max(SIDE_MIN, v));
+
+/** The Page size choices' marks: a tick on the current one, an empty glyph
+ *  of the same size on the others so the labels line up (the app's own
+ *  markup, never user text). */
+const CHECK_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>';
+const NO_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"></svg>';
 
 /* ---------------- pictures as pages (0.9.5) ---------------- */
 
@@ -170,12 +191,19 @@ export async function probePictures(
 export function withPagePictures(
   pages: PdfViewPage[],
   p: ProjectFile,
-  look: { url?: (path: string) => string; thumb?: (ref: MediaRef) => Promise<string> } = {},
+  look: { url?: (path: string) => string; thumb?: (ref: MediaRef) => Promise<string>; missing?: (ref: MediaRef) => boolean } = {},
 ): PdfViewPage[] {
   let out: PdfViewPage[] | null = null;
   let byId: Map<string, MediaRef> | null = null;
+  const missing = look.missing;
   for (let i = 0; i < pages.length; i++) {
     const vp = pages[i]!;
+    // (0.9.5) any page with a missing picture is marked in the rail; asked
+    // only while some file is known missing
+    if (missing && missingPicturesOn(p, vp.key, missing).length > 0) {
+      out ??= pages.slice();
+      out[i] = { ...out[i]!, missingPicture: true };
+    }
     if (vp.doc !== null) continue;
     const a = pageAnnots(p, vp.key).find(isPagePicture);
     if (!a) continue;
@@ -185,17 +213,19 @@ export function withPagePictures(
     const h = vp.h ?? A4[1];
     if (!ref || !(w > 0) || !(h > 0)) continue;
     const thumb = look.thumb;
+    const gone = missing?.(ref) === true;
     const picture: PdfViewPicture = {
-      file: `${ref.path}|${ref.size}|${ref.mtimeMs}`,
+      file: mediaFileKey(ref),
       url: (look.url ?? mediaUrl)(ref.path),
-      ...(thumb ? { thumb: () => thumb(ref) } : {}),
+      ...(thumb && !gone ? { thumb: () => thumb(ref) } : {}),
+      ...(gone ? { missing: true as const } : {}),
       x: a.x / w,
       y: a.y / h,
       w: a.w / w,
       h: a.h / h,
     };
     out ??= pages.slice();
-    out[i] = { ...vp, picture };
+    out[i] = { ...out[i]!, picture };
   }
   return out ?? pages;
 }
@@ -424,6 +454,8 @@ export function createPageOps(ctx: PdfEditorCtx, deps: PagePanelDeps): PageOps {
         toast.refuse(`A PDF project holds up to ${PDF_MAX_PAGES.toLocaleString()} pages.`);
         return;
       }
+      // a file picked again that was missing is there after all
+      notePicturesFound(ctx, infos);
       reselect(added);
       ctx.view.scrollToPage(at);
     } catch (e) {
@@ -433,11 +465,73 @@ export function createPageOps(ctx: PdfEditorCtx, deps: PagePanelDeps): PageOps {
     }
   };
 
-  const menuItems = (slots: readonly number[]): MenuItem[] => {
+  const setSizing = (slots: readonly number[], sizing: PicturePageSizing): boolean => {
+    const ids = idsOf(targets(slots));
+    if (ids.length === 0) return false;
+    const before = session.project;
+    session.commit((p) => setPicturePageSizing(p, ids, sizing));
+    return session.project !== before;
+  };
+
+  const missingOn = (slots: readonly number[]): string[] => {
+    const set = ctx.missingPictures?.get();
+    if (!set || set.size === 0) return [];
+    const isMissing = (ref: MediaRef): boolean => set.has(mediaFileKey(ref));
+    const p = session.project;
+    const out: string[] = [];
+    const files = new Set<string>();
+    for (const id of idsOf(targets(slots))) {
+      for (const m of missingPicturesOn(p, id, isMissing)) {
+        const ref = p.media.find((x) => x.id === m)!;
+        const key = mediaFileKey(ref);
+        if (files.has(key)) continue;
+        files.add(key);
+        out.push(m);
+      }
+    }
+    return out;
+  };
+
+  /** The Page size choices for the picture pages among `t`, the sizing they
+   *  all share now marked (none when they differ or match none). */
+  const sizingItems = (t: readonly number[]): MenuItem[] => {
+    const pages = pagesOf(session.project);
+    const ids = t.map((s) => pages[s]?.id).filter((id): id is string => id !== undefined && isPicturePage(session.project, id));
+    const now = new Set(ids.map((id) => picturePageSizingOf(session.project, id)));
+    const current = now.size === 1 ? [...now][0]! : null;
+    return PICTURE_PAGE_SIZINGS.map((s) => ({
+      label: PICTURE_SIZING_LABELS[s],
+      icon: s === current ? CHECK_ICON : NO_ICON,
+      onSelect: () => void setSizing(t, s),
+    }));
+  };
+
+  const menuItems = (slots: readonly number[], at?: { clientX: number; clientY: number }): MenuItem[] => {
     const t = targets(slots);
     const n = pagesOf(session.project).length;
     const last = t[t.length - 1] ?? n - 1;
     const many = t.length > 1;
+    const pages = pagesOf(session.project);
+    const pictures = t.filter((s) => pages[s] !== undefined && isPicturePage(session.project, pages[s]!.id));
+    const extra: MenuItem[] = [];
+    if (pictures.length > 0) {
+      const now = new Set(pictures.map((s) => picturePageSizingOf(session.project, pages[s]!.id)));
+      const current = now.size === 1 ? [...now][0]! : null;
+      extra.push({
+        label: "Page size",
+        hint: current ? PICTURE_SIZING_LABELS[current] : undefined,
+        onSelect: () => {
+          // the choices open where the page menu was
+          const x = at?.clientX ?? 0;
+          const y = at?.clientY ?? 0;
+          showMenu(x, y, sizingItems(t), undefined, at === undefined);
+        },
+      });
+    }
+    const gone = deps.relinkPictures ? missingOn(t) : [];
+    if (gone.length > 0) {
+      extra.push({ label: "Relink picture", icon: icon("warning", 14), onSelect: () => deps.relinkPictures?.(gone) });
+    }
     return [
       { label: "Rotate right", icon: imgIcon("rotateRight", 14), onSelect: () => rotate(t, 90) },
       { label: "Rotate left", icon: imgIcon("rotateLeft", 14), onSelect: () => rotate(t, -90) },
@@ -453,10 +547,11 @@ export function createPageOps(ctx: PdfEditorCtx, deps: PagePanelDeps): PageOps {
       { label: "Insert pages from PDF", onSelect: () => void insertFromPdf(last) },
       { label: "Extract pages", onSelect: () => deps.openExport(t[0] ?? 0, "pdf") },
       { label: "Export page as image", onSelect: () => deps.openExport(t[0] ?? 0, "image") },
+      ...extra,
     ];
   };
 
-  return { targets, rotate, duplicate, remove, insertBlank, insertFromPdf, insertPictures, menuItems };
+  return { targets, rotate, duplicate, remove, insertBlank, insertFromPdf, insertPictures, setSizing, missingOn, menuItems };
 }
 
 /** Mount the rail and its footer into the left panel. */
@@ -466,7 +561,7 @@ export function mountPagePanel(host: HTMLElement, ctx: PdfEditorCtx, deps: PageP
   const rail = createThumbRail({
     onPick: (slot) => ctx.view.scrollToPage(slot),
     onReorder: (keys) => ctx.session.commit((p) => reorderPages(p, keys)),
-    onContextMenu: (slots, at) => showMenu(at.clientX, at.clientY, ops.menuItems(slots)),
+    onContextMenu: (slots, at) => showMenu(at.clientX, at.clientY, ops.menuItems(slots, at)),
     selection: ctx.pageSelection,
   });
   rail.el.classList.add("pdfed-rail");
@@ -524,7 +619,11 @@ export function mountPagePanel(host: HTMLElement, ctx: PdfEditorCtx, deps: PageP
   return {
     rail,
     ops,
-    setPages: (pages) => rail.setPages(withPagePictures(pages, ctx.session.project, { thumb })),
+    setPages: (pages) => {
+      const set = ctx.missingPictures?.get();
+      const missing = set && set.size > 0 ? (ref: MediaRef): boolean => set.has(mediaFileKey(ref)) : undefined;
+      rail.setPages(withPagePictures(pages, ctx.session.project, { thumb, ...(missing ? { missing } : {}) }));
+    },
     setCurrent: (slot) => rail.setCurrent(slot),
     dispose() {
       closeMenu();

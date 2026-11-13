@@ -50,15 +50,18 @@ import { isFontId, isLegacyFont } from "../core/font-id";
 import { normalizeRuns, runsEqual } from "../core/pdf-runs";
 import {
   PDF_COORD_MAX,
+  PDF_FONT_SIZE_MAX,
+  PDF_FONT_SIZE_MIN,
   PDF_PAGE_SIDE_MAX,
   PDF_PAGE_SIDE_MIN,
+  PDF_STROKE_WIDTH_MAX,
   isPdfFilePath,
   isPdfFieldId,
   isPdfId,
   sanitizePdfFormValue,
 } from "../core/pdf-sanitize";
 import { decodePoints, encodePoints } from "../image/strokes";
-import { picturePageLayout, type PicturePageSizing } from "../core/picture-page";
+import { PICTURE_PAGE_SIZINGS, picturePageLayout, type PicturePageSizing } from "../core/picture-page";
 
 /** A fresh id for a page, source or mark — the same helper core/project uses. */
 export const newId = (): string => uid();
@@ -659,6 +662,244 @@ export function insertPicturePages(
   const pages = [...pdf.pages.slice(0, at), ...added, ...pdf.pages.slice(at)];
   const next: ProjectFile = media === p.media ? p : { ...p, media };
   return withPdf(next, { ...pdf, pages, annots });
+}
+
+/* ---------------- picture pages afterwards (0.9.5) ---------------- */
+
+/** How far (points) a picture page's size and its picture's box may sit from
+ *  a sizing's layout and still count as that sizing: the layout rounds to
+ *  0.01 pt, a hand-edited or older project may round otherwise. */
+export const PICTURE_SIZING_TOL_PT = 0.5;
+
+/** A file's identity, the one rule every picture lookup here uses (the
+ *  MediaRef's path + size + mtime). */
+export function mediaFileKey(m: { path: string; size: number; mtimeMs: number }): string {
+  return `${m.path}|${m.size}|${m.mtimeMs}`;
+}
+
+/** A picture page's parts: a blank page, its page picture (the first one) and
+ *  that picture's MediaRef with a displayed size. null for any other page. */
+function picturePageParts(
+  p: ProjectFile,
+  pageId: string,
+): { page: PdfPage; pic: Extract<PdfAnnot, { t: "image" }>; pxW: number; pxH: number } | null {
+  const pdf = pdfOf(p);
+  if (!pdf) return null;
+  const page = pdf.pages.find((pg) => pg.id === pageId);
+  if (!page || page.src !== null) return null;
+  const pic = pageAnnots(p, pageId).find(isPagePicture);
+  if (!pic) return null;
+  const ref = p.media.find((m) => m.id === pic.media);
+  const pxW = ref?.width;
+  const pxH = ref?.height;
+  if (!ref || !(typeof pxW === "number" && pxW > 0 && Number.isFinite(pxW)) || !(typeof pxH === "number" && pxH > 0 && Number.isFinite(pxH))) {
+    return null;
+  }
+  return { page, pic, pxW, pxH };
+}
+
+/** Whether a page is a picture page whose size can be changed: a blank page
+ *  carrying a page picture whose file has a known size. */
+export function isPicturePage(p: ProjectFile, pageId: string): boolean {
+  return picturePageParts(p, pageId) !== null;
+}
+
+const nearPt = (a: number | undefined, b: number): boolean => typeof a === "number" && Math.abs(a - b) <= PICTURE_SIZING_TOL_PT;
+
+/** The sizing a picture page is in NOW, read from the page and its picture's
+ *  box against `picturePageLayout` of the picture's displayed size (nothing
+ *  is stored); null when it matches none (a page sized by hand, a picture
+ *  relinked to another shape) or is not a picture page. */
+export function picturePageSizingOf(p: ProjectFile, pageId: string): PicturePageSizing | null {
+  const parts = picturePageParts(p, pageId);
+  if (!parts) return null;
+  const { page, pic, pxW, pxH } = parts;
+  for (const s of PICTURE_PAGE_SIZINGS) {
+    const l = picturePageLayout(pxW, pxH, s);
+    if (nearPt(page.w, l.pageW) && nearPt(page.h, l.pageH) && nearPt(pic.x, l.x) && nearPt(pic.y, l.y) && nearPt(pic.w, l.w) && nearPt(pic.h, l.h)) {
+      return s;
+    }
+  }
+  return null;
+}
+
+const round2 = (v: number): number => Math.round(v * 100) / 100;
+/** the thinnest stroke a refit leaves (the loader wants a width above 0) */
+const PDF_STROKE_WIDTH_MIN = 0.01;
+const clampWidth = (v: number): number => Math.min(PDF_STROKE_WIDTH_MAX, Math.max(PDF_STROKE_WIDTH_MIN, v));
+const clampFontSize = (v: number): number => Math.min(PDF_FONT_SIZE_MAX, Math.max(PDF_FONT_SIZE_MIN, round2(v)));
+
+/** A mark carried from box `from` to box `to` the way a picture under it
+ *  moves: every coordinate by the box-to-box affine, and — unlike a resize
+ *  handle (`scaleAnnot`) — stroke widths and text sizes (its style runs'
+ *  too) by the same factor (the geometric mean of the two axes' scales), so
+ *  ink drawn over a scan keeps covering the same spot at the same weight.
+ *  Widths stay in (0, 1000], text sizes in 4..288. Pure; a degenerate `from`
+ *  side maps with scale 1 on that axis. */
+export function refitAnnot(a: PdfAnnot, from: Box, to: Box): PdfAnnot {
+  const [fx, fy, fw, fh] = from;
+  const [tx, ty, tw, th] = to;
+  const sx = fw > 0 ? tw / fw : 1;
+  const sy = fh > 0 ? th / fh : 1;
+  if (!Number.isFinite(sx) || !Number.isFinite(sy) || !(sx > 0) || !(sy > 0)) return a;
+  const k = Math.sqrt(sx * sy);
+  const moved = mapAnnot(a, (x, y) => [tx + (x - fx) * sx, ty + (y - fy) * sy]);
+  switch (moved.t) {
+    case "ink":
+    case "line":
+    case "rect":
+    case "ellipse":
+    case "arrow":
+      return { ...moved, w: clampWidth(moved.w * k) };
+    case "text": {
+      const size = clampFontSize(moved.size * k);
+      const next = { ...moved, size };
+      if (!moved.runs) return next;
+      const runs = moved.runs.map((r) => (r.size === undefined ? r : { ...r, size: clampFontSize(r.size * k) }));
+      const canon = normalizeRuns(next.text, next, runs);
+      const out: Record<string, unknown> = { ...next };
+      if (canon === undefined) delete out.runs;
+      else out.runs = canon;
+      return out as unknown as PdfAnnot;
+    }
+    default:
+      return moved;
+  }
+}
+
+/**
+ * Give picture pages another sizing afterwards (the page menu's "Page size"),
+ * as ONE new project — one undo step. Each page is recomputed with
+ * `picturePageLayout` from its picture's DISPLAYED size (the MediaRef's
+ * width / height) and `sizing`; its page picture takes the layout's box, and
+ * every other mark on it is carried from the picture's old box to the new one
+ * (`refitAnnot`), so what was drawn over the picture stays over the same spot.
+ * The page keeps its id, its turn and its place. Pages that are not picture
+ * pages, unknown ids, and pages already in that sizing are skipped. Refused
+ * (returns `p`) when no page changes.
+ */
+export function setPicturePageSizing(p: ProjectFile, pageIds: readonly string[], sizing: PicturePageSizing): ProjectFile {
+  const pdf = pdfOf(p);
+  if (!pdf || !PICTURE_PAGE_SIZINGS.includes(sizing)) return p;
+  const ids = new Set(pageIds);
+  let pages: PdfPage[] | null = null;
+  let annots = pdf.annots;
+  pdf.pages.forEach((pg, i) => {
+    if (!ids.has(pg.id)) return;
+    const parts = picturePageParts(p, pg.id);
+    if (!parts || picturePageSizingOf(p, pg.id) === sizing) return;
+    const { pic, pxW, pxH } = parts;
+    const l = picturePageLayout(pxW, pxH, sizing);
+    const from: Box = [pic.x, pic.y, pic.w, pic.h];
+    const to: Box = [l.x, l.y, l.w, l.h];
+    const list = pageAnnots(p, pg.id).map((a) =>
+      a === pic ? ({ ...pic, x: l.x, y: l.y, w: l.w, h: l.h } as PdfAnnot) : refitAnnot(a, from, to),
+    );
+    pages ??= pdf.pages.slice();
+    pages[i] = { ...pg, w: l.pageW, h: l.pageH };
+    annots = setKey(annots, pg.id, list);
+  });
+  return pages ? withPdf(p, { ...pdf, pages, annots }) : p;
+}
+
+/** The ids of the image MediaRefs that are the same FILE as `mediaId`'s
+ *  (`mediaFileKey`), that one first; [] when it is unknown. */
+export function sameFileMedia(p: ProjectFile, mediaId: string): string[] {
+  const m = p.media.find((x) => x.id === mediaId);
+  if (!m) return [];
+  const key = mediaFileKey(m);
+  return [m.id, ...p.media.filter((x) => x.id !== m.id && x.kind === "image" && !x.generator && mediaFileKey(x) === key).map((x) => x.id)];
+}
+
+/** `box` with a `pxW`×`pxH` picture fitted whole inside it, centred (the
+ *  page picture's rule when its file is replaced by one of another shape).
+ *  The box itself when the shapes already agree. */
+export function fitInBox(box: Box, pxW: number, pxH: number): Box {
+  const [x, y, w, h] = box;
+  if (!(pxW > 0) || !(pxH > 0) || !(w > 0) || !(h > 0)) return box;
+  if (Math.abs(pxW / pxH - w / h) <= 1e-6 * (w / h)) return box;
+  const k = Math.min(w / pxW, h / pxH);
+  const fw = round2(pxW * k);
+  const fh = round2(pxH * k);
+  return [round2(x + (w - fw) / 2), round2(y + (h - fh) / 2), fw, fh];
+}
+
+/** After the files of `mediaIds` were replaced by a `pxW`×`pxH` picture (a
+ *  relink): every PAGE picture using one of them is fitted inside its old box,
+ *  centred (`fitInBox`) — the page keeps its size. Ordinary picture marks keep
+ *  their box. `p` itself when nothing moves. */
+export function refitPagePictures(p: ProjectFile, mediaIds: ReadonlySet<string>, pxW: number, pxH: number): ProjectFile {
+  const pdf = pdfOf(p);
+  if (!pdf || mediaIds.size === 0) return p;
+  let annots = pdf.annots;
+  for (const pg of pdf.pages) {
+    const list = pageAnnots(p, pg.id);
+    let out: PdfAnnot[] | null = null;
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i]!;
+      if (!isPagePicture(a) || !mediaIds.has(a.media)) continue;
+      const [x, y, w, h] = fitInBox([a.x, a.y, a.w, a.h], pxW, pxH);
+      if (x === a.x && y === a.y && w === a.w && h === a.h) continue;
+      out ??= list.slice();
+      out[i] = { ...a, x, y, w, h };
+    }
+    if (out) annots = setKey(annots, pg.id, out);
+  }
+  return annots === pdf.annots ? p : withPdf(p, { ...pdf, annots });
+}
+
+/** The media ids of a page's pictures (page pictures and ordinary picture
+ *  marks) whose file `isMissing` says is gone, one per file, in mark order. */
+export function missingPicturesOn(p: ProjectFile, pageId: string, isMissing: (ref: MediaRef) => boolean): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const a of pageAnnots(p, pageId)) {
+    if (a.t !== "image") continue;
+    const ref = p.media.find((m) => m.id === a.media);
+    if (!ref || !isMissing(ref)) continue;
+    const key = mediaFileKey(ref);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ref.id);
+  }
+  return out;
+}
+
+/** The image MediaRefs some picture mark (page picture or ordinary) uses, one
+ *  per FILE (`mediaFileKey`), in media order. */
+export function usedPictureFiles(p: ProjectFile): MediaRef[] {
+  const used = new Set<string>();
+  for (const list of Object.values(p.pdf?.annots ?? {})) {
+    if (!Array.isArray(list)) continue;
+    for (const a of list) if (a.t === "image") used.add(a.media);
+  }
+  const out: MediaRef[] = [];
+  const files = new Set<string>();
+  for (const m of p.media) {
+    if (!used.has(m.id) || m.kind !== "image" || m.generator) continue;
+    const key = mediaFileKey(m);
+    if (files.has(key)) continue;
+    files.add(key);
+    out.push(m);
+  }
+  return out;
+}
+
+/** The missing-file set after a check of `checked` files on disk (`gone[i]`:
+ *  that file's path is gone): every checked file is in it exactly when it is
+ *  gone; files not checked keep their entry (an older version of a relinked
+ *  picture, which an undo can bring back). `set` itself when nothing changes. */
+export function nextMissingSet(set: ReadonlySet<string>, checked: readonly MediaRef[], gone: readonly boolean[]): ReadonlySet<string> {
+  let out: Set<string> | null = null;
+  checked.forEach((m, i) => {
+    const key = mediaFileKey(m);
+    const isGone = gone[i] === true;
+    if (isGone === (out ?? set).has(key)) return;
+    out ??= new Set(set);
+    if (isGone) out.add(key);
+    else out.delete(key);
+  });
+  return out ?? set;
 }
 
 /** Drop sources no page uses, with their form values. Refused when every

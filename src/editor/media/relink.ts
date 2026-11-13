@@ -30,6 +30,28 @@ export interface RelinkCtx {
    *  kind change the image renderer cannot draw. Absent/false: the video
    *  editor's warn-but-allow flow, unchanged. */
   stillsOnly?: boolean;
+  /** How a located file is applied to the project (one commit). Absent: the
+   *  video and image editors' `applyRelink`, unchanged. The PDF editor passes
+   *  its own, which also fits a page picture to the new file's shape. */
+  relink?: (p: ProjectFile, mediaId: string, path: string, info: MediaInfo) => ProjectFile;
+  /** The file picker Locate opens for `m`; resolves to the chosen path, or
+   *  null when the picker is closed. Absent: a picker offering only the
+   *  missing file's own extension (the video and image editors). The PDF
+   *  editor passes one offering every still picture it accepts, so a missing
+   *  .jpg can be replaced by a .png. The `stillsOnly` check still runs on
+   *  whatever comes back. */
+  pick?: (m: MediaRef) => Promise<string | null>;
+}
+
+/** Locate's default picker: one filter, the missing file's own extension. */
+async function pickSameExtension(m: MediaRef): Promise<string | null> {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const ext = fileExt(m.path);
+  const picked = await open({
+    multiple: false,
+    filters: ext ? [{ name: fileStem(m.path), extensions: [ext] }] : undefined,
+  });
+  return typeof picked === "string" ? picked : null;
 }
 
 /**
@@ -242,7 +264,8 @@ export function openRelinkDialog(ctx: RelinkCtx): () => void {
    *  must not take a relink nobody will see saved. */
   function apply(m: MediaRef, path: string, info: MediaInfo, row: HTMLElement): void {
     if (closed) return;
-    session.commit((p) => applyRelink(p, m.id, path, info));
+    const relink = ctx.relink ?? applyRelink;
+    session.commit((p) => relink(p, m.id, path, info));
     // `fileChanged`: this is a different file now, so the old one's waveform
     // and thumbnail go with it instead of standing in until a reopen.
     media.retrack(m.id, true);
@@ -284,13 +307,7 @@ export function openRelinkDialog(ctx: RelinkCtx): () => void {
 
   async function locate(m: MediaRef, row: HTMLElement): Promise<void> {
     if (!inTauri) return;
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const ext = fileExt(m.path);
-    const picked = await open({
-      multiple: false,
-      filters: ext ? [{ name: fileStem(m.path), extensions: [ext] }] : undefined,
-    });
-    const path = typeof picked === "string" ? picked : null;
+    const path = await (ctx.pick ?? pickSameExtension)(m);
     if (!path) return;
     // The picker and the probe below are awaits the dialog can close across.
     if (closed) {

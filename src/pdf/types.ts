@@ -57,12 +57,17 @@ export interface PdfViewPage {
    *  original only when the thumbnail fails). The strip shows the picture
    *  through the mark layer instead. */
   picture?: PdfViewPicture;
+  /** editor only (0.9.5): a picture on this page (its page picture or an
+   *  ordinary picture mark) has a missing file; the rail marks the page */
+  missingPicture?: true;
 }
 
 export interface PdfViewPicture {
   file: string;
   url: string;
   thumb?: () => Promise<string>;
+  /** (0.9.5) the file is missing: the rail shows a placeholder, asks nothing */
+  missing?: true;
   x: number;
   y: number;
   w: number;
@@ -282,6 +287,10 @@ export interface PdfEditorCtx {
   mode: Store<"annotate" | "forms">;
   /** true when any open source has fillable fields (enables the Fill forms switch) */
   hasForms: Store<boolean>;
+  /** (0.9.5) the picture files known to be missing on disk, by identity
+   *  (model.ts `mediaFileKey`): their marks draw a placeholder. Absent or
+   *  empty = none (the usual case: nothing is looked up). */
+  missingPictures?: Store<ReadonlySet<string>>;
   /** ProjectSession.holdAutosave passthrough (pointer-down → hold, up → release) */
   holdAutosave(): () => void;
   /** register a body-parked surface's closer; dispose closes all */

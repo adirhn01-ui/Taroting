@@ -18,10 +18,10 @@
 // `pagevisible` and `pagehidden` for its page; pages already visible when the
 // layer mounts are picked up at once. Nothing runs at rest.
 
-import type { PdfAnnot, PdfPage, PdfRotation, ProjectFile } from "../../../core/types";
+import type { MediaRef, PdfAnnot, PdfPage, PdfRotation, ProjectFile } from "../../../core/types";
 import { mediaUrl } from "../../../core/ipc";
 import { onFontsChanged } from "../../../fonts";
-import { drawOrder, pageAnnots } from "../../model";
+import { drawOrder, mediaFileKey, pageAnnots } from "../../model";
 import type { PdfEditorCtx } from "../../types";
 import { boxPoints, pageTransform } from "./geom";
 import { SVG_NS, fontStateOf, markNode, needsFontRuntime } from "./render";
@@ -82,6 +82,13 @@ export function createMarkLayer(ctx: PdfEditorCtx): MarkLayer {
   const listeners = new Set<(key: string, frame: PageFrame | null) => void>();
   /** pages the view says are visible (their overlays exist) */
   const visible = new Set<string>();
+
+  /** a picture whose file is known missing draws a placeholder (0.9.5);
+   *  nothing is looked up while none is */
+  const isMissing = (ref: MediaRef): boolean => {
+    const set = ctx.missingPictures?.get();
+    return !!set && set.size > 0 && set.has(mediaFileKey(ref));
+  };
 
   const emit = (key: string, f: PageFrame | null): void => {
     for (const fn of [...listeners]) fn(key, f);
@@ -175,7 +182,7 @@ export function createMarkLayer(ctx: PdfEditorCtx): MarkLayer {
       let node: SVGElement | null;
       if (prev.has(a) && !(mediaChanged && a.t === "image")) node = prev.get(a)!;
       else {
-        node = markNode(a, p.media, mediaUrl);
+        node = markNode(a, p.media, mediaUrl, isMissing);
         if (hasFontId(a)) fontStates.set(a, fontStateOf(a));
       }
       next.set(a, node);
@@ -274,6 +281,24 @@ export function createMarkLayer(ctx: PdfEditorCtx): MarkLayer {
     }
   });
 
+  // Which files are missing changed (found missing on open, or a relink):
+  // the pages' pictures are drawn again, nothing else.
+  const unMissing = ctx.missingPictures?.subscribe(() => {
+    if (disposed) return;
+    for (const f of [...frames.values()]) {
+      const cache = nodeCache.get(f.key);
+      if (!cache) continue;
+      let hit = false;
+      for (const a of [...cache.keys()]) {
+        if (a.t === "image") {
+          cache.delete(a);
+          hit = true;
+        }
+      }
+      if (hit) paintMarks(f, session.project);
+    }
+  });
+
   return {
     frame: (key) => frames.get(key) ?? null,
     frames: () => frames.values(),
@@ -297,6 +322,7 @@ export function createMarkLayer(ctx: PdfEditorCtx): MarkLayer {
       unVisible();
       unHidden();
       unProject();
+      unMissing?.();
       unFonts?.();
       unFonts = null;
       for (const k of [...frames.keys()]) drop(k, false);

@@ -41,10 +41,19 @@
   mix-blend-mode: multiply;
 }
 .pdfmk-mark--missing {
-  fill: none;
+  fill: var(--danger);
+  fill-opacity: 0.08;
   stroke: var(--danger);
   stroke-width: 1;
   stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
+}
+/* (0.9.5) a picture whose file is missing: its box, crossed */
+.pdfmk-missing__x {
+  fill: none;
+  stroke: var(--danger);
+  stroke-opacity: 0.45;
+  stroke-width: 1;
   vector-effect: non-scaling-stroke;
 }
 

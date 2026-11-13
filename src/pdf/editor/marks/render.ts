@@ -451,7 +451,12 @@ export function styleBoxLook(el: HTMLElement, a: { bg?: string; border?: string 
 }
 
 /** One saved mark as an SVG node in page space (null: nothing to draw). */
-export function markNode(a: PdfAnnot, media: readonly MediaRef[], urlOf: (path: string) => string): SVGElement | null {
+export function markNode(
+  a: PdfAnnot,
+  media: readonly MediaRef[],
+  urlOf: (path: string) => string,
+  isMissing?: (ref: MediaRef) => boolean,
+): SVGElement | null {
   let node: SVGElement | null = null;
   switch (a.t) {
     case "ink": {
@@ -504,9 +509,10 @@ export function markNode(a: PdfAnnot, media: readonly MediaRef[], urlOf: (path: 
       break;
     case "image": {
       const m = media.find((x) => x.id === a.media);
-      if (!m) {
-        // A missing picture shows where it sits (export refuses it by name).
-        node = svg("rect", { x: n2(a.x), y: n2(a.y), width: n2(a.w), height: n2(a.h), class: "pdfmk-mark--missing" });
+      if (!m || isMissing?.(m)) {
+        // A missing picture shows where it sits (export refuses it by name):
+        // its box, dashed and crossed, instead of an empty image.
+        node = missingNode(a);
         break;
       }
       const [fx, fy, fw, fh] = frameRect(a);
@@ -527,6 +533,18 @@ export function markNode(a: PdfAnnot, media: readonly MediaRef[], urlOf: (path: 
   }
   if (node) node.setAttribute("data-id", a.id);
   return node;
+}
+
+/** A picture whose file is missing: its box, tinted, dashed and crossed. */
+function missingNode(a: { x: number; y: number; w: number; h: number }): SVGElement {
+  const g = svg("g", { class: "pdfmk-missing" });
+  g.appendChild(svg("rect", { x: n2(a.x), y: n2(a.y), width: n2(a.w), height: n2(a.h), class: "pdfmk-mark--missing" }));
+  const x0 = n2(a.x);
+  const y0 = n2(a.y);
+  const x1 = n2(a.x + a.w);
+  const y1 = n2(a.y + a.h);
+  g.appendChild(svg("path", { d: `M${x0} ${y0}L${x1} ${y1}M${x1} ${y0}L${x0} ${y1}`, class: "pdfmk-missing__x" }));
+  return g;
 }
 
 /** Turn a box mark's frame-drawn node into its box (`r`; nothing at 0). */

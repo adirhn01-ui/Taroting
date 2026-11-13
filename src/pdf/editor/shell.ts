@@ -37,13 +37,13 @@ import {
 import { Store } from "../../core/store";
 import { missingFontNotice } from "../../core/font-id";
 import { runFontRequests } from "../../core/pdf-runs";
-import type { ActionId, FontRequest, PdfFormValue, PdfPage, PdfToolStyle, ProjectFile } from "../../core/types";
+import type { ActionId, FontRequest, MediaRef, PdfFormValue, PdfPage, PdfToolStyle, ProjectFile } from "../../core/types";
 import { imgIcon } from "../../image/icons";
 import { icon } from "../../ui/icons";
 import { closeMenu, showMenu } from "../../ui/menu";
 import { createTempExits, createTempLeaveGate } from "../../ui/temp-project";
 import { toast } from "../../ui/toast";
-import { deletePages, formValue, isPagePicture, pageAnnots, setFormValue } from "../model";
+import { deletePages, formValue, isPagePicture, mediaFileKey, missingPicturesOn, pageAnnots, setFormValue } from "../model";
 import type { PdfDoc, PdfEditorCtx, PdfEditorHosts, PdfTextEditing, PdfToolState, PdfViewPage } from "../types";
 import { createPdfView, createSearch, renderPageToBlob } from "../view";
 import { button, el } from "./el";
@@ -51,6 +51,8 @@ import { openPdfExportDialog } from "./export-dialog";
 import { mountFind } from "./find";
 import { formsPart } from "./forms";
 import { inspectorPart } from "./inspector";
+import { RELINK_BUTTON, mountMissingPictureButtons, recheckPictures, whenNoModal } from "./missing-pictures";
+import type { MissingPictureButtons } from "./missing-pictures";
 import { PageSelection, mountPagePanel } from "./pages";
 import { clampFont, clampSize } from "./marks/geom";
 import { blankCover, writeCover, type CoverPicture } from "./save";
@@ -68,6 +70,13 @@ export const FORM_IDLE_MS = 1000;
 const COVER_PX = 512;
 const THUMB_CAP_MS = 1500;
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** A promise and its resolver. */
+function settle(): { done: Promise<void>; resolve(): void } {
+  let resolve!: () => void;
+  const done = new Promise<void>((r) => (resolve = r));
+  return { done, resolve };
+}
 
 /** The UI's zoom percent for a view zoom. */
 export const zoomPct = (zoom: number): number => Math.round((zoom / ZOOM_100) * 100);
@@ -182,6 +191,46 @@ export function coverKey(p: ProjectFile): string {
   }
   const s = p.pdf!.sources.find((x) => x.id === pg.src);
   return `${s?.path}|${s?.size}|${s?.mtimeMs}|${pg.page}|${pg.rotate}`;
+}
+
+/** Whether the rail must be rebuilt for its missing-picture marks although its
+ *  pages are the same: some picture is missing and the files changed (a
+ *  relink, its undo), or the marks changed which pages hold a missing picture
+ *  (deleting, moving, pasting one). Other mark edits rebuild nothing, and
+ *  nothing is looked at while no picture is missing. */
+export function railNeedsSync(was: ProjectFile, now: ProjectFile, missing: ReadonlySet<string>): boolean {
+  if (missing.size === 0) return false;
+  if (was.media !== now.media) return true;
+  if (was.pdf?.annots === now.pdf?.annots) return false;
+  const isMissing = (ref: MediaRef): boolean => missing.has(mediaFileKey(ref));
+  const pagesWith = (p: ProjectFile): string =>
+    (p.pdf?.pages ?? [])
+      .filter((pg) => missingPicturesOn(p, pg.id, isMissing).length > 0)
+      .map((pg) => pg.id)
+      .join("\n");
+  return pagesWith(was) !== pagesWith(now);
+}
+
+/** The pictures a project's open found missing or changed (`loaded.missing`,
+ *  media ids): the image MediaRefs some picture mark uses, one per file. */
+export function picturesToCheck(p: ProjectFile, missingIds: readonly string[]): MediaRef[] {
+  if (missingIds.length === 0) return [];
+  const want = new Set(missingIds);
+  const used = new Set<string>();
+  for (const list of Object.values(p.pdf?.annots ?? {})) {
+    if (!Array.isArray(list)) continue;
+    for (const a of list) if (a.t === "image" && want.has(a.media)) used.add(a.media);
+  }
+  const out: MediaRef[] = [];
+  const files = new Set<string>();
+  for (const m of p.media) {
+    if (!used.has(m.id) || m.kind !== "image" || m.generator) continue;
+    const key = mediaFileKey(m);
+    if (files.has(key)) continue;
+    files.add(key);
+    out.push(m);
+  }
+  return out;
 }
 
 /** Whether the rail is open: per app session, not saved. */
@@ -522,6 +571,7 @@ function mount(
     textEdit: new Store<PdfTextEditing | null>(null),
     mode: new Store<"annotate" | "forms">("annotate"),
     hasForms: new Store<boolean>(false),
+    missingPictures: new Store<ReadonlySet<string>>(new Set()),
     holdAutosave: () => session.holdAutosave(),
     registerOverlay,
     bindKey,
@@ -544,6 +594,7 @@ function mount(
       if (!disposed) syncPages(true);
     },
     openExport: (pageSlot, tab) => openExport({ pageSlot, tab }),
+    relinkPictures: (ids) => void relinkPictures(ids),
   });
   undo.push(() => panel.dispose());
 
@@ -917,14 +968,21 @@ function mount(
 
   /* ---------------- subscriptions ---------------- */
 
+  // While a picture is missing, the rail marks its page: a relink (or its
+  // undo) changes only the media list, and deleting, moving or pasting a
+  // picture mark only the marks, which the page sync alone would miss.
+  let shownFiles = session.project;
   unsubs.push(
     session.store.subscribe(() => {
       syncName();
       refreshUndo();
-      syncPages();
+      const force = railNeedsSync(shownFiles, session.project, ctx.missingPictures!.get());
+      shownFiles = session.project;
+      syncPages(force);
       syncForms();
     }),
   );
+  unsubs.push(ctx.missingPictures!.subscribe(() => syncPages(true)));
   unsubs.push(
     view.state.subscribe((s, prev) => {
       if (s.zoom !== prev.zoom) paintZoom();
@@ -1035,6 +1093,15 @@ function mount(
     view.el.removeEventListener("pointercancel", onPanUp, true);
   });
 
+  // A press on a page's "Relink picture" button is the button's: the tools
+  // (capture listeners on the strip, mounted after this one) skip a press
+  // someone already took.
+  const onRelinkPress = (e: PointerEvent): void => {
+    if (e.target instanceof Element && e.target.closest(`.${RELINK_BUTTON}`)) e.preventDefault();
+  };
+  view.el.addEventListener("pointerdown", onRelinkPress, true);
+  undo.push(() => view.el.removeEventListener("pointerdown", onRelinkPress, true));
+
   // A form field that loses focus closes its typing step.
   view.el.addEventListener("focusout", endTyping, true);
   undo.push(() => view.el.removeEventListener("focusout", endTyping, true));
@@ -1107,6 +1174,7 @@ function mount(
     const n = gone.length;
     toast.info(`${n} ${n === 1 ? "page wasn't" : "pages weren't"} in the PDF any more and ${n === 1 ? "was" : "were"} removed.`);
   }
+  const sourcesAsked = settle();
   if (issues.length > 0) {
     registerOverlay(
       openSourcesDialog({
@@ -1124,9 +1192,84 @@ function mount(
         },
         onCloseProject: goHome,
         onContinue: dropImpossiblePages,
+        onClosed: () => sourcesAsked.resolve(),
       }),
     );
+  } else sourcesAsked.resolve();
+
+  /* ---------------- missing pictures (0.9.5) ---------------- */
+
+  let buttons: MissingPictureButtons | null = null;
+  undo.push(() => buttons?.dispose());
+  let relinkLoading = false;
+  /** The relink dialog for these pictures' files (loaded on first use). */
+  async function relinkPictures(ids: string[]): Promise<void> {
+    if (disposed || relinkLoading || ids.length === 0 || modalOpen()) return;
+    relinkLoading = true;
+    try {
+      endTyping();
+      const { openPictureRelink } = await import("./picture-relink");
+      if (disposed || modalOpen()) return;
+      registerOverlay(
+        openPictureRelink({
+          session,
+          missing: ids,
+          missingPictures: ctx.missingPictures,
+          onRelinked: () => {
+            if (disposed) return;
+            refreshUndo();
+            // the Home card shows the first page: a picture back on it is owed
+            if (!session.temp.get() && coverFor !== coverKey(session.project)) void writeCoverNow();
+          },
+        }),
+      );
+    } catch (e) {
+      if (!disposed) toast.error(`Couldn't open the relink: ${describeError(e)}`);
+    } finally {
+      relinkLoading = false;
+    }
   }
+  // The open's identity check (loaded.missing) says missing OR changed; a
+  // changed file still shows, so only a file whose path is gone counts. Off
+  // the mount's path: the editor is already up meanwhile.
+  const toCheck = picturesToCheck(session.project, loaded.missing);
+  if (toCheck.length > 0) {
+    void (async () => {
+      const exists = await Promise.all(toCheck.map((m) => ipc.pathExists(m.path).catch(() => true)));
+      if (disposed) return;
+      const gone = toCheck.filter((_, i) => !exists[i]);
+      if (gone.length === 0) return;
+      ctx.missingPictures!.set(new Set(gone.map(mediaFileKey)));
+      ensureButtons();
+      // asked once on open, after the source PDFs' own question and after
+      // any other dialog the user opened meanwhile
+      await sourcesAsked.done;
+      if (disposed) return;
+      const free = whenNoModal();
+      undo.push(() => free.cancel());
+      await free.done;
+      if (disposed) return;
+      const still = ctx.missingPictures!.get();
+      const ids = gone.filter((m) => still.has(mediaFileKey(m)) && session.project.media.some((x) => x.id === m.id)).map((m) => m.id);
+      if (ids.length > 0) void relinkPictures(ids);
+    })();
+  }
+  function ensureButtons(): void {
+    if (!buttons && !disposed) buttons = mountMissingPictureButtons(ctx, (ids) => void relinkPictures(ids));
+  }
+  // A picture file moved away (or put back) while the editor is open is seen
+  // when the user comes back to the window: one path check per picture file,
+  // off the UI thread, and none for a project without pictures.
+  let recheckToken = 0;
+  const onWindowFocus = (): void => {
+    if (disposed) return;
+    const token = ++recheckToken;
+    void recheckPictures(ctx, (path) => ipc.pathExists(path), () => !disposed && token === recheckToken).then((missing) => {
+      if (missing && !disposed && token === recheckToken) ensureButtons();
+    });
+  };
+  window.addEventListener("focus", onWindowFocus);
+  undo.push(() => window.removeEventListener("focus", onWindowFocus));
 
   /* ---------------- dev hook ---------------- */
 

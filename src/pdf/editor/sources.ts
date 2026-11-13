@@ -149,6 +149,10 @@ export interface SourcesDialogOpts {
    *  the pages a short source does not have. Not called on Close project nor
    *  when the editor closes the dialog itself. */
   onContinue?(): void;
+  /** (0.9.5) the dialog went away by the user's hand or because every
+   *  source was found (not when the editor closes it): the shell asks about
+   *  missing pictures next. */
+  onClosed?(): void;
 }
 
 /**
@@ -182,12 +186,13 @@ export function openSourcesDialog(opts: SourcesDialogOpts): () => void {
   const releaseTrap = trapTab(backdrop);
 
   let closed = false;
-  function close(): void {
+  function close(quiet = false): void {
     if (closed) return;
     closed = true;
     document.removeEventListener("keydown", onKeydown, true);
     releaseTrap();
     backdrop.remove();
+    if (!quiet) opts.onClosed?.();
   }
   /** Esc, the X and a click outside just close: removing pages is a real
    *  edit, so only the Continue button (which says it removes them) does it. */
@@ -213,7 +218,8 @@ export function openSourcesDialog(opts: SourcesDialogOpts): () => void {
   closeX.addEventListener("click", dismiss);
   cont.addEventListener("click", carryOn);
   closeProject.addEventListener("click", () => {
-    close();
+    // leaving: nothing else is asked
+    close(true);
     opts.onCloseProject();
   });
 
@@ -299,5 +305,5 @@ export function openSourcesDialog(opts: SourcesDialogOpts): () => void {
     list.appendChild(row);
   }
   focusFirst(backdrop, "[data-locate]");
-  return close;
+  return () => close(true);
 }

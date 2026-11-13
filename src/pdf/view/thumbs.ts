@@ -34,13 +34,15 @@ interface Item {
   /** the page picture it shows (0.9.5): what it is (`pictureSig`) and its
    *  element, handed to the next build's item for the same picture */
   pic?: { sig: string; holder: HTMLDivElement };
+  /** (editor) the "picture missing" mark on it, kept over a canvas attached later */
+  badge?: HTMLDivElement;
 }
 
 /** Everything a shown page picture depends on: the file, its box, the page's
  *  turn and size. Equal → the element already decoded can be kept. */
 function pictureSig(p: PdfViewPage): string {
   const pic = p.picture!;
-  return `${pic.file}|${pic.x}|${pic.y}|${pic.w}|${pic.h}|${p.rotate}|${p.w}|${p.h}`;
+  return `${pic.file}|${pic.x}|${pic.y}|${pic.w}|${pic.h}|${p.rotate}|${p.w}|${p.h}|${pic.missing ? "missing" : ""}`;
 }
 
 const docIds = new WeakMap<PdfDoc, number>();
@@ -167,6 +169,15 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
     const holder = document.createElement("div");
     holder.className = "pdfv-thumb__pic";
     holder.style.cssText = `position:absolute;overflow:hidden;left:${box.left}%;top:${box.top}%;width:${box.width}%;height:${box.height}%`;
+    if (pic.missing) {
+      // The file is gone: its box as a placeholder (styled by the editor),
+      // and nothing asked of the disk.
+      holder.classList.add("pdfv-thumb__pic--missing");
+      it.img.style.position = "relative";
+      it.img.appendChild(holder);
+      it.pic = { sig: pictureSig(it.page), holder };
+      return;
+    }
     const img = document.createElement("img");
     img.alt = "";
     img.decoding = "async";
@@ -205,6 +216,7 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
     c.className = "pdfv-thumb__canvas";
     it.img.textContent = "";
     it.img.appendChild(c);
+    if (it.badge) it.img.appendChild(it.badge);
     it.shows = k;
   }
 
@@ -366,6 +378,18 @@ export function createThumbRail(opts: PdfThumbRailOptions): PdfThumbRail {
       row.append(img, num);
       frag.appendChild(row);
       const it: Item = { page: p, el: row, img, near: false, shows: "", measured: false };
+      if (p.missingPicture) {
+        // (editor) a picture on this page is missing: say so on the page
+        row.classList.add("pdfv-thumb--missing");
+        row.setAttribute("aria-label", `Page ${i + 1}, picture missing`);
+        const badge = document.createElement("div");
+        badge.className = "pdfv-thumb__badge";
+        badge.title = "Picture missing";
+        badge.textContent = "!";
+        badge.setAttribute("aria-hidden", "true");
+        img.appendChild(badge);
+        it.badge = badge;
+      }
       if (p.doc) {
         // an estimate until the item comes near (measure): asking every page
         // up front would queue a GetPage per page ahead of the strip's first

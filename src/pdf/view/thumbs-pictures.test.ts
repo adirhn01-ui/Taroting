@@ -106,4 +106,28 @@ describe("the rail's page pictures", () => {
     expect(thumb).toHaveBeenCalledTimes(3);
     m.rail.dispose();
   });
+
+  it("a missing picture (0.9.5): its box as a placeholder, nothing asked; a page with one is marked", async () => {
+    const thumb = vi.fn(async () => "asset://cache/t.jpg");
+    const m = mount([
+      { ...blank("a", picture("C:/gone.jpg", thumb, { missing: true })), missingPicture: true },
+      blank("b", picture("C:/here.jpg", thumb)),
+    ]);
+    m.near(0, 1);
+    await until(() => m.img(1)?.src !== undefined);
+    const holder = m.rows()[0]!.querySelector(".pdfv-thumb__pic")!;
+    expect(holder.classList.contains("pdfv-thumb__pic--missing")).toBe(true);
+    expect(String(holder.style.cssText)).toContain("left:10%");
+    expect(m.img(0)).toBeNull();
+    expect(thumb).toHaveBeenCalledTimes(1);
+    expect(m.rows()[0]!.querySelector(".pdfv-thumb__badge")).not.toBeNull();
+    expect(m.rows()[0]!.getAttribute("aria-label")).toBe("Page 1, picture missing");
+    expect(m.rows()[1]!.querySelector(".pdfv-thumb__badge")).toBeNull();
+    // found again (a rebuild with the picture present): the picture is asked for
+    m.set([blank("a", picture("C:/gone.jpg", thumb)), blank("b", picture("C:/here.jpg", thumb))]);
+    m.near(0, 1);
+    await until(() => m.img(0)?.src !== undefined);
+    expect(m.rows()[0]!.querySelector(".pdfv-thumb__badge")).toBeNull();
+    m.rail.dispose();
+  });
 });
