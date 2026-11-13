@@ -29,17 +29,16 @@
 // heavy drag is held. Lives wholly under src/viewer/: nothing in src/editor/
 // may import it (the editor's scrubbing is the owner's reference, untouched).
 
+import { HEAVY_BITS_PER_S, HEAVY_GAP_S, heavyGap, medianGap } from "../core/heavy-clip";
 import type { KeyframeIndex } from "../core/ipc";
 
-// The four thresholds below are tuned by the OWNER'S HANDS-ON FEEL on real
+// The heavy rule lives in core (the editor shares it); re-exported so this
+// module's users and tests keep one import.
+export { HEAVY_BITS_PER_S, HEAVY_GAP_S, heavyGap, medianGap };
+
+// The thresholds below are tuned by the OWNER'S HANDS-ON FEEL on real
 // clips, not by synthetic probes: change them only on what the owner says.
 
-/** A file whose median keyframe gap is shorter than this is light (s). */
-export const HEAVY_GAP_S = 2.0;
-/** A file whose overall bit rate (bytes * 8 / duration) is below this is
- *  light, whatever its gap (bits per second): a low-rate long-GOP file
- *  decodes a GOP fast enough to seek exactly. */
-export const HEAVY_BITS_PER_S = 20_000_000;
 /** A drag at or above this many median keyframe gaps of video per second of
  *  wall time is FAST and lands on keyframes; slower is exact. */
 export const FAST_GOPS_PER_S = 1.0;
@@ -53,30 +52,6 @@ export const SPEED_WINDOW_MS = 100;
  *  wobble into a "fast" drag and flashes a keyframe up to a GOP away. Until
  *  then every move is SLOW (exact). */
 export const MIN_SPEED_SPAN_MS = 30;
-
-/** The median gap between consecutive keyframes; null with fewer than two. */
-export function medianGap(times: readonly number[]): number | null {
-  if (times.length < 2) return null;
-  const gaps: number[] = [];
-  for (let i = 1; i < times.length; i++) gaps.push(times[i]! - times[i - 1]!);
-  gaps.sort((a, b) => a - b);
-  const mid = gaps.length >> 1;
-  return gaps.length % 2 === 1 ? gaps[mid]! : (gaps[mid - 1]! + gaps[mid]!) / 2;
-}
-
-/** The median keyframe gap when `index` makes the file HEAVY, else null:
- *  read, not every frame a keyframe, a gap of at least HEAVY_GAP_S AND a bit
- *  rate of at least HEAVY_BITS_PER_S. `force` (DEV seam only) skips the two
- *  thresholds, not the index's own sanity. */
-export function heavyGap(index: KeyframeIndex | null, force = false): number | null {
-  if (index === null || index.allSync) return null;
-  const gap = medianGap(index.times);
-  if (gap === null || !(gap > 0)) return null;
-  if (force) return gap;
-  if (gap < HEAVY_GAP_S) return null;
-  if (!Number.isFinite(index.duration) || index.duration <= 0) return null;
-  return (index.bytes * 8) / index.duration >= HEAVY_BITS_PER_S ? gap : null;
-}
 
 /** The keyframe in ascending `times` nearest `t` (the earlier on a tie). */
 export function nearestKeyframe(times: readonly number[], t: number): number {
