@@ -95,6 +95,9 @@ fn scan_sync(path: &str, src_in: f64, src_out: f64) -> Result<NormalizeResult> {
     let out = ffmpeg::run_with_deadline(cmd, SCAN_DEADLINE)?.ok_or_else(|| {
         AppError::Ffmpeg("volume analysis took too long and was stopped".into())
     })?;
+    if ffmpeg::libraries_missing(&out.status) {
+        return Err(AppError::Ffmpeg(ffmpeg::LIBRARIES_MISSING.into()));
+    }
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
         return Err(AppError::Ffmpeg(format!(

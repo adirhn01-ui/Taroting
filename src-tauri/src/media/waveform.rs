@@ -195,6 +195,9 @@ fn decode_into(
     if handle.is_canceled() {
         return Err(AppError::Ffmpeg("canceled".into()));
     }
+    if jobs::ffmpeg::libraries_missing(&status) {
+        return Err(AppError::Ffmpeg(jobs::ffmpeg::LIBRARIES_MISSING.into()));
+    }
     if !status.success() {
         return Err(AppError::Ffmpeg(format!("waveform decode failed ({status})")));
     }

@@ -38,6 +38,15 @@
     "targets": ["nsis"],
     "publisher": "Taroting",
     "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"],
+    "resources": {
+      "binaries/avutil-60.dll": "avutil-60.dll",
+      "binaries/swresample-6.dll": "swresample-6.dll",
+      "binaries/swscale-9.dll": "swscale-9.dll",
+      "binaries/avcodec-62.dll": "avcodec-62.dll",
+      "binaries/avformat-62.dll": "avformat-62.dll",
+      "binaries/avfilter-11.dll": "avfilter-11.dll",
+      "binaries/avdevice-62.dll": "avdevice-62.dll"
+    },
     "icon": ["icons/icon.ico"],
     "fileAssociations": [
       {

@@ -65,9 +65,9 @@ pub fn software_report() -> EncoderReport {
 }
 
 /// How long one encoder probe, or `ffmpeg -version`, may take. Generous on
-/// purpose: the first spawn of a 217 MB sidecar on a cold disk, scanned by
-/// Defender, takes seconds, and a probe killed for being slow reads as "this
-/// machine has no such encoder". What it bounds is a driver that never comes
+/// purpose: the first spawn of ffmpeg and its ~250 MB of libraries on a cold
+/// disk, scanned by Defender, takes seconds, and a probe killed for being
+/// slow reads as "this machine has no such encoder". What it bounds is a driver that never comes
 /// back from initialising — before this, that held the encoder lock (and an
 /// Export click behind it) forever, and since a hung probe never reached the
 /// cache, it hung again on every launch.
@@ -105,6 +105,9 @@ enum Probe {
     /// Still running at `PROBE_DEADLINE`, and killed. Treated as unavailable,
     /// and cached as such, so the next launch does not wait on it again.
     TimedOut,
+    /// ffmpeg never started: the loader could not find its libraries
+    /// (`ffmpeg::LIBRARIES_MISSING`). Unavailable, and said so in the detail.
+    LibrariesMissing,
 }
 
 /// Run a real 0.5s test encode, bounded by `PROBE_DEADLINE`.
@@ -142,6 +145,7 @@ fn probe_encoder_within(enc: &str, deadline: std::time::Duration) -> Probe {
 fn run_probe(cmd: std::process::Command, deadline: std::time::Duration) -> Probe {
     match ffmpeg::run_with_deadline(cmd, deadline) {
         Ok(Some(out)) if out.status.success() => Probe::Ok,
+        Ok(Some(out)) if ffmpeg::libraries_missing(&out.status) => Probe::LibrariesMissing,
         Ok(Some(_)) | Err(_) => Probe::Unavailable,
         Ok(None) => Probe::TimedOut,
     }
@@ -171,6 +175,7 @@ fn choose_with(
             }
             Probe::Unavailable => detail.push(format!("{enc}: unavailable")),
             Probe::TimedOut => detail.push(format!("{enc}: timed out")),
+            Probe::LibrariesMissing => detail.push(format!("{enc}: unavailable, {}", ffmpeg::LIBRARIES_MISSING)),
         }
     }
     // Guaranteed software fallback per family.

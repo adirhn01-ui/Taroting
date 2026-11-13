@@ -1,0 +1,72 @@
+{
+  "version": "8.1.1-full_build-www.gyan.dev",
+  "built": "2026-05-04",
+  "url": "https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-full_build-shared.zip",
+  "archiveBytes": 101083228,
+  "archiveSha256": "4296b396bdfd5fbc3dfc75ab4c8703354a56963232d65c4182993543df2d2f45",
+  "members": {
+    "avutil-60.dll": {
+      "path": "ffmpeg-8.1.1-full_build-shared/bin/avutil-60.dll",
+      "bytes": 3139072,
+      "sha256": "a98d20df601b48d85d701c8a92b83c67e088ceac34ebe434673defd15448ca9d",
+      "kind": "dll",
+      "dest": "avutil-60.dll"
+    },
+    "swresample-6.dll": {
+      "path": "ffmpeg-8.1.1-full_build-shared/bin/swresample-6.dll",
+      "bytes": 484864,
+      "sha256": "6c5dd36848986c9abe4f3ed215329dccafa4481d9e485655b900076b3e40bdc0",
+      "kind": "dll",
+      "dest": "swresample-6.dll"
+    },
+    "swscale-9.dll": {
+      "path": "ffmpeg-8.1.1-full_build-shared/bin/swscale-9.dll",
+      "bytes": 12651520,
+      "sha256": "bd1db88d009d89f212723b99c20faf53f0055e7ecb14b9580b3cb28f47453968",
+      "kind": "dll",
+      "dest": "swscale-9.dll"
+    },
+    "avcodec-62.dll": {
+      "path": "ffmpeg-8.1.1-full_build-shared/bin/avcodec-62.dll",
+      "bytes": 97333248,
+      "sha256": "86818846a9a74420f5f65fd8ebe0897bc9141e84e9c91f0f8b7607ee193a26d7",
+      "kind": "dll",
+      "dest": "avcodec-62.dll"
+    },
+    "avformat-62.dll": {
+      "path": "ffmpeg-8.1.1-full_build-shared/bin/avformat-62.dll",
+      "bytes": 19865600,
+      "sha256": "4d0a70445d5139b713596a677a9dcac64dc8f7c27053e9dbd0998e2cbdbef611",
+      "kind": "dll",
+      "dest": "avformat-62.dll"
+    },
+    "avfilter-11.dll": {
+      "path": "ffmpeg-8.1.1-full_build-shared/bin/avfilter-11.dll",
+      "bytes": 109569536,
+      "sha256": "f7e8ddc1e728dd72660dd79985ecbf1e664f7dc978bdc0382db505b347c3d3ca",
+      "kind": "dll",
+      "dest": "avfilter-11.dll"
+    },
+    "avdevice-62.dll": {
+      "path": "ffmpeg-8.1.1-full_build-shared/bin/avdevice-62.dll",
+      "bytes": 6198784,
+      "sha256": "1af517a1a3e9166909562491b5e1775280c1a54bc56e7ccea1011e4e56ab1b59",
+      "kind": "dll",
+      "dest": "avdevice-62.dll"
+    },
+    "ffmpeg": {
+      "path": "ffmpeg-8.1.1-full_build-shared/bin/ffmpeg.exe",
+      "bytes": 629248,
+      "sha256": "e5fa4969190885ad107b22bd1ec84ea29d1696e4f9be6b4d6a143f34e820ed67",
+      "kind": "exe",
+      "dest": "ffmpeg-x86_64-pc-windows-msvc.exe"
+    },
+    "ffprobe": {
+      "path": "ffmpeg-8.1.1-full_build-shared/bin/ffprobe.exe",
+      "bytes": 228864,
+      "sha256": "29478587953af2c173cd86177da9f94521af9fe7a10866a779164e982386a7ec",
+      "kind": "exe",
+      "dest": "ffprobe-x86_64-pc-windows-msvc.exe"
+    }
+  }
+}

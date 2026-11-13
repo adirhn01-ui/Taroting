@@ -464,7 +464,7 @@ pub fn execute_ffmpeg(
     if !status.success() {
         let log_tail = tail.lock().unwrap().clone();
         return Err(JobFailure {
-            message: format!("ffmpeg exited with {status}"),
+            message: ffmpeg::exit_message(&status),
             log_tail,
         });
     }

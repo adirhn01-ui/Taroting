@@ -419,6 +419,9 @@ fn attempt(src: &Path, dst: &Path, at: f64, until: Instant, abandoned: &AtomicBo
         return Ok(None);
     }
     drop(tmp);
+    if jobs::ffmpeg::libraries_missing(&out.status) {
+        return Err(AppError::Ffmpeg(jobs::ffmpeg::LIBRARIES_MISSING.into()));
+    }
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if is_locked_out(&stderr) {
         return Err(AppError::Ffmpeg(format!("thumbnail failed: {stderr}")));

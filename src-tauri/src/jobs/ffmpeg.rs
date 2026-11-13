@@ -50,8 +50,78 @@ pub fn sidecar_path(name: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("{name}.exe")))
 }
 
+/// What a user reads when a sidecar could not even start because the FFmpeg
+/// libraries it links (`avcodec-62.dll` and the rest, carried once beside
+/// `ffmpeg.exe` and `ffprobe.exe`) are missing or are not the ones it was
+/// built with: a portable folder copied without them, or an install damaged
+/// by hand. ffmpeg itself prints nothing then, so without this the failure
+/// read as a codec error or an unreadable file.
+pub const LIBRARIES_MISSING: &str =
+    "FFmpeg's library files are missing beside Taroting. Reinstall Taroting, or keep every file of the portable folder together.";
+
+/// The Windows loader's exit codes for a process that died before its first
+/// instruction because of its libraries: a DLL not found
+/// (`STATUS_DLL_NOT_FOUND`), one built for another machine type
+/// (`STATUS_INVALID_IMAGE_FORMAT`), and one of another version that lacks a
+/// function the exe imports (`STATUS_ENTRYPOINT_NOT_FOUND`, a foreign
+/// `avcodec-62.dll` found on PATH).
+const LOADER_FAILURES: [u32; 3] = [0xC000_0135, 0xC000_007B, 0xC000_0139];
+
+/// Whether a process exit code is the loader refusing the sidecar's libraries.
+pub fn is_loader_failure(code: i32) -> bool {
+    LOADER_FAILURES.contains(&(code as u32))
+}
+
+/// Whether `status` is a sidecar that never started for want of its libraries.
+pub fn libraries_missing(status: &ExitStatus) -> bool {
+    status.code().is_some_and(is_loader_failure)
+}
+
+/// The one-line failure for a sidecar that ended with `status`:
+/// [`LIBRARIES_MISSING`] for a loader failure, else `ffmpeg exited with …`.
+pub fn exit_message(status: &ExitStatus) -> String {
+    if libraries_missing(status) {
+        LIBRARIES_MISSING.to_string()
+    } else {
+        format!("ffmpeg exited with {status}")
+    }
+}
+
+/// Make the Windows loader fail quietly before a sidecar starts. Called on
+/// every spawn (a single cheap system call), so nothing that changes the
+/// process's error mode later can bring the boxes back.
+///
+/// A child inherits its parent's error mode. In the default mode a sidecar
+/// whose libraries are missing does not just exit: the loader first shows a
+/// "System Error" box ("avcodec-62.dll was not found") on the desktop and
+/// the child waits in its own start-up until someone closes it, so every
+/// probe, thumbnail and test encode would raise one box and then end as a
+/// timeout. With `SEM_FAILCRITICALERRORS` the child ends at once with
+/// `STATUS_DLL_NOT_FOUND`, which [`exit_message`] turns into
+/// [`LIBRARIES_MISSING`]. `SEM_NOOPENFILEERRORBOX` is the same for a file the
+/// loader cannot open. The bits already set are kept. Taroting itself gains
+/// the same behaviour, which is what Windows recommends for any app: a drive
+/// that is not ready answers with an error instead of a box.
+pub fn quiet_loader_errors() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            GetErrorMode, SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOOPENFILEERRORBOX,
+        };
+        const QUIET: u32 = SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX;
+        // SAFETY: plain calls on the process's own error mode.
+        unsafe {
+            let mode = GetErrorMode();
+            if mode & QUIET != QUIET {
+                SetErrorMode(mode | QUIET);
+            }
+        }
+    }
+}
+
 /// A Command for a sidecar, configured to never flash a console window.
 pub fn command(name: &str) -> Result<Command> {
+    quiet_loader_errors();
     let mut cmd = Command::new(sidecar_path(name)?);
     #[cfg(windows)]
     {
@@ -79,6 +149,7 @@ pub fn command(name: &str) -> Result<Command> {
 /// not nest); the child then runs exactly as it did before the job existed,
 /// which beats refusing the work.
 pub fn spawn_owned(cmd: &mut Command) -> io::Result<Child> {
+    quiet_loader_errors();
     let child = cmd.spawn()?;
     #[cfg(windows)]
     job::assign(&child);
@@ -318,6 +389,94 @@ mod tests {
         let out = run("ffmpeg", &["-version"]).expect("ffmpeg must spawn");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("ffmpeg version"), "unexpected: {stdout}");
+    }
+
+    #[test]
+    fn a_loader_failure_reads_as_missing_libraries() {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            for code in [0xC000_0135u32, 0xC000_007B, 0xC000_0139] {
+                let status = ExitStatus::from_raw(code);
+                assert!(libraries_missing(&status), "{code:#x}");
+                assert_eq!(exit_message(&status), LIBRARIES_MISSING);
+            }
+            // An ordinary failure, and an ffmpeg error code (AVERROR(EINVAL)),
+            // keep their own words.
+            for code in [1u32, 0xFFFF_FFEA, 0xC000_0005] {
+                let status = ExitStatus::from_raw(code);
+                assert!(!libraries_missing(&status), "{code:#x}");
+                assert!(exit_message(&status).starts_with("ffmpeg exited with "), "{code:#x}");
+            }
+        }
+        assert!(is_loader_failure(0xC000_0135u32 as i32));
+        assert!(is_loader_failure(-1_073_741_515)); // 0xC0000135 as Windows reports it
+        assert!(!is_loader_failure(0));
+        assert!(!is_loader_failure(1));
+        assert!(LIBRARIES_MISSING.starts_with("FFmpeg's library files are missing beside Taroting."));
+    }
+
+    /// In a dev build the libraries sit beside the suffixed exes in
+    /// `src-tauri/binaries`, and the loader finds them there (the folder of
+    /// the exe comes first): an ffmpeg that runs here linked every one.
+    #[test]
+    fn the_sidecars_load_their_libraries() {
+        for name in ["ffmpeg", "ffprobe"] {
+            let out = run(name, &["-hide_banner", "-buildconf"]).expect("sidecar must spawn");
+            assert!(!libraries_missing(&out.status), "{name}: {}", exit_message(&out.status));
+            assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    /// ffprobe copied alone into a folder of its own, as a portable folder
+    /// copied without its libraries: it must END, at once and without a
+    /// "System Error" box, with the loader's code, which reads as
+    /// [`LIBRARIES_MISSING`]. A test runner usually inherits a quiet mode from
+    /// its own parent (a shell, node), so the test first restores Windows'
+    /// default and lets [`command`] set it again, as it must for an app
+    /// started from Explorer. The mode is checked BEFORE the spawn, so without
+    /// [`quiet_loader_errors`] this fails there and never puts a box on the
+    /// desktop.
+    #[cfg(windows)]
+    #[test]
+    fn a_sidecar_without_its_libraries_ends_quietly() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            GetErrorMode, SetErrorMode, SEM_FAILCRITICALERRORS,
+        };
+        // SAFETY: the process's own error mode; restored below.
+        let before = unsafe { GetErrorMode() };
+        unsafe { SetErrorMode(before & !SEM_FAILCRITICALERRORS) };
+        let exe = command("ffprobe").expect("ffprobe sidecar").get_program().to_owned();
+        let dir = std::env::temp_dir().join(format!("taroting-nolibs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alone = dir.join("ffprobe.exe");
+        std::fs::copy(&exe, &alone).unwrap();
+
+        let mut cmd = Command::new(&alone);
+        cmd.arg("-version").current_dir(&dir);
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            let root = PathBuf::from(root);
+            cmd.env("PATH", std::env::join_paths([root.join("System32"), root]).unwrap());
+        }
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        // SAFETY: reads the process's own error mode.
+        let mode = unsafe { GetErrorMode() };
+        if mode & SEM_FAILCRITICALERRORS == 0 {
+            let _ = std::fs::remove_dir_all(&dir);
+            unsafe { SetErrorMode(before) };
+            panic!("the error mode {mode:#x} would show a System Error box; not spawning");
+        }
+        let started = Instant::now();
+        let out = run_with_deadline(cmd, Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { SetErrorMode(before) };
+        let out = out.expect("spawn").expect("ended before the deadline, so no box held it");
+        assert!(libraries_missing(&out.status), "{:?}", out.status);
+        assert_eq!(exit_message(&out.status), LIBRARIES_MISSING);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     #[test]

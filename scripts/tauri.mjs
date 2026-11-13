@@ -2,7 +2,13 @@
 // `build`. That one runs with `--remap-path-prefix` flags (see
 // scripts/build-paths.mjs) so dependency panic locations stop carrying the
 // build machine's home folder, and afterwards the built exe is scanned: any
-// path-shaped trace of the account fails the build.
+// path-shaped trace of the account fails the build. Then it makes sure every
+// FFmpeg file pinned in scripts/ffmpeg-pin.json (ffmpeg.exe, ffprobe.exe and
+// their libraries) sits beside the built taroting.exe with the pinned size
+// and SHA-256 (`fetch-ffmpeg.mjs --place`): that folder is run in place, the
+// release taroting.exe runs the ffmpeg.exe beside it, and ffmpeg.exe does not
+// start without its libraries. Copying taroting.exe to another folder needs
+// the same: `node scripts/fetch-ffmpeg.mjs --place <folder>`.
 //
 // Every other subcommand, `tauri dev` and `tauri build --debug` included, runs
 // with the environment untouched. Rustflags are part of cargo's fingerprint,
@@ -55,6 +61,16 @@ if (status === 0 && release && !hasFlag(args, "--target", "-t")) {
     process.exit(1);
   }
   console.log("tauri: taroting.exe checked: no trace of the build account's home folder");
+
+  // The whole pinned FFmpeg set, exes included: tauri-build copies the exes
+  // only when it reruns, so a folder can still hold an older ffmpeg.exe.
+  const place = spawnSync(process.execPath, [join(root, "scripts", "fetch-ffmpeg.mjs"), "--place", dirname(exe)], {
+    stdio: "inherit",
+  });
+  if (place.error || place.status !== 0) {
+    console.error("tauri: the FFmpeg files beside taroting.exe could not be made to match scripts/ffmpeg-pin.json");
+    process.exit(1);
+  }
 }
 
 process.exit(status);

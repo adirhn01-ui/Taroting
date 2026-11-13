@@ -142,8 +142,10 @@ A/B of two builds of the same release, not a release-over-release row. A
 shows (a product decision); what the timing decides is the viewer-mode launch.
 
 - **Binaries**: A = the release exe built just before the change, B = the
-  release exe with it. Each sits in its own folder with `ffmpeg.exe` and
-  `ffprobe.exe` beside it. Same machine, same session, same files.
+  release exe with it. Each sits in its own folder with `ffmpeg.exe`,
+  `ffprobe.exe` and, from the shared FFmpeg build on, the FFmpeg libraries
+  (`avcodec-62.dll` and the rest) beside it. Same machine, same session,
+  same files.
 - **Pre-flight** (the run refuses to start otherwise): no `taroting.exe` is
   running from ANY path. An installed copy shares the single-instance
   identity, so a test launch would be handed to that window — timing nothing

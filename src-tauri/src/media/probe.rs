@@ -620,6 +620,9 @@ pub fn probe_sync(path: &str) -> Result<MediaInfo> {
     let out = run_bounded("ffprobe", probe_args(src), deadline_for(PROBE_DEADLINE, &meta))?.ok_or_else(|| {
         AppError::Ffmpeg(format!("ffprobe took too long for {path} and was stopped"))
     })?;
+    if ffmpeg::libraries_missing(&out.status) {
+        return Err(AppError::Ffmpeg(ffmpeg::LIBRARIES_MISSING.into()));
+    }
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(AppError::Ffmpeg(format!(

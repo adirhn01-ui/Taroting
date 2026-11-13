@@ -897,7 +897,7 @@ fn run_plan(
             // of stream), so the bar waits at 0 and then runs once, with the
             // encode.
             run(palette.clone(), None).map_err(|f| JobFailure {
-                message: if f.message == "canceled" {
+                message: if f.message == "canceled" || f.message == jobs::ffmpeg::LIBRARIES_MISSING {
                     f.message
                 } else {
                     format!("{} (while preparing the GIF's colours)", f.message)

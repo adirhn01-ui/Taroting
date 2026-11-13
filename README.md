@@ -73,7 +73,7 @@ Taroting launches in a fraction of a second, stays out of your way, and does the
 
 Grab the latest build from the [**Releases**](../../releases) page. Two ways to run it:
 
-- **Portable ZIP** — unzip the `Taroting-vX.Y-portable` folder anywhere and double-click `Taroting.exe`. Nothing is installed; keep `ffmpeg.exe` and `ffprobe.exe` alongside it (they do all media processing). Delete the folder to remove it.
+- **Portable ZIP** — unzip the `Taroting-vX.Y-portable` folder anywhere and double-click `Taroting.exe`. Nothing is installed; keep every file of the folder together: `ffmpeg.exe`, `ffprobe.exe` and the FFmpeg libraries beside them (`avcodec-62.dll` and the rest) do all media processing. Delete the folder to remove it.
 - **Installer** (`Taroting_X.Y.Z_x64-setup.exe`) — installs per-user (no admin rights), adds a Start-menu entry, makes `.trt` projects open with Taroting, and offers Taroting under **Open with** (and in Default apps) for video, image and audio files — without changing which app currently opens them.
 
 The app is not code-signed yet, so Windows SmartScreen may warn on first launch — choose **More info → Run anyway**.
@@ -101,12 +101,12 @@ Every feature runs entirely on your hardware and adds zero resource overhead whe
 
 ```sh
 npm install
-npm run fetch-ffmpeg   # downloads the pinned ffmpeg/ffprobe into src-tauri/binaries/
+npm run fetch-ffmpeg   # downloads the pinned ffmpeg/ffprobe and their libraries into src-tauri/binaries/
 npm run tauri dev      # run in development
 npm run tauri build    # produce the NSIS installer + portable exe
 ```
 
-The FFmpeg sidecars are **not** committed to the repo (they are large GPL binaries). `npm run fetch-ffmpeg` downloads one pinned build — gyan.dev `ffmpeg 8.1.1-full_build`, dated 2026-05-04 — checks the archive and both binaries against SHA-256 digests recorded in the script, confirms the encoder coverage the exporter needs, and installs them in `src-tauri/binaries/` using Tauri's target-triple naming convention. Every release ships that exact build; any mismatch aborts the run and leaves an existing install untouched. `npm run fixtures` generates synthetic test media.
+The FFmpeg sidecars are **not** committed to the repo (they are large GPL binaries). `npm run fetch-ffmpeg` downloads one pinned build — gyan.dev `ffmpeg 8.1.1-full_build-shared`, dated 2026-05-04: two small exes and the seven FFmpeg libraries they share — checks the archive and every file against SHA-256 digests recorded in `scripts/ffmpeg-pin.json`, confirms the encoders, filters and formats the app uses with nothing but Windows on PATH, and installs them in `src-tauri/binaries/` (the exes under Tauri's target-triple naming convention, the libraries under their own names). `npm run fetch-ffmpeg -- --archive <zip>` installs from a copy of the pinned archive already on disk, held to the same checks. Every release ships that exact build; any mismatch aborts the run and leaves an existing install untouched (a file held open by a running FFmpeg can stop the last step partway, and the run says so). `npm run fixtures` generates synthetic test media.
 
 **Tests**
 
