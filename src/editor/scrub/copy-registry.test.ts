@@ -32,7 +32,7 @@ const times = (gap: number): number[] => Array.from({ length: 15 }, (_, i) => i 
 const heavyIndex = (): KeyframeIndex => ({ allSync: false, times: times(4.17), duration: DURATION, bytes: (63e6 * DURATION) / 8 });
 const lightIndex = (): KeyframeIndex => ({ allSync: false, times: times(4.17), duration: DURATION, bytes: (3e6 * DURATION) / 8 });
 
-function harness() {
+function harness(budget?: () => number) {
   const log: string[] = [];
   const indexes = new Map<string, Deferred<KeyframeIndex | null>>();
   const plans = new Map<string, Deferred<ScrubPlan>[]>();
@@ -66,6 +66,7 @@ function harness() {
     url: (p) => `asset://${p}`,
     changed: (f) => void changed.push(f),
     released: (f, u) => void released.push([f, u]),
+    ...(budget ? { budgetBytes: budget } : {}),
   });
   return {
     reg,
@@ -104,6 +105,32 @@ function harness() {
 
 const A = "D:\\rec\\match one.mp4";
 const B = "E:\\obs\\replay 2.mov";
+
+describe("the cache budget", () => {
+  const longIndex = (seconds: number): KeyframeIndex => ({ ...heavyIndex(), duration: seconds, bytes: (63e6 * seconds) / 8 });
+
+  it("a heavy file whose copy would not fit is failed without a plan, and the next file is planned", async () => {
+    // 600 s at 0.5 MB/s = 300 MB of copy against a 100 MB budget; 65 s fits.
+    const h = harness(() => 100e6);
+    h.reg.ask([A, B]);
+    await h.index(A, longIndex(600));
+    expect(h.reg.state(A)).toBe("failed");
+    expect(h.log).toEqual([`index ${A}`, `index ${B}`]);
+    await h.index(B, heavyIndex());
+    expect(h.log).toEqual([`index ${A}`, `index ${B}`, "listen", `plan ${B}`]);
+    expect(h.reg.planCalls).toBe(1);
+  });
+
+  it("the budget is read when the plan would be asked", async () => {
+    let budget = 10e6;
+    const h = harness(() => budget);
+    h.reg.ask([A]);
+    budget = 1e9;
+    await h.index(A, longIndex(600));
+    expect(h.reg.state(A)).toBe("waiting");
+    expect(h.reg.planCalls).toBe(1);
+  });
+});
 
 describe("weighing", () => {
   it("a light verdict plans nothing, and a second ask reads nothing", async () => {

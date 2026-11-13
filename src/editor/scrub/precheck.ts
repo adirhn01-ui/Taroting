@@ -31,6 +31,27 @@ export const IDLE_RELEASE_MS = 30000;
 /** A copy seek to within this of where it already is is not made (seconds). */
 export const SAME_POSITION_S = 0.01;
 
+/** A scrub copy's size per second of source, rounded up from the measured
+ *  rate (27.6 MB for a 65 s clip at 480 lines, about 0.42 MB/s) for content
+ *  that compresses worse (bytes per second). */
+export const COPY_BYTES_PER_S = 500_000;
+/** A scrub copy may take at most this share of the cache limit: a longer
+ *  source gets no copy (0.9.4's seeking), so one copy can never push the
+ *  cache's other files (other projects' prepared files) out. */
+export const COPY_CACHE_SHARE = 0.25;
+
+/** The bytes one scrub copy may take under a cache limit of `cacheLimitMB`
+ *  (the backend counts a MB as 1024 * 1024 bytes). */
+export function copyBudgetBytes(cacheLimitMB: number): number {
+  return Number.isFinite(cacheLimitMB) && cacheLimitMB > 0 ? cacheLimitMB * 1024 * 1024 * COPY_CACHE_SHARE : 0;
+}
+
+/** Does a copy of a source `duration` seconds long fit in `budget` bytes?
+ *  An unknown length never fits. */
+export function copyFits(duration: number, budget: number): boolean {
+  return Number.isFinite(duration) && duration > 0 && duration * COPY_BYTES_PER_S <= budget;
+}
+
 /** How far (seconds of timeline) the playhead must move from where the rest
  *  wait was last started before a held pointer starts it again: one frame of
  *  the project's timebase, never less than SAME_POSITION_S. The ruler seeks

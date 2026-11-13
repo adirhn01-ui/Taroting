@@ -670,6 +670,7 @@ function buildEditor(
       onJobEvents,
       mediaUrl,
     },
+    cacheLimitMB: () => settingsStore.get().cacheLimitMB,
   });
   teardown.add(() => scrub.dispose());
 

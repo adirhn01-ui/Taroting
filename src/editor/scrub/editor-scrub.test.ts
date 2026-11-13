@@ -198,7 +198,7 @@ function makeProject(media: MediaRef[], tracks: Track[]): ProjectFile {
 
 const heavyIndex: KeyframeIndex = { allSync: false, times: [0, 4.17, 8.34, 12.51, 16.68], duration: 65, bytes: heavyMedia.size };
 
-function harness(project: ProjectFile, opts: { plan?: ScrubPlan } = {}) {
+function harness(project: ProjectFile, opts: { plan?: ScrubPlan; index?: KeyframeIndex; cacheLimitMB?: number } = {}) {
   const store = new Store<ProjectFile>(project);
   const status = new Store<Record<string, MediaState>>({
     mh: { state: "ready", url: urlOf(HEAVY), sourcePath: HEAVY },
@@ -246,7 +246,7 @@ function harness(project: ProjectFile, opts: { plan?: ScrubPlan } = {}) {
     ipc: {
       keyframeTimes: async () => {
         calls.index++;
-        return heavyIndex;
+        return opts.index ?? heavyIndex;
       },
       planScrub: async () => {
         calls.plan++;
@@ -259,6 +259,7 @@ function harness(project: ProjectFile, opts: { plan?: ScrubPlan } = {}) {
       onJobEvents: async () => () => {},
       mediaUrl: (p) => `asset://cache/${p}`,
     },
+    cacheLimitMB: () => opts.cacheLimitMB ?? 2048,
     win,
     timers: {
       setTimeout: (fn, ms) => {
@@ -721,6 +722,42 @@ describe("the rest wait follows the playhead's time, not the pointer's events", 
     expect(c.style.display).toBe("block");
     h.advance(1);
     expect(c.style.display).toBe("none");
+  });
+});
+
+describe("the copy fits the cache", () => {
+  // Two hours at the heavy clip's bit rate: about 3.6 GB of copy at the
+  // measured rate, far over a quarter of the default 2048 MB cache.
+  const longIndex: KeyframeIndex = { ...heavyIndex, duration: 7200, bytes: Math.round((63e6 * 7200) / 8) };
+
+  it("a long heavy source is weighed but never planned, neither from the dwell nor from a press", async () => {
+    const h = harness(oneHeavy(), { index: longIndex });
+    h.engine.time = 2.4;
+    h.advance(DWELL_MS);
+    await flush();
+    expect(h.calls.index).toBe(1);
+    expect(h.calls.plan).toBe(0);
+    expect(h.scrub.dev.snapshot().files[0]!.state).toBe("failed");
+    h.press(2.4);
+    await flush();
+    expect(h.calls.index).toBe(1);
+    expect(h.calls.plan).toBe(0);
+    dragTo(h, 7.0);
+    expect(h.copies).toHaveLength(0);
+  });
+
+  it("the cache limit setting is what bounds it: the 65 s clip is planned under 2048 MB, not under 40 MB", async () => {
+    const roomy = harness(oneHeavy());
+    roomy.engine.time = 2.4;
+    roomy.advance(DWELL_MS);
+    await flush();
+    expect(roomy.calls.plan).toBe(1);
+    const tight = harness(oneHeavy(), { cacheLimitMB: 40 });
+    tight.engine.time = 2.4;
+    tight.advance(DWELL_MS);
+    await flush();
+    expect(tight.calls.index).toBe(1);
+    expect(tight.calls.plan).toBe(0);
   });
 });
 

@@ -8,7 +8,7 @@ import { HEAVY_BITS_PER_S } from "../../core/heavy-clip";
 import type { Clip, MediaRef, ProjectFile, Track } from "../../core/types";
 import type { DamageState, MediaState } from "../media/media";
 import type { VisibleClip } from "../playback/scheduler";
-import { SAME_POSITION_S, isCandidate, layerTargets, liveFiles, restTolerance } from "./precheck";
+import { COPY_BYTES_PER_S, SAME_POSITION_S, copyBudgetBytes, copyFits, isCandidate, layerTargets, liveFiles, restTolerance } from "./precheck";
 
 const MBIT = 1_000_000;
 
@@ -172,5 +172,24 @@ describe("restTolerance", () => {
     expect(restTolerance({ num: 0, den: 1 })).toBe(SAME_POSITION_S);
     expect(restTolerance({ num: 30, den: -1 })).toBe(SAME_POSITION_S);
     expect(restTolerance({ num: Number.NaN, den: 1 })).toBe(SAME_POSITION_S);
+  });
+});
+
+describe("the copy budget", () => {
+  it("is a quarter of the cache limit, in the backend's 1024 * 1024 byte MB, and nothing for a bad limit", () => {
+    expect(copyBudgetBytes(2048)).toBe(512 * 1024 * 1024);
+    expect(copyBudgetBytes(0)).toBe(0);
+    expect(copyBudgetBytes(Number.NaN)).toBe(0);
+  });
+
+  it("a source fits when its estimated copy is at most the budget; an unknown length never fits", () => {
+    const budget = copyBudgetBytes(2048);
+    const cap = budget / COPY_BYTES_PER_S; // about 17.9 minutes
+    expect(copyFits(65, budget)).toBe(true);
+    expect(copyFits(cap, budget)).toBe(true);
+    expect(copyFits(cap + 1, budget)).toBe(false);
+    expect(copyFits(7200, budget)).toBe(false);
+    expect(copyFits(Number.NaN, budget)).toBe(false);
+    expect(copyFits(0, budget)).toBe(false);
   });
 });

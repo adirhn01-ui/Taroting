@@ -30,6 +30,9 @@
 //  5. Paused only: a drag that starts while playing is today's drag, and the
 //     first playing tick lets go of every copy.
 //  6. Failures are silent and per file; the reason is kept for the dev hook.
+//  7. A copy is made only when its estimated size fits a share of the cache
+//     limit (`copyBudgetBytes`): a long source keeps 0.9.4's seeking, and no
+//     copy can push the cache's other files out.
 //
 // The pieces: precheck.ts (pure), copy-registry.ts (per file), copy-layers.ts
 // (per layer element). This file wires them to the editor.
@@ -40,7 +43,7 @@ import type { JobEventHandlers, KeyframeIndex, ScrubPlan } from "../../core/ipc"
 import type { MediaRef, ProjectFile } from "../../core/types";
 import { ScrubCopyLayers, type CopyLayerSnapshot, type CopyTimers, type SlotView } from "./copy-layers";
 import { ScrubCopyRegistry, type CopyFileSnapshot } from "./copy-registry";
-import { DWELL_MS, REST_MS, isCandidate, layerTargets, liveFiles, restTolerance, type LayerTarget } from "./precheck";
+import { DWELL_MS, REST_MS, copyBudgetBytes, isCandidate, layerTargets, liveFiles, restTolerance, type LayerTarget } from "./precheck";
 
 /** What the module may read of the playback engine (no transport). */
 export interface EngineView {
@@ -92,6 +95,9 @@ export interface EditorScrubDeps {
   /** Called on every project change; returns the unsubscribe. */
   subscribeProject(fn: () => void): () => void;
   ipc: ScrubIpc;
+  /** The cache limit setting (MB), read before each copy is asked: a copy
+   *  larger than its share (`copyBudgetBytes`) is never made. */
+  cacheLimitMB(): number;
   win?: PointerTarget;
   timers?: CopyTimers;
   raf?: (fn: () => void) => void;
@@ -244,6 +250,7 @@ export function mountEditorScrub(deps: EditorScrubDeps): EditorScrub {
     released: (_file, url) => {
       if (url !== null) layers.releaseUrl(url);
     },
+    budgetBytes: () => copyBudgetBytes(deps.cacheLimitMB()),
     changed: () => {
       // A copy that became ready under a resting playhead is loaded ahead.
       if (active && !engine.playing) preloadAt(engine.time);

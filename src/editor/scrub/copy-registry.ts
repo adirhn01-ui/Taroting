@@ -22,6 +22,7 @@
 
 import { heavyGap } from "../../core/heavy-clip";
 import type { KeyframeIndex, ScrubPlan } from "../../core/ipc";
+import { copyFits } from "./precheck";
 
 export type CopyFileState = "unknown" | "indexing" | "light" | "heavy" | "waiting" | "making" | "ready" | "failed";
 
@@ -42,6 +43,9 @@ export interface CopyRegistryDeps {
   changed?(file: string): void;
   /** A record was let go; `url` is its copy's url when it had one. */
   released?(file: string, url: string | null): void;
+  /** The bytes one copy may take now; a heavy file whose copy would be
+   *  larger gets none (no plan, no job). Absent: no bound. */
+  budgetBytes?(): number;
 }
 
 export interface CopyFileSnapshot {
@@ -195,6 +199,13 @@ export class ScrubCopyRegistry {
       const file = this.queue.shift()!;
       const rec = this.records.get(file);
       if (rec === undefined || rec.state !== "heavy") continue;
+      const budget = this.d.budgetBytes?.();
+      if (budget !== undefined && !copyFits(rec.index?.duration ?? Number.NaN, budget)) {
+        // Checked here, before every plan (a press, the dwell, a re-plan, a
+        // DEV force): `fail` pumps the rest of the queue itself.
+        this.fail(file, `too long for the cache: ${String(rec.index?.duration)} s against ${String(budget)} bytes`);
+        return;
+      }
       this.request(rec);
       return;
     }
