@@ -97,6 +97,15 @@ export type Generator =
       color: string;
       bold: boolean;
       italic: boolean;
+      /** Styles on parts of the text (0.9.5): sparse overrides over the fields
+       *  above, the PDF text box's run shape (`PdfTextRun`) with `size` in px,
+       *  this generator's own unit. Stored in `normalizeRuns`' canonical form,
+       *  never `[]` (no styles = no key); at most PDF_TEXT_MAX_RUNS. Edits
+       *  write it through core/gen-text-runs.ts only (the load-time checks
+       *  may drop or clip it). A text with runs is drawn styled
+       *  only when `activeRuns` says so (a right-to-left text keeps its runs
+       *  but is drawn in the base style everywhere). */
+      runs?: PdfTextRun[];
     }
   /** A freehand/markup layer of an IMAGE project. Never valid in a video project:
    *  load_project refuses it there, save_project refuses it unless kind === "image",
@@ -557,6 +566,7 @@ export type ActionId =
   | "imgMarker"
   | "imgEraser"
   | "imgShape"
+  | "imgText"
   | "imgRuler"
   | "imgSizeDown"
   | "imgSizeUp"
@@ -745,6 +755,8 @@ export const DEFAULT_SHORTCUTS: Record<ActionId, string> = {
   imgMarker: "H",
   imgEraser: "E",
   imgShape: "U",
+  // Image mode only: the PDF editor's own Text box tool keeps "T" there.
+  imgText: "T",
   imgRuler: "R",
   imgSizeDown: "[",
   imgSizeUp: "]",
@@ -820,6 +832,7 @@ export const ACTION_MODES: Readonly<Record<ActionId, readonly ShortcutMode[]>> =
   imgMarker: ["image", "pdf"],
   imgEraser: ["image", "pdf"],
   imgShape: ["image", "pdf"],
+  imgText: ["image"],
   imgRuler: ["image", "pdf"],
   imgSizeDown: ["image", "pdf"],
   imgSizeUp: ["image", "pdf"],

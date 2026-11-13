@@ -47,6 +47,7 @@ import { toast } from "../ui/toast";
 import { ADJUST_IDENTITY, isIdentityAdjust } from "./adjust/plan";
 import { openCanvasSizeDialog } from "./canvas-size-dialog";
 import type { ImageEditorCtx } from "./context";
+import { buildTextSection } from "./text/text-section";
 import { startImageCrop } from "./crop-image";
 import { IMAGE_SCALE_GUARD, layerToCanvas, visibleBox } from "./geom";
 import { imgIcon } from "./icons";
@@ -1123,7 +1124,9 @@ export function mountImageInspector(
   function structKey(): string {
     const l = selected();
     if (!l) return "canvas";
-    const gen = l.kind === "text" || l.kind === "solid" ? `|${stampOf(l.media)}` : "";
+    // A text layer's section refreshes its own values (text/text-section.ts):
+    // typing on the canvas must not rebuild the panel per keystroke.
+    const gen = l.kind === "solid" ? `|${stampOf(l.media)}` : "";
     return `${l.trackId}|${l.kind}${gen}`;
   }
 
@@ -1166,7 +1169,16 @@ export function mountImageInspector(
     }
     host.appendChild(buildHeader(l));
     const body = el("div", "insp-body");
-    if (l.kind === "text" || l.kind === "solid") {
+    if (l.kind === "text") {
+      body.appendChild(
+        buildTextSection(ctx, l.trackId, {
+          watch,
+          // Its cleanup (the font picker) runs with the build's.
+          onCleanup: (fn) => cleanup.push(fn),
+          closed: () => disposed,
+        }),
+      );
+    } else if (l.kind === "solid") {
       const gen = buildGeneratedSection(
         { session, refresh: () => ctx.requestRender() },
         { clip: l.clip, media: l.media },

@@ -384,7 +384,15 @@ const menuOpen = (): boolean => {
   return m !== null && m.style.display === "block";
 };
 
-export function mountSelectTool(ctx: ImageEditorCtx): {
+export function mountSelectTool(
+  ctx: ImageEditorCtx,
+  opts: {
+    /** A double-click on a TEXT layer opens it for typing at that point
+     *  (text/text-tool.ts) instead of its crop; the inspector's Crop button
+     *  still crops it. Absent: a text layer crops like the others. */
+    editText?(trackId: string, at: { clientX: number; clientY: number }): boolean;
+  } = {},
+): {
   /** Cancel an open per-layer crop now, synchronously (the window is closing:
    *  its save must not write a crop the user never applied). */
   revertCrop(): void;
@@ -1046,7 +1054,7 @@ export function mountSelectTool(ctx: ImageEditorCtx): {
   cancelBtn.addEventListener("click", () => exitCrop("revert"));
   applyBtn.addEventListener("click", () => exitCrop("commit"));
 
-  /* ---------------- double-click → crop ---------------- */
+  /* ---------------- double-click → crop (text: type in it) ---------------- */
 
   function onDblClick(e: MouseEvent): void {
     if (disposed || crop || tools.get().tool !== "select" || mode.get() !== "idle") return;
@@ -1057,6 +1065,10 @@ export function mountSelectTool(ctx: ImageEditorCtx): {
     if (!id) return;
     const l = findLayer(session.project, id);
     if (!l || !croppable(l)) return;
+    if (l.kind === "text" && opts.editText) {
+      opts.editText(id, { clientX: e.clientX, clientY: e.clientY });
+      return;
+    }
     if (selection.get() !== id) selection.set(id);
     enterCrop(id);
   }

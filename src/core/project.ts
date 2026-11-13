@@ -29,6 +29,7 @@ import type {
 import { DEFAULT_EXPORT_PRESET, IMAGE_CANVAS_MAX_SIDE } from "./types";
 import { EPS_KF, removeKfNear, upsertKf } from "./anim";
 import { isFontId } from "./font-id";
+import { sanitizeGenRuns } from "./gen-runs-sanitize";
 import { clipDuration, clipEnd } from "./time";
 
 export const MIN_CANVAS = 16;
@@ -1111,7 +1112,8 @@ export function sanitizeFps(fps: Rational): Rational {
  *  rejects it. */
 export function sanitizeMediaRef(m: MediaRef): MediaRef {
   const duration = finMin(m.duration, 0, 0);
-  const generator = sanitizeTextFontId(m.generator);
+  let generator = sanitizeTextFontId(m.generator);
+  if (generator?.type === "text" && "runs" in generator) generator = sanitizeGenRuns(generator);
   if (duration === m.duration && generator === m.generator) return m;
   return generator === m.generator ? { ...m, duration } : { ...m, duration, generator };
 }

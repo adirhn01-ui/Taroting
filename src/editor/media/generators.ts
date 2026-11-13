@@ -36,6 +36,8 @@ import {
 // This module is reached only from lazy chunks (the editor and the image
 // editor), never from the boot chunk, so neither is src/fonts.
 import { ensureFonts, facesOf, fontFace, fontsReady, missingFonts, mountFontPicker } from "../../fonts";
+import { activeRuns, genFontRequests, honourRunFaces } from "../../core/gen-text-runs";
+import { measureStyledText } from "./styled-text";
 import { trapTab } from "../../ui/focus";
 import { toast } from "../../ui/toast";
 import type { MediaManager } from "./media";
@@ -141,7 +143,10 @@ const requestOf = (g: TextGen): FontRequest | null => fontRequestOf(g.fontFamily
 
 /** The distinct font requests of every text generator in `media` (bin items
  *  included: the bin previews them too). Empty for a project that only uses
- *  the six legacy fonts. */
+ *  the six legacy fonts. A video project draws and exports a text in its
+ *  base style even when it carries styled parts, so only the base font is
+ *  asked for: a font only a styled part names is neither loaded nor reported
+ *  missing. */
 export function textFontRequests(media: readonly Pick<MediaRef, "generator">[]): FontRequest[] {
   const out: FontRequest[] = [];
   const seen = new Set<string>();
@@ -225,6 +230,16 @@ export function measureTextWhenReady(
     const gen = honourFaces(g);
     return { gen, ...measureText(gen) };
   };
+  if (activeRuns(g)) {
+    // A styled text: its base and every run font, then each run's faces.
+    const styled = (): { gen: TextGen; width: number; height: number } => {
+      const gen = honourRunFaces(honourFaces(g), styleAvailability);
+      return { gen, ...measureText(gen) };
+    };
+    const reqs = genFontRequests(g);
+    if (reqs.length === 0 || fontsReady(reqs)) return styled();
+    return ensureFonts(reqs).then(styled, styled);
+  }
   const req = requestOf(g);
   if (!req) return { gen: g, ...measureText(g) };
   if (fontsReady([req])) return done();
@@ -276,6 +291,7 @@ function ctx2d(): CanvasRenderingContext2D | null {
  *  non-legacy font awaits it first (measureTextWhenReady), since canvas
  *  measures a fallback font without a word. */
 export function measureText(g: Extract<Generator, { type: "text" }>): { width: number; height: number } {
+  if (activeRuns(g)) return measureStyledText(g);
   const lines = g.text.split("\n");
   const c = ctx2d();
   let maxW = 0;

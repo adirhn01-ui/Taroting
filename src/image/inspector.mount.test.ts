@@ -642,16 +642,17 @@ describe("inspector: Actual size and Fit land on whole pixels", () => {
   });
 });
 
-describe("inspector: a typed text edit survives a click on another layer", () => {
-  // The real text section commits its textarea on `change`, which a browser
+describe("inspector: a typed generator edit survives a click on another layer", () => {
+  // The real solid section commits its fields on `change`, which a browser
   // fires when the field blurs. The canvas tools preventDefault their
   // pointerdown, so a click on another layer never blurs it; a field removed
-  // while focused fires nothing.
+  // while focused fires nothing. (A text layer has its own section since the
+  // Text tool: its text is typed on the canvas, text/text-section.ts.)
   async function withText() {
     const t = mount(false);
     const photoId = t.id;
-    const gen = { type: "text", text: "Old", fontFamily: "Arial", sizePx: 40, color: "#ffffff", bold: false, italic: false } as const;
-    const made = addGeneratorLayer(t.store.get(), gen, 94, 50, "Text — Old");
+    const gen = { type: "solid", color: "#ffffff" } as const;
+    const made = addGeneratorLayer(t.store.get(), gen, 94, 50, "Solid");
     t.store.set(made.project);
     const areas: El[] = [];
     spies.genSection = (ctx, target) => {
@@ -660,7 +661,7 @@ describe("inspector: a typed text edit survives a click on another layer", () =>
       area.value = "Old";
       const session = (ctx as { session: { commit(fn: (p: ProjectFile) => ProjectFile): void } }).session;
       area.addEventListener("change", () =>
-        session.commit((p) => updateMedia(p, target.media.id, { generator: { ...gen, text: area.value } })),
+        session.commit((p) => updateMedia(p, target.media.id, { generator: { ...gen, color: area.value } })),
       );
       // A real blur: focus moves to <body>, and a changed value fires change.
       area.blur = () => {
@@ -679,7 +680,7 @@ describe("inspector: a typed text edit survives a click on another layer", () =>
     area.value = "New";
     const textOf = () => {
       const g = findLayer(t.store.get(), made.trackId)!.media.generator;
-      return g?.type === "text" ? g.text : null;
+      return g?.type === "solid" ? g.color : null;
     };
     return { ...t, photoId, textId: made.trackId, area, textOf };
   }
@@ -710,7 +711,7 @@ describe("inspector: a typed text edit survives a click on another layer", () =>
   });
 });
 
-describe("inspector: the text section's cleanup (0.9.4 fonts)", () => {
+describe("inspector: the generator section's cleanup (0.9.4 fonts)", () => {
   // The real section hands back a cleanup that disposes its font picker, and
   // drops a commit still waiting for a font only once `closed()` reads true
   // (generated.fonts.test.ts): here, that the image inspector runs the cleanup
@@ -719,8 +720,8 @@ describe("inspector: the text section's cleanup (0.9.4 fonts)", () => {
   async function withText() {
     const t = mount(false);
     const photoId = t.id;
-    const gen = { type: "text", text: "Old", fontFamily: "Arial", sizePx: 40, color: "#ffffff", bold: false, italic: false } as const;
-    const made = addGeneratorLayer(t.store.get(), gen, 94, 50, "Text — Old");
+    const gen = { type: "solid", color: "#ffffff" } as const;
+    const made = addGeneratorLayer(t.store.get(), gen, 94, 50, "Solid");
     t.store.set(made.project);
     const cleaned: number[] = [];
     const closed: (() => boolean)[] = [];

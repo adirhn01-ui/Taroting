@@ -210,12 +210,29 @@ fn validate_with(raw: &Value, typed: &ProjectFile, caps: Caps) -> Result<()> {
         }
     }
 
+    for m in &typed.media {
+        if let Some(Generator::Text { text, font_family, font_id, size_px, color, .. }) = &m.generator {
+            check_text(text, font_family, font_id.as_deref(), *size_px, color)
+                .map_err(|why| AppError::BadInput(format!("text layer '{}': {why}", layer_name(typed, &m.id))))?;
+        }
+    }
+
     let mut totals = Totals::default();
     let Some(media) = raw.get("media").and_then(Value::as_array) else {
         return Ok(()); // the typed parse already proved `media` is a list
     };
     for m in media {
         let Some(gen) = m.get("generator") else { continue };
+        if gen.get("type").and_then(Value::as_str) == Some("text") {
+            if let Some(runs) = gen.get("runs") {
+                let text = gen.get("text").and_then(Value::as_str).unwrap_or_default();
+                check_text_runs(runs, text).map_err(|why| {
+                    let id = m.get("id").and_then(Value::as_str).unwrap_or_default();
+                    AppError::BadInput(format!("text layer '{}': {why}", layer_name(typed, id)))
+                })?;
+            }
+            continue;
+        }
         if gen.get("type").and_then(Value::as_str) != Some("drawing") {
             continue;
         }
@@ -338,6 +355,112 @@ fn check_stroke(raw: &Value, max_points: u64) -> std::result::Result<u64, String
     }
 }
 
+/// A text layer's caps: the SAME numbers as `TEXT_MAX_CHARS`,
+/// `TEXT_SIZE_MIN` and `TEXT_SIZE_MAX` in src/image/layers.ts, which cleans a
+/// loaded project to them — change them together or not at all.
+pub const MAX_TEXT_UNITS: usize = 20_000;
+pub const TEXT_SIZE_MIN: f64 = 1.0;
+pub const TEXT_SIZE_MAX: f64 = 2048.0;
+/// The six fonts every Taroting has (src/core/font-id.ts `LEGACY_FONTS`).
+const LEGACY_FONTS: [&str; 6] = ["Segoe UI", "Arial", "Georgia", "Times New Roman", "Courier New", "Impact"];
+
+/// `isFontId` of src/core/font-id.ts (fonts/mod.rs keeps its own copy for the
+/// resolver): 1..96 UTF-16 units, no control characters, no leading or
+/// trailing whitespace, `lib:` followed by at least one character. Shape only.
+fn is_font_id_shape(id: &str) -> bool {
+    let units = id.encode_utf16().count();
+    // JavaScript's `\s`, exactly: Unicode White_Space plus U+FEFF, minus
+    // U+0085 (NEL), which `\s` leaves out. An id the loader keeps must save.
+    let space = |c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{FEFF}';
+    (1..=96).contains(&units)
+        && !id.chars().any(|c| c <= '\u{1F}' || c == '\u{7F}')
+        && !id.starts_with(space)
+        && !id.ends_with(space)
+        && id != "lib:"
+}
+
+/// One text layer against the image editor's rules (image projects only: a
+/// video project's text is the video editor's, and stays unchecked). The
+/// length is counted in UTF-16 units, as the editor counts it.
+fn check_text(text: &str, family: &str, font_id: Option<&str>, size: f64, color: &str) -> std::result::Result<(), String> {
+    if text.encode_utf16().count() > MAX_TEXT_UNITS {
+        return Err(format!("the text is longer than {MAX_TEXT_UNITS} characters"));
+    }
+    if !(size.is_finite() && (TEXT_SIZE_MIN..=TEXT_SIZE_MAX).contains(&size)) {
+        return Err(format!("the size must be {TEXT_SIZE_MIN} to {TEXT_SIZE_MAX} px"));
+    }
+    if !is_hex_colour(Some(color)) {
+        return Err("color is not #rrggbb".into());
+    }
+    if !LEGACY_FONTS.contains(&family) {
+        return Err("the font is not one of the six built-in fonts".into());
+    }
+    if font_id.is_some_and(|id| !is_font_id_shape(id)) {
+        return Err("the font id is not a font name".into());
+    }
+    Ok(())
+}
+
+/// The most style runs one text holds: `PDF_TEXT_MAX_RUNS` in
+/// src/core/types.ts, which the loader (core/gen-runs-sanitize.ts) enforces.
+pub const MAX_TEXT_RUNS: usize = 2_000;
+
+/// A text layer's style runs (0.9.5), read from the raw value (the typed
+/// generator does not carry them): a list of at most MAX_TEXT_RUNS records,
+/// each `s < e` whole numbers inside the text's UTF-16 length, sorted and not
+/// overlapping, and every field present well-formed: a built-in font, a
+/// font-id shape, a size inside the text size range, a `#rrggbb` colour,
+/// booleans for bold and italic. The editor only ever writes that.
+fn check_text_runs(runs: &Value, text: &str) -> std::result::Result<(), String> {
+    let Value::Array(list) = runs else {
+        return Err("the styles are not a list".into());
+    };
+    if list.len() > MAX_TEXT_RUNS {
+        return Err(format!("the text has more than {MAX_TEXT_RUNS} styled parts"));
+    }
+    let len = text.encode_utf16().count() as u64;
+    let mut at = 0u64;
+    for (i, r) in list.iter().enumerate() {
+        let n = i + 1;
+        let Value::Object(o) = r else {
+            return Err(format!("style {n} is not a record"));
+        };
+        let (Some(s), Some(e)) = (o.get("s").and_then(Value::as_u64), o.get("e").and_then(Value::as_u64)) else {
+            return Err(format!("style {n} has no whole-number range"));
+        };
+        if s >= e || e > len || s < at {
+            return Err(format!("style {n} covers no part of the text in order"));
+        }
+        at = e;
+        if let Some(f) = o.get("font") {
+            if !f.as_str().is_some_and(|f| LEGACY_FONTS.contains(&f)) {
+                return Err(format!("style {n}'s font is not one of the six built-in fonts"));
+            }
+        }
+        if let Some(id) = o.get("fontId") {
+            if !id.as_str().is_some_and(is_font_id_shape) {
+                return Err(format!("style {n}'s font id is not a font name"));
+            }
+        }
+        if let Some(sz) = o.get("size") {
+            if !sz.as_f64().is_some_and(|v| v.is_finite() && (TEXT_SIZE_MIN..=TEXT_SIZE_MAX).contains(&v)) {
+                return Err(format!("style {n}'s size must be {TEXT_SIZE_MIN} to {TEXT_SIZE_MAX} px"));
+            }
+        }
+        if let Some(c) = o.get("c") {
+            if !is_hex_colour(c.as_str()) {
+                return Err(format!("style {n}'s color is not #rrggbb"));
+            }
+        }
+        for k in ["bold", "italic"] {
+            if o.get(k).is_some_and(|v| !v.is_boolean()) {
+                return Err(format!("style {n}'s {k} is not on or off"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `#` + exactly six ASCII hex digits, checked on BYTES before anything reads
 /// a position — validate before you slice (the v0.7.2 `parse_color` lesson).
 /// Either case: the editor writes lowercase, and the renderer re-normalizes.
@@ -449,6 +572,165 @@ mod tests {
     #[test]
     fn a_well_formed_image_project_is_accepted() {
         check(&image_project()).expect("the fixture is valid");
+    }
+
+    /// The fixture plus a text layer named "Caption" whose every field is
+    /// valid and differs from the drawing's: size 37.5 (fractional, in
+    /// range), colour #0a1B2c (mixed case), a library font id.
+    fn with_text() -> Value {
+        let mut p = image_project();
+        p["media"].as_array_mut().unwrap().push(json!({
+            "id": "tx", "path": "Text — Hi", "size": 0, "mtimeMs": 0, "kind": "image",
+            "duration": 0.0, "hasAudio": false, "width": 94, "height": 48,
+            "generator": { "type": "text", "text": "Hi\nthere", "fontFamily": "Georgia", "fontId": "lib:Inter",
+                           "sizePx": 37.5, "color": "#0a1B2c", "bold": true, "italic": false }
+        }));
+        p["timeline"]["tracks"].as_array_mut().unwrap().insert(
+            0,
+            json!({ "id": "t0", "kind": "video", "name": "Caption", "muted": false, "clips": [clip("c0", "tx")] }),
+        );
+        p
+    }
+
+    /// Each bad text differs from the valid one on ONE field, and each
+    /// refusal names the layer and that field.
+    #[test]
+    fn every_bad_text_layer_is_refused_by_name() {
+        check(&with_text()).expect("a valid text layer is accepted");
+        let at_cap = "é".repeat(MAX_TEXT_UNITS);
+        let mut ok = with_text();
+        ok["media"][2]["generator"]["text"] = json!(at_cap);
+        check(&ok).expect("exactly the cap is accepted");
+        for edge in [TEXT_SIZE_MIN, TEXT_SIZE_MAX] {
+            let mut ok = with_text();
+            ok["media"][2]["generator"]["sizePx"] = json!(edge);
+            check(&ok).expect("the size range is inclusive");
+        }
+        let mut ok = with_text();
+        ok["media"][2]["generator"].as_object_mut().unwrap().remove("fontId");
+        check(&ok).expect("no font id is fine");
+
+        let with = |field: &str, v: Value| {
+            let mut p = with_text();
+            p["media"][2]["generator"][field] = v;
+            refusal(&p)
+        };
+        // One unit over, counted in UTF-16: an astral character is two.
+        let over = format!("{}😀", "a".repeat(MAX_TEXT_UNITS - 1));
+        let cases: [(&str, Value, &str); 8] = [
+            ("text", json!(over), "longer than 20000"),
+            ("sizePx", json!(0.5), "size must be"),
+            ("sizePx", json!(2048.5), "size must be"),
+            ("color", json!("#12345"), "color is not"),
+            ("color", json!("red"), "color is not"),
+            ("fontFamily", json!("Comic Sans MS"), "six built-in fonts"),
+            ("fontId", json!(" Inter"), "font id"),
+            ("fontId", json!("lib:"), "font id"),
+        ];
+        for (field, v, want) in cases {
+            let m = with(field, v.clone());
+            assert!(m.starts_with("text layer 'Caption': "), "{field}={v}: {m}");
+            assert!(m.contains(want), "{field}={v}: {m}");
+        }
+    }
+
+    /// The save check's font-id rule is the loader's `isFontId`, character
+    /// for character: an id the loader keeps (a NEL at either end is not JS
+    /// whitespace) must save, or that project could never be saved again.
+    /// The characters both sides call whitespace stay refused.
+    #[test]
+    fn font_id_edges_match_the_loader() {
+        for id in ["Inter\u{85}", "\u{85}Inter"] {
+            let mut p = with_text();
+            p["media"][2]["generator"]["fontId"] = json!(id);
+            check(&p).unwrap_or_else(|e| panic!("{id:?} is kept by the loader, so it saves: {e}"));
+        }
+        for id in ["Inter\u{A0}", "\u{FEFF}Inter", "Inter\u{3000}", "Inter\t"] {
+            let mut p = with_text();
+            p["media"][2]["generator"]["fontId"] = json!(id);
+            assert!(refusal(&p).contains("font id"), "{id:?}");
+        }
+    }
+
+    /// A video project's text is not the image editor's: the same bad text
+    /// in a video project is saved as before.
+    #[test]
+    fn a_video_project_text_stays_unchecked() {
+        let mut p = with_text();
+        p["schema"] = json!(2);
+        p.as_object_mut().unwrap().remove("kind");
+        p["media"].as_array_mut().unwrap().remove(1);
+        p["timeline"]["tracks"].as_array_mut().unwrap().remove(1);
+        p["media"][1]["generator"]["sizePx"] = json!(4096.0);
+        p["media"][1]["generator"]["fontFamily"] = json!("Comic Sans MS");
+        check(&p).expect("video projects are not held to the image rules");
+    }
+
+    /// `with_text` with style runs on "Hi\nthere" (8 UTF-16 units): two
+    /// valid runs whose every field differs from the base and from each other.
+    fn with_runs() -> Value {
+        let mut p = with_text();
+        p["media"][2]["generator"]["runs"] = json!([
+            { "s": 0, "e": 2, "size": 61.5, "c": "#AA5500" },
+            { "s": 3, "e": 8, "font": "Arial", "fontId": "lib:Test Sans", "bold": false, "italic": true }
+        ]);
+        p
+    }
+
+    #[test]
+    fn text_runs_are_checked_in_image_projects_by_layer_name() {
+        check(&with_runs()).expect("valid runs are accepted");
+        let mut at_cap = with_text();
+        at_cap["media"][2]["generator"]["text"] = json!("x".repeat(MAX_TEXT_RUNS));
+        at_cap["media"][2]["generator"]["runs"] =
+            json!((0..MAX_TEXT_RUNS).map(|i| json!({ "s": i, "e": i + 1, "bold": true })).collect::<Vec<_>>());
+        check(&at_cap).expect("exactly the cap is accepted");
+        let mut over = at_cap.clone();
+        over["media"][2]["generator"]["text"] = json!("x".repeat(MAX_TEXT_RUNS + 1));
+        over["media"][2]["generator"]["runs"] =
+            json!((0..=MAX_TEXT_RUNS).map(|i| json!({ "s": i, "e": i + 1, "bold": true })).collect::<Vec<_>>());
+        let m = refusal(&over);
+        assert!(m.starts_with("text layer 'Caption': ") && m.contains("more than 2000"), "{m}");
+
+        let run = |i: usize, field: &str, v: Value| {
+            let mut p = with_runs();
+            p["media"][2]["generator"]["runs"][i][field] = v;
+            refusal(&p)
+        };
+        let cases: [(usize, &str, Value, &str); 9] = [
+            (0, "e", json!(0), "in order"),
+            (1, "e", json!(9), "in order"),
+            (1, "s", json!(1), "in order"),
+            (0, "s", json!(0.5), "whole-number"),
+            (0, "c", json!("red"), "color is not"),
+            (1, "font", json!("Comic Sans MS"), "six built-in fonts"),
+            (1, "fontId", json!("lib:"), "font id"),
+            (0, "size", json!(2049.0), "size must be"),
+            (1, "bold", json!("yes"), "on or off"),
+        ];
+        for (i, field, v, want) in cases {
+            let m = run(i, field, v.clone());
+            assert!(m.starts_with("text layer 'Caption': "), "{field}={v}: {m}");
+            assert!(m.contains(want), "{field}={v}: {m}");
+        }
+        let mut p = with_runs();
+        p["media"][2]["generator"]["runs"] = json!({ "s": 0 });
+        assert!(refusal(&p).contains("not a list"));
+    }
+
+    /// The typed generator ignores `runs`; the raw value keeps them whole.
+    #[test]
+    fn runs_travel_in_the_raw_value_and_video_projects_stay_unchecked() {
+        let p = with_runs();
+        let typed: ProjectFile = serde_json::from_value(p.clone()).expect("a runs-carrying text parses");
+        assert!(matches!(typed.media[2].generator, Some(Generator::Text { .. })));
+        let mut v = with_runs();
+        v["schema"] = json!(2);
+        v.as_object_mut().unwrap().remove("kind");
+        v["media"].as_array_mut().unwrap().remove(1);
+        v["timeline"]["tracks"].as_array_mut().unwrap().remove(1);
+        v["media"][1]["generator"]["runs"][0]["c"] = json!("red");
+        check(&v).expect("video projects are not held to the image rules");
     }
 
     /// Each bad stroke differs from the valid fixture on one field, and each

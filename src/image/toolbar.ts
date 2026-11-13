@@ -22,6 +22,7 @@ import { toast } from "../ui/toast";
 import type { ImageEditorCtx } from "./context";
 import { imgIcon, type ImgIconName } from "./icons";
 import { toggleRuler } from "./ink/ruler";
+import { mountFontPicker } from "../fonts";
 import { drawingTarget } from "./layers";
 import { DEFAULT_TOOL_STATE, SIZE_MAX, SIZE_MIN, type ToolId, type ToolState } from "./tool-state";
 import "./toolbar.css";
@@ -36,9 +37,10 @@ const TOOLS: readonly { id: ToolId; action: ActionId; label: string; icon: ImgIc
   { id: "marker", action: "imgMarker", label: "Marker", icon: "marker" },
   { id: "eraser", action: "imgEraser", label: "Eraser", icon: "eraser" },
   { id: "shape", action: "imgShape", label: "Shapes", icon: "shapes" },
+  { id: "text", action: "imgText", label: "Text", icon: "text" },
 ];
 
-const COLOR_LABELS: Record<ColorKey, string> = { pen: "Pen", pencil: "Pencil", marker: "Marker", shape: "Shape" };
+const COLOR_LABELS: Record<ColorKey, string> = { pen: "Pen", pencil: "Pencil", marker: "Marker", shape: "Shape", text: "Text" };
 
 const SHAPES: readonly { id: ShapeKind; label: string }[] = [
   { id: "line", label: "Line" },
@@ -106,7 +108,7 @@ export function dotDiameter(size: number): number {
 }
 
 function colorKeyOf(tool: ToolId): ColorKey | null {
-  return tool === "pen" || tool === "pencil" || tool === "marker" || tool === "shape" ? tool : null;
+  return tool === "pen" || tool === "pencil" || tool === "marker" || tool === "shape" || tool === "text" ? tool : null;
 }
 function sizeKeyOf(tool: ToolId): SizeKey | null {
   return tool === "select" ? null : tool;
@@ -397,6 +399,24 @@ export function mountToolbar(host: HTMLElement, ctx: ImageEditorCtx): { dispose(
     ctx.tools.update((s) => (s.shape === v ? s : { ...s, shape: v }));
   });
 
+  // The Text tool's font, for the next text placed. A press on it keeps an
+  // open text open (the picker is a styling surface), and a pick restyles
+  // that text too: the font the row shows is the one being typed in.
+  const fontWrap = el("div", "imged-fontpick");
+  const fontPicker = mountFontPicker(fontWrap, {
+    value: () => ctx.tools.get().font,
+    onPick: (v) => {
+      ctx.tools.update((s) => ({ ...s, font: v.fontId === undefined ? { legacy: v.legacy } : { legacy: v.legacy, fontId: v.fontId } }));
+      const open = ctx.textEdit?.get() ?? null;
+      if (open) {
+        open.restyle({ font: v });
+        open.refocus();
+      }
+    },
+  });
+  cleanup.push(() => fontPicker.dispose());
+  row.appendChild(fontWrap);
+
   const hint = el("span", "imged-hint");
   hint.textContent = HINT_NOTHING_TO_ERASE;
   row.appendChild(hint);
@@ -417,6 +437,7 @@ export function mountToolbar(host: HTMLElement, ctx: ImageEditorCtx): { dispose(
     eraserMode: "",
     shapeVisible: null as boolean | null,
     shape: "",
+    fontVisible: null as boolean | null,
     hint: null as boolean | null,
   };
 
@@ -524,6 +545,12 @@ export function mountToolbar(host: HTMLElement, ctx: ImageEditorCtx): { dispose(
     if (shown.shape !== s.shape) {
       shown.shape = s.shape;
       shapeSel.value = s.shape;
+    }
+
+    const fontVisible = s.tool === "text";
+    if (shown.fontVisible !== fontVisible) {
+      shown.fontVisible = fontVisible;
+      setHidden(fontWrap, !fontVisible);
     }
 
     const showHint = nothingToErase(s);

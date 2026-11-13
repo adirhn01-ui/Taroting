@@ -4,6 +4,7 @@ import { Store } from "../core/store";
 import { createPhotoImageProject } from "../core/image-project";
 import type { Stroke } from "../core/types";
 import { addDrawingLayer, addGeneratorLayer, appendStrokeTo, layersOf, setLayerAdjust, setLayerTransform } from "./layers";
+import { DEFAULT_TOOL_STATE } from "./tool-state";
 
 // The Layers panel mounted against a small fake DOM (vitest runs in node):
 // what it asks the preview resources for, the generator dialog's overlay
@@ -360,6 +361,33 @@ describe("layers panel: generator dialog", () => {
     gen.opts!.onClose!();
     expect(t.unregister).toHaveBeenCalledTimes(1);
     expect(layersOf(t.store.get()).length).toBe(2);
+    t.handle.dispose();
+  });
+
+  it("Add → Text hands over the Text tool only when the new text opens", async () => {
+    const t = mount(1);
+    const tools = new Store({ ...DEFAULT_TOOL_STATE, tool: "pencil" as const });
+    let accept = false;
+    const begun: unknown[] = [];
+    Object.assign(t.ctx, {
+      tools,
+      beginText: (at: unknown) => {
+        begun.push(at);
+        return accept;
+      },
+    });
+    // Refused (a crop under way, a dialog): the pencil stays in hand.
+    t.host.find((e) => e.id === "imged-add-layer")!.fire("click", {});
+    menu.items.find((i) => i.label === "Text")!.onSelect();
+    expect(begun).toEqual([null]);
+    expect(tools.get().tool).toBe("pencil");
+    expect(t.ctx.registerOverlay).not.toHaveBeenCalled();
+    // Opened: the Text tool is in hand.
+    accept = true;
+    t.host.find((e) => e.id === "imged-add-layer")!.fire("click", {});
+    menu.items.find((i) => i.label === "Text")!.onSelect();
+    expect(begun).toEqual([null, null]);
+    expect(tools.get().tool).toBe("text");
     t.handle.dispose();
   });
 });

@@ -70,9 +70,16 @@ export function fitView(canvasW: number, canvasH: number, stageW: number, stageH
   return centred(zoom, canvasW, canvasH, stageW, stageH);
 }
 
-/** `zoom` with the canvas centred in the stage. */
+/** `zoom` with the canvas centred in the stage. At a whole-number zoom the
+ *  pan is rounded to whole device pixels: an odd-sided canvas in a stage whose
+ *  side has the other parity would otherwise sit on a half pixel, and every
+ *  canvas pixel would be drawn across two (the 100% view looked soft, and
+ *  differed from a 100% export by a half-pixel blur). At any other zoom the
+ *  picture is resampled anyway, so the exact centre is kept. */
 export function centred(zoom: number, canvasW: number, canvasH: number, stageW: number, stageH: number): ViewXf {
-  return { zoom, panX: (stageW - canvasW * zoom) / 2, panY: (stageH - canvasH * zoom) / 2 };
+  const panX = (stageW - canvasW * zoom) / 2;
+  const panY = (stageH - canvasH * zoom) / 2;
+  return Number.isInteger(zoom) ? { zoom, panX: Math.round(panX), panY: Math.round(panY) } : { zoom, panX, panY };
 }
 
 /** Zoom by `factor` about the device point (dx, dy), clamped to [min, max]:

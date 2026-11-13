@@ -92,6 +92,15 @@
   display: none;
 }
 
+/* The Text tool's font: the shared picker, kept to a tool-row width. */
+.imged-fontpick {
+  display: flex;
+  max-width: 160px;
+}
+.imged-fontpick[hidden] {
+  display: none;
+}
+
 .imged-hint {
   font-size: var(--fs-12);
   color: var(--text-3);

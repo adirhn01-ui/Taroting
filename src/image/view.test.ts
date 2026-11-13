@@ -4,6 +4,7 @@ import {
   ZOOM_FLOOR,
   ZOOM_MAX,
   canvasToStageCss,
+  centred,
   clampPan,
   clampZoom,
   fitView,
@@ -158,5 +159,22 @@ describe("zoomStep", () => {
     expect(zoomStep(0.01, -1)).toBe(0.01);
     // A fit zoom below the floor steps up onto the ladder.
     expect(zoomStep(0.004, 1)).toBe(0.01);
+  });
+});
+
+describe("centred", () => {
+  it("lands a whole-number zoom on whole device pixels, whatever the parities", () => {
+    // 301 x 203 in 900 x 500: (900 - 301) / 2 = 299.5 and (500 - 203) / 2 = 148.5.
+    expect(centred(1, 301, 203, 900, 500)).toEqual({ zoom: 1, panX: 300, panY: 149 });
+    // The same canvas at 2x: 149 and 47, already whole.
+    expect(centred(2, 301, 203, 900, 500)).toEqual({ zoom: 2, panX: 149, panY: 47 });
+    // A stage with the other parity on one axis only.
+    expect(centred(1, 301, 203, 901, 500)).toEqual({ zoom: 1, panX: 300, panY: 149 });
+  });
+
+  it("keeps the exact centre at a zoom that resamples anyway", () => {
+    const v = centred(0.5, 301, 203, 900, 500);
+    expect(v.panX).toBe(374.75);
+    expect(v.panY).toBe(199.25);
   });
 });

@@ -1,0 +1,60 @@
+/* The Text tool's pointer surface and the in-place text editor. Loaded with
+   the image chunk only.
+
+   Stacking: the surface sits at the stage-overlay level like the ink surface
+   (only one tool's surface exists at a time); the editor sits at the stage-status level, above
+   every stage overlay, so the select chrome around the layer never takes the
+   presses that place the caret. */
+
+.imged-textsurface {
+  position: absolute;
+  inset: 0;
+  z-index: var(--z-stage-overlay);
+  cursor: text;
+  touch-action: none;
+  user-select: none;
+}
+
+/* Laid out in the layer's own px (transform = view × layer matrix), so its
+   text runs exactly over the glyphs the canvas draws. The text itself is
+   transparent: the canvas shows the real pixels; only the caret and the
+   selection are drawn here. */
+.imged-textedit {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: var(--z-stage-status);
+  transform-origin: 0 0;
+  box-sizing: content-box;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  width: max-content;
+  min-width: 1px;
+  white-space: pre;
+  color: transparent;
+  caret-color: var(--accent);
+  background: transparent;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
+  /* one screen pixel at any zoom: the editor sets the variable */
+  outline: var(--imged-textedit-px, 1px) dashed color-mix(in srgb, var(--accent) 70%, transparent);
+  outline-offset: 0;
+}
+/* A text with styled parts is typed as spans (one per style): they lay out
+   like the canvas rows and stay as transparent as the editor itself. */
+.imged-textedit span {
+  color: transparent;
+}
+.imged-textedit::selection,
+.imged-textedit span::selection {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+  color: transparent;
+}
+
+/* The inspector's text section: the Edit text button spans the panel. */
+.imged-text-edit-btn {
+  width: 100%;
+  justify-content: center;
+}

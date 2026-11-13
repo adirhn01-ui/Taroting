@@ -28,7 +28,8 @@ import type {
 } from "../core/types";
 import { STROKE_CHUNK } from "../core/types";
 import { clampImageCanvas, defaultAudio, defaultTransform, uid } from "../core/project";
-import { isFontId } from "../core/font-id";
+import { DEFAULT_FONT, isFontId, isLegacyFont } from "../core/font-id";
+import { textLabel } from "../core/media-name";
 import { normalizeHexColor } from "../core/session";
 import { fileStem } from "../core/format";
 import { sanitizeAdjust } from "./adjust/plan";
@@ -328,6 +329,176 @@ export function addGeneratorLayer(
   const name = gen.type === "text" ? "Text" : "Solid";
   const transform = alignToPixels(defaultTransform(), media.width!, media.height!, p.timeline.width, p.timeline.height);
   return insertLayer(p, name, media, transform, opts?.above);
+}
+
+/* ------------------------------------------------------------------ */
+/* Text layers                                                         */
+/* ------------------------------------------------------------------ */
+
+type TextGen = Extract<Generator, { type: "text" }>;
+
+/** The most UTF-16 units a text layer holds: the PDF text box's cap, and the
+ *  number `image_rules.rs` refuses a save beyond. */
+export const TEXT_MAX_CHARS = 20_000;
+/** A text layer's font size, in source px. The same range on load, on save
+ *  (`image_rules.rs`) and in the inspector. */
+export const TEXT_SIZE_MIN = 1;
+export const TEXT_SIZE_MAX = 2048;
+/** What a size that is not a number reads as on load. */
+export const TEXT_SIZE_FALLBACK = 48;
+/** A text line's height in font sizes (measureText, the renderer). */
+const TEXT_LINE = 1.25;
+
+/** `v` as a size inside [TEXT_SIZE_MIN, TEXT_SIZE_MAX]; not a number →
+ *  TEXT_SIZE_FALLBACK. Not rounded: a stored fractional size is drawn as it
+ *  always was. */
+export function clampTextSize(v: unknown): number {
+  if (typeof v !== "number" || !Number.isFinite(v)) return TEXT_SIZE_FALLBACK;
+  return Math.min(Math.max(v, TEXT_SIZE_MIN), TEXT_SIZE_MAX);
+}
+
+/** `s` cut to at most `max` UTF-16 units, never leaving half a surrogate
+ *  pair at the end. */
+export function cutText(s: string, max = TEXT_MAX_CHARS): string {
+  if (s.length <= max) return s;
+  let out = s.slice(0, max);
+  const last = out.charCodeAt(out.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) out = out.slice(0, -1);
+  return out;
+}
+
+const HEX6 = /^#[0-9a-fA-F]{6}$/;
+
+/**
+ * A text generator as the image editor (and the save check) can take it:
+ * the text a string with `\n` line ends and no tabs, at most TEXT_MAX_CHARS;
+ * `fontFamily` one of the six (else the default); an ill-shaped `fontId`
+ * dropped (the legacy font is then in force); `sizePx` inside the size range;
+ * `color` a `#rrggbb` (a colour `normalizeHexColor` reads is spelled that
+ * way, anything else is black); `bold` / `italic` real booleans.
+ *
+ * The SAME reference when nothing needed fixing, so a valid project is not
+ * touched: a box is never re-measured here. `shortened` says the text was
+ * cut, which is the one repair a user could miss.
+ */
+export function cleanTextGen(g: TextGen): { gen: TextGen; shortened: boolean } {
+  const raw = g as unknown as Record<string, unknown>;
+  const rawText = typeof raw.text === "string" ? raw.text : "";
+  const flat = rawText.includes("\r") || rawText.includes("\t")
+    ? rawText.replace(/\r\n?/g, "\n").replace(/\t/g, " ")
+    : rawText;
+  const text = cutText(flat);
+  const shortened = text.length < flat.length;
+  const fontFamily = isLegacyFont(raw.fontFamily) ? raw.fontFamily : DEFAULT_FONT;
+  const badId = "fontId" in raw && !isFontId(raw.fontId);
+  const sizePx = clampTextSize(raw.sizePx);
+  const color =
+    typeof raw.color === "string" && HEX6.test(raw.color) ? raw.color : normalizeHexColor(raw.color, "#000000");
+  const bold = raw.bold === true;
+  const italic = raw.italic === true;
+  // Style runs (0.9.5) count UTF-16 offsets of the stored text: a tab turned
+  // into a space keeps them; line ends rewritten from "\r\n" do not, so the
+  // runs go; a cut text keeps the runs that still fit, clipped to it.
+  let runs = raw.runs as TextGen["runs"] | undefined;
+  if ("runs" in raw) {
+    if (!Array.isArray(runs) || rawText.includes("\r")) runs = undefined;
+    else if (text.length < rawText.length) {
+      const n = text.length;
+      runs = runs.filter((r) => r.s < n).map((r) => (r.e > n ? { ...r, e: n } : r));
+    }
+  }
+  if (
+    text === raw.text &&
+    fontFamily === raw.fontFamily &&
+    !badId &&
+    sizePx === raw.sizePx &&
+    color === raw.color &&
+    bold === raw.bold &&
+    italic === raw.italic &&
+    runs === raw.runs
+  ) {
+    return { gen: g, shortened: false };
+  }
+  const out: TextGen = { ...g, text, fontFamily, sizePx, color, bold, italic };
+  if (badId) delete out.fontId;
+  if (runs && runs.length > 0) out.runs = runs;
+  else delete out.runs;
+  return { gen: out, shortened };
+}
+
+/**
+ * Give text layer `trackId` the generator `gen` and its measured box `w`×`h`,
+ * keeping the box's layer-local top-left where it is on the canvas: typed
+ * text grows right and down, a bigger font grows from the same corner. The
+ * linear part of the layer's matrix does not depend on the box, so the move
+ * is exact (a whole pixel for the even boxes measureText gives at scale 1).
+ * Not a text layer, or nothing changed → same reference.
+ */
+export function setTextGen(p: ProjectFile, trackId: string, gen: TextGen, w: number, h: number): ProjectFile {
+  const l = findLayer(p, trackId);
+  if (!l || l.kind !== "text") return p;
+  const W = p.timeline.width;
+  const H = p.timeline.height;
+  const ow = side(l.media.width, W);
+  const oh = side(l.media.height, H);
+  const nw = side(w, ow);
+  const nh = side(h, oh);
+  if (l.media.generator === gen && ow === l.media.width && oh === l.media.height && nw === ow && nh === oh) return p;
+  const before = layerToCanvas(l.transform, ow, oh, W, H);
+  const after = layerToCanvas(l.transform, nw, nh, W, H);
+  const dx = before[4] - after[4];
+  const dy = before[5] - after[5];
+  const old = l.media.generator as TextGen;
+  const media: MediaRef = {
+    ...l.media,
+    width: nw,
+    height: nh,
+    generator: gen,
+    path: old.text === gen.text ? l.media.path : textLabel(gen.text),
+  };
+  let next = withMedia(p, new Map([[media.id, media]]));
+  if (dx !== 0 || dy !== 0) {
+    next = withClip(next, l, { ...l.clip, transform: { ...l.transform, x: l.transform.x + dx, y: l.transform.y + dy } });
+  }
+  return next;
+}
+
+/**
+ * A new text layer (the Text tool's click): its box `w`×`h` placed with its
+ * left edge at `at.x` and its FIRST line vertically centred on `at.y` (canvas
+ * px), on whole pixels; centred on the canvas when `at` is null. At scale 1,
+ * upright, directly above `above` (the top when null), named "Text".
+ */
+export function addTextLayer(
+  p: ProjectFile,
+  gen: TextGen,
+  w: number,
+  h: number,
+  at: { x: number; y: number } | null,
+  opts?: { above?: string | null },
+): { project: ProjectFile; trackId: string } {
+  const W = p.timeline.width;
+  const H = p.timeline.height;
+  const bw = side(w, 2);
+  const bh = side(h, 2);
+  const media: MediaRef = {
+    id: uid(),
+    path: textLabel(gen.text),
+    size: 0,
+    mtimeMs: 0,
+    kind: "image",
+    duration: 0,
+    hasAudio: false,
+    width: bw,
+    height: bh,
+    generator: gen,
+  };
+  let t = defaultTransform();
+  if (at && Number.isFinite(at.x) && Number.isFinite(at.y)) {
+    const line = clampTextSize(gen.sizePx) * TEXT_LINE;
+    t = { ...t, x: at.x + bw / 2 - W / 2, y: at.y - line / 2 + bh / 2 - H / 2 };
+  }
+  return insertLayer(p, "Text", media, alignToPixels(t, bw, bh, W, H), opts?.above);
 }
 
 /** Removes the layer's clip AND its MediaRef; drops the track unless it is
@@ -721,6 +892,16 @@ export interface ImageValidation {
   project: ProjectFile;
   droppedStrokes: number;
   notes: string[];
+  /** Text layers whose text was over TEXT_MAX_CHARS and was cut. Optional so
+   *  a hand-built result still reads as "none". */
+  shortenedTexts?: number;
+}
+
+/** What the editor says when a text layer was cut on open. */
+export function shortenedTextNote(n: number): string {
+  return n === 1
+    ? "Shortened a text layer over the length limit."
+    : `Shortened ${n} text layers over the length limit.`;
 }
 
 const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
@@ -955,6 +1136,7 @@ function cleanImageMeta(raw: unknown): ImageMeta {
 export function validateImageProject(p: ProjectFile): ImageValidation {
   const notes: string[] = [];
   let droppedStrokes = 0;
+  let shortenedTexts = 0;
   let changed = false;
 
   const tl = p.timeline;
@@ -1019,11 +1201,14 @@ export function validateImageProject(p: ProjectFile): ImageValidation {
             res.chunks === g.chunks
               ? boxed
               : { ...boxed, generator: { type: "drawing", chunks: res.chunks } };
-        } else if (g.type === "text" && "fontId" in g && !isFontId(g.fontId)) {
-          // A crafted or damaged font id: dropped, so the legacy `fontFamily`
-          // (checked as before) is the font in force. A silent repair, no note.
-          const { fontId: _bad, ...clean } = g;
-          media = { ...boxed, generator: clean };
+        } else if (g.type === "text") {
+          // The text rules (cleanTextGen): a crafted or damaged font id is
+          // dropped, so the legacy `fontFamily` is the font in force; a text
+          // over the length cap is cut (the one repair worth telling); the
+          // rest are silent repairs. A clean text keeps its reference.
+          const res = cleanTextGen(g);
+          if (res.shortened) shortenedTexts++;
+          media = res.gen === g ? boxed : { ...boxed, generator: res.gen };
         } else {
           media = boxed;
         }
@@ -1108,10 +1293,14 @@ export function validateImageProject(p: ProjectFile): ImageValidation {
     notes.push(`Skipped ${plural(overBudget, "stroke", "strokes")} over the drawing size limit.`);
   }
 
-  if (!changed) return { project: p, droppedStrokes, notes };
+  // Only when something was cut: a result for a project without long text
+  // keeps exactly the shape it always had.
+  const extra = shortenedTexts > 0 ? { shortenedTexts } : {};
+  if (!changed) return { project: p, droppedStrokes, notes, ...extra };
   return {
     project: { ...p, media, image, timeline: { ...tl, width, height, tracks } },
     droppedStrokes,
     notes,
+    ...extra,
   };
 }

@@ -610,7 +610,7 @@ export function mountInk(ctx: ImageEditorCtx): { dispose(): void } {
     if (!palm.mayDraw(e.pointerType, t)) return;
     const s = ctx.tools.get();
     const tool: ToolId = penEraser ? "eraser" : s.tool;
-    if (tool === "select" || !INK_TOOLS.has(tool)) return;
+    if (tool === "select" || tool === "text" || !INK_TOOLS.has(tool)) return;
 
     const v = view();
     const base: GestureBase = {

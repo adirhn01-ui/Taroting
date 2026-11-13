@@ -35,7 +35,7 @@ import { icon } from "../ui/icons";
 import { closeMenu } from "../ui/menu";
 import { createTempExits, createTempLeaveGate } from "../ui/temp-project";
 import { toast } from "../ui/toast";
-import type { ImageEditorCtx } from "./context";
+import type { ImageEditorCtx, TextEditHandle } from "./context";
 import { copyImage } from "./copy";
 import { cancelImageCrop } from "./crop-image";
 import { openImageExportDialog } from "./export-dialog";
@@ -50,6 +50,7 @@ import {
   layersOf,
   nextSelectionAfterRemove,
   removeLayer,
+  shortenedTextNote,
   validateImageProject,
 } from "./layers";
 import { mountLayersPanel } from "./layers-panel";
@@ -65,6 +66,7 @@ import { saveBlob } from "./save";
 import { mountSelectTool } from "./select-tool";
 import { SIZE_MAX, SIZE_MIN, createToolStore } from "./tool-state";
 import type { ToolId, ToolState } from "./tool-state";
+import { mountTextTool } from "./text/text-tool";
 import { mountToolbar } from "./toolbar";
 import { createViewController, zoomStep } from "./view";
 
@@ -424,6 +426,7 @@ function mount(
   const tools = createToolStore();
   const selection = new Store<string | null>(layersOf(session.project)[0]?.trackId ?? null);
   const mode = new Store<"idle" | "crop-image" | "crop-layer">("idle");
+  const textEdit = new Store<TextEditHandle | null>(null);
   const res = new PreviewResources(() => session.project);
   undo.push(() => res.dispose());
   // Hold to pan still works inside either crop: both hold the keyboard for
@@ -505,6 +508,10 @@ function mount(
     holdAutosave: () => session.holdAutosave(),
     mode,
     registerOverlay,
+    textEdit,
+    // Looked up at call time: the text tool mounts with the other children.
+    beginText: (at) => textTool.begin(at),
+    editText: (trackId) => textTool.edit(trackId),
   };
 
   /* ---------------- subscriptions ---------------- */
@@ -1018,9 +1025,15 @@ function mount(
     cropLayer: (trackId) => selectTool.cropLayer(trackId),
   });
   mountChild(inspector);
-  const selectTool = mountSelectTool(ctx);
+  const selectTool = mountSelectTool(ctx, {
+    editText: (trackId, at) => textTool.edit(trackId, at),
+  });
   mountChild(selectTool);
   mountChild(mountInk(ctx));
+  // Last, so it is torn down FIRST: an open text lands before anything else
+  // goes, and before the session's final save.
+  const textTool = mountTextTool(ctx, textEdit);
+  mountChild(textTool);
 
   // The window close never reaches dispose() either, and its save writes the
   // live store: an unapplied layer crop or a colour being previewed would be
@@ -1030,6 +1043,9 @@ function mount(
   undo.push(
     registerBeforeClose(() => {
       if (disposed) return;
+      // A text being typed is a finished edit: it lands (an empty new one is
+      // taken back) before the close flow reads the save state.
+      textTool.commit();
       selectTool.revertCrop();
       cancelImageCrop();
       inspector.dropPreview();
@@ -1093,6 +1109,7 @@ function mount(
   bind("imgMarker", () => setTool("marker"));
   bind("imgEraser", () => setTool("eraser"));
   bind("imgShape", () => setTool("shape"));
+  bind("imgText", () => setTool("text"));
   bind("imgRuler", toggleRuler);
   bind("imgSizeDown", () => nudgeSize(-1));
   bind("imgSizeUp", () => nudgeSize(1));
@@ -1236,6 +1253,7 @@ function mount(
   if (checked.droppedStrokes > 0 || checked.notes.length > 0) {
     toast.info("Some damaged drawing data in this project was skipped.");
   }
+  if ((checked.shortenedTexts ?? 0) > 0) toast.info(shortenedTextNote(checked.shortenedTexts!));
   if (loaded.missing.length > 0) {
     // Parked on document.body: registered so dispose closes it, or it would
     // outlive this editor and relink into a project nobody saves.
@@ -1267,6 +1285,7 @@ function mount(
       canvas,
       mode,
       ctx,
+      text: textTool,
       renderNow,
       layers: () => layersOf(session.project),
     };

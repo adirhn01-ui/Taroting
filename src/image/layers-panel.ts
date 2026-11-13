@@ -549,7 +549,22 @@ export function mountLayersPanel(host: HTMLElement, ctx: ImageEditorCtx): { disp
         },
       },
       { label: KIND_LABEL.photo, onSelect: () => void addImage() },
-      { label: "Text", onSelect: () => openGenerator("text") },
+      {
+        label: "Text",
+        // Typed on the canvas: the Text tool takes over and a new text opens
+        // in the middle of what the stage shows. The dialog stays the way in
+        // only for a shell without the text tool.
+        onSelect: () => {
+          if (!ctx.beginText) {
+            openGenerator("text");
+            return;
+          }
+          // Refused (a crop, a dialog): the tool in hand stays what it was.
+          const prevTool = ctx.tools.get().tool;
+          ctx.tools.update((s) => (s.tool === "text" ? s : { ...s, tool: "text" }));
+          if (!ctx.beginText(null)) ctx.tools.update((s) => (s.tool === prevTool ? s : { ...s, tool: prevTool }));
+        },
+      },
       { label: "Solid color", onSelect: () => openGenerator("solid") },
     ];
     showMenu(r.left, r.bottom + 4, items);

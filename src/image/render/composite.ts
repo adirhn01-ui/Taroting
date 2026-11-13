@@ -17,6 +17,15 @@
 
 import { fontString } from "../../editor/media/generators";
 import { fontRequestOf } from "../../core/font-id";
+import { activeRuns, genFontRequests } from "../../core/gen-text-runs";
+import {
+  forgetTextMetrics,
+  layoutStyledText,
+  paintStyledText,
+  plainDelta,
+  textMeasurer,
+  type StyledLayout,
+} from "../../editor/media/styled-text";
 import { normalizeHexColor } from "../../core/session";
 import type { ClipTransform, FontRequest, Generator, ProjectFile, Stroke } from "../../core/types";
 import { fontsReady } from "../../fonts";
@@ -239,6 +248,16 @@ export function textFontRequests(layers: readonly Layer[], seen?: Set<string>): 
   for (let i = 0; i < layers.length; i++) {
     const g = layers[i]!.media.generator;
     if (g?.type !== "text") continue;
+    if (activeRuns(g)) {
+      for (const r of genFontRequests(g)) {
+        const key = `${r.bold ? 1 : 0}${r.italic ? 1 : 0}${r.id}`;
+        seen ??= new Set();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        (out ??= []).push(r);
+      }
+      continue;
+    }
     const req = fontRequestOf(g.fontFamily, g.fontId, g.bold, g.italic);
     if (req === null) continue;
     const key = `${req.bold ? 1 : 0}${req.italic ? 1 : 0}${req.id}`;
@@ -255,6 +274,34 @@ export function textFontRequests(layers: readonly Layer[], seen?: Set<string>): 
  *  now name the wrong face. The image editor calls it from `onFontsChanged`. */
 export function invalidateTextLooks(): void {
   textLooks = new WeakMap();
+  styledLooks = new WeakMap();
+  forgetTextMetrics();
+}
+
+/** A styled text's layout, cached on the (immutable) generator like
+ *  `TextLook`: rebuilt once a font still loading turns ready. */
+interface StyledLook {
+  layout: StyledLayout;
+  delta: number;
+  pending: FontRequest[] | null;
+}
+let styledLooks = new WeakMap<object, StyledLook>();
+
+function styledLook(g: Extract<Generator, { type: "text" }>): StyledLook {
+  let t = styledLooks.get(g);
+  if (t && t.pending !== null && fontsReady(t.pending)) {
+    // the font arrived: the metrics measured with its fallback are stale
+    forgetTextMetrics();
+    t = undefined;
+  }
+  if (!t) {
+    const reqs = genFontRequests(g);
+    const pending = reqs.length > 0 && !fontsReady(reqs) ? reqs : null;
+    const m = textMeasurer();
+    t = { layout: layoutStyledText(g, m), delta: plainDelta(g, m), pending };
+    styledLooks.set(g, t);
+  }
+  return t;
 }
 
 function textLook(g: Extract<Generator, { type: "text" }>): TextLook {
@@ -385,6 +432,10 @@ export function drawLayer(
     return;
   }
   if (g.type === "text") {
+    if (activeRuns(g)) {
+      drawStyled(ctx, view, l, box, m, alpha, styledLook(g));
+      return;
+    }
     const look = textLook(g);
     if (look.color === "") return;
     ctx.save();
@@ -398,6 +449,17 @@ export function drawLayer(
     for (let i = 0; i < look.lines.length; i++) ctx.fillText(look.lines[i]!, 0, (i + 0.5) * look.step);
     ctx.restore();
   }
+}
+
+/** A text with styled parts: the shared layout (styled-text.ts), its
+ *  base-style rows exactly where the plain path draws them (`delta`). */
+function drawStyled(ctx: Ctx2D, view: ViewXf, l: Layer, box: { w: number; h: number }, m: Affine, alpha: number, look: StyledLook): void {
+  ctx.save();
+  applyLayerTransform(ctx, view, m);
+  clipToCrop(ctx, l.transform, box);
+  ctx.globalAlpha = alpha;
+  paintStyledText(ctx, look.layout, look.delta);
+  ctx.restore();
 }
 
 function drawDrawingLayer(

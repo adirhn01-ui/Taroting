@@ -2555,17 +2555,27 @@ const ADDED_IN_093 = ["pdfHighlight", "pdfText", "pdfWhiteout", "pdfFillForms", 
 /** The PDF editor's and the image editor's two panel toggles, new in 0.9.4. */
 const ADDED_IN_094 = ["pdfPages", "pdfProperties", "imageLayers", "imageProperties"] as const;
 
+/** The image editor's Text tool, new in 0.9.5. */
+const ADDED_IN_095 = ["imgText"] as const;
+
 /** A shortcut map exactly as a 0.8.1 settings.json stores it. */
 function shortcuts081(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const m: Record<string, unknown> = { ...DEFAULT_SHORTCUTS };
-  for (const a of [...ADDED_IN_090, ...ADDED_IN_093, ...ADDED_IN_094]) delete m[a];
+  for (const a of [...ADDED_IN_090, ...ADDED_IN_093, ...ADDED_IN_094, ...ADDED_IN_095]) delete m[a];
   return { ...m, ...overrides };
 }
 
 /** A shortcut map exactly as a 0.9.3 settings.json stores it. */
 function shortcuts093(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const m: Record<string, unknown> = { ...DEFAULT_SHORTCUTS };
-  for (const a of ADDED_IN_094) delete m[a];
+  for (const a of [...ADDED_IN_094, ...ADDED_IN_095]) delete m[a];
+  return { ...m, ...overrides };
+}
+
+/** A shortcut map exactly as a 0.9.4 settings.json stores it. */
+function shortcuts094(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const m: Record<string, unknown> = { ...DEFAULT_SHORTCUTS };
+  for (const a of ADDED_IN_095) delete m[a];
   return { ...m, ...overrides };
 }
 
@@ -2642,7 +2652,7 @@ describe("sanitizeShortcuts", () => {
   });
 
   it("0.9.4's panel toggles: F4 / Shift+F4 from a 0.9.3 map, unless a PDF-screen action of the user's holds the chord", () => {
-    expect(Object.keys(shortcuts093())).toHaveLength(Object.keys(DEFAULT_SHORTCUTS).length - 4);
+    expect(Object.keys(shortcuts093())).toHaveLength(Object.keys(DEFAULT_SHORTCUTS).length - 5);
     const fresh = sanitizeShortcuts(shortcuts093());
     expect(fresh.pdfPages).toBe("F4");
     expect(fresh.pdfProperties).toBe("Shift+F4");
@@ -2708,6 +2718,24 @@ describe("sanitizeShortcuts", () => {
       { chord: "F4", mode: "image", actions: ["imgRuler", "imageLayers"] },
       { chord: "F4", mode: "pdf", actions: ["imgRuler", "pdfPages"] },
     ]);
+  });
+
+  it("0.9.5's image Text tool: T from a 0.9.4 map, unless an image-screen action of the user's holds it", () => {
+    expect(Object.keys(shortcuts094())).toHaveLength(Object.keys(DEFAULT_SHORTCUTS).length - 1);
+    expect(ACTION_MODES.imgText).toEqual(["image"]);
+    const fresh = sanitizeShortcuts(shortcuts094());
+    expect(fresh.imgText).toBe("T");
+    // The PDF editor's Text box keeps the same T on its own screen: no clash.
+    expect(fresh.pdfText).toBe("T");
+    expect(findConflicts(fresh)).toEqual([]);
+    // imgPen lives on the image screen: the user's chord stays theirs and the
+    // Text tool waits, unbound. Different case, one chord.
+    const taken = sanitizeShortcuts(shortcuts094({ imgPen: "t" }));
+    expect(taken.imgPen).toBe("t");
+    expect(taken.imgText).toBe("");
+    // A user's own T on a PDF-only action does not reach the image screen.
+    const pdfOnly = sanitizeShortcuts(shortcuts094({ pdfHighlight: "T", pdfText: "X" }));
+    expect(pdfOnly.imgText).toBe("T");
   });
 
   it("is what sanitizeSettings reads the stored map through", () => {
