@@ -79,6 +79,18 @@ export interface RasterTextRun {
   color: string;
 }
 
+/** One text style at one size, as `fontBox` measures it: the style's font
+ *  (`fontId` absent = the legacy font) and its own bold / italic, NOT the
+ *  face it resolved, exactly as the editor styles a piece on screen. */
+export interface FontBoxSpec {
+  font: FontFamily;
+  fontId?: FontId;
+  bold: boolean;
+  italic: boolean;
+  /** points */
+  size: number;
+}
+
 export interface ExportDeps {
   pdfjs(): Promise<PdfjsLike>;
   /** extra getDocument options (worker-side font data, CSP-safe flags) */
@@ -98,6 +110,11 @@ export interface ExportDeps {
   decodeImage(bytes: Uint8Array, mime: string): Promise<Uint8Array>;
   /** PNG of a text box drawn by the browser (Arabic fallback) */
   rasterizeText(spec: RasterTextSpec): Promise<Uint8Array>;
+  /** The font box (ascent and descent in points, both positive) a row of a
+   *  text box with style runs is laid out with: what the editor reads for the
+   *  same style on screen (canvas fontBoundingBoxAscent / Descent of the same
+   *  CSS font). Absent or null: `fontBoxOf` on the face's file (node tests). */
+  fontBox?(spec: FontBoxSpec): Promise<{ asc: number; desc: number } | null>;
   now(): Date;
 }
 
@@ -178,6 +195,48 @@ export async function rasterAliases(spec: RasterTextSpec): Promise<{ base?: stri
   return { base: alias(spec), runs: (spec.runs ?? []).map(alias) };
 }
 
+let boxCtx: CanvasRenderingContext2D | null = null;
+
+/** `ExportDeps.fontBox` in the app: the CSS font the editor gives a piece
+ *  (src/pdf/editor/marks/render.ts screenCssFont: the runtime's alias with
+ *  the legacy font after it and the face it resolved, or the legacy font
+ *  quoted, Impact always plain), measured the way it reads a row's metrics
+ *  (`measureText("x")`'s font box). The font runtime is reached only for a
+ *  style with a `fontId`. */
+export async function canvasFontBox(spec: FontBoxSpec): Promise<{ asc: number; desc: number } | null> {
+  let family = `"${spec.font}"`;
+  let bold = spec.bold;
+  let italic = spec.italic;
+  let alias = false;
+  if (spec.fontId !== undefined) {
+    const fonts = await import("../../fonts");
+    const req: FontRequest = { id: spec.fontId, bold: spec.bold, italic: spec.italic };
+    if (!fonts.fontsReady([req])) await fonts.ensureFonts([req]).catch(() => {});
+    const f = fonts.fontFace(spec.font, spec.fontId, spec.bold, spec.italic);
+    if (!f.missing) {
+      family = `${f.family}, "${spec.font}"`;
+      bold = f.bold;
+      italic = f.italic;
+      alias = true;
+    }
+  }
+  // a regular-only font (Impact) is shown plain whatever the toggles say
+  if (!alias && spec.font === "Impact") bold = italic = false;
+  if (!boxCtx) {
+    const c = document.createElement("canvas");
+    c.width = 0;
+    c.height = 0;
+    boxCtx = c.getContext("2d");
+  }
+  if (!boxCtx) return null;
+  const font = `${italic ? "italic " : ""}${bold ? "bold " : ""}${spec.size}px ${family}`;
+  if (boxCtx.font !== font) boxCtx.font = font;
+  const m = boxCtx.measureText("x");
+  const asc = m.fontBoundingBoxAscent;
+  const desc = m.fontBoundingBoxDescent;
+  return Number.isFinite(asc) && Number.isFinite(desc) ? { asc, desc } : null;
+}
+
 /** The desktop app's dependencies. Imported lazily with the export chunk;
  *  core/ipc is on the boot path already, so it is imported statically. */
 export async function appDeps(): Promise<ExportDeps> {
@@ -210,6 +269,7 @@ export async function appDeps(): Promise<ExportDeps> {
       }
       return layoutCanvasLines(spec, canvasToPng, spec.fontId === undefined ? undefined : await rasterAlias(spec));
     },
+    fontBox: canvasFontBox,
     now: () => new Date(),
   };
 }

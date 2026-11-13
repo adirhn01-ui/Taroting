@@ -469,3 +469,37 @@ export function rowMetrics(pieces: readonly RowPiece[], strut: RowPiece): { heig
   const whole = parts.find((x) => x.A === maxA && x.D === maxD);
   return { height: whole ? whole.lh : maxA + maxD, baseline: maxA };
 }
+
+/** A face's vertical metrics as its font file states them, in font units
+ *  (descents positive, downwards), for `fontBoxOf`. */
+export interface FontBoxTables {
+  unitsPerEm: number;
+  winAscent: number;
+  winDescent: number;
+  typoAscender: number;
+  typoDescender: number;
+  /** OS/2 fsSelection bit 7 (USE_TYPO_METRICS) */
+  useTypoMetrics: boolean;
+}
+
+/**
+ * The font box of a face at `size` points (ascent and descent, both positive):
+ * the ONE input `rowMetrics` takes for a piece, on screen and in the export.
+ * The screen reads it from the browser (canvas fontBoundingBoxAscent /
+ * Descent of the CSS font a piece is drawn in) and the export asks the same
+ * question of the same browser; this is the rule that answer follows on
+ * Windows, used where no browser is at hand: DirectWrite's ascent / descent
+ * (the OS/2 typo metrics when USE_TYPO_METRICS is set, else winAscent /
+ * winDescent), each rounded to a whole px at `size` (px = points here), except
+ * for a tiny face (ascent under 3 or ascent + descent under 2), which keeps
+ * the fraction. NOT hhea: Calibri's hhea ascent is 0.75 em, its box 0.95 em.
+ */
+export function fontBoxOf(t: FontBoxTables, size: number): { asc: number; desc: number } {
+  const upm = t.unitsPerEm > 0 ? t.unitsPerEm : 1000;
+  const a = ((t.useTypoMetrics ? t.typoAscender : t.winAscent) / upm) * size;
+  const d = ((t.useTypoMetrics ? -t.typoDescender : t.winDescent) / upm) * size;
+  const asc = Number.isFinite(a) ? a : 0.8 * size;
+  const desc = Number.isFinite(d) ? d : 0.2 * size;
+  if (asc < 3 || asc + desc < 2) return { asc, desc };
+  return { asc: Math.floor(asc + 0.5), desc: Math.floor(desc + 0.5) };
+}

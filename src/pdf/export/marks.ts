@@ -44,9 +44,10 @@ import { fontDisplayName, fontRequestOf } from "../../core/font-id";
 import { decodePoints } from "../../image/strokes";
 import { outlinePolygon, penHalfWidth, pencilHalfWidth, type HalfWidth } from "../../image/ink/outline";
 import { arrowWings } from "../../image/ink/shapes";
-import { normalizeRuns, rowMetrics, segmentsOf, type PdfResolvedStyle, type RowPiece } from "../../core/pdf-runs";
-import { hasArabic, paragraphBidi, visualGroups, visualLine } from "./bidi";
+import { fontBoxOf, normalizeRuns, rowMetrics, segmentsOf, type PdfResolvedStyle, type RowPiece } from "../../core/pdf-runs";
+import { drawnText, hasArabic, logicalMirrored, paragraphBidi, visualGroups, visualLine, type VisualGroup } from "./bidi";
 import type { ExportDeps, RasterTextRun } from "./deps";
+import { canShape, encodeGlyphs, fkFontOf, fontBoxTables, rtlToUnicodeOrder, runWidth, shapeRtlIn, shapedWidth, type FkFont, type FkRun } from "./shape";
 import { PdfExportError, baseName, own } from "./errors";
 import { displayedOf, prepareImage, type Orientation } from "./images";
 import { LINE_HEIGHT, rangeMeasurer, rasterScale, wrapRanges, type MeasurePiece } from "./layout";
@@ -144,9 +145,9 @@ export function frameOf(a: { x: number; y: number; w: number; h: number; r?: unk
 }
 
 /** A page picture's (`bg`, 0.9.5) missing file, said the way that works for
- *  it: it cannot be selected, and the PDF editor has no picture relink — so
- *  the page is named as the user counts it (the project's own order, not the
- *  exported range's) with the two remedies there are. Any other error, or a
+ *  it: it cannot be selected, so the page is named as the user counts it (the
+ *  project's own order, not the exported range's) with the remedies there are
+ *  (the page menu's "Relink picture" among them). Any other error, or a
  *  mark no page holds, keeps the ordinary picture message. */
 function pagePictureError(e: unknown, markId: string, project: ProjectFile): unknown {
   if (!(e instanceof PdfExportError) || e.code !== "image-missing" || e.path === undefined) return e;
@@ -159,7 +160,7 @@ function pagePictureError(e: unknown, markId: string, project: ProjectFile): unk
   if (i < 0) return e;
   return new PdfExportError(
     "image-missing",
-    `Page ${i + 1}'s picture ${baseName(e.path)} is missing. Put the file back where it was, or delete the page.`,
+    `Page ${i + 1}'s picture ${baseName(e.path)} is missing. Relink it from the page's menu, put the file back where it was, or delete the page.`,
     e.path,
   );
 }
@@ -211,6 +212,14 @@ export interface MarkCtx {
   /** A resolved non-legacy face, embedded by its embedding policy ("full":
    *  subset; "noSubset": whole; "none": refused, naming the font). */
   fontFile(r: ResolvedFont): Promise<EmbeddedFont>;
+  /** A face's file read by fontkit, WITHOUT embedding it (shaping and the
+   *  font box), whatever its licence (nothing of it reaches the PDF from
+   *  here); a file that cannot be read fails as for `font` / `fontFile`. */
+  fontkitOf(f: Face): Promise<FkFont>;
+  /** A style's font box at its size (`fontBoxOf`): the browser's answer when
+   *  the dependencies can ask it (`deps.fontBox`), else the rule applied to
+   *  the face's file. */
+  fontBox(st: PdfResolvedStyle, f: Face): Promise<RowPiece>;
   image(mediaId: string): Promise<{ img: PDFImage; orientation: Orientation }>;
 }
 
@@ -511,8 +520,13 @@ async function textAppearance(
     BS: { W: 0 },
   };
 
-  if (hasArabic(text)) {
-    // No shaping here: the browser draws it (see raster.ts).
+  // Arabic (0.9.5): shaped and drawn as real text when every piece's font
+  // can draw every character of it (null: some cannot).
+  const arabic = hasArabic(text);
+  const shapers = arabic ? await shapingFaces(text, segs, segFaces, cx) : null;
+  if (arabic && shapers === null) {
+    // A character the font has no glyph for: the browser draws the box,
+    // with its own font fallback (see raster.ts).
     const png = await cx.deps.rasterizeText({
       text,
       font: a.font,
@@ -556,18 +570,29 @@ async function textAppearance(
   // Faces embedded once each, named F0 (the box's own) .. Fn in first use.
   const baseEmb = await embedFace(base, cx);
   const names = new Map<EmbeddedFont, string>([[baseEmb, "F0"]]);
-  const pieces: { emb: EmbeddedFont; name: string; size: number; rg: string; row: RowPiece }[] = [];
+  // `fk`: the face's fontkit font in a box that is shaped (Arabic) only.
+  const pieces: { emb: EmbeddedFont; name: string; size: number; rg: string; row: RowPiece; fk?: FkFont }[] = [];
   for (let i = 0; i < segs.length; i++) {
     const emb = styled ? await embedFace(segFaces[i]!, cx) : baseEmb;
     let name = names.get(emb);
     if (name === undefined) names.set(emb, (name = `F${names.size}`));
     const sz = segs[i]!.style.size;
     const rg = styled ? rgbOps(hexRgb(segs[i]!.style.c), "rg") : rgbOps(c, "rg");
-    pieces.push({ emb, name, size: sz, rg, row: { size: sz, asc: emb.ascent * sz, desc: emb.descent * sz } });
+    // Rows of a box with runs (0.9.5): each piece's font box as the screen
+    // reads it (`fontBoxOf`), not the file's hhea ascent / descent, so every
+    // baseline lands where the editor shows it. A box without runs keeps its
+    // fixed pitch below (R1).
+    const row = styled ? await cx.fontBox(segs[i]!.style, segFaces[i]!) : { size: sz, asc: emb.ascent * sz, desc: emb.descent * sz };
+    pieces.push({ emb, name, size: sz, rg, row, ...(shapers ? { fk: shapers[i]! } : {}) });
   }
-  const asc = baseEmb.ascent * size;
-  const desc = baseEmb.descent * size;
-  const strut: RowPiece = { size, asc, desc };
+  // A shaped (Arabic) box without runs was a browser-drawn picture before
+  // 0.9.5, placed by the browser's font box as the editor places it: as
+  // real text it keeps that box (`fontBox`), not the file's hhea. Every
+  // other box without runs keeps hhea (R1).
+  const box0 = shapers && !styled ? await cx.fontBox(baseStyle, base) : null;
+  const asc = box0 ? box0.asc : baseEmb.ascent * size;
+  const desc = box0 ? box0.desc : baseEmb.descent * size;
+  const strut: RowPiece = styled ? await cx.fontBox(baseStyle, base) : { size, asc, desc };
   const segAt = (i: number): number => {
     let lo = 0;
     let hi = segs.length - 1;
@@ -586,6 +611,9 @@ async function textAppearance(
   let ps = 0;
   for (const para of text.split(/\r\n|\r|\n/)) {
     const bidi = paragraphBidi(para);
+    // an Arabic box: the paragraph as drawn (mirrored at right-to-left
+    // levels), the text a right-to-left group is shaped from in its word
+    const mir = shapers ? logicalMirrored(bidi, 0, para.length) : para;
     // the paragraph's pieces, offsets into the paragraph
     const local: (MeasurePiece & { seg: number })[] = [];
     if (para) for (let k = segAt(ps); k < segs.length && segs[k]!.s < ps + para.length; k++) {
@@ -593,7 +621,8 @@ async function textAppearance(
     }
     const measure = rangeMeasurer(local, (k, s, e) => {
       const p = pieces[local[k]!.seg]!;
-      return p.emb.font.widthOfTextAtSize(para.slice(s, e), p.size);
+      const t = para.slice(s, e);
+      return p.fk && hasArabic(t) ? shapedWidth(p.fk, mir, para, s, e, p.size) : p.emb.font.widthOfTextAtSize(t, p.size);
     });
     for (const [s, e] of wrapRanges(para, W, measure)) {
       let baseline: number;
@@ -606,26 +635,52 @@ async function textAppearance(
         const m = rowMetrics(on, strut);
         baseline = top + m.baseline;
         top += m.height;
-        if (baseline - Math.max(asc, ...on.map((p) => p.asc)) > H) break;
+        if (baseline - Math.max(strut.asc, ...on.map((p) => p.asc)) > H) break;
       }
-      let groups: { seg: number; text: string }[];
-      if (!styled) {
+      let groups: ({ seg: number; text: string } | VisualGroup)[];
+      if (shapers) {
+        // an Arabic box: groups with their logical ranges, so a right-to-
+        // left group can be shaped from its logical text
+        groups = visualGroups(bidi, s, e, styled ? (i) => segAt(ps + i) : () => 0);
+      } else if (!styled) {
         const visual = visualLine(bidi, s, e);
         groups = visual ? [{ seg: 0, text: visual }] : [];
       } else {
         groups = visualGroups(bidi, s, e, (i) => segAt(ps + i));
       }
       if (!groups.length) continue;
-      const widths = groups.map((g) => pieces[g.seg]!.emb.font.widthOfTextAtSize(g.text, pieces[g.seg]!.size));
+      // a right-to-left group with Arabic in it, shaped (visual order)
+      const shaped = groups.map((g): FkRun | null => {
+        const p = pieces[g.seg]!;
+        if (!p.fk || !("rtl" in g) || !g.rtl || !hasArabic(g.text)) return null;
+        return shapeRtlIn(p.fk, mir, para, g.s, g.e, s, e);
+      });
+      const widths = groups.map((g, i) => {
+        const p = pieces[g.seg]!;
+        const run = shaped[i];
+        return run ? runWidth(p.fk!, run, p.size) : p.emb.font.widthOfTextAtSize(g.text, p.size);
+      });
       let x = alignX(a.align, W, widths.reduce((t, w) => t + w, 0));
+      // A line with shaped Arabic in it is one marked-content span whose
+      // /ActualText is the line's logical text: a reader that honours it
+      // copies and searches that text instead of rebuilding it from the
+      // glyphs. ONE span per line, not per group: pdf.js (which ignores
+      // ActualText) ends a text item at every marked-content boundary, so a
+      // span per group would cut a line into items in visual order and its
+      // Find would no longer see the words whole.
+      const span = shaped.some((r) => r !== null);
+      if (span) parts.push(`/Span <</ActualText ${PDFHexString.fromText(para.slice(s, e)).toString()}>> BDC`);
       groups.forEach((g, i) => {
         const p = pieces[g.seg]!;
         const f = `/${p.name} ${num(p.size)} Tf`;
         if (f !== tf) parts.push((tf = f));
         if (p.rg !== rg) parts.push((rg = p.rg));
-        parts.push(`1 0 0 1 ${num(frame[0] + x)} ${num(frame[3] - baseline)} Tm ${encodeVisual(p.emb.font, g.text)} Tj`);
+        const run = shaped[i];
+        const show = run ? shapedShow(p.emb.font, p.fk!, run, p.size) : `${encodeVisual(p.emb.font, g.text)} Tj`;
+        parts.push(`1 0 0 1 ${num(frame[0] + x)} ${num(frame[3] - baseline)} Tm ${show}`);
         x += widths[i]!;
       });
+      if (span) parts.push("EMC");
     }
     ps += para.length + (text.startsWith("\r\n", ps + para.length) ? 2 : 1);
   }
@@ -639,7 +694,7 @@ async function textAppearance(
  *  with the face it resolved; a style without one (or whose font is missing
  *  here) takes the legacy path, exactly as 0.9.3: no fonts_resolve call at
  *  all without a fontId (I1). */
-interface Face {
+export interface Face {
   font: FontFamily;
   lib: ResolvedFont | null;
   bold: boolean;
@@ -658,6 +713,77 @@ async function faceOf(st: PdfResolvedStyle, cx: MarkCtx): Promise<Face> {
  *  same object. */
 function embedFace(f: Face, cx: MarkCtx): Promise<EmbeddedFont> {
   return f.lib ? cx.fontFile(f.lib) : cx.font(f.font, f.bold, f.italic);
+}
+
+/** An Arabic box's fontkit font per segment (by index), when every segment's
+ *  face can draw every character of it AS DRAWN (mirrored where a right-to-
+ *  left level mirrors it) and shaping yields no .notdef; null when one
+ *  cannot, and the box falls back to a picture, as every Arabic box did
+ *  before 0.9.5. Reads the font files, embeds nothing: a box that falls back
+ *  adds no font. The licence is NOT a reason to fall back: a font that may
+ *  not be embedded but could draw the box fails when it is embedded, exactly
+ *  as for any other text; one that could not draw it anyway, or whose file
+ *  cannot be read, leaves the box a picture as before. */
+async function shapingFaces(
+  text: string,
+  segs: readonly { s: number; e: number }[],
+  faces: readonly Face[],
+  cx: MarkCtx,
+): Promise<FkFont[] | null> {
+  const drawn = drawnText(text);
+  const out: FkFont[] = [];
+  for (let i = 0; i < segs.length; i++) {
+    let fk: FkFont;
+    try {
+      fk = await cx.fontkitOf(faces[i]!);
+    } catch (e) {
+      if (e instanceof PdfExportError) return null;
+      throw e;
+    }
+    if (!canShape(fk, drawn.slice(segs[i]!.s, segs[i]!.e))) return null;
+    out.push(fk);
+  }
+  return out;
+}
+
+/** The operators showing a shaped run from the current text position: one
+ *  `TJ` with each glyph's own advance (GPOS kerning, zero-width marks) as the
+ *  adjustment against the font's /W width, a mark's offset as a shift before
+ *  it and back after it, and its vertical offset as a text rise (`Ts`). */
+function shapedShow(font: PDFFont, fk: FkFont, run: FkRun, size: number): string {
+  const codes = encodeGlyphs(font, rtlToUnicodeOrder(run.glyphs));
+  const upm = fk.unitsPerEm > 0 ? fk.unitsPerEm : 1000;
+  const k = 1000 / upm;
+  const ops: string[] = [];
+  let arr: string[] = [];
+  let pend = 0;
+  let rise = 0;
+  const flushNum = (): void => {
+    if (Math.abs(pend) >= 0.0005) arr.push(num(pend));
+    pend = 0;
+  };
+  const flush = (): void => {
+    flushNum();
+    if (arr.length) ops.push(`[${arr.join(" ")}] TJ`);
+    arr = [];
+  };
+  run.glyphs.forEach((g, i) => {
+    const p = run.positions[i] ?? { xAdvance: g.advanceWidth, xOffset: 0, yOffset: 0 };
+    const r = (p.yOffset * size) / upm;
+    if (Math.abs(r - rise) >= 0.0005) {
+      flush();
+      ops.push(`${num(r)} Ts`);
+      rise = r;
+    }
+    // TJ numbers move LEFT by n/1000 em: an offset to the right is negative
+    pend -= p.xOffset * k;
+    flushNum();
+    arr.push(`<${codes[i]}>`);
+    pend += (p.xOffset + g.advanceWidth - p.xAdvance) * k;
+  });
+  flush();
+  if (rise !== 0) ops.push("0 Ts");
+  return ops.join(" ");
 }
 
 const hexOf = (c: [number, number, number]): string =>
@@ -804,6 +930,65 @@ export function markContext(doc: PDFDocument, project: ProjectFile, deps: Export
   const images = new Map<string, Promise<{ img: PDFImage; orientation: Orientation }>>();
   const style = (bold: boolean, italic: boolean): string =>
     bold && italic ? " (bold italic)" : bold ? " (bold)" : italic ? " (italic)" : "";
+  // A face's file, read once whether it is embedded, shaped or measured.
+  const legacyBytes = new Map<string, Promise<Uint8Array>>();
+  const libBytes = new Map<string, Promise<Uint8Array>>();
+  const fks = new Map<string, Promise<FkFont>>();
+  const boxes = new Map<string, Promise<RowPiece>>();
+  const bytesOfLegacy = (family: FontFamily, bold: boolean, italic: boolean): Promise<Uint8Array> => {
+    const key = `${family}|${bold}|${italic}`;
+    let p = legacyBytes.get(key);
+    if (!p) {
+      p = (async () => {
+        const bytes = await deps.fontBytes(family, bold, italic).catch(() => null);
+        if (!bytes) {
+          throw new PdfExportError(
+            "font-missing",
+            `The font ${family}${style(bold, italic)} is not installed on this PC, so a text box that uses it cannot be exported. Pick another font for it and export again.`,
+          );
+        }
+        return bytes;
+      })();
+      legacyBytes.set(key, p);
+    }
+    return p;
+  };
+  // a library file's bytes, read whatever its licence (`bytesOfLib` checks)
+  const fileOfLib = (r: ResolvedFont): Promise<Uint8Array> => {
+    let p = libBytes.get(r.path);
+    if (!p) {
+      p = (async () => {
+        const bytes = await deps.readBytes(r.path).catch(() => null);
+        if (!bytes) {
+          throw new PdfExportError(
+            "font-missing",
+            `The font ${fontDisplayName(r.requested)} couldn't be read, so a text box that uses it cannot be exported. Pick another font for it and export again.`,
+          );
+        }
+        return bytes;
+      })();
+      libBytes.set(r.path, p);
+    }
+    return p;
+  };
+  const bytesOfLib = async (r: ResolvedFont): Promise<Uint8Array> => {
+    if (r.embed === "none") {
+      throw new PdfExportError(
+        "font-restricted",
+        `The font ${fontDisplayName(r.requested)} can't go in a PDF because its license doesn't allow it, so pick another font for the text that uses it.`,
+      );
+    }
+    return fileOfLib(r);
+  };
+  const fkOf = (f: Face): Promise<FkFont> => {
+    const key = f.lib ? `lib|${f.lib.path}` : `${f.font}|${f.bold}|${f.italic}`;
+    let p = fks.get(key);
+    if (!p) {
+      p = (f.lib ? fileOfLib(f.lib) : bytesOfLegacy(f.font, f.bold, f.italic)).then(fkFontOf);
+      fks.set(key, p);
+    }
+    return p;
+  };
   return {
     doc,
     project,
@@ -812,17 +997,26 @@ export function markContext(doc: PDFDocument, project: ProjectFile, deps: Export
       const key = `${family}|${bold}|${italic}`;
       let p = fonts.get(key);
       if (!p) {
-        p = (async () => {
-          const bytes = await deps.fontBytes(family, bold, italic).catch(() => null);
-          if (!bytes) {
-            throw new PdfExportError(
-              "font-missing",
-              `The font ${family}${style(bold, italic)} is not installed on this PC, so a text box that uses it cannot be exported. Pick another font for it and export again.`,
-            );
-          }
-          return embedWithMetrics(doc, bytes);
-        })();
+        p = bytesOfLegacy(family, bold, italic).then((bytes) => embedWithMetrics(doc, bytes));
         fonts.set(key, p);
+      }
+      return p;
+    },
+    fontkitOf: fkOf,
+    fontBox(st, f) {
+      const key = `${st.font}|${st.fontId ?? ""}|${st.bold}|${st.italic}|${st.size}|${f.lib ? f.lib.path : ""}`;
+      let p = boxes.get(key);
+      if (!p) {
+        p = (async (): Promise<RowPiece> => {
+          const spec = { font: st.font, ...(st.fontId !== undefined ? { fontId: st.fontId } : {}), bold: st.bold, italic: st.italic, size: st.size };
+          const asked = deps.fontBox ? await deps.fontBox(spec).catch(() => null) : null;
+          if (asked && Number.isFinite(asked.asc) && Number.isFinite(asked.desc) && asked.asc >= 0 && asked.desc >= 0) {
+            return { size: st.size, asc: asked.asc, desc: asked.desc };
+          }
+          const fk = await fkOf(f);
+          return { size: st.size, ...fontBoxOf(fontBoxTables(fk), st.size) };
+        })();
+        boxes.set(key, p);
       }
       return p;
     },
@@ -846,23 +1040,7 @@ export function markContext(doc: PDFDocument, project: ProjectFile, deps: Export
       const key = `${r.path}|${r.embed}`;
       let p = files.get(key);
       if (!p) {
-        p = (async () => {
-          const name = fontDisplayName(r.requested);
-          if (r.embed === "none") {
-            throw new PdfExportError(
-              "font-restricted",
-              `The font ${name} can't go in a PDF because its license doesn't allow it, so pick another font for the text that uses it.`,
-            );
-          }
-          const bytes = await deps.readBytes(r.path).catch(() => null);
-          if (!bytes) {
-            throw new PdfExportError(
-              "font-missing",
-              `The font ${name} couldn't be read, so a text box that uses it cannot be exported. Pick another font for it and export again.`,
-            );
-          }
-          return embedWithMetrics(doc, bytes, r.embed !== "noSubset");
-        })();
+        p = bytesOfLib(r).then((bytes) => embedWithMetrics(doc, bytes, r.embed !== "noSubset"));
         files.set(key, p);
       }
       return p;

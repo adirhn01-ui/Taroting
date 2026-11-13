@@ -175,7 +175,7 @@ describe("a missing picture file", () => {
       const e = await failure(p, range);
       expect(e.code).toBe("image-missing");
       // the project's page number even when only page 3 is exported
-      expect(e.message).toBe("Page 3's picture scan-03.jpg is missing. Put the file back where it was, or delete the page.");
+      expect(e.message).toBe("Page 3's picture scan-03.jpg is missing. Relink it from the page's menu, put the file back where it was, or delete the page.");
       expect(e.path).toBe(gone.path);
     }
   });

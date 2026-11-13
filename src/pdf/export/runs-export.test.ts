@@ -8,7 +8,8 @@ import { existsSync, readFileSync } from "node:fs";
 import fontkit from "@pdf-lib/fontkit";
 import { PDFDict, PDFDocument, PDFName } from "pdf-lib";
 import { describe, expect, it } from "vitest";
-import { rowMetrics } from "../../core/pdf-runs";
+import { fontBoxOf, rowMetrics } from "../../core/pdf-runs";
+import { fkFontOf, fontBoxTables } from "./shape";
 import type { FontEmbed, FontRequest, PdfAnnot, PdfTextRun, ResolvedFont } from "../../core/types";
 import { paragraphBidi, visualGroups } from "./bidi";
 import { PdfExportError } from "./errors";
@@ -120,9 +121,12 @@ describe.skipIf(!hasFixture("plain_3p.pdf") || !hasFont("Georgia") || !hasFont("
     expect(sh.map((x) => x.font)).toEqual(["/F0 10 Tf", "/F0 30 Tf", "/F0 10 Tf"]);
     const [p0, p1, p2] = sh;
     expect(p0!.y).toBe(p1!.y);
-    const g = face(fontFile("Georgia", false, false));
-    const strut = { size: 10, asc: g.asc * 10, desc: g.desc * 10 };
-    const r1 = rowMetrics([strut, { size: 30, asc: g.asc * 30, desc: g.desc * 30 }], strut);
+    // rows by the font box the screen reads (fontBoxOf), not hhea: Georgia's
+    // 1878/449 per 2048 rounded at 10 px is 9/2, at 30 px 28/7
+    const t = fontBoxTables(fkFontOf(readFileSync(fontFile("Georgia", false, false))));
+    const strut = { size: 10, ...fontBoxOf(t, 10) };
+    expect(strut).toEqual({ size: 10, asc: 9, desc: 2 });
+    const r1 = rowMetrics([strut, { size: 30, ...fontBoxOf(t, 30) }], strut);
     const r2 = rowMetrics([strut], strut);
     const top = 792 - 90; // the frame's top, user space
     expect(p0!.y).toBeCloseTo(top - r1.baseline, 3);

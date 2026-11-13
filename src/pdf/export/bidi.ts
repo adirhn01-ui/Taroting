@@ -15,8 +15,8 @@ function lib(): Bidi {
 
 /** Characters that need contextual shaping (joining) to read correctly:
  *  Arabic, Arabic Supplement, Arabic Extended-A, and the presentation forms.
- *  Export does not shape; a text box containing any of these is drawn by the
- *  browser instead (see raster.ts). */
+ *  A text box containing any of these is shaped by fontkit (shape.ts) when
+ *  its fonts can draw every character, else drawn by the browser (raster.ts). */
 const ARABIC = /[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]/;
 
 export function hasArabic(s: string): boolean {
@@ -115,6 +115,32 @@ export function visualGroups(p: ParagraphBidi, start: number, end: number, segOf
       text: fixSurrogates(text),
     });
     k = j;
+  }
+  return out;
+}
+
+/** A whole box's text with each paragraph mirrored at its right-to-left
+ *  levels (`logicalMirrored`), line breaks kept: the characters as they are
+ *  DRAWN, in logical order, offset for offset (a mirrored character is one
+ *  code unit, as its pair). */
+export function drawnText(text: string): string {
+  let out = "";
+  // split with a capture group: the separators sit at the odd indices
+  text.split(/(\r\n|\r|\n)/).forEach((part, i) => {
+    out += i % 2 === 1 ? part : logicalMirrored(paragraphBidi(part), 0, part.length);
+  });
+  return out;
+}
+
+/** `p.text[start, end)` in LOGICAL order with every character at a right-to-
+ *  left (odd) level mirrored: the input of a shaper that reverses the run
+ *  itself (shape.ts), so brackets read as `visualGroups` draws them. */
+export function logicalMirrored(p: ParagraphBidi, start: number, end: number): string {
+  const lv = p.levels.levels;
+  let out = "";
+  for (let i = start; i < end; i++) {
+    const ch = p.text[i]!;
+    out += (lv[i]! & 1 ? lib().getMirroredCharacter(ch) : null) ?? ch;
   }
   return out;
 }

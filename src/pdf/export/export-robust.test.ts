@@ -214,7 +214,8 @@ describe.skipIf(!hasFixture("plain_3p.pdf") || !hasFont())("the Arabic fallback'
       w: 4000,
       h: 3000,
       text: "مرحبا",
-      font: "Arial",
+      // no Arabic in Georgia: the box takes the picture fallback
+      font: "Georgia",
       size: 20,
       c: "#000000",
       bold: false,

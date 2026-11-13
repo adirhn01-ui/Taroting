@@ -278,10 +278,11 @@ describe.skipIf(!hasFixture("plain_3p.pdf") || !hasFont())("text boxes", () => {
     expect(item.transform[4]).toBeCloseTo(100, 1);
   });
 
-  it("Arabic falls back to a picture drawn by the browser", async () => {
+  it("Arabic in a font with no Arabic glyphs falls back to a picture drawn by the browser", async () => {
     const plain = source("plain_3p.pdf");
     const page = pg(plain, 0);
-    const p = project([plain], [page], { [page.id]: [box("مرحبا بالعالم")] });
+    // Georgia has no Arabic: the browser draws the box with its own fallback
+    const p = project([plain], [page], { [page.id]: [{ ...box("مرحبا بالعالم"), font: "Georgia" } as PdfAnnot] });
     const deps = nodeDeps();
     const out = await buildPdf(p, NO_FLAT, deps);
     expect(deps.rasterCalls.length).toBe(1);

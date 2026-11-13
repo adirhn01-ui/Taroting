@@ -7,6 +7,7 @@ import {
   RUN_LINE_HEIGHT,
   applyRunStyle,
   clearRunFields,
+  fontBoxOf,
   normalizeRuns,
   remapRuns,
   rowMetrics,
@@ -409,5 +410,30 @@ describe("remapRuns with the editor's hint (D2) and replace-selection (D6)", () 
   it("a hint that does not describe the edit is ignored (the guess)", () => {
     expect(remapRuns([B(0, 1)], "aab", "aaab", { s: 3, e: 3 })).toEqual(remapRuns([B(0, 1)], "aab", "aaab"));
     expect(remapRuns([B(0, 1)], "aab", "aaab", { s: 5, e: 5 })).toEqual(remapRuns([B(0, 1)], "aab", "aaab"));
+  });
+});
+
+describe("fontBoxOf (the font box rows are laid out with)", () => {
+  // Tables as the files state them (C:/Windows/Fonts, measured once).
+  const ARIAL = { unitsPerEm: 2048, winAscent: 1854, winDescent: 434, typoAscender: 1491, typoDescender: -431, useTypoMetrics: false };
+  const CALIBRI = { unitsPerEm: 2048, winAscent: 1950, winDescent: 550, typoAscender: 1536, typoDescender: -512, useTypoMetrics: false };
+  const GABRIOLA = { unitsPerEm: 4096, winAscent: 4880, winDescent: 2660, typoAscender: 2800, typoDescender: -1296, useTypoMetrics: true };
+
+  it("winAscent / winDescent rounded to whole px at the size", () => {
+    // 10.86 → 11, 2.54 → 3
+    expect(fontBoxOf(ARIAL, 12)).toEqual({ asc: 11, desc: 3 });
+    // Calibri's box, not its hhea (1536 / 512): 12.38 → 12, 3.49 → 3
+    expect(fontBoxOf(CALIBRI, 13)).toEqual({ asc: 12, desc: 3 });
+  });
+
+  it("the typo metrics when the font sets USE_TYPO_METRICS", () => {
+    // 13.67 → 14, 6.33 → 6 (win would be 23.83 / 12.99)
+    expect(fontBoxOf(GABRIOLA, 20)).toEqual({ asc: 14, desc: 6 });
+  });
+
+  it("a tiny face keeps the fraction", () => {
+    const b = fontBoxOf(ARIAL, 2);
+    expect(b.asc).toBeCloseTo((1854 / 2048) * 2, 9);
+    expect(b.desc).toBeCloseTo((434 / 2048) * 2, 9);
   });
 });
