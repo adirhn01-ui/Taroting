@@ -12,7 +12,7 @@ import type { FontEmbed, FontRequest, PdfAnnot, PdfTextRun, ResolvedFont } from 
 import { PdfExportError } from "./errors";
 import { buildPdf } from "./export";
 import { drawnText } from "./bidi";
-import { canShape, fkFontOf, shapeRtl, shapeRtlIn, type FkFont } from "./shape";
+import { canShape, fkFontOf, MEASURE_CONTEXT, runWidth, shapedWidth, shapeRtl, shapeRtlIn, type FkFont } from "./shape";
 import { apStream, CONSOLAS, fontFile, hasFont, nodeDeps, pg, project, rawAnnots, readBack, textBox, type TestDeps } from "./testkit";
 
 type Box = Extract<PdfAnnot, { t: "text" }>;
@@ -439,6 +439,51 @@ describe.skipIf(!ready)("Arabic text boxes as real text", () => {
     expect(read.pages[0]!.text.trim()).toBe(text);
   });
 
+  it("an Arabic box and a Latin box in the same font both copy out as typed, whichever is written first", async () => {
+    const arabic = ar({ id: "ta", text: "(مرحبا)", x: 72, y: 72 });
+    const latin = textBox({ id: "tl", font: "Arial", text: "Total (USD)", x: 72, y: 300, w: 300, h: 60 });
+    for (const marks of [[arabic, latin], [latin, arabic]]) {
+      const page = pg(null, 0, 0, 612, 792);
+      const deps = nodeDeps();
+      const bytes = await buildPdf(project([], [page], { [page.id]: marks }), FLAT, deps);
+      expect(deps.rasterCalls).toHaveLength(0);
+      const strs = (await itemsOf(bytes)).map((i) => i.str.trim());
+      expect(strs).toContain("(مرحبا)");
+      expect(strs).toContain("Total (USD)");
+    }
+  });
+
+  it("the line breaker's measure shapes a bounded context: a long word without spaces is not shaped whole per character", async () => {
+    const arial = fkFontOf(readFileSync(ARIAL));
+    let longest = 0;
+    let calls = 0;
+    const counting = Object.create(arial, {
+      layout: {
+        value(this: FkFont, t: string, ...rest: unknown[]) {
+          longest = Math.max(longest, t.length);
+          calls++;
+          return (arial.layout as (...a: unknown[]) => unknown).call(this, t, ...rest);
+        },
+      },
+    }) as FkFont;
+    const word = "بيت".repeat(400);
+    for (let j = 0; j < word.length; j++) shapedWidth(counting, word, word, j, j + 1, 13);
+    expect(calls).toBe(word.length);
+    expect(longest).toBeLessThanOrEqual(2 * MEASURE_CONTEXT + 1);
+    // the same widths as shaping the whole word, at the edges and inside
+    for (const j of [0, 1, 2, 30, 31, 32, 33, 600, word.length - 2, word.length - 1]) {
+      const whole = runWidth(arial, shapeRtlIn(arial, word, word, j, j + 1), 13);
+      expect(shapedWidth(arial, word, word, j, j + 1, 13)).toBeCloseTo(whole, 9);
+    }
+    // a word of ordinary length: every range measures exactly as before
+    const short = "الإسلام";
+    for (let s = 0; s < short.length; s++) {
+      for (let e = s + 1; e <= short.length; e++) {
+        expect(shapedWidth(arial, short, short, s, e, 13)).toBe(runWidth(arial, shapeRtlIn(arial, short, short, s, e), 13));
+      }
+    }
+  });
+
   it("a whole-font embed keeps the cmap's ToUnicode for a bracket (LTR text with that glyph copies right)", async () => {
     const deps = nodeDeps({ resolveFonts: byId({ "lib:Arial": [ARIAL, "noSubset"] }) });
     const app = await appearanceOf(await exportBox(ar({ text: "(مرحبا)", fontId: "lib:Arial" }), deps));
@@ -551,9 +596,20 @@ describe.skipIf(!ready)("Arabic text boxes as real text", () => {
     const gone = nodeDeps({ resolveFonts: byId({ "lib:Arial": ["C:/nowhere/missing-font.ttf", "full"] }) });
     await exportBox(ar({ text: "مرحبا", fontId: "lib:Arial" }), gone);
     expect(gone.rasterCalls).toHaveLength(1);
-    // a refused font that CAN draw it still refuses, as any other text
-    const can = await exportBox(ar({ text: "مرحبا", fontId: "lib:Arial" }), nodeDeps({ resolveFonts: byId({ "lib:Arial": [ARIAL, "none"] }) })).catch((e) => e);
-    expect(can).toBeInstanceOf(PdfExportError);
+    // a refused font that CAN draw it: a picture too (no font embedded), as
+    // 0.9.4 exported every Arabic box, never a refused export
+    const can = nodeDeps({ resolveFonts: byId({ "lib:Arial": [ARIAL, "none"] }) });
+    const bytes = await exportBox(ar({ text: "مرحبا", fontId: "lib:Arial" }), can);
+    expect(can.rasterCalls).toHaveLength(1);
+    expect((await appearanceOf(bytes)).picture).toBe(true);
+    // one refused run in an otherwise embeddable box: the whole box a picture
+    const run = nodeDeps({ resolveFonts: byId({ "lib:Arial": [ARIAL, "none"] }) });
+    await exportBox(ar({ text: "مرحبا بك", runs: [{ s: 6, e: 8, font: "Arial", fontId: "lib:Arial" }] }), run);
+    expect(run.rasterCalls).toHaveLength(1);
+    // Latin text in that font is still refused, exactly as before
+    const latin = await exportBox(ar({ text: "Hello", fontId: "lib:Arial" }), nodeDeps({ resolveFonts: byId({ "lib:Arial": [ARIAL, "none"] }) })).catch((e) => e);
+    expect(latin).toBeInstanceOf(PdfExportError);
+    expect(latin.code).toBe("font-restricted");
   });
 
   it("drawnText mirrors right-to-left brackets offset for offset, line breaks kept", () => {
@@ -573,10 +629,11 @@ describe.skipIf(!ready)("Arabic text boxes as real text", () => {
     expect(x + w).toBeCloseTo(72 + 300, 2);
   });
 
-  it("the licence rules hold for Arabic: refused, whole, subset", async () => {
-    const refused = await exportBox(ar({ text: "مرحبا", fontId: "lib:Arial" }), nodeDeps({ resolveFonts: byId({ "lib:Arial": [ARIAL, "none"] }) })).catch((e) => e);
-    expect(refused).toBeInstanceOf(PdfExportError);
-    expect(refused.code).toBe("font-restricted");
+  it("the licence rules hold for Arabic: refused (a picture), whole, subset", async () => {
+    const deps = nodeDeps({ resolveFonts: byId({ "lib:Arial": [ARIAL, "none"] }) });
+    const refused = await exportBox(ar({ text: "مرحبا", fontId: "lib:Arial" }), deps);
+    expect(deps.rasterCalls).toHaveLength(1);
+    expect((await appearanceOf(refused)).fonts.size).toBe(0);
     const whole = await exportBox(ar({ text: "مرحبا", fontId: "lib:Arial" }), nodeDeps({ resolveFonts: byId({ "lib:Arial": [ARIAL, "noSubset"] }) }));
     const subset = await exportBox(ar({ text: "مرحبا", fontId: "lib:Arial" }), nodeDeps({ resolveFonts: byId({ "lib:Arial": [ARIAL, "full"] }) }));
     const size = readFileSync(ARIAL).length;

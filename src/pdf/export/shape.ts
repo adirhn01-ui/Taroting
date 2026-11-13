@@ -234,12 +234,28 @@ export function runWidth(f: FkFont, run: FkRun, size: number): number {
   return (w * size) / (f.unitsPerEm > 0 ? f.unitsPerEm : 1000);
 }
 
+/** How far (code units) the line breaker's measure looks past each side of a
+ *  range for its word's joining context. Joining forms and ligatures depend
+ *  on the neighbouring letters only, so a word of ordinary length is shaped
+ *  whole exactly as before; a word thousands of letters long (no spaces) is
+ *  no longer shaped whole for every one of its characters when it is broken
+ *  between characters, which took time growing with its length squared. */
+export const MEASURE_CONTEXT = 32;
+
 /** The width of `mirrored[s, e)` of an Arabic paragraph at `size`, as the
- *  line breaker measures it: shaped as Arabic in its word (`shapeRtlIn`), so
- *  it is the width the line will draw. */
+ *  line breaker measures it: shaped as Arabic in its word (`shapeRtlIn`,
+ *  within `MEASURE_CONTEXT` of the range), so it is the width the line will
+ *  draw. */
 export function shapedWidth(f: FkFont, mirrored: string, logical: string, s: number, e: number, size: number): number {
-  return runWidth(f, shapeRtlIn(f, mirrored, logical, s, e), size);
+  let lo = Math.max(0, s - MEASURE_CONTEXT);
+  let hi = Math.min(mirrored.length, e + MEASURE_CONTEXT);
+  // never between the two halves of a surrogate pair
+  if (lo > 0 && isLow(mirrored.charCodeAt(lo))) lo--;
+  if (hi < mirrored.length && isLow(mirrored.charCodeAt(hi))) hi++;
+  return runWidth(f, shapeRtlIn(f, mirrored, logical, s, e, lo, hi), size);
 }
+
+const isLow = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
 
 /* ---------------- lending glyphs to pdf-lib ---------------- */
 

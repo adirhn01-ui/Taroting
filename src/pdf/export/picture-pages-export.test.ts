@@ -5,7 +5,7 @@
 // repo.
 
 import { PDFArray, PDFDict, PDFDocument, PDFName, PDFRawStream, PDFRef, PDFStream, decodePDFRawStream } from "pdf-lib";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { MediaRef, PdfAnnot } from "../../core/types";
 import { PdfExportError, buildPdf } from "./export";
 import { encodePts, hasFixture, nodeDeps, pg, project, readBack, source, uid } from "./testkit";
@@ -184,5 +184,35 @@ describe("a missing picture file", () => {
     const e = await failure(threePages([{ id: uid("pic"), t: "image", x: 10, y: 10, w: 20, h: 20, media: "m2" }]));
     expect(e.code).toBe("image-missing");
     expect(e.message).toBe("The picture scan-03.jpg is missing. Relink it or remove it from the page, then export again.");
+  });
+});
+
+describe("picture pages and memory", () => {
+  it("each picture is written into the document as it is placed, not all at save", async () => {
+    // three picture pages, three pictures (ids differ, so none is shared)
+    const pages = [0, 1, 2].map(() => pg(null, 0, 0, 450, 300));
+    const pics: MediaRef[] = pages.map((_, i) => ({ ...media, id: `pm${i}` }));
+    const annots: Record<string, PdfAnnot[]> = {};
+    pages.forEach((page, i) => (annots[page.id] = [{ id: uid("bg"), t: "image", x: 0, y: 0, w: 450, h: 300, media: `pm${i}`, bg: true }]));
+    const made: unknown[] = [];
+    const pending: number[] = [];
+    const real = PDFDocument.prototype.embedPng;
+    const spy = vi.spyOn(PDFDocument.prototype, "embedPng").mockImplementation(async function (this: PDFDocument, png) {
+      // how many pictures made so far still hold their decoded pixels
+      pending.push(made.filter((im) => (im as { embedder?: unknown }).embedder !== undefined).length);
+      const im = await real.call(this, png);
+      made.push(im);
+      return im;
+    });
+    try {
+      const out = await buildPdf(project([], pages, annots, {}, pics), { flattenMarks: false, flattenForms: false }, nodeDeps());
+      expect(made).toHaveLength(3);
+      // when each later picture is made, none of the earlier ones is waiting
+      expect(pending).toEqual([0, 0, 0]);
+      const back = await readBack(out);
+      expect(back.pages).toHaveLength(3);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

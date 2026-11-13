@@ -205,13 +205,23 @@ export interface MarkCtx {
   doc: PDFDocument;
   project: ProjectFile;
   deps: ExportDeps;
-  font(family: FontFamily, bold: boolean, italic: boolean): Promise<EmbeddedFont>;
+  /** `shaped`: the instance shaped (Arabic) boxes draw with, see
+   *  `fontFile`. */
+  font(family: FontFamily, bold: boolean, italic: boolean, shaped?: boolean): Promise<EmbeddedFont>;
   /** A non-legacy font (`fonts_resolve`, once per request): null when it is
    *  not on this PC; the box then exports in its legacy font. */
   resolveFont(req: FontRequest): Promise<ResolvedFont | null>;
   /** A resolved non-legacy face, embedded by its embedding policy ("full":
-   *  subset; "noSubset": whole; "none": refused, naming the font). */
-  fontFile(r: ResolvedFont): Promise<EmbeddedFont>;
+   *  subset; "noSubset": whole; "none": refused, naming the font).
+   *  `shaped`: a subset face drawn by shaped (Arabic) boxes is a SEPARATE
+   *  subset of the same file. A subset's ToUnicode holds one string per
+   *  glyph, and a shaped run names some glyphs by other characters than
+   *  ordinary text does (a bracket mirrored at a right-to-left level is the
+   *  other bracket's glyph, mapped to the bracket typed), so sharing one
+   *  subset let whichever box came last decide how the other copies out. A
+   *  whole-font embed stays one instance: its cmap entries always win there
+   *  (`keepGlyphs` in shape.ts). */
+  fontFile(r: ResolvedFont, shaped?: boolean): Promise<EmbeddedFont>;
   /** A face's file read by fontkit, WITHOUT embedding it (shaping and the
    *  font box), whatever its licence (nothing of it reaches the PDF from
    *  here); a file that cannot be read fails as for `font` / `fontFile`. */
@@ -568,12 +578,14 @@ async function textAppearance(
   }
 
   // Faces embedded once each, named F0 (the box's own) .. Fn in first use.
-  const baseEmb = await embedFace(base, cx);
+  // A shaped (Arabic) box draws from its faces' shaped instances.
+  const shapedBox = shapers !== null;
+  const baseEmb = await embedFace(base, cx, shapedBox);
   const names = new Map<EmbeddedFont, string>([[baseEmb, "F0"]]);
   // `fk`: the face's fontkit font in a box that is shaped (Arabic) only.
   const pieces: { emb: EmbeddedFont; name: string; size: number; rg: string; row: RowPiece; fk?: FkFont }[] = [];
   for (let i = 0; i < segs.length; i++) {
-    const emb = styled ? await embedFace(segFaces[i]!, cx) : baseEmb;
+    const emb = styled ? await embedFace(segFaces[i]!, cx, shapedBox) : baseEmb;
     let name = names.get(emb);
     if (name === undefined) names.set(emb, (name = `F${names.size}`));
     const sz = segs[i]!.style.size;
@@ -711,8 +723,8 @@ async function faceOf(st: PdfResolvedStyle, cx: MarkCtx): Promise<Face> {
 
 /** Embedded once per document: `cx` caches by face, so equal faces are the
  *  same object. */
-function embedFace(f: Face, cx: MarkCtx): Promise<EmbeddedFont> {
-  return f.lib ? cx.fontFile(f.lib) : cx.font(f.font, f.bold, f.italic);
+function embedFace(f: Face, cx: MarkCtx, shaped = false): Promise<EmbeddedFont> {
+  return f.lib ? cx.fontFile(f.lib, shaped) : cx.font(f.font, f.bold, f.italic, shaped);
 }
 
 /** An Arabic box's fontkit font per segment (by index), when every segment's
@@ -720,10 +732,11 @@ function embedFace(f: Face, cx: MarkCtx): Promise<EmbeddedFont> {
  *  left level mirrors it) and shaping yields no .notdef; null when one
  *  cannot, and the box falls back to a picture, as every Arabic box did
  *  before 0.9.5. Reads the font files, embeds nothing: a box that falls back
- *  adds no font. The licence is NOT a reason to fall back: a font that may
- *  not be embedded but could draw the box fails when it is embedded, exactly
- *  as for any other text; one that could not draw it anyway, or whose file
- *  cannot be read, leaves the box a picture as before. */
+ *  adds no font. A face whose licence forbids embedding ("none") also keeps
+ *  the box a picture, as every Arabic box was before 0.9.5: the picture
+ *  embeds no font, so the box still exports (and a page exported as an image
+ *  never needed the font in a PDF at all). One that could not draw it
+ *  anyway, or whose file cannot be read, leaves the box a picture too. */
 async function shapingFaces(
   text: string,
   segs: readonly { s: number; e: number }[],
@@ -733,6 +746,7 @@ async function shapingFaces(
   const drawn = drawnText(text);
   const out: FkFont[] = [];
   for (let i = 0; i < segs.length; i++) {
+    if (faces[i]!.lib?.embed === "none") return null;
     let fk: FkFont;
     try {
       fk = await cx.fontkitOf(faces[i]!);
@@ -993,8 +1007,9 @@ export function markContext(doc: PDFDocument, project: ProjectFile, deps: Export
     doc,
     project,
     deps,
-    font(family, bold, italic) {
-      const key = `${family}|${bold}|${italic}`;
+    font(family, bold, italic, shaped = false) {
+      // legacy faces are always subset: a shaped box has its own instance
+      const key = `${family}|${bold}|${italic}${shaped ? "|shaped" : ""}`;
       let p = fonts.get(key);
       if (!p) {
         p = bytesOfLegacy(family, bold, italic).then((bytes) => embedWithMetrics(doc, bytes));
@@ -1036,8 +1051,8 @@ export function markContext(doc: PDFDocument, project: ProjectFile, deps: Export
       }
       return p;
     },
-    fontFile(r) {
-      const key = `${r.path}|${r.embed}`;
+    fontFile(r, shaped = false) {
+      const key = `${r.path}|${r.embed}${shaped && r.embed !== "noSubset" ? "|shaped" : ""}`;
       let p = files.get(key);
       if (!p) {
         p = bytesOfLib(r).then((bytes) => embedWithMetrics(doc, bytes, r.embed !== "noSubset"));
@@ -1059,6 +1074,11 @@ export function markContext(doc: PDFDocument, project: ProjectFile, deps: Export
           try {
             prepared = await prepareImage(m, await deps.readBytes(m.path), deps);
             const img = prepared.kind === "jpg" ? await doc.embedJpg(prepared.bytes) : await doc.embedPng(prepared.bytes);
+            // Written into the document NOW (deflated) rather than at save:
+            // until then pdf-lib keeps a PNG's decoded pixels, so a document
+            // of picture pages held every page's raw pixels at once and
+            // deflated them all in one stretch inside save.
+            await img.embed();
             return { img, orientation: prepared.orientation };
           } catch (e) {
             if (e instanceof PdfExportError) throw e;
