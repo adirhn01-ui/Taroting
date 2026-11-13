@@ -33,6 +33,20 @@ const LOOKAHEAD_SEC = 1.5;
 // i.e. zero extra work on healthy continuous playback.
 const SEEK_REARM_SEC = 0.15;
 
+/** MediaError.MEDIA_ERR_ABORTED: the load was stopped on purpose (a new src,
+ *  a teardown), which says nothing about the file. */
+const MEDIA_ERR_ABORTED = 1;
+
+/** What the bin says about a sound file a voice could not play: the same
+ *  sentence a failed video shows, followed by the element's own code and words
+ *  (Chromium's message names the pipeline stage that refused the file). */
+export function voiceFailureMessage(code: number, elementMessage: string): string {
+  const words = elementMessage.trim();
+  return words === ""
+    ? `This file couldn't be played (error ${code})`
+    : `This file couldn't be played (error ${code}: ${words})`;
+}
+
 /** What a currently-scheduled gain envelope assumes about the thing it is
  *  riding: which clip it was built for, and the (timeline time, AudioContext
  *  time) pair its breakpoints were baked from. Held per video element AND per
@@ -87,9 +101,14 @@ interface Voice {
   gain: GainNode;
   clipId: string | null;
   url: string | null;
+  /** The media whose clip last claimed this voice: who an element error is
+   *  reported against (see `onVoiceError`). */
+  mediaId: string | null;
   /** What this voice's scheduled envelope assumes; null when it has none (a
    *  parked voice is zeroed outright). Same role as `videoEnv` below. */
   env: EnvAnchor | null;
+  /** The element's one "error" listener, kept to be removed on dispose. */
+  onError: () => void;
 }
 
 /** One clip the mixer wants a voice for on this tick. `active` = it is audible
@@ -313,6 +332,7 @@ export class AudioGraph {
   private lastPlaying = false;
   private lastProject: ProjectFile | null = null;
   private maxDrift = 0;
+  private disposed = false;
 
   private monitor = 1;
 
@@ -352,8 +372,51 @@ export class AudioGraph {
       gain.gain.value = 0;
       this.ctx.createMediaElementSource(el).connect(gain);
       gain.connect(this.master);
-      this.voices.push({ el, gain, clipId: null, url: null, env: null });
+      const voice: Voice = {
+        el,
+        gain,
+        clipId: null,
+        url: null,
+        mediaId: null,
+        env: null,
+        onError: () => this.onVoiceError(voice),
+      };
+      // One idle listener per voice, added once: nothing runs until the
+      // element actually fails.
+      el.addEventListener("error", voice.onError);
+      this.voices.push(voice);
     }
+  }
+
+  /**
+   * A voice's element refused its file. Without this a sound file the WebView
+   * cannot play (unsupported, damaged, deleted while open) was simply silent
+   * behind a normal bin row. Reported through the media manager like the
+   * preview's video elements report theirs, and ignored for everything a voice
+   * does on purpose:
+   *  - an aborted load (code 1), or an error already cleared by a new src;
+   *  - the teardown (`dispose` empties every src, which itself raises an error);
+   *  - a voice whose url was forgotten (it already reported);
+   *  - a media no longer ready on the url this voice loaded (a relink, a
+   *    reassignment to other media, a media already failed) — checked here and
+   *    again by the manager.
+   * The url is forgotten either way, as the scheduler forgets a failed slot's:
+   * an errored element stays errored until its src is set again, so the next
+   * claim of any media that is ready again (a relink, a re-import of the same
+   * file) loads afresh. A failed media is not ready, so nothing claims a voice
+   * for it and nothing reloads it per tick.
+   */
+  private onVoiceError(voice: Voice): void {
+    if (this.disposed) return;
+    const err = voice.el.error;
+    if (err === null || err.code === MEDIA_ERR_ABORTED) return;
+    const url = voice.url;
+    const mediaId = voice.mediaId;
+    voice.url = null;
+    if (url === null || mediaId === null) return;
+    const st = this.media.status.get()[mediaId];
+    if (st?.state !== "ready" || st.url !== url) return;
+    this.media.audioPlaybackFailed(mediaId, url, err.code, voiceFailureMessage(err.code, err.message));
   }
 
   /* ---------------- monitor (preview listening) volume ---------------- */
@@ -532,6 +595,7 @@ export class AudioGraph {
         if (fresh && voice.clipId !== null) this.parkVoice(voice);
 
         voice.clipId = clip.id;
+        voice.mediaId = media.id;
         // A pooled element that errored keeps its error until its src is set
         // again, and the URL test alone never sets it for the same file under
         // a new media id (a re-import, Replace media) — that clip played
@@ -725,7 +789,10 @@ export class AudioGraph {
   }
 
   dispose(): void {
+    // Before the srcs are emptied: an empty src raises an error of its own.
+    this.disposed = true;
     for (const v of this.voices) {
+      v.el.removeEventListener("error", v.onError);
       v.el.pause();
       v.el.src = "";
     }

@@ -12,7 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MediaRef } from "../../core/types";
 import type { MediaState } from "../media/media";
-import { AudioGraph } from "./audio-graph";
+import { AudioGraph, voiceFailureMessage } from "./audio-graph";
 import { Scheduler } from "./scheduler";
 import { clipOf, fakeMedia, fakeStage, projectOf, readyStatus, videoMedia } from "./test-fakes";
 
@@ -69,12 +69,26 @@ class FakeAudio {
   static all: FakeAudio[] = [];
   preload = "";
   crossOrigin = "";
-  error: { code: number } | null = null;
+  error: { code: number; message?: string } | null = null;
   srcWrites: string[] = [];
   private src_ = "";
   paused = true;
+  /** the "error" listeners currently attached */
+  errorListeners: Array<() => void> = [];
   constructor() {
     FakeAudio.all.push(this);
+  }
+  addEventListener(type: string, fn: () => void): void {
+    if (type === "error") this.errorListeners.push(fn);
+  }
+  removeEventListener(type: string, fn: () => void): void {
+    if (type === "error") this.errorListeners = this.errorListeners.filter((f) => f !== fn);
+  }
+  /** The element fails with `code`: what a refused file does, asynchronously,
+   *  in the WebView. */
+  fail(code: number, message = ""): void {
+    this.error = { code, message };
+    for (const fn of [...this.errorListeners]) fn();
   }
   get src(): string {
     return this.src_;
@@ -82,6 +96,8 @@ class FakeAudio {
   set src(v: string) {
     this.src_ = v;
     this.srcWrites.push(v);
+    // A new load clears the old error, as the load algorithm does.
+    this.error = null;
   }
   currentTime = 0;
   playbackRate = 1;
@@ -235,5 +251,153 @@ describe("AudioGraph — an audio-track voice whose element failed", () => {
     setProject(projectOf([a, again], [[]], [[clipOf(again, 1, 0.75, 4.75, 1)]]));
     graph.tick(2.25, true, 1);
     expect(voice.srcWrites.length).toBe(1);
+  });
+});
+
+describe("AudioGraph — a voice's element error reaches the media manager", () => {
+  /** A sound file (a kind the video layers never load) on one audio track,
+   *  clip on [1, 5]. `reports` records every audioPlaybackFailed call; the
+   *  status map is the fake manager's own, so a test can move the media on. */
+  function soundRig() {
+    const s: MediaRef = {
+      id: "m-voiceover",
+      path: "E:\\recordings\\voiceover take 3.ogg",
+      kind: "audio",
+      duration: 31,
+      hasAudio: true,
+    } as MediaRef;
+    let project = projectOf([s], [[]], [[clipOf(s, 1, 0.5, 4.5, 1)]]);
+    const stage = fakeStage();
+    const media = fakeMedia(ready(s));
+    const reports: Array<[string, string, number, string]> = [];
+    Object.assign(media, {
+      audioPlaybackFailed(id: string, url: string, code: number, message: string): void {
+        reports.push([id, url, code, message]);
+      },
+    });
+    const sched = new Scheduler(stage, () => project, media);
+    const graph = new AudioGraph(() => project, media, sched);
+    graph.tick(2, true, 1);
+    const voice = FakeAudio.all.find((v) => v.src === `url:${s.path}`)!;
+    return { s, media, graph, voice, reports, setProject: (p: typeof project) => (project = p) };
+  }
+
+  it("reports a refused file once, with the element's code and words", () => {
+    const { s, voice, reports } = soundRig();
+    voice.fail(4, "DEMUXER_ERROR_COULD_NOT_OPEN: FFmpegDemuxer: open context failed");
+    expect(reports).toEqual([
+      [
+        s.id,
+        `url:${s.path}`,
+        4,
+        "This file couldn't be played (error 4: DEMUXER_ERROR_COULD_NOT_OPEN: FFmpegDemuxer: open context failed)",
+      ],
+    ]);
+    // a second event from the same element is not a second report
+    voice.fail(4, "again");
+    expect(reports.length).toBe(1);
+  });
+
+  it("ignores an aborted load (code 1)", () => {
+    const { voice, reports } = soundRig();
+    voice.fail(1, "aborted by a new src");
+    expect(reports).toEqual([]);
+  });
+
+  it("ignores an event whose error a new src already cleared", () => {
+    const { voice, reports } = soundRig();
+    voice.error = null;
+    for (const fn of voice.errorListeners) fn();
+    expect(reports).toEqual([]);
+  });
+
+  it("ignores a stale event arriving after a pool reassignment to another file", () => {
+    const { s, media, graph, voice, reports, setProject } = soundRig();
+    // The element fails on the voiceover, but the event is still queued when
+    // the voice is handed to a different file on another drive.
+    voice.error = { code: 4, message: "stale" };
+    const music: MediaRef = {
+      id: "m-music",
+      path: "F:\\library\\theme.flac",
+      kind: "audio",
+      duration: 58,
+      hasAudio: true,
+    } as MediaRef;
+    media.statuses[music.id] = readyStatus(music);
+    setProject(projectOf([s, music], [[]], [[clipOf(music, 1, 2, 6, 1)]]));
+    graph.tick(2.25, true, 1);
+    // the same element now holds the new file; its src write cleared the error
+    expect(voice.src).toBe(`url:${music.path}`);
+    for (const fn of [...voice.errorListeners]) fn();
+    expect(reports).toEqual([]);
+  });
+
+  it("ignores an error on a url the media no longer plays (relinked since)", () => {
+    const { s, media, voice, reports } = soundRig();
+    media.statuses[s.id] = { state: "ready", url: "url:F:\\moved\\voiceover.ogg", sourcePath: "F:\\moved\\voiceover.ogg" };
+    voice.fail(2, "network");
+    expect(reports).toEqual([]);
+  });
+
+  it("ignores an error once the media is no longer ready", () => {
+    const { s, media, voice, reports } = soundRig();
+    media.statuses[s.id] = { state: "failed", message: "File not found" };
+    voice.fail(3, "decode");
+    expect(reports).toEqual([]);
+  });
+
+  it("ignores everything after dispose, including the empty src dispose writes", () => {
+    const { graph, voice, reports } = soundRig();
+    graph.dispose();
+    expect(voice.errorListeners.length).toBe(0);
+    // what an empty src does in the WebView, fired as if a listener survived
+    voice.error = { code: 4, message: "MEDIA_ELEMENT_ERROR: Empty src attribute" };
+    (graph as unknown as { onVoiceError(v: unknown): void }).onVoiceError(
+      (graph as unknown as { voices: Array<{ el: unknown }> }).voices.find((v) => v.el === voice),
+    );
+    expect(reports).toEqual([]);
+  });
+
+  it("one listener per voice element, added once and never per tick", () => {
+    const { graph } = soundRig();
+    for (let i = 1; i <= 20; i++) graph.tick(2 + i / 60, true, 1);
+    expect(FakeAudio.all.map((v) => v.errorListeners.length)).toEqual(FakeAudio.all.map(() => 1));
+  });
+
+  it("a failed media is not reloaded on later ticks; a ready one again is", () => {
+    const { s, media, graph, voice } = soundRig();
+    voice.fail(4, "format");
+    // the manager fails it, as markFailed does
+    media.statuses[s.id] = { state: "failed", message: "This file couldn't be played (error 4: format)" };
+    for (let i = 1; i <= 10; i++) graph.tick(2 + i / 60, true, 1);
+    expect(voice.srcWrites).toEqual([`url:${s.path}`]);
+    // recovered (a relink back onto the same file, a re-import): the same url
+    // is ready again and the errored element loads it afresh, once
+    media.statuses[s.id] = readyStatus(s);
+    graph.tick(2.5, true, 1);
+    graph.tick(2.52, true, 1);
+    expect(voice.srcWrites).toEqual([`url:${s.path}`, `url:${s.path}`]);
+  });
+
+  it("reports against the media that last claimed the voice", () => {
+    const { s, media, graph, voice, reports, setProject } = soundRig();
+    // the same file re-imported under a new id takes over the healthy voice
+    const again: MediaRef = { ...s, id: "m-voiceover-reimported" };
+    media.statuses[again.id] = readyStatus(again);
+    setProject(projectOf([s, again], [[]], [[clipOf(again, 1, 0.75, 4.75, 1)]]));
+    graph.tick(2.25, true, 1);
+    voice.fail(2, "read");
+    expect(reports.map((r) => r[0])).toEqual([again.id]);
+  });
+});
+
+describe("voiceFailureMessage", () => {
+  it("names the code alone when the element gave no words", () => {
+    expect(voiceFailureMessage(3, "  ")).toBe("This file couldn't be played (error 3)");
+  });
+  it("names the code and the element's words", () => {
+    expect(voiceFailureMessage(2, "PIPELINE_ERROR_READ")).toBe(
+      "This file couldn't be played (error 2: PIPELINE_ERROR_READ)",
+    );
   });
 });

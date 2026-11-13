@@ -1002,6 +1002,28 @@ export class MediaManager {
   }
 
   /**
+   * An audio-track voice could not play `url`, which the manager had published
+   * as `mediaId`'s ready state; `code` is the element's MediaError code and
+   * `message` the words the bin shows (they carry the code and the element's
+   * own message).
+   *
+   * Ignored exactly where `playbackFailed` ignores a report: a disposed
+   * manager, an id not tracked, a media no longer ready, or ready on another
+   * url. Otherwise the media is failed at once (`markFailed`), whatever its
+   * kind: the damaged-video repair is started only by the preview's video
+   * element. A voice refusing a video file's sound (a detached audio clip, a
+   * video on an audio track) says nothing about its pictures, and a repair
+   * started from here would take a working picture off the stage while it ran.
+   * `code` is part of `message`; it is taken for parity with `playbackFailed`.
+   */
+  audioPlaybackFailed(mediaId: string, url: string, _code: number, message: string): void {
+    if (this.disposed || !this.tracked.has(mediaId)) return;
+    const st = this.status.get()[mediaId];
+    if (st?.state !== "ready" || st.url !== url) return;
+    this.markFailed(mediaId, message);
+  }
+
+  /**
    * Forget a media item completely: it has left the project.
    *
    * `retrack`'s sibling, and the half that was missing. Removing media from the

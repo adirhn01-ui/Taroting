@@ -1844,3 +1844,96 @@ describe("soft failure diagnostics carry their paths", () => {
     }
   });
 });
+
+/**
+ * `audioPlaybackFailed` — an audio-track voice refusing a file the backend
+ * called playable. Sound file or video file, it fails at once: only the
+ * preview's video element starts the damaged-video repair.
+ * The two media live on different drives under different names, the voice's
+ * words differ from the scheduler's sentence, and the `repair` flag of every
+ * plan call is asserted, so each test fails for one reason.
+ */
+describe("audioPlaybackFailed — an audio voice refusing a file", () => {
+  const VOICEOVER: MediaRef = {
+    id: "m-voiceover",
+    path: "E:\\recordings\\voiceover take 3.ogg",
+    size: 2_400_000,
+    mtimeMs: 1_760_100_000_000,
+    kind: "audio",
+    duration: 31,
+    hasAudio: true,
+  };
+  const CLIP: MediaRef = {
+    id: "m-clip",
+    path: "D:\\captures\\Replay 2026-11-01.mp4",
+    size: 91_000_000,
+    mtimeMs: 1_761_000_000_000,
+    kind: "video",
+    duration: 64,
+    hasAudio: true,
+    width: 1920,
+    height: 1080,
+  };
+  const COPY = "C:\\cache\\repair\\9b02c4.mp4";
+  const WORDS = "This file couldn't be played (error 4: DEMUXER_ERROR_COULD_NOT_OPEN)";
+
+  async function setup(...media: MediaRef[]) {
+    silentThumbnails();
+    vi.spyOn(ipc, "ensureWaveform").mockReturnValue(new Promise<WaveformResult>(() => {}));
+    const plan = vi
+      .spyOn(ipc, "planPlayback")
+      .mockImplementation(async (m, _hints, _proxy, repair): Promise<PlaybackPlan> =>
+        repair ? { mode: "ready", path: COPY, repair: { dropsHeaders: false } } : { mode: "direct", path: m.path },
+      );
+    const project = projectWith(...media);
+    const manager = new MediaManager(() => project);
+    await manager.init();
+    for (const m of media) void manager.ensure(m);
+    await settle();
+    return { manager, flags: () => plan.mock.calls.map((c) => c[3]), status: (id: string) => manager.status.get()[id] };
+  }
+
+  it.each([2, 3, 4])("code %i on a sound file: failed at once with the voice's words, no repair", async (code) => {
+    const { manager, flags, status } = await setup(VOICEOVER);
+    expect(status(VOICEOVER.id)).toEqual({ state: "ready", url: VOICEOVER.path, sourcePath: VOICEOVER.path });
+    manager.audioPlaybackFailed(VOICEOVER.id, VOICEOVER.path, code, WORDS);
+    await settle();
+    expect(status(VOICEOVER.id)).toEqual({ state: "failed", message: WORDS });
+    expect(flags()).toEqual([false]);
+  });
+
+  // Codes 3 and 4 are the ones `playbackFailed` answers with a repair, so
+  // these are the cases that tell the voice's road from the video element's.
+  it.each([3, 4])("code %i on a VIDEO file a voice refuses: failed at once, no repair", async (code) => {
+    const { manager, flags, status } = await setup(CLIP);
+    manager.audioPlaybackFailed(CLIP.id, CLIP.path, code, WORDS);
+    await settle();
+    expect(flags()).toEqual([false]);
+    expect(status(CLIP.id)).toEqual({ state: "failed", message: WORDS });
+  });
+
+  it("ignores a url the media no longer plays", async () => {
+    const { manager, status } = await setup(VOICEOVER);
+    manager.audioPlaybackFailed(VOICEOVER.id, "E:\\recordings\\voiceover take 2.ogg", 4, WORDS);
+    await settle();
+    expect(status(VOICEOVER.id)?.state).toBe("ready");
+  });
+
+  it("ignores an id nobody tracks, and everything once disposed", async () => {
+    const { manager, status } = await setup(VOICEOVER);
+    manager.audioPlaybackFailed("m-never-imported", VOICEOVER.path, 4, WORDS);
+    expect(status("m-never-imported")).toBeUndefined();
+    manager.dispose();
+    manager.audioPlaybackFailed(VOICEOVER.id, VOICEOVER.path, 4, WORDS);
+    await settle();
+    expect(status(VOICEOVER.id)?.state).toBe("ready");
+  });
+
+  it("a second report for a media already failed changes nothing", async () => {
+    const { manager, status } = await setup(VOICEOVER);
+    manager.audioPlaybackFailed(VOICEOVER.id, VOICEOVER.path, 4, WORDS);
+    manager.audioPlaybackFailed(VOICEOVER.id, VOICEOVER.path, 2, "This file couldn't be played (error 2)");
+    await settle();
+    expect(status(VOICEOVER.id)).toEqual({ state: "failed", message: WORDS });
+  });
+});

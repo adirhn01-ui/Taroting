@@ -413,6 +413,11 @@ run("tone.mp3", ["-f", "lavfi", "-i", "sine=frequency=440:duration=30", "-c:a", 
 run("tone.flac", ["-f", "lavfi", "-i", "sine=frequency=523:duration=30", "-c:a", "flac"]);
 run("tone.wav", ["-f", "lavfi", "-i", "sine=frequency=349:duration=30", "-c:a", "pcm_s16le"]);
 run("tone.aac", ["-f", "lavfi", "-i", "sine=frequency=392:duration=30", "-c:a", "aac"]);
+// A sound file the WebView refuses: a .wav name (so it is planned to play
+// directly) over 4096 bytes that are no RIFF at all. The editor's audio voices
+// must report it (bin row "Failed"), not play silence.
+const damagedTone = path.join(outDir, "damaged_tone.wav");
+if (!fs.existsSync(damagedTone)) fs.writeFileSync(damagedTone, Buffer.alloc(4096, 0x5a));
 
 /* --- stills + sequence --- */
 run("photo.png", ["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=1:duration=1", "-frames:v", "1"]);
