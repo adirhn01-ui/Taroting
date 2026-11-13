@@ -9,7 +9,7 @@ import type {
 import { ipc } from "../core/ipc";
 import { settingsStore } from "../core/session";
 import { DEFAULT_SETTINGS, type MediaInfo } from "../core/types";
-import { createSourceLoader, type Damage, type LoadState } from "./loader";
+import { createSourceLoader, QUICK_UNREADABLE, type Damage, type LoadState } from "./loader";
 
 /**
  * WHAT THIS FILE IS ABOUT: which ipc calls the viewer's loader makes for a
@@ -1477,6 +1477,170 @@ describe("the instant copy of a damaged file", () => {
     expect(last()).toEqual({ state: "preparing", ratio: 0.1, damaged: true });
     handlers.onFailed!({ id: 91, kind: "proxy", canceled: false, message: "Conversion failed", logTail: [] });
     expect(last()).toEqual({ state: "failed", message: "Conversion failed" });
+  });
+
+  /** The file refused, its repair planned with `answers` in order (a
+   *  deferred one is awaited): the first answer puts the instant copy up. */
+  async function quickUp(...answers: Array<PlaybackPlan | Promise<PlaybackPlan>>) {
+    probeAll();
+    classifyAs({ [NV]: "direct" });
+    const plan = vi.spyOn(ipc, "planPlayback").mockImplementation(() => Promise.resolve(answers.shift()!));
+    const cancel = vi.spyOn(ipc, "cancelJob").mockResolvedValue(true);
+    const r = recorded();
+    r.loader.load(NV);
+    await settle();
+    r.loader.playbackFailed(3);
+    await settle();
+    return { ...r, plan, cancel };
+  }
+
+  it("an abort of the instant copy is ignored: it stays up and keeps telling the full repair's progress", async () => {
+    const { loader, states, plan } = await quickUp(READY_QUICK);
+    const before = states.length;
+    loader.playbackFailed(1);
+    expect(states.slice(before)).toEqual([]);
+    // Still on screen: progress repaints the copy's damage, never a card.
+    progress(91, 0.3);
+    expect(states.slice(before)).toEqual([[NV, shows(QUICK_OUT, damage("repairing", 0.3))]]);
+    expect(plan).toHaveBeenCalledTimes(1);
+  });
+
+  it("an instant copy that cannot be read waits on the running full repair, which ends it either way", async () => {
+    const a = await quickUp(READY_QUICK);
+    progress(91, 0.25);
+    a.loader.playbackFailed(2);
+    expect(a.last()).toEqual({ state: "preparing", ratio: 0.25, damaged: true });
+    expect(a.plan).toHaveBeenCalledTimes(1);
+    handlers.onDone!({ id: 91, kind: "proxy", output: { path: FULL_OUT } });
+    expect(a.last()).toEqual(shows(FULL_OUT, damage("recovered")));
+    a.loader.dispose();
+    vi.restoreAllMocks();
+
+    // The original gone too: the full repair fails, and says why.
+    const b = await quickUp(READY_QUICK);
+    b.loader.playbackFailed(2);
+    handlers.onFailed!({ id: 91, kind: "proxy", canceled: false, message: "No such file", logTail: [] });
+    expect(b.last()).toEqual({ state: "failed", message: "No such file" });
+  });
+
+  it("an unreadable instant copy is not refused: a re-plan naming it again shows it", async () => {
+    const answers = [READY_QUICK, { ...READY_QUICK, upgrade: { jobId: 92, output: FULL_OUT } }];
+    const { loader, last } = await quickUp(...answers);
+    loader.playbackFailed(2);
+    // The full repair canceled under the wait: the one re-plan answers with
+    // the instant copy again, which is shown (a refusal would keep waiting).
+    handlers.onFailed!({ id: 91, kind: "proxy", canceled: true, message: "canceled", logTail: [] });
+    await settle();
+    expect(last()).toEqual(shows(QUICK_OUT, damage("repairing")));
+    expect(loader.debug().jobId).toBe(92);
+  });
+
+  /** The instant copy up with NOTHING in flight behind it, the way the app
+   *  gets there: its full repair canceled under it, the quiet re-plan for it
+   *  rejected (the copy stays up, unrecovered). `rest` answers later plans. */
+  async function quietPlanRejected(...rest: Array<PlaybackPlan | Promise<PlaybackPlan>>) {
+    const refusedPlan = Promise.reject(new Error("The backend could not be reached"));
+    refusedPlan.catch(() => {}); // handled where the loader awaits it
+    const r = await canceledUnderIt(READY_QUICK, refusedPlan, ...rest);
+    await settle();
+    return r;
+  }
+
+  it("an unreadable instant copy whose full repair already failed ends at once, never repairing again", async () => {
+    // A second answer is there only so a re-plan would show (it must not run).
+    const { loader, last, plan, states } = await quickUp(READY_QUICK, {
+      ...READY_QUICK,
+      upgrade: { jobId: 92, output: FULL_OUT },
+    });
+    handlers.onFailed!({ id: 91, kind: "proxy", canceled: false, message: "Conversion failed", logTail: [] });
+    expect(last()).toEqual(shows(QUICK_OUT, damage("unrecovered")));
+    const before = states.length;
+    loader.playbackFailed(2);
+    await settle();
+    expect(states.slice(before)).toEqual([[NV, { state: "failed", message: QUICK_UNREADABLE }]]);
+    expect(plan).toHaveBeenCalledTimes(1);
+  });
+
+  it("an unreadable instant copy with nothing in flight plans the repair again, which makes the copy again", async () => {
+    // The copy deleted from the cache: the backend makes it again (job 89),
+    // with a new full repair (92) behind it.
+    const remade: PlaybackPlan = { ...PENDING_QUICK, jobId: 89, upgrade: { jobId: 92, output: FULL_OUT } };
+    const { loader, last, plan } = await quietPlanRejected(remade);
+    expect(last()).toEqual(shows(QUICK_OUT, damage("unrecovered")));
+    expect(loader.debug().jobId).toBeNull();
+    loader.playbackFailed(2);
+    expect(last()).toEqual({ state: "preparing", ratio: null, damaged: true });
+    await settle();
+    expect(plan.mock.calls.map((c) => c[3])).toEqual([true, true, true]);
+    expect(last()).toEqual({ state: "preparing", ratio: null, damaged: true, quick: true });
+    handlers.onDone!({ id: 89, kind: "remux", output: { path: QUICK_OUT } });
+    expect(last()).toEqual(shows(QUICK_OUT, damage("repairing")));
+    expect(loader.debug().jobId).toBe(92);
+  });
+
+  it("a repair planned again for an unreadable instant copy after a hand-off is canceled on close", async () => {
+    // The hand-off agreed while the instant copy played, the open failed, then
+    // the copy could not be read and the repair was planned again: no editor
+    // will ever join those jobs.
+    const remade: PlaybackPlan = { ...PENDING_QUICK, jobId: 89, upgrade: { jobId: 92, output: FULL_OUT } };
+    const { loader, cancel } = await quietPlanRejected(remade);
+    await loader.handOff();
+    cancel.mockClear();
+    loader.playbackFailed(2);
+    await settle();
+    expect(loader.debug().jobId).toBe(89);
+    loader.dispose();
+    expect(cancel.mock.calls.map((c) => c[0]).sort()).toEqual([89, 92]);
+  });
+
+  it("an unreadable instant copy of a file that is gone fails with the backend's words", async () => {
+    const gone = Promise.reject(new Error("The file D:\\clips\\x.mp4 no longer exists"));
+    gone.catch(() => {}); // handled where the loader awaits it
+    const { loader, last } = await quietPlanRejected(gone);
+    loader.playbackFailed(2);
+    await settle();
+    expect(last()).toEqual({ state: "failed", message: "The file D:\\clips\\x.mp4 no longer exists" });
+  });
+
+  it("an instant copy unreadable a second time on one load is the end", async () => {
+    // Job events cannot be followed: every answer's full repair is let go, so
+    // the copy plays alone, with nothing in flight behind it.
+    subscribeFails = true;
+    const { loader, last, plan } = await quickUp(READY_QUICK, READY_QUICK, READY_QUICK);
+    expect(last()).toEqual(shows(QUICK_OUT, damage("unrecovered")));
+    loader.playbackFailed(2);
+    await settle();
+    expect(last()).toEqual(shows(QUICK_OUT, damage("unrecovered")));
+    loader.playbackFailed(2);
+    await settle();
+    expect(last()).toEqual({ state: "failed", message: QUICK_UNREADABLE });
+    expect(plan).toHaveBeenCalledTimes(2);
+  });
+
+  it("an instant copy unreadable a second time while the re-planned full repair runs ends with that repair", async () => {
+    const replanned: PlaybackPlan = { ...READY_QUICK, upgrade: { jobId: 92, output: FULL_OUT } };
+    const { loader, last, plan } = await quietPlanRejected(replanned);
+    loader.playbackFailed(2);
+    await settle();
+    expect(last()).toEqual(shows(QUICK_OUT, damage("repairing")));
+    progress(92, 0.35);
+    loader.playbackFailed(2);
+    expect(last()).toEqual({ state: "preparing", ratio: 0.35, damaged: true });
+    handlers.onFailed!({ id: 92, kind: "proxy", canceled: false, message: "Conversion failed", logTail: [] });
+    expect(last()).toEqual({ state: "failed", message: "Conversion failed" });
+    expect(plan).toHaveBeenCalledTimes(3);
+  });
+
+  it("an instant copy unreadable while its full repair is asked for again shows the answer's copy", async () => {
+    const second = deferred<PlaybackPlan>();
+    const { loader, states, last } = await canceledUnderIt(READY_QUICK, second.promise);
+    loader.playbackFailed(2);
+    expect(last()).toEqual({ state: "preparing", ratio: null, damaged: true });
+    const before = states.length;
+    second.resolve({ ...READY_QUICK, upgrade: { jobId: 92, output: FULL_OUT } });
+    await settle();
+    expect(states.slice(before)).toEqual([[NV, shows(QUICK_OUT, damage("repairing"))]]);
+    expect(loader.debug().jobId).toBe(92);
   });
 
   it("a re-plan the backend answers with the file itself drops what the instant copy's answer said", async () => {

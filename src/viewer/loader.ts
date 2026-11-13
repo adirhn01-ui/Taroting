@@ -112,7 +112,12 @@ export interface SourceLoader {
    *  whatever the code. A settled video the WebView could not decode (3) or would not take
    *  (4), from the file itself or a remux, with no repair tried yet → the repair is planned
    *  at once ("preparing", damaged). The instant copy refused → wait for the full repair
-   *  behind it. Anything else → failed. Ignored while no video of this load is out. */
+   *  behind it. The instant copy unreadable (2) the first time on a load → wait for the
+   *  full repair in flight, or plan the repair again (never marked refused) unless the
+   *  full repair already failed on this load (then QUICK_UNREADABLE at once); the second
+   *  time → as a refusal, failing with QUICK_UNREADABLE when nothing is left to wait on.
+   *  The instant copy aborted (1) → ignored. Anything else → failed. Ignored while no
+   *  video of this load is out. */
   playbackFailed(code: number | null): void;
   /** Open-as-project hand-off. Keeps the current pending jobs — the job the load waits on,
    *  the full repair behind an instant copy, and any job this same load starts afterwards —
@@ -167,6 +172,18 @@ type JobKind = "prep" | "quick" | "upgrade";
  *  MediaError. A network error (2) is a file that went away, not one to repair. */
 const MEDIA_ERR_DECODE = 3;
 const MEDIA_ERR_SRC_NOT_SUPPORTED = 4;
+/** MediaError.MEDIA_ERR_ABORTED / MEDIA_ERR_NETWORK. An abort is the element
+ *  letting go of a fetch, not a verdict on the copy. A read error that reaches
+ *  the loader has already spent the viewer's own in-place reloads: the copy on
+ *  disk could not be read (gone, or its drive went away), which says nothing
+ *  about whether the WebView can decode it. */
+const MEDIA_ERR_ABORTED = 1;
+const MEDIA_ERR_NETWORK = 2;
+
+/** The detail under "Can't show this file" when the instant copy of a damaged
+ *  video could not be read twice on one load, with no full repair left to wait
+ *  on. */
+export const QUICK_UNREADABLE = "Couldn't read this video's preview copy";
 
 /** DEV-only E2E knob (S19): treat `prepared` and `repaired` as false, because
  *  the cache persists across runs and would otherwise turn "Prepare preview"
@@ -243,6 +260,12 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
   /** The instant copy was refused: an answer naming it again is not shown, the
    *  load waits for the full repair instead. */
   let quickRefused = false;
+  /** The instant copy already failed to READ once on this load (code 2 from
+   *  the viewer, its reloads spent): a second read failure is final. */
+  let quickReadFailed = false;
+  /** The full repair behind the instant copy failed on this load (not a
+   *  cancel): asking for it again would run the same encode to the same end. */
+  let fullFailed = false;
   /** A re-plan is in flight that keeps the instant copy on screen (its full
    *  repair was canceled under us); a refusal meanwhile lets its answer decide. */
   let quietPlan = false;
@@ -492,7 +515,8 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
     }
     if (k === "upgrade" && shownFrom === "quick") {
       // The instant copy keeps playing; its damaged part stays covered.
-      damage = { until: damage?.until ?? null, phase: "unrecovered", ratio: null };
+      fullFailed = true;
+      damage ={ until: damage?.until ?? null, phase: "unrecovered", ratio: null };
       retell();
       return;
     }
@@ -788,6 +812,8 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
       damage = null;
       damageSaid = "";
       quickRefused = false;
+      quickReadFailed = false;
+      fullFailed = false;
       quietPlan = false;
       lastClass = null;
       media = null;
@@ -835,9 +861,48 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
       // failure on screen): the report is about something already left.
       if (phase !== "settled" || shownFrom === null) return;
       if (shownFrom === "quick") {
+        // An abort is the element letting go of a fetch: the copy stays up.
+        if (code === MEDIA_ERR_ABORTED) return;
+        if (code === MEDIA_ERR_NETWORK && !quickReadFailed) {
+          // The copy could not be READ (deleted from the cache, its drive
+          // gone, the engine's reads failing), not refused: the WebView may
+          // well play it once it can be read. Whatever is still asking for
+          // the full repair is waited on; with nothing in flight the repair
+          // is planned again, which makes the instant copy again when it is
+          // gone, and fails with the backend's own words when the file itself
+          // is. Either way it ends on a video or on "Can't show this file".
+          // Not marked refused: an answer naming the copy again shows it. A
+          // second read failure on this load is final (below).
+          quickReadFailed = true;
+          shownFrom = null;
+          if (jobKind === "upgrade" && jobId !== null) {
+            phase = "preparing";
+            preparing(damage?.ratio ?? null);
+            return;
+          }
+          if (quietPlan) {
+            phase = "planning";
+            preparing(null);
+            return;
+          }
+          if (fullFailed) {
+            // The full repair already failed on this load: planning again
+            // would only start that same encode, and the viewer's own reloads
+            // of the copy are already spent.
+            fail(QUICK_UNREADABLE);
+            return;
+          }
+          // As for a refusal that starts the repair: a hand-off made before it
+          // must not keep this new job for an editor that never came.
+          if (handOffGen === gen) handOffGen = -1;
+          pipeline = plan(gen, true);
+          preparing(null);
+          return;
+        }
         // The instant copy refused too (a WebView that will not take even the
-        // sound part of the stream as-is). The full repair is ffmpeg's own
-        // encode: wait for it rather than fail.
+        // sound part of the stream as-is), or could not be read a second time.
+        // The full repair is ffmpeg's own encode: wait for it rather than fail.
+        const unreadable = code === MEDIA_ERR_NETWORK;
         quickRefused = true;
         shownFrom = null;
         if (jobKind === "upgrade" && jobId !== null) {
@@ -852,7 +917,7 @@ export function createSourceLoader(onState: (path: string, s: LoadState) => void
           preparing(null);
           return;
         }
-        fail("");
+        fail(unreadable ? QUICK_UNREADABLE : "");
         return;
       }
       if (
