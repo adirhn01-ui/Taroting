@@ -767,15 +767,44 @@ export function refitAnnot(a: PdfAnnot, from: Box, to: Box): PdfAnnot {
   }
 }
 
+/** below this a mark is already on the page (float noise of the box map) */
+const ON_PAGE_TOL_PT = 0.01;
+
+/** The shift (on one axis) that brings the span [lo, lo + len] inside
+ *  [0, max]; a span longer than the page is aligned to its start. */
+function shiftInto(lo: number, len: number, max: number): number {
+  if (lo < -ON_PAGE_TOL_PT || len > max + ON_PAGE_TOL_PT) return -lo;
+  if (lo + len > max + ON_PAGE_TOL_PT) return max - (lo + len);
+  return 0;
+}
+
+/** `a` moved (never scaled) just enough that its geometry — its points, ends
+ *  or box, without the stroke's half width, which may overhang an edge as it
+ *  could before — lies on a `pageW`×`pageH` page; the same object when it
+ *  already does. A mark drawn in a paper page's margin is carried by the
+ *  picture's box-to-box map to a spot that can fall outside the new page,
+ *  where it could neither be seen, picked nor exported. */
+function keepOnPage(a: PdfAnnot, pageW: number, pageH: number): PdfAnnot {
+  const [bx, by, bw, bh] = annotBounds(a);
+  const r = a.t === "ink" || a.t === "line" || a.t === "rect" || a.t === "ellipse" || a.t === "arrow" ? a.w / 2 : 0;
+  const w = Math.max(0, bw - 2 * r);
+  const h = Math.max(0, bh - 2 * r);
+  const dx = shiftInto(bx + r, w, pageW);
+  const dy = shiftInto(by + r, h, pageH);
+  return translateAnnot(a, dx, dy);
+}
+
 /**
  * Give picture pages another sizing afterwards (the page menu's "Page size"),
  * as ONE new project — one undo step. Each page is recomputed with
  * `picturePageLayout` from its picture's DISPLAYED size (the MediaRef's
  * width / height) and `sizing`; its page picture takes the layout's box, and
  * every other mark on it is carried from the picture's old box to the new one
- * (`refitAnnot`), so what was drawn over the picture stays over the same spot.
- * The page keeps its id, its turn and its place. Pages that are not picture
- * pages, unknown ids, and pages already in that sizing are skipped. Refused
+ * (`refitAnnot`), so what was drawn over the picture stays over the same spot;
+ * a mark that would then leave the new page (one drawn in a paper margin) is
+ * moved back just inside it (`keepOnPage`). The page keeps its id, its turn
+ * and its place. Pages that are not picture pages, unknown ids, and pages
+ * already in that sizing are skipped. Refused
  * (returns `p`) when no page changes.
  */
 export function setPicturePageSizing(p: ProjectFile, pageIds: readonly string[], sizing: PicturePageSizing): ProjectFile {
@@ -793,7 +822,7 @@ export function setPicturePageSizing(p: ProjectFile, pageIds: readonly string[],
     const from: Box = [pic.x, pic.y, pic.w, pic.h];
     const to: Box = [l.x, l.y, l.w, l.h];
     const list = pageAnnots(p, pg.id).map((a) =>
-      a === pic ? ({ ...pic, x: l.x, y: l.y, w: l.w, h: l.h } as PdfAnnot) : refitAnnot(a, from, to),
+      a === pic ? ({ ...pic, x: l.x, y: l.y, w: l.w, h: l.h } as PdfAnnot) : keepOnPage(refitAnnot(a, from, to), l.pageW, l.pageH),
     );
     pages ??= pdf.pages.slice();
     pages[i] = { ...pg, w: l.pageW, h: l.pageH };

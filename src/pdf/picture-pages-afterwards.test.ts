@@ -6,6 +6,7 @@ import { PAPER_PT, picturePageLayout } from "../core/picture-page";
 import type { MediaInfo, MediaRef, PdfAnnot, ProjectFile } from "../core/types";
 import { decodePoints, encodePoints } from "../image/strokes";
 import {
+  annotBounds,
   fitInBox,
   insertPicturePages,
   isPicturePage,
@@ -157,6 +158,48 @@ describe("setPicturePageSizing", () => {
     // and the result still loads
     const saved = sanitizeProject(JSON.parse(JSON.stringify(out)) as ProjectFile);
     expect(pageAnnots(saved, "i2").map((a) => a.id)).toEqual(["i3", "ink", "line", "wo", "txt"]);
+  });
+
+  it("keeps marks drawn in a paper page's margins on the page when its size changes", () => {
+    // a 3024×4032 phone photo on A4: the picture fills the width with a margin
+    // above and below it
+    let n = 0;
+    const base = createPdfProject("Doc", { path: "C:\\a.pdf", size: 10, mtimeMs: 20, pages: 1 }, {
+      id: () => ["src", "P1", "proj", "trk"][n++]!,
+    });
+    const a4 = deepFreeze(insertPicturePages(base, 1, [still("C:\\p\\phone.jpg", 3024, 4032)], "a4", seq()));
+    const la4 = picturePageLayout(3024, 4032, "a4");
+    expect(la4.y).toBeGreaterThan(20);
+    const marks: PdfAnnot[] = [
+      // top margin, bottom margin, and an ink stroke along the bottom margin
+      { id: "top", t: "whiteout", x: 100, y: 4, w: 120, h: 14, c: "#ffffff" },
+      { id: "bot", t: "text", x: 50, y: 820, w: 200, h: 18, text: "Signed", font: "Segoe UI", size: 12, c: "#000000", bold: false, italic: false, align: "left" },
+      { id: "ink", t: "ink", kind: "pen", c: "#000000", w: 2, o: 1, p: encodePoints(new Float32Array([40, 835, 1, 500, 836, 1])) },
+      // over the picture: must move exactly with it
+      { id: "mid", t: "whiteout", x: 200, y: 400, w: 50, h: 20, c: "#ffffff" },
+    ];
+    const p = withMarks(a4, "i2", marks);
+    for (const sizing of ["letter", "picture"] as const) {
+      const out = setPicturePageSizing(p, ["i2"], sizing);
+      const pg = page(out, "i2");
+      for (const a of pageAnnots(out, "i2")) {
+        // the geometry stays on the page (a stroke's half width may overhang)
+        const [x, y, w, h] = annotBounds(a);
+        const r = a.t === "ink" ? a.w / 2 : 0;
+        expect(x + r, `${sizing} ${a.id} x`).toBeGreaterThanOrEqual(-0.01);
+        expect(y + r, `${sizing} ${a.id} y`).toBeGreaterThanOrEqual(-0.01);
+        expect(x + w - r, `${sizing} ${a.id} right`).toBeLessThanOrEqual(pg.w! + 0.01);
+        expect(y + h - r, `${sizing} ${a.id} bottom`).toBeLessThanOrEqual(pg.h! + 0.01);
+      }
+      // a top-margin mark is moved just inside the top edge
+      const top = pageAnnots(out, "i2").find((a) => a.id === "top") as Extract<PdfAnnot, { t: "whiteout" }>;
+      expect(top.y).toBeCloseTo(0, 2);
+      // a mark over the picture is carried by the picture's map alone
+      const l = picturePageLayout(3024, 4032, sizing);
+      const mid = pageAnnots(out, "i2").find((a) => a.id === "mid") as Extract<PdfAnnot, { t: "whiteout" }>;
+      expect(mid.x).toBeCloseTo(l.x + (200 - la4.x) * (l.w / la4.w), 2);
+      expect(mid.y).toBeCloseTo(l.y + (400 - la4.y) * (l.h / la4.h), 2);
+    }
   });
 
   it("is one new project for several selected pages, skipping the pages that are not picture pages", () => {
