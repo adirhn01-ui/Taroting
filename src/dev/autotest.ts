@@ -4128,6 +4128,13 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     await (await import("./autotest-v095-pdf-pages")).runPdfPagesBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-v095-pictures")).runPicturePagesBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-v095-image-pdf")).runImagePdfBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-v095b-home")).runHomePdfPictureBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-v095b-pdf-pictures")).runPdfPictureBlocks2({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-v095b-pdf-text")).runPdfTextExportBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-v095b-image-text")).runImageTextToolBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-v095b-audio")).runAudioFailureBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-v095b-text-runs")).runTextRunsBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-v095b-editor-scrub")).runEditorScrubBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await runDamagedVideoBlocks(test, fixturesDir);
     await runFragmentedEditorBlock(test, fixturesDir);
   } catch (e) {

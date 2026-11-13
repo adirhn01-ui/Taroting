@@ -4,7 +4,7 @@
 import "./editor.css";
 import "../ui/player-bar.css";
 import { escapeHtml, fileExt, fileName, fileStem, formatTimecode } from "../core/format";
-import { describeError, ipc, mediaUrl, onDragDrop, pickMediaFiles } from "../core/ipc";
+import { describeError, ipc, mediaUrl, onDragDrop, onJobEvents, pickMediaFiles } from "../core/ipc";
 import type { LoadedProject } from "../core/ipc";
 import { mediaDisplayName } from "../core/media-name";
 import { exitDest, navigate } from "../core/nav";
@@ -69,6 +69,7 @@ import { clampCrop } from "./preview/canvas-math";
 import { mountCanvasOverlay } from "./preview/overlay";
 import type { CanvasOverlay } from "./preview/overlay";
 import { mountTheater } from "./preview/theater";
+import { mountEditorScrub, type ClipsView, type EngineView } from "./scrub/editor-scrub";
 import { collectCandidates, snapTime } from "./timeline/snap";
 import { laneLabels, laneLayout } from "./timeline/render";
 import { createLaneAutoScroll, type LaneAutoScroller } from "./timeline/interactions";
@@ -648,6 +649,29 @@ function buildEditor(
     cancelGesture: (): void => overlay.cancelGesture(),
   });
   teardown.add(() => theater.dispose());
+
+  // Frame-by-frame dragging over heavy clips: a small all-keyframe copy stands
+  // in for a layer while a paused drag moves the playhead. It reads the engine
+  // and the scheduler only (the narrow views below), and does nothing for a
+  // project without a heavy video.
+  const engineView: EngineView = engine;
+  const clipsView: ClipsView = scheduler;
+  const scrub = mountEditorScrub({
+    engine: engineView,
+    clips: clipsView,
+    stage,
+    media,
+    getProject: () => session.project,
+    subscribeProject: (fn) => session.store.subscribe(() => fn()),
+    ipc: {
+      keyframeTimes: (path) => ipc.keyframeTimes(path),
+      planScrub: (path) => ipc.planScrub(path),
+      cancelJob: (id) => ipc.cancelJob(id),
+      onJobEvents,
+      mediaUrl,
+    },
+  });
+  teardown.add(() => scrub.dispose());
 
   /* ---------------- actions ---------------- */
 
@@ -2037,6 +2061,7 @@ function buildEditor(
       audioGraph: graph,
       scheduler,
       activeVideo: (): HTMLVideoElement | null => scheduler.activeVideo(),
+      editorScrub: scrub.dev,
     };
   }
 
