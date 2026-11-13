@@ -44,9 +44,11 @@ import type { PdfTextRun, ProjectFile } from "../../core/types";
 import {
   dataOf,
   editorText,
+  highlightRegistry,
   isBr,
   kindOf,
   offsetOf,
+  pointAt,
   readSelection,
   UNDO_BURST_MS,
   windowSelection,
@@ -64,6 +66,9 @@ import { applyTextStyle, readRawText, readText, runPatchOf, type TextGen } from 
 /** Said once when a range style would give a text more styled parts than
  *  a text may hold. */
 export const TOO_MANY_STYLES = "This text has too many styles to add another";
+/** The highlight name text.css paints (`::highlight(imged-text-kept)`): the
+ *  selected part of an open text while focus is in a styling surface. */
+export const KEPT_HIGHLIGHT = "imged-text-kept";
 /** Snapshots the styled editor's own undo keeps (the opening state always
  *  stays). */
 const RICH_STEPS_MAX = 500;
@@ -423,7 +428,7 @@ export function openTextEditor(o: OpenTextOpts): TextEditor | null {
     // that takes none): a press is judged by the press handler instead.
     if (next === null || div.contains(next as Node)) return;
     if (stylingTarget(next)) {
-      saveRange();
+      goAway();
       return;
     }
     // Tab, or anything else that moved the keyboard away: done.
@@ -436,6 +441,60 @@ export function openTextEditor(o: OpenTextOpts): TextEditor | null {
       savedRange = ws.getRangeAt(0).cloneRange();
       if (rich) sel = readSelection(div) ?? sel;
     }
+  };
+
+  /* ---------------- the selection, kept while focus is away ---------------- */
+
+  // The native selection is drawn only while the text has focus. Once focus
+  // goes to a styling surface (the inspector, a font list, a colour picker)
+  // the selected part (the published range) is painted with the CSS Custom
+  // Highlight API, from its offsets (the spans may be rebuilt meanwhile); an
+  // engine without it paints nothing. Painted only between that focus move and the text's next focus
+  // or its close; nothing runs otherwise.
+  /** focus left the text for a styling surface and has not come back */
+  let away = false;
+  /** this editor's highlight is in the registry */
+  let kept = false;
+  const clearKept = (): void => {
+    if (!kept) return;
+    kept = false;
+    try {
+      highlightRegistry()?.delete(KEPT_HIGHLIGHT);
+    } catch {
+      /* nothing painted */
+    }
+  };
+  const paintKept = (): void => {
+    const reg = away && !closed ? highlightRegistry() : null;
+    // the part a style would go to: the published range
+    const o = published;
+    if (!reg || !o || o.e <= o.s || typeof document.createRange !== "function") {
+      clearKept();
+      return;
+    }
+    try {
+      const len = cur.text.length;
+      const a = pointAt(div, Math.min(o.s, len));
+      const b = pointAt(div, Math.min(o.e, len));
+      const r = document.createRange();
+      r.setStart(a.node, a.offset);
+      r.setEnd(b.node, b.offset);
+      const H = (globalThis as unknown as { Highlight: new (r: Range) => unknown }).Highlight;
+      reg.set(KEPT_HIGHLIGHT, new H(r));
+      kept = true;
+    } catch {
+      clearKept();
+    }
+  };
+  const onFocusIn = (): void => {
+    away = false;
+    clearKept();
+  };
+  /** Focus went to a styling surface: keep the selection and paint it. */
+  const goAway = (): void => {
+    saveRange();
+    away = true;
+    paintKept();
   };
 
   /** A press outside the text and outside every styling surface ends the
@@ -466,6 +525,7 @@ export function openTextEditor(o: OpenTextOpts): TextEditor | null {
   const publish = (r: { s: number; e: number } | null): void => {
     if (r === published || (r && published && r.s === published.s && r.e === published.e)) return;
     published = r;
+    if (away) paintKept();
     republish();
   };
   /** A selection inside the text that is a range publishes it; one that
@@ -541,6 +601,8 @@ export function openTextEditor(o: OpenTextOpts): TextEditor | null {
     render();
     sel = keep ? clampSel(keep, cur.text.length) : null;
     if (active && sel) writeSelection(div, sel);
+    // the old nodes are gone: a kept highlight is drawn again on the new ones
+    else if (!active) paintKept();
   }
 
   /* ---------------- styled parts: the editor's own undo ---------------- */
@@ -751,6 +813,7 @@ export function openTextEditor(o: OpenTextOpts): TextEditor | null {
     sel = keep;
     render();
     if (document.activeElement === div) writeSelection(div, keep);
+    else paintKept();
     push({ text: cur.text, runs: runsNow(), sel: keep }, false);
     burst = null;
     // the inspector re-reads styleOf
@@ -793,8 +856,10 @@ export function openTextEditor(o: OpenTextOpts): TextEditor | null {
   document.addEventListener("selectionchange", onSelChange);
   div.addEventListener("keydown", onKeyDown);
   div.addEventListener("focusout", onFocusOut);
+  div.addEventListener("focus", onFocusIn);
   document.addEventListener("pointerdown", onDocPress, true);
 
+  const openTool = ctx.tools.get().tool;
   const unsubs = [
     ctx.view.store.subscribe(() => {
       shownMatrix = "";
@@ -815,6 +880,12 @@ export function openTextEditor(o: OpenTextOpts): TextEditor | null {
     }),
     ctx.mode.subscribe((m) => {
       if (m !== "idle") close("other");
+    }),
+    // Another tool taken up (a chord while focus is in a styling surface):
+    // the edit lands. A change of the tool's own settings (the tool row's
+    // font) is not a change of tool.
+    ctx.tools.subscribe((s) => {
+      if (s.tool !== openTool) close("other");
     }),
   ];
 
@@ -847,10 +918,13 @@ export function openTextEditor(o: OpenTextOpts): TextEditor | null {
     div.removeEventListener("beforeinput", onBeforeInput);
     div.removeEventListener("keydown", onKeyDown);
     div.removeEventListener("focusout", onFocusOut);
+    div.removeEventListener("focus", onFocusIn);
     div.removeEventListener("compositionstart", onCompStart);
     div.removeEventListener("compositionend", onCompEnd);
     document.removeEventListener("pointerdown", onDocPress, true);
     document.removeEventListener("selectionchange", onSelChange);
+    away = false;
+    clearKept();
     stack = [];
     // A handle published for a range is not the editor itself: it is taken
     // back here (the owner of the store takes back the editor).
@@ -946,6 +1020,8 @@ export function openTextEditor(o: OpenTextOpts): TextEditor | null {
       window.setTimeout(() => {
         if (closed) return;
         if (document.activeElement !== div) div.focus({ preventScroll: true });
+        // the native selection takes over from the kept highlight
+        onFocusIn();
         const r = savedRange;
         savedRange = null;
         if (rich) {

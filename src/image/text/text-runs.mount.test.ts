@@ -108,12 +108,32 @@ class FEl extends FNode {
   getAttribute(k: string): string | null {
     return this.attrs.get(k) ?? null;
   }
+  innerHTML = "";
+  classList = {
+    contains: (c: string) => this.className.split(" ").includes(c),
+    add: (c: string) => void this.classList.toggle(c, true),
+    remove: (c: string) => void this.classList.toggle(c, false),
+    toggle: (c: string, on?: boolean): boolean => {
+      const set = new Set(this.className.split(" ").filter(Boolean));
+      const want = on ?? !set.has(c);
+      if (want) set.add(c);
+      else set.delete(c);
+      this.className = [...set].join(" ");
+      return want;
+    },
+  };
+  append(...cs: FNode[]): void {
+    for (const c of cs) this.appendChild(c);
+  }
   addEventListener(t: string, fn: Handler): void {
     if (!this.listeners.has(t)) this.listeners.set(t, new Set());
     this.listeners.get(t)!.add(fn);
   }
   removeEventListener(t: string, fn: Handler): void {
     this.listeners.get(t)?.delete(fn);
+  }
+  listenerCount(t: string): number {
+    return this.listeners.get(t)?.size ?? 0;
   }
   fire(t: string, init: Record<string, unknown> = {}): Record<string, unknown> {
     const ev: Record<string, unknown> = {
@@ -166,6 +186,10 @@ const selection = {
     return this.anchorNode === this.focusNode && this.anchorOffset === this.focusOffset;
   },
   toString: () => "",
+  getRangeAt() {
+    const n = this.anchorNode;
+    return { startContainer: n, cloneRange: () => ({ startContainer: n }) };
+  },
   removeAllRanges() {
     this.anchorNode = null;
     this.focusNode = null;
@@ -217,8 +241,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-const { openTextEditor } = await import("./text-edit");
-const { pointAt } = await import("../../ui/rich-text/dom");
+const { openTextEditor, KEPT_HIGHLIGHT } = await import("./text-edit");
+const { pointAt, offsetOf } = await import("../../ui/rich-text/dom");
 const { buildTextSection, RTL_RANGE_TITLE } = await import("./text-section");
 
 /* ---------------- a session with a real history ---------------- */
@@ -485,5 +509,217 @@ describe("the inspector's text section on a styled text", () => {
     (s.color as unknown as { fire(t: string): unknown }).fire("change");
     expect(t.genNow().color).toBe("#0000aa");
     expect(t.genNow().runs).toEqual([{ s: 6, e: 11, size: 64 }]);
+  });
+});
+
+const { mountToolbar } = await import("../toolbar");
+
+describe("the tool row's font and the inspector's size on an open text", () => {
+  /** The real tool row over the open text; its font picker's pick. */
+  function toolbar(t: ReturnType<typeof setup>) {
+    const host = new FEl("div");
+    const h = mountToolbar(host as never, { ...t.ctx, registerOverlay: () => () => {} } as never);
+    const pick = picks.list[picks.list.length - 1]!;
+    return { pick, dispose: () => h.dispose() };
+  }
+  // "Hello" [0, 5) has its own font, so a whole-text font that leaves the
+  // runs' font alone, or a range font that lands on the base, each shows.
+  const OWN: PdfTextRun = { s: 0, e: 5, font: "Courier New" };
+
+  it("with a part selected, a font picked in the tool row styles that part only", () => {
+    const t = setup(gen({ runs: [OWN, RUN] }));
+    const tb = toolbar(t);
+    t.select(6, 11);
+    tb.pick({ legacy: "Arial" });
+    const g = t.genNow();
+    expect(g.fontFamily).toBe("Georgia");
+    expect(g.runs).toEqual([OWN, { ...RUN, font: "Arial" }]);
+    expect(t.ctx.tools.get().font).toEqual({ legacy: "Arial" });
+    tb.dispose();
+  });
+
+  it("with a caret, the font is the whole text's and leaves every run", () => {
+    const t = setup(gen({ runs: [OWN, RUN] }));
+    const tb = toolbar(t);
+    t.select(3, 3);
+    tb.pick({ legacy: "Arial" });
+    const g = t.genNow();
+    expect(g.fontFamily).toBe("Arial");
+    expect(g.runs).toEqual([RUN]);
+    tb.dispose();
+  });
+
+  it("with no text open, the pick is the tool's font for the next text only", () => {
+    const t = setup(gen({ runs: [OWN, RUN] }));
+    t.ed.commit();
+    const before = t.genNow();
+    const tb = toolbar(t);
+    tb.pick({ legacy: "Arial" });
+    expect(t.genNow()).toBe(before);
+    expect(t.ctx.tools.get().font).toEqual({ legacy: "Arial" });
+    tb.dispose();
+  });
+
+  it("a size field left empty with a part selected goes back to that part's size", async () => {
+    const t = setup();
+    const watchers: (() => void)[] = [];
+    const root = buildTextSection(t.ctx as never, t.ctx.selection.get()!, {
+      watch: (read, write) => {
+        let last: unknown = Symbol();
+        const run = () => {
+          const v = read();
+          if (v !== last) write((last = v) as never);
+        };
+        run();
+        watchers.push(run);
+      },
+      onCleanup() {},
+    }) as unknown as FEl;
+    t.session.store.subscribe(() => watchers.forEach((w) => w()));
+    const all = (n: FEl): FEl[] => [n, ...n.children.flatMap(all)];
+    const size = all(root).find((e) => e.tagName === "INPUT" && (e as unknown as { type: string }).type === "number") as unknown as FEl & { value: string };
+    t.select(6, 11);
+    await settle();
+    expect(size.value).toBe("64");
+    size.value = "";
+    size.fire("change");
+    expect(size.value).toBe("64");
+    expect(t.genNow().runs).toEqual([RUN]);
+  });
+});
+
+describe("the selected part, painted while focus is in a styling surface", () => {
+  class FakeHighlight {
+    constructor(readonly range: { startContainer: FNode; startOffset: number; endContainer: FNode; endOffset: number }) {}
+  }
+  let highlights: Map<string, FakeHighlight>;
+  const withRegistry = () => {
+    highlights = new Map();
+    vi.stubGlobal("CSS", { highlights });
+    vi.stubGlobal("Highlight", FakeHighlight);
+    (doc as unknown as { createRange(): unknown }).createRange = () => {
+      const r = {
+        startContainer: null as FNode | null,
+        startOffset: 0,
+        endContainer: null as FNode | null,
+        endOffset: 0,
+        setStart(n: FNode, o: number) {
+          r.startContainer = n;
+          r.startOffset = o;
+        },
+        setEnd(n: FNode, o: number) {
+          r.endContainer = n;
+          r.endOffset = o;
+        },
+      };
+      return r;
+    };
+  };
+  afterEach(() => {
+    delete (doc as unknown as { createRange?: unknown }).createRange;
+  });
+  /** a control inside a styling surface (it answers `closest`) */
+  const STYLING = { closest: () => ({}) };
+  const away = (t: ReturnType<typeof setup>) => {
+    doc.activeElement = doc.body;
+    t.div.fire("focusout", { relatedTarget: STYLING });
+  };
+  const span = (t: ReturnType<typeof setup>, h: FakeHighlight) => [
+    offsetOf(t.div as never, h.range.startContainer as never, h.range.startOffset),
+    offsetOf(t.div as never, h.range.endContainer as never, h.range.endOffset),
+  ];
+
+  it("paints the selected part of a plain text once focus leaves for the panel, and clears it on refocus", () => {
+    withRegistry();
+    const t = setup(gen({ runs: undefined }));
+    t.select(1, 4);
+    expect(highlights.has(KEPT_HIGHLIGHT)).toBe(false);
+    away(t);
+    const h = highlights.get(KEPT_HIGHLIGHT)!;
+    expect(h).toBeInstanceOf(FakeHighlight);
+    expect(span(t, h)).toEqual([1, 4]);
+    t.ed.refocus();
+    expect(highlights.has(KEPT_HIGHLIGHT)).toBe(false);
+  });
+
+  it("a caret paints nothing", () => {
+    withRegistry();
+    const t = setup();
+    t.select(3, 3);
+    away(t);
+    expect(highlights.size).toBe(0);
+  });
+
+  it("follows the spans a range style rebuilds while focus is away", () => {
+    withRegistry();
+    const t = setup();
+    t.select(1, 4);
+    away(t);
+    const first = highlights.get(KEPT_HIGHLIGHT)!;
+    t.textEdit.get()!.applyRange!({ sizePx: 50 });
+    const h = highlights.get(KEPT_HIGHLIGHT)!;
+    expect(h).not.toBe(first);
+    expect(t.div.contains(h.range.startContainer)).toBe(true);
+    expect(span(t, h)).toEqual([1, 4]);
+    // the old start node left the text with the rebuild
+    expect(t.div.contains(first.range.startContainer)).toBe(false);
+  });
+
+  it("without the highlight API nothing is painted and styling still works", () => {
+    const t = setup();
+    t.select(0, 5);
+    away(t);
+    t.textEdit.get()!.applyRange!({ color: "#00ff00" });
+    expect(t.genNow().runs).toEqual([{ s: 0, e: 5, c: "#00ff00" }, RUN]);
+    expect((globalThis as { CSS?: unknown }).CSS).toBeUndefined();
+  });
+
+  const exits: [string, (t: ReturnType<typeof setup>) => void | Promise<void>][] = [
+    ["commit", (t) => t.ed.commit()],
+    ["Escape", (t) => void t.key("Escape")],
+    ["leave", (t) => t.ed.leave()],
+    ["an undo (it may take the layer away)", (t) => t.session.undo()],
+    ["another layer selected", async (t) => {
+      t.ctx.selection.set(null);
+      await settle();
+    }],
+    ["a crop mode", async (t) => {
+      t.ctx.mode.set("crop-layer");
+      await settle();
+    }],
+    ["another tool", async (t) => {
+      t.ctx.tools.set({ ...t.ctx.tools.get(), tool: "pen" });
+      await settle();
+    }],
+    ["another writer", async (t) => {
+      t.session.replace({ ...t.session.project, name: "Renamed elsewhere" });
+      await settle();
+    }],
+  ];
+  for (const [how, exit] of exits) {
+    it(`leaves no highlight and no listener after ${how}`, async () => {
+      withRegistry();
+      const t = setup();
+      t.select(1, 4);
+      away(t);
+      expect(highlights.has(KEPT_HIGHLIGHT)).toBe(true);
+      await exit(t);
+      expect(t.textEdit.get()).toBeNull();
+      expect(highlights.size).toBe(0);
+      expect(docListeners.get("selectionchange")?.size ?? 0).toBe(0);
+      expect(docListeners.get("pointerdown")?.size ?? 0).toBe(0);
+      for (const ev of ["focus", "focusout", "input", "beforeinput", "keydown", "compositionstart"]) expect(t.div.listenerCount(ev)).toBe(0);
+    });
+  }
+
+  it("the tool row's font changes no tool: the edit and its highlight stay", async () => {
+    withRegistry();
+    const t = setup();
+    t.select(1, 4);
+    away(t);
+    t.ctx.tools.update((s) => ({ ...s, font: { legacy: "Arial" } }));
+    await settle();
+    expect(t.textEdit.get()).not.toBeNull();
+    expect(highlights.has(KEPT_HIGHLIGHT)).toBe(true);
   });
 });

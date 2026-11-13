@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ProjectFile } from "../core/types";
+import type { Generator, ProjectFile } from "../core/types";
 import { Store } from "../core/store";
 import { shortcutsBlocked } from "../core/shortcuts";
 import { createBlankImageProject } from "../core/image-project";
@@ -111,8 +111,9 @@ class El extends Listeners {
   }
   setPointerCapture(): void {}
   releasePointerCapture(): void {}
-  getContext(): null {
-    return null;
+  getContext(): unknown {
+    // only the crop ghost records (a text measurer's canvas keeps none)
+    return this.cls.has("imged-select__ghost") ? ctx2d : null;
   }
   find(pred: (e: El) => boolean): El | undefined {
     for (const c of this.children) {
@@ -124,6 +125,35 @@ class El extends Listeners {
   }
 }
 class CanvasEl extends El {}
+
+/** A 2D context that records the text calls (null: canvases have none). */
+class TextRec {
+  log: string[] = [];
+  set font(v: string) {
+    this.log.push(`font=${v}`);
+  }
+  set fillStyle(v: string) {
+    this.log.push(`fillStyle=${v}`);
+  }
+  set textBaseline(v: string) {
+    this.log.push(`textBaseline=${v}`);
+  }
+  textAlign = "start";
+  fillText(t: string, x: number, y: number): void {
+    this.log.push(`fillText(${t},${Math.round(x * 1000) / 1000},${Math.round(y * 1000) / 1000})`);
+  }
+  setTransform(): void {}
+  transform(): void {}
+  clearRect(): void {}
+  save(): void {}
+  restore(): void {}
+  beginPath(): void {}
+  rect(): void {}
+  clip(): void {
+    this.log.push("clip()");
+  }
+}
+let ctx2d: TextRec | null = null;
 
 let win: Listeners;
 let doc: Listeners;
@@ -155,14 +185,15 @@ beforeEach(() => {
 afterEach(() => {
   for (const h of mounted) h.dispose();
   mounted = [];
+  ctx2d = null;
   vi.unstubAllGlobals();
 });
 
 const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
-function mount() {
+function mount(gen: Exclude<Generator, { type: "drawing" }> = { type: "solid", color: "#ff0000" }) {
   const base = createBlankImageProject("t", 640, 360, "#ffffff");
-  const added = addGeneratorLayer(base, { type: "solid", color: "#ff0000" }, 200, 100, "Solid");
+  const added = addGeneratorLayer(base, gen, 200, 100, gen.type === "text" ? "Text" : "Solid");
   const id = added.trackId;
   const store = new Store<ProjectFile>(added.project);
   const commits: ProjectFile[] = [];
@@ -543,5 +574,44 @@ describe("select tool: the inspector's Crop button (cropLayer)", () => {
     expect(t.handle.cropLayer("no-such-layer")).toBe(false);
     expect(t.handle.cropLayer(t.id)).toBe(true);
     t.handle.dispose();
+  });
+});
+
+describe("select tool: the crop ghost of a text layer", () => {
+  // "ab cd" in #112233; [3, 5) "cd" in #00ff00 (a colour-only run: one unit
+  // drawn once per colour, each clipped to its part). Without the run the
+  // text is one fillText per line at the plain 1.25 step.
+  const text = (runs?: { s: number; e: number; c: string }[]): Exclude<Generator, { type: "drawing" }> => ({
+    type: "text",
+    text: "ab cd\nef",
+    fontFamily: "Arial",
+    sizePx: 40,
+    color: "#112233",
+    bold: false,
+    italic: false,
+    ...(runs ? { runs } : {}),
+  });
+  const ghostLog = async (g: Exclude<Generator, { type: "drawing" }>): Promise<string[]> => {
+    ctx2d = new TextRec();
+    const t = mount(g);
+    expect(t.handle.cropLayer(t.id)).toBe(true);
+    await flush();
+    const log = ctx2d.log;
+    t.cancelBtn.fire("click", {});
+    t.handle.dispose();
+    return log;
+  };
+
+  it("draws a text with styled parts through the styled layout, each colour in its part", async () => {
+    const log = await ghostLog(text([{ s: 3, e: 5, c: "#00ff00" }]));
+    expect(log.filter((x) => x.startsWith("fillStyle"))).toEqual(["fillStyle=#112233", "fillStyle=#00ff00", "fillStyle=#112233"]);
+    expect(log.filter((x) => x.startsWith("fillText")).map((x) => x.split(",")[0])).toEqual(["fillText(ab cd", "fillText(ab cd", "fillText(ef"]);
+    expect(log).toContain("textBaseline=alphabetic");
+    expect(log.filter((x) => x === "clip()")).toHaveLength(2);
+  });
+
+  it("draws a text without runs exactly as before: one fillText per line, middle baseline", async () => {
+    const log = await ghostLog(text());
+    expect(log).toEqual(["font=12px sans-serif", "fillStyle=#112233", "textBaseline=middle", "fillText(ab cd,0,25)", "fillText(ef,0,75)"]);
   });
 });

@@ -53,6 +53,13 @@
   color: transparent;
 }
 
+/* The selected part of the open text while focus is in a styling surface
+   (painted by the CSS Custom Highlight API: no DOM change; the same tint as
+   ::selection above). */
+::highlight(imged-text-kept) {
+  background-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
 /* The inspector's text section: the Edit text button spans the panel. */
 .imged-text-edit-btn {
   width: 100%;

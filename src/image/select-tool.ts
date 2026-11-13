@@ -31,6 +31,8 @@ import { normalizeHexColor, settingsStore } from "../core/session";
 import { blockShortcuts, isTypingTarget, shortcutsBlocked } from "../core/shortcuts";
 import { snapToCenter, type WindowHandle } from "../editor/preview/canvas-math";
 import { fontString } from "../editor/media/generators";
+import { activeRuns, type TextGen } from "../core/gen-text-runs";
+import { layoutStyledText, paintStyledText, plainDelta, textMeasurer, type TextMeasurer } from "../editor/media/styled-text";
 import type { ImageEditorCtx } from "./context";
 import { IMAGE_SCALE_GUARD, canvasToLayer, hitLayer, layerCorners, layerToCanvas } from "./geom";
 import { findLayer, layersOf, setLayerTransform, type Layer } from "./layers";
@@ -363,6 +365,29 @@ function pressTarget(p: ProjectFile, sel: string | null, px: number, py: number,
 }
 
 const croppable = (l: Layer): boolean => l.kind === "photo" || l.kind === "text" || l.kind === "solid";
+
+/** What the crop ghost's text paint needs of a 2D context. */
+export type GhostTextCtx = Pick<
+  CanvasRenderingContext2D,
+  "font" | "fillStyle" | "textAlign" | "textBaseline" | "fillText" | "save" | "restore" | "beginPath" | "rect" | "clip"
+>;
+
+/** A text layer's glyphs in layer px (the context's transform already set),
+ *  as the compositor draws them: a text with active styled parts through the
+ *  shared styled layout, its base-style rows where the plain path puts them;
+ *  any other text in its base style, one fillText per line. */
+export function paintTextGhost(g: GhostTextCtx, gen: TextGen, m?: TextMeasurer): void {
+  if (activeRuns(gen)) {
+    const mm = m ?? textMeasurer();
+    paintStyledText(g, layoutStyledText(gen, mm), plainDelta(gen, mm));
+    return;
+  }
+  g.font = fontString(gen);
+  g.fillStyle = normalizeHexColor(gen.color, "#ffffff");
+  g.textBaseline = "middle";
+  const lh = gen.sizePx * 1.25;
+  gen.text.split("\n").forEach((line, i) => g.fillText(line, 0, (i + 0.5) * lh));
+}
 
 /* ------------------------------------------------------------------ */
 /* Mount                                                                */
@@ -951,11 +976,7 @@ export function mountSelectTool(
       g.fillStyle = normalizeHexColor(gen.color, "#000000");
       g.fillRect(0, 0, srcW, srcH);
     } else if (gen?.type === "text") {
-      g.font = fontString(gen);
-      g.fillStyle = normalizeHexColor(gen.color, "#ffffff");
-      g.textBaseline = "middle";
-      const lh = gen.sizePx * 1.25;
-      gen.text.split("\n").forEach((line, i) => g.fillText(line, 0, (i + 0.5) * lh));
+      paintTextGhost(g, gen);
     }
   }
   function onCropDown(e: PointerEvent): void {

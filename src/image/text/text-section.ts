@@ -179,7 +179,9 @@ export function buildTextSection(ctx: ImageEditorCtx, trackId: string, hooks: Te
     if (!g) return;
     const raw = sizeInput.value.trim() === "" ? Number.NaN : Number(sizeInput.value);
     if (!Number.isFinite(raw)) {
-      sizeInput.value = String(g.sizePx);
+      // back to what the field stands for: the selected part's size, or the
+      // whole text's
+      sizeInput.value = String(rangeStyle()?.size ?? g.sizePx);
       return;
     }
     const v = uiTextSize(raw);
