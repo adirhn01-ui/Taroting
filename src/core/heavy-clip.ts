@@ -1,6 +1,6 @@
-// Which clips are HEAVY to seek in: one rule, shared by the viewer's seek
-// pacer and scrub copy and by the editor's scrub copy, so the two screens can
-// never disagree about a file. Pure: only the keyframe index's shape.
+// Which clips are HEAVY to seek in: one rule for the viewer's seek pacer and
+// its scrub copy, so the two can never disagree about a file. Pure: only the
+// keyframe index's shape.
 //
 // MEASURED (WebView2, 2026-10-07, a 69 Mbps screen recording, one keyframe
 // every 4.17 s, B-frames): the player decodes every seek from the keyframe
