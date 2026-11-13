@@ -23,6 +23,15 @@ import {
   computeTransformInto,
   type ComputedTransform,
 } from "../preview/transforms";
+import {
+  browserPacingDeps,
+  ScrubPacing,
+  type LayerPacer,
+  type PacingDeps,
+  type PacingDev,
+  type SeekCause,
+  type SeekTarget,
+} from "./seek-pacing";
 
 const PRELOAD_AHEAD_SEC = 1.5;
 
@@ -145,6 +154,9 @@ class LayerScheduler {
   private seekAimed: number | null = null;
   private leadClipId: string | null = null;
   private leadUrl: string | null = null;
+  /** Paces this layer's seeks during a drag over a heavy file
+   *  (seek-pacing.ts); created on the first such drag. */
+  private pacer: LayerPacer | null = null;
 
   // per-prop keyframe cursors (amortized O(1) monotone playback)
   private curX = new KfCursor();
@@ -164,6 +176,7 @@ class LayerScheduler {
      *  A play() promise that resolves after the intent flipped to paused — or
      *  after this element stopped being the shown active slot — must pause back. */
     private desiredPlaying: () => boolean,
+    private pacing: ScrubPacing,
   ) {
     this.listen(set);
   }
@@ -171,6 +184,7 @@ class LayerScheduler {
   /** Rebind to a layer set; true when it was a different one. */
   setLayerSet(set: LayerSet): boolean {
     if (set === this.set) return false;
+    this.pacer?.reset();
     this.unlisten(this.set);
     this.set = set;
     this.listen(set);
@@ -219,6 +233,7 @@ class LayerScheduler {
     // media whose element fails leaves "ready" below — failed, or preparing
     // the one repair copy it may get, whose own failure is final.
     this.slotSrc[slot] = null;
+    this.pacer?.forget(this.video(slot) as unknown as SeekTarget);
     if (id === null || url === null) return;
     const st = this.media.status.get()[id];
     if (st?.state !== "ready" || st.url !== url) return;
@@ -228,6 +243,7 @@ class LayerScheduler {
   /** Drop the element listeners. The pooled elements outlive this scheduler
    *  (the stage parks them), so they must not keep it reachable. */
   dispose(): void {
+    this.pacer?.dispose();
     this.unlisten(this.set);
   }
 
@@ -350,6 +366,9 @@ class LayerScheduler {
     // hasReadyVideo() deliberately keeps its own meaning: the audio graph and
     // the dev hooks ask whether a frame is ON SCREEN, not whether it ticks.
     if (el.ended || el.error !== null) return null;
+    // A drag while playing holds this element to the engine clock: its
+    // position is not the playhead until the hold ends.
+    if (this.pacer !== null && this.pacer.holdsClock(el as unknown as SeekTarget)) return null;
     return timelineTime(this.activeClip, el.currentTime);
   }
 
@@ -416,7 +435,7 @@ class LayerScheduler {
 
   /** Show/seek/play THIS layer for time t. Returns its segment (for boundary
    *  computation). `isMaster` layers own their clock; others drift-slave. */
-  activate(t: number, playing: boolean, isMaster: boolean): Segment {
+  activate(t: number, playing: boolean, isMaster: boolean, cause: SeekCause = "none"): Segment {
     const segment = this.resolve(t);
     switch (segment.type) {
       case "video": {
@@ -459,7 +478,28 @@ class LayerScheduler {
         this.show(this.activeSlot);
         const rate = clip.speed * this.previewSpeed();
         const srcT = sourceTime(clip, t - clip.timelineStart);
-        if (playing && !isMaster && el.readyState >= 2) {
+        const pacer = cause === "none" ? null : this.pacerFor(el, clip, media, url);
+        if (pacer === null) this.pacer?.cancel();
+        else if (cause === "press") pacer.press(srcT);
+        if (pacer !== null && cause === "move") {
+          // A drag over a heavy file: one seek in flight per element
+          // (seek-pacing.ts). Its landings are distorted by the pointer's
+          // movement, so none is learned from as a lead.
+          this.seekAimed = null;
+          if (playing) {
+            pacer.hold(srcT);
+            if (!el.seeking) {
+              if (el.readyState >= 2) this.holdToClock(el, srcT, rate);
+              else {
+                if (Math.abs(el.currentTime - srcT) > 0.01) el.currentTime = srcT;
+                el.playbackRate = rate;
+              }
+            }
+          } else {
+            pacer.move(srcT);
+            el.playbackRate = rate;
+          }
+        } else if (playing && !isMaster && el.readyState >= 2) {
           // slave: correct drift against engine time instead of hard-seeking
           this.holdToClock(el, srcT, rate);
         } else {
@@ -506,6 +546,18 @@ class LayerScheduler {
     }
   }
 
+  /** This layer's pacer bound to `el`, when `clip`'s played file is known to
+   *  be heavy; else null. May ask the file's keyframe index (once per file). */
+  private pacerFor(el: HTMLVideoElement, clip: Clip, media: MediaRef, url: string): LayerPacer | null {
+    const st = this.media.status.get()[media.id];
+    if (st?.state !== "ready" || st.url !== url) return null;
+    const idx = this.pacing.heavyIndex(media, st.sourcePath);
+    if (idx === null || el.readyState < 1) return null;
+    const p = (this.pacer ??= this.pacing.createPacer());
+    p.bind(el as unknown as SeekTarget, clip.id, url, idx);
+    return p;
+  }
+
   /** Re-evaluate keyframes for the active clip at time t. Called every engine
    *  tick. Clips without keyframes take one branch and do zero work (the static
    *  pose was already applied on activate). Covers video, image and gen. */
@@ -542,6 +594,26 @@ class LayerScheduler {
     if (el.readyState < 2 || el.seeking || el.paused || el.ended || el.error !== null) return;
     const rate = clip.speed * this.previewSpeed();
     this.holdToClock(el, sourceTime(clip, t - clip.timelineStart), rate);
+    if (this.pacer !== null) {
+      // A playing drag's hold ends once its element is back in the dead band
+      // (no seek, no nudged rate). Ending here makes it the clock, which is
+      // never written to: it must not keep a slave's nudged rate.
+      const target = el as unknown as SeekTarget;
+      const held = this.pacer.holdsClock(target);
+      this.pacer.clockChecked(target, !el.seeking && el.playbackRate === rate);
+      if (this.pacer.takeRateDue(target) && held && el.playbackRate !== rate) el.playbackRate = rate;
+    }
+  }
+
+  /** The clock layer whose playing-drag hold ended away from a tick that
+   *  checked it (the settle bound): its own rate, once. */
+  settleHeldRate(): void {
+    const el = this.activeElement();
+    const clip = this.activeClip;
+    if (el === null || clip === null || this.pacer === null) return;
+    if (!this.pacer.takeRateDue(el as unknown as SeekTarget)) return;
+    const rate = clip.speed * this.previewSpeed();
+    if (el.playbackRate !== rate) el.playbackRate = rate;
   }
 
   /**
@@ -642,6 +714,7 @@ class LayerScheduler {
     // reading (a loop restart into the same clip, say) its position says
     // nothing about how far a seek misses.
     this.seekAimed = null;
+    this.pacer?.cancel();
     this.video("A").pause();
     this.video("B").pause();
   }
@@ -744,12 +817,16 @@ export class Scheduler {
   private overlayText: string | null = null;
   private overlayTone: OverlayTone = "scrim";
   private readonly unsubDamage: () => void;
+  /** Seek pacing for heavy files dragged over (seek-pacing.ts). */
+  private readonly pacing: ScrubPacing;
 
   constructor(
     private stage: Stage,
     private getProject: () => ProjectFile,
     private media: MediaManager,
+    pacingDeps: PacingDeps = browserPacingDeps(),
   ) {
+    this.pacing = new ScrubPacing(pacingDeps);
     this.syncLayers();
     // A damage record appearing, changing phase or reporting progress moves
     // the overlay with no activate behind it — paused, nothing else would
@@ -794,6 +871,7 @@ export class Scheduler {
         this.stage,
         () => this.previewSpeed,
         () => this.playing,
+        this.pacing,
       );
       this.layers.push(ls);
       this.elementsCache = null;
@@ -820,7 +898,8 @@ export class Scheduler {
 
   /** Activate every layer for time t. Returns the nearest segment boundary
    *  (min over layers of each layer's active segment end). */
-  activate(t: number, playing: boolean): { boundary: number } {
+  activate(t: number, playing: boolean, seek = false): { boundary: number } {
+    const cause: SeekCause = seek ? this.pacing.inputKind() : "none";
     this.playing = playing;
     this.slavesFresh = true;
     this.syncLayers();
@@ -841,7 +920,7 @@ export class Scheduler {
     // reporting one leaves it Infinity on its own.
     let boundary = Infinity;
     for (let i = 0; i < layers.length; i++) {
-      const seg = layers[i]!.activate(t, playing, i === masterIdx);
+      const seg = layers[i]!.activate(t, playing, i === masterIdx, cause);
       const end = segmentEnd(seg);
       if (Number.isFinite(end)) boundary = Math.min(boundary, end);
       // gaps also bound (their `until` is finite when a later clip exists)
@@ -974,7 +1053,9 @@ export class Scheduler {
       return;
     }
     const layers = this.activeLayers();
-    if (layers.length < 2) return;
+    // A single layer held by a playing drag is slaved to the engine clock too,
+    // and one whose hold just ended gets its own rate back.
+    if (layers.length < 2 && !this.pacing.holding() && this.pacing.ratesDue === 0) return;
     let clock = -1;
     for (let i = 0; i < layers.length; i++) {
       const layer = layers[i]!;
@@ -986,6 +1067,7 @@ export class Scheduler {
     for (let i = 0; i < layers.length; i++) {
       if (i !== clock) layers[i]!.syncAsSlave(t);
     }
+    if (clock >= 0 && this.pacing.ratesDue > 0) layers[clock]!.settleHeldRate();
   }
 
   /** Preload each layer's next video clip. `loopEnd` is the timeline duration
@@ -1083,5 +1165,11 @@ export class Scheduler {
     this.pauseAll();
     this.unsubDamage();
     for (const layer of this.layers) layer.dispose();
+    this.pacing.dispose();
+  }
+
+  /** The seek pacing's development seam (counters, flags, snapshot). */
+  pacingDev(): PacingDev {
+    return this.pacing.dev();
   }
 }

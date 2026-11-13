@@ -135,7 +135,9 @@ export class PlaybackEngine {
     // actually sits on, so the first opposite step moves it
     if (fromStep && this.t !== time) this.steppedFrame = frameOf(this.t, this.fps());
     this.anchor(this.t);
-    this.boundary = this.scheduler.activate(this.t, this.playing_).boundary;
+    // A non-step seek may be paced by the scheduler when it comes from a
+    // pointer drag over a heavy clip.
+    this.boundary = this.scheduler.activate(this.t, this.playing_, !fromStep).boundary;
     this.scheduler.animate(this.t);
     this.emit();
   }

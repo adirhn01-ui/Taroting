@@ -8,6 +8,8 @@ import { Store } from "../../core/store";
 import type { Clip, MediaRef, ProjectFile } from "../../core/types";
 import type { DamageState, MediaManager, MediaState } from "../media/media";
 import type { LayerSet, Stage } from "../preview/preview";
+import type { KeyframeIndex } from "../../core/ipc";
+import type { PacingDeps, SeekCause } from "./seek-pacing";
 
 type Listener = () => void;
 
@@ -51,12 +53,35 @@ export class FakeVideo {
    * that kept its old position and rate would pass for one that was put back.
    */
   resetOnLoad = false;
+  /** Every write to the element, in order: `t:<v>`, `rate:<v>`, `src:<v>`,
+   *  `play`, `pause`, `muted:<v>`, `vol:<v>` (the identity tests compare it). */
+  writes: string[] = [];
+  /** When set, the latency of a seek to `t` (seconds), in place of
+   *  `seekLatency`: a seek ON a keyframe is fast, one late in a GOP slow. */
+  latencyFor: ((t: number) => number) | null = null;
   private loading = false;
   private seekLeft = 0;
   private ct = 0;
   private rate = 1;
   private src_ = "";
+  private muted_ = false;
+  private volume_ = 1;
   private listeners = new Map<string, Set<Listener>>();
+
+  get muted(): boolean {
+    return this.muted_;
+  }
+  set muted(v: boolean) {
+    this.muted_ = v;
+    this.writes.push(`muted:${v}`);
+  }
+  get volume(): number {
+    return this.volume_;
+  }
+  set volume(v: number) {
+    this.volume_ = v;
+    this.writes.push(`vol:${v}`);
+  }
 
   get currentTime(): number {
     return this.ct;
@@ -65,6 +90,8 @@ export class FakeVideo {
     this.ct = v;
     this.seeks++;
     this.seekLog.push(performance.now());
+    this.writes.push(`t:${v}`);
+    if (this.latencyFor !== null) this.seekLatency = this.latencyFor(v);
     if (this.seekLatency > 0) {
       this.seeking = true;
       this.readyState = 1;
@@ -77,6 +104,7 @@ export class FakeVideo {
   set playbackRate(v: number) {
     this.rate = v;
     this.rateWrites++;
+    this.writes.push(`rate:${v}`);
   }
   get src(): string {
     return this.src_;
@@ -85,6 +113,7 @@ export class FakeVideo {
     this.src_ = v;
     this.srcWrites++;
     this.srcLog.push({ url: v, at: performance.now() });
+    this.writes.push(`src:${v}`);
     if (this.resetOnLoad) {
       this.ct = 0;
       this.rate = 1;
@@ -115,6 +144,8 @@ export class FakeVideo {
       this.seekLeft = 0;
       this.seeking = false;
       this.readyState = 4;
+      // a real element announces the landing of the seek that was not superseded
+      this.fire("seeked");
     }
     if (this.paused || this.ended) return;
     this.ct += dt * this.rate;
@@ -132,10 +163,12 @@ export class FakeVideo {
 
   play(): Promise<void> {
     this.paused = false;
+    this.writes.push("play");
     return Promise.resolve();
   }
   pause(): void {
     this.paused = true;
+    this.writes.push("pause");
   }
 
   addEventListener(type: string, fn: Listener): void {
@@ -412,4 +445,111 @@ export function manualFrames(): {
       performance.now = savedNow;
     },
   };
+}
+
+/** The seek pacing's injected world, under the test's control. */
+export interface FakePacing {
+  deps: PacingDeps;
+  /** What inputKind() answers. */
+  kind: SeekCause;
+  /** The timers' clock (ms). */
+  now(): number;
+  /** Own clock only: let `ms` pass, running every timer that falls due, in
+   *  order, with the clock at its due time. */
+  advance(ms: number): void;
+  /** Run every timer due at the current clock (for an external clock). */
+  runDue(): void;
+  pending(): number;
+  /** What keyframeTimes answers per path: an index, null, or an Error to
+   *  reject with. A path without an entry stays unanswered. */
+  answers: Map<string, KeyframeIndex | null | Error>;
+  /** Every keyframeTimes call, in order. */
+  calls: string[];
+  /** Answer every call whose path has an answer, then let the promise
+   *  callbacks run. */
+  flush(): Promise<void>;
+  /** Release listeners currently installed (listenEnd minus its removers). */
+  endListeners(): number;
+  /** A pointerup: every installed release listener runs. */
+  end(): void;
+}
+
+/** A fake PacingDeps. With `clock`, the timers read that clock (ms) and
+ *  `runDue` runs what is due; without it, the fake keeps its own. */
+export function fakePacingDeps(clock?: () => number): FakePacing {
+  let own = 0;
+  const now = clock ?? ((): number => own);
+  let nextId = 0;
+  const tasks = new Map<number, { at: number; fn: () => void }>();
+  const waiting: Array<{ path: string; resolve: (v: KeyframeIndex | null) => void; reject: (e: Error) => void }> = [];
+  const ends = new Set<() => void>();
+  const runUntil = (limit: number, setClock: boolean): void => {
+    for (;;) {
+      let best: number | null = null;
+      for (const [id, t] of tasks) {
+        if (t.at <= limit && (best === null || t.at < tasks.get(best)!.at)) best = id;
+      }
+      if (best === null) break;
+      const t = tasks.get(best)!;
+      tasks.delete(best);
+      if (setClock) own = Math.max(own, t.at);
+      t.fn();
+    }
+  };
+  const f: FakePacing = {
+    kind: "none",
+    answers: new Map(),
+    calls: [],
+    now,
+    advance(ms) {
+      if (clock !== undefined) throw new Error("advance() needs the fake's own clock");
+      const target = own + ms;
+      runUntil(target, true);
+      own = target;
+    },
+    runDue() {
+      runUntil(now(), false);
+    },
+    pending: () => tasks.size,
+    async flush() {
+      for (let i = waiting.length - 1; i >= 0; i--) {
+        const w = waiting[i]!;
+        if (!f.answers.has(w.path)) continue;
+        waiting.splice(i, 1);
+        const a = f.answers.get(w.path)!;
+        if (a instanceof Error) w.reject(a);
+        else w.resolve(a);
+      }
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    },
+    endListeners: () => ends.size,
+    end() {
+      for (const fn of [...ends]) fn();
+    },
+    deps: {
+      timers: {
+        now: () => now(),
+        setTimeout: (fn, ms) => {
+          tasks.set(++nextId, { at: now() + ms, fn });
+          return nextId;
+        },
+        clearTimeout: (id) => {
+          if (id !== undefined) tasks.delete(id);
+        },
+      },
+      inputKind: () => f.kind,
+      keyframeTimes: (path) => {
+        f.calls.push(path);
+        return new Promise((resolve, reject) => waiting.push({ path, resolve, reject }));
+      },
+      listenEnd: (fn) => {
+        const wrapped = (): void => fn();
+        ends.add(wrapped);
+        return () => {
+          ends.delete(wrapped);
+        };
+      },
+    },
+  };
+  return f;
 }

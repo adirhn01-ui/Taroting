@@ -2036,6 +2036,7 @@ function buildEditor(
       timeline,
       audioGraph: graph,
       scheduler,
+      get seekPacing() { return scheduler.pacingDev(); },
       activeVideo: (): HTMLVideoElement | null => scheduler.activeVideo(),
     };
   }

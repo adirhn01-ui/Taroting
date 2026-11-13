@@ -27,14 +27,15 @@
 // owner called that feel perfect). Idle cost: nothing — no listener of its
 // own (the viewer forwards `seeked`), and the one rest timer runs only while a
 // heavy drag is held. Lives wholly under src/viewer/: nothing in src/editor/
-// may import it (the editor's scrubbing is the owner's reference, untouched).
+// may import it (the editor paces its own seeks in
+// src/editor/playback/seek-pacing.ts; the shared rules are in core/heavy-clip).
 
-import { HEAVY_BITS_PER_S, HEAVY_GAP_S, heavyGap, medianGap } from "../core/heavy-clip";
+import { HEAVY_BITS_PER_S, HEAVY_GAP_S, heavyGap, medianGap, nearestKeyframe } from "../core/heavy-clip";
 import type { KeyframeIndex } from "../core/ipc";
 
 // The heavy rule lives in core (the editor shares it); re-exported so this
 // module's users and tests keep one import.
-export { HEAVY_BITS_PER_S, HEAVY_GAP_S, heavyGap, medianGap };
+export { HEAVY_BITS_PER_S, HEAVY_GAP_S, heavyGap, medianGap, nearestKeyframe };
 
 // The thresholds below are tuned by the OWNER'S HANDS-ON FEEL on real
 // clips, not by synthetic probes: change them only on what the owner says.
@@ -52,20 +53,6 @@ export const SPEED_WINDOW_MS = 100;
  *  wobble into a "fast" drag and flashes a keyframe up to a GOP away. Until
  *  then every move is SLOW (exact). */
 export const MIN_SPEED_SPAN_MS = 30;
-
-/** The keyframe in ascending `times` nearest `t` (the earlier on a tie). */
-export function nearestKeyframe(times: readonly number[], t: number): number {
-  let lo = 0;
-  let hi = times.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (times[mid]! < t) lo = mid + 1;
-    else hi = mid;
-  }
-  // times[lo] is the first at or after t (or the last); its predecessor may be nearer.
-  if (lo > 0 && t - times[lo - 1]! <= times[lo]! - t) return times[lo - 1]!;
-  return times[lo]!;
-}
 
 export interface PacerTimers {
   setTimeout(fn: () => void, ms: number): number;

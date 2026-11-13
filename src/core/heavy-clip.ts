@@ -1,14 +1,15 @@
-// Which clips are HEAVY to seek in: one rule for the viewer's seek pacer and
-// its scrub copy, so the two can never disagree about a file. Pure: only the
-// keyframe index's shape.
+// Which clips are HEAVY to seek in: one rule for the viewer's seek pacer, its
+// scrub copy and the editor's seek pacing (src/editor/playback/seek-pacing.ts),
+// so they can never disagree about a file. Pure: only the keyframe index's
+// shape.
 //
 // MEASURED (WebView2, 2026-10-07, a 69 Mbps screen recording, one keyframe
 // every 4.17 s, B-frames): the player decodes every seek from the keyframe
 // before its target, so an exact seek late in a GOP took 593-1364 ms and a
 // seek that lands ON a keyframe 3-48 ms.
 //
-// The two thresholds are tuned by the OWNER'S HANDS-ON FEEL on real clips, not
-// by synthetic probes: change them only on what the owner says.
+// The two thresholds are tuned by hand on real clips, not by synthetic
+// probes: change them only after trying real recordings.
 
 import type { KeyframeIndex } from "./ipc";
 
@@ -41,4 +42,18 @@ export function heavyGap(index: KeyframeIndex | null, force = false): number | n
   if (gap < HEAVY_GAP_S) return null;
   if (!Number.isFinite(index.duration) || index.duration <= 0) return null;
   return (index.bytes * 8) / index.duration >= HEAVY_BITS_PER_S ? gap : null;
+}
+
+/** The keyframe in ascending `times` nearest `t` (the earlier on a tie). */
+export function nearestKeyframe(times: readonly number[], t: number): number {
+  let lo = 0;
+  let hi = times.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (times[mid]! < t) lo = mid + 1;
+    else hi = mid;
+  }
+  // times[lo] is the first at or after t (or the last); its predecessor may be nearer.
+  if (lo > 0 && t - times[lo - 1]! <= times[lo]! - t) return times[lo - 1]!;
+  return times[lo]!;
 }

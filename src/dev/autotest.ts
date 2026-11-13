@@ -4135,6 +4135,7 @@ export async function runAutotest(fixturesDir: string): Promise<void> {
     await (await import("./autotest-v095b-audio")).runAudioFailureBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-v095b-text-runs")).runTextRunsBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await (await import("./autotest-v095b-image-polish")).runImageTextPolishBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
+    await (await import("./autotest-v095c-editor-pacing")).runEditorPacingBlocks({ test, assert, waitFor, sleep, fixturesDir, projectPath });
     await runDamagedVideoBlocks(test, fixturesDir);
     await runFragmentedEditorBlock(test, fixturesDir);
   } catch (e) {
