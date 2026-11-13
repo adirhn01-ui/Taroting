@@ -74,6 +74,13 @@ pub const SCRUB_RECIPE: u32 = 2;
 const DEADLINE_PER_SOURCE_SECOND: f64 = 3.0;
 const DEADLINE_FLOOR: Duration = Duration::from_secs(120);
 
+/// The longest source (seconds) a copy is made for. The copy is asked for
+/// without a drag, a moment after a heavy clip shows, and its size and encode
+/// time grow with the source (~3.4 Mbit/s of output, ~0.16 s of encode per
+/// source second measured): a longer source keeps snapping to keyframes
+/// instead of writing gigabytes nobody may scrub.
+pub const MAX_SCRUB_SOURCE_S: f64 = 15.0 * 60.0;
+
 /// The cache file's suffix (the hash of the played file's identity before it).
 pub fn scrub_suffix() -> String {
     format!(".scrub{SCRUB_RECIPE}.mp4")
@@ -379,6 +386,9 @@ fn plan(
     };
     if info.kind != "video" {
         return unavailable(format!("not a video ({})", info.kind));
+    }
+    if info.duration > MAX_SCRUB_SOURCE_S {
+        return unavailable(format!("too long for a copy ({:.0} s)", info.duration));
     }
     if let Err(e) = cache.ensure_kind_dir(CacheKind::Scrub) {
         return unavailable(format!("no cache folder: {e}"));
@@ -734,6 +744,20 @@ mod tests {
         }
         let refused = plan(&cache, &jobs, &inflight, &vpath, |_| Err(crate::error::AppError::BadInput("nope".into())), never_color, never_start);
         assert!(matches!(refused, ScrubPlan::Unavailable { .. }));
+
+        // A source longer than the cap gets no copy (no colour probe, no
+        // job); one exactly at the cap still does (below).
+        let long = |_: &str| -> crate::error::Result<MediaInfo> { Ok(MediaInfo { duration: MAX_SCRUB_SOURCE_S + 1.0, ..info("video") }) };
+        let too_long = plan(&cache, &jobs, &inflight, &vpath, long, never_color, never_start);
+        assert!(matches!(too_long, ScrubPlan::Unavailable { .. }), "{too_long:?}");
+        {
+            let mut at_cap = None;
+            let capped = |_: &str| -> crate::error::Result<MediaInfo> { Ok(MediaInfo { duration: MAX_SCRUB_SOURCE_S, ..info("video") }) };
+            let p = plan(&cache, &jobs, &inflight, &vpath, capped, no_tags, |job| at_cap = Some(job));
+            let job = at_cap.expect("a source at the cap gets a job");
+            assert_eq!(p, ScrubPlan::Pending { job_id: job.handle.id });
+            inflight.release(&job.final_path, job.handle.id);
+        }
 
         // The colour probe is asked about the SAME file, and its answer
         // reaches the argv: a stated matrix passes; the unstated fields take

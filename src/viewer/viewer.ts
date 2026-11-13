@@ -1842,9 +1842,11 @@ export function mountViewer(root: HTMLElement, path: string): ViewerHandle {
     },
     end: () => {
       pressAt = false;
-      // A copy-driven drag: one exact seek to where the pointer let go.
+      // A copy-driven drag: one exact seek to where the pointer let go (none
+      // when a rest already sent it, so no later `seeked` lets go of asked).
+      const copyHeld = scrubCopy.holding();
       scrubCopy.release();
-      const held = pacer.holding();
+      const held = pacer.holding() || copyHeld;
       // A heavy drag: the exact frame where the pointer let go; once it
       // lands, the element's time is the position again.
       pacer.release();

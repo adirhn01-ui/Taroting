@@ -108,6 +108,10 @@ export class ScrubCopy {
   private unlisten: (() => void) | null = null;
   /** Job ends that arrived before the plan named the job. */
   private early = new Map<number, { path: string | null } | { failed: string }>();
+  /** Jobs an older source's plan started after that source was left (id →
+   *  the file it copies): cancelled unless a plan now waiting for the same
+   *  file may be answered with the same job (one job per output file). */
+  private readonly orphans = new Map<number, string>();
 
   private copy: HTMLVideoElement | null = null;
   /** The src this source loaded into the copy (null: none). */
@@ -290,6 +294,7 @@ export class ScrubCopy {
   dispose(): void {
     this.reset();
     this.disposed = true;
+    this.settleOrphans();
   }
 
   snapshot(): ScrubCopySnapshot {
@@ -317,18 +322,25 @@ export class ScrubCopy {
       .then((un) => {
         if (my !== this.gen) {
           un();
+          this.settleOrphans();
           return;
         }
         this.unlisten = un;
-        return this.d.plan(file).then((p) => this.planned(my, p));
+        return this.d.plan(file).then((p) => this.planned(my, file, p));
       })
       .catch((e: unknown) => {
         if (my === this.gen) this.fail(`asking for the copy failed: ${String(e)}`);
       });
   }
 
-  private planned(my: number, p: ScrubPlan): void {
-    if (my !== this.gen || this.state !== "waiting") return;
+  private planned(my: number, file: string, p: ScrubPlan): void {
+    if (my !== this.gen || this.state !== "waiting") {
+      // The source was left while the plan was answered: a job it started
+      // must not run on for nobody.
+      if (p.mode === "pending") this.orphans.set(p.jobId, file);
+      this.settleOrphans();
+      return;
+    }
     if (p.mode === "ready") {
       this.load(p.path);
     } else if (p.mode === "pending") {
@@ -339,6 +351,21 @@ export class ScrubCopy {
       if (ended !== undefined) this.jobEnded(my, p.jobId, ended);
     } else {
       this.fail(`no copy: ${p.reason}`);
+    }
+    this.settleOrphans();
+  }
+
+  /** Cancel every orphaned job, except the one the current source adopted
+   *  and those a plan still waiting for the same file may yet adopt. */
+  private settleOrphans(): void {
+    for (const [id, file] of this.orphans) {
+      if (id === this.jobId) {
+        this.orphans.delete(id);
+        continue;
+      }
+      if (!this.disposed && this.state === "waiting" && this.file === file) continue;
+      this.orphans.delete(id);
+      this.d.cancel(id);
     }
   }
 

@@ -238,6 +238,76 @@ describe("2. asking for the copy", () => {
     expect(s.snapshot().state).toBe("none");
   });
 
+  it("a job whose plan answers after its source was left is cancelled (a step, and leaving the viewer)", async () => {
+    let answer!: (p: ScrubPlan) => void;
+    plan.mockReturnValueOnce(new Promise<ScrubPlan>((r) => (answer = r)));
+    s.press(1);
+    s.indexed(FILE, true);
+    await flush();
+    s.reset();
+    expect(cancel).not.toHaveBeenCalled();
+    answer({ mode: "pending", jobId: JOB });
+    await flush();
+    expect(cancel.mock.calls).toEqual([[JOB]]);
+    expect(s.snapshot().state).toBe("none");
+
+    // The same while the viewer closes.
+    cancel.mockClear();
+    plan.mockReturnValueOnce(new Promise<ScrubPlan>((r) => (answer = r)));
+    s.press(2);
+    s.indexed(OTHER, true);
+    await flush();
+    s.dispose();
+    answer({ mode: "pending", jobId: JOB + 9 });
+    await flush();
+    expect(cancel.mock.calls).toEqual([[JOB + 9]]);
+  });
+
+  it("a late answer naming the job the same file's new plan adopts is not cancelled", async () => {
+    // A reload of the same source: the old plan's answer and the new one name
+    // ONE job (one job per output file), in either order.
+    let first!: (p: ScrubPlan) => void;
+    let second!: (p: ScrubPlan) => void;
+    plan.mockReturnValueOnce(new Promise<ScrubPlan>((r) => (first = r)));
+    plan.mockReturnValueOnce(new Promise<ScrubPlan>((r) => (second = r)));
+    s.press(1);
+    s.indexed(FILE, true);
+    await flush();
+    s.reset();
+    s.press(3);
+    s.indexed(FILE, true);
+    await flush();
+    expect(plan.mock.calls).toEqual([[FILE], [FILE]]);
+    first({ mode: "pending", jobId: JOB });
+    await flush();
+    expect(cancel).not.toHaveBeenCalled();
+    second({ mode: "pending", jobId: JOB });
+    await flush();
+    expect(cancel).not.toHaveBeenCalled();
+    expect(s.snapshot().state).toBe("making");
+    handlers!.done(JOB, COPY);
+    expect(copies).toHaveLength(1);
+
+    // Adopted first, the late answer arrives after: still not cancelled.
+    s.reset();
+    cancel.mockClear();
+    plan.mockReturnValueOnce(new Promise<ScrubPlan>((r) => (first = r)));
+    plan.mockReturnValueOnce(new Promise<ScrubPlan>((r) => (second = r)));
+    s.press(4);
+    s.indexed(OTHER, true);
+    await flush();
+    s.reset();
+    s.press(5);
+    s.indexed(OTHER, true);
+    await flush();
+    second({ mode: "pending", jobId: JOB + 2 });
+    await flush();
+    first({ mode: "pending", jobId: JOB + 2 });
+    await flush();
+    expect(cancel).not.toHaveBeenCalled();
+    expect(s.snapshot().state).toBe("making");
+  });
+
   it("a job that ended before the plan named it is still taken", async () => {
     let answer!: (p: ScrubPlan) => void;
     plan.mockReturnValueOnce(new Promise<ScrubPlan>((r) => (answer = r)));

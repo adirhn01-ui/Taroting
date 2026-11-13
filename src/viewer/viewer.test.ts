@@ -1518,6 +1518,30 @@ describe("a heavy clip's scrub copy", () => {
     expect(v.seeks()).toEqual([5.5, 33.75]);
   });
 
+  it("a drag that rested before the release gives the position back to the video once it lets go", async () => {
+    const v = mounted();
+    await withCopy(v);
+    v.bar.fire("pointerdown", v.ptr(5.5));
+    v.video.seeking = false;
+    v.video.fire("seeked");
+    vi.advanceTimersByTime(16);
+    v.bar.fire("pointermove", v.ptr(20.25));
+    // The pointer rests: one exact seek of the main video, which lands while
+    // the pointer is still held.
+    vi.advanceTimersByTime(REST_MS + 1);
+    expect(v.seeks()).toEqual([5.5, 20.25]);
+    v.video.seeking = false;
+    v.video.fire("seeked");
+    expect(v.knob.styles.get("left")).toBe(at(20.25));
+    // The release sends nothing more (the rest already went there)...
+    v.bar.fire("pointerup", v.ptr(20.25));
+    expect(v.seeks()).toEqual([5.5, 20.25]);
+    // ...and the video's own time is the position again.
+    v.video.currentTime = 37.5;
+    v.video.fire("timeupdate");
+    expect(v.knob.styles.get("left")).toBe(at(37.5));
+  });
+
   it("a playing video pauses for the drag and keeps the wish to play through it", async () => {
     const v = mounted();
     await withCopy(v);
