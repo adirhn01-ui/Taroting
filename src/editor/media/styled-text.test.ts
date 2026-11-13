@@ -159,4 +159,40 @@ describe("paintStyledText", () => {
       "restore()",
     ]);
   });
+
+  it("a unit with very many colours is measured and drawn slice by slice, in linear work", () => {
+    // 20000 units in one font, 2000 colour runs alternating with the base colour
+    const runs: PdfTextRun[] = [];
+    for (let i = 0; i < 2000; i++) runs.push({ s: i * 10, e: i * 10 + 5, c: "#ff0000" });
+    const text = "x".repeat(20_000);
+    const m = measurer();
+    const l = layoutStyledText(gen({ text, italic: false, runs }), m);
+    const u = l.rows[0]!.units;
+    expect(u).toHaveLength(1);
+    expect(u[0]!.paints).toHaveLength(4000);
+    // the whole unit once, then each slice once: about twice the length
+    expect(m.widthCalls.reduce((n, [, t]) => n + t.length, 0)).toBeLessThanOrEqual(2 * text.length + 4);
+    expect(u[0]!.paints[1]).toEqual({ x0: 100, x1: 200, color: "#112233", text: "xxxxx" });
+    let drawn = 0;
+    let clips = 0;
+    const ctx = {
+      set font(_v: string) {},
+      set fillStyle(_v: string) {},
+      textAlign: "",
+      textBaseline: "",
+      save() {},
+      restore() {},
+      beginPath() {},
+      rect() {},
+      clip() {
+        clips++;
+      },
+      fillText(t: string) {
+        drawn += t.length;
+      },
+    };
+    paintStyledText(ctx as never, l, 0);
+    expect(drawn).toBe(text.length);
+    expect(clips).toBe(0);
+  });
 });

@@ -506,7 +506,13 @@ export function openTextEditor(o: OpenTextOpts): TextEditor | null {
       saveRange();
       return;
     }
+    // A styling field still holding a typed value (the size, before Enter)
+    // gives it up NOW, while the text is open, so it lands on the selected
+    // part. Left to the browser's own blur after this press, its change
+    // would arrive with the text closed and restyle the whole text.
     closedBy.add(e);
+    const a = document.activeElement as (Element & { blur?: () => void }) | null;
+    if (a && a !== div && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && stylingTarget(a) && typeof a.blur === "function") a.blur();
     close("other");
   };
 

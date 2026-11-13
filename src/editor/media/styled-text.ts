@@ -29,6 +29,9 @@ export interface StyledPaint {
   x0: number;
   x1: number;
   color: string;
+  /** Set only on a unit past STYLED_SPLIT_WORK: this paint's own slice of
+   *  the unit's text, drawn by itself at x0 with no clip. */
+  text?: string;
 }
 export interface StyledUnit {
   x: number;
@@ -129,6 +132,15 @@ interface Piece {
   colours: [number, string][];
 }
 
+/**
+ * A unit with N colour boundaries over L UTF-16 units is measured as N
+ * prefixes and drawn as N + 1 clipped copies of the whole unit: about N x L
+ * of shaping work. Past this much, the unit is measured and drawn slice by
+ * slice instead (each colour's own text at its own x): linear in L, at the
+ * price of shaping across a colour boundary. Ordinary texts never get near it.
+ */
+export const STYLED_SPLIT_WORK = 200_000;
+
 /** The styled layout of `g` (its runs active or not: without, one style). */
 export function layoutStyledText(g: TextGen, m: TextMeasurer = textMeasurer()): StyledLayout {
   const baseFont = fontString(g);
@@ -180,13 +192,25 @@ export function layoutStyledText(g: TextGen, m: TextMeasurer = textMeasurer()): 
     for (const p of pieces) {
       const w = m.width(p.font, p.text);
       const paints: StyledPaint[] = [];
-      // each inner colour boundary measured once, as the prefix before it
       let x0 = x;
-      for (let i = 0; i < p.colours.length; i++) {
-        const next = p.colours[i + 1];
-        const x1 = next ? x + m.width(p.font, p.text.slice(0, next[0])) : x + w;
-        paints.push({ x0, x1, color: p.colours[i]![1] });
-        x0 = x1;
+      if ((p.colours.length - 1) * p.text.length > STYLED_SPLIT_WORK) {
+        // each colour's slice measured (and later drawn) on its own
+        for (let i = 0; i < p.colours.length; i++) {
+          const from = p.colours[i]![0];
+          const next = p.colours[i + 1];
+          const slice = p.text.slice(from, next ? next[0] : p.text.length);
+          const x1 = x0 + m.width(p.font, slice);
+          paints.push({ x0, x1, color: p.colours[i]![1], text: slice });
+          x0 = x1;
+        }
+      } else {
+        // each inner colour boundary measured once, as the prefix before it
+        for (let i = 0; i < p.colours.length; i++) {
+          const next = p.colours[i + 1];
+          const x1 = next ? x + m.width(p.font, p.text.slice(0, next[0])) : x + w;
+          paints.push({ x0, x1, color: p.colours[i]![1] });
+          x0 = x1;
+        }
       }
       units.push({ x, w, size: p.size, font: p.font, text: p.text, paints });
       x += w;
@@ -240,7 +264,8 @@ type Paintable = Pick<
 
 /** Paint a layout in layer px (the context's transform already set),
  *  baselines moved by `delta`. A unit of one colour is one fillText; one of
- *  several is the same fillText once per colour, each clipped to its part. */
+ *  several is the same fillText once per colour, each clipped to its part
+ *  (past STYLED_SPLIT_WORK: each colour's own slice, unclipped). */
 export function paintStyledText(ctx: Paintable, layout: StyledLayout, delta: number): void {
   ctx.textAlign = "left";
   ctx.textBaseline = "alphabetic";
@@ -259,6 +284,12 @@ export function paintStyledText(ctx: Paintable, layout: StyledLayout, delta: num
         const p = u.paints[i]!;
         const c = normalizeHexColor(p.color, "");
         if (c === "") continue;
+        if (p.text !== undefined) {
+          // a unit split for its size: each slice by itself, no clip
+          ctx.fillStyle = c;
+          ctx.fillText(p.text, p.x0, y);
+          continue;
+        }
         const x0 = i === 0 ? p.x0 - OUTSIDE : p.x0;
         const x1 = i === u.paints.length - 1 ? p.x1 + OUTSIDE : p.x1;
         ctx.save();

@@ -586,6 +586,54 @@ describe("the tool row's font and the inspector's size on an open text", () => {
     expect(size.value).toBe("64");
     expect(t.genNow().runs).toEqual([RUN]);
   });
+
+  it("a size typed for a part and left by a press outside lands on that part only, in the edit's one step", async () => {
+    // "Hello" [0, 5) has its own size, so a size that lands on the whole text
+    // (and wipes the parts' sizes) shows on both parts.
+    const OWN_SIZE: PdfTextRun = { s: 0, e: 5, size: 120 };
+    const t = setup(gen({ runs: [OWN_SIZE, RUN] }));
+    const watchers: (() => void)[] = [];
+    const root = buildTextSection(t.ctx as never, t.ctx.selection.get()!, {
+      watch: (read, write) => {
+        let last: unknown = Symbol();
+        const run = () => {
+          const v = read();
+          if (v !== last) write((last = v) as never);
+        };
+        run();
+        watchers.push(run);
+      },
+      onCleanup() {},
+    }) as unknown as FEl;
+    t.session.store.subscribe(() => watchers.forEach((w) => w()));
+    const all = (n: FEl): FEl[] => [n, ...n.children.flatMap(all)];
+    const size = all(root).find((e) => e.tagName === "INPUT" && (e as unknown as { type: string }).type === "number") as unknown as FEl & {
+      value: string;
+      blur(): void;
+    };
+    // the field sits in the text section (a styling surface); losing focus
+    // fires its change, as the browser does for an edited value
+    size.closest = (() => ({})) as never;
+    size.blur = () => {
+      if (doc.activeElement !== size) return;
+      doc.activeElement = doc.body;
+      size.fire("change");
+    };
+    t.select(6, 11);
+    await settle();
+    size.focus();
+    size.value = "80";
+    // a press in the inspector outside the text section
+    const outside = new FEl("div");
+    for (const fn of [...(docListeners.get("pointerdown") ?? [])]) fn({ target: outside });
+    expect(t.textEdit.get()).toBeNull();
+    // the browser's own blur after the press finds nothing left to apply
+    size.blur();
+    const g = t.genNow();
+    expect(g.sizePx).toBe(30);
+    expect(g.runs).toEqual([OWN_SIZE, { ...RUN, size: 80 }]);
+    expect(t.session.past).toEqual([t.before]);
+  });
 });
 
 describe("the selected part, painted while focus is in a styling surface", () => {
