@@ -23,6 +23,7 @@ const {
   gridEnterAction,
   isSearchChord,
   modalEnterConfirms,
+  newPdfProjectRoute,
   openRouteInfo,
   openRouteNotice,
   orphanRowsHtml,
@@ -107,28 +108,28 @@ describe("routeDrop (a drop on Home)", () => {
 describe("PDFs on Open and drop", () => {
   it("make a PDF project of a single PDF, with no question asked", () => {
     const route = routeOpenPicks(["C:\\Docs\\Report.PDF"]);
-    expect(route).toEqual({ kind: "pdf", pdfs: ["C:\\Docs\\Report.PDF"], skipped: 0 });
+    expect(route).toEqual({ kind: "pdf", files: ["C:\\Docs\\Report.PDF"], skipped: 0 });
     expect(openRouteNotice(route)).toBeNull();
-    expect(routeDrop(["C:\\Docs\\Report.pdf"])).toEqual({ kind: "pdf", pdfs: ["C:\\Docs\\Report.pdf"], skipped: 0 });
+    expect(routeDrop(["C:\\Docs\\Report.pdf"])).toEqual({ kind: "pdf", files: ["C:\\Docs\\Report.pdf"], skipped: 0 });
   });
 
   it("put several PDFs in natural name order, picked or dropped, like media", () => {
     // A shift-click pick (or a drop) hands the focused file first: b, then a, c.
     const sorted = ["C:\\d\\a.pdf", "C:\\d\\b.pdf", "C:\\d\\c.pdf"];
-    expect(routeOpenPicks(["C:\\d\\b.pdf", "C:\\d\\a.pdf", "C:\\d\\c.pdf"])).toEqual({ kind: "pdf", pdfs: sorted, skipped: 0 });
-    expect(routeDrop(["C:\\d\\c.pdf", "C:\\d\\b.pdf", "C:\\d\\a.pdf"])).toEqual({ kind: "pdf", pdfs: sorted, skipped: 0 });
+    expect(routeOpenPicks(["C:\\d\\b.pdf", "C:\\d\\a.pdf", "C:\\d\\c.pdf"])).toEqual({ kind: "pdf", files: sorted, skipped: 0 });
+    expect(routeDrop(["C:\\d\\c.pdf", "C:\\d\\b.pdf", "C:\\d\\a.pdf"])).toEqual({ kind: "pdf", files: sorted, skipped: 0 });
     // Numbers by value and case ignored, as for media: "2" before "10".
     const parts = ["C:\\d\\Part 10.pdf", "C:\\x\\part 2.PDF", "C:\\d\\Part 1.pdf"];
     expect(routeOpenPicks(parts)).toEqual({
       kind: "pdf",
-      pdfs: ["C:\\d\\Part 1.pdf", "C:\\x\\part 2.PDF", "C:\\d\\Part 10.pdf"],
+      files: ["C:\\d\\Part 1.pdf", "C:\\x\\part 2.PDF", "C:\\d\\Part 10.pdf"],
       skipped: 0,
     });
   });
 
   it("skip unsupported files among PDFs with the usual one toast", () => {
     const route = routeOpenPicks(["C:\\a.pdf", "C:\\notes.txt"]);
-    expect(route).toEqual({ kind: "pdf", pdfs: ["C:\\a.pdf"], skipped: 1 });
+    expect(route).toEqual({ kind: "pdf", files: ["C:\\a.pdf"], skipped: 1 });
     expect(openRouteNotice(route)).toBe("Skipped 1 file of an unsupported type.");
   });
 
@@ -142,6 +143,35 @@ describe("PDFs on Open and drop", () => {
     expect(openRouteNotice(both)).toBe(`${PDFS_ASIDE_NOTICE} Skipped 2 files of an unsupported type.`);
   });
 
+  it("with pictures only: ONE PDF project of every file, PDFs and pictures interleaved in name order", () => {
+    // Picked out of order, across folders, a JPG in upper case: name order
+    // decides, PDFs and pictures alike.
+    const picks = ["D:\\s\\page 3.PNG", "C:\\d\\page 10.pdf", "C:\\d\\Page 1.pdf", "E:\\p\\page 2.JPG"];
+    const want = ["C:\\d\\Page 1.pdf", "E:\\p\\page 2.JPG", "D:\\s\\page 3.PNG", "C:\\d\\page 10.pdf"];
+    expect(routeOpenPicks(picks)).toEqual({ kind: "pdf", files: want, skipped: 0 });
+    expect(routeDrop([...picks].reverse())).toEqual({ kind: "pdf", files: want, skipped: 0 });
+    expect(openRouteNotice(routeOpenPicks(picks))).toBeNull();
+  });
+
+  it("with pictures and an unsupported file: still the PDF project, one skipped toast", () => {
+    const route = routeDrop(["C:\\b.png", "C:\\notes.txt", "C:\\a.pdf"]);
+    expect(route).toEqual({ kind: "pdf", files: ["C:\\a.pdf", "C:\\b.png"], skipped: 1 });
+    expect(openRouteNotice(route)).toBe("Skipped 1 file of an unsupported type.");
+  });
+
+  it("with a GIF or a song among the pictures: the media keep their flow, as with a video", () => {
+    // A GIF plays as a clip, a song has no page: neither can be a page.
+    const gif = routeOpenPicks(["C:\\a.pdf", "C:\\b.png", "C:\\c.gif"]);
+    expect(gif).toEqual({ kind: "media", media: ["C:\\b.png", "C:\\c.gif"], skipped: 0, pdfs: 1 });
+    expect(openRouteNotice(gif)).toBe(PDFS_ASIDE_NOTICE);
+    const song = routeDrop(["C:\\a.pdf", "C:\\b.png", "C:\\c.mp3"]);
+    expect(song).toEqual({ kind: "media", media: ["C:\\b.png", "C:\\c.mp3"], skipped: 0, pdfs: 1 });
+  });
+
+  it("pictures with no PDF still go to Open as", () => {
+    expect(routeOpenPicks(["C:\\b.png", "C:\\a.jpg"])).toEqual({ kind: "media", media: ["C:\\a.jpg", "C:\\b.png"], skipped: 0, pdfs: 0 });
+  });
+
   it("keep today's rule for a .trt among them", () => {
     expect(routeOpenPicks(["C:\\a.pdf", "C:\\Cut.trt"])).toEqual({ kind: "mixed" });
     expect(routeDrop(["C:\\a.pdf", "C:\\Cut.trt", "C:\\b.pdf"])).toEqual({
@@ -149,6 +179,35 @@ describe("PDFs on Open and drop", () => {
       path: "C:\\Cut.trt",
       ignored: 2,
     });
+  });
+});
+
+describe("newPdfProjectRoute (New project → PDF project)", () => {
+  it("does nothing for a cancelled picker", () => {
+    expect(newPdfProjectRoute([])).toEqual({ kind: "nothing" });
+  });
+
+  it("makes ONE PDF project of pictures alone, PDFs alone, or a mix, in name order, never asking", () => {
+    expect(newPdfProjectRoute(["C:\\p\\scan 10.jpg", "C:\\p\\scan 9.png"])).toEqual({
+      kind: "pdf",
+      files: ["C:\\p\\scan 9.png", "C:\\p\\scan 10.jpg"],
+      skipped: 0,
+    });
+    expect(newPdfProjectRoute(["C:\\d\\b.pdf", "C:\\d\\a.pdf"])).toEqual({ kind: "pdf", files: ["C:\\d\\a.pdf", "C:\\d\\b.pdf"], skipped: 0 });
+    expect(newPdfProjectRoute(["C:\\d\\c.webp", "C:\\d\\a.PDF", "C:\\d\\b.bmp"])).toEqual({
+      kind: "pdf",
+      files: ["C:\\d\\a.PDF", "C:\\d\\b.bmp", "C:\\d\\c.webp"],
+      skipped: 0,
+    });
+  });
+
+  it("skips what cannot be a page (typed past the filter) with the usual words", () => {
+    const route = newPdfProjectRoute(["C:\\a.png", "C:\\clip.mp4", "C:\\anim.gif", "C:\\Cut.trt"]);
+    expect(route).toEqual({ kind: "pdf", files: ["C:\\a.png"], skipped: 3 });
+    expect(openRouteNotice(route)).toBe("Skipped 3 files of an unsupported type.");
+    const none = newPdfProjectRoute(["C:\\clip.mp4"]);
+    expect(none).toEqual({ kind: "unsupported", count: 1 });
+    expect(openRouteNotice(none)).toBe("Unsupported file type.");
   });
 });
 

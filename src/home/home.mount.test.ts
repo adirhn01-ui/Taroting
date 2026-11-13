@@ -27,13 +27,14 @@ const m = vi.hoisted(() => ({
   menuItems: [] as Array<{ label: string; icon?: string; hint?: string; onSelect(): void }>,
   /** what "New project > PDF project" picks, and how often the picker opened */
   pdfPicks: [] as string[],
-  pdfPickArgs: [] as boolean[],
+  pdfPickCalls: 0,
+  probes: new Map<string, { path: string; size: number; mtimeMs: number; kind: string; duration: number; width?: number; height?: number; hasAudio: boolean }>(),
   stats: new Map<string, { size: number; mtimeMs: number }>(),
   /** page count, or the PdfOpenError kind countPages rejects with */
   pages: new Map<string, number | "password" | "invalid">(),
   /** held open by a test to keep a PDF project in the making */
   countGate: null as null | Promise<void>,
-  saved: [] as Array<{ path: string; project: { schema: number; kind?: string; pdf?: { sources: Array<{ id: string; path: string; size: number; mtimeMs: number; pages: number }>; pages: Array<{ src: string | null; page: number }> } } }>,
+  saved: [] as Array<{ path: string; project: { schema: number; kind?: string; pdf?: { sources: Array<{ id: string; path: string; size: number; mtimeMs: number; pages: number }>; pages: Array<{ src: string | null; page: number; w?: number; h?: number }> } } }>,
   openAs: [] as string[][],
 }));
 
@@ -42,12 +43,17 @@ vi.mock("../core/ipc", () => ({
   mediaUrl: (p: string) => `asset://${p}`,
   onDragDrop: async () => () => {},
   pickOpenFiles: async () => m.picks.slice(),
-  pickPdfFiles: async (multiple: boolean) => {
-    m.pdfPickArgs.push(multiple);
+  pickPdfAndPictureFiles: async () => {
+    m.pdfPickCalls++;
     return m.pdfPicks.slice();
   },
   ipc: {
     fileStat: async (p: string) => m.stats.get(p) ?? null,
+    probeMedia: async (p: string) => {
+      const v = m.probes.get(p);
+      if (!v) throw new Error("no such file");
+      return v;
+    },
     newProjectPath: async (s?: string) => `C:\\Docs\\Taroting\\${s ?? "Untitled"}.trt`,
     saveProject: async (path: string, project: (typeof m.saved)[number]["project"]) => {
       m.saved.push({ path, project });
@@ -273,7 +279,8 @@ beforeEach(() => {
   m.picks = [];
   m.menuItems = [];
   m.pdfPicks = [];
-  m.pdfPickArgs = [];
+  m.pdfPickCalls = 0;
+  m.probes.clear();
   m.stats.clear();
   m.pages.clear();
   m.countGate = null;
@@ -676,7 +683,7 @@ describe("New project > PDF project", () => {
     const root = mount();
     await flush();
     await choosePdf(root);
-    expect(m.pdfPickArgs).toEqual([false]);
+    expect(m.pdfPickCalls).toBe(1);
     expect(m.saved).toHaveLength(1);
     const { path, project } = m.saved[0]!;
     expect(path).toBe("C:\\Docs\\Taroting\\Report.trt");
@@ -727,7 +734,7 @@ describe("New project > PDF project", () => {
     const root = mount();
     await flush();
     await choosePdf(root);
-    expect(m.pdfPickArgs).toEqual([false]);
+    expect(m.pdfPickCalls).toBe(1);
     expect(m.saved).toEqual([]);
     expect(m.errors).toEqual([]);
   });
@@ -745,11 +752,68 @@ describe("New project > PDF project", () => {
     m.picks = [SRC];
     root.el("#btn-open").fire("click", {});
     await flush(10);
-    expect(m.pdfPickArgs).toEqual([false]);
+    expect(m.pdfPickCalls).toBe(1);
     release();
     await flush(10);
     expect(m.saved).toHaveLength(1);
     expect(m.navigations).toHaveLength(1);
+  });
+
+  it("takes PDFs and pictures together: ONE project, name order, a page per picture, never Open as", async () => {
+    const PIC = "C:\\Users\\u\\Shots\\a front.png";
+    const PIC2 = "C:\\Users\\u\\Shots\\s back.jpg";
+    // The picker hands them back in no order; "Report" sorts between them.
+    m.pdfPicks = [PIC2, SRC, PIC];
+    m.stats.set(SRC, { size: 5120, mtimeMs: 1_700_000_000_000 });
+    m.pages.set(SRC, 2);
+    m.probes.set(PIC, { path: PIC, size: 11, mtimeMs: 12, kind: "image", duration: 0, width: 40, height: 20, hasAudio: false });
+    m.probes.set(PIC2, { path: PIC2, size: 13, mtimeMs: 14, kind: "image", duration: 0, width: 20, height: 40, hasAudio: false });
+    const root = mount();
+    await flush();
+    await choosePdf(root);
+    expect(m.pdfPickCalls).toBe(1);
+    expect(m.openAs).toEqual([]);
+    expect(m.saved).toHaveLength(1);
+    const project = m.saved[0]!.project as unknown as {
+      media: Array<{ id: string; path: string }>;
+      pdf: {
+        sources: Array<{ id: string }>;
+        annots: Record<string, Array<{ media: string }>>;
+        pages: Array<{ id: string; src: string | null; page: number; w?: number; h?: number }>;
+      };
+    };
+    const pages = project.pdf.pages.map((p) =>
+      p.src === null ? project.media.find((x) => x.id === project.pdf.annots[p.id]![0]!.media)!.path : `${p.src === project.pdf.sources[0]!.id ? SRC : "?"}#${p.page}`,
+    );
+    expect(pages).toEqual([PIC, `${SRC}#0`, `${SRC}#1`, PIC2]);
+    // Picture size: each picture page its own shape.
+    expect([project.pdf.pages[0]!.w, project.pdf.pages[0]!.h, project.pdf.pages[3]!.w, project.pdf.pages[3]!.h]).toEqual([30, 15, 15, 30]);
+    // Named after the first file in name order.
+    expect(m.navigations).toEqual([{ view: "editor", projectPath: "C:\\Docs\\Taroting\\a front.trt" }]);
+  });
+
+  it("makes a PDF project of pictures alone, with no Open as question", async () => {
+    const PIC = "C:\\Users\\u\\Shots\\scan.png";
+    m.pdfPicks = [PIC];
+    m.probes.set(PIC, { path: PIC, size: 11, mtimeMs: 12, kind: "image", duration: 0, width: 64, height: 48, hasAudio: false });
+    const root = mount();
+    await flush();
+    await choosePdf(root);
+    expect(m.openAs).toEqual([]);
+    expect(m.saved).toHaveLength(1);
+    expect(m.saved[0]!.project.kind).toBe("pdf");
+    expect(m.saved[0]!.project.pdf!.pages.map((p) => p.src)).toEqual([null]);
+    expect(m.navigations).toEqual([{ view: "editor", projectPath: "C:\\Docs\\Taroting\\scan.trt" }]);
+  });
+
+  it("skips what cannot be a page with one toast, and makes nothing of a video alone", async () => {
+    m.pdfPicks = ["C:\\Users\\u\\clip.mp4"];
+    const root = mount();
+    await flush();
+    await choosePdf(root);
+    expect(m.refusals).toEqual(["Unsupported file type."]);
+    expect(m.saved).toEqual([]);
+    expect(m.navigations).toEqual([]);
   });
 
   it("makes nothing once Home is gone", async () => {
@@ -834,6 +898,37 @@ describe("Open and drop with PDFs", () => {
     expect(m.refusals).toEqual([
       "PDFs and media open separately. Open the PDFs on their own to make a PDF project.",
     ]);
+  });
+
+  it("PDFs with pictures only: ONE PDF project of PDFs and pictures in name order, no Open as, no toast", async () => {
+    const PIC = "C:\\Users\\u\\Shots\\c photo.jpg";
+    readable(A, 1, 10);
+    readable(B, 1, 20);
+    m.probes.set(PIC, { path: PIC, size: 11, mtimeMs: 12, kind: "image", duration: 0, width: 48, height: 20, hasAudio: false });
+    win.__tarotingAutotest = true;
+    mount();
+    await flush();
+    win.__tarotingHomeDev!.drop([PIC, A, B]);
+    await flush(14);
+    expect(m.openAs).toEqual([]);
+    expect(m.refusals).toEqual([]);
+    expect(m.saved).toHaveLength(1);
+    const meta = m.saved[0]!.project.pdf!;
+    const pathOf = new Map(meta.sources.map((s) => [s.id, s.path]));
+    expect(meta.pages.map((p) => (p.src === null ? "picture" : pathOf.get(p.src)))).toEqual([B, A, "picture"]);
+    // "Picture size": the picture page keeps the picture's own shape (0.75 pt per px).
+    expect([meta.pages[2]!.w, meta.pages[2]!.h]).toEqual([36, 15]);
+    expect(m.navigations).toEqual([{ view: "editor", projectPath: "C:\\Docs\\Taroting\\a body.trt" }]);
+  });
+
+  it("pictures with no PDF still go to Open as", async () => {
+    m.picks = ["C:\\Users\\u\\b.png", "C:\\Users\\u\\a.jpg"];
+    const root = mount();
+    await flush();
+    root.el("#btn-open").fire("click", {});
+    await flush(10);
+    expect(m.openAs).toEqual([["C:\\Users\\u\\a.jpg", "C:\\Users\\u\\b.png"]]);
+    expect(m.saved).toEqual([]);
   });
 
   it("skips protected PDFs in a multi-pick with one toast naming how many", async () => {

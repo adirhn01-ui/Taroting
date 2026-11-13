@@ -1,6 +1,6 @@
-// Home's PDF projects: one or more PDFs, chosen with "New project → PDF
-// project", Open, or a drop — or pictures, through "Open as → PDF project"
-// (every picture a page) — become ONE real library project in
+// Home's PDF projects: PDFs and pictures, chosen with "New project → PDF
+// project", Open, or a drop, in any mix — or pictures alone, through "Open as
+// → PDF project" (every picture a page) — become ONE real library project in
 // Documents\Taroting (never a temporary one — Home's New and Open are the
 // permanent way in), its pages in the order Home hands the files over (natural
 // name order, see home.ts mediaRoute).
@@ -17,14 +17,14 @@
 // Reading a PDF (stat → page count → which failure) is core/pdf-open's, the
 // one copy open-media uses too; only the words are Home's.
 
-import { fileStem } from "../core/format";
-import { describeError, ipc, pickPdfFiles } from "../core/ipc";
+import { fileExt, fileStem } from "../core/format";
+import { describeError, ipc, pickPdfAndPictureFiles } from "../core/ipc";
 import { PDF_MISSING, readPdfSource } from "../core/pdf-open";
 import type { PdfSourceInfo } from "../core/pdf-project";
 import { stillSizeProblem } from "../core/open-media";
 import type { PicturePageSizing } from "../core/picture-page";
 import { uid } from "../core/project";
-import { DEFAULT_EXPORT_PRESET, PDF_MAX_PAGES, PDF_SCHEMA } from "../core/types";
+import { DEFAULT_EXPORT_PRESET, DOCUMENT_FILE_EXTENSIONS, PDF_MAX_PAGES, PDF_SCHEMA } from "../core/types";
 import type { MediaInfo, ProjectFile } from "../core/types";
 import { toast } from "../ui/toast";
 
@@ -73,67 +73,180 @@ async function readPdf(path: string, gone: () => boolean): Promise<ReadResult | 
   return { failed: true };
 }
 
-/** "New project → PDF project": one PDF from the picker (none when cancelled). */
-export async function pickNewPdf(): Promise<string[]> {
-  return (await pickPdfFiles(false)).slice(0, 1);
+/** "New project → PDF project": any number of PDFs and pictures from one
+ *  picker (none when cancelled), as the picker hands them back; Home applies
+ *  the allowlist and the name order. */
+export async function pickNewPdfProjectFiles(): Promise<string[]> {
+  return pickPdfAndPictureFiles();
 }
 
-/** Reads every PDF in order, drops (and names, in a toast) any that is
- *  missing, protected or unreadable, and saves ONE PDF project of the rest:
- *  the first readable PDF makes it (and names it), each further one's pages
- *  follow in the order given. Returns the new project's path, or null when
- *  nothing was made. `gone` is asked after every await: a Home that has been
- *  left makes nothing and says nothing. */
-export async function createPdfProjectFrom(
+/** Whether Home reads this file as a PDF (else as a picture). */
+function isPdfPath(path: string): boolean {
+  return DOCUMENT_FILE_EXTENSIONS.has(fileExt(path));
+}
+
+/** One picture probed for a page. Every failure is said here in the words
+ *  "Open as → PDF project" uses; null: Home is gone. */
+async function readPicture(path: string, gone: () => boolean): Promise<MediaInfo | "failed" | null> {
+  const stem = fileStem(path);
+  let info: MediaInfo;
+  try {
+    info = await ipc.probeMedia(path);
+  } catch (e) {
+    if (gone()) return null;
+    toast.error(`Couldn't open ${stem}: ${describeError(e)}`);
+    return "failed";
+  }
+  if (gone()) return null;
+  const problem =
+    info.kind !== "image" || info.generator ? `${stem} is not a still picture, so it was left out.` : stillSizeProblem(info);
+  if (problem) {
+    toast.refuse(problem);
+    return "failed";
+  }
+  return info;
+}
+
+/** Said once when pictures did not fit after the pages already in. */
+export function picturesLeftOutText(n: number): string {
+  return n === 1
+    ? `1 picture was left out: a PDF project holds up to ${PDF_MAX_PAGES} pages.`
+    : `${n} pictures were left out: a PDF project holds up to ${PDF_MAX_PAGES} pages.`;
+}
+
+type Part = { pdf: Readable } | { picture: MediaInfo };
+
+/** Why a PDF among other files cannot go in after `pagesSoFar` pages, in
+ *  the words the user reads; null when it fits. */
+function pdfLeftOutText(pdf: Readable, pagesSoFar: number): string | null {
+  const stem = fileStem(pdf.path);
+  if (!Number.isInteger(pdf.pages) || pdf.pages < 1) return `${stem} was left out: it has no pages.`;
+  if (pagesSoFar + pdf.pages > PDF_MAX_PAGES) return `${stem} was left out: a PDF project holds up to ${PDF_MAX_PAGES} pages.`;
+  return null;
+}
+
+/** PDFs and pictures, in any mix, to ONE PDF project, in the order given:
+ *  a PDF gives every page, a picture one page at its own size ("Picture
+ *  size", core/picture-page). Reads every file first, drops (and names, in a
+ *  toast) any that is missing, protected, unreadable or not a still picture,
+ *  then saves the project, named after the first file that could be used.
+ *  What does not fit under PDF_MAX_PAGES is said, never dropped silently.
+ *  Returns the new project's path, or null when nothing was made. `gone` is
+ *  asked after every await: a Home that has been left makes nothing and says
+ *  nothing. */
+export async function createPdfProjectFromFiles(
   paths: readonly string[],
   gone: () => boolean,
 ): Promise<string | null> {
-  const readable: Readable[] = [];
+  const parts: Part[] = [];
   let protectedCount = 0;
+  let pictureCount = 0;
   for (const path of paths) {
-    const r = await readPdf(path, gone);
-    if (r === null) return null;
-    if ("ok" in r) readable.push(r.ok);
-    else if ("protectedPdf" in r) protectedCount++;
+    if (isPdfPath(path)) {
+      const r = await readPdf(path, gone);
+      if (r === null) return null;
+      if ("ok" in r) parts.push({ pdf: r.ok });
+      else if ("protectedPdf" in r) protectedCount++;
+    } else {
+      pictureCount++;
+      const r = await readPicture(path, gone);
+      if (r === null) return null;
+      if (r !== "failed") parts.push({ picture: r });
+    }
   }
   if (protectedCount > 0) {
     // Declined, not failed: the file is fine, it just cannot be edited.
     toast.info(paths.length === 1 ? PDF_PROTECTED : protectedSkippedText(protectedCount));
   }
-  if (readable.length === 0) return null;
-
-  const [first, ...rest] = readable as [Readable, ...Readable[]];
-  const { createPdfProject } = await import("../core/pdf-project");
-  if (gone()) return null;
-  const projectPath = await ipc.newProjectPath(fileStem(first.path));
-  if (gone()) return null;
-  let project: ProjectFile;
-  try {
-    // Named after the file the backend picked, so a de-duplicated "Report (2)"
-    // reads the same on the card as on disk.
-    project = createPdfProject(fileStem(projectPath), first);
-  } catch (e) {
-    // A RangeError written for the user (no pages, too many pages).
-    toast.error(describeError(e));
+  if (parts.length === 0) {
+    // Pictures alone: the sentence "Open as → PDF project" says. Each PDF's
+    // own failure has already been said.
+    if (pictureCount > 0 && pictureCount === paths.length) {
+      toast.refuse("None of the pictures could be opened, so no project was made.");
+    }
     return null;
   }
-  if (rest.length > 0) {
-    const { insertSourcePages } = await import("../pdf/model");
-    if (gone()) return null;
-    for (const pdf of rest) {
-      const at = project.pdf?.pages.length ?? 0;
-      const next = insertSourcePages(project, at, { id: uid(), ...pdf });
-      // The model refuses by handing the same project back: here, only
-      // because the pages would not fit. Said, never dropped silently.
-      if (next === project) {
-        toast.refuse(`${fileStem(pdf.path)} was left out: a PDF project holds up to ${PDF_MAX_PAGES} pages.`);
+
+  // The page model is wanted only when something is added to a first file.
+  const needModel = parts.length > 1 || "picture" in parts[0]!;
+  const [{ createPdfProject }, model] = await Promise.all([
+    import("../core/pdf-project"),
+    needModel ? import("../pdf/model") : Promise.resolve(null),
+  ]);
+  if (gone()) return null;
+  // Built first, named once the file is: the project is named after the
+  // first file that actually made it in, whatever came before it.
+  let project: ProjectFile | null = null;
+  let firstPath = "";
+  let picturesLeftOut = 0;
+  for (let i = 0; i < parts.length; ) {
+    const part = parts[i]!;
+    const at = project?.pdf?.pages.length ?? 0;
+    if ("pdf" in part) {
+      i++;
+      const stem = fileStem(part.pdf.path);
+      if (parts.length === 1) {
+        // One PDF alone: its own words, as always.
+        try {
+          project = createPdfProject(stem, part.pdf);
+        } catch (e) {
+          // A RangeError written for the user (no pages, too many pages).
+          toast.error(describeError(e));
+          return null;
+        }
+        firstPath = part.pdf.path;
         continue;
       }
-      project = next;
+      // Among other files a PDF that cannot go in is left out and named,
+      // wherever it sorts: the rest still make the project.
+      const why = pdfLeftOutText(part.pdf, at);
+      if (why) {
+        toast.refuse(why);
+        continue;
+      }
+      if (!project) {
+        project = createPdfProject(stem, part.pdf);
+        firstPath = part.pdf.path;
+        continue;
+      }
+      const next = model!.insertSourcePages(project, at, { id: uid(), ...part.pdf });
+      // Pages and room were checked above; any other refusal is a file
+      // the model could not take as a PDF.
+      if (next === project) toast.error(`Couldn't read ${stem} as a PDF.`);
+      else project = next;
+      continue;
     }
+    // A run of pictures goes in as one insert: as many as still fit.
+    const run: MediaInfo[] = [];
+    while (i < parts.length && "picture" in parts[i]!) run.push((parts[i++] as { picture: MediaInfo }).picture);
+    const fit = run.slice(0, Math.max(0, PDF_MAX_PAGES - at));
+    picturesLeftOut += run.length - fit.length;
+    if (fit.length === 0) continue;
+    const base: ProjectFile = project ?? (await emptyPdfProject(fileStem(fit[0]!.path)));
+    if (gone()) return null;
+    const next = model!.insertPicturePages(base, at, fit, "picture");
+    if (next === base) {
+      picturesLeftOut += fit.length;
+      continue;
+    }
+    if (!project) firstPath = fit[0]!.path;
+    project = next;
   }
+  if (picturesLeftOut > 0) toast.refuse(picturesLeftOutText(picturesLeftOut));
+  // Never write a project without pages.
+  if (!project || (project.pdf?.pages.length ?? 0) === 0) return null;
+  const projectPath = await ipc.newProjectPath(fileStem(firstPath));
+  if (gone()) return null;
+  // Named after the file the backend picked, so a de-duplicated "Report (2)"
+  // reads the same on the card as on disk.
+  project = { ...project, name: fileStem(projectPath) };
   await ipc.saveProject(projectPath, project);
   return projectPath;
+}
+
+/** PDFs only: the same making under the name its callers and tests know. */
+export function createPdfProjectFrom(paths: readonly string[], gone: () => boolean): Promise<string | null> {
+  return createPdfProjectFromFiles(paths, gone);
 }
 
 /* ---------------- pictures → a PDF project (0.9.5) ---------------- */
@@ -178,23 +291,9 @@ export async function createPdfProjectFromPictures(
 ): Promise<string | null> {
   const infos: MediaInfo[] = [];
   for (const path of paths) {
-    const stem = fileStem(path);
-    let info: MediaInfo;
-    try {
-      info = await ipc.probeMedia(path);
-    } catch (e) {
-      if (gone()) return null;
-      toast.error(`Couldn't open ${stem}: ${describeError(e)}`);
-      continue;
-    }
-    if (gone()) return null;
-    const problem =
-      info.kind !== "image" || info.generator ? `${stem} is not a still picture, so it was left out.` : stillSizeProblem(info);
-    if (problem) {
-      toast.refuse(problem);
-      continue;
-    }
-    infos.push(info);
+    const r = await readPicture(path, gone);
+    if (r === null) return null;
+    if (r !== "failed") infos.push(r);
   }
   if (infos.length === 0) {
     toast.refuse("None of the pictures could be opened, so no project was made.");

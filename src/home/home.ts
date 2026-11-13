@@ -16,7 +16,7 @@ import { isTempProjectPath, runOnOpenChain } from "../core/open-media";
 import { addMedia, createProject } from "../core/project";
 import { chordOf, physicalChordOf } from "../core/shortcuts";
 import type { ChordSource } from "../core/shortcuts";
-import { DOCUMENT_FILE_EXTENSIONS, MEDIA_FILE_EXTENSIONS } from "../core/types";
+import { DOCUMENT_FILE_EXTENSIONS, MEDIA_FILE_EXTENSIONS, mediaFamilyOf } from "../core/types";
 import type { RecentItem } from "../core/types";
 import { focusFirst, trapTab } from "../ui/focus";
 import { icon } from "../ui/icons";
@@ -73,7 +73,8 @@ export function sortRecents(items: readonly RecentItem[], key: SortKey): RecentI
 /** Where a set of chosen (or dropped) files goes. There is deliberately no
  *  viewer here: opening media from Home is starting a project with it, and
  *  the "Open as" dialog asks which kind. PDFs never reach that dialog: a PDF
- *  can only become a PDF project, so there is nothing to ask. */
+ *  can only become a PDF project, so there is nothing to ask — and neither
+ *  do pictures that come WITH a PDF: together they can only be pages. */
 export type OpenRoute =
   | { kind: "nothing" }
   /** `ignored`: the other files that came with it (a drop only; Open refuses) */
@@ -82,12 +83,13 @@ export type OpenRoute =
   | { kind: "mixed" }
   | { kind: "unsupported"; count: number }
   /** allowlisted media in natural name order, plus how many files were not
-   *  supported and how many PDFs came along (left aside: PDFs and media do
-   *  not go into one project) */
+   *  supported and how many PDFs came along (left aside: PDFs go into one
+   *  project with pictures only, never with a video, a GIF or a song) */
   | { kind: "media"; media: string[]; skipped: number; pdfs: number }
-  /** PDFs only (besides unsupported files): ONE new PDF project, the files
-   *  in natural name order, as media are */
-  | { kind: "pdf"; pdfs: string[]; skipped: number };
+  /** PDFs, alone or with still pictures only (besides unsupported files):
+   *  ONE new PDF project, the files in natural name order, as media are; a
+   *  PDF gives its pages, a picture one page */
+  | { kind: "pdf"; files: string[]; skipped: number };
 
 /** compareNames on the file names: the order Open and drops hand files on in. */
 function byFileName(a: string, b: string): number {
@@ -104,20 +106,43 @@ function byFileName(a: string, b: string): number {
  *  way, picked or dropped: neither order is the user's. The picker's is none
  *  in particular, and a drop (like a shift-click pick) puts the file under the
  *  pointer first — so "a, b, c" chosen while b had focus started at b. The
- *  pages can be rearranged in the editor. PDFs with media keep the
- *  media's flow and leave the PDFs aside, said in the notice: one project
- *  cannot be both, and guessing which the user meant is worse than asking
- *  them to open the PDFs on their own. */
+ *  pages can be rearranged in the editor. PDFs with still pictures only make
+ *  the same ONE PDF project, every file in name order (a picture is a page;
+ *  it can be nothing else beside a PDF). PDFs with any other media (a
+ *  video, a GIF, a song) keep the media's flow and leave the PDFs aside,
+ *  said in the notice: one project cannot be both, and guessing which the
+ *  user meant is worse than asking them to open the PDFs on their own. */
 function mediaRoute(paths: readonly string[]): OpenRoute {
   const media = paths.filter((p) => MEDIA_FILE_EXTENSIONS.has(fileExt(p)));
   const pdfs = paths.filter((p) => DOCUMENT_FILE_EXTENSIONS.has(fileExt(p)));
   const skipped = paths.length - media.length - pdfs.length;
   if (media.length === 0) {
     if (pdfs.length === 0) return { kind: "unsupported", count: skipped };
-    return { kind: "pdf", pdfs: pdfs.sort(byFileName), skipped };
+    return { kind: "pdf", files: pdfs.sort(byFileName), skipped };
+  }
+  if (pdfs.length > 0 && media.every(isPicture)) {
+    return { kind: "pdf", files: [...pdfs, ...media].sort(byFileName), skipped };
   }
   media.sort(byFileName);
   return { kind: "media", media, skipped, pdfs: pdfs.length };
+}
+
+/** A still picture (the image family; a GIF plays as a clip and is not one). */
+function isPicture(path: string): boolean {
+  return mediaFamilyOf(fileExt(path)) === "image";
+}
+
+/** "New project → PDF project": what the picker handed back, as a route.
+ *  Only PDFs and pictures can be pages (the picker's filter can be typed
+ *  around, so the allowlist is applied here too), and every kept file goes
+ *  in name order: pictures alone, PDFs alone or a mix, never "Open as" — the
+ *  user has already said which kind. */
+export function newPdfProjectRoute(paths: readonly string[]): OpenRoute {
+  if (paths.length === 0) return { kind: "nothing" };
+  const files = paths.filter((p) => DOCUMENT_FILE_EXTENSIONS.has(fileExt(p)) || isPicture(p));
+  const skipped = paths.length - files.length;
+  if (files.length === 0) return { kind: "unsupported", count: skipped };
+  return { kind: "pdf", files: files.sort(byFileName), skipped };
 }
 
 /** Home's Open: one project opens; media goes to "Open as"; a project picked
@@ -259,6 +284,8 @@ export function orphanRowsHtml(paths: readonly string[]): string {
 interface HomeDev {
   open(paths: string[]): void;
   drop(paths: string[]): void;
+  /** "New project > PDF project" with these files as the picker's answer */
+  newPdf(paths: string[]): void;
 }
 type HomeDevWindow = { __tarotingHomeDev?: HomeDev; __tarotingAutotest?: boolean };
 
@@ -845,7 +872,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
 
   /* "New project" asks which kind in a menu under the button: a video project
      is made on the spot, an image project through the "New image project"
-     dialog, a PDF project from a PDF the user picks. `fromKeyboard`: opened with Enter/Space, so the menu starts on
+     dialog, a PDF project from the PDFs and pictures the user picks. `fromKeyboard`: opened with Enter/Space, so the menu starts on
      its first row and the next Enter chooses it. */
   function openNewMenu(fromKeyboard = false): void {
     const r = newBtn.getBoundingClientRect();
@@ -908,21 +935,30 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     }
   }
 
-  /** PDFs to ONE new PDF project, a real library project like createNew's,
-   *  pages in the order given. `null`: "New project > PDF project", where the
-   *  user picks one PDF first, with nothing held busy while the picker is up
-   *  (they may take as long as they like, or cancel). The picker and the
-   *  making are their own small chunk (it fetches pdf.js and the PDF model only
-   *  once there is a PDF to read), never at boot. */
-  async function makePdfProject(pdfs: string[] | null): Promise<void> {
+  /** PDFs and pictures to ONE new PDF project, a real library project like
+   *  createNew's, pages in the order given. `null`: "New project > PDF
+   *  project", where the user picks the files first, with nothing held busy
+   *  while the picker is up (they may take as long as they like, or cancel);
+   *  `devPicks` stands in for the picker under the in-app E2E only. The
+   *  picker and the making are their own small chunk (it fetches pdf.js and
+   *  the PDF model only once there is a file to read), never at boot. */
+  async function makePdfProject(files: string[] | null, devPicks?: string[]): Promise<void> {
     if (busy) return;
     try {
       const m = await import("./pdf-project-from");
-      pdfs ??= await m.pickNewPdf();
+      if (files === null) {
+        const picked = devPicks ?? (await m.pickNewPdfProjectFiles());
+        if (disposed) return;
+        const route = newPdfProjectRoute(picked);
+        const notice = openRouteNotice(route);
+        if (notice) toast.refuse(notice);
+        if (route.kind !== "pdf") return;
+        files = route.files;
+      }
       // See createNew for why a disposed screen must not act.
-      if (disposed || pdfs.length === 0 || guard()) return;
+      if (disposed || files.length === 0 || guard()) return;
       try {
-        const projectPath = await m.createPdfProjectFrom(pdfs, () => disposed);
+        const projectPath = await m.createPdfProjectFromFiles(files, () => disposed);
         if (projectPath && !disposed) navigate({ view: "editor", projectPath });
       } finally {
         busy = false;
@@ -1089,7 +1125,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
     if (notice) toast.refuse(notice);
     if (route.kind === "project") void openPath(route.path, openRouteInfo(route));
     else if (route.kind === "media") void offerOpenAs(route.media);
-    else if (route.kind === "pdf") void makePdfProject(route.pdfs);
+    else if (route.kind === "pdf") void makePdfProject(route.files);
   }
 
   async function openViaDialog(): Promise<void> {
@@ -1366,6 +1402,7 @@ export function mountHome(root: HTMLElement): { dispose(): void } {
       ? {
           open: (paths) => followRoute(routeOpenPicks(paths)),
           drop: (paths) => handleDroppedPaths(paths),
+          newPdf: (paths) => void makePdfProject(null, paths),
         }
       : null;
   if (dev) devWin.__tarotingHomeDev = dev;

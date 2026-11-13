@@ -740,6 +740,20 @@ export async function pickPdfFiles(multiple: boolean): Promise<string[]> {
   return Array.isArray(result) ? result : [result];
 }
 
+/** Home's "New project → PDF project": any number of PDFs and still pictures
+ *  (the document and image families of media-extensions.json) in one
+ *  filter; every PDF's pages and every picture a page, in one project. */
+export async function pickPdfAndPictureFiles(): Promise<string[]> {
+  if (!inTauri) return [];
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const result = await open({
+    multiple: true,
+    filters: [{ name: "PDFs and pictures", extensions: [...MEDIA_EXTENSIONS.document, ...MEDIA_EXTENSIONS.image] }],
+  });
+  if (result === null) return [];
+  return Array.isArray(result) ? result : [result];
+}
+
 /** One folder (the PDF editor's "export pages as pictures"), opening at
  *  `defaultPath` when given; null when the user closes the picker. */
 export async function pickFolder(defaultPath?: string): Promise<string | null> {
