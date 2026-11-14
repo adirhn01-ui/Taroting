@@ -748,7 +748,10 @@ export function mountImageInspector(
           findLayer(session.project, id)?.hidden ? "Show this layer to crop it." : "This layer can't be cropped right now.",
         );
       },
-      "Crop this layer on the canvas (or double-click the layer)",
+      // A double-click on a text layer opens it for typing, not for cropping.
+      findLayer(session.project, id)?.kind === "text"
+        ? "Crop this layer on the canvas"
+        : "Crop this layer on the canvas (or double-click the layer)",
     );
     cropBtn.setAttribute("aria-label", "Crop layer");
     btns.appendChild(cropBtn);
